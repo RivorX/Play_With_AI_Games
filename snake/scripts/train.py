@@ -14,6 +14,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import shutil
 import subprocess
+import sys
 import yaml
 from model import make_env
 
@@ -266,7 +267,7 @@ def train(use_progress_bar=True):
         if os.path.exists(train_csv_path):
             try:
                 train_plot_script = os.path.join(os.path.dirname(__file__), 'plot_train_progress.py')
-                subprocess.run(['python', train_plot_script], check=True)
+                subprocess.run([sys.executable, train_plot_script], check=True)
                 print(f"Wygenerowano wykres treningu: {os.path.join(base_dir, config['paths']['plot_path'])}")
             except Exception as e:
                 print(f"Błąd podczas generowania wykresu treningu: {e}")
