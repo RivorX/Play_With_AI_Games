@@ -249,7 +249,11 @@ def train(use_progress_bar=True):
                     with open(best_model_path_absolute, 'rb') as f:
                         pass  # Próba otwarcia pliku w trybie odczytu
                     shutil.copy(best_model_path_absolute, model_path_absolute)
+                    # Tworzenie kopii zapasowej najlepszego modelu
+                    best_model_backup = best_model_path_absolute + '.backup'
+                    shutil.copy(best_model_path_absolute, best_model_backup)
                     print(f"Zaktualizowano najlepszy model: {model_path_absolute}")
+                    print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup}")
                     break
                 except PermissionError as e:
                     print(f"Próba {attempt + 1}/5: Nie udało się skopiować best_model.zip do {model_path_absolute}: {e}")
