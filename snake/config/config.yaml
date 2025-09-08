@@ -3,7 +3,7 @@ environment:
   grid_size: 15
   snake_size: 20
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]
-  observation_space: { low: 0, high: 3, shape: [96], dtype: float32 }  # Zaktualizowano shape (9 kolizji + 4 kierunki + 2 odległości + 81 mini-mapa)
+  observation_space: { low: 0, high: 3, shape: [97], dtype: float32 }  # Zaktualizowano shape (9 kolizji + 4 kierunki + 2 odległości + 1 długość węża + 81 mini-mapa)
   action_space: { type: Discrete, n: 3 }
   max_steps_without_food: 100
   max_steps_factor: 150
@@ -17,8 +17,8 @@ model:
   n_epochs: 10
   gamma: 0.999
   gae_lambda: 0.98
-  clip_range: 0.15
-  ent_coef: 0.03
+  clip_range: 0.1  # Zmniejszono z 0.15 na 0.1
+  ent_coef: 0.05  # Zwiększono z 0.03 na 0.05
   vf_coef: 0.5
   device: cuda
   policy_kwargs:
