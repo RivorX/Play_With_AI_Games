@@ -61,6 +61,9 @@ class SnakeEnv(gym.Env):
         point_f2 = head + 2 * DIRECTIONS[self.direction]  # Punkt 2 kratki do przodu
         point_l2 = head + 2 * DIRECTIONS[(self.direction - 1) % 4]  # 2 kratki w lewo
         point_r2 = head + 2 * DIRECTIONS[(self.direction + 1) % 4]  # 2 kratki w prawo
+        point_f3 = head + 3 * DIRECTIONS[self.direction]  # Punkt 3 kratki do przodu
+        point_l3 = head + 3 * DIRECTIONS[(self.direction - 1) % 4]  # 3 kratki w lewo
+        point_r3 = head + 3 * DIRECTIONS[(self.direction + 1) % 4]  # 3 kratki w prawo
 
         dir_l = (self.direction == 3)
         dir_r = (self.direction == 1)
@@ -71,11 +74,11 @@ class SnakeEnv(gym.Env):
         food_distance_x = (self.food[0] - head[0]) / self.grid_size
         food_distance_y = (self.food[1] - head[1]) / self.grid_size
 
-        # Mini-mapa: siatka 5x5 wokół głowy węża (25 elementów)
+        # Mini-mapa: siatka 9x9 wokół głowy węża (81 elementów)
         mini_map = []
         self.vision_cells = []  # Lista komórek mini-mapy do wizualizacji
-        for dy in range(-2, 3):
-            for dx in range(-2, 3):
+        for dy in range(-4, 5):  # Siatka 9x9
+            for dx in range(-4, 5):
                 x, y = head[0] + dx, head[1] + dy
                 self.vision_cells.append([x, y])  # Zapisz komórki do wizualizacji
                 if x < 0 or x >= self.grid_size or y < 0 or y >= self.grid_size:
@@ -94,10 +97,13 @@ class SnakeEnv(gym.Env):
             self._is_collision(point_f2),  # Kolizja 2 kratki do przodu
             self._is_collision(point_l2),  # Kolizja 2 kratki w lewo
             self._is_collision(point_r2),  # Kolizja 2 kratki w prawo
+            self._is_collision(point_f3),  # Kolizja 3 kratki do przodu
+            self._is_collision(point_l3),  # Kolizja 3 kratki w lewo
+            self._is_collision(point_r3),  # Kolizja 3 kratki w prawo
             dir_l, dir_r, dir_u, dir_d,  # Kierunek
             food_distance_x,  # Znormalizowana odległość X do jedzenia
             food_distance_y,  # Znormalizowana odległość Y do jedzenia
-        ] + mini_map  # Dodajemy mini-mapę (6 + 4 + 2 + 25 = 37)
+        ] + mini_map  # Dodajemy mini-mapę (9 + 4 + 2 + 81 = 96)
 
         return np.array(state, dtype=np.float32)
 
@@ -122,7 +128,7 @@ class SnakeEnv(gym.Env):
         if self._is_collision(head) or self.steps > config['environment']['max_steps_factor'] * len(self.snake):
             # Kolizja lub przekroczono maksymalną liczbę kroków
             self.done = True
-            reward = -100  # Surowsza kara za kolizję
+            reward = -15
         else:
             self.snake.appendleft(head.tolist())
             if np.array_equal(head, self.food):
@@ -134,11 +140,6 @@ class SnakeEnv(gym.Env):
                 # Przesunięcie węża
                 self.snake.pop()
                 self.steps_without_food += 1
-                # Nagroda za zbliżanie się do jedzenia
-                if new_distance < old_distance:
-                    reward += 0.1  # Mała nagroda za ruch w stronę jedzenia
-                else:
-                    reward -= 0.05  # Mała kara za oddalanie się
 
         # Dodaj karę za brak zebrania jabłka przez dłuższy czas (łagodniejsza)
         if self.steps_without_food > config['environment']['max_steps_without_food']:
@@ -157,13 +158,13 @@ class SnakeEnv(gym.Env):
             return
         self.screen.fill((0, 0, 0))  # Wypełnij tło czarnym kolorem
 
-        # Rysuj podświetlenie dla komórek mini-mapy (5x5 wokół głowy)
+        # Rysuj podświetlenie dla komórek mini-mapy (9x9 wokół głowy)
         for cell in self.vision_cells:
             x, y = cell
             # Sprawdź, czy komórka jest w granicach siatki
             if 0 <= x < self.grid_size and 0 <= y < self.grid_size:
-                # Delikatne żółte podświetlenie (półprzezroczyste)
-                pygame.draw.rect(self.screen, (255, 255, 0, 50),  # RGBA, alpha=50 dla przezroczystości
+                # Jasny niebieski, bardziej przezroczysty (alpha=30)
+                pygame.draw.rect(self.screen, (135, 206, 250, 30),  # Jasny niebieski (sky blue) z alpha=30
                                  (x * SNAKE_SIZE, y * SNAKE_SIZE, SNAKE_SIZE, SNAKE_SIZE))
 
         # Rysuj węża

@@ -3,10 +3,10 @@ environment:
   grid_size: 15
   snake_size: 20
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]
-  observation_space: { low: 0, high: 3, shape: [37], dtype: float32 }  # Zaktualizowano shape (6 kolizji + 4 kierunki + 2 odległości + 25 mini-mapa)
+  observation_space: { low: 0, high: 3, shape: [96], dtype: float32 }  # Zaktualizowano shape (9 kolizji + 4 kierunki + 2 odległości + 81 mini-mapa)
   action_space: { type: Discrete, n: 3 }
-  max_steps_without_food: 100  # Zwiększono limit kroków bez jedzenia, aby zmniejszyć zamykanie się
-  max_steps_factor: 150  # Zwiększono faktor maksymalnych kroków, aby dać więcej czasu na manewry
+  max_steps_without_food: 100
+  max_steps_factor: 150
 
 # Konfiguracja modelu PPO
 model:
@@ -22,14 +22,14 @@ model:
   vf_coef: 0.5
   device: cuda
   policy_kwargs:
-    net_arch: [512, 512, 256]  # Zwiększono architekturę sieci, aby obsłużyć większą przestrzeń obserwacji
+    net_arch: [1024, 512, 256]  # Architektura wystarczająca dla większej przestrzeni obserwacji
 
 # Konfiguracja treningu
 training:
   n_envs: 32
-  total_timesteps: 100000000
+  total_timesteps: 1000000000
   eval_freq: 10000
-  max_no_improvement_evals: 8
+  max_no_improvement_evals: 10
   min_evals: 5
   enable_testing: false  # Przełącznik do włączania/wyłączania testowania podczas treningu
 
