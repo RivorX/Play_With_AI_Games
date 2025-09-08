@@ -74,6 +74,9 @@ class SnakeEnv(gym.Env):
         food_distance_x = (self.food[0] - head[0]) / self.grid_size
         food_distance_y = (self.food[1] - head[1]) / self.grid_size
 
+        # Znormalizowana długość węża
+        snake_length = len(self.snake) / (self.grid_size ** 2)
+
         # Mini-mapa: siatka 9x9 wokół głowy węża (81 elementów)
         mini_map = []
         self.vision_cells = []  # Lista komórek mini-mapy do wizualizacji
@@ -103,7 +106,8 @@ class SnakeEnv(gym.Env):
             dir_l, dir_r, dir_u, dir_d,  # Kierunek
             food_distance_x,  # Znormalizowana odległość X do jedzenia
             food_distance_y,  # Znormalizowana odległość Y do jedzenia
-        ] + mini_map  # Dodajemy mini-mapę (9 + 4 + 2 + 81 = 96)
+            snake_length  # Znormalizowana długość węża
+        ] + mini_map  # Dodajemy mini-mapę (9 + 4 + 2 + 1 + 81 = 97)
 
         return np.array(state, dtype=np.float32)
 
@@ -125,6 +129,23 @@ class SnakeEnv(gym.Env):
         old_distance = abs(self.food[0] - self.snake[0][0]) + abs(self.food[1] - self.snake[0][1])
         new_distance = abs(self.food[0] - head[0]) + abs(self.food[1] - head[1])
 
+        # Policz puste komórki w mini-mapie
+        mini_map = []
+        for dy in range(-4, 5):  # Siatka 9x9
+            for dx in range(-4, 5):
+                x, y = head[0] + dx, head[1] + dy
+                if x < 0 or x >= self.grid_size or y < 0 or y >= self.grid_size:
+                    mini_map.append(1)  # Ściana
+                elif list([x, y]) in self.snake:
+                    mini_map.append(2)  # Ciało węża
+                elif np.array_equal([x, y], self.food):
+                    mini_map.append(3)  # Jedzenie
+                else:
+                    mini_map.append(0)  # Pusta kratka
+        empty_cells = mini_map.count(0)
+        total_cells_in_minimap = 81  # 9x9
+        reward -= 0.005 * (1 - (empty_cells / total_cells_in_minimap))  # Kara za małą liczbę pustych komórek
+
         if self._is_collision(head) or self.steps > config['environment']['max_steps_factor'] * len(self.snake):
             # Kolizja lub przekroczono maksymalną liczbę kroków
             self.done = True
@@ -140,6 +161,8 @@ class SnakeEnv(gym.Env):
                 # Przesunięcie węża
                 self.snake.pop()
                 self.steps_without_food += 1
+                # Nagroda za przetrwanie (im dłuższy wąż, tym mniejsza)
+                reward += 0.01 / len(self.snake)
 
         # Dodaj karę za brak zebrania jabłka przez dłuższy czas (łagodniejsza)
         if self.steps_without_food > config['environment']['max_steps_without_food']:
