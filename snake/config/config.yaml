@@ -1,0 +1,47 @@
+# Konfiguracja środowiska Snake
+environment:
+  grid_size: 15
+  snake_size: 20
+  directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]
+  observation_space: { low: 0, high: 1, shape: [11], dtype: float32 }
+  action_space: { type: Discrete, n: 3 }
+  max_steps_without_food: 50
+  max_steps_factor: 100
+
+# Konfiguracja modelu PPO
+model:
+  policy: MlpPolicy
+  learning_rate: 0.0002
+  n_steps: 8192
+  batch_size: 4096
+  n_epochs: 10
+  gamma: 0.999
+  gae_lambda: 0.98
+  clip_range: 0.15
+  ent_coef: 0.03
+  vf_coef: 0.5
+  device: cuda
+  policy_kwargs:
+    net_arch: [256, 256, 128]
+
+# Konfiguracja treningu
+training:
+  n_envs: 32
+  total_timesteps: 100000000
+  eval_freq: 10000
+  max_no_improvement_evals: 8
+  min_evals: 5
+  enable_testing: false  # Przełącznik do włączania/wyłączania testowania podczas treningu
+
+# Ścieżki do zapisu
+paths:
+  models_dir: models
+  logs_dir: logs
+  model_path: models/snake_ppo_model.zip
+  test_model_path: models/test_model.zip
+  best_model_path: models/best_model.zip
+  train_csv_path: logs/train_progress.csv
+  test_csv_path: logs/test_results.csv
+  test_log_path: logs/test_log.txt
+  plot_path: logs/training_progress.png
+  test_progress_path: logs/test_progress.png

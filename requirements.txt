@@ -1,0 +1,8 @@
+numpy
+gymnasium
+stable-baselines3[extra]
+torch
+pygame
+tqdm
+filelock
+pyyaml
