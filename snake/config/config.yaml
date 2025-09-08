@@ -1,47 +1,56 @@
 # Konfiguracja środowiska Snake
 environment:
-  grid_size: 15
-  snake_size: 20
-  directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]
-  observation_space: { low: 0, high: 3, shape: [97], dtype: float32 }  # Zaktualizowano shape (9 kolizji + 4 kierunki + 2 odległości + 1 długość węża + 81 mini-mapa)
-  action_space: { type: Discrete, n: 3 }
-  max_steps_without_food: 100
-  max_steps_factor: 150
+  grid_size: 15                      # Domyślny rozmiar siatki
+  snake_size: 20                     # Rozmiar kratki w pikselach
+  directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
+  observation_space:
+    low: 0                           # Minimalna wartość obserwacji
+    high: 3                          # Maksymalna wartość obserwacji
+    shape: [97]                      # Kształt przestrzeni obserwacji
+    dtype: float32                   # Typ danych obserwacji
+  action_space:
+    type: Discrete                    # Typ przestrzeni akcji
+    n: 3                             # Liczba akcji (lewo, prosto, prawo)
+  max_steps_without_food: 100        # Max kroków bez jedzenia
+  max_steps_factor: 150              # Mnożnik max kroków
 
 # Konfiguracja modelu PPO
 model:
-  policy: MlpPolicy
-  learning_rate: 0.0003
-  n_steps: 8192
-  batch_size: 4096
-  n_epochs: 10
-  gamma: 0.999
-  gae_lambda: 0.98
-  clip_range: 0.1  # Zmniejszono z 0.15 na 0.1
-  ent_coef: 0.05  # Zwiększono z 0.03 na 0.05
-  vf_coef: 0.5
-  device: cuda
+  policy: MlpPolicy                  # Typ polityki
+  learning_rate: 0.0003              # Szybkość uczenia
+  n_steps: 8192                      # Kroki na iterację
+  batch_size: 4096                   # Rozmiar partii
+  n_epochs: 10                       # Liczba epok
+  gamma: 0.999                       # Dyskontowanie nagród
+  gae_lambda: 0.98                   # Współczynnik GAE
+  clip_range: 0.1                    # Zakres obcinania gradientów
+  ent_coef: 0.1                      # Współczynnik entropii
+  vf_coef: 0.5                       # Współczynnik funkcji wartości
+  device: cuda                       # Urządzenie (cuda/cpu)
   policy_kwargs:
-    net_arch: [1024, 512, 256]  # Architektura wystarczająca dla większej przestrzeni obserwacji
+    net_arch: [1024, 512, 256]       # Architektura sieci
 
 # Konfiguracja treningu
 training:
-  n_envs: 32
-  total_timesteps: 1000000000
-  eval_freq: 10000
-  max_no_improvement_evals: 10
-  min_evals: 5
-  enable_testing: false  # Przełącznik do włączania/wyłączania testowania podczas treningu
+  n_envs: 32                         # Liczba środowisk
+  total_timesteps: 1000000000        # Całkowita liczba kroków
+  eval_freq: 10000                   # Częstotliwość ewaluacji
+  max_no_improvement_evals: 10       # Max ewaluacji bez poprawy
+  min_evals: 5                       # Min ewaluacji przed zatrzymaniem
+  enable_testing: true               # Testowanie w tle
+  curriculum_multipliers: [6, 12, 18, 20]  # Mnożniki dla curriculum_steps
+  curriculum_grid_sizes: [5, 8, 12, 16]  # Rozmiary siatki w curriculum
 
 # Ścieżki do zapisu
 paths:
-  models_dir: models
-  logs_dir: logs
-  model_path: models/snake_ppo_model.zip
-  test_model_path: models/test_model.zip
-  best_model_path: models/best_model.zip
-  train_csv_path: logs/train_progress.csv
-  test_csv_path: logs/test_results.csv
-  test_log_path: logs/test_log.txt
-  plot_path: logs/training_progress.png
-  test_progress_path: logs/test_progress.png
+  models_dir: models                 # Katalog modeli
+  logs_dir: logs                     # Katalog logów
+  model_path: models/snake_ppo_model.zip  # Ścieżka modelu
+  test_model_path: models/test_model.zip  # Ścieżka modelu testowego
+  best_model_path: models/best_model.zip  # Ścieżka najlepszego modelu
+  best_model_backup_path: models/best_model_backup.zip  # Kopia zapasowa
+  train_csv_path: logs/train_progress.csv  # Plik CSV treningu
+  test_csv_path: logs/test_results.csv     # Plik CSV testów
+  test_log_path: logs/test_log.txt         # Plik logów testów
+  plot_path: logs/training_progress.png    # Wykres treningu
+  test_progress_path: logs/test_progress.png  # Wykres testów
