@@ -15,7 +15,6 @@ with open(config_path, 'r') as f:
 GRID_SIZE = config['environment']['grid_size']
 SNAKE_SIZE = config['environment']['snake_size']
 DIRECTIONS = np.array(config['environment']['directions'])
-FUTURE_STEPS = config['environment']['future_steps']
 
 class SnakeEnv(gym.Env):
     def __init__(self, render_mode=None):
@@ -54,68 +53,26 @@ class SnakeEnv(gym.Env):
             if list(food) not in self.snake:
                 return food
 
-    def _get_map(self):
-        # Tworzy mapę gry: 0 - puste pole, 1 - wąż, 2 - jedzenie
-        game_map = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        for segment in self.snake:
-            game_map[segment[0], segment[1]] = 1
-        game_map[self.food[0], self.food[1]] = 2
-        return game_map
-
-    def _simulate_future(self, action, current_snake, current_direction, current_food, steps_left):
-        # Symuluje ruch węża dla danego działania
-        new_direction = (current_direction + (action - 1)) % 4
-        head = np.array(current_snake[0]) + DIRECTIONS[new_direction]
-        
-        # Sprawdzenie kolizji
-        if (head[0] < 0 or head[0] >= self.grid_size or 
-            head[1] < 0 or head[1] >= self.grid_size or 
-            list(head) in current_snake):
-            return None  # Kolizja, brak mapy
-
-        new_snake = collections.deque(current_snake)
-        new_snake.appendleft(head.tolist())
-        new_food = current_food.copy()
-        
-        # Jeśli jedzenie zjedzone
-        if np.array_equal(head, current_food):
-            new_food = self._place_food()
-        else:
-            new_snake.pop()
-        
-        # Tworzenie mapy dla tego stanu
-        game_map = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        for segment in new_snake:
-            game_map[segment[0], segment[1]] = 1
-        game_map[new_food[0], new_food[1]] = 2
-        
-        if steps_left > 1:
-            # Rekurencyjna symulacja dla każdego możliwego działania
-            sub_maps = []
-            for next_action in range(3):  # -1 (lewo), 0 (prosto), 1 (prawo)
-                sub_map = self._simulate_future(next_action, new_snake, new_direction, new_food, steps_left - 1)
-                if sub_map is not None:
-                    sub_maps.append(sub_map)
-            # Jeśli brak ważnych map, zwróć None
-            if not sub_maps:
-                return None
-            # Średnia z przyszłych map (można dostosować sposób agregacji)
-            return np.mean(sub_maps, axis=0)
-        return game_map
-
     def _get_obs(self):
-        # Obserwacja zawiera mapę bieżącego stanu + symulacje dla każdego możliwego ruchu
-        obs = np.zeros((self.grid_size, self.grid_size, FUTURE_STEPS + 1), dtype=np.float32)
-        obs[:, :, 0] = self._get_map()  # Bieżąca mapa
-        
-        # Symulacja dla każdego możliwego działania
-        for i, action in enumerate(range(3)):  # -1 (lewo), 0 (prosto), 1 (prawo)
-            future_map = self._simulate_future(action, self.snake, self.direction, self.food, FUTURE_STEPS)
-            if future_map is not None:
-                obs[:, :, i + 1] = future_map
-            else:
-                obs[:, :, i + 1] = self._get_map()  # Wypełnij bieżącą mapą w przypadku kolizji
-        return obs
+        head = self.snake[0]
+        point_l = head + DIRECTIONS[(self.direction - 1) % 4]
+        point_r = head + DIRECTIONS[(self.direction + 1) % 4]
+        point_f = head + DIRECTIONS[self.direction]
+        dir_l = (self.direction == 3)
+        dir_r = (self.direction == 1)
+        dir_u = (self.direction == 0)
+        dir_d = (self.direction == 2)
+        state = [
+            self._is_collision(point_f),
+            self._is_collision(point_l),
+            self._is_collision(point_r),
+            dir_l, dir_r, dir_u, dir_d,
+            self.food[0] < head[0],
+            self.food[0] > head[0],
+            self.food[1] < head[1],
+            self.food[1] > head[1],
+        ]
+        return np.array(state, dtype=np.float32)
 
     def _is_collision(self, point):
         if point[0] < 0 or point[0] >= self.grid_size or point[1] < 0 or point[1] >= self.grid_size:
@@ -128,7 +85,7 @@ class SnakeEnv(gym.Env):
         self.direction = (self.direction + (action - 1)) % 4
         head = self.snake[0] + DIRECTIONS[self.direction]
         self.steps += 1
-        reward = 0.001  # bardzo mała nagroda za każdy ruch
+        reward = 0
         self.done = False
         if self._is_collision(head) or self.steps > config['environment']['max_steps_factor'] * len(self.snake):
             # Kolizja lub przekroczono maksymalną liczbę kroków
