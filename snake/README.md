@@ -41,3 +41,14 @@ Projekt polega na uczeniu agenta RL (PPO, Stable Baselines3) do gry w Snake w ś
 - `test_snake_model.py` — testowanie wytrenowanego agenta
 - `plot_train_progress.py` — generowanie wykresu postępu
 - `config/config.yaml` — konfiguracja środowiska, modelu i ścieżek
+
+# Przywracanie modelu z kopii zapasowej
+
+Jeśli chcesz kontynuować trening lub przetestować ostatni zapisany model, a plik modelu został uszkodzony lub chcesz wrócić do poprzedniej wersji:
+
+1. Przejdź do folderu `models`.
+2. Znajdź plik z końcówką `.zip.backup` (np. `snake_ppo_model.zip.backup` lub `best_model.zip.backup`).
+3. Zmień nazwę pliku, usuwając końcówkę `.backup` (np. `snake_ppo_model.zip.backup` → `snake_ppo_model.zip`).
+4. Teraz możesz uruchomić trening lub testowanie – program użyje przywróconego modelu.
+
+To samo dotyczy pliku najlepszego modelu (`best_model.zip.backup`).
