@@ -34,8 +34,8 @@ snake/models/*.zip
 snake/models/*.npz
 
 # Training logs
-snake/logs/*
-!snake/logs/.gitkeep
+logs/*
+!logs/.gitkeep
 
 # Ignore all logs and results except .gitkeep (if you want to keep folder structure)
 
@@ -43,9 +43,4 @@ snake/logs/*
 *.swp
 *.bak
 
-# Virtual environment folders
-venv/
-.venv/
-
 logs
-__pycache__
