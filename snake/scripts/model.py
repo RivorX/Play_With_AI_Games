@@ -12,9 +12,14 @@ with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
 # Hiperparametry środowiska
-GRID_SIZE = config['environment']['grid_size']
+GRID_SIZE = config['environment']['grid_size']  # Domyślna wartość, aktualizowana w train.py
 SNAKE_SIZE = config['environment']['snake_size']
 DIRECTIONS = np.array(config['environment']['directions'])
+
+# Funkcja do aktualizacji GRID_SIZE
+def set_grid_size(new_grid_size):
+    global GRID_SIZE
+    GRID_SIZE = new_grid_size
 
 class SnakeEnv(gym.Env):
     def __init__(self, render_mode=None):
@@ -58,56 +63,52 @@ class SnakeEnv(gym.Env):
         point_l = head + DIRECTIONS[(self.direction - 1) % 4]
         point_r = head + DIRECTIONS[(self.direction + 1) % 4]
         point_f = head + DIRECTIONS[self.direction]
-        point_f2 = head + 2 * DIRECTIONS[self.direction]  # Punkt 2 kratki do przodu
-        point_l2 = head + 2 * DIRECTIONS[(self.direction - 1) % 4]  # 2 kratki w lewo
-        point_r2 = head + 2 * DIRECTIONS[(self.direction + 1) % 4]  # 2 kratki w prawo
-        point_f3 = head + 3 * DIRECTIONS[self.direction]  # Punkt 3 kratki do przodu
-        point_l3 = head + 3 * DIRECTIONS[(self.direction - 1) % 4]  # 3 kratki w lewo
-        point_r3 = head + 3 * DIRECTIONS[(self.direction + 1) % 4]  # 3 kratki w prawo
+        point_f2 = head + 2 * DIRECTIONS[self.direction]
+        point_l2 = head + 2 * DIRECTIONS[(self.direction - 1) % 4]
+        point_r2 = head + 2 * DIRECTIONS[(self.direction + 1) % 4]
+        point_f3 = head + 3 * DIRECTIONS[self.direction]
+        point_l3 = head + 3 * DIRECTIONS[(self.direction - 1) % 4]
+        point_r3 = head + 3 * DIRECTIONS[(self.direction + 1) % 4]
 
         dir_l = (self.direction == 3)
         dir_r = (self.direction == 1)
         dir_u = (self.direction == 0)
         dir_d = (self.direction == 2)
 
-        # Odległość do jedzenia (Manhattan distance, znormalizowana)
         food_distance_x = (self.food[0] - head[0]) / self.grid_size
         food_distance_y = (self.food[1] - head[1]) / self.grid_size
-
-        # Znormalizowana długość węża
         snake_length = len(self.snake) / (self.grid_size ** 2)
 
-        # Mini-mapa: siatka 9x9 wokół głowy węża (81 elementów)
         mini_map = []
-        self.vision_cells = []  # Lista komórek mini-mapy do wizualizacji
-        for dy in range(-4, 5):  # Siatka 9x9
+        self.vision_cells = []
+        for dy in range(-4, 5):
             for dx in range(-4, 5):
                 x, y = head[0] + dx, head[1] + dy
-                self.vision_cells.append([x, y])  # Zapisz komórki do wizualizacji
+                self.vision_cells.append([x, y])
                 if x < 0 or x >= self.grid_size or y < 0 or y >= self.grid_size:
-                    mini_map.append(1)  # Ściana
+                    mini_map.append(1)
                 elif list([x, y]) in self.snake:
-                    mini_map.append(2)  # Ciało węża
+                    mini_map.append(2)
                 elif np.array_equal([x, y], self.food):
-                    mini_map.append(3)  # Jedzenie
+                    mini_map.append(3)
                 else:
-                    mini_map.append(0)  # Pusta kratka
+                    mini_map.append(0)
 
         state = [
-            self._is_collision(point_f),  # Kolizja przód
-            self._is_collision(point_l),  # Kolizja lewo
-            self._is_collision(point_r),  # Kolizja prawo
-            self._is_collision(point_f2),  # Kolizja 2 kratki do przodu
-            self._is_collision(point_l2),  # Kolizja 2 kratki w lewo
-            self._is_collision(point_r2),  # Kolizja 2 kratki w prawo
-            self._is_collision(point_f3),  # Kolizja 3 kratki do przodu
-            self._is_collision(point_l3),  # Kolizja 3 kratki w lewo
-            self._is_collision(point_r3),  # Kolizja 3 kratki w prawo
-            dir_l, dir_r, dir_u, dir_d,  # Kierunek
-            food_distance_x,  # Znormalizowana odległość X do jedzenia
-            food_distance_y,  # Znormalizowana odległość Y do jedzenia
-            snake_length  # Znormalizowana długość węża
-        ] + mini_map  # Dodajemy mini-mapę (9 + 4 + 2 + 1 + 81 = 97)
+            self._is_collision(point_f),
+            self._is_collision(point_l),
+            self._is_collision(point_r),
+            self._is_collision(point_f2),
+            self._is_collision(point_l2),
+            self._is_collision(point_r2),
+            self._is_collision(point_f3),
+            self._is_collision(point_l3),
+            self._is_collision(point_r3),
+            dir_l, dir_r, dir_u, dir_d,
+            food_distance_x,
+            food_distance_y,
+            snake_length
+        ] + mini_map
 
         return np.array(state, dtype=np.float32)
 
@@ -125,53 +126,46 @@ class SnakeEnv(gym.Env):
         reward = 0
         self.done = False
 
-        # Oblicz odległość do jedzenia przed i po ruchu (Manhattan distance)
         old_distance = abs(self.food[0] - self.snake[0][0]) + abs(self.food[1] - self.snake[0][1])
         new_distance = abs(self.food[0] - head[0]) + abs(self.food[1] - head[1])
 
-        # Policz puste komórki w mini-mapie
         mini_map = []
-        for dy in range(-4, 5):  # Siatka 9x9
+        for dy in range(-4, 5):
             for dx in range(-4, 5):
                 x, y = head[0] + dx, head[1] + dy
                 if x < 0 or x >= self.grid_size or y < 0 or y >= self.grid_size:
-                    mini_map.append(1)  # Ściana
+                    mini_map.append(1)
                 elif list([x, y]) in self.snake:
-                    mini_map.append(2)  # Ciało węża
+                    mini_map.append(2)
                 elif np.array_equal([x, y], self.food):
-                    mini_map.append(3)  # Jedzenie
+                    mini_map.append(3)
                 else:
-                    mini_map.append(0)  # Pusta kratka
+                    mini_map.append(0)
         empty_cells = mini_map.count(0)
-        total_cells_in_minimap = 81  # 9x9
-        reward -= 0.005 * (1 - (empty_cells / total_cells_in_minimap))  # Kara za małą liczbę pustych komórek
+        total_cells_in_minimap = 81
+        reward -= 0.005 * (1 - (empty_cells / total_cells_in_minimap))
 
         if self._is_collision(head) or self.steps > config['environment']['max_steps_factor'] * len(self.snake):
-            # Kolizja lub przekroczono maksymalną liczbę kroków
             self.done = True
             reward = -15
         else:
             self.snake.appendleft(head.tolist())
             if np.array_equal(head, self.food):
-                # Zjedzono jedzenie
                 self.food = self._place_food()
-                reward = 10  # Większa nagroda za jedzenie
+                reward = 10
                 self.steps_without_food = 0
             else:
-                # Przesunięcie węża
                 self.snake.pop()
                 self.steps_without_food += 1
-                # Nagroda za przetrwanie (im dłuższy wąż, tym mniejsza)
                 reward += 0.01 / len(self.snake)
 
-        # Dodaj karę za brak zebrania jabłka przez dłuższy czas (łagodniejsza)
         if self.steps_without_food > config['environment']['max_steps_without_food']:
-            reward -= 0.005  # Łagodniejsza kara, aby nie kończyć zbyt szybko
+            reward -= 0.005
 
         self.total_reward += reward
         if len(self.snake) == self.grid_size * self.grid_size:
             self.done = True
-            reward += 200  # Większa nagroda za wygraną
+            reward += 200
         obs = self._get_obs()
         info = {"score": len(self.snake) - 1, "total_reward": self.total_reward}
         return obs, reward, self.done, False, info
@@ -179,26 +173,17 @@ class SnakeEnv(gym.Env):
     def render(self):
         if self.render_mode != "human":
             return
-        self.screen.fill((0, 0, 0))  # Wypełnij tło czarnym kolorem
-
-        # Rysuj podświetlenie dla komórek mini-mapy (9x9 wokół głowy)
+        self.screen.fill((0, 0, 0))
         for cell in self.vision_cells:
             x, y = cell
-            # Sprawdź, czy komórka jest w granicach siatki
             if 0 <= x < self.grid_size and 0 <= y < self.grid_size:
-                # Jasny niebieski, bardziej przezroczysty (alpha=30)
-                pygame.draw.rect(self.screen, (135, 206, 250, 30),  # Jasny niebieski (sky blue) z alpha=30
+                pygame.draw.rect(self.screen, (135, 206, 250, 30),
                                  (x * SNAKE_SIZE, y * SNAKE_SIZE, SNAKE_SIZE, SNAKE_SIZE))
-
-        # Rysuj węża
         for segment in self.snake:
             pygame.draw.rect(self.screen, (0, 255, 0),
                              (segment[0] * SNAKE_SIZE, segment[1] * SNAKE_SIZE, SNAKE_SIZE, SNAKE_SIZE))
-
-        # Rysuj jedzenie
         pygame.draw.rect(self.screen, (255, 0, 0),
                          (self.food[0] * SNAKE_SIZE, self.food[1] * SNAKE_SIZE, SNAKE_SIZE, SNAKE_SIZE))
-
         pygame.display.flip()
         self.clock.tick(10)
 
