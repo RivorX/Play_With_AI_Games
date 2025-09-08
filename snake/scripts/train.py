@@ -50,9 +50,12 @@ class TrainProgressCallback(BaseCallback):
         return True
 
 # Funkcja testowania w osobnym wątku z zapisem logów i wyników do CSV
-def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progress_path):
+def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progress_path, stop_event=None):
     current_model_timestamp = 0
     while True:
+        if stop_event is not None and stop_event.is_set():
+            print("[TestThread] Otrzymano sygnał zakończenia. Kończę wątek testujący.")
+            break
         env = make_env(render_mode="human")()
         model = None
         try:
@@ -78,6 +81,10 @@ def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progr
         with open(log_path, 'a') as f:
             f.write(f"[{time.ctime()}] Rozpoczynam test z wizualizacją...\n")
         while not done:
+            if stop_event is not None and stop_event.is_set():
+                print("[TestThread] Otrzymano sygnał zakończenia w trakcie epizodu. Kończę wątek testujący.")
+                env.close()
+                return
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     done = True
@@ -181,6 +188,7 @@ def train(use_progress_bar=True):
     # Pętla curriculum
     total_timesteps = 0 if model is None else model.num_timesteps
     test_started = False
+    test_stop_event = threading.Event()
     train_progress_callback = TrainProgressCallback(os.path.join(base_dir, config['paths']['train_csv_path']))
     
     for level, (grid_size, max_steps) in enumerate(zip(curriculum_grid_sizes, curriculum_steps)):
@@ -267,10 +275,10 @@ def train(use_progress_bar=True):
                         with open(best_model_path_absolute, 'rb') as f:
                             pass
                         shutil.copy(best_model_path_absolute, model_path_absolute)
-                        best_model_backup = os.path.normpath(os.path.join(base_dir, config['paths']['best_model_backup_path']))
-                        shutil.copy(best_model_path_absolute, best_model_backup)
+                        best_model_backup_path = best_model_path_absolute + '.backup'
+                        shutil.copy(best_model_path_absolute, best_model_backup_path)
                         print(f"Zaktualizowano najlepszy model: {model_path_absolute}")
-                        print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup}")
+                        print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup_path}")
                         break
                     except PermissionError as e:
                         print(f"Próba {attempt + 1}/5: Nie udało się skopiować best_model.zip do {model_path_absolute}: {e}")
@@ -296,17 +304,19 @@ def train(use_progress_bar=True):
                 print(f"Plik {train_csv_path} nie istnieje. Pomijam generowanie wykresu.")
 
             if config['training']['enable_testing'] and not test_started:
-                threading.Thread(
+                test_thread_obj = threading.Thread(
                     target=test_thread,
                     args=(
                         model_path_absolute,
                         os.path.join(base_dir, config['paths']['test_model_path']),
                         os.path.join(base_dir, config['paths']['test_log_path']),
                         os.path.join(base_dir, config['paths']['test_csv_path']),
-                        os.path.join(base_dir, config['paths']['test_progress_path'])
+                        os.path.join(base_dir, config['paths']['test_progress_path']),
+                        test_stop_event
                     ),
                     daemon=True
-                ).start()
+                )
+                test_thread_obj.start()
                 test_started = True
 
         env.close()
@@ -371,10 +381,10 @@ def train(use_progress_bar=True):
                         with open(best_model_path_absolute, 'rb') as f:
                             pass
                         shutil.copy(best_model_path_absolute, model_path_absolute)
-                        best_model_backup = os.path.normpath(os.path.join(base_dir, config['paths']['best_model_backup_path']))
-                        shutil.copy(best_model_path_absolute, best_model_backup)
+                        best_model_backup_path = best_model_path_absolute + '.backup'
+                        shutil.copy(best_model_path_absolute, best_model_backup_path)
                         print(f"Zaktualizowano najlepszy model: {model_path_absolute}")
-                        print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup}")
+                        print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup_path}")
                         break
                     except PermissionError as e:
                         print(f"Próba {attempt + 1}/5: Nie udało się skopiować best_model.zip do {model_path_absolute}: {e}")
@@ -424,6 +434,15 @@ if __name__ == "__main__":
         train(use_progress_bar=True)
     except KeyboardInterrupt:
         print("Przerwano trening.")
-
+        # Bezpiecznie zakończ wątek testujący jeśli istnieje
+        import gc
+        test_stop_event = None
+        for obj in gc.get_objects():
+            if isinstance(obj, threading.Event) and obj.is_set() is False:
+                test_stop_event = obj
+                break
+        if test_stop_event is not None:
+            test_stop_event.set()
+            print("Wysłano sygnał zakończenia do wątku testującego.")
         exit(0)
     print("Trening zakończony! Testowanie działa w tle. Logi testowania w:", os.path.join(base_dir, config['paths']['test_log_path']))

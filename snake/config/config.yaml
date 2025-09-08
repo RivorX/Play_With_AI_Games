@@ -37,7 +37,7 @@ training:
   eval_freq: 10000                   # Częstotliwość ewaluacji
   max_no_improvement_evals: 10       # Max ewaluacji bez poprawy
   min_evals: 5                       # Min ewaluacji przed zatrzymaniem
-  enable_testing: true               # Testowanie w tle
+  enable_testing: false              # Testowanie w tle
   curriculum_multipliers: [6, 12, 18, 20]  # Mnożniki dla curriculum_steps
   curriculum_grid_sizes: [5, 8, 12, 16]  # Rozmiary siatki w curriculum
 
