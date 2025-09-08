@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pkl
+*.egg-info/
+
+# Virtual environments
+venv/
+ENV/
+.env/
+.venv/
+
+# Jupyter and IPython
+.ipynb_checkpoints/
+
+# VSCode
+.vscode/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Logs and outputs
+*.log
+*.csv
+*.png
+*.npz
+
+# Models and checkpoints
+snake/models/*.zip
+snake/models/*.npz
+
+# Training logs
+snake/logs/*
+!snake/logs/.gitkeep
+
+# Ignore all logs and results except .gitkeep (if you want to keep folder structure)
+
+# Misc
+*.swp
+*.bak
+
+# Virtual environment folders
+venv/
+.venv/
+
+logs
+__pycache__
