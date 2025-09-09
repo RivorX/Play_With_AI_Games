@@ -1,12 +1,11 @@
 # Konfiguracja środowiska Snake
 environment:
-  grid_size: 15                      # Domyślny rozmiar siatki
+  grid_size: 15                      # Domyślny max rozmiar siatki dla paddingu
   snake_size: 20                     # Rozmiar kratki w pikselach
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
   observation_space:
     low: 0                           # Minimalna wartość obserwacji
     high: 3                          # Maksymalna wartość obserwacji
-    shape: [97]                      # Kształt przestrzeni obserwacji
     dtype: float32                   # Typ danych obserwacji
   action_space:
     type: Discrete                    # Typ przestrzeni akcji
@@ -16,41 +15,44 @@ environment:
 
 # Konfiguracja modelu PPO
 model:
-  policy: MlpPolicy                  # Typ polityki
+  policy: CnnPolicy                  # Używamy CnnPolicy dla CNN
   learning_rate: 0.0003              # Szybkość uczenia
-  n_steps: 8192                      # Kroki na iterację
-  batch_size: 4096                   # Rozmiar partii
+  n_steps: 2048                      # Liczba kroków na aktualizację
+  batch_size: 64                     # Rozmiar partii
   n_epochs: 10                       # Liczba epok
-  gamma: 0.999                       # Dyskontowanie nagród
-  gae_lambda: 0.98                   # Współczynnik GAE
-  clip_range: 0.1                    # Zakres obcinania gradientów
+  gamma: 0.99                        # Współczynnik dyskontowania
+  gae_lambda: 0.95                   # Lambda dla GAE
+  clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.1                      # Współczynnik entropii
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   policy_kwargs:
-    net_arch: [1024, 512, 256]       # Architektura sieci
+    features_extractor_class: CustomCNN
+    features_extractor_kwargs:
+      features_dim: 512
+    net_arch: [256, 128]
 
 # Konfiguracja treningu
 training:
-  n_envs: 32                         # Liczba środowisk
-  total_timesteps: 1000000000        # Całkowita liczba kroków
-  eval_freq: 10000                   # Częstotliwość ewaluacji
-  max_no_improvement_evals: 10       # Max ewaluacji bez poprawy
-  min_evals: 5                       # Min ewaluacji przed zatrzymaniem
-  enable_testing: false              # Testowanie w tle
-  curriculum_multipliers: [6, 12, 18, 20]  # Mnożniki dla curriculum_steps
+  n_envs: 16                         # Liczba środowisk
+  total_timesteps: 10000000          # Całkowita liczba kroków
+  eval_freq: 5000                    # Częstotliwość ewaluacji
+  max_no_improvement_evals: 10
+  min_evals: 5
+  enable_testing: true               # Włączone dla widoczności postępów
+  curriculum_multipliers: [6, 6, 6, 6]  # Skrócone dla testowania
   curriculum_grid_sizes: [5, 8, 12, 16]  # Rozmiary siatki w curriculum
 
 # Ścieżki do zapisu
 paths:
-  models_dir: models                 # Katalog modeli
-  logs_dir: logs                     # Katalog logów
-  model_path: models/snake_ppo_model.zip  # Ścieżka modelu
-  test_model_path: models/test_model.zip  # Ścieżka modelu testowego
-  best_model_path: models/best_model.zip  # Ścieżka najlepszego modelu
-  best_model_backup_path: models/best_model_backup.zip  # Kopia zapasowa
-  train_csv_path: logs/train_progress.csv  # Plik CSV treningu
-  test_csv_path: logs/test_results.csv     # Plik CSV testów
-  test_log_path: logs/test_log.txt         # Plik logów testów
-  plot_path: logs/training_progress.png    # Wykres treningu
-  test_progress_path: logs/test_progress.png  # Wykres testów
+  models_dir: models
+  logs_dir: logs
+  model_path: models/snake_ppo_model.zip
+  test_model_path: models/test_model.zip
+  best_model_path: models/best_model.zip
+  best_model_backup_path: models/best_model_backup.zip
+  train_csv_path: logs/train_progress.csv
+  test_csv_path: logs/test_results.csv
+  test_log_path: logs/test_log.txt
+  plot_path: logs/training_progress.png
+  test_progress_path: logs/test_progress.png
