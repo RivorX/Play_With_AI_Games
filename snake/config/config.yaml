@@ -1,6 +1,6 @@
 # Konfiguracja środowiska Snake
 environment:
-  grid_size: 16                      # Domyślny max rozmiar siatki dla paddingu
+  grid_size: 16                      # Domyślny max rozmiar siatki
   snake_size: 20                     # Rozmiar kratki w pikselach
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
   observation_space:
@@ -27,17 +27,15 @@ model:
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   policy_kwargs:
-    features_extractor_class: CustomCNN
     features_extractor_kwargs:
       features_dim: 512
     net_arch: [256, 128]
-    use_sde: true                    # Włącz SDE dla lepszej eksploracji
 
 # Konfiguracja treningu
 training:
   n_envs: 16                         # Liczba środowisk
   total_timesteps: 10000000          # Całkowita liczba kroków
-  eval_freq: 5000                    # Częstotliwość ewaluacji
+  eval_freq: 1000                    # Częstotliwość ewaluacji
   max_no_improvement_evals: 10
   min_evals: 5
   enable_testing: true               # Włączone dla widoczności postępów
@@ -50,7 +48,6 @@ paths:
   logs_dir: logs
   model_path: models/snake_ppo_model.zip
   test_model_path: models/test_model.zip
-  best_model_path: models/best_model.zip
   best_model_backup_path: models/best_model_backup.zip
   train_csv_path: logs/train_progress.csv
   test_csv_path: logs/test_results.csv

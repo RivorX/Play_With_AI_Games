@@ -14,26 +14,22 @@ with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
 # Hiperparametry środowiska
-GRID_SIZE = config['environment']['grid_size']
 SNAKE_SIZE = config['environment']['snake_size']
 DIRECTIONS = np.array(config['environment']['directions'])
-
-# Domyślny max grid_size dla paddingu
-MAX_GRID_SIZE = config['environment']['grid_size']
 
 def set_grid_size(new_grid_size):
     global GRID_SIZE
     GRID_SIZE = new_grid_size
 
 class SnakeEnv(gym.Env):
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, grid_size=None):
         super(SnakeEnv, self).__init__()
-        self.grid_size = GRID_SIZE
+        self.grid_size = grid_size if grid_size is not None else config['environment']['grid_size']
         self.render_mode = render_mode
         self.observation_space = spaces.Box(
             low=0.0,
             high=9.0,
-            shape=(MAX_GRID_SIZE, MAX_GRID_SIZE, 4),  # Bazowa obserwacja: mapa, dx, dy, kierunek
+            shape=(self.grid_size, self.grid_size, 4),  # Dynamiczny rozmiar siatki
             dtype=np.float32
         )
         self.action_space = spaces.Discrete(config['environment']['action_space']['n'])
@@ -87,24 +83,12 @@ class SnakeEnv(gym.Env):
         dir_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         dir_channel[head[0], head[1]] = self.direction / 3.0  # Normalizacja
 
-        # Padding do MAX_GRID_SIZE
-        padded_state = np.zeros((MAX_GRID_SIZE, MAX_GRID_SIZE), dtype=np.float32)
-        padded_dir = np.zeros((MAX_GRID_SIZE, MAX_GRID_SIZE), dtype=np.float32)
-        padded_dir_y = np.zeros((MAX_GRID_SIZE, MAX_GRID_SIZE), dtype=np.float32)
-        padded_dir_channel = np.zeros((MAX_GRID_SIZE, MAX_GRID_SIZE), dtype=np.float32)
-        start_x = (MAX_GRID_SIZE - self.grid_size) // 2
-        start_y = (MAX_GRID_SIZE - self.grid_size) // 2
-        padded_state[start_x:start_x + self.grid_size, start_y:start_y + self.grid_size] = active_state
-        padded_dir[start_x:start_x + self.grid_size, start_y:start_y + self.grid_size] = direction_channel
-        padded_dir_y[start_x:start_x + self.grid_size, start_y:start_y + self.grid_size] = direction_channel_y
-        padded_dir_channel[start_x:start_x + self.grid_size, start_y:start_y + self.grid_size] = dir_channel
-
         # Stwórz obserwację z 4 kanałami: [mapa, dx, dy, direction]
-        obs = np.stack([padded_state, padded_dir, padded_dir_y, padded_dir_channel], axis=-1)
+        obs = np.stack([active_state, direction_channel, direction_channel_y, dir_channel], axis=-1)
         return obs
 
     def _get_render_state(self):
-        # Mapa dla renderowania (bez paddingu, tylko grid_size x grid_size)
+        # Mapa dla renderowania
         state = np.zeros((self.grid_size, self.grid_size, 3), dtype=np.float32)
         for segment in self.snake:
             state[segment[0], segment[1], 0] = 1
@@ -197,9 +181,9 @@ class SnakeEnv(gym.Env):
         if self.render_mode == "human":
             pygame.quit()
 
-def make_env(render_mode=None):
+def make_env(render_mode=None, grid_size=None):
     def _init():
-        env = SnakeEnv(render_mode=render_mode)
+        env = SnakeEnv(render_mode=render_mode, grid_size=grid_size)
         env = FrameStack(env, stack_size=4, padding_type="reset")  # Stack 4 ostatnich obserwacji
         return env
     return _init

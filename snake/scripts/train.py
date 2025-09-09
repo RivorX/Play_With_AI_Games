@@ -58,7 +58,7 @@ def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progr
             print("[TestThread] Otrzymano sygnał zakończenia. Kończę wątek testujący.")
             break
         set_grid_size(grid_size)
-        env = make_env(render_mode="human")()
+        env = make_env(render_mode="human", grid_size=grid_size)()
         model = None
         try:
             new_timestamp = os.path.getmtime(model_path)
@@ -67,10 +67,9 @@ def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progr
                     f.write(f"[{time.ctime()}] Ładuję nowy model dla grid_size={grid_size}...\n")
                 shutil.copy(model_path, test_model_path)
                 model = PPO.load(test_model_path)
-                model.ent_coef = config['model']['ent_coef']  # Ustaw nowy ent_coef
-                # Ustaw clip_range jako funkcję zwracającą stałą wartość
+                model.ent_coef = config['model']['ent_coef']
                 model.clip_range = lambda x: config['model']['clip_range']
-                model._setup_lr_schedule()  # Reset harmonogramów
+                model._setup_lr_schedule()
                 current_model_timestamp = new_timestamp
             elif model is None:
                 shutil.copy(model_path, test_model_path)
@@ -177,81 +176,24 @@ def train(use_progress_bar=True):
     model = None
     model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['model_path']))
     print(f"Sprawdzam istnienie modelu w: {model_path_absolute}")
-    if os.path.exists(model_path_absolute):
-        choice = input(f"Model {model_path_absolute} istnieje. Kontynuować trening z tego modelu? [y/n]: ").strip().lower()
-        if choice == 'y':
-            print("Ładuję istniejący model...")
-            model = PPO.load(model_path_absolute)
-            total_timesteps = model.num_timesteps
-            print(f"Załadowano model z timesteps: {total_timesteps}")
-            update_params = input("Czy chcesz załadować nowe hiperparametry z config.yaml? [y/n]: ").strip().lower()
-            if update_params == 'y':
-                model.ent_coef = config['model']['ent_coef']
-                model.clip_range = lambda x: config['model']['clip_range']  # Ustaw jako funkcja
-                model.learning_rate = config['model']['learning_rate']
-                model.gamma = config['model']['gamma']
-                model.gae_lambda = config['model']['gae_lambda']
-                model.vf_coef = config['model']['vf_coef']
-                model._setup_lr_schedule()  # Reset harmonogramów
-                print(f"Zaktualizowano hiperparametry: ent_coef={model.ent_coef}, clip_range={config['model']['clip_range']}, itd.")
-        elif choice == 'n':
-            print("Tworzę nowy model...")
-            for p in [config['paths']['model_path'], config['paths']['best_model_path'], config['paths']['test_model_path'], config['paths']['best_model_backup_path']]:
-                full_path = os.path.join(base_dir, p)
-                if os.path.exists(full_path):
-                    try:
-                        os.remove(full_path)
-                        print(f"Usunięto stary plik modelu: {full_path}")
-                    except Exception as e:
-                        print(f"Nie udało się usunąć {full_path}: {e}")
-            for p in [config['paths']['train_csv_path'], config['paths']['test_csv_path'], config['paths']['plot_path'], config['paths']['test_progress_path'], config['paths']['test_log_path']]:
-                full_path = os.path.join(base_dir, p)
-                if os.path.exists(full_path):
-                    try:
-                        os.remove(full_path)
-                        print(f"Usunięto stary plik logu/wykresu: {full_path}")
-                    except Exception as e:
-                        print(f"Nie udało się usunąć {full_path}: {e}")
-            backup_csv = os.path.join(base_dir, config['paths']['train_csv_path']) + '.backup'
-            if os.path.exists(os.path.join(base_dir, config['paths']['train_csv_path'])):
-                shutil.copy(os.path.join(base_dir, config['paths']['train_csv_path']), backup_csv)
-                print(f"Stworzono kopię zapasową CSV w {backup_csv}")
-        else:
-            print("Nieprawidłowy wybór. Kończę program.")
-            return
-    else:
-        print(f"Model {model_path_absolute} nie istnieje. Tworzę nowy model...")
-
-    # Określ początkowy poziom curriculum na podstawie total_timesteps
-    total_timesteps = 0 if model is None else model.num_timesteps
-    cumulative_steps = 0
-    start_level = 0
-    for level, max_steps in enumerate(curriculum_steps):
-        cumulative_steps += max_steps
-        if total_timesteps >= cumulative_steps:
-            start_level = level + 1
-        else:
-            break
-
-    test_thread_handle = None
+    total_timesteps = 0
+    test_started = False
     test_stop_event = threading.Event()
-    train_progress_callback = TrainProgressCallback(os.path.join(base_dir, config['paths']['train_csv_path']))
-    test_started = False  # Flaga: czy test_thread już wystartował?
-    
-    # Pętla curriculum
-    for level, (grid_size, max_steps) in enumerate(zip(curriculum_grid_sizes, curriculum_steps)):
-        if level < start_level:
-            print(f"Pomijam poziom curriculum {level + 1}: grid_size={grid_size}, max_steps={max_steps} (już wykonano)")
-            continue
-        print(f"\nRozpoczynam poziom curriculum {level + 1}: grid_size={grid_size}, max_steps={max_steps}")
-        
-        set_grid_size(grid_size)
-        # Tworzenie środowisk po każdej zmianie grid_size!
-        env = make_vec_env(make_env(render_mode=None), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
-        eval_env = make_vec_env(make_env(render_mode=None), n_envs=1, vec_env_cls=SubprocVecEnv)
 
-        print(f"Środowisko utworzone z observation_space: {env.observation_space}")
+    # Przygotuj policy_kwargs z CustomCNN
+    policy_kwargs = {
+        'features_extractor_class': CustomCNN,
+        'features_extractor_kwargs': config['model']['policy_kwargs']['features_extractor_kwargs'],
+        'net_arch': config['model']['policy_kwargs']['net_arch']
+    }
+
+    for level, (grid_size, max_steps) in enumerate(zip(curriculum_grid_sizes, curriculum_steps)):
+        print(f"\nRozpoczynam poziom curriculum {level + 1}: grid_size={grid_size}, max_steps={max_steps}")
+        set_grid_size(grid_size)
+        env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
+        eval_env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=1, vec_env_cls=SubprocVecEnv)
         
+        # Inicjalizacja modelu dla nowego poziomu curriculum
         if model is None:
             model = PPO(
                 policy=config['model']['policy'],
@@ -265,31 +207,34 @@ def train(use_progress_bar=True):
                 clip_range=config['model']['clip_range'],
                 ent_coef=config['model']['ent_coef'],
                 vf_coef=config['model']['vf_coef'],
-                verbose=1,
+                policy_kwargs=policy_kwargs,
                 device=config['model']['device'],
-                policy_kwargs={
-                    "features_extractor_class": CustomCNN,
-                    "features_extractor_kwargs": config['model']['policy_kwargs']['features_extractor_kwargs'],
-                    "net_arch": config['model']['policy_kwargs']['net_arch']
-                }
+                verbose=1
             )
         else:
+            # Aktualizacja środowiska dla istniejącego modelu
             model.set_env(env)
 
-    # Uruchamiaj test_thread dopiero po pierwszym zapisie modelu (po pierwszej epoce)
-    # test_thread uruchamiany tylko jeśli model już istnieje na dysku
-        
+        # Ustaw ścieżki dla modelu i logów
+        best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
+        print(f"[DEBUG] best_model_save_path: {best_model_save_path}")
+        if os.path.exists(best_model_save_path):
+            print(f"[DEBUG] best_model_save_path istnieje. Typ: {'katalog' if os.path.isdir(best_model_save_path) else 'plik'}")
+        else:
+            print(f"[DEBUG] best_model_save_path nie istnieje.")
+        # Ustaw log_path na osobny katalog, np. logs_dir
+        eval_log_path = os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir']))
+
+        train_progress_callback = TrainProgressCallback(os.path.join(base_dir, config['paths']['train_csv_path']))
         stop_on_plateau = StopTrainingOnNoModelImprovement(
             max_no_improvement_evals=config['training']['max_no_improvement_evals'],
             min_evals=config['training']['min_evals'],
             verbose=1
         )
-        best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
-        print(f"Ścieżka zapisu najlepszego modelu (katalog): {best_model_save_path}")
         eval_callback = EvalCallback(
             eval_env,
             best_model_save_path=best_model_save_path,
-            log_path=best_model_save_path,
+            log_path=eval_log_path,  # Logi zapisywane do logs_dir
             eval_freq=config['training']['eval_freq'],
             deterministic=True,
             render=False,
@@ -336,15 +281,16 @@ def train(use_progress_bar=True):
             except Exception as e:
                 print(f"Nie udało się stworzyć kopii zapasowej modelu: {e}")
 
-            best_model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['best_model_path']))
-            if os.path.exists(best_model_path_absolute):
+            # Sprawdź czy istnieje najlepszy model (EvalCallback zapisuje jako best_model.zip w katalogu models)
+            best_model_file_path = os.path.join(best_model_save_path, 'best_model.zip')
+            if os.path.exists(best_model_file_path):
                 for attempt in range(5):
                     try:
-                        with open(best_model_path_absolute, 'rb') as f:
+                        with open(best_model_file_path, 'rb') as f:
                             pass
-                        shutil.copy(best_model_path_absolute, model_path_absolute)
-                        best_model_backup_path = best_model_path_absolute + '.backup'
-                        shutil.copy(best_model_path_absolute, best_model_backup_path)
+                        shutil.copy(best_model_file_path, model_path_absolute)
+                        best_model_backup_path = best_model_file_path + '.backup'
+                        shutil.copy(best_model_file_path, best_model_backup_path)
                         print(f"Zaktualizowano najlepszy model: {model_path_absolute}")
                         print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup_path}")
                         break
@@ -357,7 +303,7 @@ def train(use_progress_bar=True):
                 else:
                     print(f"Nie udało się skopiować best_model.zip po 5 próbach.")
             else:
-                print(f"Plik {best_model_path_absolute} nie istnieje. Pomijam kopiowanie.")
+                print(f"Plik {best_model_file_path} nie istnieje. Pomijam kopiowanie.")
 
             train_csv_path = os.path.join(base_dir, config['paths']['train_csv_path'])
             if os.path.exists(train_csv_path):
@@ -377,10 +323,14 @@ def train(use_progress_bar=True):
     if total_timesteps < config['training']['total_timesteps']:
         print(f"\nKontynuuję trening z ostatnim grid_size={curriculum_grid_sizes[-1]} aż do {config['training']['total_timesteps']} kroków")
         set_grid_size(curriculum_grid_sizes[-1])
-        env = make_vec_env(make_env(render_mode=None), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
-        eval_env = make_vec_env(make_env(render_mode=None), n_envs=1, vec_env_cls=SubprocVecEnv)
+        env = make_vec_env(make_env(render_mode=None, grid_size=curriculum_grid_sizes[-1]), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
+        eval_env = make_vec_env(make_env(render_mode=None, grid_size=curriculum_grid_sizes[-1]), n_envs=1, vec_env_cls=SubprocVecEnv)
         model.set_env(env)
         
+        # Ustaw ścieżki dla modelu i logów
+        best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
+        eval_log_path = os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir']))
+
         stop_on_plateau = StopTrainingOnNoModelImprovement(
             max_no_improvement_evals=config['training']['max_no_improvement_evals'],
             min_evals=config['training']['min_evals'],
@@ -389,7 +339,7 @@ def train(use_progress_bar=True):
         eval_callback = EvalCallback(
             eval_env,
             best_model_save_path=best_model_save_path,
-            log_path=best_model_save_path,
+            log_path=eval_log_path,
             eval_freq=config['training']['eval_freq'],
             deterministic=True,
             render=False,
@@ -416,15 +366,16 @@ def train(use_progress_bar=True):
             except Exception as e:
                 print(f"Nie udało się stworzyć kopii zapasowej modelu: {e}")
 
-            best_model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['best_model_path']))
-            if os.path.exists(best_model_path_absolute):
+            # Sprawdź czy istnieje najlepszy model (EvalCallback zapisuje jako best_model.zip w katalogu models)
+            best_model_file_path = os.path.join(best_model_save_path, 'best_model.zip')
+            if os.path.exists(best_model_file_path):
                 for attempt in range(5):
                     try:
-                        with open(best_model_path_absolute, 'rb') as f:
+                        with open(best_model_file_path, 'rb') as f:
                             pass
-                        shutil.copy(best_model_path_absolute, model_path_absolute)
-                        best_model_backup_path = best_model_path_absolute + '.backup'
-                        shutil.copy(best_model_path_absolute, best_model_backup_path)
+                        shutil.copy(best_model_file_path, model_path_absolute)
+                        best_model_backup_path = best_model_file_path + '.backup'
+                        shutil.copy(best_model_file_path, best_model_backup_path)
                         print(f"Zaktualizowano najlepszy model: {model_path_absolute}")
                         print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup_path}")
                         break
@@ -437,7 +388,7 @@ def train(use_progress_bar=True):
                 else:
                     print(f"Nie udało się skopiować best_model.zip po 5 próbach.")
             else:
-                print(f"Plik {best_model_path_absolute} nie istnieje. Pomijam kopiowanie.")
+                print(f"Plik {best_model_file_path} nie istnieje. Pomijam kopiowanie.")
 
             train_csv_path = os.path.join(base_dir, config['paths']['train_csv_path'])
             if os.path.exists(train_csv_path):
