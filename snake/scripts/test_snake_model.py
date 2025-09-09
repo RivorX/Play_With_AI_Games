@@ -19,7 +19,7 @@ def test_snake_model(model_path, grid_size, episodes):
     set_grid_size(grid_size)
     
     # Utwórz środowisko
-    env = make_env(render_mode="human")()
+    env = make_env(render_mode="human", grid_size=grid_size)()
     
     # Załaduj model
     try:
@@ -38,7 +38,7 @@ def test_snake_model(model_path, grid_size, episodes):
         print(f"\nEpizod {episode + 1}")
 
         while not done:
-            # --- Wyświetlanie pełnej obserwacji i kanałów ---
+            # --- Wyświetlanie informacji o obserwacji ---
             # Kanały: 0-mapa, 1-dx, 2-dy, 3-kierunek
             mapa = obs[:, :, 0]
             dx_channel = obs[:, :, 1]
@@ -100,7 +100,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Testowanie modelu Snake PPO")
     parser.add_argument("--model_path", type=str, default=os.path.join(base_dir, config['paths']['model_path']), help="Ścieżka do modelu")
     parser.add_argument("--grid_size", type=int, default=config['environment']['grid_size'], help="Rozmiar siatki")
-    parser.add_argument("--episodes", type=int, default=5, help="Liczba epizodów testowych")
+    parser.add_argument("--episodes", type=int, default=2, help="Liczba epizodów testowych")
     args = parser.parse_args()
     
     test_snake_model(args.model_path, args.grid_size, args.episodes)
