@@ -1,29 +1,29 @@
 # Konfiguracja środowiska Snake
 environment:
-  grid_size: 15                      # Domyślny max rozmiar siatki dla paddingu
+  grid_size: 16                      # Domyślny max rozmiar siatki dla paddingu
   snake_size: 20                     # Rozmiar kratki w pikselach
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
   observation_space:
     low: 0                           # Minimalna wartość obserwacji
-    high: 3                          # Maksymalna wartość obserwacji
+    high: 9                          # Maksymalna wartość obserwacji
     dtype: float32                   # Typ danych obserwacji
   action_space:
     type: Discrete                    # Typ przestrzeni akcji
     n: 3                             # Liczba akcji (lewo, prosto, prawo)
-  max_steps_without_food: 100        # Max kroków bez jedzenia
+  max_steps_without_food: 80         # Max kroków bez jedzenia (zmniejszone z 100)
   max_steps_factor: 150              # Mnożnik max kroków
 
 # Konfiguracja modelu PPO
 model:
   policy: CnnPolicy                  # Używamy CnnPolicy dla CNN
-  learning_rate: 0.0003              # Szybkość uczenia
-  n_steps: 2048                      # Liczba kroków na aktualizację
+  learning_rate: 0.0003              # Szybkość uczenia (zmniejszona z 0.001)
+  n_steps: 1024                      # Liczba kroków na aktualizację (zmniejszona z 2048)
   batch_size: 64                     # Rozmiar partii
   n_epochs: 10                       # Liczba epok
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
-  clip_range: 0.2                    # Zakres obcinania PPO
-  ent_coef: 0.1                      # Współczynnik entropii
+  clip_range: 0.1                    # Zakres obcinania PPO (zmniejszony z 0.2)
+  ent_coef: 0.01                     # Współczynnik entropii (zmniejszony z 0.1)
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   policy_kwargs:
@@ -31,6 +31,7 @@ model:
     features_extractor_kwargs:
       features_dim: 512
     net_arch: [256, 128]
+    use_sde: true                    # Włącz SDE dla lepszej eksploracji
 
 # Konfiguracja treningu
 training:
@@ -40,7 +41,7 @@ training:
   max_no_improvement_evals: 10
   min_evals: 5
   enable_testing: true               # Włączone dla widoczności postępów
-  curriculum_multipliers: [6, 6, 6, 6]  # Skrócone dla testowania
+  curriculum_multipliers: [10, 10, 10, 10]  # Skrócone dla testowania
   curriculum_grid_sizes: [5, 8, 12, 16]  # Rozmiary siatki w curriculum
 
 # Ścieżki do zapisu
