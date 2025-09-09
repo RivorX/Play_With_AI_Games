@@ -233,9 +233,10 @@ def train(use_progress_bar=True):
         else:
             break
 
-    test_started = False
+    test_thread_handle = None
     test_stop_event = threading.Event()
     train_progress_callback = TrainProgressCallback(os.path.join(base_dir, config['paths']['train_csv_path']))
+    test_started = False  # Flaga: czy test_thread już wystartował?
     
     # Pętla curriculum
     for level, (grid_size, max_steps) in enumerate(zip(curriculum_grid_sizes, curriculum_steps)):
@@ -245,9 +246,10 @@ def train(use_progress_bar=True):
         print(f"\nRozpoczynam poziom curriculum {level + 1}: grid_size={grid_size}, max_steps={max_steps}")
         
         set_grid_size(grid_size)
+        # Tworzenie środowisk po każdej zmianie grid_size!
         env = make_vec_env(make_env(render_mode=None), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
         eval_env = make_vec_env(make_env(render_mode=None), n_envs=1, vec_env_cls=SubprocVecEnv)
-        
+
         print(f"Środowisko utworzone z observation_space: {env.observation_space}")
         
         if model is None:
@@ -273,6 +275,9 @@ def train(use_progress_bar=True):
             )
         else:
             model.set_env(env)
+
+    # Uruchamiaj test_thread dopiero po pierwszym zapisie modelu (po pierwszej epoce)
+    # test_thread uruchamiany tylko jeśli model już istnieje na dysku
         
         stop_on_plateau = StopTrainingOnNoModelImprovement(
             max_no_improvement_evals=config['training']['max_no_improvement_evals'],
@@ -303,6 +308,24 @@ def train(use_progress_bar=True):
             total_timesteps += steps_per_iteration
             model.save(model_path_absolute)
             print(f"Model zapisany w: {model_path_absolute}")
+
+            # Uruchom test dopiero po pierwszym zapisie modelu
+            if config['training']['enable_testing'] and not test_started:
+                test_thread_handle = threading.Thread(
+                    target=test_thread,
+                    args=(
+                        model_path_absolute,
+                        os.path.join(base_dir, config['paths']['test_model_path']),
+                        os.path.join(base_dir, config['paths']['test_log_path']),
+                        os.path.join(base_dir, config['paths']['test_csv_path']),
+                        os.path.join(base_dir, config['paths']['test_progress_path']),
+                        grid_size,
+                        test_stop_event
+                    ),
+                    daemon=True
+                )
+                test_thread_handle.start()
+                test_started = True
 
             time.sleep(5)
 
@@ -346,22 +369,6 @@ def train(use_progress_bar=True):
                     print(f"Błąd podczas generowania wykresu treningu: {e}")
             else:
                 print(f"Plik {train_csv_path} nie istnieje. Pomijam generowanie wykresu.")
-
-            if config['training']['enable_testing'] and not test_started:
-                threading.Thread(
-                    target=test_thread,
-                    args=(
-                        model_path_absolute,
-                        os.path.join(base_dir, config['paths']['test_model_path']),
-                        os.path.join(base_dir, config['paths']['test_log_path']),
-                        os.path.join(base_dir, config['paths']['test_csv_path']),
-                        os.path.join(base_dir, config['paths']['test_progress_path']),
-                        grid_size,
-                        test_stop_event
-                    ),
-                    daemon=True
-                ).start()
-                test_started = True
 
         env.close()
         eval_env.close()
