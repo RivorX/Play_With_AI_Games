@@ -4,7 +4,7 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 class CustomCNN(BaseFeaturesExtractor):
     """
-    Niestandardowa sieć CNN do ekstrakcji cech z mapy gry o dowolnym rozmiarze.
+    Niestandardowa sieć CNN do ekstrakcji cech z mapy gry o zmiennym rozmiarze.
     Wejście: (batch_size, stack_size, grid_size, grid_size, channels) - mapa z 4 ramkami x 4 kanałami.
     Wyjście: wektor cech o wymiarze features_dim.
     """
@@ -19,13 +19,12 @@ class CustomCNN(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4, 4)),  # Redukuje do 4x4
+            nn.AdaptiveAvgPool2d((4, 4)),  # Redukuje do 4x4 niezależnie od rozmiaru wejścia
             nn.Flatten(),
         )
         # Oblicz wymiar po flatten
         with torch.no_grad():
             sample = torch.as_tensor(observation_space.sample()[None]).float()
-            # Symuluj forward
             processed = self._process_sample(sample)
             n_flatten = self.cnn(processed).shape[1]
         self.linear = nn.Sequential(
