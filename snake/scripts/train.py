@@ -1,3 +1,6 @@
+# Globalne zmienne do obsługi wątku testowego
+test_stop_event = None
+test_thread_handle = None
 import os
 import time
 import threading
@@ -157,6 +160,7 @@ def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progr
         time.sleep(1)
 
 def train(use_progress_bar=True):
+    global test_stop_event, test_thread_handle
     # Utwórz katalogi
     models_dir = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
     logs_dir = os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir']))
@@ -217,11 +221,6 @@ def train(use_progress_bar=True):
 
         # Ustaw ścieżki dla modelu i logów
         best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
-        print(f"[DEBUG] best_model_save_path: {best_model_save_path}")
-        if os.path.exists(best_model_save_path):
-            print(f"[DEBUG] best_model_save_path istnieje. Typ: {'katalog' if os.path.isdir(best_model_save_path) else 'plik'}")
-        else:
-            print(f"[DEBUG] best_model_save_path nie istnieje.")
         # Ustaw log_path na osobny katalog, np. logs_dir
         eval_log_path = os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir']))
 
@@ -402,7 +401,7 @@ def train(use_progress_bar=True):
                 print(f"Plik {train_csv_path} nie istnieje. Pomijam generowanie wykresu.")
 
             if config['training']['enable_testing'] and not test_started:
-                threading.Thread(
+                test_thread_handle = threading.Thread(
                     target=test_thread,
                     args=(
                         model_path_absolute,
@@ -414,7 +413,8 @@ def train(use_progress_bar=True):
                         test_stop_event
                     ),
                     daemon=True
-                ).start()
+                )
+                test_thread_handle.start()
                 test_started = True
 
         env.close()
@@ -428,19 +428,20 @@ if __name__ == "__main__":
         train(use_progress_bar=True)
     except KeyboardInterrupt:
         print("Przerwano trening.")
-        import gc
-        test_stop_event = None
-        for obj in gc.get_objects():
-            if isinstance(obj, threading.Event) and obj.is_set() is False:
-                test_stop_event = obj
-                break
         if test_stop_event is not None:
             test_stop_event.set()
             print("Wysłano sygnał zakończenia do wątku testującego.")
+            if test_thread_handle is not None:
+                test_thread_handle.join(timeout=10)
+                print("Wątek testujący zakończony.")
         sys.exit(0)
     except Exception as e:
         print(f"Błąd podczas treningu: {e}")
         import traceback
         traceback.print_exc()
+        if test_stop_event is not None:
+            test_stop_event.set()
+            if test_thread_handle is not None:
+                test_thread_handle.join(timeout=10)
         sys.exit(1)
     print("Trening zakończony! Testowanie działa w tle. Logi testowania w:", os.path.join(base_dir, config['paths']['test_log_path']))
