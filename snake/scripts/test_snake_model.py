@@ -36,35 +36,64 @@ def test_snake_model(model_path, grid_size, episodes):
         total_reward = 0
         steps = 0
         print(f"\nEpizod {episode + 1}")
-        
+
         while not done:
-            # Oblicz odległość Manhattan od głowy węża do jedzenia
-            head = obs[obs[:, :, 0] == 2]  # Głowa węża (wartość 2 w kanale 0)
-            if len(head) > 0:
-                head_pos = np.where(obs[:, :, 0] == 2)
+            # --- Wyświetlanie pełnej obserwacji i kanałów ---
+            # Kanały: 0-mapa, 1-dx, 2-dy, 3-kierunek
+            mapa = obs[:, :, 0]
+            dx_channel = obs[:, :, 1]
+            dy_channel = obs[:, :, 2]
+            dir_channel = obs[:, :, 3]
+
+            # Pozycja głowy (wartość 9 w kanale 0), pozycja jedzenia (wartość 2)
+            head_pos = np.where(mapa == 9)
+            food_pos = np.where(mapa == 2)
+            if len(head_pos[0]) > 0:
                 head_x, head_y = head_pos[0][0], head_pos[1][0]
-                food_pos = np.where(obs[:, :, 0] == 3)  # Jedzenie (wartość 3)
+            else:
+                head_x, head_y = -1, -1
+            if len(food_pos[0]) > 0:
                 food_x, food_y = food_pos[0][0], food_pos[1][0]
+            else:
+                food_x, food_y = -1, -1
+
+            # Wektor ruchu do jedzenia (dx, dy z kanałów w pozycji głowy)
+            dx = dx_channel[head_x, head_y] if head_x >= 0 else None
+            dy = dy_channel[head_x, head_y] if head_x >= 0 else None
+            kierunek = dir_channel[head_x, head_y] if head_x >= 0 else None
+
+            # Odległość Manhattan
+            if head_x >= 0 and food_x >= 0:
                 distance = abs(head_x - food_x) + abs(head_y - food_y)
             else:
-                distance = float('inf')  # W razie błędu (brak głowy)
-            
+                distance = float('inf')
+
+            # Wyświetl fragmenty obserwacji
+            print("--- Obserwacja (fragment) ---")
+            print("Kanał 0 (mapa):\n", np.array_str(mapa, precision=1, suppress_small=True, max_line_width=120))
+            print("Kanał 1 (dx):\n", np.array_str(dx_channel, precision=2, suppress_small=True, max_line_width=120))
+            print("Kanał 2 (dy):\n", np.array_str(dy_channel, precision=2, suppress_small=True, max_line_width=120))
+            print("Kanał 3 (kierunek):\n", np.array_str(dir_channel, precision=2, suppress_small=True, max_line_width=120))
+            print(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
+            print(f"Wektor do jedzenia: dx={dx}, dy={dy} | Kierunek węża (0-lewo,1-dół,2-prawo,3-góra): {kierunek}")
+
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, truncated, info = env.step(action)
             total_reward += reward
             steps += 1
             env.render()
-            
+
             # Wyświetl krok, wynik, nagrodę i odległość
             print(f"Krok: {steps}, Wynik: {info['score']}, Nagroda: {total_reward}, Odległość: {distance}")
-            
+            print("-" * 60)
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     done = True
             pygame.time.wait(50)
-        
+
         print(f"Epizod {episode + 1} zakończony. Wynik: {info['score']}, Całkowita nagroda: {total_reward}, Kroki: {steps}")
-    
+
     env.close()
 
 if __name__ == "__main__":
