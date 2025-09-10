@@ -7,9 +7,22 @@ from stable_baselines3 import PPO
 import gymnasium as gym
 from model import make_env, set_grid_size
 import yaml
+import logging
+
+# Konfiguracja logowania
+base_dir = os.path.dirname(os.path.dirname(__file__))
+log_dir = os.path.join(base_dir, 'logs')
+os.makedirs(log_dir, exist_ok=True)
+debug_log_path = os.path.join(log_dir, 'debug.log')
+
+logging.basicConfig(
+    filename=debug_log_path,
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    filemode='a'
+)
 
 # Wczytaj konfigurację
-base_dir = os.path.dirname(os.path.dirname(__file__))
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
@@ -24,9 +37,9 @@ def test_snake_model(model_path, grid_size, episodes):
     # Załaduj model
     try:
         model = PPO.load(model_path)
-        print(f"Załadowano model z: {model_path}")
+        logging.info(f"Załadowano model z: {model_path}")
     except Exception as e:
-        print(f"Błąd podczas ładowania modelu: {e}")
+        logging.error(f"Błąd podczas ładowania modelu: {e}")
         return
     
     # Testowanie
@@ -35,19 +48,23 @@ def test_snake_model(model_path, grid_size, episodes):
         done = False
         total_reward = 0
         steps = 0
-        print(f"\nEpizod {episode + 1}")
+        logging.info(f"\nEpizod {episode + 1}")
 
         while not done:
-            # --- Wyświetlanie informacji o obserwacji ---
-            # Kanały: 0-mapa, 1-dx, 2-dy, 3-kierunek
-            mapa = obs[:, :, 0]
-            dx_channel = obs[:, :, 1]
-            dy_channel = obs[:, :, 2]
-            dir_channel = obs[:, :, 3]
+            # Wybierz najnowszą ramkę z FrameStack (indeks 0)
+            latest_frame = obs[0]  # shape: (height, width, channels)
 
-            # Pozycja głowy (wartość 9 w kanale 0), pozycja jedzenia (wartość 2)
-            head_pos = np.where(mapa == 9)
-            food_pos = np.where(mapa == 2)
+            # Wyodrębnij kanały z najnowszej ramki
+            mapa = latest_frame[:, :, 0]  # Kanał 0: mapa
+            dx_channel = latest_frame[:, :, 1]  # Kanał 1: dx
+            dy_channel = latest_frame[:, :, 2]  # Kanał 2: dy
+            dir_channel = latest_frame[:, :, 3]  # Kanał 3: kierunek
+            size_channel = latest_frame[:, :, 4]  # Kanał 4: grid_size
+            distance_channel = latest_frame[:, :, 5] if latest_frame.shape[-1] > 5 else None  # Kanał 5: odległość
+
+            # Znajdź pozycję głowy i jedzenia w mapie
+            head_pos = np.where(mapa == 1.0)
+            food_pos = np.where(mapa == 0.75)
             if len(head_pos[0]) > 0:
                 head_x, head_y = head_pos[0][0], head_pos[1][0]
             else:
@@ -57,42 +74,47 @@ def test_snake_model(model_path, grid_size, episodes):
             else:
                 food_x, food_y = -1, -1
 
-            # Wektor ruchu do jedzenia (dx, dy z kanałów w pozycji głowy)
+            # Wyodrębnij wartości dx, dy, kierunek w pozycji głowy
             dx = dx_channel[head_x, head_y] if head_x >= 0 else None
             dy = dy_channel[head_x, head_y] if head_x >= 0 else None
             kierunek = dir_channel[head_x, head_y] if head_x >= 0 else None
 
-            # Odległość Manhattan
+            # Oblicz odległość Manhattan
             if head_x >= 0 and food_x >= 0:
                 distance = abs(head_x - food_x) + abs(head_y - food_y)
             else:
                 distance = float('inf')
 
-            # Wyświetl fragmenty obserwacji
-            print("--- Obserwacja (fragment) ---")
-            print("Kanał 0 (mapa):\n", np.array_str(mapa, precision=1, suppress_small=True, max_line_width=120))
-            print("Kanał 1 (dx):\n", np.array_str(dx_channel, precision=2, suppress_small=True, max_line_width=120))
-            print("Kanał 2 (dy):\n", np.array_str(dy_channel, precision=2, suppress_small=True, max_line_width=120))
-            print("Kanał 3 (kierunek):\n", np.array_str(dir_channel, precision=2, suppress_small=True, max_line_width=120))
-            print(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
-            print(f"Wektor do jedzenia: dx={dx}, dy={dy} | Kierunek węża (0-lewo,1-dół,2-prawo,3-góra): {kierunek}")
+            # Zapisz informacje debugowania do pliku
+            logging.info("--- Obserwacja (fragment) ---")
+            logging.info(f"Kanał 0 (mapa):\n{np.array_str(mapa, precision=1, suppress_small=True, max_line_width=120)}")
+            logging.info(f"Kanał 1 (dx):\n{np.array_str(dx_channel, precision=2, suppress_small=True, max_line_width=120)}")
+            logging.info(f"Kanał 2 (dy):\n{np.array_str(dy_channel, precision=2, suppress_small=True, max_line_width=120)}")
+            logging.info(f"Kanał 3 (kierunek):\n{np.array_str(dir_channel, precision=2, suppress_small=True, max_line_width=120)}")
+            logging.info(f"Kanał 4 (grid_size):\n{np.array_str(size_channel, precision=2, suppress_small=True, max_line_width=120)}")
+            if distance_channel is not None:
+                logging.info(f"Kanał 5 (odległość Manhattan):\n{np.array_str(distance_channel, precision=2, suppress_small=True, max_line_width=120)}")
+            logging.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
+            logging.info(f"Wektor do jedzenia: dx={dx}, dy={dy} | Kierunek węża (0-lewo,1-dół,2-prawo,3-góra): {kierunek}")
+            logging.info(f"Stan gry: done={done}, steps={steps}, snake={env.env.snake}, food={env.env.food}")
 
+            # Wykonaj akcję
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, truncated, info = env.step(action)
             total_reward += reward
             steps += 1
             env.render()
 
-            # Wyświetl krok, wynik, nagrodę i odległość
-            print(f"Krok: {steps}, Wynik: {info['score']}, Nagroda: {total_reward}, Odległość: {distance}")
-            print("-" * 60)
+            logging.info(f"Krok: {steps}, Wynik: {info['score']}, Nagroda: {total_reward}, Odległość: {distance}")
+            logging.info("-" * 60)
 
+            # Obsługa zdarzeń Pygame
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     done = True
             pygame.time.wait(50)
 
-        print(f"Epizod {episode + 1} zakończony. Wynik: {info['score']}, Całkowita nagroda: {total_reward}, Kroki: {steps}")
+        logging.info(f"Epizod {episode + 1} zakończony. Wynik: {info['score']}, Całkowita nagroda: {total_reward}, Kroki: {steps}")
 
     env.close()
 

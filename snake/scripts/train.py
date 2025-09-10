@@ -1,6 +1,3 @@
-# Globalne zmienne do obsługi wątku testowego
-test_stop_event = None
-test_thread_handle = None
 import os
 import time
 import threading
@@ -41,13 +38,14 @@ class TrainProgressCallback(BaseCallback):
             if self.num_timesteps - self.last_logged >= 1000:
                 ep_rew_mean = self.model.ep_info_buffer and np.mean([ep_info['r'] for ep_info in self.model.ep_info_buffer]) or None
                 ep_len_mean = self.model.ep_info_buffer and np.mean([ep_info['l'] for ep_info in self.model.ep_info_buffer]) or None
+                grid_size = self.training_env.get_attr('grid_size')[0]
                 try:
                     write_header = not os.path.exists(self.csv_path)
                     with open(self.csv_path, 'a', newline='') as csvfile:
                         writer = csv.writer(csvfile)
                         if write_header:
-                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length'])
-                        writer.writerow([self.num_timesteps, ep_rew_mean, ep_len_mean])
+                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length', 'grid_size'])
+                        writer.writerow([self.num_timesteps, ep_rew_mean, ep_len_mean, grid_size])
                     self.last_logged = self.num_timesteps
                 except Exception as e:
                     print(f"Błąd zapisu train_progress.csv: {e}")
@@ -110,36 +108,35 @@ def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progr
                 obs, reward, done, truncated, info = env.step(action)
                 env.render()
                 with open(log_path, 'a') as f:
-                    f.write(f"[{time.ctime()}] Wynik: {info['score']}, Nagroda: {info['total_reward']}\n")
+                    f.write(f"[{time.ctime()}] Wynik: {info['score']}, Nagroda: {info['total_reward']}, Grid_size: {info['grid_size']}\n")
                 write_header = not os.path.exists(test_csv_path)
                 try:
                     with open(test_csv_path, 'a', newline='') as csvfile:
                         writer = csv.writer(csvfile)
                         if write_header:
-                            writer.writerow(['timestamp', 'score', 'total_reward'])
-                        writer.writerow([time.time(), info['score'], info['total_reward']])
+                            writer.writerow(['timestamp', 'score', 'total_reward', 'grid_size'])
+                        writer.writerow([time.time(), info['score'], info['total_reward'], info['grid_size']])
                 except Exception:
                     with open(log_path, 'a') as f:
                         f.write(f"[{time.ctime()}] Błąd zapisu do CSV testów.\n")
                 try:
-                    timestamps, scores, rewards = [], [], []
+                    timestamps, scores, rewards, grid_sizes_data = [], [], [], []
                     with open(test_csv_path, 'r') as csvfile:
                         reader = csv.reader(csvfile)
                         header = next(reader, None)
                         for row in reader:
-                            if len(row) >= 3:
+                            if len(row) >= 4:
                                 timestamps.append(float(row[0]))
                                 scores.append(float(row[1]))
                                 rewards.append(float(row[2]))
+                                grid_sizes_data.append(float(row[3]))
                     if scores:
                         episodes = list(range(1, len(scores) + 1))
                         plt.figure(figsize=(8, 4))
-                        plt.plot(episodes, scores, label='score', alpha=0.6)
-                        plt.plot(episodes, rewards, label='total_reward', alpha=0.6)
-                        window = max(1, min(50, len(scores)//10))
-                        if window > 1:
-                            ma = np.convolve(scores, np.ones(window)/window, mode='valid')
-                            plt.plot(range(window, len(scores)+1), ma, label=f'score_ma({window})', color='red')
+                        for gs in set(grid_sizes_data):
+                            indices = [i for i, g in enumerate(grid_sizes_data) if g == gs]
+                            plt.plot([episodes[i] for i in indices], [scores[i] for i in indices], label=f'score (grid_size={int(gs)})', alpha=0.6)
+                            plt.plot([episodes[i] for i in indices], [rewards[i] for i in indices], label=f'reward (grid_size={int(gs)})', alpha=0.6, linestyle='--')
                         plt.xlabel('episode')
                         plt.ylabel('value')
                         plt.legend()
@@ -198,33 +195,11 @@ def train(use_progress_bar=True):
         eval_env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=1, vec_env_cls=SubprocVecEnv)
         
         # Inicjalizacja modelu dla nowego poziomu curriculum
-        if model is None:
-            model = PPO(
-                policy=config['model']['policy'],
-                env=env,
-                learning_rate=config['model']['learning_rate'],
-                n_steps=config['model']['n_steps'],
-                batch_size=config['model']['batch_size'],
-                n_epochs=config['model']['n_epochs'],
-                gamma=config['model']['gamma'],
-                gae_lambda=config['model']['gae_lambda'],
-                clip_range=config['model']['clip_range'],
-                ent_coef=config['model']['ent_coef'],
-                vf_coef=config['model']['vf_coef'],
-                policy_kwargs=policy_kwargs,
-                device=config['model']['device'],
-                verbose=1
-            )
-        else:
-            # Aktualizacja środowiska dla istniejącego modelu
-            model.set_env(env)
-
-        # Ustaw ścieżki dla modelu i logów
+        train_csv_path = os.path.join(base_dir, config['paths']['train_csv_path'])
+        train_progress_callback = TrainProgressCallback(train_csv_path)
         best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
-        # Ustaw log_path na osobny katalog, np. logs_dir
         eval_log_path = os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir']))
 
-        train_progress_callback = TrainProgressCallback(os.path.join(base_dir, config['paths']['train_csv_path']))
         stop_on_plateau = StopTrainingOnNoModelImprovement(
             max_no_improvement_evals=config['training']['max_no_improvement_evals'],
             min_evals=config['training']['min_evals'],
@@ -233,87 +208,107 @@ def train(use_progress_bar=True):
         eval_callback = EvalCallback(
             eval_env,
             best_model_save_path=best_model_save_path,
-            log_path=eval_log_path,  # Logi zapisywane do logs_dir
+            log_path=eval_log_path,
             eval_freq=config['training']['eval_freq'],
             deterministic=True,
             render=False,
             callback_after_eval=stop_on_plateau
         )
 
-        level_timesteps = 0
-        while level_timesteps < max_steps and total_timesteps < config['training']['total_timesteps']:
-            model.learn(
-                total_timesteps=steps_per_iteration,
-                reset_num_timesteps=False,
-                callback=[eval_callback, train_progress_callback],
-                progress_bar=use_progress_bar
-            )
-            level_timesteps += steps_per_iteration
-            total_timesteps += steps_per_iteration
-            model.save(model_path_absolute)
-            print(f"Model zapisany w: {model_path_absolute}")
-
-            # Uruchom test dopiero po pierwszym zapisie modelu
-            if config['training']['enable_testing'] and not test_started:
-                test_thread_handle = threading.Thread(
-                    target=test_thread,
-                    args=(
-                        model_path_absolute,
-                        os.path.join(base_dir, config['paths']['test_model_path']),
-                        os.path.join(base_dir, config['paths']['test_log_path']),
-                        os.path.join(base_dir, config['paths']['test_csv_path']),
-                        os.path.join(base_dir, config['paths']['test_progress_path']),
-                        grid_size,
-                        test_stop_event
-                    ),
-                    daemon=True
-                )
-                test_thread_handle.start()
-                test_started = True
-
-            time.sleep(5)
-
-            backup_model = model_path_absolute + '.backup'
+        if model is None:
             try:
-                shutil.copy(model_path_absolute, backup_model)
-                print(f"Stworzono kopię zapasową modelu w {backup_model}")
-            except Exception as e:
-                print(f"Nie udało się stworzyć kopii zapasowej modelu: {e}")
+                model = PPO.load(model_path_absolute, env=env)
+                print(f"Załadowano istniejący model z: {model_path_absolute}")
+            except FileNotFoundError:
+                print(f"Model nie istnieje, tworzę nowy model.")
+                model = PPO(
+                    config['model']['policy'],
+                    env,
+                    learning_rate=config['model']['learning_rate'],
+                    n_steps=config['model']['n_steps'],
+                    batch_size=config['model']['batch_size'],
+                    n_epochs=config['model']['n_epochs'],
+                    gamma=config['model']['gamma'],
+                    gae_lambda=config['model']['gae_lambda'],
+                    clip_range=config['model']['clip_range'],
+                    ent_coef=config['model']['ent_coef'],
+                    vf_coef=config['model']['vf_coef'],
+                    policy_kwargs=policy_kwargs,
+                    device=config['model']['device'],
+                    verbose=1
+                )
+        else:
+            model.set_env(env)
 
-            # Sprawdź czy istnieje najlepszy model (EvalCallback zapisuje jako best_model.zip w katalogu models)
-            best_model_file_path = os.path.join(best_model_save_path, 'best_model.zip')
-            if os.path.exists(best_model_file_path):
-                for attempt in range(5):
-                    try:
-                        with open(best_model_file_path, 'rb') as f:
-                            pass
-                        shutil.copy(best_model_file_path, model_path_absolute)
-                        best_model_backup_path = best_model_file_path + '.backup'
-                        shutil.copy(best_model_file_path, best_model_backup_path)
-                        print(f"Zaktualizowano najlepszy model: {model_path_absolute}")
-                        print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup_path}")
-                        break
-                    except PermissionError as e:
-                        print(f"Próba {attempt + 1}/5: Nie udało się skopiować best_model.zip: {e}")
-                        time.sleep(3)
-                    except Exception as e:
-                        print(f"Nie udało się skopiować best_model.zip: {e}")
-                        break
-                else:
-                    print(f"Nie udało się skopiować best_model.zip po 5 próbach.")
-            else:
-                print(f"Plik {best_model_file_path} nie istnieje. Pomijam kopiowanie.")
+        model.learn(
+            total_timesteps=max_steps,
+            reset_num_timesteps=False,
+            callback=[eval_callback, train_progress_callback],
+            progress_bar=use_progress_bar
+        )
+        total_timesteps += max_steps
+        model.save(model_path_absolute)
+        print(f"Model zapisany w: {model_path_absolute}")
 
-            train_csv_path = os.path.join(base_dir, config['paths']['train_csv_path'])
-            if os.path.exists(train_csv_path):
+        if config['training']['enable_testing'] and not test_started:
+            test_thread_handle = threading.Thread(
+                target=test_thread,
+                args=(
+                    model_path_absolute,
+                    os.path.join(base_dir, config['paths']['test_model_path']),
+                    os.path.join(base_dir, config['paths']['test_log_path']),
+                    os.path.join(base_dir, config['paths']['test_csv_path']),
+                    os.path.join(base_dir, config['paths']['test_progress_path']),
+                    grid_size,
+                    test_stop_event
+                ),
+                daemon=True
+            )
+            test_thread_handle.start()
+            test_started = True
+
+        time.sleep(5)
+
+        backup_model = model_path_absolute + '.backup'
+        try:
+            shutil.copy(model_path_absolute, backup_model)
+            print(f"Stworzono kopię zapasową modelu w {backup_model}")
+        except Exception as e:
+            print(f"Nie udało się stworzyć kopii zapasowej modelu: {e}")
+
+        best_model_file_path = os.path.join(best_model_save_path, 'best_model.zip')
+        if os.path.exists(best_model_file_path):
+            for attempt in range(5):
                 try:
-                    train_plot_script = os.path.join(os.path.dirname(__file__), 'plot_train_progress.py')
-                    subprocess.run([sys.executable, train_plot_script], check=True)
-                    print(f"Wygenerowano wykres treningu: {os.path.join(base_dir, config['paths']['plot_path'])}")
+                    with open(best_model_file_path, 'rb') as f:
+                        pass
+                    shutil.copy(best_model_file_path, model_path_absolute)
+                    best_model_backup_path = best_model_file_path + '.backup'
+                    shutil.copy(best_model_file_path, best_model_backup_path)
+                    print(f"Zaktualizowano najlepszy model: {model_path_absolute}")
+                    print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup_path}")
+                    break
+                except PermissionError as e:
+                    print(f"Próba {attempt + 1}/5: Nie udało się skopiować best_model.zip: {e}")
+                    time.sleep(3)
                 except Exception as e:
-                    print(f"Błąd podczas generowania wykresu treningu: {e}")
+                    print(f"Nie udało się skopiować best_model.zip: {e}")
+                    break
             else:
-                print(f"Plik {train_csv_path} nie istnieje. Pomijam generowanie wykresu.")
+                print(f"Nie udało się skopiować best_model.zip po 5 próbach.")
+        else:
+            print(f"Plik {best_model_file_path} nie istnieje. Pomijam kopiowanie.")
+
+        train_csv_path = os.path.join(base_dir, config['paths']['train_csv_path'])
+        if os.path.exists(train_csv_path):
+            try:
+                train_plot_script = os.path.join(os.path.dirname(__file__), 'plot_train_progress.py')
+                subprocess.run([sys.executable, train_plot_script], check=True)
+                print(f"Wygenerowano wykres treningu: {os.path.join(base_dir, config['paths']['plot_path'])}")
+            except Exception as e:
+                print(f"Błąd podczas generowania wykresu treningu: {e}")
+        else:
+            print(f"Plik {train_csv_path} nie istnieje. Pomijam generowanie wykresu.")
 
         env.close()
         eval_env.close()
@@ -326,7 +321,6 @@ def train(use_progress_bar=True):
         eval_env = make_vec_env(make_env(render_mode=None, grid_size=curriculum_grid_sizes[-1]), n_envs=1, vec_env_cls=SubprocVecEnv)
         model.set_env(env)
         
-        # Ustaw ścieżki dla modelu i logów
         best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
         eval_log_path = os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir']))
 
@@ -365,7 +359,6 @@ def train(use_progress_bar=True):
             except Exception as e:
                 print(f"Nie udało się stworzyć kopii zapasowej modelu: {e}")
 
-            # Sprawdź czy istnieje najlepszy model (EvalCallback zapisuje jako best_model.zip w katalogu models)
             best_model_file_path = os.path.join(best_model_save_path, 'best_model.zip')
             if os.path.exists(best_model_file_path):
                 for attempt in range(5):
@@ -399,23 +392,6 @@ def train(use_progress_bar=True):
                     print(f"Błąd podczas generowania wykresu treningu: {e}")
             else:
                 print(f"Plik {train_csv_path} nie istnieje. Pomijam generowanie wykresu.")
-
-            if config['training']['enable_testing'] and not test_started:
-                test_thread_handle = threading.Thread(
-                    target=test_thread,
-                    args=(
-                        model_path_absolute,
-                        os.path.join(base_dir, config['paths']['test_model_path']),
-                        os.path.join(base_dir, config['paths']['test_log_path']),
-                        os.path.join(base_dir, config['paths']['test_csv_path']),
-                        os.path.join(base_dir, config['paths']['test_progress_path']),
-                        curriculum_grid_sizes[-1],
-                        test_stop_event
-                    ),
-                    daemon=True
-                )
-                test_thread_handle.start()
-                test_started = True
 
         env.close()
         eval_env.close()
