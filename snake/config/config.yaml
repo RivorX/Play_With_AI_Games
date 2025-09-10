@@ -39,7 +39,7 @@ training:
   max_no_improvement_evals: 10
   min_evals: 5
   enable_testing: true               # Włączone dla widoczności postępów
-  curriculum_multipliers: [4, 30, 30, 30]  # Zwiększone dla lepszego uczenia
+  curriculum_multipliers: [30, 30, 30, 30]  # Zwiększone dla lepszego uczenia
   curriculum_grid_sizes: [5, 8, 12, 16]  # Rozmiary siatki w curriculum
 
 # Ścieżki do zapisu

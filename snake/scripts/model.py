@@ -28,11 +28,11 @@ class SnakeEnv(gym.Env):
         super(SnakeEnv, self).__init__()
         self.grid_size = grid_size if grid_size is not None else config['environment']['grid_size']
         self.render_mode = render_mode
-        # Stała przestrzeń obserwacji: 4 ramki x 16x16 x 6 kanałów (dodano kanał odległości)
+        # Stała przestrzeń obserwacji: 4 ramki x 16x16 x 6 kanałów
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 6),  # 6 kanałów: mapa, dx, dy, kierunek, grid_size, odległość
+            shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 6),
             dtype=np.float32
         )
         self.action_space = spaces.Discrete(config['environment']['action_space']['n'])
@@ -45,8 +45,8 @@ class SnakeEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.snake = collections.deque([[self.grid_size // 2, self.grid_size // 2]])  # Wąż: 1 kratka
-        self.direction = 1
+        self.snake = collections.deque([[self.grid_size // 2, self.grid_size // 2]])
+        self.direction = 1  # Domyślny kierunek: dół
         self.food = self._place_food()
         self.done = False
         self.steps = 0
@@ -55,7 +55,8 @@ class SnakeEnv(gym.Env):
         if self.render_mode == "human":
             self.screen = pygame.display.set_mode((self.grid_size * SNAKE_SIZE, self.grid_size * SNAKE_SIZE))
             pygame.display.set_caption("Snake")
-        return self._get_obs(), {}
+        obs = self._get_obs()
+        return obs, {}
 
     def _place_food(self):
         while True:
@@ -68,56 +69,84 @@ class SnakeEnv(gym.Env):
         active_state = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         for segment in list(self.snake)[1:]:
             if 0 <= segment[0] < self.grid_size and 0 <= segment[1] < self.grid_size:
-                active_state[segment[0], segment[1]] = 0.5  # ciało
+                active_state[segment[0], segment[1]] = 0.5
         if 0 <= self.food[0] < self.grid_size and 0 <= self.food[1] < self.grid_size:
-            active_state[self.food[0], self.food[1]] = 0.75  # jabłko
+            active_state[self.food[0], self.food[1]] = 0.75
         head = self.snake[0]
         if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
-            active_state[head[0], head[1]] = 1.0  # głowa
-
-        # Przeskaluj mapę do FIXED_OBS_SIZE x FIXED_OBS_SIZE
+            active_state[head[0], head[1]] = 1.0
+        else:
+            print(f"Warning: Invalid head position: {head}")
         zoom_factor = FIXED_OBS_SIZE / self.grid_size
-        active_state = zoom(active_state, zoom_factor, order=1)
+        active_state = zoom(active_state, zoom_factor, order=0)
 
         # Kanał 1: znormalizowany dx do jabłka
         direction_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        dx = 0.0
         if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
             dx = (self.food[0] - head[0]) / max(1, self.grid_size - 1)
             direction_channel[head[0], head[1]] = dx
-        direction_channel = zoom(direction_channel, zoom_factor, order=1)
+        else:
+            print(f"Warning: Invalid head position for dx: {head}")
+        direction_channel_pre_zoom = direction_channel.copy()
+        if self.grid_size == FIXED_OBS_SIZE:
+            direction_channel = direction_channel
+        else:
+            direction_channel = zoom(direction_channel, zoom_factor, order=0)
 
         # Kanał 2: znormalizowany dy
         direction_channel_y = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        dy = 0.0
         if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
             dy = (self.food[1] - head[1]) / max(1, self.grid_size - 1)
             direction_channel_y[head[0], head[1]] = dy
-        direction_channel_y = zoom(direction_channel_y, zoom_factor, order=1)
+        else:
+            print(f"Warning: Invalid head position for dy: {head}")
+        direction_channel_y_pre_zoom = direction_channel_y.copy()
+        if self.grid_size == FIXED_OBS_SIZE:
+            direction_channel_y = direction_channel_y
+        else:
+            direction_channel_y = zoom(direction_channel_y, zoom_factor, order=0)
 
         # Kanał 3: znormalizowany kierunek węża
         dir_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
-            dir_channel[head[0], head[1]] = self.direction / 3.0
-        dir_channel = zoom(dir_channel, zoom_factor, order=1)
+            dir_value = (self.direction + 1) / 4.0  # Mapuje 0->0.25, 1->0.5, 2->0.75, 3->1.0
+            dir_channel[head[0], head[1]] = dir_value
+        else:
+            print(f"Warning: Invalid head position for direction: {head}")
+            dir_value = 0.0
+        dir_channel_pre_zoom = dir_channel.copy()
+        if self.grid_size == FIXED_OBS_SIZE:
+            dir_channel = dir_channel
+        else:
+            dir_channel = zoom(dir_channel, zoom_factor, order=0)
 
         # Kanał 4: znormalizowany rozmiar siatki
         size_channel = np.full((self.grid_size, self.grid_size), 1.0 / self.grid_size, dtype=np.float32)
-        size_channel = zoom(size_channel, zoom_factor, order=1)
+        size_channel = zoom(size_channel, zoom_factor, order=0)
 
-        # Kanał 5: znormalizowana odległość Manhattan do jabłka w całej mapie
+        # Kanał 5: znormalizowana odległość Manhattan
         distance_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         for x in range(self.grid_size):
             for y in range(self.grid_size):
                 dist = abs(x - self.food[0]) + abs(y - self.food[1])
-                distance_channel[x, y] = 1.0 - (dist / max(1, 2 * (self.grid_size - 1)))  # 1=blisko, 0=daleko
-        distance_channel = zoom(distance_channel, zoom_factor, order=1)
+                distance_channel[x, y] = 1.0 - (dist / max(1, 2 * (self.grid_size - 1)))
+        distance_channel = zoom(distance_channel, zoom_factor, order=0)
 
         # Połącz kanały
         obs = np.stack([active_state, direction_channel, direction_channel_y, dir_channel, size_channel, distance_channel], axis=-1)
-        
+
         # Debug: Sprawdź wartości w kanałach
         if np.max(active_state) == 0:
             print(f"Warning: active_state is all zeros. Head: {head}, Food: {self.food}, Snake: {list(self.snake)}")
-        
+        if np.max(direction_channel) == 0 and np.min(direction_channel) == 0 and direction_channel_pre_zoom[head[0], head[1]] != dx:
+            print(f"Warning: direction_channel (dx) is all zeros. Head: {head}, Food: {self.food}, dx: {dx}, Pre-zoom: {direction_channel_pre_zoom[head[0], head[1]]}")
+        if np.max(direction_channel_y) == 0 and np.min(direction_channel_y) == 0 and direction_channel_y_pre_zoom[head[0], head[1]] != dy:
+            print(f"Warning: direction_channel_y (dy) is all zeros. Head: {head}, Food: {self.food}, dy: {dy}, Pre-zoom: {direction_channel_y_pre_zoom[head[0], head[1]]}")
+        if np.max(dir_channel) == 0 and dir_value != 0.0:
+            print(f"Warning: dir_channel is all zeros. Head: {head}, Direction: {self.direction}, Pre-zoom: {dir_channel_pre_zoom[head[0], head[1]]}")
+
         return obs
 
     def _get_render_state(self):
@@ -142,7 +171,9 @@ class SnakeEnv(gym.Env):
 
     def step(self, action):
         head = self.snake[0]
-        prev_dist = abs(head[0] - self.food[0]) + abs(head[1] - self.food[1]) / max(1, self.grid_size - 1)
+        denom = max(1, self.grid_size - 1)
+        prev_dist = (abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])) / (2 * denom)
+        # Aktualizacja kierunku
         self.direction = (self.direction + (action - 1)) % 4
         head = self.snake[0] + DIRECTIONS[self.direction]
         self.steps += 1
@@ -153,7 +184,7 @@ class SnakeEnv(gym.Env):
         reward -= 0.01
 
         # Nagroda/kara za zmianę odległości do jabłka
-        new_dist = abs(head[0] - self.food[0]) + abs(head[1] - self.food[1]) / max(1, self.grid_size - 1)
+        new_dist = (abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])) / (2 * denom)
         if new_dist < prev_dist:
             reward += 0.3
         elif new_dist > prev_dist:
@@ -175,10 +206,10 @@ class SnakeEnv(gym.Env):
             self.snake.appendleft(head.tolist())
             if np.array_equal(head, self.food):
                 self.food = self._place_food()
-                reward = 50 
+                reward = 50
                 self.steps_without_food = 0
                 if len(self.snake) > prev_length:
-                    reward += 5 
+                    reward += 5
             else:
                 self.snake.pop()
                 self.steps_without_food += 1
@@ -189,6 +220,7 @@ class SnakeEnv(gym.Env):
             reward += 10 * self.grid_size
         obs = self._get_obs()
         info = {"score": len(self.snake) - 1, "total_reward": self.total_reward, "grid_size": self.grid_size}
+        
         return obs, reward, self.done, False, info
 
     def render(self):
