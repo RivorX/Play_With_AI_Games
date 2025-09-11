@@ -19,7 +19,7 @@ model:
   learning_rate: 0.0003              # Szybkość uczenia
   min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej tej wartości)
   n_steps: 2048                      # Liczba kroków na aktualizację
-  batch_size: 1024                   # Rozmiar partii
+  batch_size: 2048                   # Rozmiar partii
   n_epochs: 10                       # Liczba epok
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
