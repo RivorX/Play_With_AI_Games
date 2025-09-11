@@ -13,8 +13,8 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r') as f:
 	config = yaml.safe_load(f)
 
-# Ścieżka do modelu z configu
-model_path = os.path.join(base_dir, config['paths']['model_path'])
+# Ścieżka do najlepszego modelu (best_model.zip w models)
+model_path = os.path.join(base_dir, config['paths']['models_dir'], 'best_model.zip')
 
 # Załaduj model PPO
 model = PPO.load(model_path)
