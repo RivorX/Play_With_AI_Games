@@ -26,6 +26,7 @@ model:
   ent_coef: 0.2                      # Współczynnik entropii
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
+  dropout_rate: 0.2                  # Współczynnik dropout w CNN
   policy_kwargs:
     features_extractor_kwargs:
       features_dim: 512
