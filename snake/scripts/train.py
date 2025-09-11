@@ -27,29 +27,45 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
-# Konfiguracja logowania do training.log
-training_log_path = os.path.join(base_dir, 'logs', 'training.log')
-logging.basicConfig(
-    filename=training_log_path,
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    filemode='a'
-)
 
-# Funkcja do logowania obserwacji (ładnie sformatowana)
-def log_observation(obs, logger, grid_size, step):
+# Przygotuj logger dla każdego kanału tylko jeśli włączone w configu
+enable_channel_logs = config.get('training', {}).get('enable_channel_logs', False)
+channel_loggers = {}
+if enable_channel_logs:
+    log_dir = os.path.join(base_dir, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    for i, channel_name in enumerate([
+        'mapa', 'dx', 'dy', 'kierunek', 'grid_size', 'odleglosc']):
+        log_path = os.path.join(log_dir, f'training_{channel_name}.log')
+        logger = logging.getLogger(f'channel_{i}')
+        handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+        formatter = logging.Formatter('%(asctime)s - %(message)s')
+        handler.setFormatter(formatter)
+        if logger.hasHandlers():
+            logger.handlers.clear()
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        channel_loggers[channel_name] = logger
+
+# Funkcja do logowania obserwacji do osobnych plików dla każdego kanału
+def log_observation(obs, channel_loggers, grid_size, step):
+    if not enable_channel_logs:
+        return
     # Obs jest (4, 16, 16, 6) - stack ramek, bierzemy najnowszą (ostatnią)
     latest_frame = obs[-1]  # Najnowsza ramka (16, 16, 6)
 
     # Wyodrębnij kanały
-    mapa = latest_frame[:, :, 0]  # Kanał 0: mapa
-    dx_channel = latest_frame[:, :, 1]  # Kanał 1: dx
-    dy_channel = latest_frame[:, :, 2]  # Kanał 2: dy
-    dir_channel = latest_frame[:, :, 3]  # Kanał 3: kierunek
-    size_channel = latest_frame[:, :, 4]  # Kanał 4: grid_size
-    distance_channel = latest_frame[:, :, 5] if latest_frame.shape[-1] > 5 else None  # Kanał 5: odległość
+    kanały = {
+        'mapa': latest_frame[:, :, 0],
+        'dx': latest_frame[:, :, 1],
+        'dy': latest_frame[:, :, 2],
+        'kierunek': latest_frame[:, :, 3],
+        'grid_size': latest_frame[:, :, 4],
+        'odleglosc': latest_frame[:, :, 5] if latest_frame.shape[-1] > 5 else None
+    }
 
     # Znajdź pozycję głowy i jedzenia w mapie
+    mapa = kanały['mapa']
     head_pos = np.where(mapa == 1.0)
     food_pos = np.where(mapa == 0.75)
     if len(head_pos[0]) > 0:
@@ -61,30 +77,33 @@ def log_observation(obs, logger, grid_size, step):
     else:
         food_x, food_y = -1, -1
 
-    # Wyodrębnij wartości dx, dy, kierunek w pozycji głowy
-    dx = dx_channel[head_x, head_y] if head_x >= 0 else None
-    dy = dy_channel[head_x, head_y] if head_x >= 0 else None
-    kierunek = dir_channel[head_x, head_y] if head_x >= 0 else None
+    dx = kanały['dx'][head_x, head_y] if head_x >= 0 else None
+    dy = kanały['dy'][head_x, head_y] if head_x >= 0 else None
+    kierunek = kanały['kierunek'][head_x, head_y] if head_x >= 0 else None
 
-    # Oblicz odległość Manhattan
     if head_x >= 0 and food_x >= 0:
         distance = abs(head_x - food_x) + abs(head_y - food_y)
     else:
         distance = float('inf')
 
-    # Loguj ładnie sformatowane informacje
-    logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
-    logger.info(f"Kanał 0 (mapa):\n{np.array_str(mapa, precision=1, suppress_small=True, max_line_width=120)}")
-    logger.info(f"Kanał 1 (dx):\n{np.array_str(dx_channel, precision=2, suppress_small=True, max_line_width=120)}")
-    logger.info(f"Kanał 2 (dy):\n{np.array_str(dy_channel, precision=2, suppress_small=True, max_line_width=120)}")
-    logger.info(f"Kanał 3 (kierunek):\n{np.array_str(dir_channel, precision=2, suppress_small=True, max_line_width=120)}")
-    logger.info(f"Kanał 4 (grid_size):\n{np.array_str(size_channel, precision=2, suppress_small=True, max_line_width=120)}")
-    if distance_channel is not None:
-        logger.info(f"Kanał 5 (odległość Manhattan):\n{np.array_str(distance_channel, precision=2, suppress_small=True, max_line_width=120)}")
-    logger.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
-    logger.info(f"Wektor do jedzenia: dx={dx}, dy={dy} | Kierunek węża (0-lewo,1-dół,2-prawo,3-góra): {kierunek}")
-    logger.info(f"Odległość Manhattan: {distance}")
-    logger.info("-" * 60)
+    # Loguj każdy kanał do osobnego pliku
+    for channel_name, arr in kanały.items():
+        logger = channel_loggers.get(channel_name)
+        if logger is None or arr is None:
+            continue
+        logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
+        logger.info(f"Kanał {channel_name}:\n{np.array_str(arr, precision=2, suppress_small=True, max_line_width=120)}")
+        if channel_name == 'mapa':
+            logger.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
+        if channel_name == 'dx':
+            logger.info(f"dx w pozycji głowy: {dx}")
+        if channel_name == 'dy':
+            logger.info(f"dy w pozycji głowy: {dy}")
+        if channel_name == 'kierunek':
+            logger.info(f"Kierunek węża (0-lewo,1-dół,2-prawo,3-góra): {kierunek}")
+        if channel_name == 'odleglosc':
+            logger.info(f"Odległość Manhattan: {distance}")
+        logger.info("-" * 60)
 
 # Callback do zapisu postępu treningu
 class TrainProgressCallback(BaseCallback):
@@ -215,19 +234,26 @@ def train(use_progress_bar=False):
         set_grid_size(grid_size)
         steps_per_iteration = config['training']['n_envs'] * config['model']['n_steps'] * curriculum_multipliers[level]
 
-        logging.info(f"\n--- Debug: Pierwsze wywołanie env dla grid_size={grid_size} ---")
+        # Logowanie debug do osobnych plików kanałów
+        if enable_channel_logs:
+            for logger in channel_loggers.values():
+                logger.info(f"\n--- Debug: Pierwsze wywołanie env dla grid_size={grid_size} ---")
         debug_env = make_env(render_mode=None, grid_size=grid_size)()
         obs, _ = debug_env.reset()
-        log_observation(obs, logging, grid_size, step=0)
+        log_observation(obs, channel_loggers, grid_size, step=0)
         for debug_step in range(5):  # Symuluj 5 kroków z losowymi akcjami
             action = debug_env.action_space.sample()
             obs, reward, done, _, info = debug_env.step(action)
-            log_observation(obs, logging, grid_size, step=debug_step + 1)
-            logging.info(f"Akcja: {action}, Nagroda: {reward}, Done: {done}, Info: {info}")
+            log_observation(obs, channel_loggers, grid_size, step=debug_step + 1)
+            if enable_channel_logs:
+                for logger in channel_loggers.values():
+                    logger.info(f"Akcja: {action}, Nagroda: {reward}, Done: {done}, Info: {info}")
             if done:
                 break
         debug_env.close()
-        logging.info(f"--- Koniec debug dla grid_size={grid_size} ---")
+        if enable_channel_logs:
+            for logger in channel_loggers.values():
+                logger.info(f"--- Koniec debug dla grid_size={grid_size} ---")
 
         env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
         eval_env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=1, vec_env_cls=SubprocVecEnv)
@@ -354,20 +380,26 @@ def train(use_progress_bar=False):
         grid_size = curriculum_grid_sizes[-1]
         set_grid_size(grid_size)
 
-        # Logowanie obserwacji tylko dla kontynuacji (jak pierwsze wywołanie)
-        logging.info(f"\n--- Debug: Kontynuacja treningu dla grid_size={grid_size} ---")
+        # Logowanie debug do osobnych plików kanałów (kontynuacja)
+        if enable_channel_logs:
+            for logger in channel_loggers.values():
+                logger.info(f"\n--- Debug: Kontynuacja treningu dla grid_size={grid_size} ---")
         debug_env = make_env(render_mode=None, grid_size=grid_size)()
         obs, _ = debug_env.reset()
-        log_observation(obs, logging, grid_size, step=0)
+        log_observation(obs, channel_loggers, grid_size, step=0)
         for debug_step in range(5):  # Symuluj 5 kroków z losowymi akcjami
             action = debug_env.action_space.sample()
             obs, reward, done, _, info = debug_env.step(action)
-            log_observation(obs, logging, grid_size, step=debug_step + 1)
-            logging.info(f"Akcja: {action}, Nagroda: {reward}, Done: {done}, Info: {info}")
+            log_observation(obs, channel_loggers, grid_size, step=debug_step + 1)
+            if enable_channel_logs:
+                for logger in channel_loggers.values():
+                    logger.info(f"Akcja: {action}, Nagroda: {reward}, Done: {done}, Info: {info}")
             if done:
                 break
         debug_env.close()
-        logging.info(f"--- Koniec debug dla kontynuacji grid_size={grid_size} ---")
+        if enable_channel_logs:
+            for logger in channel_loggers.values():
+                logger.info(f"--- Koniec debug dla kontynuacji grid_size={grid_size} ---")
 
         env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
         eval_env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=1, vec_env_cls=SubprocVecEnv)
