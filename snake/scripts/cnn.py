@@ -21,23 +21,41 @@ class CustomCNN(BaseFeaturesExtractor):
         # stack_size = 4, channels = 10 (6 podstawowych + 4 historia kierunków)
         in_channels = 4 * 10
         dropout_rate = config['model'].get('dropout_rate', 0.2)  # Pobierz dropout_rate z configu
+        leaky_relu = nn.LeakyReLU(negative_slope=0.01)
+
+        # Blok residualny (ResNet-like) po 2 warstwie konwolucyjnej
+        class ResidualBlock(nn.Module):
+            def __init__(self, channels):
+                super().__init__()
+                self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+                self.bn1 = nn.BatchNorm2d(channels)
+                self.act = nn.LeakyReLU(0.01)
+                self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+                self.bn2 = nn.BatchNorm2d(channels)
+            def forward(self, x):
+                identity = x
+                out = self.conv1(x)
+                out = self.bn1(out)
+                out = self.act(out)
+                out = self.conv2(out)
+                out = self.bn2(out)
+                out += identity
+                out = self.act(out)
+                return out
+
         self.cnn = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Dropout2d(dropout_rate),
+            leaky_relu,
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Dropout2d(dropout_rate),
+            leaky_relu,
+            # Blok residualny na 64 kanałach
+            ResidualBlock(64),
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.Dropout2d(dropout_rate),
+            leaky_relu,
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.Dropout2d(dropout_rate),
+            leaky_relu,
             nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
         )
@@ -47,10 +65,10 @@ class CustomCNN(BaseFeaturesExtractor):
             n_flatten = self.cnn(processed).shape[1]
         self.linear = nn.Sequential(
             nn.Linear(n_flatten, features_dim),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),
             nn.Dropout(dropout_rate),
             nn.Linear(features_dim, features_dim),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),
             nn.Dropout(dropout_rate)
         )
 
