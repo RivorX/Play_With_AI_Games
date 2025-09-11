@@ -87,7 +87,7 @@ def test_snake_model(model_path, grid_size, episodes):
 
             # Zapisz informacje debugowania do pliku
             logging.info("--- Obserwacja (fragment) ---")
-            logging.info(f"Kanał 0 (mapa):\n{np.array_str(mapa, precision=1, suppress_small=True, max_line_width=120)}")
+            logging.info(f"Kanał 0 (mapa):\n{np.array_str(mapa, precision=2, suppress_small=True, max_line_width=120)}")
             logging.info(f"Kanał 1 (dx):\n{np.array_str(dx_channel, precision=2, suppress_small=True, max_line_width=120)}")
             logging.info(f"Kanał 2 (dy):\n{np.array_str(dy_channel, precision=2, suppress_small=True, max_line_width=120)}")
             logging.info(f"Kanał 3 (kierunek):\n{np.array_str(dir_channel, precision=2, suppress_small=True, max_line_width=120)}")

@@ -78,21 +78,15 @@ class SnakeEnv(gym.Env):
         else:
             print(f"Warning: Invalid head position: {head}")
         zoom_factor = FIXED_OBS_SIZE / self.grid_size
-        active_state = zoom(active_state, zoom_factor, order=0)
+        active_state = zoom(active_state, zoom_factor, order=0)  # Zachowaj order=0 dla mapy
 
-        # Kanał 1: znormalizowany dx do jabłka
+        # Kanał 1: znormalizowany dx
         direction_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         dx = 0.0
         if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
             dx = (self.food[0] - head[0]) / max(1, self.grid_size - 1)
             direction_channel[head[0], head[1]] = dx
-        else:
-            print(f"Warning: Invalid head position for dx: {head}")
-        direction_channel_pre_zoom = direction_channel.copy()
-        if self.grid_size == FIXED_OBS_SIZE:
-            direction_channel = direction_channel
-        else:
-            direction_channel = zoom(direction_channel, zoom_factor, order=0)
+        direction_channel = zoom(direction_channel, zoom_factor, order=1)  # order=1 dla dx
 
         # Kanał 2: znormalizowany dy
         direction_channel_y = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
@@ -100,15 +94,9 @@ class SnakeEnv(gym.Env):
         if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
             dy = (self.food[1] - head[1]) / max(1, self.grid_size - 1)
             direction_channel_y[head[0], head[1]] = dy
-        else:
-            print(f"Warning: Invalid head position for dy: {head}")
-        direction_channel_y_pre_zoom = direction_channel_y.copy()
-        if self.grid_size == FIXED_OBS_SIZE:
-            direction_channel_y = direction_channel_y
-        else:
-            direction_channel_y = zoom(direction_channel_y, zoom_factor, order=0)
+        direction_channel_y = zoom(direction_channel_y, zoom_factor, order=1)  # order=1 dla dy
 
-        # Kanał 3: znormalizowany kierunek węża
+        # Kanał 3: kierunek
         dir_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
             dir_value = (self.direction + 1) / 4.0  # Mapuje 0->0.25, 1->0.5, 2->0.75, 3->1.0
@@ -116,37 +104,24 @@ class SnakeEnv(gym.Env):
         else:
             print(f"Warning: Invalid head position for direction: {head}")
             dir_value = 0.0
-        dir_channel_pre_zoom = dir_channel.copy()
         if self.grid_size == FIXED_OBS_SIZE:
             dir_channel = dir_channel
         else:
             dir_channel = zoom(dir_channel, zoom_factor, order=0)
 
-        # Kanał 4: znormalizowany rozmiar siatki
-        size_channel = np.full((self.grid_size, self.grid_size), 1.0 / self.grid_size, dtype=np.float32)
-        size_channel = zoom(size_channel, zoom_factor, order=0)
+        # Kanał 4: grid_size
+        size_channel = np.full((self.grid_size, self.grid_size), self.grid_size / 16.0, dtype=np.float32)
+        size_channel = zoom(size_channel, zoom_factor, order=1)  # order=1 dla grid_size
 
-        # Kanał 5: znormalizowana odległość Manhattan
+        # Kanał 5: odległość Manhattan
         distance_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         for x in range(self.grid_size):
             for y in range(self.grid_size):
-                dist = abs(x - self.food[0]) + abs(y - self.food[1])
-                distance_channel[x, y] = 1.0 - (dist / max(1, 2 * (self.grid_size - 1)))
-        distance_channel = zoom(distance_channel, zoom_factor, order=0)
+                distance = abs(x - self.food[0]) + abs(y - self.food[1])
+                distance_channel[x, y] = min(distance / self.grid_size, 1.0)
+        distance_channel = zoom(distance_channel, zoom_factor, order=1)  # order=1 dla odległości
 
-        # Połącz kanały
         obs = np.stack([active_state, direction_channel, direction_channel_y, dir_channel, size_channel, distance_channel], axis=-1)
-
-        # Debug: Sprawdź wartości w kanałach
-        if np.max(active_state) == 0:
-            print(f"Warning: active_state is all zeros. Head: {head}, Food: {self.food}, Snake: {list(self.snake)}")
-        if np.max(direction_channel) == 0 and np.min(direction_channel) == 0 and direction_channel_pre_zoom[head[0], head[1]] != dx:
-            print(f"Warning: direction_channel (dx) is all zeros. Head: {head}, Food: {self.food}, dx: {dx}, Pre-zoom: {direction_channel_pre_zoom[head[0], head[1]]}")
-        if np.max(direction_channel_y) == 0 and np.min(direction_channel_y) == 0 and direction_channel_y_pre_zoom[head[0], head[1]] != dy:
-            print(f"Warning: direction_channel_y (dy) is all zeros. Head: {head}, Food: {self.food}, dy: {dy}, Pre-zoom: {direction_channel_y_pre_zoom[head[0], head[1]]}")
-        if np.max(dir_channel) == 0 and dir_value != 0.0:
-            print(f"Warning: dir_channel is all zeros. Head: {head}, Direction: {self.direction}, Pre-zoom: {dir_channel_pre_zoom[head[0], head[1]]}")
-
         return obs
 
     def _get_render_state(self):
