@@ -79,5 +79,22 @@ class CustomCNN(BaseFeaturesExtractor):
         return observations
 
     def forward(self, observations):
-        processed = self._process_sample(observations)
-        return self.linear(self.cnn(processed))
+        # Użyj AMP (bfloat16 jeśli dostępne), ale zawsze zwracaj float32
+        use_amp = torch.is_autocast_enabled() or (torch.cuda.is_available() and observations.is_cuda)
+        # Sprawdź czy karta obsługuje bfloat16
+        use_bfloat16 = False
+        if use_amp and torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability()
+            # Ampere (8.0+) i nowsze obsługują bfloat16
+            if cap[0] >= 8:
+                use_bfloat16 = True
+        if use_amp:
+            dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+            with torch.amp.autocast(device_type='cuda', dtype=dtype):
+                processed = self._process_sample(observations)
+                out = self.linear(self.cnn(processed))
+                return out.to(torch.float32)
+        else:
+            processed = self._process_sample(observations)
+            out = self.linear(self.cnn(processed))
+            return out.to(torch.float32)
