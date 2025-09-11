@@ -52,3 +52,20 @@ Jeśli chcesz kontynuować trening lub przetestować ostatni zapisany model, a p
 4. Teraz możesz uruchomić trening lub testowanie – program użyje przywróconego modelu.
 
 To samo dotyczy pliku najlepszego modelu (`best_model.zip.backup`).
+
+# Wyjaśnienie metryk PPO (Stable Baselines3)
+
+Podczas treningu w logach pojawiają się metryki, które pomagają monitorować postęp i stabilność uczenia:
+
+- **approx_kl** — Przybliżona dywergencja KL. Pokazuje, jak bardzo zmieniła się polityka agenta po aktualizacji. Niska wartość = stabilne uczenie.
+- **clip_fraction** — Ułamek aktualizacji, które zostały „ucięte” przez mechanizm PPO (clip_range). Wysoka wartość może oznaczać zbyt duże zmiany polityki.
+- **clip_range** — Maksymalny zakres zmiany polityki w jednej aktualizacji (ustawienie PPO).
+- **entropy_loss** — Entropia polityki. Im bliżej zera, tym bardziej deterministyczne decyzje agenta. Wyższa wartość = więcej eksploracji.
+- **explained_variance** — Jak dobrze krytyk (value function) przewiduje nagrody. 0 = brak korelacji, 1 = idealne przewidywanie. Im wyżej, tym lepiej.
+- **learning_rate** — Aktualna szybkość uczenia.
+- **loss** — Całkowita strata modelu (łączna dla polityki i wartości). Ważny jest trend (czy maleje).
+- **n_updates** — Liczba aktualizacji sieci.
+- **policy_gradient_loss** — Strata gradientu polityki. Pokazuje, jak mocno aktualizowana jest polityka.
+- **value_loss** — Strata funkcji wartości (krytyka). Im niższa, tym lepiej krytyk przewiduje nagrody.
+
+Te wskaźniki pozwalają ocenić, czy agent uczy się stabilnie, nie „wariuje” i czy sieć wartości dobrze przewiduje nagrody.
