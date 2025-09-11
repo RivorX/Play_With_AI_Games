@@ -23,7 +23,7 @@ model:
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
-  ent_coef: 0.08                     # Współczynnik entropii
+  ent_coef: 0.2                      # Współczynnik entropii
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   policy_kwargs:
@@ -36,11 +36,11 @@ training:
   n_envs: 16                         # Liczba środowisk
   total_timesteps: 10000000          # Całkowita liczba kroków
   eval_freq: 1000                    # Częstotliwość ewaluacji
-  max_no_improvement_evals: 10
+  max_no_improvement_evals: 20       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 5
-  enable_testing: true               # Włączone dla widoczności postępów
+  enable_testing: false              # Włączone dla widoczności postępów
   enable_channel_logs: true          # Włącz logi kanałów
-  curriculum_multipliers: [30, 30, 30, 30]  # Zwiększone dla lepszego uczenia
+  curriculum_multipliers: [30, 30, 30, 30]  # Ilość kroków do ukończenia poziomu w curriculum
   curriculum_grid_sizes: [5, 8, 12, 16]  # Rozmiary siatki w curriculum
 
 # Ścieżki do zapisu

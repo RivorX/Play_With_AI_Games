@@ -1,3 +1,11 @@
+# Harmonogram liniowy learning rate
+def linear_schedule(initial_value):
+    """
+    Zwraca funkcję, która zmniejsza learning rate liniowo od initial_value do 0.
+    """
+    def func(progress_remaining):
+        return initial_value * progress_remaining
+    return func
 # train.py (zmieniony: dodano logging do training.log z obserwacjami tylko dla pierwszego wywołania env w każdym levelu curriculum oraz w kontynuacji; formatowanie ładne)
 import os
 import time
@@ -230,6 +238,7 @@ def train(use_progress_bar=False):
     curriculum_multipliers = config['training']['curriculum_multipliers']
     total_timesteps = 0
     model = None
+
     for level, grid_size in enumerate(curriculum_grid_sizes):
         set_grid_size(grid_size)
         steps_per_iteration = config['training']['n_envs'] * config['model']['n_steps'] * curriculum_multipliers[level]
@@ -264,7 +273,7 @@ def train(use_progress_bar=False):
             model = PPO(
                 config['model']['policy'],
                 env,
-                learning_rate=config['model']['learning_rate'],
+                learning_rate=linear_schedule(config['model']['learning_rate']),
                 n_steps=config['model']['n_steps'],
                 batch_size=config['model']['batch_size'],
                 n_epochs=config['model']['n_epochs'],
