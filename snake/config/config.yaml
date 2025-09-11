@@ -17,6 +17,7 @@ environment:
 model:
   policy: CnnPolicy                  # Używamy CnnPolicy dla CNN
   learning_rate: 0.0003              # Szybkość uczenia
+  min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej tej wartości)
   n_steps: 2048                      # Liczba kroków na aktualizację
   batch_size: 1024                   # Rozmiar partii
   n_epochs: 10                       # Liczba epok
