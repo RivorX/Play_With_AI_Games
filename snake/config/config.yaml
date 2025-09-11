@@ -20,30 +20,32 @@ model:
   min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej tej wartości)
   n_steps: 2048                      # Liczba kroków na aktualizację
   batch_size: 2048                   # Rozmiar partii
-  n_epochs: 10                       # Liczba epok
+  n_epochs: 20                       # Liczba epok (więcej aktualizacji na batch)
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.4                      # Współczynnik entropii
-  vf_coef: 0.5                       # Współczynnik funkcji wartości
+  vf_coef: 1.0                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   dropout_rate: 0.2                  # Współczynnik dropout w CNN
   policy_kwargs:
     features_extractor_kwargs:
       features_dim: 512
-    net_arch: [256, 128]
+    net_arch:
+      pi: [256, 128]  # dla aktora
+      vf: [512, 256, 128]  # dla krytyka
 
 # Konfiguracja treningu
 training:
   n_envs: 16                         # Liczba środowisk
   total_timesteps: 10000000          # Całkowita liczba kroków
   eval_freq: 2000                    # Częstotliwość ewaluacji
-  max_no_improvement_evals: 20       # Liczba ewaluacji bez poprawy przed zatrzymaniem
+  max_no_improvement_evals: 50       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 5
   enable_testing: false              # Włączone dla widoczności postępów
   enable_channel_logs: true          # Włącz logi kanałów
-  curriculum_multipliers: [30, 30, 30, 30]  # Ilość kroków do ukończenia poziomu w curriculum
-  curriculum_grid_sizes: [5, 8, 12, 16]  # Rozmiary siatki w curriculum
+  curriculum_multipliers: [1, 30, 30, 30, 30]  # Ilość kroków do ukończenia poziomu w curriculum
+  curriculum_grid_sizes: [5, 5, 8, 12, 16]  # Rozmiary siatki w curriculum
 
 # Ścieżki do zapisu
 paths:
