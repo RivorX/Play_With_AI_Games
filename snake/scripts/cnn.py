@@ -18,7 +18,8 @@ class CustomCNN(BaseFeaturesExtractor):
     """
     def __init__(self, observation_space, features_dim=512):
         super(CustomCNN, self).__init__(observation_space, features_dim)
-        in_channels = 4 * 6  # stack_size = 4, channels = 6 (mapa, dx, dy, kierunek, grid_size, odległość)
+        # stack_size = 4, channels = 10 (6 podstawowych + 4 historia kierunków)
+        in_channels = 4 * 10
         dropout_rate = config['model'].get('dropout_rate', 0.2)  # Pobierz dropout_rate z configu
         self.cnn = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),

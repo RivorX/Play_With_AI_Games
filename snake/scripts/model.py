@@ -28,15 +28,17 @@ class SnakeEnv(gym.Env):
         super(SnakeEnv, self).__init__()
         self.grid_size = grid_size if grid_size is not None else config['environment']['grid_size']
         self.render_mode = render_mode
-        # Stała przestrzeń obserwacji: 4 ramki x 16x16 x 6 kanałów
+        # Stała przestrzeń obserwacji: 4 ramki x 16x16 x 6 kanałów + 4 ostatnie kierunki
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 6),
+            shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 6 + 4),
             dtype=np.float32
         )
         self.action_space = spaces.Discrete(config['environment']['action_space']['n'])
         self.steps_without_food = 0
+        self.state_counter = {}
+        self.last_directions = collections.deque([0, 0, 0, 0], maxlen=4)  # historia 4 ostatnich kierunków
         self.reset()
         if render_mode == "human":
             pygame.init()
@@ -52,6 +54,8 @@ class SnakeEnv(gym.Env):
         self.steps = 0
         self.total_reward = 0
         self.steps_without_food = 0
+        self.state_counter = {}
+        self.last_directions = collections.deque([0, 0, 0, 0], maxlen=4)
         if self.render_mode == "human":
             self.screen = pygame.display.set_mode((self.grid_size * SNAKE_SIZE, self.grid_size * SNAKE_SIZE))
             pygame.display.set_caption("Snake")
@@ -121,7 +125,18 @@ class SnakeEnv(gym.Env):
                 distance_channel[x, y] = min(distance / self.grid_size, 1.0)
         distance_channel = zoom(distance_channel, zoom_factor, order=1)  # order=1 dla odległości
 
-        obs = np.stack([active_state, direction_channel, direction_channel_y, dir_channel, size_channel, distance_channel], axis=-1)
+        # Nowe kanały: historia ostatnich 4 kierunków (każdy jako osobny kanał, wartość w pozycji głowy)
+        direction_history_channels = []
+        for d in self.last_directions:
+            ch = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+            if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
+                ch[head[0], head[1]] = (d + 1) / 4.0  # tak jak w dir_channel
+            direction_history_channels.append(zoom(ch, zoom_factor, order=0))
+
+        obs = np.stack([
+            active_state, direction_channel, direction_channel_y, dir_channel, size_channel, distance_channel,
+            *direction_history_channels
+        ], axis=-1)
         return obs
 
     def _get_render_state(self):
@@ -150,6 +165,7 @@ class SnakeEnv(gym.Env):
         prev_dist = (abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])) / (2 * denom)
         # Aktualizacja kierunku
         self.direction = (self.direction + (action - 1)) % 4
+        self.last_directions.append(self.direction)
         head = self.snake[0] + DIRECTIONS[self.direction]
         self.steps += 1
         reward = 0
@@ -165,26 +181,42 @@ class SnakeEnv(gym.Env):
         elif new_dist > prev_dist:
             reward -= 0.3
 
+        # Kara za powtarzanie stanów (pętlenie się)
+        # Stan: pozycja głowy + kierunek + długość węża
+        state_hash = (tuple(head.tolist()), self.direction, len(self.snake))
+        self.state_counter[state_hash] = self.state_counter.get(state_hash, 0) + 1
+        if self.state_counter[state_hash] > 3:
+            reward -= 1.0  # kara za zapętlanie się
+
         # Kara za zbyt długie niejedzenie jabłka
         max_steps_without_food = config['environment'].get('max_steps_without_food', 80) * self.grid_size
         if self.steps_without_food >= max_steps_without_food:
             self.done = True
-            reward -= 50
+            reward -= 20
 
         # Sprawdź kolizję lub przekroczenie limitu kroków
         max_steps = config['environment']['max_steps_factor'] * len(self.snake) * self.grid_size
         if self._is_collision(head) or self.steps > max_steps:
             self.done = True
             reward = -20
+            # Reset licznika stanów po śmierci (koniec epizodu)
+            self.state_counter = {}
         else:
             prev_length = len(self.snake)
             self.snake.appendleft(head.tolist())
             if np.array_equal(head, self.food):
                 self.food = self._place_food()
+                # Nagroda bazowa za jabłko
                 reward = 50
+                # Nagroda za szybkie zdobycie jabłka: im mniej kroków od ostatniego jabłka, tym większy bonus
+                # (np. +10 za każde 10 kroków szybciej, max +50 bonusu)
+                bonus = max(0, 50 - self.steps_without_food)
+                reward += bonus
                 self.steps_without_food = 0
                 if len(self.snake) > prev_length:
                     reward += 5
+                # Reset licznika stanów po zjedzeniu jabłka
+                self.state_counter = {}
             else:
                 self.snake.pop()
                 self.steps_without_food += 1
