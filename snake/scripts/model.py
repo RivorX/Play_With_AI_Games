@@ -171,51 +171,47 @@ class SnakeEnv(gym.Env):
         reward = 0
         self.done = False
 
-        # Kara za każdy krok
-        reward -= 0.01
 
-        # Nagroda/kara za zmianę odległości do jabłka
+        # Kara za każdy krok
+        reward -= 0.02
+
+        # Nagroda/kara za zmianę odległości do jabłka (łagodniejsza)
         new_dist = (abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])) / (2 * denom)
         if new_dist < prev_dist:
-            reward += 0.3
+            reward += 0.1
         elif new_dist > prev_dist:
-            reward -= 0.3
+            reward -= 0.1
 
-        # Kara za powtarzanie stanów (pętlenie się)
-        # Stan: pozycja głowy + kierunek + długość węża
+        # Kara za powtarzanie stanów (pętlenie się) - mocniejsza
         state_hash = (tuple(head.tolist()), self.direction, len(self.snake))
         self.state_counter[state_hash] = self.state_counter.get(state_hash, 0) + 1
         if self.state_counter[state_hash] > 3:
-            reward -= 1.0  # kara za zapętlanie się
+            reward -= 2.0
 
-        # Kara za zbyt długie niejedzenie jabłka
+        # Kara za zbyt długie niejedzenie jabłka (łagodniejsza)
         max_steps_without_food = config['environment'].get('max_steps_without_food', 80) * self.grid_size
         if self.steps_without_food >= max_steps_without_food:
             self.done = True
-            reward -= 20
+            reward -= 10
 
         # Sprawdź kolizję lub przekroczenie limitu kroków
         max_steps = config['environment']['max_steps_factor'] * len(self.snake) * self.grid_size
         if self._is_collision(head) or self.steps > max_steps:
             self.done = True
-            reward = -20
-            # Reset licznika stanów po śmierci (koniec epizodu)
+            reward = -10
             self.state_counter = {}
         else:
             prev_length = len(self.snake)
             self.snake.appendleft(head.tolist())
             if np.array_equal(head, self.food):
                 self.food = self._place_food()
-                # Nagroda bazowa za jabłko
-                reward = 50
-                # Nagroda za szybkie zdobycie jabłka: im mniej kroków od ostatniego jabłka, tym większy bonus
-                # (np. +10 za każde 10 kroków szybciej, max +50 bonusu)
-                bonus = max(0, 50 - self.steps_without_food)
+                # Nagroda bazowa za jabłko (mniejsza)
+                reward = 20
+                # Bonus za szybkie zdobycie jabłka (max +20)
+                bonus = max(0, 20 - self.steps_without_food)
                 reward += bonus
                 self.steps_without_food = 0
-                if len(self.snake) > prev_length:
-                    reward += 5
-                # Reset licznika stanów po zjedzeniu jabłka
+                # Usuwamy dodatkową nagrodę za wydłużenie węża
                 self.state_counter = {}
             else:
                 self.snake.pop()

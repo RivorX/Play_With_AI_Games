@@ -14,7 +14,7 @@ import numpy as np
 import pygame
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
 import csv
@@ -267,8 +267,11 @@ def train(use_progress_bar=False):
             for logger in channel_loggers.values():
                 logger.info(f"--- Koniec debug dla grid_size={grid_size} ---")
 
+        # Tworzenie środowiska z aktualnym grid_size
         env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
+        env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
         eval_env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=1, vec_env_cls=SubprocVecEnv)
+        eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
         if model is None:
             policy_kwargs = config['model']['policy_kwargs']
@@ -413,8 +416,11 @@ def train(use_progress_bar=False):
             for logger in channel_loggers.values():
                 logger.info(f"--- Koniec debug dla kontynuacji grid_size={grid_size} ---")
 
+        set_grid_size(grid_size)
         env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
+        env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
         eval_env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=1, vec_env_cls=SubprocVecEnv)
+        eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
         model.set_env(env)
         
         best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
