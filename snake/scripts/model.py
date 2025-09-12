@@ -172,8 +172,38 @@ class SnakeEnv(gym.Env):
         self.done = False
 
 
+
+
         # Kara za każdy krok
         reward -= 0.02
+
+        # Nagroda za przeżycie kolejnego kroku
+        reward += 0.01
+
+        # Kara za bycie blisko własnego ciała (sąsiadujące pola wokół głowy)
+        neighbors = [
+            [head[0] + 1, head[1]],
+            [head[0] - 1, head[1]],
+            [head[0], head[1] + 1],
+            [head[0], head[1] - 1]
+        ]
+        close_body = 0
+        for n in neighbors:
+            if 0 <= n[0] < self.grid_size and 0 <= n[1] < self.grid_size:
+                if list(n) in self.snake:
+                    close_body += 1
+        reward -= 0.05 * close_body  # kara za każdy sąsiadujący segment ciała
+
+        # Kara za bycie w pułapce (głowa otoczona przez ciało lub ścianę z 3 stron)
+        trap_count = 0
+        for n in neighbors:
+            if 0 <= n[0] < self.grid_size and 0 <= n[1] < self.grid_size:
+                if list(n) in self.snake:
+                    trap_count += 1
+            else:
+                trap_count += 1  # ściana też liczymy jako przeszkodę
+        if trap_count >= 3:
+            reward -= 1.0
 
         # Nagroda/kara za zmianę odległości do jabłka (łagodniejsza)
         new_dist = (abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])) / (2 * denom)
@@ -198,7 +228,9 @@ class SnakeEnv(gym.Env):
         max_steps = config['environment']['max_steps_factor'] * len(self.snake) * self.grid_size
         if self._is_collision(head) or self.steps > max_steps:
             self.done = True
-            reward = -10
+            # Kara za szybką śmierć (im krótszy epizod, tym większa kara)
+            death_penalty = -20 - max(0, 10 - self.steps * 0.1)
+            reward = death_penalty
             self.state_counter = {}
         else:
             prev_length = len(self.snake)
@@ -207,6 +239,8 @@ class SnakeEnv(gym.Env):
                 self.food = self._place_food()
                 # Nagroda bazowa za jabłko (mniejsza)
                 reward = 20
+                # Dodatkowa nagroda za wydłużenie węża
+                reward += 1
                 # Bonus za szybkie zdobycie jabłka (max +20)
                 bonus = max(0, 20 - self.steps_without_food)
                 reward += bonus

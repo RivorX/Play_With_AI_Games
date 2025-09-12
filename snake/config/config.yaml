@@ -44,8 +44,10 @@ training:
   min_evals: 5
   enable_testing: false              # Włączone dla widoczności postępów
   enable_channel_logs: true          # Włącz logi kanałów
-  curriculum_multipliers: [1, 30, 30, 30, 30]  # Ilość kroków do ukończenia poziomu w curriculum
-  curriculum_grid_sizes: [5, 5, 8, 12, 16]  # Rozmiary siatki w curriculum
+  #curriculum_multipliers: [1, 30, 30, 30, 30]  # Ilość kroków do ukończenia poziomu w curriculum
+  #curriculum_grid_sizes: [5, 5, 8, 12, 16]  # Rozmiary siatki w curriculum
+  curriculum_multipliers: [1, 10,10,10,10]  # Ilość kroków do ukończenia poziomu w curriculum
+  curriculum_grid_sizes: [5, 5, 5, 5, 5] # Dla testu
 
 # Ścieżki do zapisu
 paths:
