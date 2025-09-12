@@ -27,12 +27,20 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
-# Przygotuj logger dla każdego kanału tylko jeśli włączone w configu
-enable_channel_logs = config.get('training', {}).get('enable_channel_logs', False)
-channel_loggers = {}
-if enable_channel_logs:
+
+# Funkcja do resetowania plików logów kanałów
+def reset_channel_logs():
     log_dir = os.path.join(base_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
+    for channel_name in ['mapa', 'dx', 'dy', 'kierunek', 'grid_size', 'odleglosc']:
+        log_path = os.path.join(log_dir, f'training_{channel_name}.log')
+        with open(log_path, 'w', encoding='utf-8'):
+            pass  # nadpisz plik pustą zawartością
+
+# Funkcja do inicjalizacji loggerów kanałów (zawsze po resecie plików)
+def init_channel_loggers():
+    loggers = {}
+    log_dir = os.path.join(base_dir, 'logs')
     for i, channel_name in enumerate([
         'mapa', 'dx', 'dy', 'kierunek', 'grid_size', 'odleglosc']):
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
@@ -44,7 +52,11 @@ if enable_channel_logs:
             logger.handlers.clear()
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
-        channel_loggers[channel_name] = logger
+        loggers[channel_name] = logger
+    return loggers
+
+enable_channel_logs = config.get('training', {}).get('enable_channel_logs', False)
+channel_loggers = {}
 
 # Funkcja do logowania obserwacji do osobnych plików dla każdego kanału
 def log_observation(obs, channel_loggers, grid_size, step):
@@ -310,6 +322,20 @@ def train(use_progress_bar=False):
     # Wczytaj stan treningu, jeśli istnieje
     model, env, eval_env, total_timesteps, current_level, use_config_hyperparams = load_training_state(model_path_absolute, vec_norm_path, vec_norm_eval_path)
     min_lr = config['model'].get('min_learning_rate', 0.00005)
+
+    # Jeśli trening od zera (model == None), zresetuj train_progress.csv i liczniki
+    if model is None:
+        train_csv_path = os.path.join(base_dir, config['paths']['train_csv_path'])
+        with open(train_csv_path, 'w', encoding='utf-8'):
+            pass  # nadpisz pustą zawartością
+        total_timesteps = 0
+        current_level = 0
+
+    # Zawsze resetuj logi kanałów na początku treningu (niezależnie czy kontynuacja czy nie)
+    if enable_channel_logs:
+        reset_channel_logs()
+        global channel_loggers
+        channel_loggers = init_channel_loggers()
 
     # Oblicz kroki dla każdego poziomu curriculum
     curriculum_steps = [n_envs * n_steps * multiplier for multiplier in curriculum_multipliers]
