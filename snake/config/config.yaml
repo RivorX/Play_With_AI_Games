@@ -16,16 +16,16 @@ environment:
 # Konfiguracja modelu PPO
 model:
   policy: CnnPolicy                  # Używamy CnnPolicy dla CNN
-  learning_rate: 0.0003              # Szybkość uczenia
+  learning_rate: 0.0002              # Szybkość uczenia 
   min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej tej wartości)
   n_steps: 2048                      # Liczba kroków na aktualizację
   batch_size: 2048                   # Rozmiar partii
-  n_epochs: 20                       # Liczba epok (więcej aktualizacji na batch)
+  n_epochs: 10                       # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.4                      # Współczynnik entropii
-  vf_coef: 5.0                       # Współczynnik funkcji wartości
+  vf_coef: 1.0                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   dropout_rate: 0.2                  # Współczynnik dropout w CNN
   policy_kwargs:
@@ -33,7 +33,7 @@ model:
       features_dim: 512
     net_arch:
       pi: [256, 128]  # dla aktora
-      vf: [512, 256, 128]  # dla krytyka
+      vf: [256, 128]  # dla krytyka
 
 # Konfiguracja treningu
 training:
