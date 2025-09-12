@@ -27,7 +27,6 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
-
 # Funkcja do resetowania plików logów kanałów
 def reset_channel_logs():
     log_dir = os.path.join(base_dir, 'logs')
@@ -41,8 +40,7 @@ def reset_channel_logs():
 def init_channel_loggers():
     loggers = {}
     log_dir = os.path.join(base_dir, 'logs')
-    for i, channel_name in enumerate([
-        'mapa', 'dx', 'dy', 'kierunek', 'grid_size', 'odleglosc']):
+    for i, channel_name in enumerate(['mapa', 'dx', 'dy', 'kierunek', 'grid_size', 'odleglosc']):
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         logger = logging.getLogger(f'channel_{i}')
         handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
@@ -243,8 +241,8 @@ def load_training_state(model_path, vec_norm_path, vec_norm_eval_path):
     env = None
     eval_env = None
     model = None
-    load_model = False
     use_config_hyperparams = True
+    load_model = False
 
     if os.path.exists(model_path):
         while True:
@@ -262,8 +260,7 @@ def load_training_state(model_path, vec_norm_path, vec_norm_eval_path):
             print("Proszę wpisać 'y', 'n' lub wcisnąć Enter (domyślnie 'Y').")
         use_config_hyperparams = response != 'n'
 
-    try:
-        if load_model and os.path.exists(model_path):
+        try:
             model = PPO.load(model_path)
             print(f"Wczytano model z {model_path}")
             if use_config_hyperparams:
@@ -276,29 +273,40 @@ def load_training_state(model_path, vec_norm_path, vec_norm_eval_path):
                 model.gae_lambda = config['model']['gae_lambda']
                 model.ent_coef = config['model']['ent_coef']
                 model.vf_coef = config['model']['vf_coef']
-                # clip_range zostanie ustawione przy inicjalizacji modelu w funkcji train
             else:
                 print("Używam hiperparametrów z wczytanego modelu")
-        if os.path.exists(vec_norm_path):
-            print(f"Wczytano VecNormalize dla env z {vec_norm_path}")
-        if os.path.exists(vec_norm_eval_path):
-            print(f"Wczytano VecNormalize dla eval_env z {vec_norm_eval_path}")
+            if os.path.exists(vec_norm_path):
+                env = VecNormalize.load(vec_norm_path, make_vec_env(make_env(render_mode=None, grid_size=config['training']['curriculum_grid_sizes'][0]), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv))
+                print(f"Wczytano VecNormalize dla env z {vec_norm_path}")
+            if os.path.exists(vec_norm_eval_path):
+                eval_env = VecNormalize.load(vec_norm_eval_path, make_vec_env(make_env(render_mode=None, grid_size=config['training']['curriculum_grid_sizes'][0]), n_envs=1, vec_env_cls=SubprocVecEnv))
+                print(f"Wczytano VecNormalize dla eval_env z {vec_norm_eval_path}")
+            state_path = os.path.join(base_dir, config['paths']['models_dir'], 'training_state.pkl')
+            if os.path.exists(state_path):
+                with open(state_path, 'rb') as f:
+                    state = pickle.load(f)
+                    total_timesteps = state['total_timesteps']
+                    current_level = state['current_level']
+                    print(f"Wczytano stan treningu: total_timesteps={total_timesteps}, current_level={current_level}")
+        except Exception as e:
+            print(f"Błąd podczas wczytywania stanu treningu: {e}")
+    else:
+        print("Rozpoczynanie treningu od zera.")
+        total_timesteps = 0
+        current_level = 0
+        # Resetowanie pliku training_state.pkl
         state_path = os.path.join(base_dir, config['paths']['models_dir'], 'training_state.pkl')
         if os.path.exists(state_path):
-            with open(state_path, 'rb') as f:
-                state = pickle.load(f)
-                total_timesteps = state['total_timesteps']
-                current_level = state['current_level']
-                print(f"Wczytano stan treningu: total_timesteps={total_timesteps}, current_level={current_level}")
-    except Exception as e:
-        print(f"Błąd podczas wczytywania stanu treningu: {e}")
-    return model, env, eval_env, total_timesteps, current_level, use_config_hyperparams
+            os.remove(state_path)
+            print(f"Usunięto plik stanu treningu: {state_path}")
+
+    return model, env, eval_env, total_timesteps, current_level, use_config_hyperparams, load_model
 
 # Główna funkcja treningu
 test_stop_event = None
 test_thread_handle = None
 
-def train(use_progress_bar=False):
+def train(use_progress_bar=False, load_model=False):
     global test_stop_event, test_thread_handle
     test_stop_event = threading.Event()
     test_started = False
@@ -320,14 +328,14 @@ def train(use_progress_bar=False):
     print_curriculum_schedule(curriculum_grid_sizes, curriculum_multipliers, n_envs, n_steps)
 
     # Wczytaj stan treningu, jeśli istnieje
-    model, env, eval_env, total_timesteps, current_level, use_config_hyperparams = load_training_state(model_path_absolute, vec_norm_path, vec_norm_eval_path)
+    model, env, eval_env, total_timesteps, current_level, use_config_hyperparams, load_model = load_training_state(model_path_absolute, vec_norm_path, vec_norm_eval_path)
     min_lr = config['model'].get('min_learning_rate', 0.00005)
 
     # Jeśli trening od zera (model == None), zresetuj train_progress.csv i liczniki
     if model is None:
         train_csv_path = os.path.join(base_dir, config['paths']['train_csv_path'])
-        with open(train_csv_path, 'w', encoding='utf-8'):
-            pass  # nadpisz pustą zawartością
+        with open(train_csv_path, 'w', encoding='utf-8') as f:
+            f.write('timesteps,mean_reward,mean_ep_length,current_level\n')
         total_timesteps = 0
         current_level = 0
 
@@ -381,13 +389,13 @@ def train(use_progress_bar=False):
             env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
         else:
             env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=n_envs, vec_env_cls=SubprocVecEnv)
-            env = VecNormalize.load(vec_norm_path, env) if os.path.exists(vec_norm_path) else VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+            env = VecNormalize.load(vec_norm_path, env) if os.path.exists(vec_norm_path) and load_model else VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
         if eval_env is None:
             eval_env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=1, vec_env_cls=SubprocVecEnv)
             eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
         else:
             eval_env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=1, vec_env_cls=SubprocVecEnv)
-            eval_env = VecNormalize.load(vec_norm_eval_path, eval_env) if os.path.exists(vec_norm_eval_path) else VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+            eval_env = VecNormalize.load(vec_norm_eval_path, eval_env) if os.path.exists(vec_norm_eval_path) and load_model else VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
         # Inicjalizacja modelu, jeśli nie wczytano
         if model is None:
@@ -412,7 +420,6 @@ def train(use_progress_bar=False):
         else:
             model.set_env(env)
             if use_config_hyperparams:
-                # Ponownie inicjalizujemy model z parametrami z configu
                 policy_kwargs = config['model']['policy_kwargs']
                 policy_kwargs['features_extractor_class'] = CustomCNN
                 model_new = PPO(
@@ -431,7 +438,6 @@ def train(use_progress_bar=False):
                     verbose=1,
                     device=config['model']['device']
                 )
-                # Wczytujemy zapisane wagi modelu
                 model_tmp = PPO.load(model_path_absolute)
                 model_new.policy.load_state_dict(model_tmp.policy.state_dict())
                 model = model_new
@@ -475,15 +481,7 @@ def train(use_progress_bar=False):
             if config['training']['enable_testing'] and not test_started:
                 test_thread_handle = threading.Thread(
                     target=test_thread,
-                    args=(
-                        model_path_absolute,
-                        test_model_path,
-                        test_log_path,
-                        test_csv_path,
-                        test_progress_path,
-                        grid_size,
-                        test_stop_event
-                    ),
+                    args=(model_path_absolute, test_model_path, test_log_path, test_csv_path, test_progress_path, grid_size, test_stop_event),
                     daemon=True
                 )
                 test_thread_handle.start()
@@ -555,12 +553,11 @@ def train(use_progress_bar=False):
                 logger.info(f"--- Koniec debug dla kontynuacji grid_size={grid_size} ---")
 
         env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=n_envs, vec_env_cls=SubprocVecEnv)
-        env = VecNormalize.load(vec_norm_path, env) if os.path.exists(vec_norm_path) else VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+        env = VecNormalize.load(vec_norm_path, env) if os.path.exists(vec_norm_path) and load_model else VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
         eval_env = make_vec_env(make_env(render_mode=None, grid_size=grid_size), n_envs=1, vec_env_cls=SubprocVecEnv)
-        eval_env = VecNormalize.load(vec_norm_eval_path, eval_env) if os.path.exists(vec_norm_eval_path) else VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+        eval_env = VecNormalize.load(vec_norm_eval_path, eval_env) if os.path.exists(vec_norm_eval_path) and load_model else VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
         model.set_env(env)
-        if use_config_hyperparams:
-            # Ponownie inicjalizujemy model z parametrami z configu
+        if use_config_hyperparams and model is not None:
             policy_kwargs = config['model']['policy_kwargs']
             policy_kwargs['features_extractor_class'] = CustomCNN
             model_new = PPO(
@@ -579,7 +576,6 @@ def train(use_progress_bar=False):
                 verbose=1,
                 device=config['model']['device']
             )
-            # Wczytujemy zapisane wagi modelu
             model_tmp = PPO.load(model_path_absolute)
             model_new.policy.load_state_dict(model_tmp.policy.state_dict())
             model = model_new
