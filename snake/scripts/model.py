@@ -171,14 +171,11 @@ class SnakeEnv(gym.Env):
         reward = 0
         self.done = False
 
-
-
-
         # Kara za każdy krok
         reward -= 0.02
 
         # Nagroda za przeżycie kolejnego kroku
-        reward += 0.01
+        reward += 0.02
 
         # Kara za bycie blisko własnego ciała (sąsiadujące pola wokół głowy)
         neighbors = [
@@ -192,7 +189,7 @@ class SnakeEnv(gym.Env):
             if 0 <= n[0] < self.grid_size and 0 <= n[1] < self.grid_size:
                 if list(n) in self.snake:
                     close_body += 1
-        reward -= 0.05 * close_body  # kara za każdy sąsiadujący segment ciała
+        reward -= 0.02 * close_body  # kara za każdy sąsiadujący segment ciała
 
         # Kara za bycie w pułapce (głowa otoczona przez ciało lub ścianę z 3 stron)
         trap_count = 0
