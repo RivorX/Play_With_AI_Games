@@ -14,6 +14,9 @@ base_dir = os.path.dirname(os.path.dirname(__file__))
 log_dir = os.path.join(base_dir, 'logs')
 os.makedirs(log_dir, exist_ok=True)
 debug_log_path = os.path.join(log_dir, 'debug.log')
+# Resetuj plik debug.log na starcie
+with open(debug_log_path, 'w', encoding='utf-8'):
+    pass
 
 logging.basicConfig(
     filename=debug_log_path,
