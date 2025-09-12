@@ -25,7 +25,7 @@ model:
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.4                      # Współczynnik entropii
-  vf_coef: 1.0                       # Współczynnik funkcji wartości
+  vf_coef: 5.0                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   dropout_rate: 0.2                  # Współczynnik dropout w CNN
   policy_kwargs:
