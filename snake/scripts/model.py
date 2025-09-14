@@ -204,16 +204,12 @@ class SnakeEnv(gym.Env):
 
         # Nagroda/kara za zmianę odległości do jabłka (łagodniejsza)
         new_dist = (abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])) / (2 * denom)
-        if new_dist < prev_dist:
-            reward += 0.1
-        elif new_dist > prev_dist:
-            reward -= 0.1
+        reward += 0.2 * (prev_dist - new_dist)  # Proporcjonalna nagroda za zmniejszenie odległości
 
         # Kara za powtarzanie stanów (pętlenie się) - mocniejsza
         state_hash = (tuple(head.tolist()), self.direction, len(self.snake))
         self.state_counter[state_hash] = self.state_counter.get(state_hash, 0) + 1
-        if self.state_counter[state_hash] > 3:
-            reward -= 2.0
+        reward -= 0.5 * self.state_counter[state_hash]  # Kara rośnie z liczbą powtórek
 
         # Kara za zbyt długie niejedzenie jabłka (łagodniejsza)
         max_steps_without_food = config['environment'].get('max_steps_without_food', 80) * self.grid_size

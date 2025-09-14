@@ -10,6 +10,28 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation block: lekka attention na kanałach.
+    Wejście: (batch, channels, H, W)
+    Wyjście: to samo, ale z ważonymi kanałami.
+    """
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)  # Global average pooling: ściska HxW do 1x1
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()  # Wagi między 0-1
+        )
+
+    def forward(self, x):
+        batch, ch, _, _ = x.shape
+        y = self.squeeze(x).view(batch, ch)  # Squeeze: średnia po przestrzennych wymiarach
+        y = self.excitation(y).view(batch, ch, 1, 1)  # Excitation: oblicz wagi
+        return x * y.expand_as(x)  # Mnożymy wagi przez oryginalne feature maps
+
 class CustomCNN(BaseFeaturesExtractor):
     """
     Niestandardowa sieć CNN do ekstrakcji cech z mapy gry o stałym rozmiarze 16x16.
@@ -47,15 +69,18 @@ class CustomCNN(BaseFeaturesExtractor):
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
             leaky_relu,
+            SEBlock(32),  # Dodano SEBlock po pierwszej warstwie konwolucyjnej
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
             leaky_relu,
-            # Blok residualny na 64 kanałach
             ResidualBlock(64),
+            SEBlock(64),  # Dodano SEBlock po ResidualBlock
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
             leaky_relu,
+            SEBlock(128),  # Dodano SEBlock po trzeciej warstwie konwolucyjnej
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             leaky_relu,
+            SEBlock(256),  # Dodano SEBlock po czwartej warstwie konwolucyjnej
             nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
         )
