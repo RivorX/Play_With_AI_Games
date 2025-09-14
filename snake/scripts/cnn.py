@@ -40,8 +40,8 @@ class CustomCNN(BaseFeaturesExtractor):
     """
     def __init__(self, observation_space, features_dim=512):
         super(CustomCNN, self).__init__(observation_space, features_dim)
-        # stack_size = 4, channels = 10 (6 podstawowych + 4 historia kierunków)
-        in_channels = 4 * 10
+        # stack_size = 4, channels = 6 (bez historii kierunków, FrameStack zapewnia historię)
+        in_channels = 4 * 6
         dropout_rate = config['model'].get('dropout_rate', 0.2)  # Pobierz dropout_rate z configu
         leaky_relu = nn.LeakyReLU(negative_slope=0.01)
 

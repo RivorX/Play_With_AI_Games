@@ -28,17 +28,16 @@ class SnakeEnv(gym.Env):
         super(SnakeEnv, self).__init__()
         self.grid_size = grid_size if grid_size is not None else config['environment']['grid_size']
         self.render_mode = render_mode
-        # Stała przestrzeń obserwacji: 4 ramki x 16x16 x 6 kanałów + 4 ostatnie kierunki
+        # Stała przestrzeń obserwacji: 16x16x6 kanałów (FrameStack zapewnia historię)
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 6 + 4),
+            shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 6),
             dtype=np.float32
         )
         self.action_space = spaces.Discrete(config['environment']['action_space']['n'])
         self.steps_without_food = 0
         self.state_counter = {}
-        self.last_directions = collections.deque([0, 0, 0, 0], maxlen=4)  # historia 4 ostatnich kierunków
         self.reset()
         if render_mode == "human":
             pygame.init()
@@ -47,7 +46,10 @@ class SnakeEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.snake = collections.deque([[self.grid_size // 2, self.grid_size // 2]])
+        # Losowa pozycja startowa węża, min 1 kratka od ścian
+        head_x = np.random.randint(1, self.grid_size - 1)
+        head_y = np.random.randint(1, self.grid_size - 1)
+        self.snake = collections.deque([[head_x, head_y]])
         self.direction = 1  # Domyślny kierunek: dół
         self.food = self._place_food()
         self.done = False
@@ -55,7 +57,6 @@ class SnakeEnv(gym.Env):
         self.total_reward = 0
         self.steps_without_food = 0
         self.state_counter = {}
-        self.last_directions = collections.deque([0, 0, 0, 0], maxlen=4)
         if self.render_mode == "human":
             self.screen = pygame.display.set_mode((self.grid_size * SNAKE_SIZE, self.grid_size * SNAKE_SIZE))
             pygame.display.set_caption("Snake")
@@ -125,17 +126,8 @@ class SnakeEnv(gym.Env):
                 distance_channel[x, y] = min(distance / self.grid_size, 1.0)
         distance_channel = zoom(distance_channel, zoom_factor, order=1)  # order=1 dla odległości
 
-        # Nowe kanały: historia ostatnich 4 kierunków (każdy jako osobny kanał, wartość w pozycji głowy)
-        direction_history_channels = []
-        for d in self.last_directions:
-            ch = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-            if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
-                ch[head[0], head[1]] = (d + 1) / 4.0  # tak jak w dir_channel
-            direction_history_channels.append(zoom(ch, zoom_factor, order=0))
-
         obs = np.stack([
-            active_state, direction_channel, direction_channel_y, dir_channel, size_channel, distance_channel,
-            *direction_history_channels
+            active_state, direction_channel, direction_channel_y, dir_channel, size_channel, distance_channel
         ], axis=-1)
         return obs
 
@@ -164,11 +156,16 @@ class SnakeEnv(gym.Env):
         denom = max(1, self.grid_size - 1)
         prev_dist = (abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])) / (2 * denom)
         # Aktualizacja kierunku
-        self.direction = (self.direction + (action - 1)) % 4
-        self.last_directions.append(self.direction)
-        head = self.snake[0] + DIRECTIONS[self.direction]
-        self.steps += 1
+        next_direction = (self.direction + (action - 1)) % 4
+        next_head = self.snake[0] + DIRECTIONS[next_direction]
         reward = 0
+        # Prewencyjna kara za potencjalną kolizję (jeśli nowa głowa będzie w ciele, poza bieżącą głową)
+        if list(next_head) in list(self.snake)[1:]:
+            # Kara prewencyjna, ale nie kończymy gry
+            reward -= 0.5
+        self.direction = next_direction
+        head = next_head
+        self.steps += 1
         self.done = False
 
         # Kara za każdy krok
