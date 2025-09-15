@@ -35,13 +35,13 @@ class SEBlock(nn.Module):
 class CustomCNN(BaseFeaturesExtractor):
     """
     Niestandardowa sieć CNN do ekstrakcji cech z mapy gry o stałym rozmiarze 16x16.
-    Wejście: (batch_size, stack_size, 16, 16, channels) - mapa z 4 ramkami x 7 kanałami.
+    Wejście: (batch_size, stack_size, 16, 16, channels) - mapa z 4 ramkami x 5 kanałami.
     Wyjście: wektor cech o wymiarze features_dim.
     """
     def __init__(self, observation_space, features_dim=512):
         super(CustomCNN, self).__init__(observation_space, features_dim)
-        # stack_size = 4, channels = 6 (bez historii kierunków, FrameStack zapewnia historię)
-        in_channels = 4 * 6
+        # stack_size = 4, channels = 5
+        in_channels = 4 * 5
         dropout_rate = config['model'].get('dropout_rate', 0.2)  # Pobierz dropout_rate z configu
         leaky_relu = nn.LeakyReLU(negative_slope=0.01)
 
