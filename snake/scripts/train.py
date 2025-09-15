@@ -31,7 +31,7 @@ with open(config_path, 'r') as f:
 def reset_channel_logs():
     log_dir = os.path.join(base_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
-    for channel_name in ['mapa', 'dx', 'dy', 'kierunek', 'grid_size', 'odleglosc']:
+    for channel_name in ['mapa', 'dx', 'dy', 'kierunek', 'grid_size']:
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         with open(log_path, 'w', encoding='utf-8'):
             pass  # nadpisz plik pustą zawartością
@@ -40,7 +40,7 @@ def reset_channel_logs():
 def init_channel_loggers():
     loggers = {}
     log_dir = os.path.join(base_dir, 'logs')
-    for i, channel_name in enumerate(['mapa', 'dx', 'dy', 'kierunek', 'grid_size', 'odleglosc']):
+    for i, channel_name in enumerate(['mapa', 'dx', 'dy', 'kierunek', 'grid_size']):
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         logger = logging.getLogger(f'channel_{i}')
         handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
@@ -66,8 +66,7 @@ def log_observation(obs, channel_loggers, grid_size, step):
         'dx': latest_frame[:, :, 1],
         'dy': latest_frame[:, :, 2],
         'kierunek': latest_frame[:, :, 3],
-        'grid_size': latest_frame[:, :, 4],
-        'odleglosc': latest_frame[:, :, 5] if latest_frame.shape[-1] > 5 else None
+        'grid_size': latest_frame[:, :, 4]
     }
     mapa = kanały['mapa']
     head_pos = np.where(mapa == 1.0)
@@ -89,7 +88,7 @@ def log_observation(obs, channel_loggers, grid_size, step):
         distance = float('inf')
     for channel_name, arr in kanały.items():
         logger = channel_loggers.get(channel_name)
-        if logger is None or arr is None:
+        if logger is None:
             continue
         logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
         logger.info(f"Kanał {channel_name}:\n{np.array_str(arr, precision=2, suppress_small=True, max_line_width=120)}")
@@ -101,8 +100,6 @@ def log_observation(obs, channel_loggers, grid_size, step):
             logger.info(f"dy w pozycji głowy: {dy}")
         if channel_name == 'kierunek':
             logger.info(f"Kierunek węża (0-lewo,1-dół,2-prawo,3-góra): {kierunek}")
-        if channel_name == 'odleglosc':
-            logger.info(f"Odległość Manhattan: {distance}")
         logger.info("-" * 60)
 
 # Harmonogram liniowy learning rate
