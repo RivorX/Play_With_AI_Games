@@ -76,13 +76,13 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
 
         scalar_dim = 4  # direction, grid_size, dx_head, dy_head
         self.scalar_linear = nn.Sequential(
-            nn.Linear(scalar_dim, 32),
+            nn.Linear(scalar_dim, 128),  # Zwiększono z 32 do 128
             nn.LeakyReLU(0.01),
             nn.Dropout(dropout_rate)
         )
 
         cnn_dim = 256 * 4 * 4
-        total_dim = cnn_dim + 32
+        total_dim = cnn_dim + 128  # Zaktualizowano z 32 na 128
         self.final_linear = nn.Sequential(
             nn.Linear(total_dim, features_dim),
             nn.LeakyReLU(0.01),
