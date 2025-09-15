@@ -28,7 +28,6 @@ class DictFrameStack(gym.Wrapper):
         self.stack_size = stack_size
         self.image_stack = collections.deque(maxlen=stack_size)
         image_space = self.env.observation_space['image']
-        # Poprawiona przestrzeń obserwacji dla stackowanego obrazu
         stacked_image_space = spaces.Box(
             low=image_space.low.min(),
             high=image_space.high.max(),
@@ -45,14 +44,12 @@ class DictFrameStack(gym.Wrapper):
 
     def reset(self, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
-        # Inicjalizacja stosu ramek z zerami
         self.image_stack.clear()
         for _ in range(self.stack_size - 1):
             self.image_stack.append(np.zeros_like(obs['image']))
         self.image_stack.append(obs['image'])
-        # Konwersja do formatu [C, H, W]
-        stacked_image = np.concatenate(list(self.image_stack), axis=-1)  # [H, W, C*stack_size]
-        stacked_image = np.transpose(stacked_image, (2, 0, 1))  # [C*stack_size, H, W]
+        stacked_image = np.concatenate(list(self.image_stack), axis=-1)
+        stacked_image = np.transpose(stacked_image, (2, 0, 1))
         new_obs = {
             'image': stacked_image,
             'direction': obs['direction'],
@@ -65,9 +62,8 @@ class DictFrameStack(gym.Wrapper):
     def step(self, action):
         obs, reward, done, truncated, info = self.env.step(action)
         self.image_stack.append(obs['image'])
-        # Konwersja do formatu [C, H, W]
-        stacked_image = np.concatenate(list(self.image_stack), axis=-1)  # [H, W, C*stack_size]
-        stacked_image = np.transpose(stacked_image, (2, 0, 1))  # [C*stack_size, H, W]
+        stacked_image = np.concatenate(list(self.image_stack), axis=-1)
+        stacked_image = np.transpose(stacked_image, (2, 0, 1))
         new_obs = {
             'image': stacked_image,
             'direction': obs['direction'],
@@ -81,142 +77,109 @@ class SnakeEnv(gym.Env):
     def __init__(self, render_mode=None, grid_size=None):
         super(SnakeEnv, self).__init__()
         self.render_mode = render_mode
-        self.default_grid_size = grid_size
-        self.grid_size = grid_size if grid_size is not None else np.random.randint(
-            config['environment']['min_grid_size'], 
-            config['environment']['max_grid_size'] + 1
-        )
-        # Przestrzeń obserwacji jako Dict: obraz (1 kanał: mapa) + skalary
+        self.default_grid_size = grid_size if grid_size is not None else config['environment']['max_grid_size']
+        self.grid_size = self.default_grid_size
+        self.action_space = spaces.Discrete(config['environment']['action_space']['n'])
         self.observation_space = spaces.Dict({
             'image': spaces.Box(
-                low=-1.0,
-                high=1.0,
-                shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 1),  # Tylko mapa [H, W, 1]
-                dtype=np.float32
+                low=config['environment']['observation_space']['low'],
+                high=config['environment']['observation_space']['high'],
+                shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 1),
+                dtype=config['environment']['observation_space']['dtype']
             ),
-            'direction': spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
-            'grid_size': spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
-            'dx_head': spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
-            'dy_head': spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+            'direction': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
+            'grid_size': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
+            'dx_head': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
+            'dy_head': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
         })
-        self.action_space = spaces.Discrete(config['environment']['action_space']['n'])
+        self.snake = None
+        self.food = None
+        self.direction = None
+        self.screen = None
+        self.clock = None
+        self.steps = 0
         self.steps_without_food = 0
+        self.total_reward = 0
         self.state_counter = {}
-        self.reset()
-        if render_mode == "human":
+        self.done = False
+        self.min_dist = float('inf')  # Śledzenie minimalnego dystansu do jedzenia
+        if self.render_mode == "human":
             pygame.init()
-            self.screen = None
+            self.screen = pygame.display.set_mode((self.grid_size * SNAKE_SIZE, self.grid_size * SNAKE_SIZE))
             self.clock = pygame.time.Clock()
 
     def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        if self.default_grid_size is None:
-            self.grid_size = np.random.randint(
-                config['environment']['min_grid_size'], 
-                config['environment']['max_grid_size'] + 1
-            )
-        head_x = np.random.randint(1, self.grid_size - 1)
-        head_y = np.random.randint(1, self.grid_size - 1)
-        self.snake = collections.deque([[head_x, head_y]])
-        self.direction = 1
+        if seed is not None:
+            np.random.seed(seed)
+        self.grid_size = self.default_grid_size if self.default_grid_size is not None else np.random.randint(
+            config['environment']['min_grid_size'], config['environment']['max_grid_size'] + 1)
+        self.snake = collections.deque([[self.grid_size // 2, self.grid_size // 2]])
         self.food = self._place_food()
-        self.done = False
+        self.direction = np.random.randint(0, 4)
         self.steps = 0
-        self.total_reward = 0
         self.steps_without_food = 0
+        self.total_reward = 0
         self.state_counter = {}
-        if self.render_mode == "human":
-            self.screen = pygame.display.set_mode((self.grid_size * SNAKE_SIZE, self.grid_size * SNAKE_SIZE))
-            pygame.display.set_caption("Snake")
-        obs = self._get_obs()
-        return obs, {}
+        self.done = False
+        self.min_dist = float('inf')  # Resetuj minimalny dystans
+        return self._get_obs(), {"score": 0, "total_reward": 0, "grid_size": self.grid_size}
 
     def _place_food(self):
-        while True:
-            food = np.random.randint(0, self.grid_size, size=2)
-            if list(food) not in self.snake:
-                return food
+        available_positions = [[i, j] for i in range(self.grid_size) for j in range(self.grid_size)
+                              if [i, j] not in self.snake]
+        if not available_positions:
+            return None
+        return np.array(available_positions[np.random.randint(0, len(available_positions))])
+
+    def _is_collision(self, head):
+        return (head[0] < 0 or head[0] >= self.grid_size or
+                head[1] < 0 or head[1] >= self.grid_size or
+                head.tolist() in list(self.snake)[1:])
+
+    def _get_render_state(self):
+        state = np.zeros((self.grid_size, self.grid_size, 1), dtype=np.float32)
+        for i, segment in enumerate(self.snake):
+            state[segment[0], segment[1], 0] = 1 if i == 0 else 2
+        if self.food is not None:
+            state[self.food[0], self.food[1], 0] = 3
+        return state
 
     def _get_obs(self):
         active_state = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        for segment in list(self.snake)[1:]:
+        for segment in self.snake:
             if 0 <= segment[0] < self.grid_size and 0 <= segment[1] < self.grid_size:
                 active_state[segment[0], segment[1]] = 0.5
-        if 0 <= self.food[0] < self.grid_size and 0 <= self.food[1] < self.grid_size:
-            active_state[self.food[0], self.food[1]] = 0.75
         head = self.snake[0]
-        if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
-            active_state[head[0], head[1]] = 1.0
-        else:
-            print(f"Warning: Invalid head position: {head}")
-        zoom_factor = FIXED_OBS_SIZE / self.grid_size
-        active_state = zoom(active_state, zoom_factor, order=0)
-
-        # Obliczanie dx_head i dy_head
+        active_state[head[0], head[1]] = 1.0
+        if self.food is not None:
+            active_state[self.food[0], self.food[1]] = 0.75
+        if self.grid_size != FIXED_OBS_SIZE:
+            scale_factor = FIXED_OBS_SIZE / self.grid_size
+            active_state = zoom(active_state, scale_factor, order=0)
+        active_state = active_state[:, :, np.newaxis]
         denom = max(1, self.grid_size - 1)
-        dx_head = (self.food[0] - head[0]) / denom
-        dy_head = (self.food[1] - head[1]) / denom
-
-        image = active_state[..., np.newaxis]  # [H, W, 1]
-
-        obs = {
-            'image': image,
+        return {
+            'image': active_state,
             'direction': np.array([(self.direction + 1) / 4.0], dtype=np.float32),
             'grid_size': np.array([self.grid_size / 16.0], dtype=np.float32),
-            'dx_head': np.array([dx_head], dtype=np.float32),
-            'dy_head': np.array([dy_head], dtype=np.float32)
+            'dx_head': np.array([(self.food[0] - head[0]) / denom], dtype=np.float32),
+            'dy_head': np.array([(self.food[1] - head[1]) / denom], dtype=np.float32)
         }
-        return obs
-
-    def _get_render_state(self):
-        state = np.zeros((self.grid_size, self.grid_size, 3), dtype=np.float32)
-        for segment in self.snake:
-            state[segment[0], segment[1], 0] = 1
-        state[self.snake[0][0], self.snake[0][1], 0] = 2
-        state[self.food[0], self.food[1], 0] = 3
-        state[self.snake[0][0], self.snake[0][1], 1] = self.direction
-        for x in range(self.grid_size):
-            for y in range(self.grid_size):
-                distance = abs(x - self.food[0]) + abs(y - self.food[1])
-                state[x, y, 2] = min(distance / self.grid_size, 1.0)
-        return state
-
-    def _is_collision(self, point):
-        if point[0] < 0 or point[0] >= self.grid_size or point[1] < 0 or point[1] >= self.grid_size:
-            return 1
-        if list(point) in self.snake:
-            return 1
-        return 0
 
     def step(self, action):
-        head = np.array(self.snake[0])
-        denom = max(1, self.grid_size - 1)
-        prev_dist = (abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])) / (2 * denom)
-        next_direction = (self.direction + (action - 1)) % 4
-        next_head = head + DIRECTIONS[next_direction]
-        reward = 0
-        if list(next_head) in list(self.snake)[1:]:
-            reward -= 0.5
-        self.direction = next_direction
-        head = next_head
         self.steps += 1
-        self.done = False
-
-        reward -= 0.02
-        reward += 0.02
-
-        neighbors = [
-            [head[0] + 1, head[1]],
-            [head[0] - 1, head[1]],
-            [head[0], head[1] + 1],
-            [head[0], head[1] - 1]
-        ]
+        prev_dist = abs(self.snake[0][0] - self.food[0]) + abs(self.snake[0][1] - self.food[1])
+        
+        # Bazowa nagroda (brak kary za krok)
+        reward = 0.0
         close_body = 0
+        head = np.array(self.snake[0])
+        neighbors = head + np.array([[-1, 0], [1, 0], [0, -1], [0, 1]])
         for n in neighbors:
             if 0 <= n[0] < self.grid_size and 0 <= n[1] < self.grid_size:
                 if list(n) in self.snake:
                     close_body += 1
-        reward -= 0.02 * close_body
+        reward -= 0.01 * close_body  # Zmniejszona kara za bliskość ciała
 
         trap_count = 0
         for n in neighbors:
@@ -226,11 +189,38 @@ class SnakeEnv(gym.Env):
             else:
                 trap_count += 1
         if trap_count >= 3:
-            reward -= 1.0
+            reward -= 0.5  # Zmniejszona kara za pułapkę
 
-        new_dist = (abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])) / (2 * denom)
-        reward += 0.2 * (prev_dist - new_dist)
+        # Aktualizacja kierunku przed ruchem
+        if action == 0:  # kontynuuj
+            pass
+        elif action == 1:  # skręć w lewo
+            self.direction = (self.direction - 1) % 4
+        elif action == 2:  # skręć w prawo
+            self.direction = (self.direction + 1) % 4
 
+        # Ruch węża
+        head = np.array(self.snake[0])
+        if self.direction == 0:  # lewo
+            head[1] -= 1
+        elif self.direction == 1:  # dół
+            head[0] += 1
+        elif self.direction == 2:  # prawo
+            head[1] += 1
+        elif self.direction == 3:  # góra
+            head[0] -= 1
+
+        # Oblicz nowy dystans Manhattan
+        new_dist = abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])
+        
+        # Nagroda za zbliżenie się do jedzenia
+        if new_dist < prev_dist:
+            reward += 0.1  # Nagroda za zmniejszenie dystansu
+            if new_dist < self.min_dist:
+                self.min_dist = new_dist
+                reward += 1.0  # Dodatkowa nagroda za pobicie rekordu zbliżenia
+
+        # Kara za powtarzanie stanów
         state_hash = (tuple(head.tolist()), self.direction, len(self.snake))
         self.state_counter[state_hash] = self.state_counter.get(state_hash, 0) + 1
         reward -= 0.5 * self.state_counter[state_hash]
@@ -257,6 +247,7 @@ class SnakeEnv(gym.Env):
                 reward += bonus
                 self.steps_without_food = 0
                 self.state_counter = {}
+                self.min_dist = float('inf')  # Resetuj minimalny dystans po zjedzeniu
             else:
                 self.snake.pop()
                 self.steps_without_food += 1
