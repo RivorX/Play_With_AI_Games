@@ -54,16 +54,14 @@ def test_snake_model(model_path, grid_size, episodes):
         logging.info(f"\nEpizod {episode + 1}")
 
         while not done:
-            # Wybierz najnowszą ramkę z FrameStack (indeks 0)
-            latest_frame = obs[0]  # shape: (height, width, channels)
+            # Wybierz najnowszą ramkę z FrameStack (ostatni kanał)
+            mapa = obs['image'][-1, :, :]  # [H, W], kanał mapa z ostatniej ramki
 
-            # Wyodrębnij kanały z najnowszej ramki
-            mapa = latest_frame[:, :, 0]  # Kanał 0: mapa
-            dx_channel = latest_frame[:, :, 1]  # Kanał 1: dx
-            dy_channel = latest_frame[:, :, 2]  # Kanał 2: dy
-            dir_channel = latest_frame[:, :, 3]  # Kanał 3: kierunek
-            size_channel = latest_frame[:, :, 4]  # Kanał 4: grid_size
-            distance_channel = latest_frame[:, :, 5] if latest_frame.shape[-1] > 5 else None  # Kanał 5: odległość
+            # Wyodrębnij skalary
+            direction = obs['direction'][0]
+            grid_size_val = obs['grid_size'][0]
+            dx_head = obs['dx_head'][0]
+            dy_head = obs['dy_head'][0]
 
             # Znajdź pozycję głowy i jedzenia w mapie
             head_pos = np.where(mapa == 1.0)
@@ -77,11 +75,6 @@ def test_snake_model(model_path, grid_size, episodes):
             else:
                 food_x, food_y = -1, -1
 
-            # Wyodrębnij wartości dx, dy, kierunek w pozycji głowy
-            dx = dx_channel[head_x, head_y] if head_x >= 0 else None
-            dy = dy_channel[head_x, head_y] if head_x >= 0 else None
-            kierunek = dir_channel[head_x, head_y] if head_x >= 0 else None
-
             # Oblicz odległość Manhattan
             if head_x >= 0 and food_x >= 0:
                 distance = abs(head_x - food_x) + abs(head_y - food_y)
@@ -90,16 +83,15 @@ def test_snake_model(model_path, grid_size, episodes):
 
             # Zapisz informacje debugowania do pliku
             logging.info("--- Obserwacja (fragment) ---")
-            logging.info(f"Kanał 0 (mapa):\n{np.array_str(mapa, precision=2, suppress_small=True, max_line_width=120)}")
-            logging.info(f"Kanał 1 (dx):\n{np.array_str(dx_channel, precision=2, suppress_small=True, max_line_width=120)}")
-            logging.info(f"Kanał 2 (dy):\n{np.array_str(dy_channel, precision=2, suppress_small=True, max_line_width=120)}")
-            logging.info(f"Kanał 3 (kierunek):\n{np.array_str(dir_channel, precision=2, suppress_small=True, max_line_width=120)}")
-            logging.info(f"Kanał 4 (grid_size):\n{np.array_str(size_channel, precision=2, suppress_small=True, max_line_width=120)}")
-            if distance_channel is not None:
-                logging.info(f"Kanał 5 (odległość Manhattan):\n{np.array_str(distance_channel, precision=2, suppress_small=True, max_line_width=120)}")
+            logging.info(f"Kanał mapa:\n{np.array_str(mapa, precision=2, suppress_small=True, max_line_width=120)}")
+            logging.info(f"Direction: {direction}")
+            logging.info(f"Grid_size: {grid_size_val}")
+            logging.info(f"dx_head: {dx_head}")
+            logging.info(f"dy_head: {dy_head}")
             logging.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
-            logging.info(f"Wektor do jedzenia: dx={dx}, dy={dy} | Kierunek węża (0-lewo,1-dół,2-prawo,3-góra): {kierunek}")
+            logging.info(f"Dystans Manhattan: {distance}")
             logging.info(f"Stan gry: done={done}, steps={steps}, snake={env.env.snake}, food={env.env.food}")
+            logging.info("-" * 60)
 
             # Wykonaj akcję
             action, _ = model.predict(obs, deterministic=True)
@@ -108,7 +100,7 @@ def test_snake_model(model_path, grid_size, episodes):
             steps += 1
             env.render()
 
-            logging.info(f"Krok: {steps}, Wynik: {info['score']}, Nagroda: {total_reward}, Odległość: {distance}")
+            logging.info(f"Krok: {steps}, Wynik: {info['score']}, Nagroda: {total_reward}, Akcja: {action}")
             logging.info("-" * 60)
 
             # Obsługa zdarzeń Pygame
