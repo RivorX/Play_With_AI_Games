@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import yaml
+from gymnasium import spaces
 import os
 
 # Wczytaj konfigurację
@@ -11,41 +12,29 @@ with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
 class SEBlock(nn.Module):
-    """
-    Squeeze-and-Excitation block: lekka attention na kanałach.
-    Wejście: (batch, channels, H, W)
-    Wyjście: to samo, ale z ważonymi kanałami.
-    """
     def __init__(self, channels, reduction=16):
         super().__init__()
-        self.squeeze = nn.AdaptiveAvgPool2d(1)  # Global average pooling: ściska HxW do 1x1
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
         self.excitation = nn.Sequential(
             nn.Linear(channels, channels // reduction, bias=False),
             nn.ReLU(inplace=True),
             nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid()  # Wagi między 0-1
+            nn.Sigmoid()
         )
 
     def forward(self, x):
         batch, ch, _, _ = x.shape
-        y = self.squeeze(x).view(batch, ch)  # Squeeze: średnia po przestrzennych wymiarach
-        y = self.excitation(y).view(batch, ch, 1, 1)  # Excitation: oblicz wagi
-        return x * y.expand_as(x)  # Mnożymy wagi przez oryginalne feature maps
+        y = self.squeeze(x).view(batch, ch)
+        y = self.excitation(y).view(batch, ch, 1, 1)
+        return x * y.expand_as(x)
 
-class CustomCNN(BaseFeaturesExtractor):
-    """
-    Niestandardowa sieć CNN do ekstrakcji cech z mapy gry o stałym rozmiarze 16x16.
-    Wejście: (batch_size, stack_size, 16, 16, channels) - mapa z 4 ramkami x 5 kanałami.
-    Wyjście: wektor cech o wymiarze features_dim.
-    """
-    def __init__(self, observation_space, features_dim=512):
-        super(CustomCNN, self).__init__(observation_space, features_dim)
-        # stack_size = 4, channels = 5
-        in_channels = 4 * 5
-        dropout_rate = config['model'].get('dropout_rate', 0.2)  # Pobierz dropout_rate z configu
+class CustomFeaturesExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space: spaces.Dict, features_dim=512):
+        super().__init__(observation_space, features_dim)
+        in_channels = 4 * 1  # 4 ramki × 1 kanał (mapa)
+        dropout_rate = config['model'].get('dropout_rate', 0.2)
         leaky_relu = nn.LeakyReLU(negative_slope=0.01)
 
-        # Blok residualny (ResNet-like) po 2 warstwie konwolucyjnej
         class ResidualBlock(nn.Module):
             def __init__(self, channels):
                 super().__init__()
@@ -69,57 +58,50 @@ class CustomCNN(BaseFeaturesExtractor):
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
             leaky_relu,
-            SEBlock(32),  # Dodano SEBlock po pierwszej warstwie konwolucyjnej
+            SEBlock(32),
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
             leaky_relu,
             ResidualBlock(64),
-            SEBlock(64),  # Dodano SEBlock po ResidualBlock
+            SEBlock(64),
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
             leaky_relu,
-            SEBlock(128),  # Dodano SEBlock po trzeciej warstwie konwolucyjnej
+            SEBlock(128),
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             leaky_relu,
-            SEBlock(256),  # Dodano SEBlock po czwartej warstwie konwolucyjnej
+            SEBlock(256),
             nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
         )
-        with torch.no_grad():
-            sample = torch.as_tensor(observation_space.sample()[None]).float()
-            processed = self._process_sample(sample)
-            n_flatten = self.cnn(processed).shape[1]
-        self.linear = nn.Sequential(
-            nn.Linear(n_flatten, features_dim),
-            nn.LeakyReLU(0.01),
-            nn.Dropout(dropout_rate),
-            nn.Linear(features_dim, features_dim),
+
+        scalar_dim = 4  # direction, grid_size, dx_head, dy_head
+        self.scalar_linear = nn.Sequential(
+            nn.Linear(scalar_dim, 32),
             nn.LeakyReLU(0.01),
             nn.Dropout(dropout_rate)
         )
 
-    def _process_sample(self, observations):
-        batch_size = observations.shape[0]
-        observations = observations.permute(0, 1, 4, 2, 3)  # (batch_size, stack_size, C, H, W)
-        observations = observations.reshape(batch_size, -1, observations.shape[3], observations.shape[4])
-        return observations
+        cnn_dim = 256 * 4 * 4
+        total_dim = cnn_dim + 32
+        self.final_linear = nn.Sequential(
+            nn.Linear(total_dim, features_dim),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(dropout_rate)
+        )
 
     def forward(self, observations):
-        # Użyj AMP (bfloat16 jeśli dostępne), ale zawsze zwracaj float32
-        use_amp = torch.is_autocast_enabled() or (torch.cuda.is_available() and observations.is_cuda)
-        # Sprawdź czy karta obsługuje bfloat16
-        use_bfloat16 = False
-        if use_amp and torch.cuda.is_available():
-            cap = torch.cuda.get_device_capability()
-            # Ampere (8.0+) i nowsze obsługują bfloat16
-            if cap[0] >= 8:
-                use_bfloat16 = True
-        if use_amp:
-            dtype = torch.bfloat16 if use_bfloat16 else torch.float16
-            with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                processed = self._process_sample(observations)
-                out = self.linear(self.cnn(processed))
-                return out.to(torch.float32)
-        else:
-            processed = self._process_sample(observations)
-            out = self.linear(self.cnn(processed))
-            return out.to(torch.float32)
+        image = observations['image']
+        # Upewnij się, że obraz jest w formacie [batch, channels, height, width]
+        if image.shape[1] != 4:  # Sprawdzenie, czy kanały są pierwsze
+            image = image.permute(0, 3, 1, 2)  # [batch, H, W, C] -> [batch, C, H, W]
+        scalars = torch.cat([
+            observations['direction'],
+            observations['grid_size'],
+            observations['dx_head'],
+            observations['dy_head']
+        ], dim=-1)
+
+        image_features = self.cnn(image)
+        scalar_features = self.scalar_linear(scalars)
+        features = torch.cat([image_features, scalar_features], dim=-1)
+        return self.final_linear(features)
