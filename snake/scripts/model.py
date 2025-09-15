@@ -32,11 +32,11 @@ class SnakeEnv(gym.Env):
             config['environment']['min_grid_size'], 
             config['environment']['max_grid_size'] + 1
         )
-        # Stała przestrzeń obserwacji: 16x16x6 kanałów (FrameStack zapewnia historię)
+        # Stała przestrzeń obserwacji: 16x16x5 kanałów (FrameStack zapewnia historię)
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 6),
+            shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 5),
             dtype=np.float32
         )
         self.action_space = spaces.Discrete(config['environment']['action_space']['n'])
@@ -95,46 +95,31 @@ class SnakeEnv(gym.Env):
         zoom_factor = FIXED_OBS_SIZE / self.grid_size
         active_state = zoom(active_state, zoom_factor, order=0)
 
-        # Kanał 1: znormalizowany dx
-        direction_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        dx = 0.0
-        if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
-            dx = (self.food[0] - head[0]) / max(1, self.grid_size - 1)
-            direction_channel[head[0], head[1]] = dx
-        direction_channel = zoom(direction_channel, zoom_factor, order=1)
+        # Kanał 1: mapa znormalizowanego dx (od każdej komórki do jedzenia)
+        denom = max(1, self.grid_size - 1)
+        x_coords = np.arange(self.grid_size).reshape(-1, 1)
+        y_coords = np.arange(self.grid_size).reshape(1, -1)
+        dx_channel = (self.food[0] - x_coords) / denom  # Broadcasting: (grid_size, 1)
+        dx_channel = np.repeat(dx_channel, self.grid_size, axis=1)  # Rozszerz do (grid_size, grid_size)
+        dx_channel = zoom(dx_channel, zoom_factor, order=1)  # Skaluj do (16, 16)
 
-        # Kanał 2: znormalizowany dy
-        direction_channel_y = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        dy = 0.0
-        if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
-            dy = (self.food[1] - head[1]) / max(1, self.grid_size - 1)
-            direction_channel_y[head[0], head[1]] = dy
-        direction_channel_y = zoom(direction_channel_y, zoom_factor, order=1)
+        # Kanał 2: mapa znormalizowanego dy (od każdej komórki do jedzenia)
+        dy_channel = (self.food[1] - y_coords) / denom  # Broadcasting: (1, grid_size)
+        dy_channel = np.repeat(dy_channel, self.grid_size, axis=0)  # Rozszerz do (grid_size, grid_size)
+        dy_channel = zoom(dy_channel, zoom_factor, order=1)  # Skaluj do (16, 16)
 
-        # Kanał 3: kierunek
-        dir_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
-            dir_value = (self.direction + 1) / 4.0
-            dir_channel[head[0], head[1]] = dir_value
-        else:
-            print(f"Warning: Invalid head position for direction: {head}")
-            dir_value = 0.0
+        # Kanał 3: mapa kierunku (powtórzona wartość na całej planszy)
+        dir_value = (self.direction + 1) / 4.0
+        dir_channel = np.full((self.grid_size, self.grid_size), dir_value, dtype=np.float32)
         dir_channel = zoom(dir_channel, zoom_factor, order=0)
 
-        # Kanał 4: grid_size
+        # Kanał 4: mapa grid_size (powtórzona wartość na całej planszy)
         size_channel = np.full((self.grid_size, self.grid_size), self.grid_size / 16.0, dtype=np.float32)
         size_channel = zoom(size_channel, zoom_factor, order=1)
 
-        # Kanał 5: odległość Manhattan
-        distance_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        for x in range(self.grid_size):
-            for y in range(self.grid_size):
-                distance = abs(x - self.food[0]) + abs(y - self.food[1])
-                distance_channel[x, y] = min(distance / self.grid_size, 1.0)
-        distance_channel = zoom(distance_channel, zoom_factor, order=1)
-
+        # Łączenie kanałów
         obs = np.stack([
-            active_state, direction_channel, direction_channel_y, dir_channel, size_channel, distance_channel
+            active_state, dx_channel, dy_channel, dir_channel, size_channel
         ], axis=-1)
         return obs
 
