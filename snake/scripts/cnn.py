@@ -11,78 +11,35 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
-class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        self.squeeze = nn.AdaptiveAvgPool2d(1)
-        self.excitation = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        batch, ch, _, _ = x.shape
-        y = self.squeeze(x).view(batch, ch)
-        y = self.excitation(y).view(batch, ch, 1, 1)
-        return x * y.expand_as(x)
-
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: spaces.Dict, features_dim=512):
         super().__init__(observation_space, features_dim)
-        in_channels = 4 * 1  # 4 ramki × 1 kanał (mapa)
+        in_channels = 4  # 4 ramki × 1 kanał (mapa)
         dropout_rate = config['model'].get('dropout_rate', 0.2)
         leaky_relu = nn.LeakyReLU(negative_slope=0.01)
-
-        class ResidualBlock(nn.Module):
-            def __init__(self, channels):
-                super().__init__()
-                self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
-                self.bn1 = nn.BatchNorm2d(channels)
-                self.act = nn.LeakyReLU(0.01)
-                self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
-                self.bn2 = nn.BatchNorm2d(channels)
-            def forward(self, x):
-                identity = x
-                out = self.conv1(x)
-                out = self.bn1(out)
-                out = self.act(out)
-                out = self.conv2(out)
-                out = self.bn2(out)
-                out += identity
-                out = self.act(out)
-                return out
 
         self.cnn = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
             leaky_relu,
-            SEBlock(32),
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
             leaky_relu,
-            ResidualBlock(64),
-            SEBlock(64),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            leaky_relu,
-            SEBlock(128),
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            leaky_relu,
-            SEBlock(256),
-            nn.AdaptiveAvgPool2d((4, 4)),
-            nn.Flatten(),
+            nn.AdaptiveAvgPool2d((2, 2)),
+            nn.Flatten()
         )
 
         scalar_dim = 4  # direction, grid_size, dx_head, dy_head
         self.scalar_linear = nn.Sequential(
-            nn.Linear(scalar_dim, 128),  # Zwiększono z 32 do 128
+            nn.Linear(scalar_dim, 64),
+            nn.LeakyReLU(0.01),
+            nn.Linear(64, 128),
             nn.LeakyReLU(0.01),
             nn.Dropout(dropout_rate)
         )
 
-        cnn_dim = 256 * 4 * 4
-        total_dim = cnn_dim + 128  # Zaktualizowano z 32 na 128
+        cnn_dim = 64 * 2 * 2  # 256 cech
+        total_dim = cnn_dim + 128  # 256 (CNN) + 128 (scalars) = 384
         self.final_linear = nn.Sequential(
             nn.Linear(total_dim, features_dim),
             nn.LeakyReLU(0.01),
@@ -94,6 +51,8 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         # Upewnij się, że obraz jest w formacie [batch, channels, height, width]
         if image.shape[1] != 4:  # Sprawdzenie, czy kanały są pierwsze
             image = image.permute(0, 3, 1, 2)  # [batch, H, W, C] -> [batch, C, H, W]
+        if image.requires_grad:  # Retain gradients only if requires_grad is True
+            image.retain_grad()
         scalars = torch.cat([
             observations['direction'],
             observations['grid_size'],
