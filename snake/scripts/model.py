@@ -26,8 +26,12 @@ def set_grid_size(new_grid_size):
 class SnakeEnv(gym.Env):
     def __init__(self, render_mode=None, grid_size=None):
         super(SnakeEnv, self).__init__()
-        self.grid_size = grid_size if grid_size is not None else config['environment']['grid_size']
         self.render_mode = render_mode
+        self.default_grid_size = grid_size  # Przechowujemy domyślny grid_size
+        self.grid_size = grid_size if grid_size is not None else np.random.randint(
+            config['environment']['min_grid_size'], 
+            config['environment']['max_grid_size'] + 1
+        )
         # Stała przestrzeń obserwacji: 16x16x6 kanałów (FrameStack zapewnia historię)
         self.observation_space = spaces.Box(
             low=-1.0,
@@ -46,6 +50,12 @@ class SnakeEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        # Losuj grid_size przy każdym resecie, jeśli default_grid_size=None
+        if self.default_grid_size is None:
+            self.grid_size = np.random.randint(
+                config['environment']['min_grid_size'], 
+                config['environment']['max_grid_size'] + 1
+            )
         # Losowa pozycja startowa węża, min 1 kratka od ścian
         head_x = np.random.randint(1, self.grid_size - 1)
         head_y = np.random.randint(1, self.grid_size - 1)
@@ -83,7 +93,7 @@ class SnakeEnv(gym.Env):
         else:
             print(f"Warning: Invalid head position: {head}")
         zoom_factor = FIXED_OBS_SIZE / self.grid_size
-        active_state = zoom(active_state, zoom_factor, order=0)  # Zachowaj order=0 dla mapy
+        active_state = zoom(active_state, zoom_factor, order=0)
 
         # Kanał 1: znormalizowany dx
         direction_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
@@ -91,7 +101,7 @@ class SnakeEnv(gym.Env):
         if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
             dx = (self.food[0] - head[0]) / max(1, self.grid_size - 1)
             direction_channel[head[0], head[1]] = dx
-        direction_channel = zoom(direction_channel, zoom_factor, order=1)  # order=1 dla dx
+        direction_channel = zoom(direction_channel, zoom_factor, order=1)
 
         # Kanał 2: znormalizowany dy
         direction_channel_y = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
@@ -99,24 +109,21 @@ class SnakeEnv(gym.Env):
         if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
             dy = (self.food[1] - head[1]) / max(1, self.grid_size - 1)
             direction_channel_y[head[0], head[1]] = dy
-        direction_channel_y = zoom(direction_channel_y, zoom_factor, order=1)  # order=1 dla dy
+        direction_channel_y = zoom(direction_channel_y, zoom_factor, order=1)
 
         # Kanał 3: kierunek
         dir_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         if 0 <= head[0] < self.grid_size and 0 <= head[1] < self.grid_size:
-            dir_value = (self.direction + 1) / 4.0  # Mapuje 0->0.25, 1->0.5, 2->0.75, 3->1.0
+            dir_value = (self.direction + 1) / 4.0
             dir_channel[head[0], head[1]] = dir_value
         else:
             print(f"Warning: Invalid head position for direction: {head}")
             dir_value = 0.0
-        if self.grid_size == FIXED_OBS_SIZE:
-            dir_channel = dir_channel
-        else:
-            dir_channel = zoom(dir_channel, zoom_factor, order=0)
+        dir_channel = zoom(dir_channel, zoom_factor, order=0)
 
         # Kanał 4: grid_size
         size_channel = np.full((self.grid_size, self.grid_size), self.grid_size / 16.0, dtype=np.float32)
-        size_channel = zoom(size_channel, zoom_factor, order=1)  # order=1 dla grid_size
+        size_channel = zoom(size_channel, zoom_factor, order=1)
 
         # Kanał 5: odległość Manhattan
         distance_channel = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
@@ -124,7 +131,7 @@ class SnakeEnv(gym.Env):
             for y in range(self.grid_size):
                 distance = abs(x - self.food[0]) + abs(y - self.food[1])
                 distance_channel[x, y] = min(distance / self.grid_size, 1.0)
-        distance_channel = zoom(distance_channel, zoom_factor, order=1)  # order=1 dla odległości
+        distance_channel = zoom(distance_channel, zoom_factor, order=1)
 
         obs = np.stack([
             active_state, direction_channel, direction_channel_y, dir_channel, size_channel, distance_channel
@@ -159,22 +166,18 @@ class SnakeEnv(gym.Env):
         next_direction = (self.direction + (action - 1)) % 4
         next_head = self.snake[0] + DIRECTIONS[next_direction]
         reward = 0
-        # Prewencyjna kara za potencjalną kolizję (jeśli nowa głowa będzie w ciele, poza bieżącą głową)
+        # Prewencyjna kara za potencjalną kolizję
         if list(next_head) in list(self.snake)[1:]:
-            # Kara prewencyjna, ale nie kończymy gry
             reward -= 0.5
         self.direction = next_direction
         head = next_head
         self.steps += 1
         self.done = False
 
-        # Kara za każdy krok
-        reward -= 0.02
+        reward -= 0.02  # Kara za każdy krok
+        reward += 0.02  # Nagroda za przeżycie
 
-        # Nagroda za przeżycie kolejnego kroku
-        reward += 0.02
-
-        # Kara za bycie blisko własnego ciała (sąsiadujące pola wokół głowy)
+        # Kara za bycie blisko własnego ciała
         neighbors = [
             [head[0] + 1, head[1]],
             [head[0] - 1, head[1]],
@@ -186,29 +189,29 @@ class SnakeEnv(gym.Env):
             if 0 <= n[0] < self.grid_size and 0 <= n[1] < self.grid_size:
                 if list(n) in self.snake:
                     close_body += 1
-        reward -= 0.02 * close_body  # kara za każdy sąsiadujący segment ciała
+        reward -= 0.02 * close_body
 
-        # Kara za bycie w pułapce (głowa otoczona przez ciało lub ścianę z 3 stron)
+        # Kara za bycie w pułapce
         trap_count = 0
         for n in neighbors:
             if 0 <= n[0] < self.grid_size and 0 <= n[1] < self.grid_size:
                 if list(n) in self.snake:
                     trap_count += 1
             else:
-                trap_count += 1  # ściana też liczymy jako przeszkodę
+                trap_count += 1
         if trap_count >= 3:
             reward -= 1.0
 
-        # Nagroda/kara za zmianę odległości do jabłka (łagodniejsza)
+        # Nagroda/kara za zmianę odległości do jabłka
         new_dist = (abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])) / (2 * denom)
-        reward += 0.2 * (prev_dist - new_dist)  # Proporcjonalna nagroda za zmniejszenie odległości
+        reward += 0.2 * (prev_dist - new_dist)
 
-        # Kara za powtarzanie stanów (pętlenie się) - mocniejsza
+        # Kara za powtarzanie stanów
         state_hash = (tuple(head.tolist()), self.direction, len(self.snake))
         self.state_counter[state_hash] = self.state_counter.get(state_hash, 0) + 1
-        reward -= 0.5 * self.state_counter[state_hash]  # Kara rośnie z liczbą powtórek
+        reward -= 0.5 * self.state_counter[state_hash]
 
-        # Kara za zbyt długie niejedzenie jabłka (łagodniejsza)
+        # Kara za zbyt długie niejedzenie jabłka
         max_steps_without_food = config['environment'].get('max_steps_without_food', 80) * self.grid_size
         if self.steps_without_food >= max_steps_without_food:
             self.done = True
@@ -218,7 +221,6 @@ class SnakeEnv(gym.Env):
         max_steps = config['environment']['max_steps_factor'] * len(self.snake) * self.grid_size
         if self._is_collision(head) or self.steps > max_steps:
             self.done = True
-            # Kara za szybką śmierć (im krótszy epizod, tym większa kara)
             death_penalty = -20 - max(0, 10 - self.steps * 0.1)
             reward = death_penalty
             self.state_counter = {}
@@ -227,15 +229,11 @@ class SnakeEnv(gym.Env):
             self.snake.appendleft(head.tolist())
             if np.array_equal(head, self.food):
                 self.food = self._place_food()
-                # Nagroda bazowa za jabłko (mniejsza)
                 reward = 20
-                # Dodatkowa nagroda za wydłużenie węża
                 reward += 1
-                # Bonus za szybkie zdobycie jabłka (max +20)
                 bonus = max(0, 20 - self.steps_without_food)
                 reward += bonus
                 self.steps_without_food = 0
-                # Usuwamy dodatkową nagrodę za wydłużenie węża
                 self.state_counter = {}
             else:
                 self.snake.pop()
