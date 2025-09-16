@@ -25,7 +25,6 @@ Thumbs.db
 # Logs and outputs
 *.log
 *.csv
-*.png
 *.npz
 
 # Training logs
