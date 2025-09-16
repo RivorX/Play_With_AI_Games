@@ -1,0 +1,61 @@
+# Konfiguracja środowiska Snake
+environment:
+  min_grid_size: 5                   # Minimalny rozmiar siatki dla losowania
+  max_grid_size: 16                  # Maksymalny rozmiar siatki dla losowania
+  snake_size: 20                     # Rozmiar kratki w pikselach
+  directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
+  observation_space:
+    low: -1.0                        # Minimalna wartość obserwacji
+    high: 1.0                        # Maksymalna wartość obserwacji
+    dtype: float32                   # Typ danych obserwacji
+  action_space:
+    type: Discrete                    # Typ przestrzeni akcji
+    n: 3                             # Liczba akcji (lewo, prosto, prawo)
+  max_steps_without_food: 10         # Max kroków bez jedzenia (skalowane z rozmiarem)
+  max_steps_factor: 150              # Mnożnik max kroków
+
+# Konfiguracja modelu PPO
+model:
+  policy: MultiInputPolicy           # Zmieniono na MultiInputPolicy dla przestrzeni Dict
+  learning_rate: 0.0002              # Szybkość uczenia 
+  min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej tej wartości)
+  n_steps: 2048                      # Liczba kroków na aktualizację
+  batch_size: 2048                   # Rozmiar partii
+  n_epochs: 10                       # Liczba epok 
+  gamma: 0.99                        # Współczynnik dyskontowania
+  gae_lambda: 0.95                   # Lambda dla GAE
+  clip_range: 0.2                    # Zakres obcinania PPO
+  ent_coef: 0.4                      # Współczynnik entropii
+  vf_coef: 1.0                       # Współczynnik funkcji wartości
+  device: cuda                       # Urządzenie (cuda/cpu)
+  dropout_rate: 0.2                  # Współczynnik dropout w CNN
+  policy_kwargs:
+    features_extractor_kwargs:
+      features_dim: 512
+    net_arch:
+      pi: [256, 256, 128]  # dla aktora
+      vf: [256, 256, 128]  # dla krytyka
+
+# Konfiguracja treningu
+training:
+  n_envs: 16                         # Liczba środowisk
+  total_timesteps: 10000000          # Całkowita liczba kroków
+  eval_freq: 5000                    # Częstotliwość ewaluacji (zwiększona dla rzadszej validacji)
+  plot_interval: 2                   # Co ile walidacji robić wykres i zapisywać model
+  max_no_improvement_evals: 50       # Liczba ewaluacji bez poprawy przed zatrzymaniem
+  min_evals: 5                       # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
+  enable_testing: false              # Włączone dla widoczności postępów
+  enable_channel_logs: true          # Włącz logi kanałów
+
+# Ścieżki do zapisu
+paths:
+  models_dir: models
+  logs_dir: logs
+  model_path: models/snake_ppo_model.zip
+  test_model_path: models/test_model.zip
+  best_model_backup_path: models/best_model_backup.zip
+  train_csv_path: logs/train_progress.csv
+  test_csv_path: logs/test_results.csv
+  test_log_path: logs/test_log.txt
+  plot_path: logs/training_progress.png
+  test_progress_path: logs/test_progress.png
