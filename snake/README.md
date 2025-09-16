@@ -1,46 +1,79 @@
 # Snake — Reinforcement Learning
 
-Projekt polega na uczeniu agenta RL (PPO, Stable Baselines3) do gry w Snake w środowisku opartym o Gymnasium i Pygame.
+Projekt: agent PPO (Stable Baselines3) uczący się gry Snake (Gymnasium + Pygame).
 
-## Jak uruchomić
+---
 
-1. Przejdź do głównego katalogu repozytorium i aktywuj środowisko:
-   ```powershell
-   .\venv\Scripts\Activate.ps1
-   ```
-2. Zainstaluj wymagane pakiety:
-   ```bash
-   pip install -r requirements.txt
-   pip uninstal torch
-   pip install torch>=2.7 --index-url https://download.pytorch.org/whl/cu128
-   ```
-3. Rozpocznij trening agenta:
-   ```bash
-   python snake/scripts/train.py
-   ```
-4. Przetestuj wytrenowanego agenta:
-   ```bash
-   python snake/scripts/test_snake_model.py
-   ```
+## Najważniejsze wyniki
 
-## Czego się spodziewać
-- Podczas treningu agent uczy się zdobywać jak najwięcej punktów, unikając kolizji.
-- Wyniki i modele zapisywane są w katalogach `snake/models/` i `snake/logs/`.
-- W trakcie testowania pojawi się okno z wizualizacją gry Snake, a agent będzie grał samodzielnie (o ile to włączymy w configu).
-- W katalogu `logs/` generowany jest wykres postępu treningu (`training_progress.png`).
+![Training progress](docs/training_progress.png)
 
-## Jak działa środowisko
-- Obserwacja agenta to wektor cech (np. mini-mapa wokół głowy, kierunek, odległość do jedzenia).
-- Akcje: skręt w lewo, prosto, skręt w prawo.
-- Nagrody: za zebranie jabłka, za przeżycie, kara za kolizję lub zbyt długie kręcenie się bez postępu.
-- Możesz modyfikować parametry środowiska i modelu w pliku `snake/config/config.yaml`.
+Przykładowe przebiegi (GIFy):
 
-## Pliki
+![snake run 5](docs/snake_run_5.gif)
+![snake run 8](docs/snake_run_8.gif)
+![snake run 16](docs/snake_run_16.gif)
+
+---
+
+## Szybkie uruchomienie (najpierw)
+
+1. Aktywuj środowisko w katalogu głównym repo:
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+2. Zainstaluj zależności:
+```powershell
+pip install -r requirements.txt
+```
+3. Trening (domyślnie):
+```powershell
+python .\snake\scripts\train.py
+```
+4. Test wytrenowanego modelu (okno Pygame):
+```powershell
+python .\snake\scripts\test_snake_model.py --grid_size 8 --episodes 2
+```
+
+## Generowanie GIF-ów (szybkie)
+
+```powershell
+python .\snake\scripts\make_gif.py --model_path .\snake\models\best_model.zip --grid_size 8 --episodes 1 --fps 8
+```
+
+Wynikowy GIF domyślnie: `snake/logs/snake_run.gif`.
+
+---
+
+## Szczegóły i pliki
+
+Pliki i co robią:
 - `model.py` — definicja środowiska Snake (Gym)
-- `train.py` — trening agenta RL
-- `test_snake_model.py` — testowanie wytrenowanego agenta
-- `plot_train_progress.py` — generowanie wykresu postępu
+- `train.py` — trening agenta RL (z callbackami, VecNormalize itp.)
+- `test_snake_model.py` — testowanie i debug (render_mode="human")
+- `make_gif.py` — nagrywanie przebiegu agenta i składanie GIF-a (zapisuje klatki i tworzy `snake/logs/snake_run.gif`)
+- `analyze_model.py` — analiza saliency i wykresów modelu (zapisuje wyniki w `snake/logs/analize_model/`)
+- `plot_train_progress.py` — generowanie wykresu postępu treningu
 - `config/config.yaml` — konfiguracja środowiska, modelu i ścieżek
+
+Krótko o parametrach używanych w skryptach:
+- `train.py`: większość hiperparametrów (np. `n_steps`, `n_envs`, `eval_freq`) jest w `config/config.yaml`. Domyślnie trening zapisuje modele do `snake/models/` i logi do `snake/logs/`.
+- `test_snake_model.py`:
+  - `--model_path` — ścieżka do modelu (domyślnie `snake/models/best_model.zip`)
+  - `--grid_size` — rozmiar siatki (np. 8)
+  - `--episodes` — liczba epizodów testowych
+- `make_gif.py`:
+  - `--model_path` — ścieżka do modelu (opcjonalne)
+  - `--grid_size` — rozmiar siatki
+  - `--episodes` — ile epizodów nagrać
+  - `--fps` — liczba klatek na sekundę dla GIF-a
+- `analyze_model.py` — uruchom bez parametrów, wyniki trafią do `snake/logs/analize_model/` (można modyfikować wewnątrz skryptu)
+
+Uwaga o rozmiarach gridu:
+
+Model trenowany był dla rozmiarów siatki w zakresie 5–16 (grid_size 5..16). Powyżej 16 mogą występować problemy z mechanizmem zoomowania (skalowaniem obserwacji do stałego rozmiaru 16x16), co może prowadzić do zniekształceń obrazu i gorszej jakości obserwacji. Jeśli chcesz trenować dla większych gridów, najlepiej dostosować wartość `FIXED_OBS_SIZE` w `model.py` lub zmodyfikować preprocessing obrazu.
+
+---
 
 # Przywracanie modelu z kopii zapasowej
 
