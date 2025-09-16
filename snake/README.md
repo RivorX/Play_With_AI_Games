@@ -1,18 +1,16 @@
-# Snake — Reinforcement Learning
+# Snake — RL agent for Snake (PPO)
 
-Projekt: agent PPO (Stable Baselines3) uczący się gry Snake (Gymnasium + Pygame).
+Projekt: lekki agent PPO (Stable Baselines3) nauczony gry w Snake na siatkach o rozmiarach 5–16. Celem jest proste, czytelne środowisko Gym + Pygame używane do badań nad zachowaniami agenta i wizualizacją decyzji.
 
 ---
 
-## Najważniejsze wyniki
+## Przykładowe przebiegi (GIFy) — szybki podgląd
 
-![Training progress](docs/training_progress.png)
+| 5x5 | 8x8 | 16x16 |
+|:---:|:---:|:----:|
+| ![snake run 5](docs/snake_run_5.gif) | ![snake run 8](docs/snake_run_8.gif) | ![snake run 16](docs/snake_run_16.gif) |
 
-Przykładowe przebiegi (GIFy):
-
-![snake run 5](docs/snake_run_5.gif)
-![snake run 8](docs/snake_run_8.gif)
-![snake run 16](docs/snake_run_16.gif)
+> GIFy zapętlone — jeśli plik GIF został zapisany jako pętla, GitHub również go zapętli. Jeśli nie widzisz pętli, możemy zrekodować GIF w pętli.
 
 ---
 
@@ -74,6 +72,13 @@ Uwaga o rozmiarach gridu:
 Model trenowany był dla rozmiarów siatki w zakresie 5–16 (grid_size 5..16). Powyżej 16 mogą występować problemy z mechanizmem zoomowania (skalowaniem obserwacji do stałego rozmiaru 16x16), co może prowadzić do zniekształceń obrazu i gorszej jakości obserwacji. Jeśli chcesz trenować dla większych gridów, najlepiej dostosować wartość `FIXED_OBS_SIZE` w `model.py` lub zmodyfikować preprocessing obrazu.
 
 ---
+
+## Trening i wyniki
+
+Poniżej przykładowy wykres postępu treningu (średnia nagroda / epizod podczas treningu). Wykres generowany przez `plot_train_progress.py` i zapisywany do `snake/docs/training_progress.png`.
+
+![Training progress](docs/training_progress.png)
+
 
 # Przywracanie modelu z kopii zapasowej
 
