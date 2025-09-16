@@ -5,7 +5,7 @@ import numpy as np
 import pygame
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
 import csv
@@ -16,433 +16,471 @@ import shutil
 import subprocess
 import sys
 import yaml
-from model import make_env
+from model import make_env, set_grid_size
+from cnn import CustomFeaturesExtractor
+import logging
+import pickle
 
-# Wczytaj konfigurację względem lokalizacji pliku train.py
-base_dir = os.path.dirname(os.path.dirname(__file__))  # Katalog nadrzędny (projekt/)
+# Wczytaj konfigurację
+base_dir = os.path.dirname(os.path.dirname(__file__))
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
-# Callback do zapisu postępu treningu do CSV
+# Definicja zmiennych globalnych
+test_stop_event = None
+test_thread_handle = None
+
+def reset_channel_logs():
+    log_dir = os.path.join(base_dir, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
+        log_path = os.path.join(log_dir, f'training_{channel_name}.log')
+        with open(log_path, 'w', encoding='utf-8'):
+            pass
+
+def init_channel_loggers():
+    loggers = {}
+    log_dir = os.path.join(base_dir, 'logs')
+    for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
+        log_path = os.path.join(log_dir, f'training_{channel_name}.log')
+        logger = logging.getLogger(f'channel_{channel_name}')
+        handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+        formatter = logging.Formatter('%(asctime)s - %(message)s')
+        handler.setFormatter(formatter)
+        if logger.hasHandlers():
+            logger.handlers.clear()
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        loggers[channel_name] = logger
+    return loggers
+
+enable_channel_logs = config.get('training', {}).get('enable_channel_logs', False)
+channel_loggers = init_channel_loggers() if enable_channel_logs else {}
+
+def log_observation(obs, channel_loggers, grid_size, step):
+    if not enable_channel_logs:
+        return
+    image = obs['image']
+    latest_channel = image[-1:, :, :]  # [1, H, W]
+    mapa = latest_channel[0, :, :]  # [H, W]
+    head_pos = np.where(mapa == 1.0)
+    food_pos = np.where(mapa == 0.75)
+    if len(head_pos[0]) > 0:
+        head_x, head_y = head_pos[0][0], head_pos[1][0]
+    else:
+        head_x, head_y = -1, -1
+    if len(food_pos[0]) > 0:
+        food_x, food_y = food_pos[0][0], food_pos[1][0]
+    else:
+        food_x, food_y = -1, -1
+    if head_x >= 0 and food_x >= 0:
+        distance = abs(head_x - food_x) + abs(head_y - food_y)
+    else:
+        distance = float('inf')
+    
+    logger = channel_loggers.get('mapa')
+    if logger:
+        logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
+        logger.info(f"Kanał mapa:\n{np.array_str(mapa, precision=2, suppress_small=True, max_line_width=120)}")
+        logger.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
+        logger.info(f"Dystans Manhattan: {distance}")
+        logger.info("-" * 60)
+
+    for scalar_name in ['direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
+        logger = channel_loggers.get(scalar_name)
+        if logger:
+            logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
+            logger.info(f"{scalar_name.capitalize()}: {obs[scalar_name][0]}")
+            logger.info("-" * 60)
+
+def linear_schedule(initial_value, min_value=0.00005):
+    def func(progress_remaining):
+        return min_value + (initial_value - min_value) * progress_remaining
+    return func
+
 class TrainProgressCallback(BaseCallback):
-    def __init__(self, csv_path, verbose=0):
+    def __init__(self, csv_path, initial_timesteps=0, verbose=0):
         super().__init__(verbose)
         self.csv_path = csv_path
+        self.initial_timesteps = initial_timesteps
         self.header_written = False
         self.last_logged = 0
 
     def _on_step(self) -> bool:
         if self.locals.get('dones') is not None and any(self.locals['dones']):
-            if self.num_timesteps - self.last_logged >= 1000:
+            if (self.num_timesteps + self.initial_timesteps) - self.last_logged >= 1000:
                 ep_rew_mean = self.model.ep_info_buffer and np.mean([ep_info['r'] for ep_info in self.model.ep_info_buffer]) or None
                 ep_len_mean = self.model.ep_info_buffer and np.mean([ep_info['l'] for ep_info in self.model.ep_info_buffer]) or None
+                grid_size = np.mean(self.training_env.get_attr('grid_size'))  # Średni grid_size
                 try:
                     write_header = not os.path.exists(self.csv_path)
                     with open(self.csv_path, 'a', newline='') as csvfile:
                         writer = csv.writer(csvfile)
                         if write_header:
-                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length'])
-                        writer.writerow([self.num_timesteps, ep_rew_mean, ep_len_mean])
-                    self.last_logged = self.num_timesteps
+                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length', 'grid_size'])
+                        writer.writerow([self.num_timesteps + self.initial_timesteps, ep_rew_mean, ep_len_mean, grid_size])
+                    self.last_logged = self.num_timesteps + self.initial_timesteps
                 except Exception as e:
                     print(f"Błąd zapisu train_progress.csv: {e}")
         return True
 
-# Funkcja testowania w osobnym wątku z zapisem logów i wyników do CSV
-def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progress_path, stop_event=None):
+class CustomEvalCallback(EvalCallback):
+    def __init__(self, eval_env, callback_on_new_best=None, callback_after_eval=None, best_model_save_path=None,
+                 log_path=None, eval_freq=10000, deterministic=True, render=False, verbose=1,
+                 warn=True, n_eval_episodes=5, plot_interval=3, plot_script_path=None, initial_timesteps=0):
+        super().__init__(eval_env, callback_on_new_best=callback_on_new_best, callback_after_eval=callback_after_eval,
+                         best_model_save_path=best_model_save_path, log_path=log_path, eval_freq=eval_freq,
+                         deterministic=deterministic, render=render, verbose=verbose, warn=warn,
+                         n_eval_episodes=n_eval_episodes)
+        self.eval_count = 0
+        self.plot_interval = plot_interval
+        self.plot_script_path = plot_script_path
+        self.initial_timesteps = initial_timesteps
+
+    def _on_step(self) -> bool:
+        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            super()._on_step()
+            self.eval_count += 1
+            # Zapis najnowszego modelu po każdej walidacji
+            total_timesteps = self.model.num_timesteps + self.initial_timesteps
+            save_training_state(self.model, self.model.env, self.eval_env, total_timesteps, self.best_model_save_path)
+            print(f"Zaktualizowano najnowszy model po {total_timesteps} krokach z mean_reward={self.last_mean_reward}")
+
+            # Zapis najlepszego modelu, jeśli poprawiono mean_reward
+            if self.best_mean_reward < self.last_mean_reward:
+                self.model.save(os.path.join(self.best_model_save_path, f'best_model_{total_timesteps}.zip'))
+                print(f"New best model saved at {total_timesteps} timesteps with mean reward {self.last_mean_reward}")
+            if self.eval_count % self.plot_interval == 0:
+                try:
+                    subprocess.run([sys.executable, self.plot_script_path], check=True)
+                    print(f"Wygenerowano wykres po {self.eval_count} walidacji.")
+                except Exception as e:
+                    print(f"Błąd podczas generowania wykresu: {e}")
+        return True
+
+def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progress_path, grid_size, stop_event=None):
     current_model_timestamp = 0
+    timestamps = []
+    mean_scores = []
+    mean_rewards = []
+    mean_lengths = []
     while True:
         if stop_event is not None and stop_event.is_set():
             print("[TestThread] Otrzymano sygnał zakończenia. Kończę wątek testujący.")
             break
-        env = make_env(render_mode="human")()
+        set_grid_size(grid_size)
+        env = make_env(render_mode="human", grid_size=grid_size)()
         model = None
         try:
             new_timestamp = os.path.getmtime(model_path)
             if new_timestamp > current_model_timestamp:
                 with open(log_path, 'a') as f:
-                    f.write(f"[{time.ctime()}] Ładuję nowy model...\n")
+                    f.write(f"[{time.ctime()}] Ładuję nowy model dla grid_size={grid_size}...\n")
                 shutil.copy(model_path, test_model_path)
                 model = PPO.load(test_model_path)
+                model.ent_coef = config['model']['ent_coef']
+                model._setup_lr_schedule()
                 current_model_timestamp = new_timestamp
             elif model is None:
                 shutil.copy(model_path, test_model_path)
                 model = PPO.load(test_model_path)
+                model.ent_coef = config['model']['ent_coef']
+                model._setup_lr_schedule()
         except FileNotFoundError:
             with open(log_path, 'a') as f:
                 f.write(f"[{time.ctime()}] Nie znaleziono modelu w {model_path}. Czekam 5 sekund...\n")
             time.sleep(5)
             env.close()
             continue
-
-        obs, _ = env.reset()
-        done = False
-        with open(log_path, 'a') as f:
-            f.write(f"[{time.ctime()}] Rozpoczynam test z wizualizacją...\n")
-        while not done:
-            if stop_event is not None and stop_event.is_set():
-                print("[TestThread] Otrzymano sygnał zakończenia w trakcie epizodu. Kończę wątek testujący.")
-                env.close()
-                return
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    done = True
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, truncated, info = env.step(action)
-            env.render()
+        except Exception as e:
             with open(log_path, 'a') as f:
-                f.write(f"[{time.ctime()}] Wynik: {info['score']}, Nagroda: {info['total_reward']}\n")
-            write_header = not os.path.exists(test_csv_path)
-            try:
-                with open(test_csv_path, 'a', newline='') as csvfile:
-                    writer = csv.writer(csvfile)
-                    if write_header:
-                        writer.writerow(['timestamp', 'score', 'total_reward'])
-                    writer.writerow([time.time(), info['score'], info['total_reward']])
-            except Exception:
-                with open(log_path, 'a') as f:
-                    f.write(f"[{time.ctime()}] Błąd zapisu do CSV testów.\n")
+                f.write(f"[{time.ctime()}] Błąd ładowania modelu: {e}\n")
+            time.sleep(5)
+            env.close()
+            continue
 
-            try:
-                timestamps, scores, rewards = [], [], []
-                with open(test_csv_path, 'r') as csvfile:
-                    reader = csv.reader(csvfile)
-                    header = next(reader, None)
-                    for row in reader:
-                        if len(row) >= 3:
-                            timestamps.append(float(row[0]))
-                            scores.append(float(row[1]))
-                            rewards.append(float(row[2]))
-                if scores:
-                    episodes = list(range(1, len(scores) + 1))
-                    plt.figure(figsize=(8, 4))
-                    plt.plot(episodes, scores, label='score', alpha=0.6)
-                    plt.plot(episodes, rewards, label='total_reward', alpha=0.6)
-                    window = max(1, min(50, len(scores)//10))
-                    if window > 1:
-                        ma = np.convolve(scores, np.ones(window)/window, mode='valid')
-                        plt.plot(range(window, len(scores)+1), ma, label=f'score_ma({window})', color='red')
-                    plt.xlabel('episode')
-                    plt.ylabel('value')
-                    plt.legend()
-                    plt.tight_layout()
-                    plt.savefig(test_progress_path)
-                    plt.close()
-            except Exception:
-                with open(log_path, 'a') as f:
-                    f.write(f"[{time.ctime()}] Błąd podczas tworzenia wykresu testu.\n")
-            pygame.time.wait(50)
-        env.close()
+        scores = []
+        rewards = []
+        lengths = []
+        for ep in range(5):
+            obs, _ = env.reset()
+            done = False
+            total_reward = 0
+            steps = 0
+            while not done:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, done, _, info = env.step(action)
+                total_reward += reward
+                steps += 1
+                env.render()
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        done = True
+            scores.append(info['score'])
+            rewards.append(total_reward)
+            lengths.append(steps)
+            with open(log_path, 'a') as f:
+                f.write(f"[{time.ctime()}] Epizod {ep+1}: Wynik={info['score']}, Nagroda={total_reward}, Kroki={steps}\n")
+
+        mean_score = np.mean(scores)
+        mean_reward = np.mean(rewards)
+        mean_length = np.mean(lengths)
+        timestamps.append(time.time())
+        mean_scores.append(mean_score)
+        mean_rewards.append(mean_reward)
+        mean_lengths.append(mean_length)
         with open(log_path, 'a') as f:
-            f.write(f"[{time.ctime()}] Epizod zakończony. Sprawdzam nowy model...\n")
-        time.sleep(1)
+            f.write(f"[{time.ctime()}] Średni wynik: {mean_score}, Średnia nagroda: {mean_reward}, Średnia długość: {mean_length}\n")
 
-def train(use_progress_bar=True):
-    # Utwórz katalogi względem katalogu nadrzędnego
-    models_dir = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
-    logs_dir = os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir']))
-    os.makedirs(models_dir, exist_ok=True)
-    os.makedirs(logs_dir, exist_ok=True)
+        try:
+            write_header = not os.path.exists(test_csv_path)
+            with open(test_csv_path, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                if write_header:
+                    writer.writerow(['timestamp', 'mean_score', 'mean_reward', 'mean_ep_length'])
+                writer.writerow([time.time(), mean_score, mean_reward, mean_length])
+        except Exception as e:
+            with open(log_path, 'a') as f:
+                f.write(f"[{time.ctime()}] Błąd zapisu CSV: {e}\n")
 
-    # Inicjalizacja curriculum
-    curriculum_grid_sizes = config['training']['curriculum_grid_sizes']
-    curriculum_multipliers = config['training']['curriculum_multipliers']
-    curriculum_steps = [config['training']['n_envs'] * config['model']['n_steps'] * m for m in curriculum_multipliers]
-    print(f"Plan curriculum: {list(zip(curriculum_grid_sizes, curriculum_steps))}")
-
-    # Oblicz steps_per_iteration dynamicznie
-    steps_per_iteration = config['training']['n_envs'] * config['model']['n_steps']
-    
-    # Sprawdź, czy model istnieje i zapytaj o kontynuację
-    model = None
-    model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['model_path']))
-    print(f"Sprawdzam istnienie modelu w: {model_path_absolute}")
-    if os.path.exists(model_path_absolute):
-        choice = input(f"Model {model_path_absolute} istnieje. Kontynuować trening z tego modelu? [y/n]: ").strip().lower()
-        if choice == 'y':
-            print("Ładuję istniejący model...")
-            model = PPO.load(model_path_absolute)
-            total_timesteps = model.num_timesteps
-            print(f"Załadowano model z timesteps: {total_timesteps}")
-        elif choice == 'n':
-            print("Tworzę nowy model...")
-            backup_csv = os.path.join(base_dir, config['paths']['train_csv_path']) + '.backup'
-            if os.path.exists(os.path.join(base_dir, config['paths']['train_csv_path'])):
-                shutil.copy(os.path.join(base_dir, config['paths']['train_csv_path']), backup_csv)
-                print(f"Stworzono kopię zapasową CSV w {backup_csv}")
-            for p in [config['paths']['train_csv_path'], config['paths']['test_csv_path']]:
-                try:
-                    full_path = os.path.join(base_dir, p)
-                    if os.path.exists(full_path):
-                        os.remove(full_path)
-                        print(f"Usunięto plik: {full_path}")
-                except Exception as e:
-                    print(f"Nie udało się usunąć {full_path}: {e}")
-        else:
-            print("Nieprawidłowy wybór. Kończę program.")
-            return
-    else:
-        print(f"Model {model_path_absolute} nie istnieje. Tworzę nowy model...")
-
-    # Pętla curriculum
-    total_timesteps = 0 if model is None else model.num_timesteps
-    test_started = False
-    test_stop_event = threading.Event()
-    train_progress_callback = TrainProgressCallback(os.path.join(base_dir, config['paths']['train_csv_path']))
-    
-    for level, (grid_size, max_steps) in enumerate(zip(curriculum_grid_sizes, curriculum_steps)):
-        print(f"\nRozpoczynam poziom curriculum {level + 1}: grid_size={grid_size}, max_steps={max_steps}")
-        
-        # Aktualizuj GRID_SIZE w module model
-        from model import set_grid_size
-        set_grid_size(grid_size)
-        
-        # Utwórz środowisko z nowym grid_size
-        env = make_vec_env(make_env(render_mode=None), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
-        eval_env = make_vec_env(make_env(render_mode=None), n_envs=1, vec_env_cls=SubprocVecEnv)
-        
-        # Inicjalizuj model dla pierwszego poziomu lub przypisz istniejący
-        if model is None:
-            model = PPO(
-                policy=config['model']['policy'],
-                env=env,
-                learning_rate=config['model']['learning_rate'],
-                n_steps=config['model']['n_steps'],
-                batch_size=config['model']['batch_size'],
-                n_epochs=config['model']['n_epochs'],
-                gamma=config['model']['gamma'],
-                gae_lambda=config['model']['gae_lambda'],
-                clip_range=config['model']['clip_range'],
-                ent_coef=config['model']['ent_coef'],
-                vf_coef=config['model']['vf_coef'],
-                verbose=1,
-                device=config['model']['device'],
-                policy_kwargs={"net_arch": config['model']['policy_kwargs']['net_arch']}
-            )
-        else:
-            model.set_env(env)  # Aktualizuj środowisko dla istniejącego modelu
-        
-        # Callback do zatrzymania na plateau
-        stop_on_plateau = StopTrainingOnNoModelImprovement(
-            max_no_improvement_evals=config['training']['max_no_improvement_evals'],
-            min_evals=config['training']['min_evals'],
-            verbose=1
-        )
-        best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
-        print(f"Ścieżka zapisu najlepszego modelu (katalog): {best_model_save_path}")
-        eval_callback = EvalCallback(
-            eval_env,
-            best_model_save_path=best_model_save_path,
-            log_path=best_model_save_path,
-            eval_freq=config['training']['eval_freq'],
-            deterministic=True,
-            render=False,
-            callback_after_eval=stop_on_plateau
-        )
-
-        # Trening dla bieżącego poziomu curriculum
-        level_timesteps = 0
-        while level_timesteps < max_steps and total_timesteps < config['training']['total_timesteps']:
-            model.learn(
-                total_timesteps=steps_per_iteration,
-                reset_num_timesteps=False,
-                callback=[eval_callback, train_progress_callback],
-                progress_bar=use_progress_bar
-            )
-            level_timesteps += steps_per_iteration
-            total_timesteps += steps_per_iteration
-            # Zapisz model
-            model.save(model_path_absolute)
-            print(f"Model zapisany w: {model_path_absolute}")
-
-            # Poczekaj na zakończenie wszystkich operacji zapisu
-            time.sleep(5)
-
-            # Tworzenie kopii zapasowej modelu
-            backup_model = model_path_absolute + '.backup'
-            try:
-                shutil.copy(model_path_absolute, backup_model)
-                print(f"Stworzono kopię zapasową modelu w {backup_model}")
-            except Exception as e:
-                print(f"Nie udało się stworzyć kopii zapasowej modelu: {e}")
-
-            # Próba skopiowania najlepszego modelu
-            best_model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['best_model_path']))
-            if os.path.exists(best_model_path_absolute):
-                for attempt in range(5):
-                    try:
-                        with open(best_model_path_absolute, 'rb') as f:
-                            pass
-                        shutil.copy(best_model_path_absolute, model_path_absolute)
-                        best_model_backup_path = best_model_path_absolute + '.backup'
-                        shutil.copy(best_model_path_absolute, best_model_backup_path)
-                        print(f"Zaktualizowano najlepszy model: {model_path_absolute}")
-                        print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup_path}")
-                        break
-                    except PermissionError as e:
-                        print(f"Próba {attempt + 1}/5: Nie udało się skopiować best_model.zip do {model_path_absolute}: {e}")
-                        time.sleep(3)
-                    except Exception as e:
-                        print(f"Nie udało się skopiować best_model.zip do {model_path_absolute}: {e}")
-                        break
-                else:
-                    print(f"Nie udało się skopiować best_model.zip po 5 próbach.")
-            else:
-                print(f"Plik {best_model_path_absolute} nie istnieje. Pomijam kopiowanie najlepszego modelu.")
-            
-            # Sprawdź, czy train_progress.csv istnieje przed wywołaniem skryptu
-            train_csv_path = os.path.join(base_dir, config['paths']['train_csv_path'])
-            if os.path.exists(train_csv_path):
-                try:
-                    train_plot_script = os.path.join(os.path.dirname(__file__), 'plot_train_progress.py')
-                    subprocess.run([sys.executable, train_plot_script], check=True)
-                    print(f"Wygenerowano wykres treningu: {os.path.join(base_dir, config['paths']['plot_path'])}")
-                except Exception as e:
-                    print(f"Błąd podczas generowania wykresu treningu: {e}")
-            else:
-                print(f"Plik {train_csv_path} nie istnieje. Pomijam generowanie wykresu.")
-
-            if config['training']['enable_testing'] and not test_started:
-                test_thread_obj = threading.Thread(
-                    target=test_thread,
-                    args=(
-                        model_path_absolute,
-                        os.path.join(base_dir, config['paths']['test_model_path']),
-                        os.path.join(base_dir, config['paths']['test_log_path']),
-                        os.path.join(base_dir, config['paths']['test_csv_path']),
-                        os.path.join(base_dir, config['paths']['test_progress_path']),
-                        test_stop_event
-                    ),
-                    daemon=True
-                )
-                test_thread_obj.start()
-                test_started = True
+        if timestamps:
+            plt.figure(figsize=(8, 4))
+            plt.plot(timestamps, mean_scores, label='mean_score')
+            plt.plot(timestamps, mean_rewards, label='mean_reward')
+            plt.plot(timestamps, mean_lengths, label='mean_ep_length')
+            plt.xlabel('Timestamp')
+            plt.ylabel('Value')
+            plt.title('Test Progress')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(test_progress_path)
+            plt.close()
+            with open(log_path, 'a') as f:
+                f.write(f"[{time.ctime()}] Zaktualizowano wykres testów: {test_progress_path}\n")
 
         env.close()
-        eval_env.close()
+        time.sleep(5)
 
-    # Kontynuacja treningu z ostatnim grid_size aż do total_timesteps
-    if total_timesteps < config['training']['total_timesteps']:
-        print(f"\nKontynuuję trening z ostatnim grid_size={curriculum_grid_sizes[-1]} aż do {config['training']['total_timesteps']} kroków")
-        # Ustaw ostatni grid_size
-        from model import set_grid_size
-        set_grid_size(curriculum_grid_sizes[-1])
-        # Utwórz środowisko
-        env = make_vec_env(make_env(render_mode=None), n_envs=config['training']['n_envs'], vec_env_cls=SubprocVecEnv)
-        eval_env = make_vec_env(make_env(render_mode=None), n_envs=1, vec_env_cls=SubprocVecEnv)
-        model.set_env(env)  # Aktualizuj środowisko
-        
-        # Callback do zatrzymania na plateau
-        stop_on_plateau = StopTrainingOnNoModelImprovement(
-            max_no_improvement_evals=config['training']['max_no_improvement_evals'],
-            min_evals=config['training']['min_evals'],
-            verbose=1
-        )
-        eval_callback = EvalCallback(
-            eval_env,
-            best_model_save_path=best_model_save_path,
-            log_path=best_model_save_path,
-            eval_freq=config['training']['eval_freq'],
-            deterministic=True,
-            render=False,
-            callback_after_eval=stop_on_plateau
-        )
+def save_training_state(model, env, eval_env, total_timesteps, save_path):
+    model_path_absolute = os.path.normpath(os.path.join(save_path, 'snake_ppo_model.zip'))
+    vec_norm_path = model_path_absolute.replace('.zip', '_vecnorm.pkl')
+    vec_norm_eval_path = model_path_absolute.replace('.zip', '_vecnorm_eval.pkl')
+    state_path = model_path_absolute.replace('.zip', '_state.pkl')
 
-        # Trening do końca
-        while total_timesteps < config['training']['total_timesteps']:
-            model.learn(
-                total_timesteps=steps_per_iteration,
-                reset_num_timesteps=False,
-                callback=[eval_callback, train_progress_callback],
-                progress_bar=use_progress_bar
-            )
-            total_timesteps += steps_per_iteration
-            # Zapisz model
+    for attempt in range(5):
+        try:
             model.save(model_path_absolute)
-            print(f"Model zapisany w: {model_path_absolute}")
+            env.save(vec_norm_path)
+            eval_env.save(vec_norm_eval_path)
+            with open(state_path, 'wb') as f:
+                pickle.dump({'total_timesteps': total_timesteps}, f)
+            print(f"Zaktualizowano najnowszy model: {model_path_absolute} po {total_timesteps} krokach.")
+            break
+        except PermissionError as e:
+            print(f"Próba {attempt + 1}/5: Nie udało się zapisać stanu: {e}")
+            time.sleep(3)
+        except Exception as e:
+            print(f"Błąd zapisu stanu: {e}")
+            break
+    else:
+        print("Nie udało się zapisać stanu po 5 próbach.")
 
-            # Poczekaj na zakończenie wszystkich operacji zapisu
-            time.sleep(5)
+def train(use_progress_bar=False, use_config_hyperparams=True):
+    global test_stop_event, test_thread_handle, best_model_save_path
 
-            # Tworzenie kopii zapasowej modelu
-            backup_model = model_path_absolute + '.backup'
-            try:
-                shutil.copy(model_path_absolute, backup_model)
-                print(f"Stworzono kopię zapasową modelu w {backup_model}")
-            except Exception as e:
-                print(f"Nie udało się stworzyć kopii zapasowej modelu: {e}")
+    n_envs = config['training']['n_envs']
+    n_steps = config['model']['n_steps']
+    eval_freq = config['training']['eval_freq']
+    plot_interval = config['training']['plot_interval']
 
-            # Próba skopiowania najlepszego modelu
-            best_model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['best_model_path']))
-            if os.path.exists(best_model_path_absolute):
-                for attempt in range(5):
-                    try:
-                        with open(best_model_path_absolute, 'rb') as f:
-                            pass
-                        shutil.copy(best_model_path_absolute, model_path_absolute)
-                        best_model_backup_path = best_model_path_absolute + '.backup'
-                        shutil.copy(best_model_path_absolute, best_model_backup_path)
-                        print(f"Zaktualizowano najlepszy model: {model_path_absolute}")
-                        print(f"Stworzono kopię zapasową najlepszego modelu w {best_model_backup_path}")
-                        break
-                    except PermissionError as e:
-                        print(f"Próba {attempt + 1}/5: Nie udało się skopiować best_model.zip do {model_path_absolute}: {e}")
-                        time.sleep(3)
-                    except Exception as e:
-                        print(f"Nie udało się skopiować best_model.zip do {model_path_absolute}: {e}")
-                        break
-                else:
-                    print(f"Nie udało się skopiować best_model.zip po 5 próbach.")
-            else:
-                print(f"Plik {best_model_path_absolute} nie istnieje. Pomijam kopiowanie najlepszego modelu.")
+    model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['model_path']))
+    vec_norm_path = model_path_absolute.replace('.zip', '_vecnorm.pkl')
+    vec_norm_eval_path = model_path_absolute.replace('.zip', '_vecnorm_eval.pkl')
+    state_path = model_path_absolute.replace('.zip', '_state.pkl')
 
-            # Sprawdź, czy train_progress.csv istnieje przed wywołaniem skryptu
-            train_csv_path = os.path.join(base_dir, config['paths']['train_csv_path'])
-            if os.path.exists(train_csv_path):
-                try:
-                    train_plot_script = os.path.join(os.path.dirname(__file__), 'plot_train_progress.py')
-                    subprocess.run([sys.executable, train_plot_script], check=True)
-                    print(f"Wygenerowano wykres treningu: {os.path.join(base_dir, config['paths']['plot_path'])}")
-                except Exception as e:
-                    print(f"Błąd podczas generowania wykresu treningu: {e}")
-            else:
-                print(f"Plik {train_csv_path} nie istnieje. Pomijam generowanie wykresu.")
+    load_model = os.path.exists(model_path_absolute)
+    total_timesteps = 0
+    if load_model:
+        try:
+            with open(state_path, 'rb') as f:
+                state = pickle.load(f)
+                total_timesteps = state['total_timesteps']
+            print(f"Wznowienie treningu od {total_timesteps} kroków.")
+        except Exception as e:
+            print(f"Błąd ładowania stanu: {e}. Zaczynam od zera.")
 
-            if config['training']['enable_testing'] and not test_started:
-                threading.Thread(
-                    target=test_thread,
-                    args=(
-                        model_path_absolute,
-                        os.path.join(base_dir, config['paths']['test_model_path']),
-                        os.path.join(base_dir, config['paths']['test_log_path']),
-                        os.path.join(base_dir, config['paths']['test_csv_path']),
-                        os.path.join(base_dir, config['paths']['test_progress_path'])
-                    ),
-                    daemon=True
-                ).start()
-                test_started = True
+    reset_channel_logs()
+    if enable_channel_logs:
+        channel_loggers.update(init_channel_loggers())
 
+    env = make_vec_env(make_env(render_mode=None, grid_size=None), n_envs=n_envs, vec_env_cls=SubprocVecEnv)
+    if load_model and os.path.exists(vec_norm_path):
+        env = VecNormalize.load(vec_norm_path, env)
+    else:
+        env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+
+    eval_env = make_vec_env(make_env(render_mode=None, grid_size=16), n_envs=1, vec_env_cls=SubprocVecEnv)
+    if load_model and os.path.exists(vec_norm_eval_path):
+        eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
+    else:
+        eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+
+    policy_kwargs = config['model']['policy_kwargs']
+    policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
+
+    if load_model:
+        model = PPO.load(model_path_absolute, env=env)
+        model.ent_coef = config['model']['ent_coef']
+        model.learning_rate = linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate'])
+        model._setup_lr_schedule()
+    else:
+        model = PPO(
+            config['model']['policy'],
+            env,
+            learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
+            n_steps=config['model']['n_steps'],
+            batch_size=config['model']['batch_size'],
+            n_epochs=config['model']['n_epochs'],
+            gamma=config['model']['gamma'],
+            gae_lambda=config['model']['gae_lambda'],
+            clip_range=config['model']['clip_range'],
+            ent_coef=config['model']['ent_coef'],
+            vf_coef=config['model']['vf_coef'],
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            device=config['model']['device']
+        )
+
+    if use_config_hyperparams and load_model:
+        policy_kwargs = config['model']['policy_kwargs']
+        policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
+        model_new = PPO(
+            config['model']['policy'],
+            env,
+            learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
+            n_steps=config['model']['n_steps'],
+            batch_size=config['model']['batch_size'],
+            n_epochs=config['model']['n_epochs'],
+            gamma=config['model']['gamma'],
+            gae_lambda=config['model']['gae_lambda'],
+            clip_range=config['model']['clip_range'],
+            ent_coef=config['model']['ent_coef'],
+            vf_coef=config['model']['vf_coef'],
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            device=config['model']['device']
+        )
+        model_tmp = PPO.load(model_path_absolute)
+        model_new.policy.load_state_dict(model_tmp.policy.state_dict())
+        model = model_new
+        del model_tmp
+
+    global best_model_save_path
+    best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
+
+    stop_on_plateau = StopTrainingOnNoModelImprovement(
+        max_no_improvement_evals=config['training']['max_no_improvement_evals'],
+        min_evals=config['training']['min_evals'],
+        verbose=1
+    )
+
+    plot_script_path = os.path.join(os.path.dirname(__file__), 'plot_train_progress.py')
+
+    eval_callback = CustomEvalCallback(
+        eval_env=eval_env,
+        best_model_save_path=best_model_save_path,
+        log_path=os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir'])),
+        eval_freq=eval_freq,
+        deterministic=True,
+        render=False,
+        callback_after_eval=stop_on_plateau,
+        plot_interval=plot_interval,
+        plot_script_path=plot_script_path,
+        initial_timesteps=total_timesteps
+    )
+
+    train_progress_callback = TrainProgressCallback(
+        os.path.join(base_dir, config['paths']['train_csv_path']),
+        initial_timesteps=total_timesteps
+    )
+
+    if config['training'].get('enable_testing', False):
+        global test_stop_event, test_thread_handle
+        test_stop_event = threading.Event()
+        test_model_path = os.path.join(base_dir, config['paths']['test_model_path'])
+        test_log_path = os.path.join(base_dir, config['paths']['test_log_path'])
+        test_csv_path = os.path.join(base_dir, config['paths']['test_csv_path'])
+        test_progress_path = os.path.join(base_dir, config['paths']['test_progress_path'])
+        grid_size = 16
+        test_thread_handle = threading.Thread(target=test_thread, args=(
+            model_path_absolute, test_model_path, test_log_path, test_csv_path, test_progress_path, grid_size, test_stop_event
+        ))
+        test_thread_handle.start()
+        print("Uruchomiono wątek testujący w tle.")
+
+    if enable_channel_logs:
+        for logger in channel_loggers.values():
+            logger.info(f"\n--- Debug: Rozpoczęcie treningu ---")
+        debug_env = make_env(render_mode=None, grid_size=None)()
+        obs, _ = debug_env.reset()
+        grid_size = debug_env.env.grid_size
+        log_observation(obs, channel_loggers, grid_size, step=0)
+        for debug_step in range(5):
+            action = debug_env.action_space.sample()
+            obs, reward, done, _, info = debug_env.step(action)
+            log_observation(obs, channel_loggers, grid_size, step=debug_step + 1)
+            if enable_channel_logs:
+                for logger in channel_loggers.values():
+                    logger.info(f"Akcja: {action}, Nagroda: {reward}, Done: {done}, Info: {info}")
+            if done:
+                break
+        debug_env.close()
+        if enable_channel_logs:
+            for logger in channel_loggers.values():
+                logger.info(f"--- Koniec debug dla grid_size={grid_size} ---")
+
+    try:
+        # Oblicz pozostałe kroki do treningu
+        remaining_timesteps = config['training']['total_timesteps'] - total_timesteps
+        if remaining_timesteps > 0:
+            model.learn(
+                total_timesteps=remaining_timesteps,
+                reset_num_timesteps=not load_model,
+                callback=[eval_callback, train_progress_callback],
+                progress_bar=use_progress_bar,
+                tb_log_name=f"ppo_snake_{total_timesteps}"
+            )
+        else:
+            print(f"Trening zakończony: osiągnięto {total_timesteps} kroków.")
+    except Exception as e:
+        print(f"Błąd podczas treningu: {e}")
+        raise
+    finally:
         env.close()
         eval_env.close()
 
     print("Trening zakończony! Testowanie działa w tle. Logi testowania w:", os.path.join(base_dir, config['paths']['test_log_path']))
 
 if __name__ == "__main__":
-    model = None
     try:
         train(use_progress_bar=True)
     except KeyboardInterrupt:
         print("Przerwano trening.")
-        # Bezpiecznie zakończ wątek testujący jeśli istnieje
-        import gc
-        test_stop_event = None
-        for obj in gc.get_objects():
-            if isinstance(obj, threading.Event) and obj.is_set() is False:
-                test_stop_event = obj
-                break
         if test_stop_event is not None:
             test_stop_event.set()
             print("Wysłano sygnał zakończenia do wątku testującego.")
-        exit(0)
+            if test_thread_handle is not None:
+                test_thread_handle.join(timeout=10)
+                print("Wątek testujący zakończony.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"Błąd podczas treningu: {e}")
+        import traceback
+        traceback.print_exc()
+        if test_stop_event is not None:
+            test_stop_event.set()
+            if test_thread_handle is not None:
+                test_thread_handle.join(timeout=10)
+        sys.exit(1)
     print("Trening zakończony! Testowanie działa w tle. Logi testowania w:", os.path.join(base_dir, config['paths']['test_log_path']))
