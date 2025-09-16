@@ -27,10 +27,14 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
+# Definicja zmiennych globalnych
+test_stop_event = None
+test_thread_handle = None
+
 def reset_channel_logs():
     log_dir = os.path.join(base_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
-    for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head']:
+    for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         with open(log_path, 'w', encoding='utf-8'):
             pass
@@ -38,7 +42,7 @@ def reset_channel_logs():
 def init_channel_loggers():
     loggers = {}
     log_dir = os.path.join(base_dir, 'logs')
-    for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head']:
+    for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         logger = logging.getLogger(f'channel_{channel_name}')
         handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
@@ -58,7 +62,6 @@ def log_observation(obs, channel_loggers, grid_size, step):
     if not enable_channel_logs:
         return
     image = obs['image']
-    # Obraz w formacie [C, H, W], bierzemy ostatnią ramkę (ostatni kanał)
     latest_channel = image[-1:, :, :]  # [1, H, W]
     mapa = latest_channel[0, :, :]  # [H, W]
     head_pos = np.where(mapa == 1.0)
@@ -76,7 +79,6 @@ def log_observation(obs, channel_loggers, grid_size, step):
     else:
         distance = float('inf')
     
-    # Logowanie kanału mapa
     logger = channel_loggers.get('mapa')
     if logger:
         logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
@@ -85,15 +87,14 @@ def log_observation(obs, channel_loggers, grid_size, step):
         logger.info(f"Dystans Manhattan: {distance}")
         logger.info("-" * 60)
 
-    # Logowanie skalarów
-    for scalar_name in ['direction', 'grid_size', 'dx_head', 'dy_head']:
+    for scalar_name in ['direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         logger = channel_loggers.get(scalar_name)
         if logger:
             logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
             logger.info(f"{scalar_name.capitalize()}: {obs[scalar_name][0]}")
             logger.info("-" * 60)
 
-def linear_schedule(initial_value, min_value=0.0):
+def linear_schedule(initial_value, min_value=0.00005):
     def func(progress_remaining):
         return min_value + (initial_value - min_value) * progress_remaining
     return func
@@ -111,7 +112,7 @@ class TrainProgressCallback(BaseCallback):
             if (self.num_timesteps + self.initial_timesteps) - self.last_logged >= 1000:
                 ep_rew_mean = self.model.ep_info_buffer and np.mean([ep_info['r'] for ep_info in self.model.ep_info_buffer]) or None
                 ep_len_mean = self.model.ep_info_buffer and np.mean([ep_info['l'] for ep_info in self.model.ep_info_buffer]) or None
-                grid_size = self.training_env.get_attr('grid_size')[0]
+                grid_size = np.mean(self.training_env.get_attr('grid_size'))  # Średni grid_size
                 try:
                     write_header = not os.path.exists(self.csv_path)
                     with open(self.csv_path, 'a', newline='') as csvfile:
@@ -127,7 +128,7 @@ class TrainProgressCallback(BaseCallback):
 class CustomEvalCallback(EvalCallback):
     def __init__(self, eval_env, callback_on_new_best=None, callback_after_eval=None, best_model_save_path=None,
                  log_path=None, eval_freq=10000, deterministic=True, render=False, verbose=1,
-                 warn=True, n_eval_episodes=5, plot_interval=3, plot_script_path=None):
+                 warn=True, n_eval_episodes=5, plot_interval=3, plot_script_path=None, initial_timesteps=0):
         super().__init__(eval_env, callback_on_new_best=callback_on_new_best, callback_after_eval=callback_after_eval,
                          best_model_save_path=best_model_save_path, log_path=log_path, eval_freq=eval_freq,
                          deterministic=deterministic, render=render, verbose=verbose, warn=warn,
@@ -135,11 +136,21 @@ class CustomEvalCallback(EvalCallback):
         self.eval_count = 0
         self.plot_interval = plot_interval
         self.plot_script_path = plot_script_path
+        self.initial_timesteps = initial_timesteps
 
     def _on_step(self) -> bool:
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
             super()._on_step()
             self.eval_count += 1
+            # Zapis najnowszego modelu po każdej walidacji
+            total_timesteps = self.model.num_timesteps + self.initial_timesteps
+            save_training_state(self.model, self.model.env, self.eval_env, total_timesteps, self.best_model_save_path)
+            print(f"Zaktualizowano najnowszy model po {total_timesteps} krokach z mean_reward={self.last_mean_reward}")
+
+            # Zapis najlepszego modelu, jeśli poprawiono mean_reward
+            if self.best_mean_reward < self.last_mean_reward:
+                self.model.save(os.path.join(self.best_model_save_path, f'best_model_{total_timesteps}.zip'))
+                print(f"New best model saved at {total_timesteps} timesteps with mean reward {self.last_mean_reward}")
             if self.eval_count % self.plot_interval == 0:
                 try:
                     subprocess.run([sys.executable, self.plot_script_path], check=True)
@@ -251,19 +262,20 @@ def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progr
         env.close()
         time.sleep(5)
 
-def save_training_state(model, env, eval_env, total_timesteps):
-    model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['model_path']))
+def save_training_state(model, env, eval_env, total_timesteps, save_path):
+    model_path_absolute = os.path.normpath(os.path.join(save_path, 'snake_ppo_model.zip'))
     vec_norm_path = model_path_absolute.replace('.zip', '_vecnorm.pkl')
     vec_norm_eval_path = model_path_absolute.replace('.zip', '_vecnorm_eval.pkl')
+    state_path = model_path_absolute.replace('.zip', '_state.pkl')
 
     for attempt in range(5):
         try:
             model.save(model_path_absolute)
             env.save(vec_norm_path)
             eval_env.save(vec_norm_eval_path)
-            with open(model_path_absolute.replace('.zip', '_state.pkl'), 'wb') as f:
+            with open(state_path, 'wb') as f:
                 pickle.dump({'total_timesteps': total_timesteps}, f)
-            print(f"Stan treningu zapisany po {total_timesteps} krokach.")
+            print(f"Zaktualizowano najnowszy model: {model_path_absolute} po {total_timesteps} krokach.")
             break
         except PermissionError as e:
             print(f"Próba {attempt + 1}/5: Nie udało się zapisać stanu: {e}")
@@ -274,35 +286,11 @@ def save_training_state(model, env, eval_env, total_timesteps):
     else:
         print("Nie udało się zapisać stanu po 5 próbach.")
 
-    best_model_file_path = os.path.join(best_model_save_path, 'best_model.zip')
-    if os.path.exists(best_model_file_path):
-        for attempt in range(5):
-            try:
-                with open(best_model_file_path, 'rb') as f:
-                    pass
-                shutil.copy(best_model_file_path, model_path_absolute)
-                print(f"Zaktualizowano najlepszy model: {model_path_absolute}")
-                break
-            except PermissionError as e:
-                print(f"Próba {attempt + 1}/5: Nie udało się skopiować best_model.zip: {e}")
-                time.sleep(3)
-            except Exception as e:
-                print(f"Nie udało się skopiować best_model.zip: {e}")
-                break
-        else:
-            print(f"Nie udało się skopiować best_model.zip po 5 próbach.")
-    else:
-        print(f"Plik {best_model_file_path} nie istnieje. Pomijam kopiowanie.")
-
-test_stop_event = None
-test_thread_handle = None
-
 def train(use_progress_bar=False, use_config_hyperparams=True):
     global test_stop_event, test_thread_handle, best_model_save_path
 
     n_envs = config['training']['n_envs']
     n_steps = config['model']['n_steps']
-    min_lr = config['model'].get('min_learning_rate', 0.0)
     eval_freq = config['training']['eval_freq']
     plot_interval = config['training']['plot_interval']
 
@@ -344,13 +332,13 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     if load_model:
         model = PPO.load(model_path_absolute, env=env)
         model.ent_coef = config['model']['ent_coef']
-        model.learning_rate = linear_schedule(config['model']['learning_rate'], min_lr)
+        model.learning_rate = linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate'])
         model._setup_lr_schedule()
     else:
         model = PPO(
             config['model']['policy'],
             env,
-            learning_rate=linear_schedule(config['model']['learning_rate'], min_lr),
+            learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
             n_steps=config['model']['n_steps'],
             batch_size=config['model']['batch_size'],
             n_epochs=config['model']['n_epochs'],
@@ -370,7 +358,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         model_new = PPO(
             config['model']['policy'],
             env,
-            learning_rate=linear_schedule(config['model']['learning_rate'], min_lr),
+            learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
             n_steps=config['model']['n_steps'],
             batch_size=config['model']['batch_size'],
             n_epochs=config['model']['n_epochs'],
@@ -390,7 +378,6 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
 
     global best_model_save_path
     best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
-    eval_log_path = os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir']))
 
     stop_on_plateau = StopTrainingOnNoModelImprovement(
         max_no_improvement_evals=config['training']['max_no_improvement_evals'],
@@ -403,13 +390,14 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     eval_callback = CustomEvalCallback(
         eval_env=eval_env,
         best_model_save_path=best_model_save_path,
-        log_path=eval_log_path,
+        log_path=os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir'])),
         eval_freq=eval_freq,
         deterministic=True,
         render=False,
         callback_after_eval=stop_on_plateau,
         plot_interval=plot_interval,
-        plot_script_path=plot_script_path
+        plot_script_path=plot_script_path,
+        initial_timesteps=total_timesteps
     )
 
     train_progress_callback = TrainProgressCallback(
@@ -418,6 +406,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     )
 
     if config['training'].get('enable_testing', False):
+        global test_stop_event, test_thread_handle
         test_stop_event = threading.Event()
         test_model_path = os.path.join(base_dir, config['paths']['test_model_path'])
         test_log_path = os.path.join(base_dir, config['paths']['test_log_path'])
@@ -451,22 +440,29 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             for logger in channel_loggers.values():
                 logger.info(f"--- Koniec debug dla grid_size={grid_size} ---")
 
-    model.learn(
-        total_timesteps=config['training']['total_timesteps'],
-        reset_num_timesteps=not load_model,
-        callback=[eval_callback, train_progress_callback],
-        progress_bar=use_progress_bar
-    )
-
-    save_training_state(model, env, eval_env, config['training']['total_timesteps'])
-
-    env.close()
-    eval_env.close()
+    try:
+        # Oblicz pozostałe kroki do treningu
+        remaining_timesteps = config['training']['total_timesteps'] - total_timesteps
+        if remaining_timesteps > 0:
+            model.learn(
+                total_timesteps=remaining_timesteps,
+                reset_num_timesteps=not load_model,
+                callback=[eval_callback, train_progress_callback],
+                progress_bar=use_progress_bar,
+                tb_log_name=f"ppo_snake_{total_timesteps}"
+            )
+        else:
+            print(f"Trening zakończony: osiągnięto {total_timesteps} kroków.")
+    except Exception as e:
+        print(f"Błąd podczas treningu: {e}")
+        raise
+    finally:
+        env.close()
+        eval_env.close()
 
     print("Trening zakończony! Testowanie działa w tle. Logi testowania w:", os.path.join(base_dir, config['paths']['test_log_path']))
 
 if __name__ == "__main__":
-    model = None
     try:
         train(use_progress_bar=True)
     except KeyboardInterrupt:
