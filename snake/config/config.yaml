@@ -1,6 +1,7 @@
 # Konfiguracja środowiska Snake
 environment:
-  grid_size: 16                      # Domyślny rozmiar siatki
+  min_grid_size: 5                   # Minimalny rozmiar siatki dla losowania
+  max_grid_size: 16                  # Maksymalny rozmiar siatki dla losowania
   snake_size: 20                     # Rozmiar kratki w pikselach
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
   observation_space:
@@ -15,7 +16,7 @@ environment:
 
 # Konfiguracja modelu PPO
 model:
-  policy: CnnPolicy                  # Używamy CnnPolicy dla CNN
+  policy: MultiInputPolicy           # Zmieniono na MultiInputPolicy dla przestrzeni Dict
   learning_rate: 0.0002              # Szybkość uczenia 
   min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej tej wartości)
   n_steps: 2048                      # Liczba kroków na aktualizację
@@ -32,22 +33,19 @@ model:
     features_extractor_kwargs:
       features_dim: 512
     net_arch:
-      pi: [256, 128]  # dla aktora
-      vf: [256, 128]  # dla krytyka
+      pi: [256, 256, 128]  # dla aktora
+      vf: [256, 256, 128]  # dla krytyka
 
 # Konfiguracja treningu
 training:
   n_envs: 16                         # Liczba środowisk
   total_timesteps: 10000000          # Całkowita liczba kroków
-  eval_freq: 2000                    # Częstotliwość ewaluacji
+  eval_freq: 5000                    # Częstotliwość ewaluacji (zwiększona dla rzadszej validacji)
+  plot_interval: 2                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 50       # Liczba ewaluacji bez poprawy przed zatrzymaniem
-  min_evals: 5
+  min_evals: 5                       # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
   enable_testing: false              # Włączone dla widoczności postępów
   enable_channel_logs: true          # Włącz logi kanałów
-  #curriculum_multipliers: [1, 30, 30, 30, 30]  # Ilość kroków do ukończenia poziomu w curriculum
-  #curriculum_grid_sizes: [5, 5, 8, 12, 16]  # Rozmiary siatki w curriculum
-  curriculum_multipliers: [1, 20,60,80,80]  # Ilość kroków do ukończenia poziomu w curriculum
-  curriculum_grid_sizes: [5, 5, 5, 5, 5] # Dla testu
 
 # Ścieżki do zapisu
 paths:
