@@ -6,3 +6,5 @@ pygame
 tqdm
 filelock
 pyyaml
+imageio
+Pillow

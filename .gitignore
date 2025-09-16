@@ -4,7 +4,6 @@ __pycache__/
 *.pyo
 *.pyd
 *.pyc
-*.pkl
 *.egg-info/
 
 # Virtual environments
@@ -26,12 +25,7 @@ Thumbs.db
 # Logs and outputs
 *.log
 *.csv
-*.png
 *.npz
-
-# Models and checkpoints
-snake/models/*.zip
-snake/models/*.npz
 
 # Training logs
 logs/*
