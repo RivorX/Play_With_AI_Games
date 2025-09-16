@@ -10,8 +10,6 @@ Projekt: lekki agent PPO (Stable Baselines3) nauczony gry w Snake na siatkach o 
 |:---:|:---:|:----:|
 | ![snake run 5](docs/snake_run_5.gif) | ![snake run 8](docs/snake_run_8.gif) | ![snake run 16](docs/snake_run_16.gif) |
 
-> GIFy zapętlone — jeśli plik GIF został zapisany jako pętla, GitHub również go zapętli. Jeśli nie widzisz pętli, możemy zrekodować GIF w pętli.
-
 ---
 
 ## Szybkie uruchomienie (najpierw)
@@ -23,6 +21,8 @@ Projekt: lekki agent PPO (Stable Baselines3) nauczony gry w Snake na siatkach o 
 2. Zainstaluj zależności:
 ```powershell
 pip install -r requirements.txt
+pip uninstal torch
+pip install torch>=2.7 --index-url https://download.pytorch.org/whl/cu128
 ```
 3. Trening (domyślnie):
 ```powershell
@@ -75,21 +75,10 @@ Model trenowany był dla rozmiarów siatki w zakresie 5–16 (grid_size 5..16). 
 
 ## Trening i wyniki
 
-Poniżej przykładowy wykres postępu treningu (średnia nagroda / epizod podczas treningu). Wykres generowany przez `plot_train_progress.py` i zapisywany do `snake/docs/training_progress.png`.
+Poniżej przykładowy wykres postępu treningu (średnia nagroda / epizod podczas treningu). Wykres generowany przez `plot_train_progress.py` i przeniesiony do `snake/docs/training_progress.png`.
 
 ![Training progress](docs/training_progress.png)
 
-
-# Przywracanie modelu z kopii zapasowej
-
-Jeśli chcesz kontynuować trening lub przetestować ostatni zapisany model, a plik modelu został uszkodzony lub chcesz wrócić do poprzedniej wersji:
-
-1. Przejdź do folderu `models`.
-2. Znajdź plik z końcówką `.zip.backup` (np. `snake_ppo_model.zip.backup` lub `best_model.zip.backup`).
-3. Zmień nazwę pliku, usuwając końcówkę `.backup` (np. `snake_ppo_model.zip.backup` → `snake_ppo_model.zip`).
-4. Teraz możesz uruchomić trening lub testowanie – program użyje przywróconego modelu.
-
-To samo dotyczy pliku najlepszego modelu (`best_model.zip.backup`).
 
 # Wyjaśnienie metryk PPO (Stable Baselines3)
 
