@@ -29,17 +29,17 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
             nn.Flatten()
         )
 
-        scalar_dim = 4  # direction, grid_size, dx_head, dy_head
+        scalar_dim = 7  # direction, grid_size, dx_head, dy_head, front_coll, left_coll, right_coll
         self.scalar_linear = nn.Sequential(
-            nn.Linear(scalar_dim, 64),
+            nn.Linear(scalar_dim, 128),  # Zwiększono z 64 do 128
             nn.LeakyReLU(0.01),
-            nn.Linear(64, 128),
+            nn.Linear(128, 256),  # Zwiększono z 128 do 256
             nn.LeakyReLU(0.01),
             nn.Dropout(dropout_rate)
         )
 
         cnn_dim = 64 * 2 * 2  # 256 cech
-        total_dim = cnn_dim + 128  # 256 (CNN) + 128 (scalars) = 384
+        total_dim = cnn_dim + 256  # 256 (CNN) + 256 (scalars) = 512
         self.final_linear = nn.Sequential(
             nn.Linear(total_dim, features_dim),
             nn.LeakyReLU(0.01),
@@ -48,16 +48,18 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
 
     def forward(self, observations):
         image = observations['image']
-        # Upewnij się, że obraz jest w formacie [batch, channels, height, width]
         if image.shape[1] != 4:  # Sprawdzenie, czy kanały są pierwsze
             image = image.permute(0, 3, 1, 2)  # [batch, H, W, C] -> [batch, C, H, W]
-        if image.requires_grad:  # Retain gradients only if requires_grad is True
+        if image.requires_grad:
             image.retain_grad()
         scalars = torch.cat([
             observations['direction'],
             observations['grid_size'],
             observations['dx_head'],
-            observations['dy_head']
+            observations['dy_head'],
+            observations['front_coll'],
+            observations['left_coll'],
+            observations['right_coll']
         ], dim=-1)
 
         image_features = self.cnn(image)
