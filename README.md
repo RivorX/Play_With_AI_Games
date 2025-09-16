@@ -1,4 +1,4 @@
-# Game AI Lab
+# Play With AI Games
 
 Zbiór prostych projektów i eksperymentów związanych z zastosowaniem algorytmów uczenia maszynowego w grach.
 
