@@ -309,6 +309,21 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             print(f"Wznowienie treningu od {total_timesteps} kroków.")
         except Exception as e:
             print(f"Błąd ładowania stanu: {e}. Zaczynam od zera.")
+        # Interaktywne pytania dla użytkownika gdy znaleziono model
+        try:
+            resp = input(f"Znaleziono istniejący model pod {model_path_absolute}. Czy kontynuować trening? [Y/n]: ").strip()
+        except Exception:
+            resp = ''
+        if resp.lower() in ('n', 'no'):
+            print("Anulowano trening przez użytkownika.")
+            return
+
+        try:
+            resp2 = input("Użyć hyperparametrów z configu zamiast z modelu? [Y/n]: ").strip()
+        except Exception:
+            resp2 = ''
+        # Domyślnie True (użyj configu)
+        use_config_hyperparams = False if resp2.lower() in ('n', 'no') else True
 
     reset_channel_logs()
     if enable_channel_logs:
@@ -442,7 +457,22 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
 
     try:
         # Oblicz pozostałe kroki do treningu
-        remaining_timesteps = config['training']['total_timesteps'] - total_timesteps
+        configured_total = config['training'].get('total_timesteps', 0)
+        remaining_timesteps = configured_total - total_timesteps
+        # Jeżeli osiągnięto już >=80% limitu, zapytaj czy dodać dodatkowe kroki
+        try:
+            if configured_total > 0 and total_timesteps / configured_total >= 0.8:
+                print(f"Użyto {total_timesteps}/{configured_total} kroków ({total_timesteps/configured_total:.1%}). To >=80% limitu.")
+                extra = input("Ile dodatkowych kroków dodać? (0 = brak, domyślnie 0): ").strip()
+                try:
+                    extra_int = int(extra) if extra != '' else 0
+                except ValueError:
+                    print("Niepoprawna wartość, używam 0 dodatkowych kroków.")
+                    extra_int = 0
+                remaining_timesteps += extra_int
+        except Exception:
+            # W środowiskach nieinteraktywnych input może rzucić wyjątkiem; ignoruj wtedy
+            pass
         if remaining_timesteps > 0:
             model.learn(
                 total_timesteps=remaining_timesteps,
