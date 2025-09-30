@@ -1,10 +1,8 @@
 import argparse
 import os
-import time
 import numpy as np
 import pygame
 from stable_baselines3 import PPO
-import gymnasium as gym
 from model import make_env, set_grid_size
 import yaml
 import logging
