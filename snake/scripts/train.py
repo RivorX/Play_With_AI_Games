@@ -1,8 +1,6 @@
 import os
 import time
-import threading
 import numpy as np
-import pygame
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
@@ -11,12 +9,10 @@ from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoMod
 import csv
 import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import shutil
 import subprocess
 import sys
 import yaml
-from model import make_env, set_grid_size
+from model import make_env
 from cnn import CustomFeaturesExtractor
 import logging
 import pickle
@@ -27,12 +23,21 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
-# Definicja zmiennych globalnych
-test_stop_event = None
-test_thread_handle = None
+# Funkcja tworząca wymagane katalogi jeśli nie istnieją
+def ensure_directories():
+    dirs = [
+        os.path.join(base_dir, 'models'),
+        os.path.join(base_dir, 'logs'),
+        os.path.join(base_dir, 'logs', 'Training_channels')
+    ]
+    for d in dirs:
+        if not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+
+ensure_directories()
 
 def reset_channel_logs():
-    log_dir = os.path.join(base_dir, 'logs')
+    log_dir = os.path.join(base_dir, 'logs', 'Training_channels')
     os.makedirs(log_dir, exist_ok=True)
     for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
@@ -41,7 +46,7 @@ def reset_channel_logs():
 
 def init_channel_loggers():
     loggers = {}
-    log_dir = os.path.join(base_dir, 'logs')
+    log_dir = os.path.join(base_dir, 'logs', 'Training_channels')
     for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         logger = logging.getLogger(f'channel_{channel_name}')
@@ -159,108 +164,7 @@ class CustomEvalCallback(EvalCallback):
                     print(f"Błąd podczas generowania wykresu: {e}")
         return True
 
-def test_thread(model_path, test_model_path, log_path, test_csv_path, test_progress_path, grid_size, stop_event=None):
-    current_model_timestamp = 0
-    timestamps = []
-    mean_scores = []
-    mean_rewards = []
-    mean_lengths = []
-    while True:
-        if stop_event is not None and stop_event.is_set():
-            print("[TestThread] Otrzymano sygnał zakończenia. Kończę wątek testujący.")
-            break
-        set_grid_size(grid_size)
-        env = make_env(render_mode="human", grid_size=grid_size)()
-        model = None
-        try:
-            new_timestamp = os.path.getmtime(model_path)
-            if new_timestamp > current_model_timestamp:
-                with open(log_path, 'a') as f:
-                    f.write(f"[{time.ctime()}] Ładuję nowy model dla grid_size={grid_size}...\n")
-                shutil.copy(model_path, test_model_path)
-                model = PPO.load(test_model_path)
-                model.ent_coef = config['model']['ent_coef']
-                model._setup_lr_schedule()
-                current_model_timestamp = new_timestamp
-            elif model is None:
-                shutil.copy(model_path, test_model_path)
-                model = PPO.load(test_model_path)
-                model.ent_coef = config['model']['ent_coef']
-                model._setup_lr_schedule()
-        except FileNotFoundError:
-            with open(log_path, 'a') as f:
-                f.write(f"[{time.ctime()}] Nie znaleziono modelu w {model_path}. Czekam 5 sekund...\n")
-            time.sleep(5)
-            env.close()
-            continue
-        except Exception as e:
-            with open(log_path, 'a') as f:
-                f.write(f"[{time.ctime()}] Błąd ładowania modelu: {e}\n")
-            time.sleep(5)
-            env.close()
-            continue
-
-        scores = []
-        rewards = []
-        lengths = []
-        for ep in range(5):
-            obs, _ = env.reset()
-            done = False
-            total_reward = 0
-            steps = 0
-            while not done:
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, done, _, info = env.step(action)
-                total_reward += reward
-                steps += 1
-                env.render()
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        done = True
-            scores.append(info['score'])
-            rewards.append(total_reward)
-            lengths.append(steps)
-            with open(log_path, 'a') as f:
-                f.write(f"[{time.ctime()}] Epizod {ep+1}: Wynik={info['score']}, Nagroda={total_reward}, Kroki={steps}\n")
-
-        mean_score = np.mean(scores)
-        mean_reward = np.mean(rewards)
-        mean_length = np.mean(lengths)
-        timestamps.append(time.time())
-        mean_scores.append(mean_score)
-        mean_rewards.append(mean_reward)
-        mean_lengths.append(mean_length)
-        with open(log_path, 'a') as f:
-            f.write(f"[{time.ctime()}] Średni wynik: {mean_score}, Średnia nagroda: {mean_reward}, Średnia długość: {mean_length}\n")
-
-        try:
-            write_header = not os.path.exists(test_csv_path)
-            with open(test_csv_path, 'a', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                if write_header:
-                    writer.writerow(['timestamp', 'mean_score', 'mean_reward', 'mean_ep_length'])
-                writer.writerow([time.time(), mean_score, mean_reward, mean_length])
-        except Exception as e:
-            with open(log_path, 'a') as f:
-                f.write(f"[{time.ctime()}] Błąd zapisu CSV: {e}\n")
-
-        if timestamps:
-            plt.figure(figsize=(8, 4))
-            plt.plot(timestamps, mean_scores, label='mean_score')
-            plt.plot(timestamps, mean_rewards, label='mean_reward')
-            plt.plot(timestamps, mean_lengths, label='mean_ep_length')
-            plt.xlabel('Timestamp')
-            plt.ylabel('Value')
-            plt.title('Test Progress')
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(test_progress_path)
-            plt.close()
-            with open(log_path, 'a') as f:
-                f.write(f"[{time.ctime()}] Zaktualizowano wykres testów: {test_progress_path}\n")
-
-        env.close()
-        time.sleep(5)
+ # Usunięto funkcję test_thread
 
 def save_training_state(model, env, eval_env, total_timesteps, save_path):
     model_path_absolute = os.path.normpath(os.path.join(save_path, 'snake_ppo_model.zip'))
@@ -287,7 +191,7 @@ def save_training_state(model, env, eval_env, total_timesteps, save_path):
         print("Nie udało się zapisać stanu po 5 próbach.")
 
 def train(use_progress_bar=False, use_config_hyperparams=True):
-    global test_stop_event, test_thread_handle, best_model_save_path
+    global best_model_save_path
 
     n_envs = config['training']['n_envs']
     n_steps = config['model']['n_steps']
@@ -311,19 +215,35 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             print(f"Błąd ładowania stanu: {e}. Zaczynam od zera.")
         # Interaktywne pytania dla użytkownika gdy znaleziono model
         try:
-            resp = input(f"Znaleziono istniejący model pod {model_path_absolute}. Czy kontynuować trening? [Y/n]: ").strip()
+            resp = input(f"Znaleziono istniejący model pod {model_path_absolute}. Czy kontynuować trening? [[Y]/n]: ").strip()
         except Exception:
+            # W środowiskach nieinteraktywnych zachowaj domyślne zachowanie (kontynuuj)
             resp = ''
-        if resp.lower() in ('n', 'no'):
-            print("Anulowano trening przez użytkownika.")
-            return
 
-        try:
-            resp2 = input("Użyć hyperparametrów z configu zamiast z modelu? [Y/n]: ").strip()
-        except Exception:
-            resp2 = ''
-        # Domyślnie True (użyj configu)
-        use_config_hyperparams = False if resp2.lower() in ('n', 'no') else True
+        # Jeśli użytkownik wybierze 'n' lub 'no', traktujemy to jako decyzję o rozpoczęciu treningu od nowa.
+        # W takim przypadku nie ładujemy modelu, resetujemy total_timesteps i ustawiamy load_model=False.
+        if resp.lower() in ('n', 'no'):
+            print("Użytkownik wybrał rozpoczęcie treningu od nowa. Zaczynam od zera i używam hyperparametrów z configu.")
+            load_model = False
+            total_timesteps = 0
+            # W trybie "od nowa" nie pytamy o użycie hyperparametrów z modelu (oczywiste, bo model nie istnieje)
+            use_config_hyperparams = True
+            # Usuń istniejący plik z postępem treningu, bo zaczynamy od nowa
+            try:
+                train_csv = os.path.join(base_dir, config['paths']['train_csv_path'])
+                if os.path.exists(train_csv):
+                    os.remove(train_csv)
+                    print(f"Usunięto istniejący plik postępu treningu: {train_csv}")
+            except Exception as e:
+                print(f"Nie udało się usunąć pliku postępu treningu: {e}")
+        else:
+            # Jeżeli kontynuujemy trening (domyślnie), pytamy czy użyć hyperparametrów z configu
+            try:
+                resp2 = input("Użyć hyperparametrów z configu zamiast z modelu? [[Y]/n]: ").strip()
+            except Exception:
+                resp2 = ''
+            # Domyślnie True (użyj configu)
+            use_config_hyperparams = False if resp2.lower() in ('n', 'no') else True
 
     reset_channel_logs()
     if enable_channel_logs:
@@ -355,7 +275,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             env,
             learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
             n_steps=config['model']['n_steps'],
-            batch_size=config['model']['batch_size'],
+            batch_size=config['training']['batch_size'],
             n_epochs=config['model']['n_epochs'],
             gamma=config['model']['gamma'],
             gae_lambda=config['model']['gae_lambda'],
@@ -375,7 +295,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             env,
             learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
             n_steps=config['model']['n_steps'],
-            batch_size=config['model']['batch_size'],
+            batch_size=config['training']['batch_size'],
             n_epochs=config['model']['n_epochs'],
             gamma=config['model']['gamma'],
             gae_lambda=config['model']['gae_lambda'],
@@ -420,19 +340,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         initial_timesteps=total_timesteps
     )
 
-    if config['training'].get('enable_testing', False):
-        global test_stop_event, test_thread_handle
-        test_stop_event = threading.Event()
-        test_model_path = os.path.join(base_dir, config['paths']['test_model_path'])
-        test_log_path = os.path.join(base_dir, config['paths']['test_log_path'])
-        test_csv_path = os.path.join(base_dir, config['paths']['test_csv_path'])
-        test_progress_path = os.path.join(base_dir, config['paths']['test_progress_path'])
-        grid_size = 16
-        test_thread_handle = threading.Thread(target=test_thread, args=(
-            model_path_absolute, test_model_path, test_log_path, test_csv_path, test_progress_path, grid_size, test_stop_event
-        ))
-        test_thread_handle.start()
-        print("Uruchomiono wątek testujący w tle.")
+    # Usunięto uruchamianie testowania modelu podczas treningu
 
     if enable_channel_logs:
         for logger in channel_loggers.values():
@@ -490,27 +398,17 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         env.close()
         eval_env.close()
 
-    print("Trening zakończony! Testowanie działa w tle. Logi testowania w:", os.path.join(base_dir, config['paths']['test_log_path']))
+    print("Trening zakończony!")
 
 if __name__ == "__main__":
     try:
         train(use_progress_bar=True)
     except KeyboardInterrupt:
         print("Przerwano trening.")
-        if test_stop_event is not None:
-            test_stop_event.set()
-            print("Wysłano sygnał zakończenia do wątku testującego.")
-            if test_thread_handle is not None:
-                test_thread_handle.join(timeout=10)
-                print("Wątek testujący zakończony.")
         sys.exit(0)
     except Exception as e:
         print(f"Błąd podczas treningu: {e}")
         import traceback
         traceback.print_exc()
-        if test_stop_event is not None:
-            test_stop_event.set()
-            if test_thread_handle is not None:
-                test_thread_handle.join(timeout=10)
         sys.exit(1)
-    print("Trening zakończony! Testowanie działa w tle. Logi testowania w:", os.path.join(base_dir, config['paths']['test_log_path']))
+    print("Trening zakończony!")

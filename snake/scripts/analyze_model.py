@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import os
 import yaml
 import csv
-from cnn import CustomFeaturesExtractor
 from model import make_env
 from stable_baselines3 import PPO
 
