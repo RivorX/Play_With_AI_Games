@@ -20,7 +20,6 @@ model:
   learning_rate: 0.0002              # Szybkość uczenia 
   min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej tej wartości)
   n_steps: 2048                      # Liczba kroków na aktualizację
-  batch_size: 2048                   # Rozmiar partii
   n_epochs: 10                       # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
@@ -39,12 +38,12 @@ model:
 # Konfiguracja treningu
 training:
   n_envs: 16                         # Liczba środowisk
+  batch_size: 2048                   # Rozmiar partii
   total_timesteps: 10000000          # Całkowita liczba kroków
   eval_freq: 5000                    # Częstotliwość ewaluacji (zwiększona dla rzadszej validacji)
-  plot_interval: 2                   # Co ile walidacji robić wykres i zapisywać model
+  plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 50       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 5                       # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
-  enable_testing: false              # Włączone dla widoczności postępów
   enable_channel_logs: true          # Włącz logi kanałów
 
 # Ścieżki do zapisu
@@ -52,10 +51,6 @@ paths:
   models_dir: models
   logs_dir: logs
   model_path: models/snake_ppo_model.zip
-  test_model_path: models/test_model.zip
-  best_model_backup_path: models/best_model_backup.zip
   train_csv_path: logs/train_progress.csv
-  test_csv_path: logs/test_results.csv
-  test_log_path: logs/test_log.txt
   plot_path: logs/training_progress.png
   test_progress_path: logs/test_progress.png
