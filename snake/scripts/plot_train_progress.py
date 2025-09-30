@@ -1,7 +1,6 @@
 import os
 import csv
 import matplotlib.pyplot as plt
-import numpy as np
 
 def plot_train_progress(csv_path, output_path):
     timesteps, rewards, lengths = [], [], []
