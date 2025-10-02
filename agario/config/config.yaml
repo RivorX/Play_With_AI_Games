@@ -1,0 +1,77 @@
+# Konfiguracja środowiska Agar.io
+environment:
+  screen_size: [256, 192]            # Rozmiar zrzutu ekranu po crop i resize (proporcja 4:3, lepsza do nauki)
+  frame_history: 4                   # Liczba klatek historii dla LSTM
+  actions:
+    type: Box                         # Przestrzeń akcji: ciągła (delta_x, delta_y dla myszy) + dyskretne (split, eject)
+    low: [-1.0, -1.0, 0]              # Min: lewo, góra, no split/eject
+    high: [1.0, 1.0, 1]               # Max: prawo, dół, split/eject
+    shape: (3,)                       # 3 wymiary akcji
+  observation_space:
+    shape: (4, 3, 84, 84)             # Batch x time x channels x H x W (RGB + historia)
+    low: 0.0                          # Normalizacja [0,1]
+    high: 1.0
+    dtype: float32
+  max_episode_steps: 2000            # Max kroków na epizod (dłuższe niż Snake)
+  reward_scale: 10.0                 # Skalowanie nagród (masa + jedzenie - kolizje)
+
+# Konfiguracja datasetu nagrań
+dataset:
+  recordings_dir: datasets/recordings  # Katalog z sesjami nagrań
+  fps: 10                             # FPS nagrywania
+  session_length: 300                 # Max długość sesji w sekundach
+  min_sessions: 5                     # Min liczba sesji do imitation
+
+# Konfiguracja imitation learning (BC - Behavioral Cloning)
+imitation:
+  batch_size: 32                      # Batch dla BC
+  epochs: 50                          # Epoki pre-treningu
+  learning_rate: 0.001                # LR dla BC
+
+# Konfiguracja modelu PPO (dostosowane dla ConvLSTM)
+model:
+  policy: CnnLstmPolicy               # Custom policy z ConvLSTM
+  learning_rate: 0.0003               # Wyższy start dla dynamicznej gry
+  min_learning_rate: 0.00005
+  n_steps: 2048
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01                      # Niższy dla RL po imitation
+  vf_coef: 0.5
+  device: cuda
+  dropout_rate: 0.2
+  conv_lstm_kwargs:
+    conv_layers: [[32, (8,8), 4], [64, (4,4), 2], [64, (3,3), 1]]  # Conv2D layers
+    lstm_layers: 2                      # Num layers LSTM
+    hidden_dim: 256                     # Hidden size LSTM
+  policy_kwargs:
+    features_extractor_kwargs:
+      features_dim: 512
+    net_arch:
+      pi: [256, 128]                   # Dla aktora (krótsze po LSTM)
+      vf: [256, 128]                   # Dla krytyka
+
+# Konfiguracja treningu (hybrydowy: imitation + RL)
+training:
+  n_envs: 8                           # Mniej envs dla browser-based (ciężkie)
+  batch_size: 2048
+  total_timesteps: 5000000            # Mniej na start (Agar.io dłuższe)
+  imitation_timesteps: 100000         # Kroków na pre-trening BC
+  eval_freq: 10000                    # Rzadsza ewaluacja
+  plot_interval: 1                    # Wykres co 1 ewaluacji
+  max_no_improvement_evals: 20
+  min_evals: 5
+  enable_channel_logs: true
+
+# Ścieżki do zapisu (dostosowane dla Agar.io)
+paths:
+  models_dir: models
+  logs_dir: logs
+  model_path: models/agario_ppo_model.zip
+  state_path: logs/training_state.pkl
+  train_csv_path: logs/train_progress.csv
+  plot_path: logs/training_progress.png
+  test_progress_path: logs/test_progress.png
+  dataset_path: datasets/agario_dataset.npz  

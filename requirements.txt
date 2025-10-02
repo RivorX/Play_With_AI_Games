@@ -1,6 +1,6 @@
 numpy
 gymnasium
-stable-baselines3[extra]
+stable-baselines3
 torch
 pygame
 tqdm
@@ -8,3 +8,6 @@ filelock
 pyyaml
 imageio
 Pillow
+selenium
+pyautogui
+easyocr
