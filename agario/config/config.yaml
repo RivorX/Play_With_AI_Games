@@ -1,39 +1,39 @@
 # Konfiguracja środowiska Agar.io
 environment:
-  screen_size: [256, 192]            # Rozmiar zrzutu ekranu po crop i resize (proporcja 4:3, lepsza do nauki)
+  screen_size: [256, 192]            # [Width, Height] = [256, 192] - proporcja 4:3 (szerokie i niskie)
+                                      # W observation_space: (T, C, H, W) = (4, 3, 192, 256)
   frame_history: 4                   # Liczba klatek historii dla LSTM
   actions:
     type: Box                         # Przestrzeń akcji: ciągła (delta_x, delta_y dla myszy) + dyskretne (split, eject)
     low: [-1.0, -1.0, 0]              # Min: lewo, góra, no split/eject
     high: [1.0, 1.0, 1]               # Max: prawo, dół, split/eject
     shape: (3,)                       # 3 wymiary akcji
-  observation_space:
-    shape: (4, 3, 84, 84)             # Batch x time x channels x H x W (RGB + historia)
-    low: 0.0                          # Normalizacja [0,1]
-    high: 1.0
-    dtype: float32
   max_episode_steps: 2000            # Max kroków na epizod (dłuższe niż Snake)
   reward_scale: 10.0                 # Skalowanie nagród (masa + jedzenie - kolizje)
 
 # Konfiguracja datasetu nagrań
 dataset:
   recordings_dir: datasets/recordings  # Katalog z sesjami nagrań
+  train_val_split: true               # Czy automatycznie dzielić sesje na train/val
+  val_split_ratio: 0.2                # Procent sesji do walidacji (20%)
   fps: 10                             # FPS nagrywania
   session_length: 300                 # Max długość sesji w sekundach
   min_sessions: 5                     # Min liczba sesji do imitation
 
-# Konfiguracja imitation learning (BC - Behavioral Cloning)
+# Konfiguracja imitation learning (Reward-weighted)
 imitation:
-  batch_size: 32                      # Batch dla BC
+  enabled: true                       # Czy używać imitation learning (false = tylko RL)
+  batch_size: 32                      # Batch dla imitation
   epochs: 50                          # Epoki pre-treningu
-  learning_rate: 0.001                # LR dla BC
+  learning_rate: 0.001                # LR dla imitation
+  eval_interval: 10                   # Co ile epok ewaluować na val
 
 # Konfiguracja modelu PPO (dostosowane dla ConvLSTM)
 model:
   policy: CnnLstmPolicy               # Custom policy z ConvLSTM
   learning_rate: 0.0003               # Wyższy start dla dynamicznej gry
   min_learning_rate: 0.00005
-  n_steps: 2048
+  n_steps: 256                        # ZMNIEJSZONE z 512 na 256 (mniejszy bufor rollout)
   n_epochs: 10
   gamma: 0.99
   gae_lambda: 0.95
@@ -43,23 +43,25 @@ model:
   device: cuda
   dropout_rate: 0.2
   conv_lstm_kwargs:
-    conv_layers: [[32, (8,8), 4], [64, (4,4), 2], [64, (3,3), 1]]  # Conv2D layers
+    conv_layers: [[32, [8,8], 4], [64, [4,4], 2], [64, [3,3], 1]]  # Poprawka: listy [8,8] zamiast tupli (8,8)
     lstm_layers: 2                      # Num layers LSTM
-    hidden_dim: 256                     # Hidden size LSTM
+    hidden_dim: 128                     # ZMNIEJSZONE z 256 na 128 (oszczędność RAM)
+    frame_history: 4                    # Dodane, do walidacji w extractor
   policy_kwargs:
     features_extractor_kwargs:
-      features_dim: 512
+      features_dim: 256                 # ZMNIEJSZONE z 512 na 256
     net_arch:
-      pi: [256, 128]                   # Dla aktora (krótsze po LSTM)
-      vf: [256, 128]                   # Dla krytyka
+      pi: [128, 64]                    # ZMNIEJSZONE: dla aktora
+      vf: [128, 64]                    # ZMNIEJSZONE: dla krytyka
 
 # Konfiguracja treningu (hybrydowy: imitation + RL)
 training:
-  n_envs: 8                           # Mniej envs dla browser-based (ciężkie)
-  batch_size: 2048
-  total_timesteps: 5000000            # Mniej na start (Agar.io dłuższe)
+  use_rl: false                        # Czy używać RL po imitation (false = tylko imitation)
+  n_envs: 1                           # Mniej envs dla browser-based (ciężkie)
+  batch_size: 64                     
+  total_timesteps: 100000            # Mniej na start (Agar.io dłuższe)
   imitation_timesteps: 100000         # Kroków na pre-trening BC
-  eval_freq: 10000                    # Rzadsza ewaluacja
+  eval_freq: 5000                    # Rzadsza ewaluacja
   plot_interval: 1                    # Wykres co 1 ewaluacji
   max_no_improvement_evals: 20
   min_evals: 5
@@ -70,8 +72,12 @@ paths:
   models_dir: models
   logs_dir: logs
   model_path: models/agario_ppo_model.zip
+  imitation_model_path: models/agario_imitation_model.zip  # Model po Imitation Learning
   state_path: logs/training_state.pkl
   train_csv_path: logs/train_progress.csv
   plot_path: logs/training_progress.png
   test_progress_path: logs/test_progress.png
-  dataset_path: datasets/agario_dataset.npz  
+  dataset_path: datasets/agario_dataset.npz
+  train_dataset_path: datasets/agario_train.npz
+  val_dataset_path: datasets/agario_val.npz
+  imitation_log_path: logs/imitation_progress.csv
