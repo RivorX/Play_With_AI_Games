@@ -43,3 +43,4 @@ logs
 
 # Games
 agario/datasets/*
+agario/models/*.zip
