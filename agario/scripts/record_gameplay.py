@@ -47,7 +47,6 @@ def record_session(driver, session_id):
     os.makedirs(session_dir, exist_ok=True)
     
     frames = []
-    actions = []
     
     start_time = time.time()
     frame_interval = 1.0 / FPS
@@ -159,29 +158,10 @@ def record_session(driver, session_id):
             frames.append(game_crop_scaled)
             cv2.imwrite(os.path.join(session_dir, f"frame_{len(frames):04d}.png"), game_crop_scaled)
 
-        # Loguj akcje
-        mouse_pos = pyautogui.position()
-        if len(actions) > 0:
-            prev_pos = actions[-1].get('mouse_pos', mouse_pos)
-            dx = mouse_pos[0] - prev_pos[0]
-            dy = mouse_pos[1] - prev_pos[1]
-        else:
-            dx, dy = 0, 0
-        keys = {'split': False, 'eject': False}  # Dodaj detekcję klawiszy (np. pyautogui.is_pressed)
-        actions.append({
-            'time': current_time - start_time,
-            'mouse_delta': (dx, dy),
-            'keys': keys,
-            'mouse_pos': mouse_pos,
-            'score': score_val
-        })
 
         time.sleep(max(0, frame_interval - (current_time - last_frame_time)))
         last_frame_time = time.time()
     
-    # Zapisz JSON akcji
-    with open(os.path.join(session_dir, 'actions.json'), 'w') as f:
-        json.dump(actions, f)
     
     print(f"Nagrano sesję {session_id}: {len(frames)} klatek")
 
