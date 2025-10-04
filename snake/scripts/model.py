@@ -215,7 +215,7 @@ class SnakeEnv(gym.Env):
         prev_dist = abs(self.snake[0][0] - self.food[0]) + abs(self.snake[0][1] - self.food[1])
         
         # Bazowa nagroda
-        reward = 0.0
+        reward = -0.1
         close_body = 0
         head = np.array(self.snake[0])
         neighbors = head + np.array([[-1, 0], [1, 0], [0, -1], [0, 1]])
@@ -223,7 +223,7 @@ class SnakeEnv(gym.Env):
             if 0 <= n[0] < self.grid_size and 0 <= n[1] < self.grid_size:
                 if list(n) in self.snake:
                     close_body += 1
-        reward -= 0.05 * close_body  # Zwiększona kara za bliskość ciała (było 0.01)
+        reward -= 0.01 * close_body  
 
         trap_count = 0
         for n in neighbors:
@@ -233,11 +233,7 @@ class SnakeEnv(gym.Env):
             else:
                 trap_count += 1
         if trap_count >= 3:
-            reward -= 1.0  # Zwiększona kara za pułapkę (było 0.5)
-
-        # Nagroda za otwartą przestrzeń
-        open_space = self._count_open_space(head)
-        reward += 0.01 * open_space  # Nagroda za wolne pola w promieniu 2
+            reward -= 1.0
 
         # Aktualizacja kierunku przed ruchem
         if action == 0:  # kontynuuj
@@ -267,6 +263,8 @@ class SnakeEnv(gym.Env):
             if new_dist < self.min_dist:
                 self.min_dist = new_dist
                 reward += 1.0  # Dodatkowa nagroda za pobicie rekordu zbliżenia
+        else:
+            reward -= 0.1  # Kara za oddalenie się od jedzenia
 
         # Kara za powtarzanie stanów
         state_hash = (tuple(head.tolist()), self.direction, len(self.snake))
@@ -289,8 +287,7 @@ class SnakeEnv(gym.Env):
             self.snake.appendleft(head.tolist())
             if np.array_equal(head, self.food):
                 self.food = self._place_food()
-                reward = 20
-                reward += 1
+                reward += 20
                 bonus = max(0, 20 - self.steps_without_food)
                 reward += bonus
                 self.steps_without_food = 0
