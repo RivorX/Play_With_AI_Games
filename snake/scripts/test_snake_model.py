@@ -3,7 +3,7 @@ import os
 import numpy as np
 import pygame
 from stable_baselines3 import PPO
-from model import make_env, set_grid_size
+from model import make_env
 import yaml
 import logging
 
@@ -29,11 +29,8 @@ with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
 def test_snake_model(model_path, grid_size, episodes):
-    # Ustaw grid_size
-    set_grid_size(grid_size)
-    
-    # Utwórz środowisko
-    env = make_env(render_mode="human", grid_size=grid_size)()
+    # Utwórz środowisko z nowym wrapperem i sekwencją
+    env = make_env(render_mode="human", grid_size=grid_size, sequence_length=config['environment']['sequence_length'])()
     
     # Załaduj model
     try:
@@ -51,15 +48,18 @@ def test_snake_model(model_path, grid_size, episodes):
         steps = 0
         logging.info(f"\nEpizod {episode + 1}")
 
-        while not done:
-            # Wybierz najnowszą ramkę z FrameStack (ostatni kanał)
-            mapa = obs['image'][-1, :, :]  # [H, W], kanał mapa z ostatniej ramki
+
+    while not done:
+            # Wybierz najnowszą ramkę z sekwencji (ostatnia ramka, kanał 0)
+            mapa = obs['image'][-1, :, :, 0]  # [H, W], kanał mapa z ostatniej ramki
 
             # Wyodrębnij skalary
             direction = obs['direction'][0]
-            grid_size_val = obs['grid_size'][0]
             dx_head = obs['dx_head'][0]
             dy_head = obs['dy_head'][0]
+            front_coll = obs['front_coll'][0]
+            left_coll = obs['left_coll'][0]
+            right_coll = obs['right_coll'][0]
 
             # Znajdź pozycję głowy i jedzenia w mapie
             head_pos = np.where(mapa == 1.0)
@@ -83,9 +83,11 @@ def test_snake_model(model_path, grid_size, episodes):
             logging.info("--- Obserwacja (fragment) ---")
             logging.info(f"Kanał mapa:\n{np.array_str(mapa, precision=2, suppress_small=True, max_line_width=120)}")
             logging.info(f"Direction: {direction}")
-            logging.info(f"Grid_size: {grid_size_val}")
             logging.info(f"dx_head: {dx_head}")
             logging.info(f"dy_head: {dy_head}")
+            logging.info(f"front_coll: {front_coll}")
+            logging.info(f"left_coll: {left_coll}")
+            logging.info(f"right_coll: {right_coll}")
             logging.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
             logging.info(f"Dystans Manhattan: {distance}")
             logging.info(f"Stan gry: done={done}, steps={steps}, snake={env.env.snake}, food={env.env.food}")
@@ -107,7 +109,7 @@ def test_snake_model(model_path, grid_size, episodes):
                     done = True
             pygame.time.wait(50)
 
-        logging.info(f"Epizod {episode + 1} zakończony. Wynik: {info['score']}, Całkowita nagroda: {total_reward}, Kroki: {steps}")
+    logging.info(f"Epizod {episode + 1} zakończony. Wynik: {info['score']}, Całkowita nagroda: {total_reward}, Kroki: {steps}")
 
     env.close()
 

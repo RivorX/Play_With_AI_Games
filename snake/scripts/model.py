@@ -5,8 +5,6 @@ import collections
 import pygame
 import yaml
 import os
-import torch
-from scipy.ndimage import zoom
 
 # Wczytaj konfigurację
 config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'config.yaml')
@@ -16,28 +14,31 @@ with open(config_path, 'r') as f:
 # Hiperparametry środowiska
 SNAKE_SIZE = config['environment']['snake_size']
 DIRECTIONS = np.array(config['environment']['directions'])
-FIXED_OBS_SIZE = 16  # Stały rozmiar obserwacji (16x16)
+VIEWPORT_SIZE = 16  # Stały rozmiar viewport (zawsze 16x16)
 
-def set_grid_size(new_grid_size):
-    global GRID_SIZE
-    GRID_SIZE = new_grid_size
 
-class DictFrameStack(gym.Wrapper):
-    def __init__(self, env, stack_size=4):
+class SequenceWrapper(gym.Wrapper):
+    """
+    Wrapper przechowujący historię obserwacji dla ConvLSTM.
+    Zamiast stackować ramki, zwraca sekwencję ostatnich N ramek.
+    """
+    def __init__(self, env, sequence_length=4):
         super().__init__(env)
-        self.stack_size = stack_size
-        self.image_stack = collections.deque(maxlen=stack_size)
+        self.sequence_length = sequence_length
+        self.image_history = collections.deque(maxlen=sequence_length)
+        
         image_space = self.env.observation_space['image']
-        stacked_image_space = spaces.Box(
+        # Obserwacja to sekwencja ramek: [seq_len, H, W, C]
+        sequence_image_space = spaces.Box(
             low=image_space.low.min(),
             high=image_space.high.max(),
-            shape=(image_space.shape[2] * stack_size, image_space.shape[0], image_space.shape[1]),  # [C, H, W]
+            shape=(sequence_length, image_space.shape[0], image_space.shape[1], image_space.shape[2]),
             dtype=image_space.dtype
         )
+        
         self.observation_space = spaces.Dict({
-            'image': stacked_image_space,
+            'image': sequence_image_space,
             'direction': self.env.observation_space['direction'],
-            'grid_size': self.env.observation_space['grid_size'],
             'dx_head': self.env.observation_space['dx_head'],
             'dy_head': self.env.observation_space['dy_head'],
             'front_coll': self.env.observation_space['front_coll'],
@@ -47,16 +48,18 @@ class DictFrameStack(gym.Wrapper):
 
     def reset(self, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
-        self.image_stack.clear()
-        for _ in range(self.stack_size - 1):
-            self.image_stack.append(np.zeros_like(obs['image']))
-        self.image_stack.append(obs['image'])
-        stacked_image = np.concatenate(list(self.image_stack), axis=-1)
-        stacked_image = np.transpose(stacked_image, (2, 0, 1))
+        self.image_history.clear()
+        
+        # Wypełnij historię zerami
+        for _ in range(self.sequence_length - 1):
+            self.image_history.append(np.zeros_like(obs['image']))
+        self.image_history.append(obs['image'])
+        
+        sequence_image = np.stack(list(self.image_history), axis=0)
+        
         new_obs = {
-            'image': stacked_image,
+            'image': sequence_image,
             'direction': obs['direction'],
-            'grid_size': obs['grid_size'],
             'dx_head': obs['dx_head'],
             'dy_head': obs['dy_head'],
             'front_coll': obs['front_coll'],
@@ -67,13 +70,13 @@ class DictFrameStack(gym.Wrapper):
 
     def step(self, action):
         obs, reward, done, truncated, info = self.env.step(action)
-        self.image_stack.append(obs['image'])
-        stacked_image = np.concatenate(list(self.image_stack), axis=-1)
-        stacked_image = np.transpose(stacked_image, (2, 0, 1))
+        self.image_history.append(obs['image'])
+        
+        sequence_image = np.stack(list(self.image_history), axis=0)
+        
         new_obs = {
-            'image': stacked_image,
+            'image': sequence_image,
             'direction': obs['direction'],
-            'grid_size': obs['grid_size'],
             'dx_head': obs['dx_head'],
             'dy_head': obs['dy_head'],
             'front_coll': obs['front_coll'],
@@ -81,6 +84,7 @@ class DictFrameStack(gym.Wrapper):
             'right_coll': obs['right_coll']
         }
         return new_obs, reward, done, truncated, info
+
 
 class SnakeEnv(gym.Env):
     def __init__(self, render_mode=None, grid_size=None):
@@ -91,13 +95,12 @@ class SnakeEnv(gym.Env):
         self.action_space = spaces.Discrete(config['environment']['action_space']['n'])
         self.observation_space = spaces.Dict({
             'image': spaces.Box(
-                low=config['environment']['observation_space']['low'],
+                low=-1.0,  # Ściany mają wartość -1
                 high=config['environment']['observation_space']['high'],
-                shape=(FIXED_OBS_SIZE, FIXED_OBS_SIZE, 1),
+                shape=(VIEWPORT_SIZE, VIEWPORT_SIZE, 1),
                 dtype=config['environment']['observation_space']['dtype']
             ),
             'direction': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
-            'grid_size': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
             'dx_head': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
             'dy_head': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
             'front_coll': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
@@ -114,7 +117,7 @@ class SnakeEnv(gym.Env):
         self.total_reward = 0
         self.state_counter = {}
         self.done = False
-        self.min_dist = float('inf')  # Śledzenie minimalnego dystansu do jedzenia
+        self.min_dist = float('inf')
         if self.render_mode == "human":
             pygame.init()
             self.screen = pygame.display.set_mode((self.grid_size * SNAKE_SIZE, self.grid_size * SNAKE_SIZE))
@@ -136,7 +139,7 @@ class SnakeEnv(gym.Env):
         self.total_reward = 0
         self.state_counter = {}
         self.done = False
-        self.min_dist = float('inf')  # Resetuj minimalny dystans
+        self.min_dist = float('inf')
         return self._get_obs(), {"score": 0, "total_reward": 0, "grid_size": self.grid_size}
 
     def _place_food(self):
@@ -157,20 +160,6 @@ class SnakeEnv(gym.Env):
         new_head = head + delta
         return 1.0 if self._is_collision(new_head) else 0.0
 
-    def _count_open_space(self, head):
-        # Liczy wolne pola w promieniu 2 wokół głowy węża
-        open_space = 0
-        head = np.array(head)
-        for i in range(-2, 3):
-            for j in range(-2, 3):
-                if i == 0 and j == 0:
-                    continue
-                pos = head + np.array([i, j])
-                if (0 <= pos[0] < self.grid_size and 0 <= pos[1] < self.grid_size and
-                    pos.tolist() not in self.snake and not np.array_equal(pos, self.food)):
-                    open_space += 1
-        return open_space
-
     def _get_render_state(self):
         state = np.zeros((self.grid_size, self.grid_size, 1), dtype=np.float32)
         for i, segment in enumerate(self.snake):
@@ -179,19 +168,55 @@ class SnakeEnv(gym.Env):
             state[self.food[0], self.food[1], 0] = 3
         return state
 
+    def _get_viewport_observation(self):
+        """
+        Tworzy viewport 16x16 wycentrowany na głowie węża.
+        - Głowa zawsze w centrum
+        - Obszar poza planszą = -1 (ściany)
+        - Wartości: -1 (ściana), 0 (puste), 0.5 (ciało), 1.0 (głowa), 0.75 (jedzenie)
+        """
+        # Inicjalizuj viewport wypełniony ścianami (-1)
+        viewport = np.full((VIEWPORT_SIZE, VIEWPORT_SIZE), -1.0, dtype=np.float32)
+        
+        head = np.array(self.snake[0])
+        half_view = VIEWPORT_SIZE // 2
+        
+        # Oblicz zakres widoku w współrzędnych planszy
+        view_start_y = head[0] - half_view
+        view_end_y = head[0] + half_view
+        view_start_x = head[1] - half_view
+        view_end_x = head[1] + half_view
+        
+        # Dla każdej pozycji w viewport sprawdź co tam jest
+        for vp_y in range(VIEWPORT_SIZE):
+            for vp_x in range(VIEWPORT_SIZE):
+                # Przelicz na współrzędne planszy
+                grid_y = view_start_y + vp_y
+                grid_x = view_start_x + vp_x
+                
+                # Jeśli poza planszą - zostaje -1 (ściana)
+                if grid_y < 0 or grid_y >= self.grid_size or grid_x < 0 or grid_x >= self.grid_size:
+                    continue
+                
+                # W granicach planszy - ustaw wartość
+                viewport[vp_y, vp_x] = 0.0  # Domyślnie puste pole
+                
+                # Sprawdź czy to część węża
+                pos = [grid_y, grid_x]
+                if pos == self.snake[0]:
+                    viewport[vp_y, vp_x] = 1.0  # Głowa
+                elif pos in self.snake:
+                    viewport[vp_y, vp_x] = 0.5  # Ciało
+                
+                # Sprawdź czy to jedzenie
+                if self.food is not None and pos == self.food.tolist():
+                    viewport[vp_y, vp_x] = 0.75
+        
+        return viewport[:, :, np.newaxis]  # Dodaj wymiar kanału
+
     def _get_obs(self):
-        active_state = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        for segment in self.snake:
-            if 0 <= segment[0] < self.grid_size and 0 <= segment[1] < self.grid_size:
-                active_state[segment[0], segment[1]] = 0.5
+        viewport = self._get_viewport_observation()
         head = self.snake[0]
-        active_state[head[0], head[1]] = 1.0
-        if self.food is not None:
-            active_state[self.food[0], self.food[1]] = 0.75
-        if self.grid_size != FIXED_OBS_SIZE:
-            scale_factor = FIXED_OBS_SIZE / self.grid_size
-            active_state = zoom(active_state, scale_factor, order=0)
-        active_state = active_state[:, :, np.newaxis]
         denom = max(1, self.grid_size - 1)
 
         # Oblicz potencjalne kolizje
@@ -200,9 +225,8 @@ class SnakeEnv(gym.Env):
         right_coll = self._get_potential_collision((self.direction + 1) % 4)
 
         return {
-            'image': active_state,
+            'image': viewport,
             'direction': np.array([(self.direction + 1) / 4.0], dtype=np.float32),
-            'grid_size': np.array([self.grid_size / 16.0], dtype=np.float32),
             'dx_head': np.array([(self.food[0] - head[0]) / denom], dtype=np.float32),
             'dy_head': np.array([(self.food[1] - head[1]) / denom], dtype=np.float32),
             'front_coll': np.array([front_coll], dtype=np.float32),
@@ -259,12 +283,12 @@ class SnakeEnv(gym.Env):
         
         # Nagroda za zbliżenie się do jedzenia
         if new_dist < prev_dist:
-            reward += 0.1  # Nagroda za zmniejszenie dystansu
+            reward += 0.1
             if new_dist < self.min_dist:
                 self.min_dist = new_dist
-                reward += 1.0  # Dodatkowa nagroda za pobicie rekordu zbliżenia
+                reward += 1.0
         else:
-            reward -= 0.1  # Kara za oddalenie się od jedzenia
+            reward -= 0.1
 
         # Kara za powtarzanie stanów
         state_hash = (tuple(head.tolist()), self.direction, len(self.snake))
@@ -283,16 +307,15 @@ class SnakeEnv(gym.Env):
             reward = death_penalty
             self.state_counter = {}
         else:
-            prev_length = len(self.snake)
             self.snake.appendleft(head.tolist())
             if np.array_equal(head, self.food):
                 self.food = self._place_food()
-                reward += 20
+                reward = 20
                 bonus = max(0, 20 - self.steps_without_food)
                 reward += bonus
                 self.steps_without_food = 0
                 self.state_counter = {}
-                self.min_dist = float('inf')  # Resetuj minimalny dystans po zjedzeniu
+                self.min_dist = float('inf')
             else:
                 self.snake.pop()
                 self.steps_without_food += 1
@@ -330,9 +353,18 @@ class SnakeEnv(gym.Env):
         if self.render_mode == "human":
             pygame.quit()
 
-def make_env(render_mode=None, grid_size=None):
+
+def make_env(render_mode=None, grid_size=None, sequence_length=4):
+    """
+    Tworzy środowisko Snake.
+    
+    Args:
+        render_mode: Tryb renderowania ('human' lub None)
+        grid_size: Rozmiar siatki (None dla losowania)
+        sequence_length: Długość sekwencji dla SequenceWrapper
+    """
     def _init():
         env = SnakeEnv(render_mode=render_mode, grid_size=grid_size)
-        env = DictFrameStack(env, stack_size=4)
+        env = SequenceWrapper(env, sequence_length=sequence_length)
         return env
     return _init

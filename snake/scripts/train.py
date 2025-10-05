@@ -39,7 +39,7 @@ ensure_directories()
 def reset_channel_logs():
     log_dir = os.path.join(base_dir, 'logs', 'Training_channels')
     os.makedirs(log_dir, exist_ok=True)
-    for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
+    for channel_name in ['viewport', 'direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         with open(log_path, 'w', encoding='utf-8'):
             pass
@@ -47,7 +47,7 @@ def reset_channel_logs():
 def init_channel_loggers():
     loggers = {}
     log_dir = os.path.join(base_dir, 'logs', 'Training_channels')
-    for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
+    for channel_name in ['viewport', 'direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         logger = logging.getLogger(f'channel_{channel_name}')
         handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
@@ -67,10 +67,19 @@ def log_observation(obs, channel_loggers, grid_size, step):
     if not enable_channel_logs:
         return
     image = obs['image']
-    latest_channel = image[-1:, :, :]  # [1, H, W]
-    mapa = latest_channel[0, :, :]  # [H, W]
-    head_pos = np.where(mapa == 1.0)
-    food_pos = np.where(mapa == 0.75)
+    # image to sekwencja: [seq_len, H, W, C]
+    if len(image.shape) == 4:
+        latest_frame = image[-1, :, :, :]  # Ostatnia ramka z sekwencji
+    else:
+        latest_frame = image
+    
+    viewport = latest_frame[:, :, 0]  # [H, W]
+    
+    # Znajdź pozycję głowy (powinna być w centrum viewport)
+    head_pos = np.where(viewport == 1.0)
+    food_pos = np.where(viewport == 0.75)
+    wall_pos = np.where(viewport == -1.0)
+    
     if len(head_pos[0]) > 0:
         head_x, head_y = head_pos[0][0], head_pos[1][0]
     else:
@@ -79,20 +88,23 @@ def log_observation(obs, channel_loggers, grid_size, step):
         food_x, food_y = food_pos[0][0], food_pos[1][0]
     else:
         food_x, food_y = -1, -1
+    
     if head_x >= 0 and food_x >= 0:
         distance = abs(head_x - food_x) + abs(head_y - food_y)
     else:
         distance = float('inf')
     
-    logger = channel_loggers.get('mapa')
+    logger = channel_loggers.get('viewport')
     if logger:
         logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
-        logger.info(f"Kanał mapa:\n{np.array_str(mapa, precision=2, suppress_small=True, max_line_width=120)}")
-        logger.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
-        logger.info(f"Dystans Manhattan: {distance}")
+        logger.info(f"Viewport (16x16, głowa w centrum):\n{np.array_str(viewport, precision=2, suppress_small=True, max_line_width=120)}")
+        logger.info(f"Pozycja głowy w viewport: ({head_x}, {head_y})")
+        logger.info(f"Pozycja jedzenia w viewport: ({food_x}, {food_y})")
+        logger.info(f"Dystans Manhattan w viewport: {distance}")
+        logger.info(f"Liczba ścian (-1): {np.sum(viewport == -1.0)}")
         logger.info("-" * 60)
 
-    for scalar_name in ['direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
+    for scalar_name in ['direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         logger = channel_loggers.get(scalar_name)
         if logger:
             logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
@@ -117,14 +129,13 @@ class TrainProgressCallback(BaseCallback):
             if (self.num_timesteps + self.initial_timesteps) - self.last_logged >= 1000:
                 ep_rew_mean = self.model.ep_info_buffer and np.mean([ep_info['r'] for ep_info in self.model.ep_info_buffer]) or None
                 ep_len_mean = self.model.ep_info_buffer and np.mean([ep_info['l'] for ep_info in self.model.ep_info_buffer]) or None
-                grid_size = np.mean(self.training_env.get_attr('grid_size'))  # Średni grid_size
                 try:
                     write_header = not os.path.exists(self.csv_path)
                     with open(self.csv_path, 'a', newline='') as csvfile:
                         writer = csv.writer(csvfile)
                         if write_header:
-                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length', 'grid_size'])
-                        writer.writerow([self.num_timesteps + self.initial_timesteps, ep_rew_mean, ep_len_mean, grid_size])
+                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length'])
+                        writer.writerow([self.num_timesteps + self.initial_timesteps, ep_rew_mean, ep_len_mean])  # usunięto grid_size
                     self.last_logged = self.num_timesteps + self.initial_timesteps
                 except Exception as e:
                     print(f"Błąd zapisu train_progress.csv: {e}")
@@ -147,12 +158,10 @@ class CustomEvalCallback(EvalCallback):
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
             super()._on_step()
             self.eval_count += 1
-            # Zapis najnowszego modelu po każdej walidacji
             total_timesteps = self.model.num_timesteps + self.initial_timesteps
             save_training_state(self.model, self.model.env, self.eval_env, total_timesteps, self.best_model_save_path)
             print(f"Zaktualizowano najnowszy model po {total_timesteps} krokach z mean_reward={self.last_mean_reward}")
 
-            # Zapis najlepszego modelu, jeśli poprawiono mean_reward
             if self.best_mean_reward < self.last_mean_reward:
                 self.model.save(os.path.join(self.best_model_save_path, f'best_model_{total_timesteps}.zip'))
                 print(f"New best model saved at {total_timesteps} timesteps with mean reward {self.last_mean_reward}")
@@ -163,8 +172,6 @@ class CustomEvalCallback(EvalCallback):
                 except Exception as e:
                     print(f"Błąd podczas generowania wykresu: {e}")
         return True
-
- # Usunięto funkcję test_thread
 
 def save_training_state(model, env, eval_env, total_timesteps, save_path):
     model_path_absolute = os.path.normpath(os.path.join(save_path, 'snake_ppo_model.zip'))
@@ -197,6 +204,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     n_steps = config['model']['n_steps']
     eval_freq = config['training']['eval_freq']
     plot_interval = config['training']['plot_interval']
+    sequence_length = config['environment']['sequence_length']
 
     model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['model_path']))
     vec_norm_path = model_path_absolute.replace('.zip', '_vecnorm.pkl')
@@ -213,22 +221,16 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             print(f"Wznowienie treningu od {total_timesteps} kroków.")
         except Exception as e:
             print(f"Błąd ładowania stanu: {e}. Zaczynam od zera.")
-        # Interaktywne pytania dla użytkownika gdy znaleziono model
         try:
             resp = input(f"Znaleziono istniejący model pod {model_path_absolute}. Czy kontynuować trening? [[Y]/n]: ").strip()
         except Exception:
-            # W środowiskach nieinteraktywnych zachowaj domyślne zachowanie (kontynuuj)
             resp = ''
 
-        # Jeśli użytkownik wybierze 'n' lub 'no', traktujemy to jako decyzję o rozpoczęciu treningu od nowa.
-        # W takim przypadku nie ładujemy modelu, resetujemy total_timesteps i ustawiamy load_model=False.
         if resp.lower() in ('n', 'no'):
             print("Użytkownik wybrał rozpoczęcie treningu od nowa. Zaczynam od zera i używam hyperparametrów z configu.")
             load_model = False
             total_timesteps = 0
-            # W trybie "od nowa" nie pytamy o użycie hyperparametrów z modelu (oczywiste, bo model nie istnieje)
             use_config_hyperparams = True
-            # Usuń istniejący plik z postępem treningu, bo zaczynamy od nowa
             try:
                 train_csv = os.path.join(base_dir, config['paths']['train_csv_path'])
                 if os.path.exists(train_csv):
@@ -237,25 +239,32 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             except Exception as e:
                 print(f"Nie udało się usunąć pliku postępu treningu: {e}")
         else:
-            # Jeżeli kontynuujemy trening (domyślnie), pytamy czy użyć hyperparametrów z configu
             try:
                 resp2 = input("Użyć hyperparametrów z configu zamiast z modelu? [[Y]/n]: ").strip()
             except Exception:
                 resp2 = ''
-            # Domyślnie True (użyj configu)
             use_config_hyperparams = False if resp2.lower() in ('n', 'no') else True
 
     reset_channel_logs()
     if enable_channel_logs:
         channel_loggers.update(init_channel_loggers())
 
-    env = make_vec_env(make_env(render_mode=None, grid_size=None), n_envs=n_envs, vec_env_cls=SubprocVecEnv)
+    # Tworzenie środowisk z SequenceWrapper
+    env = make_vec_env(
+        make_env(render_mode=None, grid_size=None, sequence_length=sequence_length), 
+        n_envs=n_envs, 
+        vec_env_cls=SubprocVecEnv
+    )
     if load_model and os.path.exists(vec_norm_path):
         env = VecNormalize.load(vec_norm_path, env)
     else:
         env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
-    eval_env = make_vec_env(make_env(render_mode=None, grid_size=16), n_envs=1, vec_env_cls=SubprocVecEnv)
+    eval_env = make_vec_env(
+        make_env(render_mode=None, grid_size=16, sequence_length=sequence_length), 
+        n_envs=1, 
+        vec_env_cls=SubprocVecEnv
+    )
     if load_model and os.path.exists(vec_norm_eval_path):
         eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
     else:
@@ -340,13 +349,12 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         initial_timesteps=total_timesteps
     )
 
-    # Usunięto uruchamianie testowania modelu podczas treningu
-
     if enable_channel_logs:
         for logger in channel_loggers.values():
             logger.info(f"\n--- Debug: Rozpoczęcie treningu ---")
-        debug_env = make_env(render_mode=None, grid_size=None)()
+        debug_env = make_env(render_mode=None, grid_size=None, sequence_length=sequence_length)()
         obs, _ = debug_env.reset()
+        # debug_env to SequenceWrapper, więc .env to SnakeEnv
         grid_size = debug_env.env.grid_size
         log_observation(obs, channel_loggers, grid_size, step=0)
         for debug_step in range(5):
@@ -364,10 +372,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                 logger.info(f"--- Koniec debug dla grid_size={grid_size} ---")
 
     try:
-        # Oblicz pozostałe kroki do treningu
         configured_total = config['training'].get('total_timesteps', 0)
         remaining_timesteps = configured_total - total_timesteps
-        # Jeżeli osiągnięto już >=80% limitu, zapytaj czy dodać dodatkowe kroki
         try:
             if configured_total > 0 and total_timesteps / configured_total >= 0.8:
                 print(f"Użyto {total_timesteps}/{configured_total} kroków ({total_timesteps/configured_total:.1%}). To >=80% limitu.")
@@ -379,7 +385,6 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                     extra_int = 0
                 remaining_timesteps += extra_int
         except Exception:
-            # W środowiskach nieinteraktywnych input może rzucić wyjątkiem; ignoruj wtedy
             pass
         if remaining_timesteps > 0:
             model.learn(

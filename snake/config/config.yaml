@@ -1,11 +1,11 @@
 # Konfiguracja środowiska Snake
 environment:
   min_grid_size: 5                   # Minimalny rozmiar siatki dla losowania
-  max_grid_size: 16                  # Maksymalny rozmiar siatki dla losowania
-  snake_size: 20                     # Rozmiar kratki w pikselach
-  directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
+  max_grid_size: 25                  # Maksymalny rozmiar siatki (może być >16 dzięki viewport!)
+  snake_size: 20                     # Rozmiar kratki w pikselach (dla renderowania)
+  directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża [lewo, dół, prawo, góra]
   observation_space:
-    low: -1.0                        # Minimalna wartość obserwacji
+    low: -1.0                        # Minimalna wartość obserwacji (-1 = ściany)
     high: 1.0                        # Maksymalna wartość obserwacji
     dtype: float32                   # Typ danych obserwacji
   action_space:
@@ -13,12 +13,13 @@ environment:
     n: 3                             # Liczba akcji (lewo, prosto, prawo)
   max_steps_without_food: 10         # Max kroków bez jedzenia (skalowane z rozmiarem)
   max_steps_factor: 150              # Mnożnik max kroków
+  sequence_length: 4                 # Długość sekwencji ramek dla ConvLSTM
 
 # Konfiguracja modelu PPO
 model:
-  policy: MultiInputPolicy           # Zmieniono na MultiInputPolicy dla przestrzeni Dict
+  policy: MultiInputPolicy           # MultiInputPolicy dla przestrzeni Dict
   learning_rate: 0.0002              # Szybkość uczenia 
-  min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej tej wartości)
+  min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej)
   n_steps: 2048                      # Liczba kroków na aktualizację
   n_epochs: 10                       # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
@@ -28,23 +29,32 @@ model:
   vf_coef: 1.0                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   dropout_rate: 0.2                  # Współczynnik dropout w CNN
+  
+  # Parametry ConvLSTM
+  convlstm:
+    num_layers: 1                    # Liczba warstw ConvLSTM (1-4 zalecane)
+    hidden_channels: 32              # Liczba kanałów ukrytych w ConvLSTM (32, 64, 128)
+    kernel_size: 3                   # Rozmiar kernela w ConvLSTM (3 lub 5)
+    cnn_channels: [64, 128]          # Kanały w warstwach CNN po ConvLSTM
+    scalar_hidden_dims: [32]         # Rozmiary warstw ukrytych dla zmiennych skalarnych
+  
   policy_kwargs:
     features_extractor_kwargs:
       features_dim: 512
     net_arch:
-      pi: [256, 256, 128]  # dla aktora
-      vf: [256, 256, 128]  # dla krytyka
+      pi: [256, 128]  # dla aktora
+      vf: [256, 128]  # dla krytyka
 
 # Konfiguracja treningu
 training:
   n_envs: 16                         # Liczba środowisk
-  batch_size: 2048                   # Rozmiar partii
+  batch_size: 1280                    # Rozmiar partii
   total_timesteps: 10000000          # Całkowita liczba kroków
-  eval_freq: 5000                    # Częstotliwość ewaluacji (zwiększona dla rzadszej validacji)
-  plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
+  eval_freq: 5000                    # Częstotliwość ewaluacji
+  plot_interval: 1                   # Co ile walidacji robić wykres
   max_no_improvement_evals: 50       # Liczba ewaluacji bez poprawy przed zatrzymaniem
-  min_evals: 5                       # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
-  enable_channel_logs: true          # Włącz logi kanałów
+  min_evals: 5                       # Minimalna liczba ewaluacji
+  enable_channel_logs: true          # Włącz logi kanałów (debug)
 
 # Ścieżki do zapisu
 paths:
