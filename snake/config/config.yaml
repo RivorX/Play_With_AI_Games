@@ -32,8 +32,8 @@ model:
   
   # Parametry CNN
   convlstm:
-    cnn_channels: [24, 32, 40]       # Zmniejszone z [32,48,64] - teraz 512 dims zamiast 1024
-    scalar_hidden_dims: [128]         # Zwiększone z [32] - skalary mają teraz 20% wpływu
+    cnn_channels: [24, 32, 40]      # Liczba kanałów w warstwach konwolucyjnych
+    scalar_hidden_dims: [128]       # Ukryte wymiary dla danych skalarnych  
   
   policy_kwargs:
     features_extractor_kwargs:
@@ -48,7 +48,7 @@ model:
 # Konfiguracja treningu
 training:
   n_envs: 8                          # Zwiększone z powrotem do 8
-  batch_size: 1024                   # Rozmiar partii
+  batch_size: 2048                   # Rozmiar partii
   total_timesteps: 10000000          # Całkowita liczba kroków
   eval_freq: 5000                    # Częstotliwość ewaluacji (rzadziej)
   plot_interval: 1                   # Co ile walidacji robić wykres
