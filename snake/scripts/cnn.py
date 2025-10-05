@@ -5,83 +5,91 @@ import yaml
 from gymnasium import spaces
 import os
 
-# Wczytaj konfigurację
 base_dir = os.path.dirname(os.path.dirname(__file__))
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
-with open(config_path, 'r') as f:
+with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 
 
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Dict, features_dim=512):
+    def __init__(self, observation_space: spaces.Dict, features_dim=128):
         super().__init__(observation_space, features_dim)
         
-        # Wczytaj parametry z configu
         convlstm_config = config['model']['convlstm']
-        in_channels = 1  # Pojedyncza mapa (viewport zawsze 16x16)
-        dropout_rate = config['model'].get('dropout_rate', 0.2)
-        leaky_relu = nn.LeakyReLU(negative_slope=0.01)
+        in_channels = 1
+        dropout_rate = config['model'].get('dropout_rate', 0.0)
         
-        # CNN do przetwarzania pojedynczych ramek (BEZ LSTM - RecurrentPPO ma własny LSTM)
         cnn_layers = []
         current_channels = in_channels
         
-        # Dodaj warstwy CNN
-        for layer_channels in convlstm_config['cnn_channels']:
-            cnn_layers.extend([
-                nn.Conv2d(current_channels, layer_channels, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(layer_channels),
-                leaky_relu
-            ])
-            current_channels = layer_channels
-        
+        # Warstwa 1: 16x16x1 -> 8x8x32
         cnn_layers.extend([
-            nn.AdaptiveAvgPool2d((2, 2)),
-            nn.Flatten()
+            nn.Conv2d(current_channels, convlstm_config['cnn_channels'][0], 
+                     kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(convlstm_config['cnn_channels'][0]),
+            nn.ReLU(inplace=True)
         ])
+        current_channels = convlstm_config['cnn_channels'][0]
         
+        # Warstwa 2: 8x8x32 -> 8x8x48
+        cnn_layers.extend([
+            nn.Conv2d(current_channels, convlstm_config['cnn_channels'][1], 
+                     kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(convlstm_config['cnn_channels'][1]),
+            nn.ReLU(inplace=True)
+        ])
+        current_channels = convlstm_config['cnn_channels'][1]
+        
+        # Warstwa 3: 8x8x48 -> 4x4x64 (NOWA!)
+        cnn_layers.extend([
+            nn.Conv2d(current_channels, convlstm_config['cnn_channels'][2], 
+                     kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(convlstm_config['cnn_channels'][2]),
+            nn.ReLU(inplace=True)
+        ])
+        current_channels = convlstm_config['cnn_channels'][2]
+        
+        cnn_layers.append(nn.Flatten())
         self.cnn = nn.Sequential(*cnn_layers)
         
-        # Warstwa dla zmiennych skalarnych
-        scalar_dim = 6  # direction, dx_head, dy_head, front_coll, left_coll, right_coll
-        scalar_layers = []
-        current_dim = scalar_dim
-        
-        for hidden_dim in convlstm_config['scalar_hidden_dims']:
-            scalar_layers.extend([
-                nn.Linear(current_dim, hidden_dim),
-                nn.LeakyReLU(0.01),
-                nn.Dropout(dropout_rate)
-            ])
-            current_dim = hidden_dim
-        
+        # Skalary
+        scalar_dim = 6
+        scalar_layers = [
+            nn.Linear(scalar_dim, convlstm_config['scalar_hidden_dims'][0]),
+            nn.ReLU(inplace=True)
+        ]
         self.scalar_linear = nn.Sequential(*scalar_layers)
         
-        # Oblicz wymiar po CNN
+        # Wymiary: 4*4*40 = 640 (zmniejszone z 1024 dla lepszej równowagi)
         cnn_out_channels = convlstm_config['cnn_channels'][-1]
-        cnn_dim = cnn_out_channels * 2 * 2
-        total_dim = cnn_dim + current_dim
+        spatial_size = 4
+        cnn_dim = cnn_out_channels * spatial_size * spatial_size
+        scalar_out_dim = convlstm_config['scalar_hidden_dims'][0]
+        total_dim = cnn_dim + scalar_out_dim
         
-        self.final_linear = nn.Sequential(
+        final_layers = [
             nn.Linear(total_dim, features_dim),
-            nn.LeakyReLU(0.01),
-            nn.Dropout(dropout_rate)
-        )
+            nn.ReLU(inplace=True)
+        ]
+        if dropout_rate > 0:
+            final_layers.append(nn.Dropout(dropout_rate))
+        
+        self.final_linear = nn.Sequential(*final_layers)
+        
+        scalar_percent = 100 * scalar_out_dim / total_dim
+        print(f"✓ CNN: 16x16 -> 8x8 -> 8x8 -> 4x4 ({cnn_dim} dims + {scalar_out_dim} scalars = {total_dim} → {features_dim})")
+        print(f"  Skalary mają {scalar_percent:.1f}% wpływu (direction, dx/dy, collisions)")
         
     def forward(self, observations):
         image = observations['image']
         
-        # Obsługa formatu: [batch, height, width, channels]
         if len(image.shape) == 4:
-            # Przekształć na [batch, channels, height, width]
             image = image.permute(0, 3, 1, 2)
         else:
-            raise ValueError(f"Unexpected image shape: {image.shape}. Expected 4D tensor [batch, H, W, C]")
+            raise ValueError(f"Unexpected image shape: {image.shape}")
         
-        # Przetwórz przez CNN (RecurrentPPO ma własny LSTM w policy)
         image_features = self.cnn(image)
         
-        # Przetwórz zmienne skalarne
         scalars = torch.cat([
             observations['direction'],
             observations['dx_head'],
@@ -92,7 +100,5 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         ], dim=-1)
         
         scalar_features = self.scalar_linear(scalars)
-        
-        # Połącz cechy
         features = torch.cat([image_features, scalar_features], dim=-1)
         return self.final_linear(features)

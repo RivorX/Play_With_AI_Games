@@ -17,41 +17,42 @@ environment:
 # Konfiguracja modelu RecurrentPPO
 model:
   policy: MultiInputLstmPolicy       # MultiInputLstmPolicy dla RecurrentPPO
-  learning_rate: 0.0002              # Szybkość uczenia 
-  min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej)
-  n_steps: 1024                      # Liczba kroków na aktualizację
-  n_epochs: 10                       # Liczba epok 
+  learning_rate: 0.0003              # Szybkość uczenia 
+  min_learning_rate: 0.00003         # Minimalny learning rate (nie schodzi poniżej)
+  schedule_type: cosine 
+  n_steps: 2048                      # Liczba kroków na aktualizację (zmniejszone dla VRAM)
+  n_epochs: 5                        # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
-  ent_coef: 0.2                      # Współczynnik entropii
-  vf_coef: 1.0                       # Współczynnik funkcji wartości
+  ent_coef: 0.02                     # Współczynnik entropii (zmniejszone z 0.05)
+  vf_coef: 0.5                       # Współczynnik funkcji wartości (zmniejszone z 1.0)
   device: cuda                       # Urządzenie (cuda/cpu)
-  dropout_rate: 0.2                  # Współczynnik dropout w CNN
+  dropout_rate: 0.1
   
-  # Parametry CNN (ConvLSTM usunięty - RecurrentPPO ma własny LSTM)
+  # Parametry CNN
   convlstm:
-    cnn_channels: [32, 64]          # Kanały w warstwach CNN
-    scalar_hidden_dims: [32]         # Rozmiary warstw ukrytych dla zmiennych skalarnych
+    cnn_channels: [24, 32, 40]       # Zmniejszone z [32,48,64] - teraz 512 dims zamiast 1024
+    scalar_hidden_dims: [128]         # Zwiększone z [32] - skalary mają teraz 20% wpływu
   
   policy_kwargs:
     features_extractor_kwargs:
-      features_dim: 512
+      features_dim: 256              
     net_arch:
-      pi: [256, 128]  # dla aktora
-      vf: [256, 128]  # dla krytyka
-    lstm_hidden_size: 128            # Rozmiar LSTM w RecurrentPPO
-    n_lstm_layers: 1                 # Liczba warstw LSTM
-    enable_critic_lstm: true         # LSTM także dla krytyka
+      pi: [128, 64]                    
+      vf: [128, 64]                    
+    lstm_hidden_size: 128            
+    n_lstm_layers: 1                  # Liczba warstw LSTM
+    enable_critic_lstm: true          # LSTM także dla krytyka
 
 # Konfiguracja treningu
 training:
-  n_envs: 8                          # Liczba środowisk
-  batch_size: 512                    # Rozmiar partii
+  n_envs: 8                          # Zwiększone z powrotem do 8
+  batch_size: 1024                   # Rozmiar partii
   total_timesteps: 10000000          # Całkowita liczba kroków
-  eval_freq: 3000                    # Częstotliwość ewaluacji
+  eval_freq: 5000                    # Częstotliwość ewaluacji (rzadziej)
   plot_interval: 1                   # Co ile walidacji robić wykres
-  max_no_improvement_evals: 50       # Liczba ewaluacji bez poprawy przed zatrzymaniem
+  max_no_improvement_evals: 20       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 5                       # Minimalna liczba ewaluacji
   enable_channel_logs: false         # Wyłącz logi kanałów (wydajność)
 

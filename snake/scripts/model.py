@@ -8,7 +8,7 @@ import os
 
 # Wczytaj konfigurację
 config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'config.yaml')
-with open(config_path, 'r') as f:
+with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 
 # Hiperparametry środowiska
@@ -39,6 +39,7 @@ class SnakeEnv(gym.Env):
             'right_coll': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)
         })
         self.snake = None
+        self.snake_set = None  # Set dla O(1) lookup kolizji
         self.food = None
         self.direction = None
         self.screen = None
@@ -49,6 +50,21 @@ class SnakeEnv(gym.Env):
         self.state_counter = {}
         self.done = False
         self.min_dist = float('inf')
+        
+        # === TRACKING NAGRÓD DLA DEBUGOWANIA ===
+        self.reward_components = {
+            'food': 0.0,
+            'speed_bonus': 0.0,
+            'distance_shaping': 0.0,
+            'progress_bonus': 0.0,
+            'time_penalty': 0.0,
+            'loop_penalty': 0.0,
+            'exploration_penalty': 0.0,
+            'death_penalty': 0.0,
+            'timeout_penalty': 0.0,
+            'win_bonus': 0.0
+        }
+        
         if self.render_mode == "human":
             pygame.init()
             self.screen = pygame.display.set_mode((self.grid_size * SNAKE_SIZE, self.grid_size * SNAKE_SIZE))
@@ -63,6 +79,7 @@ class SnakeEnv(gym.Env):
             self.grid_size = np.random.randint(
                 config['environment']['min_grid_size'], config['environment']['max_grid_size'] + 1)
         self.snake = collections.deque([[self.grid_size // 2, self.grid_size // 2]])
+        self.snake_set = {tuple(self.snake[0])}  # Set dla szybkiego lookup
         self.food = self._place_food()
         self.direction = np.random.randint(0, 4)
         self.steps = 0
@@ -71,19 +88,33 @@ class SnakeEnv(gym.Env):
         self.state_counter = {}
         self.done = False
         self.min_dist = float('inf')
-        return self._get_obs(), {"score": 0, "total_reward": 0, "grid_size": self.grid_size}
+        
+        # Reset trackingu nagród
+        for key in self.reward_components:
+            self.reward_components[key] = 0.0
+        
+        return self._get_obs(), {
+            "score": 0, 
+            "total_reward": 0, 
+            "grid_size": self.grid_size,
+            "reward_components": self.reward_components.copy()
+        }
 
     def _place_food(self):
         available_positions = [[i, j] for i in range(self.grid_size) for j in range(self.grid_size)
-                              if [i, j] not in self.snake]
+                              if (i, j) not in self.snake_set]
         if not available_positions:
             return None
         return np.array(available_positions[np.random.randint(0, len(available_positions))])
 
     def _is_collision(self, head):
-        return (head[0] < 0 or head[0] >= self.grid_size or
-                head[1] < 0 or head[1] >= self.grid_size or
-                head.tolist() in list(self.snake)[1:])
+        # Kolizja ze ścianą
+        if head[0] < 0 or head[0] >= self.grid_size or head[1] < 0 or head[1] >= self.grid_size:
+            return True
+        # Kolizja z ciałem węża (pomijając głowę - index 0)
+        head_tuple = tuple(head)
+        current_head = tuple(self.snake[0])
+        return head_tuple in self.snake_set and head_tuple != current_head
 
     def _get_potential_collision(self, direction):
         head = np.array(self.snake[0])
@@ -106,7 +137,6 @@ class SnakeEnv(gym.Env):
         - Obszar poza planszą = -1 (ściany)
         - Wartości: -1 (ściana), 0 (puste), 0.5 (ciało), 1.0 (głowa), 0.75 (jedzenie)
         """
-        # Inicjalizuj viewport wypełniony ścianami (-1)
         viewport = np.full((VIEWPORT_SIZE, VIEWPORT_SIZE), -1.0, dtype=np.float32)
         
         head = np.array(self.snake[0])
@@ -132,13 +162,20 @@ class SnakeEnv(gym.Env):
         if grid_y_end > grid_y_start and grid_x_end > grid_x_start:
             viewport[vp_y_start:vp_y_end, vp_x_start:vp_x_end] = 0.0
             
-            # Zaznacz węża
-            for i, segment in enumerate(self.snake):
+            # Zaznacz węża - głowa
+            head_y, head_x = self.snake[0]
+            if grid_y_start <= head_y < grid_y_end and grid_x_start <= head_x < grid_x_end:
+                vp_y = head_y - y_start
+                vp_x = head_x - x_start
+                viewport[vp_y, vp_x] = 1.0
+            
+            # Zaznacz ciało węża (pomiń głowę - index 0)
+            for segment in list(self.snake)[1:]:
                 gy, gx = segment
                 if grid_y_start <= gy < grid_y_end and grid_x_start <= gx < grid_x_end:
                     vp_y = gy - y_start
                     vp_x = gx - x_start
-                    viewport[vp_y, vp_x] = 1.0 if i == 0 else 0.5
+                    viewport[vp_y, vp_x] = 0.5
             
             # Zaznacz jedzenie
             if self.food is not None:
@@ -152,9 +189,21 @@ class SnakeEnv(gym.Env):
 
     def _get_obs(self):
         viewport = self._get_viewport_observation()
-        head = self.snake[0]
-        denom = max(1, self.grid_size - 1)
-
+        head = np.array(self.snake[0])
+        
+        # === POPRAWKA: dx/dy W UKŁADZIE VIEWPORT, NIE GRID ===
+        # Viewport jest 16x16, głowa zawsze w centrum (8, 8)
+        half_view = VIEWPORT_SIZE // 2
+        
+        # Pozycja jedzenia w viewport
+        food_viewport_y = self.food[0] - head[0] + half_view
+        food_viewport_x = self.food[1] - head[1] + half_view
+        
+        # Kierunek do jedzenia w viewport (-1 do 1)
+        # Znormalizowane względem połowy viewport (8 pól)
+        dx_viewport = (food_viewport_y - half_view) / half_view  # -1 to 1
+        dy_viewport = (food_viewport_x - half_view) / half_view  # -1 to 1
+        
         # Oblicz potencjalne kolizje
         front_coll = self._get_potential_collision(self.direction)
         left_coll = self._get_potential_collision((self.direction - 1) % 4)
@@ -163,8 +212,8 @@ class SnakeEnv(gym.Env):
         return {
             'image': viewport,
             'direction': np.array([(self.direction + 1) / 4.0], dtype=np.float32),
-            'dx_head': np.array([(self.food[0] - head[0]) / denom], dtype=np.float32),
-            'dy_head': np.array([(self.food[1] - head[1]) / denom], dtype=np.float32),
+            'dx_head': np.array([dx_viewport], dtype=np.float32),
+            'dy_head': np.array([dy_viewport], dtype=np.float32),
             'front_coll': np.array([front_coll], dtype=np.float32),
             'left_coll': np.array([left_coll], dtype=np.float32),
             'right_coll': np.array([right_coll], dtype=np.float32)
@@ -172,96 +221,119 @@ class SnakeEnv(gym.Env):
 
     def step(self, action):
         self.steps += 1
-        prev_dist = abs(self.snake[0][0] - self.food[0]) + abs(self.snake[0][1] - self.food[1])
+        self.steps_without_food += 1
         
-        # Bazowa nagroda
-        reward = -0.1
-        close_body = 0
-        head = np.array(self.snake[0])
-        neighbors = head + np.array([[-1, 0], [1, 0], [0, -1], [0, 1]])
-        for n in neighbors:
-            if 0 <= n[0] < self.grid_size and 0 <= n[1] < self.grid_size:
-                if list(n) in self.snake:
-                    close_body += 1
-        reward -= 0.01 * close_body  
-
-        trap_count = 0
-        for n in neighbors:
-            if 0 <= n[0] < self.grid_size and 0 <= n[1] < self.grid_size:
-                if list(n) in self.snake:
-                    trap_count += 1
-            else:
-                trap_count += 1
-        if trap_count >= 3:
-            reward -= 1.0
-
+        # Reset komponentów nagród dla tego kroku
+        step_rewards = {
+            'food': 0.0,
+            'distance_shaping': 0.0,
+            'death_penalty': 0.0,
+            'timeout_penalty': 0.0
+        }
+        
+        # Zapisz poprzednią pozycję i dystans
+        prev_head = np.array(self.snake[0])
+        prev_dist = abs(prev_head[0] - self.food[0]) + abs(prev_head[1] - self.food[1])
+        
         # Aktualizacja kierunku przed ruchem
-        if action == 0:  # kontynuuj
-            pass
-        elif action == 1:  # skręć w lewo
+        if action == 1:  # skręć w lewo
             self.direction = (self.direction - 1) % 4
         elif action == 2:  # skręć w prawo
             self.direction = (self.direction + 1) % 4
-
-        # Ruch węża
-        head = np.array(self.snake[0])
-        if self.direction == 0:  # lewo
-            head[1] -= 1
-        elif self.direction == 1:  # dół
-            head[0] += 1
-        elif self.direction == 2:  # prawo
-            head[1] += 1
-        elif self.direction == 3:  # góra
-            head[0] -= 1
-
-        # Oblicz nowy dystans Manhattan
-        new_dist = abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])
         
-        # Nagroda za zbliżenie się do jedzenia
-        if new_dist < prev_dist:
-            reward += 0.1
-            if new_dist < self.min_dist:
-                self.min_dist = new_dist
-                reward += 1.0
+        # Ruch węża
+        head = prev_head + DIRECTIONS[self.direction]
+        
+        # === UPROSZCZONY SYSTEM NAGRÓD ===
+        reward = -0.01  # Mała kara za krok, aby zachęcić do szybszego jedzenia 
+        
+        # 1. KOLIZJA - ŚMIERĆ
+        if self._is_collision(head):
+            self.done = True
+            death_penalty = -10.0
+            step_rewards['death_penalty'] = death_penalty
+            reward = death_penalty
+            
+            obs = self._get_obs()
+            
+            # Aktualizuj totalne komponenty
+            for key in step_rewards:
+                self.reward_components[key] += step_rewards[key]
+            
+            info = {
+                "score": len(self.snake) - 1, 
+                "total_reward": self.total_reward + reward, 
+                "grid_size": self.grid_size,
+                "reward_components": self.reward_components.copy(),
+                "step_rewards": step_rewards
+            }
+            self.total_reward += reward
+            return obs, reward, self.done, False, info
+        
+        # 2. Dodaj nową głowę
+        self.snake.appendleft(head.tolist())
+        self.snake_set.add(tuple(head))
+        
+        # 3. ZJEDZENIE JEDZENIA
+        if np.array_equal(head, self.food):
+            # Nagroda za jedzenie
+            food_reward = 10.0
+            step_rewards['food'] = food_reward
+            reward += food_reward
+            
+            # Reset
+            self.food = self._place_food()
+            self.steps_without_food = 0
+            
+            # Sprawdź wygraną (cała plansza wypełniona)
+            if len(self.snake) == self.grid_size * self.grid_size:
+                self.done = True
+                win_bonus = 50.0
+                step_rewards['win_bonus'] = win_bonus
+                reward += win_bonus
         else:
-            reward -= 0.1
-
-        # Kara za powtarzanie stanów
-        state_hash = (tuple(head.tolist()), self.direction, len(self.snake))
-        self.state_counter[state_hash] = self.state_counter.get(state_hash, 0) + 1
-        reward -= 0.5 * self.state_counter[state_hash]
-
-        max_steps_without_food = config['environment'].get('max_steps_without_food', 80) * self.grid_size
+            # Usuń ogon (nie zjedzono jedzenia)
+            tail = self.snake.pop()
+            self.snake_set.discard(tuple(tail))
+            
+            # 4. DISTANCE SHAPING (bardzo subtelny - zmniejszone z 0.15)
+            new_dist = abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])
+            dist_change = prev_dist - new_dist
+            distance_reward = dist_change * 0.05  # Zmniejszone z 0.15 - mniej nagrody za losowe ruchy
+            step_rewards['distance_shaping'] = distance_reward
+            reward += distance_reward
+        
+        # 5. TIMEOUT - adaptacyjny
+        max_steps_without_food = max(100, self.grid_size * 10)
         if self.steps_without_food >= max_steps_without_food:
             self.done = True
-            reward -= 10
-
-        max_steps = config['environment']['max_steps_factor'] * len(self.snake) * self.grid_size
-        if self._is_collision(head) or self.steps > max_steps:
+            timeout_penalty = -3.0
+            step_rewards['timeout_penalty'] = timeout_penalty
+            reward += timeout_penalty
+        
+        # 6. MAKSYMALNA DŁUGOŚĆ EPIZODU
+        max_steps = 200 * self.grid_size
+        if self.steps > max_steps:
             self.done = True
-            death_penalty = -20 - max(0, 10 - self.steps * 0.1)
-            reward = death_penalty
-            self.state_counter = {}
-        else:
-            self.snake.appendleft(head.tolist())
-            if np.array_equal(head, self.food):
-                self.food = self._place_food()
-                reward = 20
-                bonus = max(0, 20 - self.steps_without_food)
-                reward += bonus
-                self.steps_without_food = 0
-                self.state_counter = {}
-                self.min_dist = float('inf')
-            else:
-                self.snake.pop()
-                self.steps_without_food += 1
-
+            if step_rewards['timeout_penalty'] == 0.0:  # Jeśli jeszcze nie było timeout
+                timeout_penalty = -3.0
+                step_rewards['timeout_penalty'] = timeout_penalty
+                reward += timeout_penalty
+        
+        # Aktualizuj totalne komponenty
+        for key in step_rewards:
+            self.reward_components[key] += step_rewards[key]
+        
         self.total_reward += reward
-        if len(self.snake) == self.grid_size * self.grid_size:
-            self.done = True
-            reward += 10 * self.grid_size
         obs = self._get_obs()
-        info = {"score": len(self.snake) - 1, "total_reward": self.total_reward, "grid_size": self.grid_size}
+        info = {
+            "score": len(self.snake) - 1, 
+            "total_reward": self.total_reward, 
+            "grid_size": self.grid_size,
+            "steps_without_food": self.steps_without_food,
+            "reward_components": self.reward_components.copy(),
+            "step_rewards": step_rewards
+        }
         
         return obs, reward, self.done, False, info
 

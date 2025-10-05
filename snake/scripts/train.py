@@ -1,6 +1,7 @@
 import os
 import time
 import numpy as np
+import math
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
@@ -16,11 +17,12 @@ from model import make_env
 from cnn import CustomFeaturesExtractor
 import logging
 import pickle
+import torch
 
 # Wczytaj konfigurację
 base_dir = os.path.dirname(os.path.dirname(__file__))
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
-with open(config_path, 'r') as f:
+with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 
 # Funkcja tworząca wymagane katalogi jeśli nie istnieją
@@ -68,10 +70,8 @@ def log_observation(obs, channel_loggers, grid_size, step):
         return
     image = obs['image']
     
-    # Teraz image to pojedyncza ramka: [H, W, C]
-    viewport = image[:, :, 0]  # [H, W]
+    viewport = image[:, :, 0]
     
-    # Znajdź pozycję głowy (powinna być w centrum viewport)
     head_pos = np.where(viewport == 1.0)
     food_pos = np.where(viewport == 0.75)
     wall_pos = np.where(viewport == -1.0)
@@ -106,6 +106,20 @@ def log_observation(obs, channel_loggers, grid_size, step):
             logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
             logger.info(f"{scalar_name.capitalize()}: {obs[scalar_name][0]}")
             logger.info("-" * 60)
+
+def cosine_schedule(initial_value, min_value=0.00003):
+    """
+    Cosine annealing schedule - płynniejsze schodzenie niż linear.
+    Zalety vs linear:
+    - Wolniejszy spadek na początku (więcej eksploracji)
+    - Szybszy spadek w środku (efektywne uczenie)
+    - Bardzo wolny spadek na końcu (fine-tuning)
+    """
+    def func(progress_remaining):
+        progress = 1.0 - progress_remaining
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_value + (initial_value - min_value) * cosine_decay
+    return func
 
 def linear_schedule(initial_value, min_value=0.00005):
     def func(progress_remaining):
@@ -193,6 +207,19 @@ def save_training_state(model, env, eval_env, total_timesteps, save_path):
     else:
         print("Nie udało się zapisać stanu po 5 próbach.")
 
+def enable_amp_for_model(model):
+    """
+    Włącza TF32 dla GPU Ampere+ (RTX 30xx, 40xx) - bezpieczniejsze niż FP16.
+    TF32 daje ~2x przyspieszenie bez utraty stabilności (w przeciwieństwie do FP16).
+    """
+    if config['model']['device'] == 'cuda' and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("✓ Włączono TF32 dla GPU Ampere+ - przyspieszenie bez utraty stabilności")
+    else:
+        print("CPU/stary GPU - trening w FP32")
+    return
+
 def train(use_progress_bar=False, use_config_hyperparams=True):
     global best_model_save_path
 
@@ -253,8 +280,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     if load_model and os.path.exists(vec_norm_path):
         env = VecNormalize.load(vec_norm_path, env)
     else:
-        # ZMIANA: norm_obs=True dla normalizacji obserwacji
-        env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_reward=10.0)
+        env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_reward=10.0)
 
     eval_env = make_vec_env(
         make_env(render_mode=None, grid_size=16), 
@@ -264,22 +290,36 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     if load_model and os.path.exists(vec_norm_eval_path):
         eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
     else:
-        # ZMIANA: norm_obs=True dla normalizacji obserwacji
         eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
 
-    policy_kwargs = config['model']['policy_kwargs']
+    policy_kwargs = config['model']['policy_kwargs'].copy()
     policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
+
+    # Wybór schedule (cosine vs linear)
+    schedule_type = config['model'].get('schedule_type', 'linear')
+    if schedule_type == 'cosine':
+        lr_schedule = cosine_schedule(
+            config['model']['learning_rate'], 
+            config['model']['min_learning_rate']
+        )
+        print("✓ Używam cosine schedule dla learning rate")
+    else:
+        lr_schedule = linear_schedule(
+            config['model']['learning_rate'], 
+            config['model']['min_learning_rate']
+        )
+        print("✓ Używam linear schedule dla learning rate")
 
     if load_model:
         model = RecurrentPPO.load(model_path_absolute, env=env)
         model.ent_coef = config['model']['ent_coef']
-        model.learning_rate = linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate'])
+        model.learning_rate = lr_schedule
         model._setup_lr_schedule()
     else:
         model = RecurrentPPO(
             config['model']['policy'],
             env,
-            learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
+            learning_rate=lr_schedule,
             n_steps=config['model']['n_steps'],
             batch_size=config['training']['batch_size'],
             n_epochs=config['model']['n_epochs'],
@@ -288,19 +328,19 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             clip_range=config['model']['clip_range'],
             ent_coef=config['model']['ent_coef'],
             vf_coef=config['model']['vf_coef'],
-            max_grad_norm=0.5,  # ZMIANA: Dodano gradient clipping
+            max_grad_norm=0.5,
             policy_kwargs=policy_kwargs,
             verbose=1,
             device=config['model']['device']
         )
 
     if use_config_hyperparams and load_model:
-        policy_kwargs = config['model']['policy_kwargs']
+        policy_kwargs = config['model']['policy_kwargs'].copy()
         policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
         model_new = RecurrentPPO(
             config['model']['policy'],
             env,
-            learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
+            learning_rate=lr_schedule,
             n_steps=config['model']['n_steps'],
             batch_size=config['training']['batch_size'],
             n_epochs=config['model']['n_epochs'],
@@ -309,7 +349,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             clip_range=config['model']['clip_range'],
             ent_coef=config['model']['ent_coef'],
             vf_coef=config['model']['vf_coef'],
-            max_grad_norm=0.5,  # ZMIANA: Dodano gradient clipping
+            max_grad_norm=0.5,
             policy_kwargs=policy_kwargs,
             verbose=1,
             device=config['model']['device']
@@ -318,6 +358,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         model_new.policy.load_state_dict(model_tmp.policy.state_dict())
         model = model_new
         del model_tmp
+
+    # Włącz AMP (selektywnie dla CNN, pomija LSTM)
+    enable_amp_for_model(model)
 
     global best_model_save_path
     best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))

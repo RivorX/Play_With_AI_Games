@@ -80,42 +80,41 @@ for state_idx in range(3):
         
         obs_tensor[k] = v_tensor
 
-    # === Użyj standardowej metody do uzyskania prawdopodobieństw ===
+    # === UPROSZCZONE: Użyj model.predict + ręczny forward dla logitów ===
     with torch.no_grad():
-        # Ekstrahuj cechy z obserwacji
+        # 1. Pobierz akcję (i zaktualizuj lstm_states)
+        action, lstm_states = model.predict(
+            obs, 
+            state=lstm_states, 
+            episode_start=episode_starts, 
+            deterministic=True
+        )
+        action_idx = int(action.item() if torch.is_tensor(action) else action)
+        action_idx = int(np.clip(action_idx, 0, len(action_names) - 1))
+        
+        # 2. Ręczny forward dla prawdopodobieństw (bez LSTM - już było w predict)
+        # Ekstrahuj cechy
         features = features_extractor(obs_tensor)
         
-        # Przygotuj lstm_states dla forward pass
-        if lstm_states is None:
-            # Inicjalizuj puste stany LSTM
-            lstm_states_tuple = (
-                torch.zeros(policy.lstm_actor.num_layers, 1, policy.lstm_actor.hidden_size, device=policy.device),
-                torch.zeros(policy.lstm_actor.num_layers, 1, policy.lstm_actor.hidden_size, device=policy.device)
-            )
-        else:
-            # Konwertuj numpy lstm_states na tensory
-            lstm_states_tuple = (
-                torch.tensor(lstm_states[0], dtype=torch.float32, device=policy.device),
-                torch.tensor(lstm_states[1], dtype=torch.float32, device=policy.device)
-            )
+        # Przygotuj lstm_states jako tensory
+        lstm_states_tensor = (
+            torch.tensor(lstm_states[0], dtype=torch.float32, device=policy.device),
+            torch.tensor(lstm_states[1], dtype=torch.float32, device=policy.device)
+        )
         
-        # Episode starts jako tensor
-        episode_starts_tensor = torch.tensor(episode_starts, dtype=torch.bool, device=policy.device)
-        
-        # Forward przez LSTM aktora
-        # features: [batch, features_dim] -> [batch, seq_len=1, features_dim]
+        # Przepuść przez LSTM aktora (już zaktualizowane stany z predict)
+        # features: [batch, features_dim] -> [batch, seq=1, features_dim]
         features_seq = features.unsqueeze(1)
         
-        # Przepuść przez LSTM aktora
-        lstm_output, lstm_hidden = policy.lstm_actor(features_seq, lstm_states_tuple)
-        
-        # Flatten output
+        # Forward przez LSTM
+        lstm_output, _ = policy.lstm_actor(features_seq, lstm_states_tensor)
         latent_pi = lstm_output.squeeze(1)  # [batch, lstm_hidden_size]
+        
+        # MLP extractor dla policy
+        latent_pi = policy.mlp_extractor.policy_net(latent_pi)
         
         # Logity akcji
         logits = policy.action_net(latent_pi)
-        action_idx = torch.argmax(logits, dim=1).item()
-        action_idx = int(np.clip(action_idx, 0, len(action_names) - 1))
 
     # === Prawdopodobieństwa akcji ===
     action_probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]

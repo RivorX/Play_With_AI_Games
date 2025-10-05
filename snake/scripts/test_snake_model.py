@@ -29,17 +29,34 @@ with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
 def test_snake_model(model_path, grid_size, episodes):
-    # Utwórz środowisko z nowym wrapperem i sekwencją
-    env = make_env(render_mode="human", grid_size=grid_size, sequence_length=config['environment']['sequence_length'])()
-    
-    # Załaduj model
+
+    # Utwórz środowisko bez sequence_length
+    env = make_env(render_mode="human", grid_size=grid_size)()
+
+    # Automatycznie wykryj typ modelu (PPO lub RecurrentPPO)
     try:
+        from sb3_contrib import RecurrentPPO
+        if model_path.endswith(".zip"):
+            try:
+                model = RecurrentPPO.load(model_path)
+                is_recurrent = True
+                logging.info(f"Załadowano model RecurrentPPO z: {model_path}")
+            except Exception:
+                model = PPO.load(model_path)
+                is_recurrent = False
+                logging.info(f"Załadowano model PPO z: {model_path}")
+        else:
+            model = PPO.load(model_path)
+            is_recurrent = False
+            logging.info(f"Załadowano model PPO z: {model_path}")
+    except ImportError:
         model = PPO.load(model_path)
-        logging.info(f"Załadowano model z: {model_path}")
+        is_recurrent = False
+        logging.info(f"Załadowano model PPO z: {model_path}")
     except Exception as e:
         logging.error(f"Błąd podczas ładowania modelu: {e}")
         return
-    
+
     # Testowanie
     for episode in range(episodes):
         obs, _ = env.reset()
@@ -48,12 +65,15 @@ def test_snake_model(model_path, grid_size, episodes):
         steps = 0
         logging.info(f"\nEpizod {episode + 1}")
 
+        # Stan dla RecurrentPPO
+        if is_recurrent:
+            lstm_states = None
+            episode_starts = np.ones((1,), dtype=bool)
 
-    while not done:
-            # Wybierz najnowszą ramkę z sekwencji (ostatnia ramka, kanał 0)
-            mapa = obs['image'][-1, :, :, 0]  # [H, W], kanał mapa z ostatniej ramki
+        while not done:
+            # Dict observation: obs['image'] shape: [H, W, 1]
+            mapa = obs['image'][:, :, 0]
 
-            # Wyodrębnij skalary
             direction = obs['direction'][0]
             dx_head = obs['dx_head'][0]
             dy_head = obs['dy_head'][0]
@@ -61,7 +81,6 @@ def test_snake_model(model_path, grid_size, episodes):
             left_coll = obs['left_coll'][0]
             right_coll = obs['right_coll'][0]
 
-            # Znajdź pozycję głowy i jedzenia w mapie
             head_pos = np.where(mapa == 1.0)
             food_pos = np.where(mapa == 0.75)
             if len(head_pos[0]) > 0:
@@ -73,13 +92,11 @@ def test_snake_model(model_path, grid_size, episodes):
             else:
                 food_x, food_y = -1, -1
 
-            # Oblicz odległość Manhattan
             if head_x >= 0 and food_x >= 0:
                 distance = abs(head_x - food_x) + abs(head_y - food_y)
             else:
                 distance = float('inf')
 
-            # Zapisz informacje debugowania do pliku
             logging.info("--- Obserwacja (fragment) ---")
             logging.info(f"Kanał mapa:\n{np.array_str(mapa, precision=2, suppress_small=True, max_line_width=120)}")
             logging.info(f"Direction: {direction}")
@@ -90,11 +107,15 @@ def test_snake_model(model_path, grid_size, episodes):
             logging.info(f"right_coll: {right_coll}")
             logging.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
             logging.info(f"Dystans Manhattan: {distance}")
-            logging.info(f"Stan gry: done={done}, steps={steps}, snake={env.env.snake}, food={env.env.food}")
+            logging.info(f"Stan gry: done={done}, steps={steps}, snake={env.snake}, food={env.food}")
             logging.info("-" * 60)
 
             # Wykonaj akcję
-            action, _ = model.predict(obs, deterministic=True)
+            if is_recurrent:
+                action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=True)
+                episode_starts = np.array([done], dtype=bool)
+            else:
+                action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, truncated, info = env.step(action)
             total_reward += reward
             steps += 1
@@ -103,13 +124,12 @@ def test_snake_model(model_path, grid_size, episodes):
             logging.info(f"Krok: {steps}, Wynik: {info['score']}, Nagroda: {total_reward}, Akcja: {action}")
             logging.info("-" * 60)
 
-            # Obsługa zdarzeń Pygame
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     done = True
             pygame.time.wait(50)
 
-    logging.info(f"Epizod {episode + 1} zakończony. Wynik: {info['score']}, Całkowita nagroda: {total_reward}, Kroki: {steps}")
+        logging.info(f"Epizod {episode + 1} zakończony. Wynik: {info['score']}, Całkowita nagroda: {total_reward}, Kroki: {steps}")
 
     env.close()
 
