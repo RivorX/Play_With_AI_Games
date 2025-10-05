@@ -1,7 +1,7 @@
 import os
 import time
 import numpy as np
-from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.env_util import make_vec_env
@@ -67,13 +67,9 @@ def log_observation(obs, channel_loggers, grid_size, step):
     if not enable_channel_logs:
         return
     image = obs['image']
-    # image to sekwencja: [seq_len, H, W, C]
-    if len(image.shape) == 4:
-        latest_frame = image[-1, :, :, :]  # Ostatnia ramka z sekwencji
-    else:
-        latest_frame = image
     
-    viewport = latest_frame[:, :, 0]  # [H, W]
+    # Teraz image to pojedyncza ramka: [H, W, C]
+    viewport = image[:, :, 0]  # [H, W]
     
     # Znajdź pozycję głowy (powinna być w centrum viewport)
     head_pos = np.where(viewport == 1.0)
@@ -135,7 +131,7 @@ class TrainProgressCallback(BaseCallback):
                         writer = csv.writer(csvfile)
                         if write_header:
                             writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length'])
-                        writer.writerow([self.num_timesteps + self.initial_timesteps, ep_rew_mean, ep_len_mean])  # usunięto grid_size
+                        writer.writerow([self.num_timesteps + self.initial_timesteps, ep_rew_mean, ep_len_mean])
                     self.last_logged = self.num_timesteps + self.initial_timesteps
                 except Exception as e:
                     print(f"Błąd zapisu train_progress.csv: {e}")
@@ -204,7 +200,6 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     n_steps = config['model']['n_steps']
     eval_freq = config['training']['eval_freq']
     plot_interval = config['training']['plot_interval']
-    sequence_length = config['environment']['sequence_length']
 
     model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['model_path']))
     vec_norm_path = model_path_absolute.replace('.zip', '_vecnorm.pkl')
@@ -249,37 +244,39 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     if enable_channel_logs:
         channel_loggers.update(init_channel_loggers())
 
-    # Tworzenie środowisk z SequenceWrapper
+    # Tworzenie środowisk BEZ SequenceWrapper - LSTM sam obsłuży sekwencje
     env = make_vec_env(
-        make_env(render_mode=None, grid_size=None, sequence_length=sequence_length), 
+        make_env(render_mode=None, grid_size=None), 
         n_envs=n_envs, 
         vec_env_cls=SubprocVecEnv
     )
     if load_model and os.path.exists(vec_norm_path):
         env = VecNormalize.load(vec_norm_path, env)
     else:
-        env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+        # ZMIANA: norm_obs=True dla normalizacji obserwacji
+        env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_reward=10.0)
 
     eval_env = make_vec_env(
-        make_env(render_mode=None, grid_size=16, sequence_length=sequence_length), 
+        make_env(render_mode=None, grid_size=16), 
         n_envs=1, 
         vec_env_cls=SubprocVecEnv
     )
     if load_model and os.path.exists(vec_norm_eval_path):
         eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
     else:
-        eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+        # ZMIANA: norm_obs=True dla normalizacji obserwacji
+        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
 
     policy_kwargs = config['model']['policy_kwargs']
     policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
 
     if load_model:
-        model = PPO.load(model_path_absolute, env=env)
+        model = RecurrentPPO.load(model_path_absolute, env=env)
         model.ent_coef = config['model']['ent_coef']
         model.learning_rate = linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate'])
         model._setup_lr_schedule()
     else:
-        model = PPO(
+        model = RecurrentPPO(
             config['model']['policy'],
             env,
             learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
@@ -291,6 +288,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             clip_range=config['model']['clip_range'],
             ent_coef=config['model']['ent_coef'],
             vf_coef=config['model']['vf_coef'],
+            max_grad_norm=0.5,  # ZMIANA: Dodano gradient clipping
             policy_kwargs=policy_kwargs,
             verbose=1,
             device=config['model']['device']
@@ -299,7 +297,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     if use_config_hyperparams and load_model:
         policy_kwargs = config['model']['policy_kwargs']
         policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
-        model_new = PPO(
+        model_new = RecurrentPPO(
             config['model']['policy'],
             env,
             learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
@@ -311,11 +309,12 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             clip_range=config['model']['clip_range'],
             ent_coef=config['model']['ent_coef'],
             vf_coef=config['model']['vf_coef'],
+            max_grad_norm=0.5,  # ZMIANA: Dodano gradient clipping
             policy_kwargs=policy_kwargs,
             verbose=1,
             device=config['model']['device']
         )
-        model_tmp = PPO.load(model_path_absolute)
+        model_tmp = RecurrentPPO.load(model_path_absolute)
         model_new.policy.load_state_dict(model_tmp.policy.state_dict())
         model = model_new
         del model_tmp
@@ -352,10 +351,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     if enable_channel_logs:
         for logger in channel_loggers.values():
             logger.info(f"\n--- Debug: Rozpoczęcie treningu ---")
-        debug_env = make_env(render_mode=None, grid_size=None, sequence_length=sequence_length)()
+        debug_env = make_env(render_mode=None, grid_size=None)()
         obs, _ = debug_env.reset()
-        # debug_env to SequenceWrapper, więc .env to SnakeEnv
-        grid_size = debug_env.env.grid_size
+        grid_size = debug_env.grid_size
         log_observation(obs, channel_loggers, grid_size, step=0)
         for debug_step in range(5):
             action = debug_env.action_space.sample()
@@ -392,7 +390,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                 reset_num_timesteps=not load_model,
                 callback=[eval_callback, train_progress_callback],
                 progress_bar=use_progress_bar,
-                tb_log_name=f"ppo_snake_{total_timesteps}"
+                tb_log_name=f"recurrent_ppo_snake_{total_timesteps}"
             )
         else:
             print(f"Trening zakończony: osiągnięto {total_timesteps} kroków.")

@@ -17,75 +17,6 @@ DIRECTIONS = np.array(config['environment']['directions'])
 VIEWPORT_SIZE = 16  # Stały rozmiar viewport (zawsze 16x16)
 
 
-class SequenceWrapper(gym.Wrapper):
-    """
-    Wrapper przechowujący historię obserwacji dla ConvLSTM.
-    Zamiast stackować ramki, zwraca sekwencję ostatnich N ramek.
-    """
-    def __init__(self, env, sequence_length=4):
-        super().__init__(env)
-        self.sequence_length = sequence_length
-        self.image_history = collections.deque(maxlen=sequence_length)
-        
-        image_space = self.env.observation_space['image']
-        # Obserwacja to sekwencja ramek: [seq_len, H, W, C]
-        sequence_image_space = spaces.Box(
-            low=image_space.low.min(),
-            high=image_space.high.max(),
-            shape=(sequence_length, image_space.shape[0], image_space.shape[1], image_space.shape[2]),
-            dtype=image_space.dtype
-        )
-        
-        self.observation_space = spaces.Dict({
-            'image': sequence_image_space,
-            'direction': self.env.observation_space['direction'],
-            'dx_head': self.env.observation_space['dx_head'],
-            'dy_head': self.env.observation_space['dy_head'],
-            'front_coll': self.env.observation_space['front_coll'],
-            'left_coll': self.env.observation_space['left_coll'],
-            'right_coll': self.env.observation_space['right_coll']
-        })
-
-    def reset(self, seed=None, options=None):
-        obs, info = self.env.reset(seed=seed, options=options)
-        self.image_history.clear()
-        
-        # Wypełnij historię zerami
-        for _ in range(self.sequence_length - 1):
-            self.image_history.append(np.zeros_like(obs['image']))
-        self.image_history.append(obs['image'])
-        
-        sequence_image = np.stack(list(self.image_history), axis=0)
-        
-        new_obs = {
-            'image': sequence_image,
-            'direction': obs['direction'],
-            'dx_head': obs['dx_head'],
-            'dy_head': obs['dy_head'],
-            'front_coll': obs['front_coll'],
-            'left_coll': obs['left_coll'],
-            'right_coll': obs['right_coll']
-        }
-        return new_obs, info
-
-    def step(self, action):
-        obs, reward, done, truncated, info = self.env.step(action)
-        self.image_history.append(obs['image'])
-        
-        sequence_image = np.stack(list(self.image_history), axis=0)
-        
-        new_obs = {
-            'image': sequence_image,
-            'direction': obs['direction'],
-            'dx_head': obs['dx_head'],
-            'dy_head': obs['dy_head'],
-            'front_coll': obs['front_coll'],
-            'left_coll': obs['left_coll'],
-            'right_coll': obs['right_coll']
-        }
-        return new_obs, reward, done, truncated, info
-
-
 class SnakeEnv(gym.Env):
     def __init__(self, render_mode=None, grid_size=None):
         super(SnakeEnv, self).__init__()
@@ -170,7 +101,7 @@ class SnakeEnv(gym.Env):
 
     def _get_viewport_observation(self):
         """
-        Tworzy viewport 16x16 wycentrowany na głowie węża.
+        Tworzy viewport 16x16 wycentrowany na głowie węża - WEKTORYZOWANA WERSJA.
         - Głowa zawsze w centrum
         - Obszar poza planszą = -1 (ściany)
         - Wartości: -1 (ściana), 0 (puste), 0.5 (ciało), 1.0 (głowa), 0.75 (jedzenie)
@@ -181,35 +112,40 @@ class SnakeEnv(gym.Env):
         head = np.array(self.snake[0])
         half_view = VIEWPORT_SIZE // 2
         
-        # Oblicz zakres widoku w współrzędnych planszy
-        view_start_y = head[0] - half_view
-        view_end_y = head[0] + half_view
-        view_start_x = head[1] - half_view
-        view_end_x = head[1] + half_view
+        # Zakres viewport w grid coordinates
+        y_start, y_end = head[0] - half_view, head[0] + half_view
+        x_start, x_end = head[1] - half_view, head[1] + half_view
         
-        # Dla każdej pozycji w viewport sprawdź co tam jest
-        for vp_y in range(VIEWPORT_SIZE):
-            for vp_x in range(VIEWPORT_SIZE):
-                # Przelicz na współrzędne planszy
-                grid_y = view_start_y + vp_y
-                grid_x = view_start_x + vp_x
-                
-                # Jeśli poza planszą - zostaje -1 (ściana)
-                if grid_y < 0 or grid_y >= self.grid_size or grid_x < 0 or grid_x >= self.grid_size:
-                    continue
-                
-                # W granicach planszy - ustaw wartość
-                viewport[vp_y, vp_x] = 0.0  # Domyślnie puste pole
-                
-                # Sprawdź czy to część węża
-                pos = [grid_y, grid_x]
-                if pos == self.snake[0]:
-                    viewport[vp_y, vp_x] = 1.0  # Głowa
-                elif pos in self.snake:
-                    viewport[vp_y, vp_x] = 0.5  # Ciało
-                
-                # Sprawdź czy to jedzenie
-                if self.food is not None and pos == self.food.tolist():
+        # Przecięcie z granicami planszy
+        grid_y_start = max(0, y_start)
+        grid_y_end = min(self.grid_size, y_end)
+        grid_x_start = max(0, x_start)
+        grid_x_end = min(self.grid_size, x_end)
+        
+        # Odpowiadające pozycje w viewport
+        vp_y_start = grid_y_start - y_start
+        vp_y_end = vp_y_start + (grid_y_end - grid_y_start)
+        vp_x_start = grid_x_start - x_start
+        vp_x_end = vp_x_start + (grid_x_end - grid_x_start)
+        
+        # Wypełnij viewport (gdzie jest plansza) - pustymi polami
+        if grid_y_end > grid_y_start and grid_x_end > grid_x_start:
+            viewport[vp_y_start:vp_y_end, vp_x_start:vp_x_end] = 0.0
+            
+            # Zaznacz węża
+            for i, segment in enumerate(self.snake):
+                gy, gx = segment
+                if grid_y_start <= gy < grid_y_end and grid_x_start <= gx < grid_x_end:
+                    vp_y = gy - y_start
+                    vp_x = gx - x_start
+                    viewport[vp_y, vp_x] = 1.0 if i == 0 else 0.5
+            
+            # Zaznacz jedzenie
+            if self.food is not None:
+                fy, fx = self.food
+                if grid_y_start <= fy < grid_y_end and grid_x_start <= fx < grid_x_end:
+                    vp_y = fy - y_start
+                    vp_x = fx - x_start
                     viewport[vp_y, vp_x] = 0.75
         
         return viewport[:, :, np.newaxis]  # Dodaj wymiar kanału
@@ -354,17 +290,15 @@ class SnakeEnv(gym.Env):
             pygame.quit()
 
 
-def make_env(render_mode=None, grid_size=None, sequence_length=4):
+def make_env(render_mode=None, grid_size=None):
     """
-    Tworzy środowisko Snake.
+    Tworzy środowisko Snake - BEZ SequenceWrapper (RecurrentPPO obsługuje sekwencje sam)
     
     Args:
         render_mode: Tryb renderowania ('human' lub None)
         grid_size: Rozmiar siatki (None dla losowania)
-        sequence_length: Długość sekwencji dla SequenceWrapper
     """
     def _init():
         env = SnakeEnv(render_mode=render_mode, grid_size=grid_size)
-        env = SequenceWrapper(env, sequence_length=sequence_length)
         return env
     return _init
