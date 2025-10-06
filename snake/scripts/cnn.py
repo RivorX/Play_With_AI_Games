@@ -13,45 +13,86 @@ with open(config_path, 'r') as f:
 
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     """
-    Features Extractor dla RecurrentPPO
-    RecurrentPPO używa LSTM do zapamiętywania historii
+    Features Extractor dla RecurrentPPO z dynamiczną architekturą
+    Liczba warstw CNN i scalar MLP jest konfigurowalna przez config.yaml
     """
     def __init__(self, observation_space: spaces.Dict, features_dim=512):
         super().__init__(observation_space, features_dim)
-        in_channels = 1
+        
+        # Pobierz parametry z configu
+        cnn_config = config['model'].get('convlstm', {})
+        cnn_channels = cnn_config.get('cnn_channels', [32, 64])
+        scalar_hidden_dims = cnn_config.get('scalar_hidden_dims', [128, 192])
         dropout_rate = config['model'].get('dropout_rate', 0.2)
+        
+        in_channels = 1
         leaky_relu = nn.LeakyReLU(negative_slope=0.01)
 
-        # CNN dla obrazu (16x16x1)
-        self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
-            leaky_relu,
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            leaky_relu,
+        # === DYNAMICZNE BUDOWANIE CNN ===
+        cnn_layers = []
+        current_channels = in_channels
+        
+        for i, out_channels in enumerate(cnn_channels):
+            # Pierwsza i ostatnia warstwa zmniejszają rozmiar (stride=2), pozostałe nie
+            if i == 0 or i == len(cnn_channels) - 1:
+                stride = 2
+            else:
+                stride = 1
+            cnn_layers.extend([
+                nn.Conv2d(current_channels, out_channels, kernel_size=3, stride=stride, padding=1),
+                nn.BatchNorm2d(out_channels),
+                leaky_relu
+            ])
+            current_channels = out_channels
+        
+        # Adaptive pooling na końcu CNN
+        cnn_layers.extend([
             nn.AdaptiveAvgPool2d((2, 2)),
             nn.Flatten()
-        )
+        ])
+        
+        self.cnn = nn.Sequential(*cnn_layers)
+        
+        # Oblicz wymiar wyjściowy CNN (ostatni kanał * 2 * 2)
+        self.cnn_output_dim = cnn_channels[-1] * 2 * 2
 
-        # Sieć dla skalarów: direction (2D sin/cos), dx_head, dy_head, front_coll, left_coll, right_coll
-        scalar_dim = 2 + 1 + 1 + 1 + 1 + 1  # 7 wartości
-        self.scalar_linear = nn.Sequential(
-            nn.Linear(scalar_dim, 128),
-            nn.LeakyReLU(0.01),
-            nn.Linear(128, 192),  # Zmieniono z 256 na 192
-            nn.LeakyReLU(0.01),
-            nn.Dropout(dropout_rate)
-        )
+        # === DYNAMICZNE BUDOWANIE SIECI SKALARÓW ===
+        # Skalary: direction (2D sin/cos), dx_head, dy_head, front_coll, left_coll, right_coll
+        scalar_input_dim = 2 + 1 + 1 + 1 + 1 + 1  # 7 wartości
+        
+        scalar_layers = []
+        current_dim = scalar_input_dim
+        
+        for i, hidden_dim in enumerate(scalar_hidden_dims):
+            scalar_layers.extend([
+                nn.Linear(current_dim, hidden_dim),
+                nn.LeakyReLU(0.01)
+            ])
+            # Dropout po każdej warstwie oprócz ostatniej
+            if i < len(scalar_hidden_dims) - 1:
+                scalar_layers.append(nn.Dropout(dropout_rate))
+            current_dim = hidden_dim
+        
+        # Dropout na końcu sieci skalarów
+        scalar_layers.append(nn.Dropout(dropout_rate))
+        
+        self.scalar_linear = nn.Sequential(*scalar_layers)
+        self.scalar_output_dim = scalar_hidden_dims[-1]
 
-        # Łączenie cech CNN i skalarów
-        cnn_dim = 64 * 2 * 2  # 256 cech z CNN
-        total_dim = cnn_dim + 192  # 256 (CNN) + 192 (scalars) = 448
+        # === WARSTWA ŁĄCZĄCA ===
+        total_dim = self.cnn_output_dim + self.scalar_output_dim
         self.final_linear = nn.Sequential(
             nn.Linear(total_dim, features_dim),
             nn.LeakyReLU(0.01),
             nn.Dropout(dropout_rate)
         )
+        
+        print(f"[CNN] Zainicjalizowano architekturę:")
+        print(f"  CNN layers: {cnn_channels} -> output_dim: {self.cnn_output_dim}")
+        print(f"  Scalar layers: {scalar_hidden_dims} -> output_dim: {self.scalar_output_dim}")
+        print(f"  Total features: {total_dim} -> final: {features_dim}")
+        scalar_percent = (self.scalar_output_dim / total_dim) * 100
+        print(f"  Skalary mają {scalar_percent:.1f}% wpływu")
 
     def forward(self, observations):
         # Obraz: [batch, H, W, C] -> [batch, C, H, W]
