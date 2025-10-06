@@ -50,7 +50,9 @@ def init_channel_loggers():
     for channel_name in ['mapa', 'direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         logger = logging.getLogger(f'channel_{channel_name}')
+        import torch
         handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+        torch.backends.cudnn.benchmark = True  # Optymalizacja dla stałych rozmiarów wejścia na GPU
         formatter = logging.Formatter('%(asctime)s - %(message)s')
         handler.setFormatter(formatter)
         if logger.hasHandlers():
