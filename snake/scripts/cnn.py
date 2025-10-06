@@ -55,19 +55,24 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         cnn_layers.append(nn.Flatten())
         self.cnn = nn.Sequential(*cnn_layers)
         
-        # Skalary
-        scalar_dim = 6
+        # ZMIANA: Skalary - direction ma teraz 2 wymiary zamiast 1
+        scalar_dim = 7  # direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1)
         scalar_layers = [
             nn.Linear(scalar_dim, convlstm_config['scalar_hidden_dims'][0]),
             nn.ReLU(inplace=True)
         ]
+        if len(convlstm_config['scalar_hidden_dims']) > 1:
+            scalar_layers.extend([
+                nn.Linear(convlstm_config['scalar_hidden_dims'][0], convlstm_config['scalar_hidden_dims'][1]),
+                nn.ReLU(inplace=True)
+            ])
         self.scalar_linear = nn.Sequential(*scalar_layers)
-        
+
+        scalar_out_dim = convlstm_config['scalar_hidden_dims'][-1]
         # Wymiary: 4*4*40 = 640
         cnn_out_channels = convlstm_config['cnn_channels'][-1]
         spatial_size = 4
         cnn_dim = cnn_out_channels * spatial_size * spatial_size
-        scalar_out_dim = convlstm_config['scalar_hidden_dims'][0]
         total_dim = cnn_dim + scalar_out_dim
         
         final_layers = [
@@ -81,7 +86,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         
         scalar_percent = 100 * scalar_out_dim / total_dim
         print(f"✓ CNN: 16x16 -> 8x8 -> 8x8 -> 4x4 ({cnn_dim} dims + {scalar_out_dim} scalars = {total_dim} → {features_dim})")
-        print(f"  Skalary mają {scalar_percent:.1f}% wpływu (direction, dx/dy, collisions)")
+        print(f"  Skalary mają {scalar_percent:.1f}% wpływu (direction[2D], dx/dy, collisions)")
         
         if self.use_cuda:
             print(f"✓ Pinned memory enabled dla przyspieszenia CPU→GPU transfer")
@@ -105,8 +110,9 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         
         image_features = self.cnn(image)
         
+        # ZMIANA: direction ma teraz 2 wymiary
         scalars = torch.cat([
-            observations['direction'],
+            observations['direction'],  # 2D: [sin(angle), cos(angle)]
             observations['dx_head'],
             observations['dy_head'],
             observations['front_coll'],

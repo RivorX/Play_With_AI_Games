@@ -5,6 +5,7 @@ import collections
 import pygame
 import yaml
 import os
+import math
 
 # Wczytaj konfigurację
 config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'config.yaml')
@@ -24,6 +25,8 @@ class SnakeEnv(gym.Env):
         self.default_grid_size = grid_size  # Może być None dla losowania
         self.grid_size = config['environment']['max_grid_size'] if self.default_grid_size is None else self.default_grid_size
         self.action_space = spaces.Discrete(config['environment']['action_space']['n'])
+        
+        # ZMIANA: direction ma teraz 2 wymiary (sin, cos)
         self.observation_space = spaces.Dict({
             'image': spaces.Box(
                 low=-1.0,  # Ściany mają wartość -1
@@ -31,7 +34,7 @@ class SnakeEnv(gym.Env):
                 shape=(VIEWPORT_SIZE, VIEWPORT_SIZE, 1),
                 dtype=config['environment']['observation_space']['dtype']
             ),
-            'direction': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
+            'direction': spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32),  # ZMIANA: 2D
             'dx_head': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
             'dy_head': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
             'front_coll': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
@@ -198,16 +201,22 @@ class SnakeEnv(gym.Env):
         viewport = self._get_viewport_observation()
         head = np.array(self.snake[0])
         
-        # dx/dy w układzie viewport (znormalizowane -1 do 1)
         half_view = VIEWPORT_SIZE // 2
         
-        # Pozycja jedzenia w viewport
-        food_viewport_y = self.food[0] - head[0] + half_view
+        # FIX 1: Poprawione osie X/Y - food[1] to X, food[0] to Y
         food_viewport_x = self.food[1] - head[1] + half_view
+        food_viewport_y = self.food[0] - head[0] + half_view
         
-        # Kierunek do jedzenia w viewport (-1 do 1)
-        dx_viewport = (food_viewport_y - half_view) / half_view
-        dy_viewport = (food_viewport_x - half_view) / half_view
+        # FIX 2: Prawidłowe przypisanie - X do dx, Y do dy
+        dx_viewport = (food_viewport_x - half_view) / half_view  # -1..1
+        dy_viewport = (food_viewport_y - half_view) / half_view  # -1..1
+        
+        # FIX 3: Lepsze kodowanie kierunku (sin/cos)
+        # direction: 0=góra, 1=prawo, 2=dół, 3=lewo
+        # Rotacja: 0° = góra = (0, -1), 90° = prawo = (1, 0), itd.
+        angle = self.direction * math.pi / 2
+        direction_x = math.sin(angle)  # sin daje X (lewo-prawo)
+        direction_y = -math.cos(angle)  # -cos daje Y (góra-dół)
         
         # Oblicz potencjalne kolizje
         front_coll = self._get_potential_collision(self.direction)
@@ -216,7 +225,7 @@ class SnakeEnv(gym.Env):
 
         return {
             'image': viewport,
-            'direction': np.array([(self.direction + 1) / 4.0], dtype=np.float32),
+            'direction': np.array([direction_x, direction_y], dtype=np.float32),  # ZMIANA: 2D
             'dx_head': np.array([dx_viewport], dtype=np.float32),
             'dy_head': np.array([dy_viewport], dtype=np.float32),
             'front_coll': np.array([front_coll], dtype=np.float32),
@@ -286,7 +295,7 @@ class SnakeEnv(gym.Env):
         # 3. ZJEDZENIE JEDZENIA
         if np.array_equal(head, self.food):
             # Nagroda za jedzenie
-            food_reward = 10.0
+            food_reward = 20.0
             step_rewards['food'] = food_reward
             reward += food_reward
             

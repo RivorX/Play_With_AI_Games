@@ -100,7 +100,14 @@ def log_observation(obs, channel_loggers, grid_size, step):
         logger.info(f"Liczba ścian (-1): {np.sum(viewport == -1.0)}")
         logger.info("-" * 60)
 
-    for scalar_name in ['direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
+    # ZMIANA: direction ma teraz 2 wymiary
+    logger = channel_loggers.get('direction')
+    if logger:
+        logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
+        logger.info(f"Direction (sin, cos): [{obs['direction'][0]:.4f}, {obs['direction'][1]:.4f}]")
+        logger.info("-" * 60)
+
+    for scalar_name in ['dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         logger = channel_loggers.get(scalar_name)
         if logger:
             logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")

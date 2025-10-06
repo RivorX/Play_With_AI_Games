@@ -74,7 +74,7 @@ def test_snake_model(model_path, grid_size, episodes):
             # Dict observation: obs['image'] shape: [H, W, 1]
             mapa = obs['image'][:, :, 0]
 
-            direction = obs['direction'][0]
+            direction = obs['direction']  # direction to teraz [sin, cos]
             dx_head = obs['dx_head'][0]
             dy_head = obs['dy_head'][0]
             front_coll = obs['front_coll'][0]

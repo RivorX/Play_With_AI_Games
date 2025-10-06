@@ -11,7 +11,7 @@ environment:
   action_space:
     type: Discrete                    # Typ przestrzeni akcji
     n: 3                             # Liczba akcji (lewo, prosto, prawo)
-  max_steps_without_food: 10         # Max kroków bez jedzenia (skalowane z rozmiarem)
+  max_steps_without_food: 20         # Max kroków bez jedzenia (skalowane z rozmiarem)
   max_steps_factor: 150              # Mnożnik max kroków
 
 # Konfiguracja modelu RecurrentPPO
@@ -25,23 +25,23 @@ model:
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
-  ent_coef: 0.02                     # Współczynnik entropii (zmniejszone z 0.05)
+  ent_coef: 0.1                      # Współczynnik entropii (zmniejszone z 0.05)
   vf_coef: 0.5                       # Współczynnik funkcji wartości (zmniejszone z 1.0)
   device: cuda                       # Urządzenie (cuda/cpu)
   dropout_rate: 0.1
   
   # Parametry CNN
   convlstm:
-    cnn_channels: [24, 32, 40]      # Liczba kanałów w warstwach konwolucyjnych
-    scalar_hidden_dims: [128]       # Ukryte wymiary dla danych skalarnych  
+    cnn_channels: [24, 32, 40]        # Liczba kanałów w warstwach konwolucyjnych
+    scalar_hidden_dims: [128, 256]    # Ukryte wymiary dla danych skalarnych  
   
   policy_kwargs:
     features_extractor_kwargs:
-      features_dim: 256              
+      features_dim: 512               
     net_arch:
-      pi: [128, 64]                    
-      vf: [128, 64]                    
-    lstm_hidden_size: 128            
+      pi: [256, 128]                    
+      vf: [256, 128]                    
+    lstm_hidden_size: 16              # Rozmiar ukryty LSTM
     n_lstm_layers: 1                  # Liczba warstw LSTM
     enable_critic_lstm: true          # LSTM także dla krytyka
 
@@ -54,7 +54,7 @@ training:
   plot_interval: 1                   # Co ile walidacji robić wykres
   max_no_improvement_evals: 20       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 5                       # Minimalna liczba ewaluacji
-  enable_channel_logs: false         # Wyłącz logi kanałów (wydajność)
+  enable_channel_logs: true         # Wyłącz logi kanałów (wydajność)
 
 # Ścieżki do zapisu
 paths:
