@@ -1,7 +1,8 @@
 # Konfiguracja środowiska Snake
 environment:
-  min_grid_size: 5                   # Minimalny rozmiar siatki dla losowania
-  max_grid_size: 16                  # Maksymalny rozmiar siatki dla losowania
+  min_grid_size: 5                   # Minimalny rozmiar siatki
+  max_grid_size: 25                  # Maksymalny rozmiar siatki
+  viewport_size: 16                  # Rozmiar viewport (stały dla wszystkich grid_size)
   snake_size: 20                     # Rozmiar kratki w pikselach
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
   observation_space:
@@ -9,40 +10,43 @@ environment:
     high: 1.0                        # Maksymalna wartość obserwacji
     dtype: float32                   # Typ danych obserwacji
   action_space:
-    type: Discrete                    # Typ przestrzeni akcji
+    type: Discrete                   # Typ przestrzeni akcji
     n: 3                             # Liczba akcji (lewo, prosto, prawo)
   max_steps_without_food: 10         # Max kroków bez jedzenia (skalowane z rozmiarem)
   max_steps_factor: 150              # Mnożnik max kroków
 
-# Konfiguracja modelu PPO
+# Konfiguracja modelu RecurrentPPO
 model:
-  policy: MultiInputPolicy           # Zmieniono na MultiInputPolicy dla przestrzeni Dict
+  policy: MultiInputLstmPolicy       # Policy dla RecurrentPPO
   learning_rate: 0.0002              # Szybkość uczenia 
-  min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej tej wartości)
-  n_steps: 2048                      # Liczba kroków na aktualizację
+  min_learning_rate: 0.00005         # Minimalny learning rate
+  n_steps: 1024                      # Liczba kroków na aktualizację
   n_epochs: 10                       # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
-  ent_coef: 0.4                      # Współczynnik entropii
-  vf_coef: 1.0                       # Współczynnik funkcji wartości
+  ent_coef: 0.3                      # Współczynnik entropii
+  vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
-  dropout_rate: 0.2                  # Współczynnik dropout w CNN
+  dropout_rate: 0.1                  # Współczynnik dropout w CNN
   policy_kwargs:
     features_extractor_kwargs:
-      features_dim: 512
+      features_dim: 512              # Wymiar cech wyjściowych ekstraktora
     net_arch:
-      pi: [256, 256, 128]  # dla aktora
-      vf: [256, 256, 128]  # dla krytyka
+      pi: [256, 128]                 # Wielkość sieci aktora
+      vf: [256, 128]                 # Wielkość sieci krytyka
+    lstm_hidden_size: 2             # Rozmiar ukryty LSTM
+    n_lstm_layers: 1                 # Liczba warstw LSTM
+    enable_critic_lstm: true         # LSTM także dla krytyka
 
 # Konfiguracja treningu
 training:
-  n_envs: 16                         # Liczba środowisk
-  batch_size: 2048                   # Rozmiar partii
+  n_envs: 8                          # Liczba środowisk
+  batch_size: 512                    # Rozmiar partii
   total_timesteps: 10000000          # Całkowita liczba kroków
-  eval_freq: 5000                    # Częstotliwość ewaluacji (zwiększona dla rzadszej validacji)
+  eval_freq: 5000                    # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
-  max_no_improvement_evals: 50       # Liczba ewaluacji bez poprawy przed zatrzymaniem
+  max_no_improvement_evals: 20       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 5                       # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
   enable_channel_logs: true          # Włącz logi kanałów
 

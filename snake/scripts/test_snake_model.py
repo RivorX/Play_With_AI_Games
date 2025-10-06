@@ -2,8 +2,8 @@ import argparse
 import os
 import numpy as np
 import pygame
-from stable_baselines3 import PPO
-from model import make_env, set_grid_size
+from sb3_contrib import RecurrentPPO
+from model import make_env
 import yaml
 import logging
 
@@ -29,20 +29,17 @@ with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
 def test_snake_model(model_path, grid_size, episodes):
-    # Ustaw grid_size
-    set_grid_size(grid_size)
-    
     # Utwórz środowisko
     env = make_env(render_mode="human", grid_size=grid_size)()
-    
+
     # Załaduj model
     try:
-        model = PPO.load(model_path)
+        model = RecurrentPPO.load(model_path)
         logging.info(f"Załadowano model z: {model_path}")
     except Exception as e:
         logging.error(f"Błąd podczas ładowania modelu: {e}")
         return
-    
+
     # Testowanie
     for episode in range(episodes):
         obs, _ = env.reset()
@@ -52,12 +49,11 @@ def test_snake_model(model_path, grid_size, episodes):
         logging.info(f"\nEpizod {episode + 1}")
 
         while not done:
-            # Wybierz najnowszą ramkę z FrameStack (ostatni kanał)
-            mapa = obs['image'][-1, :, :]  # [H, W], kanał mapa z ostatniej ramki
+            # Obraz z viewportu
+            mapa = obs['image'][:, :, 0]  # [H, W], pojedynczy kanał
 
             # Wyodrębnij skalary
-            direction = obs['direction'][0]
-            grid_size_val = obs['grid_size'][0]
+            direction = obs['direction']
             dx_head = obs['dx_head'][0]
             dy_head = obs['dy_head'][0]
 
@@ -83,12 +79,11 @@ def test_snake_model(model_path, grid_size, episodes):
             logging.info("--- Obserwacja (fragment) ---")
             logging.info(f"Kanał mapa:\n{np.array_str(mapa, precision=2, suppress_small=True, max_line_width=120)}")
             logging.info(f"Direction: {direction}")
-            logging.info(f"Grid_size: {grid_size_val}")
             logging.info(f"dx_head: {dx_head}")
             logging.info(f"dy_head: {dy_head}")
             logging.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
             logging.info(f"Dystans Manhattan: {distance}")
-            logging.info(f"Stan gry: done={done}, steps={steps}, snake={env.env.snake}, food={env.env.food}")
+            logging.info(f"Stan gry: done={done}, steps={steps}, snake={env.snake}, food={env.food}")
             logging.info("-" * 60)
 
             # Wykonaj akcję
