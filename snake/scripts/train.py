@@ -1,7 +1,7 @@
 import os
 import time
 import numpy as np
-from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.env_util import make_vec_env
@@ -39,7 +39,7 @@ ensure_directories()
 def reset_channel_logs():
     log_dir = os.path.join(base_dir, 'logs', 'Training_channels')
     os.makedirs(log_dir, exist_ok=True)
-    for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
+    for channel_name in ['mapa', 'direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         with open(log_path, 'w', encoding='utf-8'):
             pass
@@ -47,7 +47,7 @@ def reset_channel_logs():
 def init_channel_loggers():
     loggers = {}
     log_dir = os.path.join(base_dir, 'logs', 'Training_channels')
-    for channel_name in ['mapa', 'direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
+    for channel_name in ['mapa', 'direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         log_path = os.path.join(log_dir, f'training_{channel_name}.log')
         logger = logging.getLogger(f'channel_{channel_name}')
         handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
@@ -67,8 +67,7 @@ def log_observation(obs, channel_loggers, grid_size, step):
     if not enable_channel_logs:
         return
     image = obs['image']
-    latest_channel = image[-1:, :, :]  # [1, H, W]
-    mapa = latest_channel[0, :, :]  # [H, W]
+    mapa = image[:, :, 0]  # [H, W] - BEZ framestackingu
     head_pos = np.where(mapa == 1.0)
     food_pos = np.where(mapa == 0.75)
     if len(head_pos[0]) > 0:
@@ -92,11 +91,14 @@ def log_observation(obs, channel_loggers, grid_size, step):
         logger.info(f"Dystans Manhattan: {distance}")
         logger.info("-" * 60)
 
-    for scalar_name in ['direction', 'grid_size', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
+    for scalar_name in ['direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
         logger = channel_loggers.get(scalar_name)
         if logger:
             logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
-            logger.info(f"{scalar_name.capitalize()}: {obs[scalar_name][0]}")
+            if scalar_name == 'direction':
+                logger.info(f"{scalar_name.capitalize()}: sin={obs[scalar_name][0]:.3f}, cos={obs[scalar_name][1]:.3f}")
+            else:
+                logger.info(f"{scalar_name.capitalize()}: {obs[scalar_name][0]}")
             logger.info("-" * 60)
 
 def linear_schedule(initial_value, min_value=0.00005):
@@ -111,21 +113,56 @@ class TrainProgressCallback(BaseCallback):
         self.initial_timesteps = initial_timesteps
         self.header_written = False
         self.last_logged = 0
+        self.episode_scores = []
+        self.episode_grid_sizes = []
 
     def _on_step(self) -> bool:
+        # Zbieraj info z zakończonych epizodów
+        infos = self.locals.get('infos', [])
+        dones = self.locals.get('dones', [])
+        
+        for i, (info, done) in enumerate(zip(infos, dones)):
+            if done and 'score' in info:
+                self.episode_scores.append(info['score'])
+                self.episode_grid_sizes.append(info.get('grid_size', 16))
+        
+        # Loguj co 1000 kroków
         if self.locals.get('dones') is not None and any(self.locals['dones']):
             if (self.num_timesteps + self.initial_timesteps) - self.last_logged >= 1000:
                 ep_rew_mean = self.model.ep_info_buffer and np.mean([ep_info['r'] for ep_info in self.model.ep_info_buffer]) or None
                 ep_len_mean = self.model.ep_info_buffer and np.mean([ep_info['l'] for ep_info in self.model.ep_info_buffer]) or None
-                grid_size = np.mean(self.training_env.get_attr('grid_size'))  # Średni grid_size
+                
+                # Oblicz dodatkowe statystyki
+                mean_score = np.mean(self.episode_scores) if self.episode_scores else 0
+                max_score = np.max(self.episode_scores) if self.episode_scores else 0
+                mean_grid_size = np.mean(self.episode_grid_sizes) if self.episode_grid_sizes else 16
+                
+                # Pobierz loss'y z modelu (jeśli dostępne z ostatniego update)
+                policy_loss = getattr(self.model, '_last_policy_loss', None)
+                value_loss = getattr(self.model, '_last_value_loss', None)
+                entropy_loss = getattr(self.model, '_last_entropy_loss', None)
+                
                 try:
                     write_header = not os.path.exists(self.csv_path)
                     with open(self.csv_path, 'a', newline='') as csvfile:
                         writer = csv.writer(csvfile)
                         if write_header:
-                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length', 'grid_size'])
-                        writer.writerow([self.num_timesteps + self.initial_timesteps, ep_rew_mean, ep_len_mean, grid_size])
+                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length', 'mean_score', 'max_score', 'mean_grid_size', 'policy_loss', 'value_loss', 'entropy_loss'])
+                        writer.writerow([
+                            self.num_timesteps + self.initial_timesteps, 
+                            ep_rew_mean, 
+                            ep_len_mean, 
+                            mean_score,
+                            max_score,
+                            mean_grid_size,
+                            policy_loss,
+                            value_loss,
+                            entropy_loss
+                        ])
                     self.last_logged = self.num_timesteps + self.initial_timesteps
+                    # Reset buforów po zapisie
+                    self.episode_scores = []
+                    self.episode_grid_sizes = []
                 except Exception as e:
                     print(f"Błąd zapisu train_progress.csv: {e}")
         return True
@@ -163,8 +200,6 @@ class CustomEvalCallback(EvalCallback):
                 except Exception as e:
                     print(f"Błąd podczas generowania wykresu: {e}")
         return True
-
- # Usunięto funkcję test_thread
 
 def save_training_state(model, env, eval_env, total_timesteps, save_path):
     model_path_absolute = os.path.normpath(os.path.join(save_path, 'snake_ppo_model.zip'))
@@ -217,18 +252,13 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         try:
             resp = input(f"Znaleziono istniejący model pod {model_path_absolute}. Czy kontynuować trening? [[Y]/n]: ").strip()
         except Exception:
-            # W środowiskach nieinteraktywnych zachowaj domyślne zachowanie (kontynuuj)
             resp = ''
 
-        # Jeśli użytkownik wybierze 'n' lub 'no', traktujemy to jako decyzję o rozpoczęciu treningu od nowa.
-        # W takim przypadku nie ładujemy modelu, resetujemy total_timesteps i ustawiamy load_model=False.
         if resp.lower() in ('n', 'no'):
             print("Użytkownik wybrał rozpoczęcie treningu od nowa. Zaczynam od zera i używam hyperparametrów z configu.")
             load_model = False
             total_timesteps = 0
-            # W trybie "od nowa" nie pytamy o użycie hyperparametrów z modelu (oczywiste, bo model nie istnieje)
             use_config_hyperparams = True
-            # Usuń istniejący plik z postępem treningu, bo zaczynamy od nowa
             try:
                 train_csv = os.path.join(base_dir, config['paths']['train_csv_path'])
                 if os.path.exists(train_csv):
@@ -237,40 +267,41 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             except Exception as e:
                 print(f"Nie udało się usunąć pliku postępu treningu: {e}")
         else:
-            # Jeżeli kontynuujemy trening (domyślnie), pytamy czy użyć hyperparametrów z configu
             try:
                 resp2 = input("Użyć hyperparametrów z configu zamiast z modelu? [[Y]/n]: ").strip()
             except Exception:
                 resp2 = ''
-            # Domyślnie True (użyj configu)
             use_config_hyperparams = False if resp2.lower() in ('n', 'no') else True
 
     reset_channel_logs()
     if enable_channel_logs:
         channel_loggers.update(init_channel_loggers())
 
+    # LOSOWY ROZMIAR SIATKI (min_grid_size - max_grid_size), viewport zawsze 16x16
     env = make_vec_env(make_env(render_mode=None, grid_size=None), n_envs=n_envs, vec_env_cls=SubprocVecEnv)
     if load_model and os.path.exists(vec_norm_path):
         env = VecNormalize.load(vec_norm_path, env)
     else:
         env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
+    # Środowisko eval zawsze z grid_size=16 dla konsystentnej ewaluacji
     eval_env = make_vec_env(make_env(render_mode=None, grid_size=16), n_envs=1, vec_env_cls=SubprocVecEnv)
     if load_model and os.path.exists(vec_norm_eval_path):
         eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
     else:
         eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
-    policy_kwargs = config['model']['policy_kwargs']
+    # KONFIGURACJA DLA RECURRENTPPO
+    policy_kwargs = config['model']['policy_kwargs'].copy()
     policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
 
     if load_model:
-        model = PPO.load(model_path_absolute, env=env)
+        model = RecurrentPPO.load(model_path_absolute, env=env)
         model.ent_coef = config['model']['ent_coef']
         model.learning_rate = linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate'])
         model._setup_lr_schedule()
     else:
-        model = PPO(
+        model = RecurrentPPO(
             config['model']['policy'],
             env,
             learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
@@ -288,9 +319,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         )
 
     if use_config_hyperparams and load_model:
-        policy_kwargs = config['model']['policy_kwargs']
+        policy_kwargs = config['model']['policy_kwargs'].copy()
         policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
-        model_new = PPO(
+        model_new = RecurrentPPO(
             config['model']['policy'],
             env,
             learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
@@ -306,7 +337,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             verbose=1,
             device=config['model']['device']
         )
-        model_tmp = PPO.load(model_path_absolute)
+        model_tmp = RecurrentPPO.load(model_path_absolute)
         model_new.policy.load_state_dict(model_tmp.policy.state_dict())
         model = model_new
         del model_tmp
@@ -339,15 +370,31 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         os.path.join(base_dir, config['paths']['train_csv_path']),
         initial_timesteps=total_timesteps
     )
-
-    # Usunięto uruchamianie testowania modelu podczas treningu
+    
+    # Callback do zapisywania loss'ów z modelu
+    class LossRecorderCallback(BaseCallback):
+        def _on_step(self) -> bool:
+            # Zapisz loss'y jeśli są dostępne w logger
+            if hasattr(self.model, 'logger') and self.model.logger is not None:
+                try:
+                    # RecurrentPPO loguje te wartości jako 'train/policy_gradient_loss', etc.
+                    if hasattr(self.model.logger, 'name_to_value'):
+                        losses = self.model.logger.name_to_value
+                        self.model._last_policy_loss = losses.get('train/policy_gradient_loss', None)
+                        self.model._last_value_loss = losses.get('train/value_loss', None)
+                        self.model._last_entropy_loss = losses.get('train/entropy_loss', None)
+                except Exception:
+                    pass
+            return True
+    
+    loss_recorder = LossRecorderCallback()
 
     if enable_channel_logs:
         for logger in channel_loggers.values():
             logger.info(f"\n--- Debug: Rozpoczęcie treningu ---")
         debug_env = make_env(render_mode=None, grid_size=None)()
         obs, _ = debug_env.reset()
-        grid_size = debug_env.env.grid_size
+        grid_size = debug_env.grid_size
         log_observation(obs, channel_loggers, grid_size, step=0)
         for debug_step in range(5):
             action = debug_env.action_space.sample()
@@ -364,10 +411,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                 logger.info(f"--- Koniec debug dla grid_size={grid_size} ---")
 
     try:
-        # Oblicz pozostałe kroki do treningu
         configured_total = config['training'].get('total_timesteps', 0)
         remaining_timesteps = configured_total - total_timesteps
-        # Jeżeli osiągnięto już >=80% limitu, zapytaj czy dodać dodatkowe kroki
         try:
             if configured_total > 0 and total_timesteps / configured_total >= 0.8:
                 print(f"Użyto {total_timesteps}/{configured_total} kroków ({total_timesteps/configured_total:.1%}). To >=80% limitu.")
@@ -379,15 +424,14 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                     extra_int = 0
                 remaining_timesteps += extra_int
         except Exception:
-            # W środowiskach nieinteraktywnych input może rzucić wyjątkiem; ignoruj wtedy
             pass
         if remaining_timesteps > 0:
             model.learn(
                 total_timesteps=remaining_timesteps,
                 reset_num_timesteps=not load_model,
-                callback=[eval_callback, train_progress_callback],
+                callback=[eval_callback, train_progress_callback, loss_recorder],
                 progress_bar=use_progress_bar,
-                tb_log_name=f"ppo_snake_{total_timesteps}"
+                tb_log_name=f"recurrent_ppo_snake_{total_timesteps}"
             )
         else:
             print(f"Trening zakończony: osiągnięto {total_timesteps} kroków.")

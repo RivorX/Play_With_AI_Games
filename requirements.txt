@@ -8,3 +8,4 @@ filelock
 pyyaml
 imageio
 Pillow
+sb3-contrib
