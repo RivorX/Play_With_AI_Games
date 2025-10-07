@@ -31,7 +31,7 @@ model:
   dropout_rate: 0.1                  # Współczynnik dropout w CNN
 
   convlstm:
-    cnn_channels: [24, 32, 40]        # Liczba kanałów w warstwach konwolucyjnych
+    cnn_channels: [32, 48, 64]        # Liczba kanałów w warstwach konwolucyjnych
     scalar_hidden_dims: [128]         # Ukryte wymiary dla danych skalarnych 
 
   policy_kwargs:
@@ -40,7 +40,7 @@ model:
     net_arch:
       pi: [128, 64]                 # Wielkość sieci aktora
       vf: [128, 64]                 # Wielkość sieci krytyka
-    lstm_hidden_size: 2             # Rozmiar ukryty LSTM
+    lstm_hidden_size: 128            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
     enable_critic_lstm: true         # LSTM także dla krytyka
 
