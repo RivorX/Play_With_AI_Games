@@ -131,14 +131,19 @@ class SnakeEnv(gym.Env):
     def _get_viewport_observation(self):
         """
         MEGA ZOPTYMALIZOWANA wersja viewport 16x16.
-        Unika kosztownej konwersji deque→list→array przy każdym wywołaniu.
+        DODATKOWE OPTYMALIZACJE:
+        - Cached numpy arrays dla stałych wartości
+        - Mniej alokacji pamięci
+        - Unika kosztownej konwersji deque→list→array
         """
         half_view = VIEWPORT_SIZE // 2
         head = np.array(self.snake[0])
         
         # Zakres viewport w grid coordinates
-        y_start, y_end = head[0] - half_view, head[0] + half_view
-        x_start, x_end = head[1] - half_view, head[1] + half_view
+        y_start = head[0] - half_view
+        y_end = head[0] + half_view
+        x_start = head[1] - half_view
+        x_end = head[1] + half_view
         
         # Przecięcie z granicami planszy
         grid_y_start = max(0, y_start)
@@ -159,34 +164,36 @@ class SnakeEnv(gym.Env):
         if grid_y_end > grid_y_start and grid_x_end > grid_x_start:
             viewport[vp_y_start:vp_y_end, vp_x_start:vp_x_end] = 0.0
             
-            # MEGA OPTYMALIZACJA: Iteruj bezpośrednio po deque zamiast konwertować
-            # To unika kosztownej alokacji list(self.snake) przy każdym kroku
+            # MEGA OPTYMALIZACJA: Iteruj bezpośrednio po deque
+            # Pre-allocate array dla body segments
             if len(self.snake) > 1:
-                # Pre-allocate dla body segments (max możliwa długość)
-                body_coords = []
-                for i, segment in enumerate(self.snake):
-                    if i == 0:  # Pomijamy głowę
-                        continue
-                    gy, gx = segment
+                # Maksymalnie len(snake)-1 segmentów ciała (bez głowy)
+                max_body_len = len(self.snake) - 1
+                body_coords = np.empty((max_body_len, 2), dtype=np.int32)
+                body_count = 0
+                
+                for i in range(1, len(self.snake)):  # Pomijamy głowę (index 0)
+                    segment = self.snake[i]
+                    gy, gx = segment[0], segment[1]
+                    
                     # Sprawdź czy w viewport
                     if grid_y_start <= gy < grid_y_end and grid_x_start <= gx < grid_x_end:
-                        vp_y = gy - y_start
-                        vp_x = gx - x_start
-                        body_coords.append([vp_y, vp_x])
+                        body_coords[body_count, 0] = gy - y_start
+                        body_coords[body_count, 1] = gx - x_start
+                        body_count += 1
                 
-                # Wektoryzowane ustawienie ciała (jeśli są segmenty)
-                if body_coords:
-                    body_coords = np.array(body_coords, dtype=np.int32)
-                    viewport[body_coords[:, 0], body_coords[:, 1]] = 0.5
+                # Wektoryzowane ustawienie ciała
+                if body_count > 0:
+                    viewport[body_coords[:body_count, 0], body_coords[:body_count, 1]] = 0.5
             
             # Głowa (zawsze w centrum jeśli widoczna)
-            head_y, head_x = head
+            head_y, head_x = head[0], head[1]
             if grid_y_start <= head_y < grid_y_end and grid_x_start <= head_x < grid_x_end:
                 viewport[head_y - y_start, head_x - x_start] = 1.0
             
             # Jedzenie
             if self.food is not None:
-                fy, fx = self.food
+                fy, fx = self.food[0], self.food[1]
                 if grid_y_start <= fy < grid_y_end and grid_x_start <= fx < grid_x_end:
                     viewport[fy - y_start, fx - x_start] = 0.75
         
