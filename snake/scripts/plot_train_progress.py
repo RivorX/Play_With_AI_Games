@@ -10,7 +10,9 @@ def plot_train_progress(csv_path, output_path):
         'mean_ep_length': [],
         'mean_score': [],
         'max_score': [],
-        'mean_grid_size': [],
+        'mean_snake_length': [],
+        'mean_steps_per_apple': [],
+        'progress_score': [],
         'policy_loss': [],
         'value_loss': [],
         'entropy_loss': []
@@ -18,22 +20,43 @@ def plot_train_progress(csv_path, output_path):
     
     with open(csv_path, 'r') as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        for row_num, row in enumerate(reader, start=2):  # start=2 bo wiersz 1 to nagłówek
+            # Pomiń puste wiersze
+            if not row or not row.get('timesteps'):
+                continue
+                
             try:
-                data['timesteps'].append(int(row['timesteps']))
-                data['mean_reward'].append(float(row.get('mean_reward', 0)))
-                data['mean_ep_length'].append(float(row.get('mean_ep_length', 0)))
-                data['mean_score'].append(float(row.get('mean_score', 0)))
-                data['max_score'].append(float(row.get('max_score', 0)))
-                data['mean_grid_size'].append(float(row.get('mean_grid_size', 16)))
+                timesteps = int(row['timesteps'])
+                mean_reward = float(row.get('mean_reward', 0))
+                mean_ep_length = float(row.get('mean_ep_length', 0))
+                mean_score = float(row.get('mean_score', 0))
+                max_score = float(row.get('max_score', 0))
+                mean_snake_length = float(row.get('mean_snake_length', 3))
+                mean_steps_per_apple = float(row.get('mean_steps_per_apple', 0))
+                progress_score = float(row.get('progress_score', 0))
+                
                 # Loss'y mogą być None, zamień na nan
                 policy_loss = row.get('policy_loss', '')
                 value_loss = row.get('value_loss', '')
                 entropy_loss = row.get('entropy_loss', '')
-                data['policy_loss'].append(float(policy_loss) if policy_loss and policy_loss != 'None' else float('nan'))
-                data['value_loss'].append(float(value_loss) if value_loss and value_loss != 'None' else float('nan'))
-                data['entropy_loss'].append(float(entropy_loss) if entropy_loss and entropy_loss != 'None' else float('nan'))
-            except Exception:
+                policy_loss_val = float(policy_loss) if policy_loss and policy_loss != 'None' else float('nan')
+                value_loss_val = float(value_loss) if value_loss and value_loss != 'None' else float('nan')
+                entropy_loss_val = float(entropy_loss) if entropy_loss and entropy_loss != 'None' else float('nan')
+                
+                # Jeśli wszystko się udało, dodaj do danych
+                data['timesteps'].append(timesteps)
+                data['mean_reward'].append(mean_reward)
+                data['mean_ep_length'].append(mean_ep_length)
+                data['mean_score'].append(mean_score)
+                data['max_score'].append(max_score)
+                data['mean_snake_length'].append(mean_snake_length)
+                data['mean_steps_per_apple'].append(mean_steps_per_apple)
+                data['progress_score'].append(progress_score)
+                data['policy_loss'].append(policy_loss_val)
+                data['value_loss'].append(value_loss_val)
+                data['entropy_loss'].append(entropy_loss_val)
+                
+            except Exception as e:
                 continue
     
     if not data['timesteps']:
@@ -74,11 +97,11 @@ def plot_train_progress(csv_path, output_path):
     axes[1, 0].set_ylabel('Apples')
     axes[1, 0].grid(True, alpha=0.3)
     
-    # Wykres 5: Mean Grid Size
-    axes[1, 1].plot(timesteps, data['mean_grid_size'], color='purple', linewidth=2)
-    axes[1, 1].set_title('Mean Grid Size', fontsize=12, fontweight='bold')
+    # Wykres 5: Progress Score (metryka kompozytowa)
+    axes[1, 1].plot(timesteps, data['progress_score'], color='#2ecc71', linewidth=2)
+    axes[1, 1].set_title('Progress Score (Composite Metric)', fontsize=12, fontweight='bold')
     axes[1, 1].set_xlabel('Timesteps')
-    axes[1, 1].set_ylabel('Grid Size')
+    axes[1, 1].set_ylabel('Progress Score')
     axes[1, 1].grid(True, alpha=0.3)
     
     # Wykres 6: Policy Loss
