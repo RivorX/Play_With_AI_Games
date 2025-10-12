@@ -114,7 +114,8 @@ class TrainProgressCallback(BaseCallback):
         self.header_written = False
         self.last_logged = 0
         self.episode_scores = []
-        self.episode_grid_sizes = []
+        self.episode_snake_lengths = []
+        self.episode_steps_per_apple = []
 
     def _on_step(self) -> bool:
         # Zbieraj info z zakończonych epizodów
@@ -124,7 +125,8 @@ class TrainProgressCallback(BaseCallback):
         for i, (info, done) in enumerate(zip(infos, dones)):
             if done and 'score' in info:
                 self.episode_scores.append(info['score'])
-                self.episode_grid_sizes.append(info.get('grid_size', 16))
+                self.episode_snake_lengths.append(info.get('snake_length', 3))
+                self.episode_steps_per_apple.append(info.get('steps_per_apple', 0))
         
         # Loguj co 1000 kroków
         if self.locals.get('dones') is not None and any(self.locals['dones']):
@@ -135,7 +137,11 @@ class TrainProgressCallback(BaseCallback):
                 # Oblicz dodatkowe statystyki
                 mean_score = np.mean(self.episode_scores) if self.episode_scores else 0
                 max_score = np.max(self.episode_scores) if self.episode_scores else 0
-                mean_grid_size = np.mean(self.episode_grid_sizes) if self.episode_grid_sizes else 16
+                mean_snake_length = np.mean(self.episode_snake_lengths) if self.episode_snake_lengths else 3
+                mean_steps_per_apple = np.mean(self.episode_steps_per_apple) if self.episode_steps_per_apple else 0
+                
+                # Oblicz progress_score
+                progress_score = ep_rew_mean + 0.1 * mean_snake_length - 0.05 * mean_steps_per_apple if ep_rew_mean is not None else 0
                 
                 # Pobierz loss'y z modelu (jeśli dostępne z ostatniego update)
                 policy_loss = getattr(self.model, '_last_policy_loss', None)
@@ -147,14 +153,16 @@ class TrainProgressCallback(BaseCallback):
                     with open(self.csv_path, 'a', newline='') as csvfile:
                         writer = csv.writer(csvfile)
                         if write_header:
-                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length', 'mean_score', 'max_score', 'mean_grid_size', 'policy_loss', 'value_loss', 'entropy_loss'])
+                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length', 'mean_score', 'max_score', 'mean_snake_length', 'mean_steps_per_apple', 'progress_score', 'policy_loss', 'value_loss', 'entropy_loss'])
                         writer.writerow([
                             self.num_timesteps + self.initial_timesteps, 
                             ep_rew_mean, 
                             ep_len_mean, 
                             mean_score,
                             max_score,
-                            mean_grid_size,
+                            mean_snake_length,
+                            mean_steps_per_apple,
+                            progress_score,
                             policy_loss,
                             value_loss,
                             entropy_loss
@@ -162,7 +170,8 @@ class TrainProgressCallback(BaseCallback):
                     self.last_logged = self.num_timesteps + self.initial_timesteps
                     # Reset buforów po zapisie
                     self.episode_scores = []
-                    self.episode_grid_sizes = []
+                    self.episode_snake_lengths = []
+                    self.episode_steps_per_apple = []
                 except Exception as e:
                     print(f"Błąd zapisu train_progress.csv: {e}")
         return True

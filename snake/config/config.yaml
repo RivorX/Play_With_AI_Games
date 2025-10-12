@@ -21,33 +21,38 @@ model:
   learning_rate: 0.0002              # Szybkość uczenia 
   min_learning_rate: 0.00005         # Minimalny learning rate
   n_steps: 1024                      # Liczba kroków na aktualizację
-  n_epochs: 6                       # Liczba epok 
+  n_epochs: 6                        # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.3                      # Współczynnik entropii
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
-  dropout_rate: 0.1                  # Współczynnik dropout w CNN
+  
+  # Selektywne dropouty - WYMUSZAJĄ używanie CNN!
+  cnn_dropout: 0.05                  # Mały dropout dla CNN (zachowujemy informację wizualną)
+  scalar_dropout: 0.1                # Duży dropout na ukrytych warstwach skalarów
+  scalar_input_dropout: 0.15         # EXTRA mocny dropout na WEJŚCIU skalarów (wymusza CNN!)
+  fusion_dropout: 0.15               # Średni dropout przy łączeniu cech
 
   convlstm:
-    cnn_channels: [32, 48, 64]        # Liczba kanałów w warstwach konwolucyjnych
-    scalar_hidden_dims: [128]         # Ukryte wymiary dla danych skalarnych 
+    cnn_channels: [32, 64]       # Liczba kanałów w warstwach konwolucyjnych
+    scalar_hidden_dims: [64]        # Ukryte wymiary dla danych skalarnych 
 
   policy_kwargs:
     features_extractor_kwargs:
-      features_dim: 256              # Wymiar cech wyjściowych ekstraktora
+      features_dim: 512              # Wymiar cech wyjściowych ekstraktora
     net_arch:
-      pi: [128, 64]                 # Wielkość sieci aktora
-      vf: [128, 64]                 # Wielkość sieci krytyka
-    lstm_hidden_size: 128            # Rozmiar ukryty LSTM
+      pi: [256, 128]                 # Wielkość sieci aktora
+      vf: [256, 128]                 # Wielkość sieci krytyka
+    lstm_hidden_size: 512            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
     enable_critic_lstm: true         # LSTM także dla krytyka
 
 # Konfiguracja treningu
 training:
   n_envs: 8                          # Liczba środowisk
-  batch_size: 1024                    # Rozmiar partii
+  batch_size: 512                    # Rozmiar partii
   total_timesteps: 10000000          # Całkowita liczba kroków
   eval_freq: 5000                    # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model

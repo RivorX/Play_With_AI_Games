@@ -280,8 +280,14 @@ class SnakeEnv(gym.Env):
             for key in step_rewards:
                 self.reward_components[key] += step_rewards[key]
             
+            # Oblicz steps_per_apple (średnia liczba kroków na jabłko)
+            score = len(self.snake) - 1
+            steps_per_apple = self.steps / score if score > 0 else self.steps
+            
             info = {
-                "score": len(self.snake) - 1, 
+                "score": score, 
+                "snake_length": len(self.snake),
+                "steps_per_apple": steps_per_apple,
                 "total_reward": self.total_reward + reward, 
                 "grid_size": self.grid_size,
                 "reward_components": self.reward_components.copy(),
@@ -346,8 +352,15 @@ class SnakeEnv(gym.Env):
         
         self.total_reward += reward
         obs = self._get_obs()
+        
+        # Oblicz steps_per_apple (średnia liczba kroków na jabłko)
+        score = len(self.snake) - 1
+        steps_per_apple = self.steps / score if score > 0 else self.steps
+        
         info = {
-            "score": len(self.snake) - 1, 
+            "score": score, 
+            "snake_length": len(self.snake),
+            "steps_per_apple": steps_per_apple,
             "total_reward": self.total_reward, 
             "grid_size": self.grid_size,
             "steps_without_food": self.steps_without_food,

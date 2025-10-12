@@ -141,7 +141,35 @@ for state_idx in range(3):
         if image.dim() == 4 and image.shape[-1] == 1:
             image = image.permute(0, 3, 1, 2)
         
-        cnn_features = features_extractor.cnn(image)
+        # Manual forward przez warstwy CNN (zgodnie z nową architekturą)
+        x = features_extractor.conv1(image)
+        x = features_extractor.bn1(x)
+        x = torch.nn.functional.leaky_relu(x, 0.01)
+        x = features_extractor.dropout1(x)
+        identity1 = x
+        
+        x = features_extractor.conv2(x)
+        x = features_extractor.bn2(x)
+        identity1 = features_extractor.residual_proj(identity1)
+        identity1 = features_extractor.residual_bn(identity1)
+        x = x + identity1
+        x = torch.nn.functional.leaky_relu(x, 0.01)
+        x = features_extractor.dropout2(x)
+        
+        if features_extractor.conv3 is not None:
+            identity2 = x
+            x = features_extractor.conv3(x)
+            x = features_extractor.bn3(x)
+            identity2 = features_extractor.residual_proj2(identity2)
+            identity2 = features_extractor.residual_bn2(identity2)
+            x = x + identity2
+            x = torch.nn.functional.leaky_relu(x, 0.01)
+            x = features_extractor.dropout3(x)
+        
+        cnn_features = features_extractor.flatten(x)
+        cnn_features = cnn_features.float()
+        cnn_features = features_extractor.cnn_norm(cnn_features)
+        
         state_activations['cnn_output_mean'] = cnn_features.abs().mean().item()
         state_activations['cnn_output_max'] = cnn_features.abs().max().item()
         state_activations['cnn_output_std'] = cnn_features.std().item()
@@ -224,7 +252,11 @@ for state_idx in range(3):
     # ===================================================
     print(f"  Generowanie attention heatmap...")
     
-    model.policy.train()
+    # KLUCZOWE: Features extractor w eval() (BatchNorm), LSTM w train() (cuDNN backward)
+    features_extractor.eval()  # ✅ BatchNorm używa stored stats (działa z batch_size=1)
+    policy.lstm_actor.train()  # ✅ LSTM wymaga train() dla backward z cuDNN
+    policy.mlp_extractor.train()  # ✅ MLP też w train() dla spójności
+    policy.action_net.train()  # ✅ Action net w train()
     
     obs_grad = {}
     for k, v in obs.items():
@@ -248,8 +280,34 @@ for state_idx in range(3):
     # TERAZ retain_grad na przekształconym tensorze
     image_grad.retain_grad()
     
-    # Całe features extraction
-    cnn_output = features_extractor.cnn(image_grad)
+    # Manual forward przez CNN (zgodnie z nową architekturą)
+    x = features_extractor.conv1(image_grad)
+    x = features_extractor.bn1(x)
+    x = torch.nn.functional.leaky_relu(x, 0.01)
+    x = features_extractor.dropout1(x)
+    identity1 = x
+    
+    x = features_extractor.conv2(x)
+    x = features_extractor.bn2(x)
+    identity1 = features_extractor.residual_proj(identity1)
+    identity1 = features_extractor.residual_bn(identity1)
+    x = x + identity1
+    x = torch.nn.functional.leaky_relu(x, 0.01)
+    x = features_extractor.dropout2(x)
+    
+    if features_extractor.conv3 is not None:
+        identity2 = x
+        x = features_extractor.conv3(x)
+        x = features_extractor.bn3(x)
+        identity2 = features_extractor.residual_proj2(identity2)
+        identity2 = features_extractor.residual_bn2(identity2)
+        x = x + identity2
+        x = torch.nn.functional.leaky_relu(x, 0.01)
+        x = features_extractor.dropout3(x)
+    
+    cnn_output = features_extractor.flatten(x)
+    cnn_output = cnn_output.float()
+    cnn_output = features_extractor.cnn_norm(cnn_output)
     
     scalars_grad = torch.cat([
         obs_grad['direction'],
@@ -260,8 +318,17 @@ for state_idx in range(3):
         obs_grad['right_coll']
     ], dim=-1)
     
+    scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
     scalar_output = features_extractor.scalar_linear(scalars_grad)
-    combined = torch.cat([cnn_output, scalar_output], dim=-1)
+    scalar_output = features_extractor.scalar_norm(scalar_output)
+    
+    # Weighted fusion
+    cnn_w = torch.nn.functional.softplus(features_extractor.cnn_weight)
+    scalar_w = torch.nn.functional.softplus(features_extractor.scalar_weight)
+    cnn_output_weighted = cnn_output * cnn_w
+    scalar_output_weighted = scalar_output * scalar_w
+    
+    combined = torch.cat([cnn_output_weighted, scalar_output_weighted], dim=-1)
     features_final = features_extractor.final_linear(combined)
     
     # LSTM
@@ -328,12 +395,15 @@ for state_idx in range(3):
         plt.close()
         print(f"  ✓ Attention heatmap zapisana: {heatmap_path}")
     
-    model.policy.eval()
+    # NIE ZMIENIAJ z powrotem na train() - zostaw selektywnie
+    # Features extractor już w eval(), LSTM w train()
     
     # === ANALIZA GRADIENTÓW DLA KAŻDEJ WARSTWY (z oryginalnego kodu) ===
     print(f"  Obliczanie gradientów warstw...")
     
-    model.policy.train()
+    # ✅ Zachowaj ten sam tryb: Features extractor eval(), LSTM train()
+    # features_extractor.eval()  # Już jest
+    # policy.lstm_actor.train()  # Już jest
     
     obs_grad = {}
     for k, v in obs.items():
@@ -355,16 +425,60 @@ for state_idx in range(3):
     if image_grad.dim() == 4 and image_grad.shape[-1] == 1:
         image_grad = image_grad.permute(0, 3, 1, 2)
     
-    # CNN layers z gradient tracking
+    # CNN layers z gradient tracking - zgodnie z nową architekturą
     cnn_intermediates = []
     x_cnn = image_grad
-    for i, layer in enumerate(features_extractor.cnn):
-        x_cnn = layer(x_cnn)
-        if isinstance(layer, (torch.nn.Conv2d, torch.nn.LeakyReLU)):
-            x_cnn.retain_grad()
-            cnn_intermediates.append(('cnn', i, layer.__class__.__name__, x_cnn))
     
-    cnn_output = x_cnn
+    # Conv1 + BN1 + LeakyReLU + Dropout1
+    x_cnn = features_extractor.conv1(x_cnn)
+    x_cnn.retain_grad()
+    cnn_intermediates.append(('cnn', 0, 'Conv2d-1', x_cnn))
+    
+    x_cnn = features_extractor.bn1(x_cnn)
+    x_cnn = torch.nn.functional.leaky_relu(x_cnn, 0.01)
+    x_cnn.retain_grad()
+    cnn_intermediates.append(('cnn', 1, 'LeakyReLU-1', x_cnn))
+    
+    x_cnn = features_extractor.dropout1(x_cnn)
+    identity1 = x_cnn
+    
+    # Conv2 + BN2 + Residual + LeakyReLU + Dropout2
+    x_cnn = features_extractor.conv2(x_cnn)
+    x_cnn.retain_grad()
+    cnn_intermediates.append(('cnn', 2, 'Conv2d-2', x_cnn))
+    
+    x_cnn = features_extractor.bn2(x_cnn)
+    identity1 = features_extractor.residual_proj(identity1)
+    identity1 = features_extractor.residual_bn(identity1)
+    x_cnn = x_cnn + identity1
+    x_cnn = torch.nn.functional.leaky_relu(x_cnn, 0.01)
+    x_cnn.retain_grad()
+    cnn_intermediates.append(('cnn', 3, 'LeakyReLU-2+Residual', x_cnn))
+    
+    x_cnn = features_extractor.dropout2(x_cnn)
+    
+    # Conv3 (jeśli istnieje)
+    if features_extractor.conv3 is not None:
+        identity2 = x_cnn
+        x_cnn = features_extractor.conv3(x_cnn)
+        x_cnn.retain_grad()
+        cnn_intermediates.append(('cnn', 4, 'Conv2d-3', x_cnn))
+        
+        x_cnn = features_extractor.bn3(x_cnn)
+        identity2 = features_extractor.residual_proj2(identity2)
+        identity2 = features_extractor.residual_bn2(identity2)
+        x_cnn = x_cnn + identity2
+        x_cnn = torch.nn.functional.leaky_relu(x_cnn, 0.01)
+        x_cnn.retain_grad()
+        cnn_intermediates.append(('cnn', 5, 'LeakyReLU-3+Residual', x_cnn))
+        
+        x_cnn = features_extractor.dropout3(x_cnn)
+    
+    cnn_output = features_extractor.flatten(x_cnn)
+    cnn_output = cnn_output.float()
+    cnn_output = features_extractor.cnn_norm(cnn_output)
+    cnn_output.retain_grad()
+    cnn_intermediates.append(('cnn', len(cnn_intermediates), 'Flatten+Norm', cnn_output))
     
     # Scalar layers
     scalars_grad = torch.cat([
@@ -376,6 +490,8 @@ for state_idx in range(3):
         obs_grad['right_coll']
     ], dim=-1)
     
+    scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
+    
     scalar_intermediates = []
     x_scalar = scalars_grad
     for i, layer in enumerate(features_extractor.scalar_linear):
@@ -384,10 +500,17 @@ for state_idx in range(3):
             x_scalar.retain_grad()
             scalar_intermediates.append(('scalar', i, layer.__class__.__name__, x_scalar))
     
-    scalar_output = x_scalar
+    scalar_output = features_extractor.scalar_norm(x_scalar)
+    scalar_output.retain_grad()
+    scalar_intermediates.append(('scalar', len(scalar_intermediates), 'Norm', scalar_output))
     
-    # Combined features
-    combined = torch.cat([cnn_output, scalar_output], dim=-1)
+    # Combined features z weighted fusion
+    cnn_w = torch.nn.functional.softplus(features_extractor.cnn_weight)
+    scalar_w = torch.nn.functional.softplus(features_extractor.scalar_weight)
+    cnn_output_weighted = cnn_output * cnn_w
+    scalar_output_weighted = scalar_output * scalar_w
+    
+    combined = torch.cat([cnn_output_weighted, scalar_output_weighted], dim=-1)
     combined.retain_grad()
     features_final = features_extractor.final_linear(combined)
     features_final.retain_grad()
@@ -506,8 +629,11 @@ for state_idx in range(3):
     
     # === Wizualizacja CNN output ===
     with torch.no_grad():
-        first_conv = features_extractor.cnn[0]
-        cnn_activation = first_conv(image).detach().cpu().numpy()[0]
+        # Forward przez pierwszą warstwę CNN (conv1)
+        image_viz = obs_tensor['image']
+        if image_viz.dim() == 4 and image_viz.shape[-1] == 1:
+            image_viz = image_viz.permute(0, 3, 1, 2)
+        cnn_activation = features_extractor.conv1(image_viz).detach().cpu().numpy()[0]
     
     num_channels_to_show = min(16, cnn_activation.shape[0])
     fig, axes = plt.subplots(4, 4, figsize=(12, 12))
@@ -1259,44 +1385,11 @@ env.close()
 print("\n" + "="*80)
 print("=== ANALIZA ZAKOŃCZONA ===")
 print("="*80)
-print(f"\n📂 Struktura katalogów:")
+print(f"\n📂 Ważne pliki analizy:")
 print(f"   {output_dir}/")
 print(f"   ├── bottleneck_analysis.png          ⚠️  Analiza bottlenecków")
-print(f"   ├── neuron_activations_overview.png")
 print(f"   ├── bottleneck_report.csv            📊 Raport bottlenecków")
-print(f"   ├── detailed_activations.csv")
 print(f"   │")
-print(f"   ├── 🔥 attention_heatmaps/")
-print(f"   │   ├── attention_heatmap_state_0.png")
-print(f"   │   ├── attention_heatmap_state_1.png")
-print(f"   │   └── attention_heatmap_state_2.png")
-print(f"   │")
-print(f"   ├── 🧠 lstm_analysis/")
-print(f"   │   ├── lstm_memory_evolution.png")
-print(f"   │   ├── lstm_neurons_heatmap.png")
-print(f"   │   └── lstm_memory_data.csv")
-print(f"   │")
-print(f"   ├── 🎲 uncertainty_analysis/")
-print(f"   │   ├── uncertainty_analysis.png")
-print(f"   │   └── uncertainty_data.csv")
-print(f"   │")
-print(f"   ├── 📊 confusion_matrix/")
-print(f"   │   ├── confusion_matrix.png")
-print(f"   │   └── confusion_matrix.csv")
-print(f"   │")
-print(f"   ├── conv_visualizations/")
-print(f"   │   ├── cnn_output_state_0.png")
-print(f"   │   ├── cnn_output_state_1.png")
-print(f"   │   └── cnn_output_state_2.png")
-print(f"   │")
-print(f"   ├── viewports/")
-print(f"   │   ├── viewport_state_0.png")
-print(f"   │   ├── viewport_state_1.png")
-print(f"   │   └── viewport_state_2.png")
-print(f"   │")
-print(f"   └── action_probs/")
-print(f"       ├── action_probs_combined.png")
-print(f"       └── action_probs.csv")
 
 print("\n" + "="*80)
 print("=== KLUCZOWE WYNIKI ===")
