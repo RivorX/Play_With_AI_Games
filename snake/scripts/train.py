@@ -16,6 +16,7 @@ from model import make_env
 from cnn import CustomFeaturesExtractor
 import logging
 import pickle
+import torch
 
 # Wczytaj konfigurację
 base_dir = os.path.dirname(os.path.dirname(__file__))
@@ -67,7 +68,7 @@ def log_observation(obs, channel_loggers, grid_size, step):
     if not enable_channel_logs:
         return
     image = obs['image']
-    mapa = image[:, :, 0]  # [H, W] - BEZ framestackingu
+    mapa = image[:, :, 0]
     head_pos = np.where(mapa == 1.0)
     food_pos = np.where(mapa == 0.75)
     if len(head_pos[0]) > 0:
@@ -118,7 +119,6 @@ class TrainProgressCallback(BaseCallback):
         self.episode_steps_per_apple = []
 
     def _on_step(self) -> bool:
-        # Zbieraj info z zakończonych epizodów
         infos = self.locals.get('infos', [])
         dones = self.locals.get('dones', [])
         
@@ -128,22 +128,18 @@ class TrainProgressCallback(BaseCallback):
                 self.episode_snake_lengths.append(info.get('snake_length', 3))
                 self.episode_steps_per_apple.append(info.get('steps_per_apple', 0))
         
-        # Loguj co 1000 kroków
         if self.locals.get('dones') is not None and any(self.locals['dones']):
             if (self.num_timesteps + self.initial_timesteps) - self.last_logged >= 1000:
                 ep_rew_mean = self.model.ep_info_buffer and np.mean([ep_info['r'] for ep_info in self.model.ep_info_buffer]) or None
                 ep_len_mean = self.model.ep_info_buffer and np.mean([ep_info['l'] for ep_info in self.model.ep_info_buffer]) or None
                 
-                # Oblicz dodatkowe statystyki
                 mean_score = np.mean(self.episode_scores) if self.episode_scores else 0
                 max_score = np.max(self.episode_scores) if self.episode_scores else 0
                 mean_snake_length = np.mean(self.episode_snake_lengths) if self.episode_snake_lengths else 3
                 mean_steps_per_apple = np.mean(self.episode_steps_per_apple) if self.episode_steps_per_apple else 0
                 
-                # Oblicz progress_score
                 progress_score = ep_rew_mean + 0.1 * mean_snake_length - 0.05 * mean_steps_per_apple if ep_rew_mean is not None else 0
                 
-                # Pobierz loss'y z modelu (jeśli dostępne z ostatniego update)
                 policy_loss = getattr(self.model, '_last_policy_loss', None)
                 value_loss = getattr(self.model, '_last_value_loss', None)
                 entropy_loss = getattr(self.model, '_last_entropy_loss', None)
@@ -168,7 +164,6 @@ class TrainProgressCallback(BaseCallback):
                             entropy_loss
                         ])
                     self.last_logged = self.num_timesteps + self.initial_timesteps
-                    # Reset buforów po zapisie
                     self.episode_scores = []
                     self.episode_snake_lengths = []
                     self.episode_steps_per_apple = []
@@ -193,12 +188,10 @@ class CustomEvalCallback(EvalCallback):
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
             super()._on_step()
             self.eval_count += 1
-            # Zapis najnowszego modelu po każdej walidacji
             total_timesteps = self.model.num_timesteps + self.initial_timesteps
             save_training_state(self.model, self.model.env, self.eval_env, total_timesteps, self.best_model_save_path)
             print(f"Zaktualizowano najnowszy model po {total_timesteps} krokach z mean_reward={self.last_mean_reward}")
 
-            # Zapis najlepszego modelu, jeśli poprawiono mean_reward
             if self.best_mean_reward < self.last_mean_reward:
                 self.model.save(os.path.join(self.best_model_save_path, f'best_model_{total_timesteps}.zip'))
                 print(f"New best model saved at {total_timesteps} timesteps with mean reward {self.last_mean_reward}")
@@ -234,6 +227,33 @@ def save_training_state(model, env, eval_env, total_timesteps, save_path):
     else:
         print("Nie udało się zapisać stanu po 5 próbach.")
 
+
+def apply_gradient_clipping(model, clip_value=1.0):
+    """
+    ✅ KLUCZOWA NAPRAWA: Gradient Clipping dla LSTM
+    Zapobiega exploding gradients w LSTM (MLP gradient 1.0 → 0.4)
+    """
+    def clip_grad_hook(module, grad_input, grad_output):
+        """Hook który clippuje gradienty w backward pass"""
+        if grad_input is not None:
+            clipped = tuple(
+                torch.clamp(g, -clip_value, clip_value) if g is not None else g 
+                for g in grad_input
+            )
+            return clipped
+        return grad_input
+    
+    # Zarejestruj hook dla LSTM actor
+    if hasattr(model.policy, 'lstm_actor'):
+        model.policy.lstm_actor.register_full_backward_hook(clip_grad_hook)
+        print(f"[GRADIENT CLIPPING] ✅ Enabled for LSTM Actor (clip_value={clip_value})")
+    
+    # Opcjonalnie dla LSTM critic (jeśli enable_critic_lstm=true)
+    if hasattr(model.policy, 'lstm_critic'):
+        model.policy.lstm_critic.register_full_backward_hook(clip_grad_hook)
+        print(f"[GRADIENT CLIPPING] ✅ Enabled for LSTM Critic (clip_value={clip_value})")
+
+
 def train(use_progress_bar=False, use_config_hyperparams=True):
     global best_model_save_path
 
@@ -257,7 +277,6 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             print(f"Wznowienie treningu od {total_timesteps} kroków.")
         except Exception as e:
             print(f"Błąd ładowania stanu: {e}. Zaczynam od zera.")
-        # Interaktywne pytania dla użytkownika gdy znaleziono model
         try:
             resp = input(f"Znaleziono istniejący model pod {model_path_absolute}. Czy kontynuować trening? [[Y]/n]: ").strip()
         except Exception:
@@ -286,21 +305,18 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     if enable_channel_logs:
         channel_loggers.update(init_channel_loggers())
 
-    # LOSOWY ROZMIAR SIATKI (min_grid_size - max_grid_size), viewport zawsze 16x16
     env = make_vec_env(make_env(render_mode=None, grid_size=None), n_envs=n_envs, vec_env_cls=SubprocVecEnv)
     if load_model and os.path.exists(vec_norm_path):
         env = VecNormalize.load(vec_norm_path, env)
     else:
         env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
-    # Środowisko eval zawsze z grid_size=16 dla konsystentnej ewaluacji
     eval_env = make_vec_env(make_env(render_mode=None, grid_size=16), n_envs=1, vec_env_cls=SubprocVecEnv)
     if load_model and os.path.exists(vec_norm_eval_path):
         eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
     else:
         eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
-    # KONFIGURACJA DLA RECURRENTPPO
     policy_kwargs = config['model']['policy_kwargs'].copy()
     policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
 
@@ -351,6 +367,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         model = model_new
         del model_tmp
 
+    # ✅ ZASTOSUJ GRADIENT CLIPPING (KLUCZOWA NAPRAWA!)
+    apply_gradient_clipping(model, clip_value=1.0)
+
     global best_model_save_path
     best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
 
@@ -380,13 +399,10 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         initial_timesteps=total_timesteps
     )
     
-    # Callback do zapisywania loss'ów z modelu
     class LossRecorderCallback(BaseCallback):
         def _on_step(self) -> bool:
-            # Zapisz loss'y jeśli są dostępne w logger
             if hasattr(self.model, 'logger') and self.model.logger is not None:
                 try:
-                    # RecurrentPPO loguje te wartości jako 'train/policy_gradient_loss', etc.
                     if hasattr(self.model.logger, 'name_to_value'):
                         losses = self.model.logger.name_to_value
                         self.model._last_policy_loss = losses.get('train/policy_gradient_loss', None)
