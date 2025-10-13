@@ -145,7 +145,6 @@ for state_idx in range(3):
         x = features_extractor.conv1(image)
         x = features_extractor.bn1(x)
         x = torch.nn.functional.leaky_relu(x, 0.01)
-        x = features_extractor.dropout1(x)
         identity1 = x
         
         x = features_extractor.conv2(x)
@@ -284,7 +283,6 @@ for state_idx in range(3):
     x = features_extractor.conv1(image_grad)
     x = features_extractor.bn1(x)
     x = torch.nn.functional.leaky_relu(x, 0.01)
-    x = features_extractor.dropout1(x)
     identity1 = x
     
     x = features_extractor.conv2(x)
@@ -322,13 +320,8 @@ for state_idx in range(3):
     scalar_output = features_extractor.scalar_linear(scalars_grad)
     scalar_output = features_extractor.scalar_norm(scalar_output)
     
-    # Weighted fusion
-    cnn_w = torch.nn.functional.softplus(features_extractor.cnn_weight)
-    scalar_w = torch.nn.functional.softplus(features_extractor.scalar_weight)
-    cnn_output_weighted = cnn_output * cnn_w
-    scalar_output_weighted = scalar_output * scalar_w
-    
-    combined = torch.cat([cnn_output_weighted, scalar_output_weighted], dim=-1)
+    # Fusion bez wag (nowa architektura)
+    combined = torch.cat([cnn_output, scalar_output], dim=-1)
     features_final = features_extractor.final_linear(combined)
     
     # LSTM
@@ -439,7 +432,6 @@ for state_idx in range(3):
     x_cnn.retain_grad()
     cnn_intermediates.append(('cnn', 1, 'LeakyReLU-1', x_cnn))
     
-    x_cnn = features_extractor.dropout1(x_cnn)
     identity1 = x_cnn
     
     # Conv2 + BN2 + Residual + LeakyReLU + Dropout2
@@ -504,13 +496,8 @@ for state_idx in range(3):
     scalar_output.retain_grad()
     scalar_intermediates.append(('scalar', len(scalar_intermediates), 'Norm', scalar_output))
     
-    # Combined features z weighted fusion
-    cnn_w = torch.nn.functional.softplus(features_extractor.cnn_weight)
-    scalar_w = torch.nn.functional.softplus(features_extractor.scalar_weight)
-    cnn_output_weighted = cnn_output * cnn_w
-    scalar_output_weighted = scalar_output * scalar_w
-    
-    combined = torch.cat([cnn_output_weighted, scalar_output_weighted], dim=-1)
+    # Combined features bez weighted fusion (nowa architektura)
+    combined = torch.cat([cnn_output, scalar_output], dim=-1)
     combined.retain_grad()
     features_final = features_extractor.final_linear(combined)
     features_final.retain_grad()
@@ -862,7 +849,7 @@ for episode_idx in range(num_episodes):
         # jeśli jedzenie z lewej -> lewo, z prawej -> prawo
         expected_action = 1  # default: prosto
         
-        if front_coll > 0.5:  # kolizja z przodu
+        if front_coll > 0.5: # kolizja z przodu
             if left_coll < 0.5:
                 expected_action = 0  # lewo
             elif right_coll < 0.5:
