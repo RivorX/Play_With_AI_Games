@@ -269,6 +269,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     n_steps = config['model']['n_steps']
     eval_freq = config['training']['eval_freq']
     plot_interval = config['training']['plot_interval']
+    eval_n_envs = config['training'].get('eval_n_envs', 4)
+    eval_n_repeats = config['training'].get('eval_n_repeats', 2)
     
     # ✅ POBIERZ USTAWIENIA NORMALIZACJI Z CONFIGU
     norm_config = config['training'].get('normalization', {})
@@ -351,7 +353,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         )
         print(f"✅ Utworzono nowy VecNormalize z ustawieniami z config.yaml")
 
-    eval_env = make_vec_env(make_env(render_mode=None, grid_size=16), n_envs=1, vec_env_cls=SubprocVecEnv)
+    # Tworzenie eval_env z wieloma środowiskami
+    eval_env = make_vec_env(make_env(render_mode=None, grid_size=16), n_envs=eval_n_envs, vec_env_cls=SubprocVecEnv)
     if load_model and os.path.exists(vec_norm_eval_path):
         eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
         print(f"✅ Załadowano eval VecNormalize z {vec_norm_eval_path}")
@@ -432,6 +435,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
 
     plot_script_path = os.path.join(os.path.dirname(__file__), 'plot_train_progress.py')
 
+    # Liczba epizodów ewaluacyjnych = liczba środowisk * liczba powtórzeń
+    n_eval_episodes = eval_n_envs * eval_n_repeats
     eval_callback = CustomEvalCallback(
         eval_env=eval_env,
         best_model_save_path=best_model_save_path,
@@ -442,7 +447,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         callback_after_eval=stop_on_plateau,
         plot_interval=plot_interval,
         plot_script_path=plot_script_path,
-        initial_timesteps=total_timesteps
+        initial_timesteps=total_timesteps,
+        n_eval_episodes=n_eval_episodes
     )
 
     train_progress_callback = TrainProgressCallback(
@@ -511,12 +517,24 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             )
         else:
             print(f"Trening zakończony: osiągnięto {total_timesteps} kroków.")
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Przerwanie treningu przez użytkownika (Ctrl+C)")
+        print("Zamykanie środowisk...")
+        try:
+            env.close()
+            eval_env.close()
+        except:
+            pass
+        raise
     except Exception as e:
         print(f"Błąd podczas treningu: {e}")
         raise
     finally:
-        env.close()
-        eval_env.close()
+        try:
+            env.close()
+            eval_env.close()
+        except:
+            pass
 
     print("Trening zakończony!")
 
@@ -524,8 +542,9 @@ if __name__ == "__main__":
     try:
         train(use_progress_bar=True)
     except KeyboardInterrupt:
-        print("Przerwano trening.")
-        sys.exit(0)
+        print("\n\nTrening przerwany.")
+        # Wymuś szybkie zakończenie bez czekania na procesy podrzędne
+        os._exit(0)
     except Exception as e:
         print(f"Błąd podczas treningu: {e}")
         import traceback
