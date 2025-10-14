@@ -658,7 +658,6 @@ for state_idx in range(3):
     viewport_path = os.path.join(viewport_dir, f'viewport_state_{state_idx}.png')
     plt.savefig(viewport_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f'  Viewport zapisany: {viewport_path}')
 
     print(f"  Wybrany action: {action_names[action_idx]}")
     print(f"  Prawdopodobieństwa: lewo={action_probs[0]:.3f}, prosto={action_probs[1]:.3f}, prawo={action_probs[2]:.3f}")
@@ -675,7 +674,7 @@ episode_starts = np.ones((1,), dtype=bool)
 
 episode_lstm_data = []
 step_count = 0
-max_steps = 50  # Analizujemy 50 kroków
+max_steps = config['model']['n_steps']
 
 while step_count < max_steps:
     # Predict
@@ -1041,12 +1040,38 @@ axes[0, 1].legend()
 axes[0, 1].grid(alpha=0.3)
 
 # Plot 3: Entropy vs Reward
-axes[1, 0].scatter([d['entropy'] for d in extended_uncertainty], 
-                   [d['reward'] for d in extended_uncertainty],
-                   alpha=0.5, c='#e74c3c', s=20)
-axes[1, 0].set_xlabel('Entropia')
-axes[1, 0].set_ylabel('Reward')
-axes[1, 0].set_title('Entropia vs Reward (czy niepewność szkodzi?)')
+"""
+Nowa analiza: średnia entropia epizodu vs suma rewardów epizodu
+"""
+# Grupowanie po epizodach
+episode_stats = []
+current_episode_entropies = []
+current_episode_rewards = []
+current_episode = extended_uncertainty[0]['episode'] if extended_uncertainty else 0
+for d in extended_uncertainty:
+    if d['episode'] != current_episode:
+        if current_episode_entropies:
+            mean_entropy = np.mean(current_episode_entropies)
+            sum_reward = np.sum(current_episode_rewards)
+            episode_stats.append({'mean_entropy': mean_entropy, 'sum_reward': sum_reward})
+        current_episode_entropies = []
+        current_episode_rewards = []
+        current_episode = d['episode']
+    current_episode_entropies.append(d['entropy'])
+    current_episode_rewards.append(d['reward'])
+# Dodaj ostatni epizod
+if current_episode_entropies:
+    mean_entropy = np.mean(current_episode_entropies)
+    sum_reward = np.sum(current_episode_rewards)
+    episode_stats.append({'mean_entropy': mean_entropy, 'sum_reward': sum_reward})
+
+# Wykres: średnia entropia epizodu vs suma rewardów epizodu
+axes[1, 0].scatter([e['mean_entropy'] for e in episode_stats],
+                   [e['sum_reward'] for e in episode_stats],
+                   alpha=0.7, c='#e74c3c', s=40)
+axes[1, 0].set_xlabel('Średnia entropia epizodu')
+axes[1, 0].set_ylabel('Suma rewardów epizodu')
+axes[1, 0].set_title('Entropia vs Reward (epizod)')
 axes[1, 0].grid(alpha=0.3)
 
 # Plot 4: Certainty categories
@@ -1324,7 +1349,6 @@ plt.tight_layout()
 action_probs_combined_path = os.path.join(action_probs_dir, 'action_probs_combined.png')
 plt.savefig(action_probs_combined_path, dpi=150)
 plt.close()
-print(f'Wykres prawdopodobieństw akcji zapisany: {action_probs_combined_path}')
 
 # Zapisz prawdopodobieństwa akcji do CSV
 action_csv_path = os.path.join(action_probs_dir, 'action_probs.csv')
@@ -1339,7 +1363,6 @@ with open(action_csv_path, 'w', newline='', encoding='utf-8') as f:
             probs['p_prawo'],
             action_names[probs['akcja']]
         ])
-print(f'CSV prawdopodobieństw akcji zapisany: {action_csv_path}')
 
 # Zapisz szczegółowe dane aktywacji do CSV
 activations_csv_path = os.path.join(output_dir, 'detailed_activations.csv')
@@ -1362,7 +1385,6 @@ with open(activations_csv_path, 'w', newline='', encoding='utf-8') as f:
             d['logits_mean']
         ]
         writer.writerow(row)
-print(f'Szczegółowe aktywacje zapisane: {activations_csv_path}')
 
 env.close()
 
@@ -1376,7 +1398,6 @@ print(f"\n📂 Ważne pliki analizy:")
 print(f"   {output_dir}/")
 print(f"   ├── bottleneck_analysis.png          ⚠️  Analiza bottlenecków")
 print(f"   ├── bottleneck_report.csv            📊 Raport bottlenecków")
-print(f"   │")
 
 print("\n" + "="*80)
 print("=== KLUCZOWE WYNIKI ===")
@@ -1410,17 +1431,3 @@ if medium_severity:
     print(f"   - 🟠 ŚREDNIE RYZYKO: {len(medium_severity)} przypadków")
 if not high_severity and not medium_severity:
     print("   - ✅ Brak krytycznych bottlenecków")
-
-print("\n" + "="*80)
-print("🎯 REKOMENDACJE:")
-print("="*80)
-print("1. Sprawdź attention heatmaps - czy model patrzy na właściwe rzeczy?")
-print("2. Przeanalizuj LSTM memory evolution - czy pamięć jest wykorzystywana?")
-print("3. Zbadaj uncertainty - wysokie wartości = model się waha")
-print("4. Confusion matrix - jakie błędy popełnia model najczęściej?")
-print("5. Jeśli są bottlenecki - rozważ:")
-print("   - Zwiększenie learning rate")
-print("   - Gradient clipping")
-print("   - Batch normalization")
-print("   - Residual connections")
-print("\n" + "="*80)

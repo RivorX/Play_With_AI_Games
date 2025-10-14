@@ -238,7 +238,10 @@ class SnakeEnv(gym.Env):
     def step(self, action):
         self.steps += 1
         self.steps_without_food += 1
-        
+
+        terminated = False  # śmierć/wygrana
+        truncated = False   # timeout/max_steps
+
         # Reset komponentów nagród dla tego kroku
         step_rewards = {
             'food': 0.0,
@@ -246,11 +249,11 @@ class SnakeEnv(gym.Env):
             'death_penalty': 0.0,
             'timeout_penalty': 0.0
         }
-        
+
         # Zapisz poprzednią pozycję i dystans
         prev_head = np.array(self.snake[0])
         prev_dist = abs(prev_head[0] - self.food[0]) + abs(prev_head[1] - self.food[1])
-        
+
         # Aktualizacja kierunku przed ruchem
         turn_penalty = 0.0
         if action == 1:  # skręć w lewo
@@ -259,31 +262,32 @@ class SnakeEnv(gym.Env):
         elif action == 2:  # skręć w prawo
             self.direction = (self.direction + 1) % 4
             turn_penalty = -0.05  # kara za skręt
-        
+
         # Ruch węża
         head = prev_head + DIRECTIONS[self.direction]
-        
+
         # === UPROSZCZONY SYSTEM NAGRÓD ===
         reward = -0.01  # Mała kara za krok
         reward += turn_penalty  # kara za skręt
-        
+
         # 1. KOLIZJA - ŚMIERĆ
         if self._is_collision(head):
             self.done = True
+            terminated = True
             death_penalty = -10.0
             step_rewards['death_penalty'] = death_penalty
             reward = death_penalty
-            
+
             obs = self._get_obs()
-            
+
             # Aktualizuj totalne komponenty
             for key in step_rewards:
                 self.reward_components[key] += step_rewards[key]
-            
+
             # Oblicz steps_per_apple (średnia liczba kroków na jabłko)
             score = len(self.snake) - 1
             steps_per_apple = self.steps / score if score > 0 else self.steps
-            
+
             info = {
                 "score": score, 
                 "snake_length": len(self.snake),
@@ -294,26 +298,27 @@ class SnakeEnv(gym.Env):
                 "step_rewards": step_rewards
             }
             self.total_reward += reward
-            return obs, reward, self.done, False, info
-        
+            return obs, reward, terminated, truncated, info
+
         # 2. Dodaj nową głowę
         self.snake.appendleft(head.tolist())
         self.snake_set.add(tuple(head))
-        
+
         # 3. ZJEDZENIE JEDZENIA
         if np.array_equal(head, self.food):
             # Nagroda za jedzenie
             food_reward = 20.0
             step_rewards['food'] = food_reward
             reward += food_reward
-            
+
             # Reset
             self.food = self._place_food()
             self.steps_without_food = 0
-            
+
             # Sprawdź wygraną (cała plansza wypełniona)
             if len(self.snake) == self.grid_size * self.grid_size:
                 self.done = True
+                terminated = True
                 win_bonus = 50.0
                 step_rewards['win_bonus'] = win_bonus
                 reward += win_bonus
@@ -321,42 +326,44 @@ class SnakeEnv(gym.Env):
             # Usuń ogon (nie zjedzono jedzenia)
             tail = self.snake.pop()
             self.snake_set.discard(tuple(tail))
-            
+
             # 4. DISTANCE SHAPING (subtelny)
             new_dist = abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])
             dist_change = prev_dist - new_dist
             distance_reward = dist_change * 0.05
             step_rewards['distance_shaping'] = distance_reward
             reward += distance_reward
-        
+
         # 5. TIMEOUT - adaptacyjny
         max_steps_without_food = max(100, self.grid_size * 10)
         if self.steps_without_food >= max_steps_without_food:
             self.done = True
+            truncated = True
             timeout_penalty = -3.0
             step_rewards['timeout_penalty'] = timeout_penalty
             reward += timeout_penalty
-        
+
         # 6. MAKSYMALNA DŁUGOŚĆ EPIZODU
         max_steps = 200 * self.grid_size
         if self.steps > max_steps:
             self.done = True
+            truncated = True
             if step_rewards['timeout_penalty'] == 0.0:
                 timeout_penalty = -3.0
                 step_rewards['timeout_penalty'] = timeout_penalty
                 reward += timeout_penalty
-        
+
         # Aktualizuj totalne komponenty
         for key in step_rewards:
             self.reward_components[key] += step_rewards[key]
-        
+
         self.total_reward += reward
         obs = self._get_obs()
-        
+
         # Oblicz steps_per_apple (średnia liczba kroków na jabłko)
         score = len(self.snake) - 1
         steps_per_apple = self.steps / score if score > 0 else self.steps
-        
+
         info = {
             "score": score, 
             "snake_length": len(self.snake),
@@ -367,8 +374,8 @@ class SnakeEnv(gym.Env):
             "reward_components": self.reward_components.copy(),
             "step_rewards": step_rewards
         }
-        
-        return obs, reward, self.done, False, info
+
+        return obs, reward, terminated, truncated, info
 
     def render(self):
         if self.render_mode != "human":
@@ -377,7 +384,7 @@ class SnakeEnv(gym.Env):
         state = self._get_render_state()
         for x in range(self.grid_size):
             for y in range(self.grid_size):
-                value = state[x, y, 0]
+                value = state[y, x, 0]
                 if value == 1:
                     pygame.draw.rect(self.screen, (0, 255, 0),
                                      (x * SNAKE_SIZE, y * SNAKE_SIZE, SNAKE_SIZE, SNAKE_SIZE))

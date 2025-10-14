@@ -12,32 +12,31 @@ environment:
   action_space:
     type: Discrete                   # Typ przestrzeni akcji
     n: 3                             # Liczba akcji (lewo, prosto, prawo)
-  max_steps_without_food: 10         # Max kroków bez jedzenia (skalowane z rozmiarem)
-  max_steps_factor: 150              # Mnożnik max kroków
+  max_steps_without_food: 20         # Max kroków bez jedzenia (skalowane z rozmiarem)
+  max_steps_factor: 200              # Mnożnik max kroków
 
 # Konfiguracja modelu RecurrentPPO
 model:
   policy: MultiInputLstmPolicy       # Policy dla RecurrentPPO
-  learning_rate: 0.0001              # Szybkość uczenia 
+  learning_rate: 0.0003              # Szybkość uczenia 
   min_learning_rate: 0.00005         # Minimalny learning rate
-  n_steps: 1024                      # Liczba kroków na aktualizację
-  n_epochs: 6                        # Liczba epok 
+  n_steps: 512                       # Liczba kroków na aktualizację
+  n_epochs: 3                        # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
-  clip_range: 0.15                   # Zakres obcinania PPO
-  ent_coef: 0.2                      # Współczynnik entropii
+  clip_range: 0.2                    # Zakres obcinania PPO
+  ent_coef: 0.05                     # Współczynnik entropii
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   
   # Selektywne dropouty - WYMUSZAJĄ używanie CNN!
-  cnn_dropout: 0.0                   # Mały dropout dla CNN (zachowujemy informację wizualną)
-  scalar_dropout: 0.05                # Duży dropout na ukrytych warstwach skalarów
-  scalar_input_dropout: 0.1         # EXTRA mocny dropout na WEJŚCIU skalarów (wymusza CNN!)
-  fusion_dropout: 0.02               # Średni dropout przy łączeniu cech
-
+  cnn_dropout: 0.0                   # Dropout dla CNN
+  scalar_dropout: 0.05               # Dropout dla skalarów
+  scalar_input_dropout: 0.1          # Dropout dla wejścia skalarów
+  fusion_dropout: 0.02               # Dropout po fuzji
   convlstm:
-    cnn_channels: [32, 64]       # Liczba kanałów w warstwach konwolucyjnych
-    scalar_hidden_dims: [64]        # Ukryte wymiary dla danych skalarnych 
+    cnn_channels: [32, 64]           # Liczba kanałów w warstwach konwolucyjnych
+    scalar_hidden_dims: [64]         # Ukryte wymiary dla danych skalarnych 
 
   policy_kwargs:
     features_extractor_kwargs:
@@ -51,14 +50,28 @@ model:
 
 # Konfiguracja treningu
 training:
-  n_envs: 12                          # Liczba środowisk
-  batch_size: 256                    # Rozmiar partii
+  n_envs: 12                         # Liczba środowisk
+  batch_size: 1024                   # Rozmiar partii
   total_timesteps: 10000000          # Całkowita liczba kroków
   eval_freq: 5000                    # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 20       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 5                       # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
-  enable_channel_logs: false          # Włącz logi kanałów
+  enable_channel_logs: false         # Włącz logi kanałów
+  
+  # Konfiguracja normalizacji (PRZEŁĄCZNIKI)
+  normalization:
+    norm_obs: false                  # ❌ FALSE dla obrazów (CNN radzi sobie z surowymi pikselami)
+    norm_reward: true                # ✅ TRUE - stabilizuje trening (running mean rewards)
+    clip_obs: 10.0                   # Clipping obserwacji (tylko jeśli norm_obs=true)
+    clip_reward: 10.0                # Clipping nagród (10.0 = standardowa wartość)
+    gamma: 0.99                      # Gamma dla running mean rewards (powinno = model.gamma)
+    
+    # DODATKOWE OPCJE (zaawansowane)
+    norm_obs_keys: []                # Lista kluczy do normalizacji (puste = wszystkie, jeśli norm_obs=true)
+                                     # Przykład: ['dx_head', 'dy_head'] - tylko skalary
+    epsilon: 1.0e-8                  # Epsilon dla stabilności numerycznej
+    clip_obs_asymmetric: false       # Asymetryczne clipping: (-clip_obs, clip_obs) vs (0, clip_obs)
 
 # Ścieżki do zapisu
 paths:

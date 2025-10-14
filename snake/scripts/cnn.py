@@ -10,9 +10,8 @@ import os
 # Wczytaj konfigurację
 base_dir = os.path.dirname(os.path.dirname(__file__))
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
-with open(config_path, 'r') as f:
+with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
-
 # ✅ GLOBAL FLAG - wyświetl info tylko raz
 _INFO_PRINTED = False
 
@@ -198,11 +197,11 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         if not _INFO_PRINTED:
             amp_status = "✅ ENABLED" if self.use_amp else "❌ DISABLED (CPU mode)"
             print(f"\n{'='*70}")
-            print(f"[CNN] NAPRAWIONY FEATURES EXTRACTOR - BOTTLENECKI USUNIĘTE")
+            print(f"[CNN] FEATURES EXTRACTORE")
             print(f"{'='*70}")
             print(f"[CNN] Architektura CNN: {cnn_channels}")
             print(f"[CNN] ✅ Residual connections: ENABLED")
-            print(f"[CNN] ✅ Dropout CNN: {cnn_dropout} (WYŁĄCZONY - mamy BatchNorm)")
+            print(f"[CNN] ✅ Dropout CNN: {cnn_dropout}")
             print(f"[CNN] ✅ AMP (Mixed Precision): {amp_status}")
             print(f"[CNN] Spatial size po CNN: {spatial_size}x{spatial_size}")
             print(f"[CNN] CNN output dim: {cnn_dim}")
@@ -211,32 +210,15 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
             print(f"[CNN] Total features dim: {total_dim} -> {features_dim}")
             print(f"[CNN] Scalary stanowią {scalar_output_dim/total_dim*100:.1f}% wejścia")
             print(f"\n[DROPOUT]")
-            print(f"  - CNN: {cnn_dropout} (WYŁĄCZONY)")
-            print(f"  - Scalar INPUT: {scalar_input_dropout} (wymusza CNN)")
+            print(f"  - CNN: {cnn_dropout}")
+            print(f"  - Scalar INPUT: {scalar_input_dropout}")
             print(f"  - Scalar hidden: {scalar_dropout}")
             print(f"  - Fusion: {fusion_dropout}")
-            print(f"\n[ACTIVATION]")
-            print(f"  - CNN: LeakyReLU(0.01)")
-            print(f"  - Scalars: ReLU (silniejsze gradienty)")
-            print(f"\n[NORMALIZATION]")
-            print(f"  - CNN: BatchNorm2d + LayerNorm")
-            print(f"  - Scalars: LayerNorm")
-            print(f"  - Fusion: LayerNorm (STABILNE)")
-            print(f"\n[INITIALIZATION]")
-            print(f"  - Conv/Linear: Xavier (gain=0.8)")
-            print(f"  - LSTM: Xavier + Orthogonal (gain=0.5)")
-            print(f"  - Forget bias: 1.0 (zapobiega zanikaniu pamięci)")
             
             if self.use_amp:
                 print(f"\n[AMP] 🚀 Expected speedup: 30-50% (RTX series)")
                 print(f"[AMP] 💾 Expected VRAM saving: ~30%")
-            
-            print(f"\n[FIXES APPLIED]")
-            print(f"  ✅ Usunięto zbędne dropouty z CNN")
-            print(f"  ✅ ReLU zamiast LeakyReLU dla skalarów")
-            print(f"  ✅ Xavier init zamiast He")
-            print(f"  ✅ Stabilna fusion bez learnable weights")
-            print(f"  ✅ Większa architektura CNN/Scalar")
+
             print(f"{'='*70}\n")
             _INFO_PRINTED = True
 
