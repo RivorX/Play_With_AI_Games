@@ -21,7 +21,7 @@ import torch
 # Wczytaj konfigurację
 base_dir = os.path.dirname(os.path.dirname(__file__))
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
-with open(config_path, 'r') as f:
+with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 
 # Funkcja tworząca wymagane katalogi jeśli nie istnieją
@@ -186,7 +186,7 @@ class CustomEvalCallback(EvalCallback):
 
     def _on_step(self) -> bool:
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
-            super()._on_step()
+            continue_training = super()._on_step()
             self.eval_count += 1
             total_timesteps = self.model.num_timesteps + self.initial_timesteps
             save_training_state(self.model, self.model.env, self.eval_env, total_timesteps, self.best_model_save_path)
@@ -201,6 +201,14 @@ class CustomEvalCallback(EvalCallback):
                     print(f"Wygenerowano wykres po {self.eval_count} walidacji.")
                 except Exception as e:
                     print(f"Błąd podczas generowania wykresu: {e}")
+            
+            # Jeśli callback_after_eval zatrzyma trening, zatrzymamy go tutaj
+            if not continue_training:
+                print(f"\n{'='*70}")
+                print(f"🛑 TRENING ZATRZYMANY przez StopTrainingOnNoModelImprovement")
+                print(f"{'='*70}\n")
+                return False
+        
         return True
 
 def save_training_state(model, env, eval_env, total_timesteps, save_path):
@@ -261,6 +269,15 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     n_steps = config['model']['n_steps']
     eval_freq = config['training']['eval_freq']
     plot_interval = config['training']['plot_interval']
+    
+    # ✅ POBIERZ USTAWIENIA NORMALIZACJI Z CONFIGU
+    norm_config = config['training'].get('normalization', {})
+    norm_obs = norm_config.get('norm_obs', False)
+    norm_reward = norm_config.get('norm_reward', True)
+    clip_obs = norm_config.get('clip_obs', 10.0)
+    clip_reward = norm_config.get('clip_reward', 10.0)
+    norm_gamma = norm_config.get('gamma', 0.99)
+    epsilon = norm_config.get('epsilon', 1e-8)
 
     model_path_absolute = os.path.normpath(os.path.join(base_dir, config['paths']['model_path']))
     vec_norm_path = model_path_absolute.replace('.zip', '_vecnorm.pkl')
@@ -305,17 +322,51 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     if enable_channel_logs:
         channel_loggers.update(init_channel_loggers())
 
+    # ✅ WYŚWIETL INFO O NORMALIZACJI
+    print(f"\n{'='*70}")
+    print(f"[NORMALIZATION CONFIG]")
+    print(f"{'='*70}")
+    print(f"  norm_obs:        {norm_obs} {'❌ DISABLED (recommended for images)' if not norm_obs else '✅ ENABLED'}")
+    print(f"  norm_reward:     {norm_reward} {'✅ ENABLED (stabilizes training)' if norm_reward else '❌ DISABLED'}")
+    print(f"  clip_obs:        {clip_obs}")
+    print(f"  clip_reward:     {clip_reward}")
+    print(f"  gamma:           {norm_gamma}")
+    print(f"  epsilon:         {epsilon}")
+    print(f"{'='*70}\n")
+
     env = make_vec_env(make_env(render_mode=None, grid_size=None), n_envs=n_envs, vec_env_cls=SubprocVecEnv)
     if load_model and os.path.exists(vec_norm_path):
         env = VecNormalize.load(vec_norm_path, env)
+        print(f"✅ Załadowano VecNormalize z {vec_norm_path}")
     else:
-        env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+        # ✅ ZASTOSUJ USTAWIENIA Z CONFIGU
+        env = VecNormalize(
+            env, 
+            norm_obs=norm_obs,
+            norm_reward=norm_reward,
+            clip_obs=clip_obs,
+            clip_reward=clip_reward,
+            gamma=norm_gamma,
+            epsilon=epsilon
+        )
+        print(f"✅ Utworzono nowy VecNormalize z ustawieniami z config.yaml")
 
     eval_env = make_vec_env(make_env(render_mode=None, grid_size=16), n_envs=1, vec_env_cls=SubprocVecEnv)
     if load_model and os.path.exists(vec_norm_eval_path):
         eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
+        print(f"✅ Załadowano eval VecNormalize z {vec_norm_eval_path}")
     else:
-        eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+        # ✅ ZASTOSUJ USTAWIENIA Z CONFIGU (eval też potrzebuje normalizacji!)
+        eval_env = VecNormalize(
+            eval_env,
+            norm_obs=norm_obs,
+            norm_reward=norm_reward,
+            clip_obs=clip_obs,
+            clip_reward=clip_reward,
+            gamma=norm_gamma,
+            epsilon=epsilon
+        )
+        print(f"✅ Utworzono nowy eval VecNormalize z ustawieniami z config.yaml")
 
     policy_kwargs = config['model']['policy_kwargs'].copy()
     policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
@@ -423,12 +474,12 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         log_observation(obs, channel_loggers, grid_size, step=0)
         for debug_step in range(5):
             action = debug_env.action_space.sample()
-            obs, reward, done, _, info = debug_env.step(action)
+            obs, reward, terminated, truncated, info = debug_env.step(action)
             log_observation(obs, channel_loggers, grid_size, step=debug_step + 1)
             if enable_channel_logs:
                 for logger in channel_loggers.values():
-                    logger.info(f"Akcja: {action}, Nagroda: {reward}, Done: {done}, Info: {info}")
-            if done:
+                    logger.info(f"Akcja: {action}, Nagroda: {reward}, Terminated: {terminated}, Truncated: {truncated}, Info: {info}")
+            if terminated or truncated:
                 break
         debug_env.close()
         if enable_channel_logs:

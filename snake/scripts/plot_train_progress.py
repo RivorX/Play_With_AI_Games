@@ -1,6 +1,8 @@
 import os
 import csv
 import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+import numpy as np
 
 def plot_train_progress(csv_path, output_path):
     # Zbierz wszystkie dane
@@ -84,18 +86,29 @@ def plot_train_progress(csv_path, output_path):
     axes[0, 1].grid(True, alpha=0.3)
     
     # Wykres 3: Mean Score (średnia liczba zjedzonych jabłek)
-    axes[0, 2].plot(timesteps, data['mean_score'], color='red', linewidth=2)
+    axes[0, 2].plot(timesteps, data['mean_score'], color='red', linewidth=1, alpha=0.5, label='Mean Score (raw)')
+    # Dodaj rolling mean (wygładzony)
+    window = 15
+    if len(data['mean_score']) >= window:
+        mean_score_smooth = np.convolve(data['mean_score'], np.ones(window)/window, mode='valid')
+        axes[0, 2].plot(timesteps[window-1:], mean_score_smooth, color='black', linewidth=2, label=f'Rolling Mean (window={window})')
     axes[0, 2].set_title('Mean Score (Apples Eaten)', fontsize=12, fontweight='bold')
     axes[0, 2].set_xlabel('Timesteps')
     axes[0, 2].set_ylabel('Apples')
     axes[0, 2].grid(True, alpha=0.3)
+    axes[0, 2].legend()
     
     # Wykres 4: Max Score
-    axes[1, 0].plot(timesteps, data['max_score'], color='orange', linewidth=2)
+    axes[1, 0].plot(timesteps, data['max_score'], color='orange', linewidth=1, alpha=0.5, label='Max Score (raw)')
+    # Dodaj rolling mean (wygładzony)
+    if len(data['max_score']) >= window:
+        max_score_smooth = np.convolve(data['max_score'], np.ones(window)/window, mode='valid')
+        axes[1, 0].plot(timesteps[window-1:], max_score_smooth, color='black', linewidth=2, label=f'Rolling Mean (window={window})')
     axes[1, 0].set_title('Max Score (Best Episode)', fontsize=12, fontweight='bold')
     axes[1, 0].set_xlabel('Timesteps')
     axes[1, 0].set_ylabel('Apples')
     axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].legend()
     
     # Wykres 5: Progress Score (metryka kompozytowa)
     axes[1, 1].plot(timesteps, data['progress_score'], color='#2ecc71', linewidth=2)
@@ -105,18 +118,27 @@ def plot_train_progress(csv_path, output_path):
     axes[1, 1].grid(True, alpha=0.3)
     
     # Wykres 6: Policy Loss
-    axes[1, 2].plot(timesteps, data['policy_loss'], color='#e74c3c', linewidth=2)
+    axes[1, 2].plot(timesteps, data['policy_loss'], color='#e74c3c', linewidth=1, alpha=0.5, label='Policy Loss (raw)')
+    if len(data['policy_loss']) >= window:
+        policy_loss_smooth = np.convolve(np.nan_to_num(data['policy_loss'], nan=0.0), np.ones(window)/window, mode='valid')
+        axes[1, 2].plot(timesteps[window-1:], policy_loss_smooth, color='black', linewidth=2, label=f'Rolling Mean (window={window})')
     axes[1, 2].set_title('Policy Loss', fontsize=12, fontweight='bold')
     axes[1, 2].set_xlabel('Timesteps')
     axes[1, 2].set_ylabel('Loss')
     axes[1, 2].grid(True, alpha=0.3)
+    axes[1, 2].legend()
     
     # Wykres 7: Value Loss
-    axes[2, 0].plot(timesteps, data['value_loss'], color='#3498db', linewidth=2)
+    axes[2, 0].plot(timesteps, data['value_loss'], color='#3498db', linewidth=1, alpha=0.5, label='Value Loss (raw)')
+    if len(data['value_loss']) >= window:
+        value_loss_smooth = np.convolve(np.nan_to_num(data['value_loss'], nan=0.0), np.ones(window)/window, mode='valid')
+        axes[2, 0].plot(timesteps[window-1:], value_loss_smooth, color='black', linewidth=2, label=f'Rolling Mean (window={window})')
     axes[2, 0].set_title('Value Loss', fontsize=12, fontweight='bold')
     axes[2, 0].set_xlabel('Timesteps')
-    axes[2, 0].set_ylabel('Loss')
-    axes[2, 0].grid(True, alpha=0.3)
+    axes[2, 0].set_ylabel('Loss (log scale)')
+    axes[2, 0].set_yscale('log')
+    axes[2, 0].grid(True, alpha=0.3, which='both')
+    axes[2, 0].legend()
     
     # Wykres 8: Entropy Loss
     axes[2, 1].plot(timesteps, data['entropy_loss'], color='#9b59b6', linewidth=2)
@@ -126,15 +148,40 @@ def plot_train_progress(csv_path, output_path):
     axes[2, 1].grid(True, alpha=0.3)
     
     # Wykres 9: Score vs Episode Length (scatter/correlation)
-    axes[2, 2].scatter(data['mean_ep_length'], data['mean_score'], 
-                       c=timesteps, cmap='viridis', alpha=0.6, s=20)
+    sc = axes[2, 2].scatter(data['mean_ep_length'], data['mean_score'], 
+                            c=timesteps, cmap='viridis', alpha=0.6, s=20, label='Raw')
+    # Savitzky-Golay smoothing (rolling mean, wygładzenie)
+    if len(data['mean_score']) >= window:
+        # Bardziej wygładzone: większe okno Savitzky-Golaya
+        sg_window = max(window * 3, 21)  # np. 45 lub min. 21, musi być nieparzyste
+        if sg_window % 2 == 0:
+            sg_window += 1
+        sg_poly = 3 if sg_window > 3 else 2
+        mean_ep_length_arr = np.array(data['mean_ep_length'])
+        mean_score_arr = np.array(data['mean_score'])
+        timesteps_arr = np.array(timesteps)
+        mean_ep_length_smooth = savgol_filter(mean_ep_length_arr, sg_window, sg_poly)
+        mean_score_smooth = savgol_filter(mean_score_arr, sg_window, sg_poly)
+        # Kolorowanie linii względem timesteps
+        from matplotlib.collections import LineCollection
+        points = np.array([mean_ep_length_smooth, mean_score_smooth]).T.reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+        norm = plt.Normalize(timesteps_arr.min(), timesteps_arr.max())
+        # Najpierw czarna obwódka (grubsza, alpha=0.5)
+        lc_outline = LineCollection(segments, colors='black', linewidth=4, alpha=0.5, zorder=2)
+        axes[2, 2].add_collection(lc_outline)
+        # Potem kolorowa linia na wierzchu
+        lc = LineCollection(segments, cmap='viridis', norm=norm, linewidth=2.5, zorder=3)
+        lc.set_array(timesteps_arr)
+        axes[2, 2].add_collection(lc)
     axes[2, 2].set_title('Score vs Episode Length', fontsize=12, fontweight='bold')
     axes[2, 2].set_xlabel('Mean Episode Length')
     axes[2, 2].set_ylabel('Mean Score')
     axes[2, 2].grid(True, alpha=0.3)
     if len(axes[2, 2].collections) > 0:
-        cbar = plt.colorbar(axes[2, 2].collections[0], ax=axes[2, 2])
+        cbar = plt.colorbar(sc, ax=axes[2, 2])
         cbar.set_label('Timesteps', rotation=270, labelpad=15)
+    axes[2, 2].legend()
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')

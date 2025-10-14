@@ -25,7 +25,7 @@ logging.basicConfig(
 
 # Wczytaj konfigurację
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
-with open(config_path, 'r') as f:
+with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 
 def test_snake_model(model_path, grid_size, episodes):
@@ -110,7 +110,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Testowanie modelu Snake PPO")
     parser.add_argument("--model_path", type=str, default=os.path.join(base_dir, config['paths']['models_dir'], 'best_model.zip'), help="Ścieżka do modelu")
     parser.add_argument("--grid_size", type=int, default=8, help="Rozmiar siatki")
-    parser.add_argument("--episodes", type=int, default=2, help="Liczba epizodów testowych")
+    parser.add_argument("--episodes", type=int, default=1, help="Liczba epizodów testowych")
     args = parser.parse_args()
     
     test_snake_model(args.model_path, args.grid_size, args.episodes)
