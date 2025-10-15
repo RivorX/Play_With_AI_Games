@@ -22,8 +22,7 @@ def plot_train_progress(csv_path, output_path):
     
     with open(csv_path, 'r') as f:
         reader = csv.DictReader(f)
-        for row_num, row in enumerate(reader, start=2):  # start=2 bo wiersz 1 to nagłówek
-            # Pomiń puste wiersze
+        for row_num, row in enumerate(reader, start=2):
             if not row or not row.get('timesteps'):
                 continue
                 
@@ -37,7 +36,6 @@ def plot_train_progress(csv_path, output_path):
                 mean_steps_per_apple = float(row.get('mean_steps_per_apple', 0))
                 progress_score = float(row.get('progress_score', 0))
                 
-                # Loss'y mogą być None, zamień na nan
                 policy_loss = row.get('policy_loss', '')
                 value_loss = row.get('value_loss', '')
                 entropy_loss = row.get('entropy_loss', '')
@@ -45,7 +43,6 @@ def plot_train_progress(csv_path, output_path):
                 value_loss_val = float(value_loss) if value_loss and value_loss != 'None' else float('nan')
                 entropy_loss_val = float(entropy_loss) if entropy_loss and entropy_loss != 'None' else float('nan')
                 
-                # Jeśli wszystko się udało, dodaj do danych
                 data['timesteps'].append(timesteps)
                 data['mean_reward'].append(mean_reward)
                 data['mean_ep_length'].append(mean_ep_length)
@@ -65,7 +62,6 @@ def plot_train_progress(csv_path, output_path):
         print('Brak danych do wykresu!')
         return
     
-    # Utwórz siatkę wykresów 3x3
     fig, axes = plt.subplots(3, 3, figsize=(20, 14))
     fig.suptitle('Training Progress - Snake RecurrentPPO', fontsize=18, fontweight='bold')
     
@@ -85,10 +81,9 @@ def plot_train_progress(csv_path, output_path):
     axes[0, 1].set_ylabel('Steps')
     axes[0, 1].grid(True, alpha=0.3)
     
-    # Wykres 3: Mean Score (średnia liczba zjedzonych jabłek)
-    axes[0, 2].plot(timesteps, data['mean_score'], color='red', linewidth=1, alpha=0.5, label='Mean Score (raw)')
-    # Dodaj rolling mean (wygładzony)
+    # Wykres 3: Mean Score
     window = 15
+    axes[0, 2].plot(timesteps, data['mean_score'], color='red', linewidth=1, alpha=0.5, label='Mean Score (raw)')
     if len(data['mean_score']) >= window:
         mean_score_smooth = np.convolve(data['mean_score'], np.ones(window)/window, mode='valid')
         axes[0, 2].plot(timesteps[window-1:], mean_score_smooth, color='black', linewidth=2, label=f'Rolling Mean (window={window})')
@@ -100,7 +95,6 @@ def plot_train_progress(csv_path, output_path):
     
     # Wykres 4: Max Score
     axes[1, 0].plot(timesteps, data['max_score'], color='orange', linewidth=1, alpha=0.5, label='Max Score (raw)')
-    # Dodaj rolling mean (wygładzony)
     if len(data['max_score']) >= window:
         max_score_smooth = np.convolve(data['max_score'], np.ones(window)/window, mode='valid')
         axes[1, 0].plot(timesteps[window-1:], max_score_smooth, color='black', linewidth=2, label=f'Rolling Mean (window={window})')
@@ -110,7 +104,7 @@ def plot_train_progress(csv_path, output_path):
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].legend()
     
-    # Wykres 5: Progress Score (metryka kompozytowa)
+    # Wykres 5: Progress Score
     axes[1, 1].plot(timesteps, data['progress_score'], color='#2ecc71', linewidth=2)
     axes[1, 1].set_title('Progress Score (Composite Metric)', fontsize=12, fontweight='bold')
     axes[1, 1].set_xlabel('Timesteps')
@@ -147,13 +141,11 @@ def plot_train_progress(csv_path, output_path):
     axes[2, 1].set_ylabel('Loss')
     axes[2, 1].grid(True, alpha=0.3)
     
-    # Wykres 9: Score vs Episode Length (scatter/correlation)
+    # Wykres 9: Score vs Episode Length
     sc = axes[2, 2].scatter(data['mean_ep_length'], data['mean_score'], 
                             c=timesteps, cmap='viridis', alpha=0.6, s=20, label='Raw')
-    # Savitzky-Golay smoothing (rolling mean, wygładzenie)
     if len(data['mean_score']) >= window:
-        # Bardziej wygładzone: większe okno Savitzky-Golaya
-        sg_window = max(window * 3, 21)  # np. 45 lub min. 21, musi być nieparzyste
+        sg_window = max(window * 3, 21)
         if sg_window % 2 == 0:
             sg_window += 1
         sg_poly = 3 if sg_window > 3 else 2
@@ -162,15 +154,12 @@ def plot_train_progress(csv_path, output_path):
         timesteps_arr = np.array(timesteps)
         mean_ep_length_smooth = savgol_filter(mean_ep_length_arr, sg_window, sg_poly)
         mean_score_smooth = savgol_filter(mean_score_arr, sg_window, sg_poly)
-        # Kolorowanie linii względem timesteps
         from matplotlib.collections import LineCollection
         points = np.array([mean_ep_length_smooth, mean_score_smooth]).T.reshape(-1, 1, 2)
         segments = np.concatenate([points[:-1], points[1:]], axis=1)
         norm = plt.Normalize(timesteps_arr.min(), timesteps_arr.max())
-        # Najpierw czarna obwódka (grubsza, alpha=0.5)
         lc_outline = LineCollection(segments, colors='black', linewidth=4, alpha=0.5, zorder=2)
         axes[2, 2].add_collection(lc_outline)
-        # Potem kolorowa linia na wierzchu
         lc = LineCollection(segments, cmap='viridis', norm=norm, linewidth=2.5, zorder=3)
         lc.set_array(timesteps_arr)
         axes[2, 2].add_collection(lc)
@@ -189,7 +178,7 @@ def plot_train_progress(csv_path, output_path):
     print(f'Wykres zapisany do {output_path}')
 
 if __name__ == "__main__":
-    logs_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
+    logs_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'logs')
     csv_path = os.path.join(logs_dir, 'train_progress.csv')
     output_path = os.path.join(logs_dir, 'training_progress.png')
     plot_train_progress(csv_path, output_path)
