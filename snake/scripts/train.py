@@ -1,22 +1,26 @@
 import os
-import time
-import numpy as np
-from sb3_contrib import RecurrentPPO
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
-import csv
-import matplotlib
-matplotlib.use('Agg')
-import subprocess
 import sys
 import yaml
+import pickle
+from sb3_contrib import RecurrentPPO
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import StopTrainingOnNoModelImprovement
+import matplotlib
+matplotlib.use('Agg')
+
+# Import lokalnych modułów
 from model import make_env
 from cnn import CustomFeaturesExtractor
-import logging
-import pickle
-import torch
+from utils.callbacks import TrainProgressCallback, CustomEvalCallback, LossRecorderCallback
+from utils.training_utils import (
+    linear_schedule, 
+    apply_gradient_clipping, 
+    ensure_directories,
+    reset_channel_logs,
+    init_channel_loggers,
+    log_observation
+)
 
 # Wczytaj konfigurację
 base_dir = os.path.dirname(os.path.dirname(__file__))
@@ -24,242 +28,11 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 
-# Funkcja tworząca wymagane katalogi jeśli nie istnieją
-def ensure_directories():
-    dirs = [
-        os.path.join(base_dir, 'models'),
-        os.path.join(base_dir, 'logs'),
-        os.path.join(base_dir, 'logs', 'Training_channels')
-    ]
-    for d in dirs:
-        if not os.path.exists(d):
-            os.makedirs(d, exist_ok=True)
+ensure_directories(base_dir)
 
-ensure_directories()
-
-def reset_channel_logs():
-    log_dir = os.path.join(base_dir, 'logs', 'Training_channels')
-    os.makedirs(log_dir, exist_ok=True)
-    for channel_name in ['mapa', 'direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
-        log_path = os.path.join(log_dir, f'training_{channel_name}.log')
-        with open(log_path, 'w', encoding='utf-8'):
-            pass
-
-def init_channel_loggers():
-    loggers = {}
-    log_dir = os.path.join(base_dir, 'logs', 'Training_channels')
-    for channel_name in ['mapa', 'direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
-        log_path = os.path.join(log_dir, f'training_{channel_name}.log')
-        logger = logging.getLogger(f'channel_{channel_name}')
-        handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
-        formatter = logging.Formatter('%(asctime)s - %(message)s')
-        handler.setFormatter(formatter)
-        if logger.hasHandlers():
-            logger.handlers.clear()
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        loggers[channel_name] = logger
-    return loggers
-
+# Channel logging (opcjonalne)
 enable_channel_logs = config.get('training', {}).get('enable_channel_logs', False)
-channel_loggers = init_channel_loggers() if enable_channel_logs else {}
-
-def log_observation(obs, channel_loggers, grid_size, step):
-    if not enable_channel_logs:
-        return
-    image = obs['image']
-    mapa = image[:, :, 0]
-    head_pos = np.where(mapa == 1.0)
-    food_pos = np.where(mapa == 0.75)
-    if len(head_pos[0]) > 0:
-        head_x, head_y = head_pos[0][0], head_pos[1][0]
-    else:
-        head_x, head_y = -1, -1
-    if len(food_pos[0]) > 0:
-        food_x, food_y = food_pos[0][0], food_pos[1][0]
-    else:
-        food_x, food_y = -1, -1
-    if head_x >= 0 and food_x >= 0:
-        distance = abs(head_x - food_x) + abs(head_y - food_y)
-    else:
-        distance = float('inf')
-    
-    logger = channel_loggers.get('mapa')
-    if logger:
-        logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
-        logger.info(f"Kanał mapa:\n{np.array_str(mapa, precision=2, suppress_small=True, max_line_width=120)}")
-        logger.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
-        logger.info(f"Dystans Manhattan: {distance}")
-        logger.info("-" * 60)
-
-    for scalar_name in ['direction', 'dx_head', 'dy_head', 'front_coll', 'left_coll', 'right_coll']:
-        logger = channel_loggers.get(scalar_name)
-        if logger:
-            logger.info(f"--- Obserwacja dla grid_size={grid_size}, krok={step} ---")
-            if scalar_name == 'direction':
-                logger.info(f"{scalar_name.capitalize()}: sin={obs[scalar_name][0]:.3f}, cos={obs[scalar_name][1]:.3f}")
-            else:
-                logger.info(f"{scalar_name.capitalize()}: {obs[scalar_name][0]}")
-            logger.info("-" * 60)
-
-def linear_schedule(initial_value, min_value=0.00005):
-    def func(progress_remaining):
-        return min_value + (initial_value - min_value) * progress_remaining
-    return func
-
-class TrainProgressCallback(BaseCallback):
-    def __init__(self, csv_path, initial_timesteps=0, verbose=0):
-        super().__init__(verbose)
-        self.csv_path = csv_path
-        self.initial_timesteps = initial_timesteps
-        self.header_written = False
-        self.last_logged = 0
-        self.episode_scores = []
-        self.episode_snake_lengths = []
-        self.episode_steps_per_apple = []
-
-    def _on_step(self) -> bool:
-        infos = self.locals.get('infos', [])
-        dones = self.locals.get('dones', [])
-        
-        for i, (info, done) in enumerate(zip(infos, dones)):
-            if done and 'score' in info:
-                self.episode_scores.append(info['score'])
-                self.episode_snake_lengths.append(info.get('snake_length', 3))
-                self.episode_steps_per_apple.append(info.get('steps_per_apple', 0))
-        
-        if self.locals.get('dones') is not None and any(self.locals['dones']):
-            if (self.num_timesteps + self.initial_timesteps) - self.last_logged >= 1000:
-                ep_rew_mean = self.model.ep_info_buffer and np.mean([ep_info['r'] for ep_info in self.model.ep_info_buffer]) or None
-                ep_len_mean = self.model.ep_info_buffer and np.mean([ep_info['l'] for ep_info in self.model.ep_info_buffer]) or None
-                
-                mean_score = np.mean(self.episode_scores) if self.episode_scores else 0
-                max_score = np.max(self.episode_scores) if self.episode_scores else 0
-                mean_snake_length = np.mean(self.episode_snake_lengths) if self.episode_snake_lengths else 3
-                mean_steps_per_apple = np.mean(self.episode_steps_per_apple) if self.episode_steps_per_apple else 0
-                
-                progress_score = ep_rew_mean + 0.1 * mean_snake_length - 0.05 * mean_steps_per_apple if ep_rew_mean is not None else 0
-                
-                policy_loss = getattr(self.model, '_last_policy_loss', None)
-                value_loss = getattr(self.model, '_last_value_loss', None)
-                entropy_loss = getattr(self.model, '_last_entropy_loss', None)
-                
-                try:
-                    write_header = not os.path.exists(self.csv_path)
-                    with open(self.csv_path, 'a', newline='') as csvfile:
-                        writer = csv.writer(csvfile)
-                        if write_header:
-                            writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length', 'mean_score', 'max_score', 'mean_snake_length', 'mean_steps_per_apple', 'progress_score', 'policy_loss', 'value_loss', 'entropy_loss'])
-                        writer.writerow([
-                            self.num_timesteps + self.initial_timesteps, 
-                            ep_rew_mean, 
-                            ep_len_mean, 
-                            mean_score,
-                            max_score,
-                            mean_snake_length,
-                            mean_steps_per_apple,
-                            progress_score,
-                            policy_loss,
-                            value_loss,
-                            entropy_loss
-                        ])
-                    self.last_logged = self.num_timesteps + self.initial_timesteps
-                    self.episode_scores = []
-                    self.episode_snake_lengths = []
-                    self.episode_steps_per_apple = []
-                except Exception as e:
-                    print(f"Błąd zapisu train_progress.csv: {e}")
-        return True
-
-class CustomEvalCallback(EvalCallback):
-    def __init__(self, eval_env, callback_on_new_best=None, callback_after_eval=None, best_model_save_path=None,
-                 log_path=None, eval_freq=10000, deterministic=True, render=False, verbose=1,
-                 warn=True, n_eval_episodes=5, plot_interval=3, plot_script_path=None, initial_timesteps=0):
-        super().__init__(eval_env, callback_on_new_best=callback_on_new_best, callback_after_eval=callback_after_eval,
-                         best_model_save_path=best_model_save_path, log_path=log_path, eval_freq=eval_freq,
-                         deterministic=deterministic, render=render, verbose=verbose, warn=warn,
-                         n_eval_episodes=n_eval_episodes)
-        self.eval_count = 0
-        self.plot_interval = plot_interval
-        self.plot_script_path = plot_script_path
-        self.initial_timesteps = initial_timesteps
-
-    def _on_step(self) -> bool:
-        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
-            continue_training = super()._on_step()
-            self.eval_count += 1
-            total_timesteps = self.model.num_timesteps + self.initial_timesteps
-            save_training_state(self.model, self.model.env, self.eval_env, total_timesteps, self.best_model_save_path)
-            print(f"Zaktualizowano najnowszy model po {total_timesteps} krokach z mean_reward={self.last_mean_reward}")
-
-            if self.best_mean_reward < self.last_mean_reward:
-                self.model.save(os.path.join(self.best_model_save_path, f'best_model_{total_timesteps}.zip'))
-                print(f"New best model saved at {total_timesteps} timesteps with mean reward {self.last_mean_reward}")
-            if self.eval_count % self.plot_interval == 0:
-                try:
-                    subprocess.run([sys.executable, self.plot_script_path], check=True)
-                    print(f"Wygenerowano wykres po {self.eval_count} walidacji.")
-                except Exception as e:
-                    print(f"Błąd podczas generowania wykresu: {e}")
-            
-            # Jeśli callback_after_eval zatrzyma trening, zatrzymamy go tutaj
-            if not continue_training:
-                print(f"\n{'='*70}")
-                print(f"🛑 TRENING ZATRZYMANY przez StopTrainingOnNoModelImprovement")
-                print(f"{'='*70}\n")
-                return False
-        
-        return True
-
-def save_training_state(model, env, eval_env, total_timesteps, save_path):
-    model_path_absolute = os.path.normpath(os.path.join(save_path, 'snake_ppo_model.zip'))
-    vec_norm_path = model_path_absolute.replace('.zip', '_vecnorm.pkl')
-    vec_norm_eval_path = model_path_absolute.replace('.zip', '_vecnorm_eval.pkl')
-    state_path = model_path_absolute.replace('.zip', '_state.pkl')
-
-    for attempt in range(5):
-        try:
-            model.save(model_path_absolute)
-            env.save(vec_norm_path)
-            eval_env.save(vec_norm_eval_path)
-            with open(state_path, 'wb') as f:
-                pickle.dump({'total_timesteps': total_timesteps}, f)
-            print(f"Zaktualizowano najnowszy model: {model_path_absolute} po {total_timesteps} krokach.")
-            break
-        except PermissionError as e:
-            print(f"Próba {attempt + 1}/5: Nie udało się zapisać stanu: {e}")
-            time.sleep(3)
-        except Exception as e:
-            print(f"Błąd zapisu stanu: {e}")
-            break
-    else:
-        print("Nie udało się zapisać stanu po 5 próbach.")
-
-
-def apply_gradient_clipping(model, clip_value=1.0):
-    """
-    ✅ KLUCZOWA NAPRAWA: Gradient Clipping dla LSTM
-    Zapobiega exploding gradients w LSTM (MLP gradient 1.0 → 0.4)
-    """
-    def clip_grad_hook(module, grad_input, grad_output):
-        """Hook który clippuje gradienty w backward pass"""
-        if grad_input is not None:
-            clipped = tuple(
-                torch.clamp(g, -clip_value, clip_value) if g is not None else g 
-                for g in grad_input
-            )
-            return clipped
-        return grad_input
-    
-    # Zarejestruj hook dla LSTM actor
-    if hasattr(model.policy, 'lstm_actor'):
-        model.policy.lstm_actor.register_full_backward_hook(clip_grad_hook)
-        print(f"[GRADIENT CLIPPING] ✅ Enabled for LSTM Actor (clip_value={clip_value})")
-    
-    # Opcjonalnie dla LSTM critic (jeśli enable_critic_lstm=true)
-    if hasattr(model.policy, 'lstm_critic'):
-        model.policy.lstm_critic.register_full_backward_hook(clip_grad_hook)
-        print(f"[GRADIENT CLIPPING] ✅ Enabled for LSTM Critic (clip_value={clip_value})")
+channel_loggers = init_channel_loggers(base_dir) if enable_channel_logs else {}
 
 
 def train(use_progress_bar=False, use_config_hyperparams=True):
@@ -272,7 +45,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     eval_n_envs = config['training'].get('eval_n_envs', 4)
     eval_n_repeats = config['training'].get('eval_n_repeats', 2)
     
-    # ✅ POBIERZ USTAWIENIA NORMALIZACJI Z CONFIGU
+    # Ustawienia normalizacji z configu
     norm_config = config['training'].get('normalization', {})
     norm_obs = norm_config.get('norm_obs', False)
     norm_reward = norm_config.get('norm_reward', True)
@@ -288,6 +61,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
 
     load_model = os.path.exists(model_path_absolute)
     total_timesteps = 0
+    
     if load_model:
         try:
             with open(state_path, 'rb') as f:
@@ -296,6 +70,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             print(f"Wznowienie treningu od {total_timesteps} kroków.")
         except Exception as e:
             print(f"Błąd ładowania stanu: {e}. Zaczynam od zera.")
+        
         try:
             resp = input(f"Znaleziono istniejący model pod {model_path_absolute}. Czy kontynuować trening? [[Y]/n]: ").strip()
         except Exception:
@@ -320,11 +95,11 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                 resp2 = ''
             use_config_hyperparams = False if resp2.lower() in ('n', 'no') else True
 
-    reset_channel_logs()
+    reset_channel_logs(base_dir)
     if enable_channel_logs:
-        channel_loggers.update(init_channel_loggers())
+        channel_loggers.update(init_channel_loggers(base_dir))
 
-    # ✅ WYŚWIETL INFO O NORMALIZACJI
+    # Wyświetl info o normalizacji
     print(f"\n{'='*70}")
     print(f"[NORMALIZATION CONFIG]")
     print(f"{'='*70}")
@@ -336,12 +111,12 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     print(f"  epsilon:         {epsilon}")
     print(f"{'='*70}\n")
 
+    # Tworzenie środowisk treningowych
     env = make_vec_env(make_env(render_mode=None, grid_size=None), n_envs=n_envs, vec_env_cls=SubprocVecEnv)
     if load_model and os.path.exists(vec_norm_path):
         env = VecNormalize.load(vec_norm_path, env)
         print(f"✅ Załadowano VecNormalize z {vec_norm_path}")
     else:
-        # ✅ ZASTOSUJ USTAWIENIA Z CONFIGU
         env = VecNormalize(
             env, 
             norm_obs=norm_obs,
@@ -353,13 +128,12 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         )
         print(f"✅ Utworzono nowy VecNormalize z ustawieniami z config.yaml")
 
-    # Tworzenie eval_env z wieloma środowiskami
+    # Tworzenie środowisk ewaluacyjnych
     eval_env = make_vec_env(make_env(render_mode=None, grid_size=16), n_envs=eval_n_envs, vec_env_cls=SubprocVecEnv)
     if load_model and os.path.exists(vec_norm_eval_path):
         eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
         print(f"✅ Załadowano eval VecNormalize z {vec_norm_eval_path}")
     else:
-        # ✅ ZASTOSUJ USTAWIENIA Z CONFIGU (eval też potrzebuje normalizacji!)
         eval_env = VecNormalize(
             eval_env,
             norm_obs=norm_obs,
@@ -371,6 +145,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         )
         print(f"✅ Utworzono nowy eval VecNormalize z ustawieniami z config.yaml")
 
+    # Tworzenie lub ładowanie modelu
     policy_kwargs = config['model']['policy_kwargs'].copy()
     policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
 
@@ -421,22 +196,22 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         model = model_new
         del model_tmp
 
-    # ✅ ZASTOSUJ GRADIENT CLIPPING (KLUCZOWA NAPRAWA!)
+    # Zastosuj gradient clipping (kluczowa naprawa!)
     apply_gradient_clipping(model, clip_value=1.0)
 
     global best_model_save_path
     best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
 
+    # Callbacki
     stop_on_plateau = StopTrainingOnNoModelImprovement(
         max_no_improvement_evals=config['training']['max_no_improvement_evals'],
         min_evals=config['training']['min_evals'],
         verbose=1
     )
 
-    plot_script_path = os.path.join(os.path.dirname(__file__), 'plot_train_progress.py')
-
-    # Liczba epizodów ewaluacyjnych = liczba środowisk * liczba powtórzeń
+    plot_script_path = os.path.join(os.path.dirname(__file__), 'utils', 'plot_train_progress.py')
     n_eval_episodes = eval_n_envs * eval_n_repeats
+    
     eval_callback = CustomEvalCallback(
         eval_env=eval_env,
         best_model_save_path=best_model_save_path,
@@ -456,21 +231,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         initial_timesteps=total_timesteps
     )
     
-    class LossRecorderCallback(BaseCallback):
-        def _on_step(self) -> bool:
-            if hasattr(self.model, 'logger') and self.model.logger is not None:
-                try:
-                    if hasattr(self.model.logger, 'name_to_value'):
-                        losses = self.model.logger.name_to_value
-                        self.model._last_policy_loss = losses.get('train/policy_gradient_loss', None)
-                        self.model._last_value_loss = losses.get('train/value_loss', None)
-                        self.model._last_entropy_loss = losses.get('train/entropy_loss', None)
-                except Exception:
-                    pass
-            return True
-    
     loss_recorder = LossRecorderCallback()
 
+    # Debug logging (jeśli włączone)
     if enable_channel_logs:
         for logger in channel_loggers.values():
             logger.info(f"\n--- Debug: Rozpoczęcie treningu ---")
@@ -492,9 +255,11 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             for logger in channel_loggers.values():
                 logger.info(f"--- Koniec debug dla grid_size={grid_size} ---")
 
+    # Rozpocznij trening
     try:
         configured_total = config['training'].get('total_timesteps', 0)
         remaining_timesteps = configured_total - total_timesteps
+        
         try:
             if configured_total > 0 and total_timesteps / configured_total >= 0.8:
                 print(f"Użyto {total_timesteps}/{configured_total} kroków ({total_timesteps/configured_total:.1%}). To >=80% limitu.")
@@ -507,6 +272,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                 remaining_timesteps += extra_int
         except Exception:
             pass
+        
         if remaining_timesteps > 0:
             model.learn(
                 total_timesteps=remaining_timesteps,
@@ -538,12 +304,12 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
 
     print("Trening zakończony!")
 
+
 if __name__ == "__main__":
     try:
         train(use_progress_bar=True)
     except KeyboardInterrupt:
         print("\n\nTrening przerwany.")
-        # Wymuś szybkie zakończenie bez czekania na procesy podrzędne
         os._exit(0)
     except Exception as e:
         print(f"Błąd podczas treningu: {e}")
