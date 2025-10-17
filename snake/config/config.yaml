@@ -25,9 +25,17 @@ model:
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
-  ent_coef: 0.05                     # Współczynnik entropii
+  ent_coef: 0.05                     # Współczynnik entropii (początkowy)
+  min_ent_coef: 0.01                # Minimalny współczynnik entropii (docelowy)
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
+  
+  # ✅ NOWE: Konfiguracja optymalizatora
+  optimizer:
+    type: adamw                      # Typ: 'adam' lub 'adamw'
+    weight_decay: 0.01               # Weight decay dla AdamW (0.0 = wyłączone)
+    eps: 1.0e-5                      # Epsilon dla stabilności
+    betas: [0.9, 0.999]              # Beta1, Beta2 dla Adam/AdamW
   
   # Selektywne dropouty - WYMUSZAJĄ używanie CNN!
   cnn_dropout: 0.0                   # Dropout dla CNN
@@ -51,13 +59,14 @@ model:
 # Konfiguracja treningu
 training:
   n_envs: 12                         # Liczba środowisk
-  batch_size: 1024                   # Rozmiar partii
+  batch_size: 512                    # Rozmiar partii
   total_timesteps: 10000000          # Całkowita liczba kroków
   eval_freq: 4000                    # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 30       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 5                       # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
   enable_channel_logs: false         # Włącz logi kanałów
+  gradient_log_freq: 2000            # ✅ NOWE: Co ile kroków logować gradienty/wagi
   # Liczba środowisk do ewaluacji równoległej
   eval_n_envs: 6                    # Liczba środowisk ewaluacyjnych
   eval_n_repeats: 2                 # Ile razy każde środowisko ma wykonać ewaluację

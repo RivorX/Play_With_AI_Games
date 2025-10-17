@@ -2,6 +2,7 @@ import os
 import sys
 import yaml
 import pickle
+import torch
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.env_util import make_vec_env
@@ -12,9 +13,11 @@ matplotlib.use('Agg')
 # Import lokalnych modułów
 from model import make_env
 from cnn import CustomFeaturesExtractor
-from utils.callbacks import TrainProgressCallback, CustomEvalCallback, LossRecorderCallback
+from utils.callbacks import TrainProgressCallback, CustomEvalCallback, LossRecorderCallback, EntropySchedulerCallback
+from utils.gradient_monitor import GradientWeightMonitor
 from utils.training_utils import (
     linear_schedule, 
+    entropy_schedule,
     apply_gradient_clipping, 
     ensure_directories,
     reset_channel_logs,
@@ -33,6 +36,58 @@ ensure_directories(base_dir)
 # Channel logging (opcjonalne)
 enable_channel_logs = config.get('training', {}).get('enable_channel_logs', False)
 channel_loggers = init_channel_loggers(base_dir) if enable_channel_logs else {}
+
+
+def setup_adamw_optimizer(model, config):
+    """
+    Konfiguruje optimizer AdamW dla modelu RecurrentPPO
+    
+    Args:
+        model: Model RecurrentPPO
+        config: Konfiguracja z config.yaml
+    """
+    opt_config = config['model'].get('optimizer', {})
+    optimizer_type = opt_config.get('type', 'adam').lower()
+    weight_decay = opt_config.get('weight_decay', 0.01)
+    eps = opt_config.get('eps', 1e-5)
+    betas = tuple(opt_config.get('betas', [0.9, 0.999]))
+    
+    if optimizer_type == 'adamw':
+        # ✅ Utwórz AdamW optimizer
+        optimizer = torch.optim.AdamW(
+            model.policy.parameters(),
+            lr=model.learning_rate if isinstance(model.learning_rate, float) else model.learning_rate(1.0),
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay
+        )
+        
+        # Zastąp optimizer w modelu
+        model.policy.optimizer = optimizer
+        
+        print(f"\n{'='*70}")
+        print(f"[OPTIMIZER] ✅ AdamW ENABLED")
+        print(f"{'='*70}")
+        print(f"  Type:          AdamW")
+        print(f"  Weight Decay:  {weight_decay} {'(L2 regularization)' if weight_decay > 0 else '(DISABLED)'}")
+        print(f"  Epsilon:       {eps}")
+        print(f"  Betas:         {betas}")
+        print(f"  Learning Rate: {model.learning_rate if isinstance(model.learning_rate, float) else 'schedule'}")
+        print(f"{'='*70}\n")
+        
+    elif optimizer_type == 'adam':
+        # Domyślny Adam (już jest w SB3)
+        print(f"\n{'='*70}")
+        print(f"[OPTIMIZER] Standard Adam (default SB3)")
+        print(f"{'='*70}")
+        print(f"  Type:          Adam")
+        print(f"  Epsilon:       {eps}")
+        print(f"  Betas:         {betas}")
+        print(f"{'='*70}\n")
+    else:
+        raise ValueError(f"Unknown optimizer type: {optimizer_type}. Use 'adam' or 'adamw'.")
+    
+    return model
 
 
 def train(use_progress_bar=False, use_config_hyperparams=True):
@@ -154,6 +209,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         model.ent_coef = config['model']['ent_coef']
         model.learning_rate = linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate'])
         model._setup_lr_schedule()
+        
+        # ✅ NOWE: Skonfiguruj AdamW dla załadowanego modelu
+        model = setup_adamw_optimizer(model, config)
     else:
         model = RecurrentPPO(
             config['model']['policy'],
@@ -171,6 +229,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             verbose=1,
             device=config['model']['device']
         )
+        
+        # ✅ NOWE: Skonfiguruj AdamW dla nowego modelu
+        model = setup_adamw_optimizer(model, config)
 
     if use_config_hyperparams and load_model:
         policy_kwargs = config['model']['policy_kwargs'].copy()
@@ -195,6 +256,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         model_new.policy.load_state_dict(model_tmp.policy.state_dict())
         model = model_new
         del model_tmp
+        
+        # ✅ NOWE: Skonfiguruj AdamW po przeniesieniu wag
+        model = setup_adamw_optimizer(model, config)
 
     # Zastosuj gradient clipping (kluczowa naprawa!)
     apply_gradient_clipping(model, clip_value=1.0)
@@ -232,6 +296,30 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     )
     
     loss_recorder = LossRecorderCallback()
+    
+    # Entropy scheduler - zmniejsza entropię liniowo w czasie
+    entropy_scheduler = EntropySchedulerCallback(
+        entropy_schedule_fn=entropy_schedule(
+            config['model']['ent_coef'], 
+            config['model'].get('min_ent_coef', 0.001)
+        ),
+        initial_timesteps=total_timesteps,
+        verbose=1
+    )
+    
+    print(f"\n{'='*70}")
+    print(f"[ENTROPY SCHEDULE]")
+    print(f"{'='*70}")
+    print(f"  Initial ent_coef:  {config['model']['ent_coef']}")
+    print(f"  Min ent_coef:      {config['model'].get('min_ent_coef', 0.001)}")
+    print(f"  Schedule:          Linear decay (similar to learning rate)")
+    print(f"{'='*70}\n")
+
+    # ✅ NOWE: Gradient & Weight Monitor
+    gradient_monitor = GradientWeightMonitor(
+        csv_path=os.path.join(base_dir, 'logs', 'gradient_monitor.csv'),
+        log_freq=config['training'].get('gradient_log_freq', 2000)
+    )
 
     # Debug logging (jeśli włączone)
     if enable_channel_logs:
@@ -277,7 +365,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             model.learn(
                 total_timesteps=remaining_timesteps,
                 reset_num_timesteps=not load_model,
-                callback=[eval_callback, train_progress_callback, loss_recorder],
+                callback=[eval_callback, train_progress_callback, loss_recorder, entropy_scheduler, gradient_monitor],
                 progress_bar=use_progress_bar,
                 tb_log_name=f"recurrent_ppo_snake_{total_timesteps}"
             )
