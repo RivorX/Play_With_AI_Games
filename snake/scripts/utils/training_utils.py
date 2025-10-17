@@ -13,6 +13,21 @@ def linear_schedule(initial_value, min_value=0.00005):
     return func
 
 
+def entropy_schedule(initial_value, min_value=0.001):
+    """Entropy coefficient scheduler - linear decay
+    
+    Args:
+        initial_value: Początkowa wartość entropii (np. 0.05)
+        min_value: Minimalna wartość entropii (np. 0.001)
+    
+    Returns:
+        Function that returns current entropy based on progress
+    """
+    def func(progress_remaining):
+        return min_value + (initial_value - min_value) * progress_remaining
+    return func
+
+
 def apply_gradient_clipping(model, clip_value=1.0):
     """
     ✅ KLUCZOWA NAPRAWA: Gradient Clipping dla LSTM

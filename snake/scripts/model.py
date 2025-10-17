@@ -5,7 +5,6 @@ import collections
 import pygame
 import yaml
 import os
-import math
 
 # Wczytaj konfigurację
 config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'config.yaml')
@@ -15,32 +14,43 @@ with open(config_path, 'r', encoding='utf-8') as f:
 # Hiperparametry środowiska
 SNAKE_SIZE = config['environment']['snake_size']
 DIRECTIONS = np.array(config['environment']['directions'])
-VIEWPORT_SIZE = config['environment']['viewport_size']  # Rozmiar viewport z konfiguracji
+VIEWPORT_SIZE = config['environment']['viewport_size']
+
+# PRE-COMPUTED STAŁE (obliczone raz na starcie programu)
+# Kierunki jako wektory [x, y] dla sin/cos
+DIRECTION_VECTORS = np.array([
+    [0.0, -1.0],   # 0: góra    (sin(0°), -cos(0°))
+    [1.0, 0.0],    # 1: prawo   (sin(90°), -cos(90°))
+    [0.0, 1.0],    # 2: dół     (sin(180°), -cos(180°))
+    [-1.0, 0.0]    # 3: lewo    (sin(270°), -cos(270°))
+], dtype=np.float32)
+
 
 class SnakeEnv(gym.Env):
     def __init__(self, render_mode=None, grid_size=16):
         super(SnakeEnv, self).__init__()
         self.render_mode = render_mode
-        self.grid_size = grid_size  # Rozmiar siatki z parametru (może być losowy)
+        self.grid_size = grid_size
         self.action_space = spaces.Discrete(config['environment']['action_space']['n'])
         
-        # Observation space dla RecurrentPPO (bez framestacking)
+        # Observation space dla RecurrentPPO
         self.observation_space = spaces.Dict({
             'image': spaces.Box(
-                low=-1.0,  # Ściany mają wartość -1
+                low=-1.0,
                 high=config['environment']['observation_space']['high'],
                 shape=(VIEWPORT_SIZE, VIEWPORT_SIZE, 1),
                 dtype=config['environment']['observation_space']['dtype']
             ),
-            'direction': spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32),  # sin/cos
+            'direction': spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32),
             'dx_head': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
             'dy_head': spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
             'front_coll': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
             'left_coll': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
             'right_coll': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)
         })
+        
         self.snake = None
-        self.snake_set = None  # Set dla O(1) lookup kolizji
+        self.snake_set = None
         self.food = None
         self.direction = None
         self.screen = None
@@ -52,7 +62,7 @@ class SnakeEnv(gym.Env):
         self.done = False
         self.min_dist = float('inf')
         
-        # === TRACKING NAGRÓD DLA DEBUGOWANIA ===
+        # Tracking nagród
         self.reward_components = {
             'food': 0.0,
             'speed_bonus': 0.0,
@@ -66,6 +76,9 @@ class SnakeEnv(gym.Env):
             'win_bonus': 0.0
         }
         
+        # Cache dla half_view (używany często)
+        self.half_view = VIEWPORT_SIZE // 2
+        
         if self.render_mode == "human":
             pygame.init()
             self.screen = pygame.display.set_mode((self.grid_size * SNAKE_SIZE, self.grid_size * SNAKE_SIZE))
@@ -75,9 +88,8 @@ class SnakeEnv(gym.Env):
         if seed is not None:
             np.random.seed(seed)
         
-        # grid_size pochodzi z __init__ - może być losowy
         self.snake = collections.deque([[self.grid_size // 2, self.grid_size // 2]])
-        self.snake_set = {tuple(self.snake[0])}  # Set dla szybkiego lookup
+        self.snake_set = {tuple(self.snake[0])}
         self.food = self._place_food()
         self.direction = np.random.randint(0, 4)
         self.steps = 0
@@ -87,7 +99,6 @@ class SnakeEnv(gym.Env):
         self.done = False
         self.min_dist = float('inf')
         
-        # Reset trackingu nagród
         for key in self.reward_components:
             self.reward_components[key] = 0.0
         
@@ -103,24 +114,33 @@ class SnakeEnv(gym.Env):
                               if (i, j) not in self.snake_set]
         if not available_positions:
             return None
-        return np.array(available_positions[np.random.randint(0, len(available_positions))])
+        return np.array(available_positions[np.random.randint(0, len(available_positions))], dtype=np.int32)
 
     def _is_collision(self, head):
         # Kolizja ze ścianą
         if head[0] < 0 or head[0] >= self.grid_size or head[1] < 0 or head[1] >= self.grid_size:
             return True
-        # Kolizja z ciałem węża (pomijając głowę - index 0)
+        # Kolizja z ciałem węża
         head_tuple = tuple(head)
         current_head = tuple(self.snake[0])
         return head_tuple in self.snake_set and head_tuple != current_head
 
     def _get_potential_collision(self, direction):
-        head = np.array(self.snake[0])
+        """Sprawdza kolizję w danym kierunku - ZOPTYMALIZOWANE"""
+        head = self.snake[0]  # Nie konwertuj na array jeśli nie trzeba
         delta = DIRECTIONS[direction]
-        new_head = head + delta
-        return 1.0 if self._is_collision(new_head) else 0.0
+        new_head = [head[0] + delta[0], head[1] + delta[1]]
+        
+        # Sprawdź ściany (szybsza wersja)
+        if new_head[0] < 0 or new_head[0] >= self.grid_size or \
+           new_head[1] < 0 or new_head[1] >= self.grid_size:
+            return 1.0
+        
+        # Sprawdź ciało
+        return 1.0 if tuple(new_head) in self.snake_set else 0.0
 
     def _get_render_state(self):
+        """Tylko dla renderowania - nie optymalizujemy"""
         state = np.zeros((self.grid_size, self.grid_size, 1), dtype=np.float32)
         for i, segment in enumerate(self.snake):
             state[segment[0], segment[1], 0] = 1 if i == 0 else 2
@@ -130,20 +150,16 @@ class SnakeEnv(gym.Env):
 
     def _get_viewport_observation(self):
         """
-        MEGA ZOPTYMALIZOWANA wersja viewport 16x16.
-        DODATKOWE OPTYMALIZACJE:
-        - Cached numpy arrays dla stałych wartości
-        - Mniej alokacji pamięci
-        - Unika kosztownej konwersji deque→list→array
+        ULTRA ZOPTYMALIZOWANA wersja viewport 16x16
+        Używa wektoryzacji NumPy zamiast pętli Python
         """
-        half_view = VIEWPORT_SIZE // 2
-        head = np.array(self.snake[0])
+        head = self.snake[0]  # Lista [y, x]
         
         # Zakres viewport w grid coordinates
-        y_start = head[0] - half_view
-        y_end = head[0] + half_view
-        x_start = head[1] - half_view
-        x_end = head[1] + half_view
+        y_start = head[0] - self.half_view
+        y_end = head[0] + self.half_view
+        x_start = head[1] - self.half_view
+        x_end = head[1] + self.half_view
         
         # Przecięcie z granicami planszy
         grid_y_start = max(0, y_start)
@@ -164,27 +180,24 @@ class SnakeEnv(gym.Env):
         if grid_y_end > grid_y_start and grid_x_end > grid_x_start:
             viewport[vp_y_start:vp_y_end, vp_x_start:vp_x_end] = 0.0
             
-            # MEGA OPTYMALIZACJA: Iteruj bezpośrednio po deque
-            # Pre-allocate array dla body segments
+            # MEGA OPTYMALIZACJA: Konwersja deque → numpy array JEDNORAZOWO
             if len(self.snake) > 1:
-                # Maksymalnie len(snake)-1 segmentów ciała (bez głowy)
-                max_body_len = len(self.snake) - 1
-                body_coords = np.empty((max_body_len, 2), dtype=np.int32)
-                body_count = 0
+                # Konwertuj całego węża na numpy array (O(n) raz zamiast O(n) razy)
+                snake_array = np.array(self.snake, dtype=np.int32)
                 
-                for i in range(1, len(self.snake)):  # Pomijamy głowę (index 0)
-                    segment = self.snake[i]
-                    gy, gx = segment[0], segment[1]
-                    
-                    # Sprawdź czy w viewport
-                    if grid_y_start <= gy < grid_y_end and grid_x_start <= gx < grid_x_end:
-                        body_coords[body_count, 0] = gy - y_start
-                        body_coords[body_count, 1] = gx - x_start
-                        body_count += 1
+                # Filtruj segmenty w viewport (wektoryzacja)
+                body_array = snake_array[1:]  # Bez głowy
+                in_y_range = (body_array[:, 0] >= grid_y_start) & (body_array[:, 0] < grid_y_end)
+                in_x_range = (body_array[:, 1] >= grid_x_start) & (body_array[:, 1] < grid_x_end)
+                in_viewport = in_y_range & in_x_range
                 
-                # Wektoryzowane ustawienie ciała
-                if body_count > 0:
-                    viewport[body_coords[:body_count, 0], body_coords[:body_count, 1]] = 0.5
+                if np.any(in_viewport):
+                    body_coords = body_array[in_viewport]
+                    # Przelicz na współrzędne viewport
+                    vp_coords_y = body_coords[:, 0] - y_start
+                    vp_coords_x = body_coords[:, 1] - x_start
+                    # Ustaw wartości (fancy indexing - szybkie)
+                    viewport[vp_coords_y, vp_coords_x] = 0.5
             
             # Głowa (zawsze w centrum jeśli widoczna)
             head_y, head_x = head[0], head[1]
@@ -200,34 +213,31 @@ class SnakeEnv(gym.Env):
         return viewport[:, :, np.newaxis]  # Dodaj wymiar kanału
 
     def _get_obs(self):
+        """
+        NAJSZYBSZA WERSJA - używa pre-computed stałych
+        """
         viewport = self._get_viewport_observation()
-        head = np.array(self.snake[0])
+        head = self.snake[0]  # Lista [y, x]
         
-        half_view = VIEWPORT_SIZE // 2
+        # Wektoryzowane obliczenia pozycji jedzenia względem głowy
+        food_viewport_x = self.food[1] - head[1] + self.half_view
+        food_viewport_y = self.food[0] - head[0] + self.half_view
         
-        # FIX 1: Poprawione osie X/Y - food[1] to X, food[0] to Y
-        food_viewport_x = self.food[1] - head[1] + half_view
-        food_viewport_y = self.food[0] - head[0] + half_view
+        # Normalizacja do [-1, 1]
+        dx_viewport = (food_viewport_x - self.half_view) / self.half_view
+        dy_viewport = (food_viewport_y - self.half_view) / self.half_view
         
-        # FIX 2: Prawidłowe przypisanie - X do dx, Y do dy
-        dx_viewport = (food_viewport_x - half_view) / half_view  # -1..1
-        dy_viewport = (food_viewport_y - half_view) / half_view  # -1..1
+        # ZERO OBLICZEŃ - używamy pre-computed lookup table!
+        direction_vec = DIRECTION_VECTORS[self.direction]
         
-        # FIX 3: Lepsze kodowanie kierunku (sin/cos)
-        # direction: 0=góra, 1=prawo, 2=dół, 3=lewo
-        # Rotacja: 0° = góra = (0, -1), 90° = prawo = (1, 0), itd.
-        angle = self.direction * math.pi / 2
-        direction_x = math.sin(angle)  # sin daje X (lewo-prawo)
-        direction_y = -math.cos(angle)  # -cos daje Y (góra-dół)
-        
-        # Oblicz potencjalne kolizje
+        # Kolizje - już zoptymalizowane
         front_coll = self._get_potential_collision(self.direction)
         left_coll = self._get_potential_collision((self.direction - 1) % 4)
         right_coll = self._get_potential_collision((self.direction + 1) % 4)
 
         return {
             'image': viewport,
-            'direction': np.array([direction_x, direction_y], dtype=np.float32),
+            'direction': direction_vec,  # Gotowy array z lookup table
             'dx_head': np.array([dx_viewport], dtype=np.float32),
             'dy_head': np.array([dy_viewport], dtype=np.float32),
             'front_coll': np.array([front_coll], dtype=np.float32),
@@ -239,10 +249,10 @@ class SnakeEnv(gym.Env):
         self.steps += 1
         self.steps_without_food += 1
 
-        terminated = False  # śmierć/wygrana
-        truncated = False   # timeout/max_steps
+        terminated = False
+        truncated = False
 
-        # Reset komponentów nagród dla tego kroku
+        # Reset komponentów nagród
         step_rewards = {
             'food': 0.0,
             'distance_shaping': 0.0,
@@ -250,25 +260,26 @@ class SnakeEnv(gym.Env):
             'timeout_penalty': 0.0
         }
 
-        # Zapisz poprzednią pozycję i dystans
-        prev_head = np.array(self.snake[0])
+        # Zapisz poprzednią pozycję (jako lista, nie array!)
+        prev_head = self.snake[0]
+        # Manhattan distance bez abs() - używamy sumy różnic
         prev_dist = abs(prev_head[0] - self.food[0]) + abs(prev_head[1] - self.food[1])
 
-        # Aktualizacja kierunku przed ruchem
+        # Aktualizacja kierunku
         turn_penalty = 0.0
         if action == 1:  # skręć w lewo
             self.direction = (self.direction - 1) % 4
-            turn_penalty = -0.05  # kara za skręt
+            turn_penalty = -0.05
         elif action == 2:  # skręć w prawo
             self.direction = (self.direction + 1) % 4
-            turn_penalty = -0.05  # kara za skręt
+            turn_penalty = -0.05
 
-        # Ruch węża
-        head = prev_head + DIRECTIONS[self.direction]
+        # Ruch węża - ZOPTYMALIZOWANE (bez konwersji na array)
+        delta = DIRECTIONS[self.direction]
+        head = [prev_head[0] + delta[0], prev_head[1] + delta[1]]
 
-        # === UPROSZCZONY SYSTEM NAGRÓD ===
-        reward = -0.01  # Mała kara za krok
-        reward += turn_penalty  # kara za skręt
+        # Uproszczony system nagród
+        reward = -0.01 + turn_penalty
 
         # 1. KOLIZJA - ŚMIERĆ
         if self._is_collision(head):
@@ -280,11 +291,9 @@ class SnakeEnv(gym.Env):
 
             obs = self._get_obs()
 
-            # Aktualizuj totalne komponenty
             for key in step_rewards:
                 self.reward_components[key] += step_rewards[key]
 
-            # Oblicz steps_per_apple (średnia liczba kroków na jabłko)
             score = len(self.snake) - 1
             steps_per_apple = self.steps / score if score > 0 else self.steps
 
@@ -301,21 +310,19 @@ class SnakeEnv(gym.Env):
             return obs, reward, terminated, truncated, info
 
         # 2. Dodaj nową głowę
-        self.snake.appendleft(head.tolist())
+        self.snake.appendleft(head)
         self.snake_set.add(tuple(head))
 
         # 3. ZJEDZENIE JEDZENIA
-        if np.array_equal(head, self.food):
-            # Nagroda za jedzenie
+        if head[0] == self.food[0] and head[1] == self.food[1]:
             food_reward = 20.0
             step_rewards['food'] = food_reward
             reward += food_reward
 
-            # Reset
             self.food = self._place_food()
             self.steps_without_food = 0
 
-            # Sprawdź wygraną (cała plansza wypełniona)
+            # Sprawdź wygraną
             if len(self.snake) == self.grid_size * self.grid_size:
                 self.done = True
                 terminated = True
@@ -323,11 +330,11 @@ class SnakeEnv(gym.Env):
                 step_rewards['win_bonus'] = win_bonus
                 reward += win_bonus
         else:
-            # Usuń ogon (nie zjedzono jedzenia)
+            # Usuń ogon
             tail = self.snake.pop()
             self.snake_set.discard(tuple(tail))
 
-            # 4. DISTANCE SHAPING (subtelny)
+            # Distance shaping
             new_dist = abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])
             dist_change = prev_dist - new_dist
             distance_reward = dist_change * 0.05
@@ -360,7 +367,6 @@ class SnakeEnv(gym.Env):
         self.total_reward += reward
         obs = self._get_obs()
 
-        # Oblicz steps_per_apple (średnia liczba kroków na jabłko)
         score = len(self.snake) - 1
         steps_per_apple = self.steps / score if score > 0 else self.steps
 
@@ -406,13 +412,8 @@ def make_env(render_mode=None, grid_size=None):
     """
     Tworzy środowisko Snake - BEZ SequenceWrapper i BEZ DictFrameStack
     RecurrentPPO obsługuje sekwencje i pamięć sam
-    
-    Args:
-        render_mode: Tryb renderowania ('human' lub None)
-        grid_size: Rozmiar siatki - jeśli None, losowany z zakresu config (min_grid_size, max_grid_size)
     """
     def _init():
-        # Losuj grid_size z zakresu config jeśli nie podano
         actual_grid_size = grid_size
         if actual_grid_size is None:
             min_size = config['environment']['min_grid_size']
