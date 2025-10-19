@@ -136,6 +136,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             load_model = False
             total_timesteps = 0
             use_config_hyperparams = True
+            
+            # ✅ RESETOWANIE CSV: train_progress.csv
             try:
                 train_csv = os.path.join(base_dir, config['paths']['train_csv_path'])
                 if os.path.exists(train_csv):
@@ -143,6 +145,15 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                     print(f"Usunięto istniejący plik postępu treningu: {train_csv}")
             except Exception as e:
                 print(f"Nie udało się usunąć pliku postępu treningu: {e}")
+            
+            # ✅ RESETOWANIE CSV: gradient_monitor.csv
+            try:
+                gradient_csv = os.path.join(base_dir, 'logs', 'gradient_monitor.csv')
+                if os.path.exists(gradient_csv):
+                    os.remove(gradient_csv)
+                    print(f"Usunięto istniejący plik gradient monitor: {gradient_csv}")
+            except Exception as e:
+                print(f"Nie udało się usunąć pliku gradient monitor: {e}")
         else:
             try:
                 resp2 = input("Użyć hyperparametrów z configu zamiast z modelu? [[Y]/n]: ").strip()

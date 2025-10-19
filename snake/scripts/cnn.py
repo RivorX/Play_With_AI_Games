@@ -16,71 +16,10 @@ with open(config_path, 'r', encoding='utf-8') as f:
 _INFO_PRINTED = False
 
 
-class LayerNormLSTM(nn.Module):
-    """
-    LSTM z Layer Normalization - zapobiega saturacji Cell State
-    KLUCZOWA NAPRAWA dla problemu LSTM Cell State = 1.8-2.0
-    """
-    def __init__(self, input_size, hidden_size, num_layers=1, batch_first=True):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.batch_first = batch_first
-        
-        # Standardowy LSTM
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=batch_first)
-        
-        # Layer Norm dla każdej warstwy LSTM (zapobiega saturacji hidden state)
-        self.layer_norms = nn.ModuleList([
-            nn.LayerNorm(hidden_size) for _ in range(num_layers)
-        ])
-        
-        # Inicjalizacja LSTM (zapobiega wczesnej saturacji)
-        self._init_lstm_weights()
-        
-    def _init_lstm_weights(self):
-        """Specjalna inicjalizacja dla stabilnego LSTM"""
-        for name, param in self.lstm.named_parameters():
-            if 'weight_ih' in name:
-                nn.init.xavier_normal_(param, gain=0.5)
-            elif 'weight_hh' in name:
-                nn.init.orthogonal_(param, gain=0.5)
-            elif 'bias' in name:
-                nn.init.constant_(param, 0)
-                # Forget gate bias = 1.0 (zapobiega zanikaniu pamięci)
-                n = param.size(0)
-                param.data[n//4:n//2].fill_(1.0)
-        
-    def forward(self, x, hidden=None):
-        # LSTM forward
-        output, (h, c) = self.lstm(x, hidden)
-        
-        # ✅ KLUCZOWA NAPRAWA: Aplikuj Layer Norm do hidden states
-        # To zapobiega saturacji (h >>1.0) która powodowała gradient vanishing
-        h_norm = torch.stack([
-            self.layer_norms[i](h[i]) for i in range(self.num_layers)
-        ])
-        
-        # Cell state zostawiamy bez norm (ważne dla pamięci długoterminowej)
-        # Ale clippujemy żeby nie eksplodował
-        c_clipped = torch.clamp(c, -2.0, 2.0)
-        
-        return output, (h_norm, c_clipped)
-
-
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     """
-    NAPRAWIONY Features Extractor - USUNIĘTE BOTTLENECKI
-    
-    ZMIANY:
-    1. ✅ LayerNorm LSTM - zapobiega saturacji Cell State (1.8→0.5)
-    2. ✅ Gradient Clipping w LSTM
-    3. ✅ Usunięto zbędne dropouty z CNN (BatchNorm wystarczy)
-    4. ✅ ReLU zamiast LeakyReLU dla skalarów (silniejsze gradienty)
-    5. ✅ Xavier init zamiast He (lepsze dla małych sieci)
-    6. ✅ Stabilna fusion bez learnable weights
-    7. ✅ Większa architektura CNN [32,64,128]
-    8. ✅ Dwuwarstwowe Scalar MLP [128,64]
+    NAPRAWIONY Features Extractor z silu - USUNIĘTE BOTTLENECKI
+
     """
     def __init__(self, observation_space: spaces.Dict, features_dim=256):
         super().__init__(observation_space, features_dim)
@@ -103,7 +42,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         in_channels = 1
         
         # ===========================
-        # CNN Z POPRAWIONYM RESIDUAL
+        # CNN Z POPRAWIONYM RESIDUAL + silu
         # ===========================
         # Warstwa 1 (16x16 → 16x16, stride=1)
         self.conv1 = nn.Conv2d(in_channels, cnn_channels[0], kernel_size=3, stride=1, padding=1)
@@ -146,14 +85,14 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         self.cnn_norm = nn.LayerNorm(cnn_dim)
         
         # ===========================
-        # SCALARS Z POPRAWIONYM MLP
+        # SCALARS Z silu MLP
         # ===========================
         scalar_dim = 7  # 2 (direction) + 5 (inne)
         
         # Input dropout dla wymuszania CNN
         self.scalar_input_dropout = nn.Dropout(scalar_input_dropout)
         
-        # ✅ ZMIANA: ReLU zamiast LeakyReLU (silniejsze gradienty)
+        # 🆕 silu zamiast ReLU - lepsze gradienty, smooth activation
         scalar_layers = []
         prev_dim = scalar_dim
         
@@ -161,7 +100,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
             scalar_layers.extend([
                 nn.Linear(prev_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
-                nn.ReLU(inplace=True),  # ✅ ReLU zamiast LeakyReLU
+                nn.SiLU(),  # 🆕 SiLU zamiast ReLU (smooth, non-monotonic)
                 nn.Dropout(scalar_dropout) if idx < len(scalar_hidden_dims)-1 else nn.Identity()
             ])
             prev_dim = hidden_dim
@@ -173,16 +112,15 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         self.scalar_norm = nn.LayerNorm(scalar_output_dim)
         
         # ===========================
-        # STABILNA FUSION (bez learnable weights)
+        # STABILNA FUSION (bez learnable weights) + silu
         # ===========================
         total_dim = cnn_dim + scalar_output_dim
         
-        # ✅ USUNIĘTO learnable weights (powodowały niestabilność)
-        # Zamiast tego: normalizacja + linear
+
         self.final_linear = nn.Sequential(
             nn.LayerNorm(total_dim),  # Normalizacja PRZED linear
             nn.Linear(total_dim, features_dim),
-            nn.ReLU(inplace=True),
+            nn.SiLU(),  # 🆕 SiLU zamiast ReLU
             nn.Dropout(fusion_dropout)
         )
         
@@ -197,12 +135,13 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         if not _INFO_PRINTED:
             amp_status = "✅ ENABLED" if self.use_amp else "❌ DISABLED (CPU mode)"
             print(f"\n{'='*70}")
-            print(f"[CNN] FEATURES EXTRACTORE")
+            print(f"[CNN] FEATURES EXTRACTOR 🆕 WITH silu")
             print(f"{'='*70}")
             print(f"[CNN] Architektura CNN: {cnn_channels}")
             print(f"[CNN] ✅ Residual connections: ENABLED")
             print(f"[CNN] ✅ Dropout CNN: {cnn_dropout}")
             print(f"[CNN] ✅ AMP (Mixed Precision): {amp_status}")
+            print(f"[CNN] 🆕 Activation: silu (smooth, non-monotonic)")
             print(f"[CNN] Spatial size po CNN: {spatial_size}x{spatial_size}")
             print(f"[CNN] CNN output dim: {cnn_dim}")
             print(f"[CNN] Scalar hidden dims: {scalar_hidden_dims}")
@@ -244,7 +183,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
 
     def forward(self, observations):
         # ===========================
-        # CNN Z AMP I RESIDUAL CONNECTIONS
+        # CNN Z AMP I RESIDUAL CONNECTIONS + silu
         # ===========================
         image = observations['image']
         if image.dim() == 4 and image.shape[-1] == 1:
@@ -255,7 +194,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
             # Warstwa 1
             x = self.conv1(image)
             x = self.bn1(x)
-            x = F.leaky_relu(x, 0.01, inplace=True)
+            x = F.silu(x)  # 🆕 SiLU zamiast LeakyReLU
             # BRAK dropout1
             identity1 = x
             
@@ -268,7 +207,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
             identity1 = self.residual_bn(identity1)
             
             x = x + identity1  # ✅ RESIDUAL CONNECTION
-            x = F.leaky_relu(x, 0.01, inplace=True)
+            x = F.silu(x)  # 🆕 SiLU
             x = self.dropout2(x)
             
             # Warstwa 3 (jeśli istnieje) z residual
@@ -281,7 +220,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
                 identity2 = self.residual_bn2(identity2)
                 
                 x = x + identity2  # ✅ RESIDUAL CONNECTION
-                x = F.leaky_relu(x, 0.01, inplace=True)
+                x = F.silu(x)  # 🆕 SiLU
                 x = self.dropout3(x)
             
             # Flatten
@@ -292,7 +231,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         image_features = self.cnn_norm(image_features)
         
         # ===========================
-        # SCALARS Z ReLU
+        # SCALARS Z silu
         # ===========================
         scalars = torch.cat([
             observations['direction'],
@@ -308,7 +247,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         scalar_features = self.scalar_norm(scalar_features)
         
         # ===========================
-        # STABILNA FUSION (bez weighted)
+        # STABILNA FUSION (bez weighted) + silu
         # ===========================
         features = torch.cat([image_features, scalar_features], dim=-1)
         return self.final_linear(features)
