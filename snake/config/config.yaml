@@ -26,22 +26,22 @@ model:
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.05                     # Współczynnik entropii (początkowy)
-  min_ent_coef: 0.01                # Minimalny współczynnik entropii (docelowy)
+  min_ent_coef: 0.01                 # Minimalny współczynnik entropii (docelowy)
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   
   # ✅ NOWE: Konfiguracja optymalizatora
   optimizer:
     type: adamw                      # Typ: 'adam' lub 'adamw'
-    weight_decay: 0.01               # Weight decay dla AdamW (0.0 = wyłączone)
-    eps: 1.0e-5                      # Epsilon dla stabilności
+    weight_decay: 0.001               # Weight decay dla AdamW (0.0 = wyłączone)
+    eps: 1.0e-6                      # Epsilon dla stabilności
     betas: [0.9, 0.999]              # Beta1, Beta2 dla Adam/AdamW
   
   # Selektywne dropouty - WYMUSZAJĄ używanie CNN!
   cnn_dropout: 0.0                   # Dropout dla CNN
-  scalar_dropout: 0.05               # Dropout dla skalarów
-  scalar_input_dropout: 0.1          # Dropout dla wejścia skalarów
-  fusion_dropout: 0.02               # Dropout po fuzji
+  scalar_dropout: 0.01               # Dropout dla skalarów
+  scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
+  fusion_dropout: 0.01               # Dropout po fuzji
   convlstm:
     cnn_channels: [32, 64]           # Liczba kanałów w warstwach konwolucyjnych
     scalar_hidden_dims: [64]         # Ukryte wymiary dla danych skalarnych 
@@ -54,7 +54,7 @@ model:
       vf: [256, 128]                 # Wielkość sieci krytyka
     lstm_hidden_size: 256            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
-    enable_critic_lstm: true         # LSTM także dla krytyka
+    enable_critic_lstm: false         # LSTM także dla krytyka
 
 # Konfiguracja treningu
 training:

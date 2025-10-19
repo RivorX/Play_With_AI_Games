@@ -49,7 +49,7 @@ def apply_gradient_clipping(model, clip_value=1.0):
         print(f"[GRADIENT CLIPPING] ✅ Enabled for LSTM Actor (clip_value={clip_value})")
     
     # Opcjonalnie dla LSTM critic (jeśli enable_critic_lstm=true)
-    if hasattr(model.policy, 'lstm_critic'):
+    if hasattr(model.policy, 'lstm_critic') and model.policy.lstm_critic is not None:
         model.policy.lstm_critic.register_full_backward_hook(clip_grad_hook)
         print(f"[GRADIENT CLIPPING] ✅ Enabled for LSTM Critic (clip_value={clip_value})")
 
