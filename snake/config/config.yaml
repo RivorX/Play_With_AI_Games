@@ -33,18 +33,18 @@ model:
   # ✅ NOWE: Konfiguracja optymalizatora
   optimizer:
     type: adamw                      # Typ: 'adam' lub 'adamw'
-    weight_decay: 0.001               # Weight decay dla AdamW (0.0 = wyłączone)
+    weight_decay: 0.01               # Weight decay dla AdamW (0.0 = wyłączone)
     eps: 1.0e-6                      # Epsilon dla stabilności
     betas: [0.9, 0.999]              # Beta1, Beta2 dla Adam/AdamW
   
   # Selektywne dropouty - WYMUSZAJĄ używanie CNN!
   cnn_dropout: 0.0                   # Dropout dla CNN
-  scalar_dropout: 0.01               # Dropout dla skalarów
+  scalar_dropout: 0.0                # Dropout dla skalarów
   scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
-  fusion_dropout: 0.01               # Dropout po fuzji
+  fusion_dropout: 0.0                # Dropout po fuzji
   convlstm:
-    cnn_channels: [32, 64]           # Liczba kanałów w warstwach konwolucyjnych
-    scalar_hidden_dims: [64]         # Ukryte wymiary dla danych skalarnych 
+    cnn_channels: [32, 64]          # Liczba kanałów w warstwach konwolucyjnych
+    scalar_hidden_dims: [128, 64]         # Ukryte wymiary dla danych skalarnych 
 
   policy_kwargs:
     features_extractor_kwargs:
@@ -54,7 +54,7 @@ model:
       vf: [256, 128]                 # Wielkość sieci krytyka
     lstm_hidden_size: 256            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
-    enable_critic_lstm: false         # LSTM także dla krytyka
+    enable_critic_lstm: false        # LSTM dla krytyka
 
 # Konfiguracja treningu
 training:
@@ -68,8 +68,8 @@ training:
   enable_channel_logs: false         # Włącz logi kanałów
   gradient_log_freq: 2000            # ✅ NOWE: Co ile kroków logować gradienty/wagi
   # Liczba środowisk do ewaluacji równoległej
-  eval_n_envs: 6                    # Liczba środowisk ewaluacyjnych
-  eval_n_repeats: 2                 # Ile razy każde środowisko ma wykonać ewaluację
+  eval_n_envs: 6                     # Liczba środowisk ewaluacyjnych
+  eval_n_repeats: 2                  # Ile razy każde środowisko ma wykonać ewaluację
   
   # Konfiguracja normalizacji (PRZEŁĄCZNIKI)
   normalization:
