@@ -10,7 +10,7 @@ from scipy.ndimage import gaussian_filter
 def analyze_basic_states(model, env, output_dirs, action_names, config):
     """
     Analiza podstawowych stanów: aktywacje, attention heatmaps, gradienty
-    🆕 FIXED: Simplified Pre-LN (no skip connections, 2 CNN layers, GELU)
+    🆕 UPDATED: Moderate Compression (1024) + Residual Connection
     """
     policy = model.policy
     features_extractor = policy.features_extractor
@@ -85,44 +85,47 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
                 'action': action_idx
             }
             
-            # 🆕 CNN FEATURES - Simplified Pre-LN (NO SKIP, 2 LAYERS)
+            # 🆕 CNN FEATURES - Moderate Compression + Residual
             image = obs_tensor['image']
             if image.dim() == 4 and image.shape[-1] == 1:
                 image = image.permute(0, 3, 1, 2)
             
-            # Input BN
-            if hasattr(features_extractor, 'input_bn'):
-                x = features_extractor.input_bn(image)
-            else:
-                x = image
+            # CNN layers (bez input_bn)
+            x = image
             
             # Layer 1
             x = features_extractor.conv1(x)
             x = features_extractor.bn1(x)
-            x = torch.nn.functional.gelu(x)  # 🆕 GELU
+            x = torch.nn.functional.gelu(x)
             
-            # Layer 2 with Pre-Norm (NO SKIP)
-            if hasattr(features_extractor, 'pre_bn2'):
-                x = features_extractor.pre_bn2(x)
+            # Layer 2
             x = features_extractor.conv2(x)
             x = features_extractor.bn2(x)
-            x = torch.nn.functional.gelu(x)  # 🆕 GELU
+            x = torch.nn.functional.gelu(x)
             x = features_extractor.dropout2(x)
             
-            # No Conv3 - REMOVED
+            # Flatten
+            cnn_raw = features_extractor.flatten(x)
+            cnn_raw = cnn_raw.float()
             
-            cnn_features = features_extractor.flatten(x)
-            cnn_features = cnn_features.float()
+            # 🆕 RESIDUAL CONNECTION
+            cnn_compressed = features_extractor.cnn_compress(cnn_raw)
+            cnn_skip = features_extractor.cnn_residual(cnn_raw)
+            cnn_features = cnn_compressed + cnn_skip  # ✅ Residual
             
-            # Pre-LN norm
-            if hasattr(features_extractor, 'cnn_pre_norm'):
-                cnn_features = features_extractor.cnn_pre_norm(cnn_features)
-            
+            state_activations['cnn_raw_mean'] = cnn_raw.abs().mean().item()
+            state_activations['cnn_raw_max'] = cnn_raw.abs().max().item()
+            state_activations['cnn_compressed_mean'] = cnn_compressed.abs().mean().item()
+            state_activations['cnn_skip_mean'] = cnn_skip.abs().mean().item()
             state_activations['cnn_output_mean'] = cnn_features.abs().mean().item()
             state_activations['cnn_output_max'] = cnn_features.abs().max().item()
             state_activations['cnn_output_std'] = cnn_features.std().item()
             
-            # SCALAR FEATURES (unchanged)
+            # 🆕 Gradient scaling check (tylko w training mode)
+            if hasattr(features_extractor, 'cnn_gradient_scale'):
+                state_activations['cnn_gradient_scale'] = features_extractor.cnn_gradient_scale
+            
+            # SCALAR FEATURES
             scalars = torch.cat([
                 obs_tensor['direction'],
                 obs_tensor['dx_head'],
@@ -135,12 +138,13 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             scalars = features_extractor.scalar_input_dropout(scalars)
             scalar_features = features_extractor.scalar_linear(scalars)
             
-            if hasattr(features_extractor, 'scalar_pre_norm'):
-                scalar_features = features_extractor.scalar_pre_norm(scalar_features)
-            
             state_activations['scalar_output_mean'] = scalar_features.abs().mean().item()
             state_activations['scalar_output_max'] = scalar_features.abs().max().item()
             state_activations['scalar_output_std'] = scalar_features.std().item()
+            
+            # 🆕 Gradient scaling check
+            if hasattr(features_extractor, 'scalar_gradient_scale'):
+                state_activations['scalar_gradient_scale'] = features_extractor.scalar_gradient_scale
             
             # COMBINED FEATURES
             features = features_extractor(obs_tensor)
@@ -218,6 +222,7 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
         
         print(f"  Wybrany action: {action_names[action_idx]}")
         print(f"  Prawdopodobieństwa: lewo={action_probs[0]:.3f}, prosto={action_probs[1]:.3f}, prawo={action_probs[2]:.3f}")
+        print(f"  🆕 CNN raw: {state_activations['cnn_raw_mean']:.4f}, compressed: {state_activations['cnn_compressed_mean']:.4f}, skip: {state_activations['cnn_skip_mean']:.4f}")
     
     return action_probs_list, detailed_activations, layer_gradients, attention_heatmaps
 
@@ -225,7 +230,7 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
 def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, output_dir, state_idx, action_names):
     """
     Generuje attention heatmap używając gradientów
-    🆕 FIXED: Simplified Pre-LN (no skip, 2 layers, GELU)
+    🆕 UPDATED: Moderate Compression + Residual
     """
     policy = model.policy
     features_extractor = policy.features_extractor
@@ -257,33 +262,30 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     
     image_grad.retain_grad()
     
-    # 🆕 Simplified Pre-LN CNN (NO SKIP)
-    if hasattr(features_extractor, 'input_bn'):
-        x = features_extractor.input_bn(image_grad)
-    else:
-        x = image_grad
+    # 🆕 CNN (bez input_bn)
+    x = image_grad
     
     # Layer 1
     x = features_extractor.conv1(x)
     x = features_extractor.bn1(x)
     x = torch.nn.functional.gelu(x)
     
-    # Layer 2 (NO SKIP)
-    if hasattr(features_extractor, 'pre_bn2'):
-        x = features_extractor.pre_bn2(x)
+    # Layer 2
     x = features_extractor.conv2(x)
     x = features_extractor.bn2(x)
     x = torch.nn.functional.gelu(x)
     x = features_extractor.dropout2(x)
     
-    # No Conv3
+    # Flatten
+    cnn_raw = features_extractor.flatten(x)
+    cnn_raw = cnn_raw.float()
     
-    cnn_output = features_extractor.flatten(x)
-    cnn_output = cnn_output.float()
+    # 🆕 RESIDUAL CONNECTION
+    cnn_compressed = features_extractor.cnn_compress(cnn_raw)
+    cnn_skip = features_extractor.cnn_residual(cnn_raw)
+    cnn_output = cnn_compressed + cnn_skip
     
-    if hasattr(features_extractor, 'cnn_pre_norm'):
-        cnn_output = features_extractor.cnn_pre_norm(cnn_output)
-    
+    # Scalars
     scalars_grad = torch.cat([
         obs_grad['direction'],
         obs_grad['dx_head'],
@@ -296,9 +298,7 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
     scalar_output = features_extractor.scalar_linear(scalars_grad)
     
-    if hasattr(features_extractor, 'scalar_pre_norm'):
-        scalar_output = features_extractor.scalar_pre_norm(scalar_output)
-    
+    # Fusion
     combined = torch.cat([cnn_output, scalar_output], dim=-1)
     features_final = features_extractor.final_linear(combined)
     
@@ -362,7 +362,7 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
 def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, features_extractor):
     """
     Oblicza gradienty dla wszystkich warstw
-    🆕 FIXED: Simplified Pre-LN (no skip, 2 layers, GELU)
+    🆕 UPDATED: Moderate Compression + Residual
     """
     policy = model.policy
     
@@ -389,51 +389,49 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     if image_grad.dim() == 4 and image_grad.shape[-1] == 1:
         image_grad = image_grad.permute(0, 3, 1, 2)
     
-    # 🆕 CNN layers (SIMPLIFIED - NO SKIP, 2 LAYERS)
+    # 🆕 CNN layers (bez input_bn)
     cnn_intermediates = []
     x_cnn = image_grad
-    
-    if hasattr(features_extractor, 'input_bn'):
-        x_cnn = features_extractor.input_bn(x_cnn)
-        x_cnn.retain_grad()
-        cnn_intermediates.append(('cnn', 0, 'InputBN', x_cnn))
     
     # Layer 1
     x_cnn = features_extractor.conv1(x_cnn)
     x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 1, 'Conv2d-1', x_cnn))
+    cnn_intermediates.append(('cnn', 0, 'Conv2d-1', x_cnn))
     x_cnn = features_extractor.bn1(x_cnn)
     x_cnn = torch.nn.functional.gelu(x_cnn)
     x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 2, 'GELU-1', x_cnn))
+    cnn_intermediates.append(('cnn', 1, 'GELU-1', x_cnn))
     
-    # Layer 2 (NO SKIP)
-    if hasattr(features_extractor, 'pre_bn2'):
-        x_cnn = features_extractor.pre_bn2(x_cnn)
-        x_cnn.retain_grad()
-        cnn_intermediates.append(('cnn', 3, 'PreBN2', x_cnn))
-    
+    # Layer 2
     x_cnn = features_extractor.conv2(x_cnn)
     x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 4, 'Conv2d-2', x_cnn))
+    cnn_intermediates.append(('cnn', 2, 'Conv2d-2', x_cnn))
     x_cnn = features_extractor.bn2(x_cnn)
     x_cnn = torch.nn.functional.gelu(x_cnn)
     x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 5, 'GELU-2', x_cnn))
+    cnn_intermediates.append(('cnn', 3, 'GELU-2', x_cnn))
     x_cnn = features_extractor.dropout2(x_cnn)
     
-    # No Conv3
+    # Flatten
+    cnn_raw = features_extractor.flatten(x_cnn)
+    cnn_raw = cnn_raw.float()
+    cnn_raw.retain_grad()
+    cnn_intermediates.append(('cnn', 4, 'Flatten', cnn_raw))
     
-    cnn_output = features_extractor.flatten(x_cnn)
-    cnn_output = cnn_output.float()
+    # 🆕 RESIDUAL CONNECTION
+    cnn_compressed = features_extractor.cnn_compress(cnn_raw)
+    cnn_compressed.retain_grad()
+    cnn_intermediates.append(('cnn', 5, 'Compressed', cnn_compressed))
     
-    if hasattr(features_extractor, 'cnn_pre_norm'):
-        cnn_output = features_extractor.cnn_pre_norm(cnn_output)
+    cnn_skip = features_extractor.cnn_residual(cnn_raw)
+    cnn_skip.retain_grad()
+    cnn_intermediates.append(('cnn', 6, 'Residual', cnn_skip))
     
+    cnn_output = cnn_compressed + cnn_skip
     cnn_output.retain_grad()
-    cnn_intermediates.append(('cnn', len(cnn_intermediates), 'Flatten+Norm', cnn_output))
+    cnn_intermediates.append(('cnn', 7, 'Residual+Main', cnn_output))
     
-    # Scalar layers (unchanged)
+    # Scalar layers
     scalars_grad = torch.cat([
         obs_grad['direction'],
         obs_grad['dx_head'],
@@ -449,15 +447,13 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     x_scalar = scalars_grad
     for i, layer in enumerate(features_extractor.scalar_linear):
         x_scalar = layer(x_scalar)
-        if isinstance(layer, (torch.nn.Linear, torch.nn.GELU, torch.nn.LayerNorm)):  # 🆕 GELU
+        if isinstance(layer, (torch.nn.Linear, torch.nn.GELU, torch.nn.LayerNorm)):
             x_scalar.retain_grad()
             scalar_intermediates.append(('scalar', i, layer.__class__.__name__, x_scalar))
     
-    if hasattr(features_extractor, 'scalar_pre_norm'):
-        scalar_output = features_extractor.scalar_pre_norm(x_scalar)
-    
+    scalar_output = x_scalar
     scalar_output.retain_grad()
-    scalar_intermediates.append(('scalar', len(scalar_intermediates), 'Norm', scalar_output))
+    scalar_intermediates.append(('scalar', len(scalar_intermediates), 'Output', scalar_output))
     
     # Combined features
     combined = torch.cat([cnn_output, scalar_output], dim=-1)
@@ -626,10 +622,13 @@ def visualize_viewport(obs, output_dir, state_idx):
 
 
 def analyze_bottlenecks(layer_gradients, action_names, output_dir):
-    """Analiza bottlenecków w sieci"""
+    """
+    Analiza bottlenecków w sieci
+    🆕 UPDATED: Dodano etykiety dla residual connections
+    """
     print("\n=== Analiza bottlenecków (aktywacje vs gradienty) ===")
     
-    fig, axes = plt.subplots(3, 1, figsize=(16, 14))
+    fig, axes = plt.subplots(3, 1, figsize=(18, 14))
     
     bottleneck_report = []
     

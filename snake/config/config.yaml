@@ -21,7 +21,7 @@ model:
   learning_rate: 0.0003              # Szybkość uczenia 
   min_learning_rate: 0.00005         # Minimalny learning rate
   n_steps: 512                       # Liczba kroków na aktualizację
-  n_epochs: 3                        # Liczba epok 
+  n_epochs: 4                        # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
@@ -33,18 +33,38 @@ model:
   # ✅ NOWE: Konfiguracja optymalizatora
   optimizer:
     type: adamw                      # Typ: 'adam' lub 'adamw'
-    weight_decay: 0.01               # Weight decay dla AdamW (0.0 = wyłączone)
+    weight_decay: 0.005              # Weight decay dla AdamW (0.0 = wyłączone)
     eps: 1.0e-6                      # Epsilon dla stabilności
     betas: [0.9, 0.999]              # Beta1, Beta2 dla Adam/AdamW
+
+  # 🆕 LSTM Configuration (Fix 2)
+  lstm:
+    gradient_clip_val: 1.0           # Clip gradients LSTM
+    cell_state_penalty: 0.001        # L2 penalty na cell state
+    hidden_state_penalty: 0.0001     # L2 penalty na hidden state
+    dropout: 0.1                     # Dropout w LSTM
   
-  # Selektywne dropouty - WYMUSZAJĄ używanie CNN!
-  cnn_dropout: 0.0                   # Dropout dla CNN
-  scalar_dropout: 0.0                # Dropout dla skalarów
+  # Selektywne dropouty
+  cnn_dropout: 0.01                  # Dropout dla CNN
+  scalar_dropout: 0.01               # Dropout dla skalarów
   scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
-  fusion_dropout: 0.0                # Dropout po fuzji
+  fusion_dropout: 0.05               # Dropout po fuzji
+  
+  # 🔥 LIGHTWEIGHT CNN ARCHITECTURE (4GB VRAM)
   convlstm:
-    cnn_channels: [32, 64]          # Liczba kanałów w warstwach konwolucyjnych
-    scalar_hidden_dims: [128, 64]         # Ukryte wymiary dla danych skalarnych 
+    cnn_channels: [32, 64]           # Kanały CNN (nie zmieniaj)
+    
+    # 🆕 CNN Bottleneck Architecture (zoptymalizowane pod 4GB VRAM)
+    cnn_bottleneck_dim: 384          # Mniejsze (było 512)
+    cnn_output_dim: 768              # Mniejsze (było 1024)
+    
+    # 🆕 Scalar Network Architecture  
+    scalar_hidden_dims: [128, 64]    # Mniejsze (było [256, 128, 128])
+    
+    # 🆕 Architecture Options
+    use_layernorm: true              # LayerNorm (OK dla VRAM)
+    learnable_alpha: true            # Learnable alpha (OK dla VRAM)
+    initial_alpha: 0.5               # Początkowa waga residual
 
   policy_kwargs:
     features_extractor_kwargs:
@@ -64,7 +84,7 @@ training:
   eval_freq: 4000                    # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 30       # Liczba ewaluacji bez poprawy przed zatrzymaniem
-  min_evals: 5                       # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
+  min_evals: 10                      # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
   enable_channel_logs: false         # Włącz logi kanałów
   gradient_log_freq: 2000            # ✅ NOWE: Co ile kroków logować gradienty/wagi
   # Liczba środowisk do ewaluacji równoległej
