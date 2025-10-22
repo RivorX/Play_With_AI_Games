@@ -7,7 +7,6 @@ import yaml
 from gymnasium import spaces
 import os
 
-# Wczytaj konfigurację
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r', encoding='utf-8') as f:
@@ -18,148 +17,127 @@ _INFO_PRINTED = False
 
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     """
-    🆕 SIMPLIFIED Pre-Layer Norm CNN
-    
-    CHANGES:
-    ✅ Removed skip connections (Pre-LN handles gradient flow)
-    ✅ Only 2 CNN layers (3rd removed)
-    ✅ Changed SiLU → GELU (better gradients)
-    ✅ Simplified architecture (less oversmoothing)
-    
-    ARCHITECTURE:
-    Input (16x16) → BN → Conv1 (32ch) → BN → GELU → Conv2 (64ch, stride=2) → BN → GELU → 8x8
     """
     def __init__(self, observation_space: spaces.Dict, features_dim=256):
         super().__init__(observation_space, features_dim)
         
         global _INFO_PRINTED
         
-        # Pobierz konfigurację (używamy tylko pierwszych 2 kanałów)
-        cnn_channels_full = config['model']['convlstm']['cnn_channels']
-        cnn_channels = cnn_channels_full[:2]  # [32, 64] - tylko 2 warstwy
-        scalar_hidden_dims = config['model']['convlstm']['scalar_hidden_dims']
+        # 🔧 Load from config
+        cnn_channels = config['model']['convlstm']['cnn_channels'][:2]
+        cnn_bottleneck_dim = config['model']['convlstm'].get('cnn_bottleneck_dim', 384)
+        cnn_output_dim = config['model']['convlstm'].get('cnn_output_dim', 768)
+        scalar_hidden_dims = config['model']['convlstm'].get('scalar_hidden_dims', [128, 64])
         
-        # Dropouty
         cnn_dropout = config['model'].get('cnn_dropout', 0.0)
         scalar_dropout = config['model'].get('scalar_dropout', 0.0)
-        scalar_input_dropout = config['model'].get('scalar_input_dropout', 0.0)
         fusion_dropout = config['model'].get('fusion_dropout', 0.0)
+        
+        use_layernorm = config['model']['convlstm'].get('use_layernorm', True)
+        learnable_alpha = config['model']['convlstm'].get('learnable_alpha', True)
+        initial_alpha = config['model']['convlstm'].get('initial_alpha', 0.5)
         
         self.use_amp = torch.cuda.is_available()
         in_channels = 1
         
-        # ===========================
-        # 🆕 SIMPLIFIED CNN (2 LAYERS, NO SKIP)
-        # ===========================
-        # Input BatchNorm
-        self.input_bn = nn.BatchNorm2d(in_channels)
-        
-        # Warstwa 1: 16x16 → 16x16 (stride=1)
+        # ==================== TRADITIONAL CNN (FAST!) ====================
         self.conv1 = nn.Conv2d(in_channels, cnn_channels[0], kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(cnn_channels[0])
         
-        # Warstwa 2: 16x16 → 8x8 (stride=2)
-        # 🆕 Pre-Norm BEFORE Conv2
-        self.pre_bn2 = nn.BatchNorm2d(cnn_channels[0])
         self.conv2 = nn.Conv2d(cnn_channels[0], cnn_channels[1], kernel_size=3, stride=2, padding=1)
         self.bn2 = nn.BatchNorm2d(cnn_channels[1])
         self.dropout2 = nn.Dropout2d(cnn_dropout) if cnn_dropout > 0 else nn.Identity()
         
         self.flatten = nn.Flatten()
         
-        # Oblicz wymiar po CNN
-        spatial_size = 16 // 2  # 16 → 8 (jeden stride=2)
-        cnn_output_size = spatial_size * spatial_size  # 64
-        cnn_dim = cnn_channels[1] * cnn_output_size  # 64 * 64 = 4096
+        # ==================== BOTTLENECK FIX ====================
+        spatial_size = 8
+        cnn_raw_dim = cnn_channels[1] * spatial_size * spatial_size  # 4096
         
-        # Pre-Norm dla CNN output
-        self.cnn_pre_norm = nn.LayerNorm(cnn_dim)
+        # Main path: 4096 → bottleneck → output
+        main_layers = [nn.Linear(cnn_raw_dim, cnn_bottleneck_dim)]
+        if use_layernorm:
+            main_layers.append(nn.LayerNorm(cnn_bottleneck_dim))
+        main_layers.extend([
+            nn.GELU(),
+            nn.Dropout(cnn_dropout),
+            nn.Linear(cnn_bottleneck_dim, cnn_output_dim)
+        ])
+        if use_layernorm:
+            main_layers.append(nn.LayerNorm(cnn_output_dim))
         
-        # ===========================
-        # SCALARS (UNCHANGED)
-        # ===========================
-        scalar_dim = 7  # 2 (direction) + 5 (inne)
-        self.scalar_input_dropout = nn.Dropout(scalar_input_dropout)
+        self.cnn_compress = nn.Sequential(*main_layers)
         
-        # 🆕 Pre-Norm MLP with GELU
+        # Skip connection: 4096 → output
+        skip_layers = [nn.Linear(cnn_raw_dim, cnn_output_dim, bias=False)]
+        if use_layernorm:
+            skip_layers.append(nn.LayerNorm(cnn_output_dim))
+        
+        self.cnn_residual = nn.Sequential(*skip_layers)
+        
+        # 🆕 Learnable or fixed residual weight
+        if learnable_alpha:
+            self.alpha = nn.Parameter(torch.tensor(initial_alpha))
+            self.alpha_mode = 'learnable'
+        else:
+            self.register_buffer('alpha', torch.tensor(initial_alpha))
+            self.alpha_mode = 'fixed'
+        
+        # ==================== SCALARS ====================
+        scalar_dim = 7
+        self.scalar_input_dropout = nn.Dropout(config['model'].get('scalar_input_dropout', 0.0))
+        
         scalar_layers = []
         prev_dim = scalar_dim
-        
         for idx, hidden_dim in enumerate(scalar_hidden_dims):
-            scalar_layers.extend([
-                nn.LayerNorm(prev_dim),
-                nn.Linear(prev_dim, hidden_dim),
-                nn.GELU(),  # 🆕 GELU zamiast SiLU
-                nn.Dropout(scalar_dropout) if idx < len(scalar_hidden_dims)-1 else nn.Identity()
-            ])
+            scalar_layers.append(nn.Linear(prev_dim, hidden_dim))
+            if use_layernorm:
+                scalar_layers.append(nn.LayerNorm(hidden_dim))
+            scalar_layers.append(nn.GELU())
+            if idx < len(scalar_hidden_dims) - 1:
+                scalar_layers.append(nn.Dropout(scalar_dropout))
             prev_dim = hidden_dim
         
         self.scalar_linear = nn.Sequential(*scalar_layers)
         scalar_output_dim = scalar_hidden_dims[-1]
-        self.scalar_pre_norm = nn.LayerNorm(scalar_output_dim)
         
-        # ===========================
-        # FUSION (UNCHANGED)
-        # ===========================
-        total_dim = cnn_dim + scalar_output_dim
+        # ==================== FUSION ====================
+        total_dim = cnn_output_dim + scalar_output_dim
         
         self.final_linear = nn.Sequential(
-            nn.LayerNorm(total_dim),
+            nn.LayerNorm(total_dim) if use_layernorm else nn.Identity(),
             nn.Linear(total_dim, features_dim),
-            nn.GELU(),  # 🆕 GELU zamiast SiLU
+            nn.GELU(),
             nn.Dropout(fusion_dropout)
         )
         
-        # ===========================
-        # XAVIER INITIALIZATION
-        # ===========================
         self._initialize_weights()
         
-        # ===========================
-        # LOGGING
-        # ===========================
+        # Count parameters
+        cnn_params = sum(p.numel() for p in self.conv1.parameters()) + \
+                     sum(p.numel() for p in self.conv2.parameters())
+        bottleneck_params = sum(p.numel() for p in self.cnn_compress.parameters()) + \
+                           sum(p.numel() for p in self.cnn_residual.parameters())
+        
         if not _INFO_PRINTED:
-            amp_status = "✅ ENABLED" if self.use_amp else "❌ DISABLED (CPU mode)"
             print(f"\n{'='*70}")
-            print(f"[CNN] 🆕 SIMPLIFIED PRE-LAYER NORM (NO SKIP, 2 LAYERS, GELU)")
+            print(f"[CNN] ⚡ CNN")
             print(f"{'='*70}")
-            print(f"[CNN] Architektura CNN: {cnn_channels} (3. warstwa USUNIĘTA)")
-            print(f"[CNN] ❌ Skip connections: REMOVED (Pre-LN handles gradient flow)")
-            print(f"[CNN] ✅ Pre-Layer Norm: ENABLED")
-            print(f"[CNN] ✅ Input BatchNorm: ENABLED")
-            print(f"[CNN] 🆕 Activation: GELU (better gradients than SiLU)")
-            print(f"[CNN] Spatial size po CNN: {spatial_size}x{spatial_size}")
-            print(f"[CNN] CNN output dim: {cnn_dim}")
-            print(f"[CNN] Scalar hidden dims: {scalar_hidden_dims}")
-            print(f"[CNN] Scalar output dim: {scalar_output_dim}")
-            print(f"[CNN] Total features dim: {total_dim} -> {features_dim}")
-            print(f"[CNN] Scalary stanowią {scalar_output_dim/total_dim*100:.1f}% wejścia")
-            print(f"\n[DROPOUT]")
-            print(f"  - CNN: {cnn_dropout}")
-            print(f"  - Scalar INPUT: {scalar_input_dropout}")
-            print(f"  - Scalar hidden: {scalar_dropout}")
-            print(f"  - Fusion: {fusion_dropout}")
-            
-            print(f"\n[WHY THESE CHANGES?]")
-            print(f"  🎯 Pre-LN already stabilizes gradients → skip redundant")
-            print(f"  🎯 2 CNN layers enough for 16x16 viewport")
-            print(f"  🎯 GELU > SiLU for vanishing gradients (smoother)")
-            print(f"  🎯 Simpler = less oversmoothing = better features")
-            
-            if self.use_amp:
-                print(f"\n[AMP] 🚀 Expected speedup: 30-50% (RTX series)")
-
+            print(f"[CNN] Architecture: {cnn_raw_dim} → {cnn_bottleneck_dim} → {cnn_output_dim}")
+            print(f"[CNN] ✅ Bottleneck compression: {cnn_raw_dim/cnn_bottleneck_dim:.1f}x")
+            print(f"[CNN] ✅ LayerNorm: {use_layernorm}")
+            print(f"[CNN] ✅ Alpha mode: {self.alpha_mode} (init={initial_alpha:.2f})")
+            print(f"[CNN] 📊 CNN params: {cnn_params:,}")
+            print(f"[CNN] 📊 Bottleneck params: {bottleneck_params:,}")
+            print(f"[SCALARS] Hidden dims: {scalar_hidden_dims}")
+            print(f"[SCALARS] Output: {scalar_output_dim} ({scalar_output_dim/total_dim*100:.1f}%)")
+            print(f"[BALANCE] CNN:Scalar ratio: {cnn_output_dim/scalar_output_dim:.1f}:1")
             print(f"{'='*70}\n")
             _INFO_PRINTED = True
 
     def _initialize_weights(self):
-        """Xavier initialization (gain=1.0 dla Pre-LN)"""
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.xavier_normal_(m.weight, gain=1.0)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.xavier_normal_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
@@ -168,39 +146,42 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, observations):
-        # ===========================
-        # 🆕 SIMPLIFIED CNN (NO SKIP)
-        # ===========================
         image = observations['image']
         if image.dim() == 4 and image.shape[-1] == 1:
             image = image.permute(0, 3, 1, 2)
         
+        # ==================== TRADITIONAL CNN ====================
         with autocast('cuda', enabled=self.use_amp):
-            # Input normalization
-            x = self.input_bn(image)
+            x = image
             
-            # Warstwa 1 (bez pre-norm, bo input_bn już jest)
+            # Block 1: 16×16 → 16×16
             x = self.conv1(x)
             x = self.bn1(x)
-            x = F.gelu(x)  # 🆕 GELU
+            x = F.gelu(x)
             
-            # Warstwa 2 z Pre-Norm (BEZ SKIP CONNECTION)
-            x = self.pre_bn2(x)  # 🆕 Norm BEFORE Conv2
+            # Block 2: 16×16 → 8×8
             x = self.conv2(x)
             x = self.bn2(x)
-            x = F.gelu(x)  # 🆕 GELU
+            x = F.gelu(x)
             x = self.dropout2(x)
             
-            # Flatten
-            image_features = self.flatten(x)
+            cnn_raw = self.flatten(x)
         
-        # Pre-Norm na CNN output (poza autocast)
-        image_features = image_features.float()
-        image_features = self.cnn_pre_norm(image_features)
+        cnn_raw = cnn_raw.float()
         
-        # ===========================
-        # SCALARS (UNCHANGED)
-        # ===========================
+        # ==================== BOTTLENECK + RESIDUAL ====================
+        main_path = self.cnn_compress(cnn_raw)
+        skip_path = self.cnn_residual(cnn_raw)
+        
+        # Weighted combination (learnable)
+        if self.alpha_mode == 'learnable':
+            alpha = torch.sigmoid(self.alpha)  # Clamp to [0,1]
+        else:
+            alpha = self.alpha
+        
+        cnn_features = alpha * main_path + (1 - alpha) * skip_path
+        
+        # ==================== SCALARS ====================
         scalars = torch.cat([
             observations['direction'],
             observations['dx_head'],
@@ -212,10 +193,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         
         scalars = self.scalar_input_dropout(scalars)
         scalar_features = self.scalar_linear(scalars)
-        scalar_features = self.scalar_pre_norm(scalar_features)
         
-        # ===========================
-        # FUSION
-        # ===========================
-        features = torch.cat([image_features, scalar_features], dim=-1)
+        # ==================== FUSION ====================
+        features = torch.cat([cnn_features, scalar_features], dim=-1)
         return self.final_linear(features)
