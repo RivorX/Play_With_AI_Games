@@ -1,6 +1,6 @@
-# Konfiguracja środowiska Snake
+# Konfiguracja Środowiska Snake
 environment:
-  min_grid_size: 5                   # Minimalny rozmiar siatki
+  min_grid_size: 8                   # Minimalny rozmiar siatki
   max_grid_size: 25                  # Maksymalny rozmiar siatki
   viewport_size: 16                  # Rozmiar viewport (stały dla wszystkich grid_size)
   snake_size: 20                     # Rozmiar kratki w pikselach
@@ -14,6 +14,35 @@ environment:
     n: 3                             # Liczba akcji (lewo, prosto, prawo)
   max_steps_without_food: 20         # Max kroków bez jedzenia (skalowane z rozmiarem)
   max_steps_factor: 200              # Mnożnik max kroków
+
+  reward_scaling:
+    enable: true                          # Włącz skalowanie nagród
+    min_difficulty_multiplier: 1.0        # Mnożnik dla min_grid_size
+    max_difficulty_multiplier: 2.5        # Mnożnik dla max_grid_size
+    
+    # Nagrody bazowe
+    base_food_reward: 10.0                # Podstawowa nagroda za jabłko
+    base_death_penalty: -10.0             # Podstawowa kara za śmierć
+    step_penalty: -0.03                   # ⬆️ ZWIĘKSZONE z -0.01 (zachęca do efektywności)
+    
+    # ⬇️ ZMNIEJSZONE Milestone bonusy (% zajęcia planszy)
+    milestones:
+      0.10: 5.0       # ⬇️ Z 10.0
+      0.20: 15.0      # ⬇️ Z 30.0
+      0.30: 35.0      # ⬇️ Z 70.0
+      0.40: 70.0      # ⬇️ Z 140.0
+      0.50: 150.0     # ⬇️ Z 280.0
+      0.60: 300.0     # ⬇️ Z 600.0
+      0.70: 600.0     # ⬇️ Z 1200.0
+      0.80: 1200.0    # ⬇️ Z 2500.0
+      0.90: 2500.0    # ⬇️ Z 5000.0
+      1.00: 10000.0   # 🏆 Epic win!
+
+    # Opcjonalne: bonus za efektywność (małe steps_per_apple)
+    efficiency_bonus:
+      enable: true
+      threshold: 15.0               # Jeśli steps_per_apple < 15
+      reward: 2.0                   # Dodatkowy bonus +2.0
 
 # Konfiguracja modelu RecurrentPPO
 model:
@@ -30,14 +59,14 @@ model:
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   
-  # ✅ NOWE: Konfiguracja optymalizatora
+  # ✅ Konfiguracja optymalizatora
   optimizer:
     type: adamw                      # Typ: 'adam' lub 'adamw'
     weight_decay: 0.005              # Weight decay dla AdamW (0.0 = wyłączone)
     eps: 1.0e-7                      # Epsilon dla stabilności
     betas: [0.9, 0.999]              # Beta1, Beta2 dla Adam/AdamW
 
-  # 🆕 LSTM Configuration (Fix 2)
+  # 🆕 LSTM Configuration
   lstm:
     gradient_clip_val: 1.0           # Clip gradients LSTM
     cell_state_penalty: 0.005        # L2 penalty na cell state
@@ -45,25 +74,26 @@ model:
     dropout: 0.1                     # Dropout w LSTM
   
   # Selektywne dropouty
-  cnn_dropout: 0.005                 # Dropout dla CNN
+  cnn_dropout: 0.003                 # ⬇️ Zmniejszone z 0.005
   scalar_dropout: 0.01               # Dropout dla skalarów
   scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
-  fusion_dropout: 0.05               # Dropout po fuzji
+  fusion_dropout: 0.03               # ⬇️ Zmniejszone z 0.05
   
-  # CNN ARCHITECTURE
+  # ✅ DEEP BOTTLENECK CNN ARCHITECTURE
   convlstm:
-    cnn_channels: [32, 64]           # Kanały CNN (nie zmieniaj)
+    cnn_channels: [32, 64]           # Kanały CNN (bez zmian)
     
-    # 🆕 CNN Bottleneck Architecture (zoptymalizowane pod 4GB VRAM)
-    cnn_bottleneck_dim: 640          # Mniejsze (było 512)
-    cnn_output_dim: 896              # Mniejsze (było 1024)
+    # Deep Bottleneck (multi-stage compression)
+    # Main path: 4096 → 1536 → 768 → 512
+    cnn_bottleneck_dims: [1536, 768]
+    cnn_output_dim: 512
     
     # 🆕 Scalar Network Architecture  
-    scalar_hidden_dims: [192, 128]    # Mniejsze
+    scalar_hidden_dims: [128, 128] 
     
     # 🆕 Architecture Options
-    use_layernorm: true              # LayerNorm (OK dla VRAM)
-    learnable_alpha: true            # Learnable alpha (OK dla VRAM)
+    use_layernorm: true              # LayerNorm
+    learnable_alpha: true            # Learnable alpha
     initial_alpha: 0.5               # Początkowa waga residual
 
   policy_kwargs:
@@ -86,12 +116,12 @@ training:
   max_no_improvement_evals: 30       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 10                      # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
   enable_channel_logs: false         # Włącz logi kanałów
-  gradient_log_freq: 2000            # ✅ NOWE: Co ile kroków logować gradienty/wagi
+  gradient_log_freq: 2000            # ✅ Co ile kroków logować gradienty/wagi
   # Liczba środowisk do ewaluacji równoległej
   eval_n_envs: 6                     # Liczba środowisk ewaluacyjnych
   eval_n_repeats: 2                  # Ile razy każde środowisko ma wykonać ewaluację
   
-  # Konfiguracja normalizacji (PRZEŁĄCZNIKI)
+  # Konfiguracja normalizacji
   normalization:
     norm_obs: false                  # ❌ FALSE dla obrazów (CNN radzi sobie z surowymi pikselami)
     norm_reward: true                # ✅ TRUE - stabilizuje trening (running mean rewards)
@@ -101,9 +131,8 @@ training:
     
     # DODATKOWE OPCJE (zaawansowane)
     norm_obs_keys: []                # Lista kluczy do normalizacji (puste = wszystkie, jeśli norm_obs=true)
-                                     # Przykład: ['dx_head', 'dy_head'] - tylko skalary
     epsilon: 1.0e-8                  # Epsilon dla stabilności numerycznej
-    clip_obs_asymmetric: false       # Asymetryczne clipping: (-clip_obs, clip_obs) vs (0, clip_obs)
+    clip_obs_asymmetric: false       # Asymetryczne clipping
 
 # Ścieżki do zapisu
 paths:

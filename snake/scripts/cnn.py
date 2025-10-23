@@ -17,15 +17,23 @@ _INFO_PRINTED = False
 
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     """
+    ✅ Deep Bottleneck Architecture
+    Main path: 6144 → 2048 → 896 → 768 (3-stage compression)
+    Skip path: 6144 → 768 (direct projection)
     """
     def __init__(self, observation_space: spaces.Dict, features_dim=256):
         super().__init__(observation_space, features_dim)
         
         global _INFO_PRINTED
         
-        # 🔧 Load from config
+        # 📧 Load from config
         cnn_channels = config['model']['convlstm']['cnn_channels'][:2]
-        cnn_bottleneck_dim = config['model']['convlstm'].get('cnn_bottleneck_dim', 384)
+        
+        # ✅ NEW: Support for multi-stage bottleneck
+        cnn_bottleneck_dims = config['model']['convlstm'].get('cnn_bottleneck_dims', [896])
+        if isinstance(cnn_bottleneck_dims, int):
+            cnn_bottleneck_dims = [cnn_bottleneck_dims]  # Backward compatibility
+        
         cnn_output_dim = config['model']['convlstm'].get('cnn_output_dim', 768)
         scalar_hidden_dims = config['model']['convlstm'].get('scalar_hidden_dims', [128, 64])
         
@@ -50,25 +58,34 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         
         self.flatten = nn.Flatten()
         
-        # ==================== BOTTLENECK FIX ====================
+        # ==================== DEEP BOTTLENECK (Multi-stage) ====================
         spatial_size = 8
-        cnn_raw_dim = cnn_channels[1] * spatial_size * spatial_size  # 4096
+        cnn_raw_dim = cnn_channels[1] * spatial_size * spatial_size  # e.g., 6144
         
-        # Main path: 4096 → bottleneck → output
-        main_layers = [nn.Linear(cnn_raw_dim, cnn_bottleneck_dim)]
-        if use_layernorm:
-            main_layers.append(nn.LayerNorm(cnn_bottleneck_dim))
-        main_layers.extend([
-            nn.GELU(),
-            nn.Dropout(cnn_dropout),
-            nn.Linear(cnn_bottleneck_dim, cnn_output_dim)
-        ])
+        # ✅ Build multi-stage compression path
+        main_layers = []
+        prev_dim = cnn_raw_dim
+        
+        for idx, bottleneck_dim in enumerate(cnn_bottleneck_dims):
+            main_layers.append(nn.Linear(prev_dim, bottleneck_dim))
+            if use_layernorm:
+                main_layers.append(nn.LayerNorm(bottleneck_dim))
+            main_layers.append(nn.GELU())
+            
+            # Add dropout between stages (not after last stage)
+            if idx < len(cnn_bottleneck_dims) - 1:
+                main_layers.append(nn.Dropout(cnn_dropout))
+            
+            prev_dim = bottleneck_dim
+        
+        # Final projection to output_dim
+        main_layers.append(nn.Linear(prev_dim, cnn_output_dim))
         if use_layernorm:
             main_layers.append(nn.LayerNorm(cnn_output_dim))
         
         self.cnn_compress = nn.Sequential(*main_layers)
         
-        # Skip connection: 4096 → output
+        # ✅ Skip connection: cnn_raw_dim → output_dim (direct)
         skip_layers = [nn.Linear(cnn_raw_dim, cnn_output_dim, bias=False)]
         if use_layernorm:
             skip_layers.append(nn.LayerNorm(cnn_output_dim))
@@ -113,25 +130,53 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         
         self._initialize_weights()
         
-        # Count parameters
+        # ==================== PARAMETER COUNT ====================
         cnn_params = sum(p.numel() for p in self.conv1.parameters()) + \
                      sum(p.numel() for p in self.conv2.parameters())
         bottleneck_params = sum(p.numel() for p in self.cnn_compress.parameters()) + \
                            sum(p.numel() for p in self.cnn_residual.parameters())
+        scalar_params = sum(p.numel() for p in self.scalar_linear.parameters())
+        fusion_params = sum(p.numel() for p in self.final_linear.parameters())
+        total_params = cnn_params + bottleneck_params + scalar_params + fusion_params
+        
+        # Calculate compression ratio
+        if len(cnn_bottleneck_dims) > 0:
+            compression_ratio = cnn_raw_dim / cnn_bottleneck_dims[0]
+        else:
+            compression_ratio = cnn_raw_dim / cnn_output_dim
         
         if not _INFO_PRINTED:
             print(f"\n{'='*70}")
-            print(f"[CNN] ⚡ CNN")
+            print(f"[CNN] ⚡ DEEP BOTTLENECK CNN")
             print(f"{'='*70}")
-            print(f"[CNN] Architecture: {cnn_raw_dim} → {cnn_bottleneck_dim} → {cnn_output_dim}")
-            print(f"[CNN] ✅ Bottleneck compression: {cnn_raw_dim/cnn_bottleneck_dim:.1f}x")
+            
+            # Architecture visualization
+            arch_str = f"{cnn_raw_dim}"
+            for dim in cnn_bottleneck_dims:
+                arch_str += f" → {dim}"
+            arch_str += f" → {cnn_output_dim}"
+            
+            print(f"[CNN] Architecture: {arch_str}")
+            print(f"[CNN] ✅ Bottleneck stages: {len(cnn_bottleneck_dims)}")
+            print(f"[CNN] ✅ Initial compression: {compression_ratio:.1f}x")
             print(f"[CNN] ✅ LayerNorm: {use_layernorm}")
             print(f"[CNN] ✅ Alpha mode: {self.alpha_mode} (init={initial_alpha:.2f})")
             print(f"[CNN] 📊 CNN params: {cnn_params:,}")
             print(f"[CNN] 📊 Bottleneck params: {bottleneck_params:,}")
+            print(f"[CNN] 📊 Total CNN+Bottleneck: {cnn_params + bottleneck_params:,}")
+            print(f"")
             print(f"[SCALARS] Hidden dims: {scalar_hidden_dims}")
-            print(f"[SCALARS] Output: {scalar_output_dim} ({scalar_output_dim/total_dim*100:.1f}%)")
+            print(f"[SCALARS] Output: {scalar_output_dim}")
+            print(f"[SCALARS] 📊 Scalar params: {scalar_params:,}")
+            print(f"")
+            print(f"[FUSION] Output: {features_dim}")
+            print(f"[FUSION] 📊 Fusion params: {fusion_params:,}")
+            print(f"")
             print(f"[BALANCE] CNN:Scalar ratio: {cnn_output_dim/scalar_output_dim:.1f}:1")
+            print(f"[BALANCE] CNN portion: {cnn_output_dim/total_dim*100:.1f}%")
+            print(f"[BALANCE] Scalar portion: {scalar_output_dim/total_dim*100:.1f}%")
+            print(f"")
+            print(f"[TOTAL] 🎯 All parameters: {total_params:,}")
             print(f"{'='*70}\n")
             _INFO_PRINTED = True
 
@@ -169,11 +214,14 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         
         cnn_raw = cnn_raw.float()
         
-        # ==================== BOTTLENECK + RESIDUAL ====================
+        # ==================== DEEP BOTTLENECK + RESIDUAL ====================
+        # Main path: multi-stage compression
         main_path = self.cnn_compress(cnn_raw)
+        
+        # Skip path: direct projection
         skip_path = self.cnn_residual(cnn_raw)
         
-        # Weighted combination (learnable)
+        # Weighted combination (learnable alpha)
         if self.alpha_mode == 'learnable':
             alpha = torch.sigmoid(self.alpha)  # Clamp to [0,1]
         else:
