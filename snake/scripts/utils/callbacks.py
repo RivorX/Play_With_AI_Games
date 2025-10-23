@@ -3,6 +3,7 @@ import csv
 import numpy as np
 import subprocess
 import sys
+import datetime
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 
 
@@ -314,3 +315,99 @@ class EntropySchedulerCallback(BaseCallback):
             self._last_logged = total_timesteps
         
         return True
+    
+# Dodaj to do utils/callbacks.py (na końcu pliku)
+
+from stable_baselines3.common.callbacks import BaseCallback
+import datetime
+import os
+
+
+class VictoryTrackerCallback(BaseCallback):
+    """
+    Callback śledzący zwycięstwa (pełne plansze) i zapisujący je do logu
+    
+    Zapisuje szczegółowe informacje o każdym ukończeniu pełnej planszy:
+    - Timestamp
+    - Total timesteps
+    - Grid size
+    - Snake length
+    - Steps per apple
+    - Total reward
+    """
+    def __init__(self, log_dir: str, verbose: int = 0):
+        super().__init__(verbose)
+        self.log_dir = log_dir
+        self.log_file = os.path.join(log_dir, 'victories.log')
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Inicjalizuj plik jeśli nie istnieje
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, 'w', encoding='utf-8') as f:
+                f.write("="*70 + "\n")
+                f.write("SNAKE AI - VICTORY LOG\n")
+                f.write("Full Board Completions Tracker\n")
+                f.write("="*70 + "\n\n")
+    
+    def _on_step(self) -> bool:
+        # Sprawdź każde środowisko
+        for i, info in enumerate(self.locals['infos']):
+            # Sprawdź czy to wygrana (snake_length == grid_size^2)
+            if 'snake_length' in info and 'grid_size' in info:
+                snake_len = info['snake_length']
+                grid_size = info['grid_size']
+                
+                # Pełna plansza = wygrana!
+                if snake_len == grid_size * grid_size:
+                    self._log_victory(info, env_idx=i)
+        
+        return True
+    
+    def _log_victory(self, info: dict, env_idx: int):
+        """Zapisz zwycięstwo do pliku"""
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        total_timesteps = self.num_timesteps
+        victory_count = self._count_victories() + 1
+        
+        grid_size = info['grid_size']
+        snake_length = info['snake_length']
+        total_reward = info.get('total_reward', 0)
+        steps_per_apple = info.get('steps_per_apple', 0)
+        
+        log_entry = (
+            f"\n{'='*70}\n"
+            f"🎉 VICTORY #{victory_count}\n"
+            f"{'='*70}\n"
+            f"Timestamp:         {timestamp}\n"
+            f"Total Timesteps:   {total_timesteps:,}\n"
+            f"Environment:       #{env_idx}\n"
+            f"Grid Size:         {grid_size}x{grid_size}\n"
+            f"Snake Length:      {snake_length} / {grid_size * grid_size} (FULL BOARD!)\n"
+            f"Steps per Apple:   {steps_per_apple:.2f}\n"
+            f"Total Reward:      {total_reward:.2f}\n"
+            f"{'='*70}\n"
+        )
+        
+        try:
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(log_entry)
+            
+            # Wyświetl w konsoli
+            print("\n" + "🎉" * 35)
+            print(log_entry)
+            print("🎉" * 35 + "\n")
+            
+            if self.verbose > 0:
+                print(f"Victory logged to {self.log_file}")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to write victory log: {e}")
+    
+    def _count_victories(self) -> int:
+        """Policz ile było zwycięstw"""
+        try:
+            with open(self.log_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                return content.count('🎉 VICTORY #')
+        except:
+            return 0

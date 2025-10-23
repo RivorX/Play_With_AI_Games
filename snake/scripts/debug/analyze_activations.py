@@ -574,28 +574,173 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
 
 
 def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
-    """Wizualizuje output CNN (pierwsze 16 kanałów)"""
+    """
+    Wizualizuje output wszystkich warstw CNN
+    🆕 UPDATED: Conv1, Conv2, Bottleneck, Residual, Final Output
+    """
     with torch.no_grad():
         image = obs_tensor['image']
         if image.dim() == 4 and image.shape[-1] == 1:
             image = image.permute(0, 3, 1, 2)
-        cnn_activation = features_extractor.conv1(image).detach().cpu().numpy()[0]
+        
+        # ==================== WSZYSTKIE WARSTWY CNN ====================
+        activations = {}
+        
+        # Warstwa 1: Conv1 + BN + GELU
+        x = features_extractor.conv1(image)
+        x = features_extractor.bn1(x)
+        x = torch.nn.functional.gelu(x)
+        activations['conv1_output'] = x.detach().cpu().numpy()[0]  # [32, 16, 16]
+        
+        # Warstwa 2: Conv2 + BN + GELU + Dropout
+        x = features_extractor.conv2(x)
+        x = features_extractor.bn2(x)
+        x = torch.nn.functional.gelu(x)
+        x = features_extractor.dropout2(x)
+        activations['conv2_output'] = x.detach().cpu().numpy()[0]  # [64, 8, 8]
+        
+        # Flatten
+        cnn_raw = features_extractor.flatten(x)
+        cnn_raw = cnn_raw.float()
+        
+        # Bottleneck path
+        cnn_compressed = features_extractor.cnn_compress(cnn_raw)
+        activations['bottleneck'] = cnn_compressed.detach().cpu().numpy()[0]  # [640]
+        
+        # Residual path
+        cnn_skip = features_extractor.cnn_residual(cnn_raw)
+        activations['residual'] = cnn_skip.detach().cpu().numpy()[0]  # [896]
+        
+        # Final output
+        cnn_output = cnn_compressed + cnn_skip
+        activations['cnn_final'] = cnn_output.detach().cpu().numpy()[0]  # [896]
     
-    num_channels_to_show = min(16, cnn_activation.shape[0])
+    # ==================== WIZUALIZACJA ====================
+    
+    # 🆕 1. CONV1 OUTPUT (32 kanały, 16x16)
+    visualize_conv_layer(
+        activations['conv1_output'], 
+        layer_name='Conv1 (32 channels, 16x16)',
+        output_path=os.path.join(output_dir, f'cnn_conv1_state_{state_idx}.png'),
+        num_channels=min(16, activations['conv1_output'].shape[0])
+    )
+    
+    # 🆕 2. CONV2 OUTPUT (64 kanały, 8x8)
+    visualize_conv_layer(
+        activations['conv2_output'], 
+        layer_name='Conv2 (64 channels, 8x8)',
+        output_path=os.path.join(output_dir, f'cnn_conv2_state_{state_idx}.png'),
+        num_channels=min(16, activations['conv2_output'].shape[0])
+    )
+    
+    # 🆕 3. BOTTLENECK VS RESIDUAL (1D features)
+    visualize_1d_features(
+        {
+            'Bottleneck (640)': activations['bottleneck'],
+            'Residual (896)': activations['residual'],
+            'Final Output (896)': activations['cnn_final']
+        },
+        output_path=os.path.join(output_dir, f'cnn_bottleneck_residual_state_{state_idx}.png'),
+        state_idx=state_idx
+    )
+    
+    # 🆕 4. HEATMAPA WSZYSTKICH KANAŁÓW CONV2 (64x8x8)
+    visualize_all_channels_heatmap(
+        activations['conv2_output'],
+        layer_name='Conv2 All Channels',
+        output_path=os.path.join(output_dir, f'cnn_conv2_all_channels_state_{state_idx}.png')
+    )
+    
+    print(f'  ✅ CNN visualization (all layers) zapisana dla stanu {state_idx}')
+
+
+def visualize_conv_layer(activation, layer_name, output_path, num_channels=16):
+    """Wizualizuje wybrane kanały warstwy konwolucyjnej (grid 4x4)"""
+    num_channels = min(num_channels, activation.shape[0])
+    
     fig, axes = plt.subplots(4, 4, figsize=(12, 12))
-    for i in range(num_channels_to_show):
+    for i in range(num_channels):
         ax = axes[i // 4, i % 4]
-        ax.imshow(cnn_activation[i], cmap='viridis')
-        ax.set_title(f'CNN Ch{i}')
+        im = ax.imshow(activation[i], cmap='viridis', interpolation='nearest')
+        ax.set_title(f'Ch{i}', fontsize=10)
         ax.axis('off')
-    for i in range(num_channels_to_show, 16):
+        plt.colorbar(im, ax=ax, fraction=0.046)
+    
+    # Wyłącz puste subploty
+    for i in range(num_channels, 16):
         axes[i // 4, i % 4].axis('off')
-    plt.suptitle(f'CNN Output (warstwa 1) - Stan {state_idx}')
+    
+    plt.suptitle(f'{layer_name}', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    cnn_viz_path = os.path.join(output_dir, f'cnn_output_state_{state_idx}.png')
-    plt.savefig(cnn_viz_path, dpi=150)
+    plt.savefig(output_path, dpi=150)
     plt.close()
-    print(f'  Wizualizacja CNN zapisana: {cnn_viz_path}')
+
+
+def visualize_1d_features(features_dict, output_path, state_idx):
+    """
+    Wizualizuje 1D features (bottleneck, residual, final output)
+    jako heatmapy poziome
+    """
+    fig, axes = plt.subplots(len(features_dict), 1, figsize=(16, 6))
+    
+    if len(features_dict) == 1:
+        axes = [axes]
+    
+    for idx, (name, features) in enumerate(features_dict.items()):
+        ax = axes[idx]
+        
+        # Normalizacja dla lepszej wizualizacji
+        features_norm = features / (np.abs(features).max() + 1e-8)
+        
+        # Heatmapa pozioma
+        im = ax.imshow(features_norm.reshape(1, -1), 
+                       cmap='coolwarm', 
+                       aspect='auto', 
+                       interpolation='nearest',
+                       vmin=-1, vmax=1)
+        
+        ax.set_title(f'{name} - Stan {state_idx}', fontsize=12, fontweight='bold')
+        ax.set_yticks([])
+        ax.set_xlabel('Neuron Index', fontsize=10)
+        plt.colorbar(im, ax=ax, label='Normalized Activation')
+        
+        # Statystyki
+        stats_text = f'Mean: {features.mean():.3f} | Std: {features.std():.3f} | Max: {features.max():.3f} | Min: {features.min():.3f}'
+        ax.text(0.5, -0.3, stats_text, ha='center', transform=ax.transAxes, fontsize=9, color='gray')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def visualize_all_channels_heatmap(activation, layer_name, output_path):
+    """
+    Wizualizuje WSZYSTKIE kanały jako heatmapę (channels x spatial)
+    Użyteczne dla Conv2: 64 channels x 8x8 = 64 rows x 64 cols
+    """
+    num_channels, height, width = activation.shape
+    
+    # Flatten spatial dimensions: [64, 8, 8] → [64, 64]
+    activation_flat = activation.reshape(num_channels, -1)
+    
+    fig, ax = plt.subplots(figsize=(14, 10))
+    
+    im = ax.imshow(activation_flat, cmap='viridis', aspect='auto', interpolation='nearest')
+    
+    ax.set_xlabel('Spatial Position (flattened)', fontsize=12)
+    ax.set_ylabel('Channel Index', fontsize=12)
+    ax.set_title(f'{layer_name} - All Channels Heatmap', fontsize=14, fontweight='bold')
+    
+    plt.colorbar(im, ax=ax, label='Activation Value')
+    
+    # Dodaj linie co 8 pikseli (dla 8x8 spatial)
+    if width == 8:
+        for i in range(1, height):
+            ax.axvline(i * width - 0.5, color='white', linewidth=0.5, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
 
 
 def visualize_viewport(obs, output_dir, state_idx):
@@ -761,7 +906,157 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
     
     return bottleneck_report
 
-
+def analyze_channel_specialization(model, env, output_dir, num_samples=50):
+    """
+    Analiza specjalizacji kanałów CNN
+    - Które kanały są aktywne?
+    - Które kanały są "dead" (zawsze ~0)?
+    - Jaka jest różnorodność między kanałami?
+    """
+    print("\n=== Analiza specjalizacji kanałów CNN ===")
+    
+    policy = model.policy
+    features_extractor = policy.features_extractor
+    
+    # Zbierz aktywacje z wielu stanów
+    conv1_activations = []
+    conv2_activations = []
+    
+    for _ in range(num_samples):
+        obs, _ = env.reset()
+        
+        # Random steps
+        for _ in range(np.random.randint(0, 20)):
+            action = env.action_space.sample()
+            obs, _, done, _, _ = env.step(action)
+            if done:
+                obs, _ = env.reset()
+        
+        # Get activations
+        with torch.no_grad():
+            obs_tensor = {}
+            for k, v in obs.items():
+                v_np = v if isinstance(v, np.ndarray) else np.array(v)
+                v_tensor = torch.tensor(v_np, dtype=torch.float32, device=policy.device)
+                
+                if k == 'image':
+                    if v_tensor.ndim == 3:
+                        v_tensor = v_tensor.unsqueeze(0)
+                else:
+                    if v_tensor.ndim == 1:
+                        v_tensor = v_tensor.unsqueeze(0)
+                
+                obs_tensor[k] = v_tensor
+            
+            image = obs_tensor['image']
+            if image.dim() == 4 and image.shape[-1] == 1:
+                image = image.permute(0, 3, 1, 2)
+            
+            # Conv1
+            x = features_extractor.conv1(image)
+            x = features_extractor.bn1(x)
+            x = torch.nn.functional.gelu(x)
+            conv1_activations.append(x.detach().cpu().numpy()[0])  # [32, 16, 16]
+            
+            # Conv2
+            x = features_extractor.conv2(x)
+            x = features_extractor.bn2(x)
+            x = torch.nn.functional.gelu(x)
+            conv2_activations.append(x.detach().cpu().numpy()[0])  # [64, 8, 8]
+    
+    # Stack: [num_samples, channels, height, width]
+    conv1_activations = np.array(conv1_activations)  # [50, 32, 16, 16]
+    conv2_activations = np.array(conv2_activations)  # [50, 64, 8, 8]
+    
+    # Analiza per channel
+    def analyze_channels(activations, layer_name):
+        num_channels = activations.shape[1]
+        channel_stats = []
+        
+        for ch in range(num_channels):
+            ch_data = activations[:, ch, :, :].flatten()
+            
+            mean_activation = ch_data.mean()
+            std_activation = ch_data.std()
+            max_activation = ch_data.max()
+            sparsity = (np.abs(ch_data) < 0.01).sum() / len(ch_data)
+            
+            # Dead neuron detection
+            is_dead = (max_activation < 0.01) or (std_activation < 0.001)
+            
+            channel_stats.append({
+                'channel': ch,
+                'mean': mean_activation,
+                'std': std_activation,
+                'max': max_activation,
+                'sparsity': sparsity,
+                'is_dead': is_dead
+            })
+        
+        return channel_stats
+    
+    conv1_stats = analyze_channels(conv1_activations, 'Conv1')
+    conv2_stats = analyze_channels(conv2_activations, 'Conv2')
+    
+    # Wizualizacja
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # Plot 1: Conv1 - Mean activation per channel
+    channels_conv1 = [s['channel'] for s in conv1_stats]
+    means_conv1 = [s['mean'] for s in conv1_stats]
+    dead_conv1 = [s['is_dead'] for s in conv1_stats]
+    
+    colors_conv1 = ['red' if d else 'green' for d in dead_conv1]
+    axes[0, 0].bar(channels_conv1, means_conv1, color=colors_conv1, alpha=0.7, edgecolor='black')
+    axes[0, 0].set_xlabel('Channel')
+    axes[0, 0].set_ylabel('Mean Activation')
+    axes[0, 0].set_title(f'Conv1 - Channel Activity (Red = Dead)')
+    axes[0, 0].grid(axis='y', alpha=0.3)
+    
+    # Plot 2: Conv2 - Mean activation per channel
+    channels_conv2 = [s['channel'] for s in conv2_stats]
+    means_conv2 = [s['mean'] for s in conv2_stats]
+    dead_conv2 = [s['is_dead'] for s in conv2_stats]
+    
+    colors_conv2 = ['red' if d else 'green' for d in dead_conv2]
+    axes[0, 1].bar(channels_conv2, means_conv2, color=colors_conv2, alpha=0.7, edgecolor='black')
+    axes[0, 1].set_xlabel('Channel')
+    axes[0, 1].set_ylabel('Mean Activation')
+    axes[0, 1].set_title(f'Conv2 - Channel Activity (Red = Dead)')
+    axes[0, 1].grid(axis='y', alpha=0.3)
+    
+    # Plot 3: Sparsity (ile neuronów ~0)
+    sparsity_conv1 = [s['sparsity'] for s in conv1_stats]
+    axes[1, 0].bar(channels_conv1, sparsity_conv1, color='#3498db', alpha=0.7, edgecolor='black')
+    axes[1, 0].set_xlabel('Channel')
+    axes[1, 0].set_ylabel('Sparsity (% near-zero)')
+    axes[1, 0].set_title('Conv1 - Sparsity per Channel')
+    axes[1, 0].grid(axis='y', alpha=0.3)
+    
+    # Plot 4: Sparsity Conv2
+    sparsity_conv2 = [s['sparsity'] for s in conv2_stats]
+    axes[1, 1].bar(channels_conv2, sparsity_conv2, color='#3498db', alpha=0.7, edgecolor='black')
+    axes[1, 1].set_xlabel('Channel')
+    axes[1, 1].set_ylabel('Sparsity (% near-zero)')
+    axes[1, 1].set_title('Conv2 - Sparsity per Channel')
+    axes[1, 1].grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    specialization_path = os.path.join(output_dir, 'channel_specialization.png')
+    plt.savefig(specialization_path, dpi=150)
+    plt.close()
+    
+    # Raport
+    dead_conv1_count = sum(dead_conv1)
+    dead_conv2_count = sum(dead_conv2)
+    
+    print(f"\n📊 Channel Specialization Report:")
+    print(f"   Conv1: {dead_conv1_count}/32 dead channels ({dead_conv1_count/32*100:.1f}%)")
+    print(f"   Conv2: {dead_conv2_count}/64 dead channels ({dead_conv2_count/64*100:.1f}%)")
+    print(f"\n   âš ï¸ Jeśli >30% kanałów jest dead, sieć jest UNDERUTILIZED!")
+    
+    print(f"\n✅ Channel specialization zapisana: {specialization_path}")
+    
 def plot_activation_overview(detailed_activations, action_probs_list, action_names, output_dirs):
     """Generuje wykresy przeglądu aktywacji"""
     

@@ -18,15 +18,15 @@ environment:
 # Konfiguracja modelu RecurrentPPO
 model:
   policy: MultiInputLstmPolicy       # Policy dla RecurrentPPO
-  learning_rate: 0.0003              # Szybkość uczenia 
-  min_learning_rate: 0.00005         # Minimalny learning rate
+  learning_rate: 0.0002              # Szybkość uczenia 
+  min_learning_rate: 0.00001         # Minimalny learning rate
   n_steps: 512                       # Liczba kroków na aktualizację
   n_epochs: 4                        # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.05                     # Współczynnik entropii (początkowy)
-  min_ent_coef: 0.01                 # Minimalny współczynnik entropii (docelowy)
+  min_ent_coef: 0.03                 # Minimalny współczynnik entropii (docelowy)
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   
@@ -34,32 +34,32 @@ model:
   optimizer:
     type: adamw                      # Typ: 'adam' lub 'adamw'
     weight_decay: 0.005              # Weight decay dla AdamW (0.0 = wyłączone)
-    eps: 1.0e-6                      # Epsilon dla stabilności
+    eps: 1.0e-7                      # Epsilon dla stabilności
     betas: [0.9, 0.999]              # Beta1, Beta2 dla Adam/AdamW
 
   # 🆕 LSTM Configuration (Fix 2)
   lstm:
     gradient_clip_val: 1.0           # Clip gradients LSTM
-    cell_state_penalty: 0.001        # L2 penalty na cell state
-    hidden_state_penalty: 0.0001     # L2 penalty na hidden state
+    cell_state_penalty: 0.005        # L2 penalty na cell state
+    hidden_state_penalty: 0.0005     # L2 penalty na hidden state
     dropout: 0.1                     # Dropout w LSTM
   
   # Selektywne dropouty
-  cnn_dropout: 0.01                  # Dropout dla CNN
+  cnn_dropout: 0.005                 # Dropout dla CNN
   scalar_dropout: 0.01               # Dropout dla skalarów
   scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
   fusion_dropout: 0.05               # Dropout po fuzji
   
-  # 🔥 LIGHTWEIGHT CNN ARCHITECTURE (4GB VRAM)
+  # CNN ARCHITECTURE
   convlstm:
     cnn_channels: [32, 64]           # Kanały CNN (nie zmieniaj)
     
     # 🆕 CNN Bottleneck Architecture (zoptymalizowane pod 4GB VRAM)
-    cnn_bottleneck_dim: 384          # Mniejsze (było 512)
-    cnn_output_dim: 768              # Mniejsze (było 1024)
+    cnn_bottleneck_dim: 640          # Mniejsze (było 512)
+    cnn_output_dim: 896              # Mniejsze (było 1024)
     
     # 🆕 Scalar Network Architecture  
-    scalar_hidden_dims: [128, 64]    # Mniejsze (było [256, 128, 128])
+    scalar_hidden_dims: [192, 128]    # Mniejsze
     
     # 🆕 Architecture Options
     use_layernorm: true              # LayerNorm (OK dla VRAM)
@@ -68,11 +68,11 @@ model:
 
   policy_kwargs:
     features_extractor_kwargs:
-      features_dim: 512              # Wymiar cech wyjściowych ekstraktora
+      features_dim: 768              # Wymiar cech wyjściowych ekstraktora
     net_arch:
-      pi: [256, 128]                 # Wielkość sieci aktora
-      vf: [256, 128]                 # Wielkość sieci krytyka
-    lstm_hidden_size: 256            # Rozmiar ukryty LSTM
+      pi: [320, 160]                 # Wielkość sieci aktora
+      vf: [320, 160]                 # Wielkość sieci krytyka
+    lstm_hidden_size: 320            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
     enable_critic_lstm: false        # LSTM dla krytyka
 
