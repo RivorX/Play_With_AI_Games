@@ -148,6 +148,17 @@ analyze_uncertainty(
     num_episodes=10
 )
 
+# ===================================================
+# CZĘŚĆ 7: ANALIZA SPECJALIZACJI KANAŁÓW
+# ===================================================
+print("\n[7/7] Analiza specjalizacji kanałów CNN...")
+from analyze_activations import analyze_channel_specialization
+analyze_channel_specialization(
+    model=model,
+    env=env,
+    output_dir=conv_viz_dir,
+    num_samples=50
+)
 env.close()
 
 # ===================================================

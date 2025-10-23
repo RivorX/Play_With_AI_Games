@@ -215,17 +215,24 @@ class SnakeEnv(gym.Env):
     def _get_obs(self):
         """
         NAJSZYBSZA WERSJA - używa pre-computed stałych
+        ZABEZPIECZENIE: gdy self.food is None (wygrana), użyj domyślnych wartości
         """
         viewport = self._get_viewport_observation()
         head = self.snake[0]  # Lista [y, x]
         
-        # Wektoryzowane obliczenia pozycji jedzenia względem głowy
-        food_viewport_x = self.food[1] - head[1] + self.half_view
-        food_viewport_y = self.food[0] - head[0] + self.half_view
-        
-        # Normalizacja do [-1, 1]
-        dx_viewport = (food_viewport_x - self.half_view) / self.half_view
-        dy_viewport = (food_viewport_y - self.half_view) / self.half_view
+        # ⚠️ ZABEZPIECZENIE: jeśli brak jedzenia (wygrana), użyj środka viewport
+        if self.food is None:
+            # Domyślne wartości - jedzenie "w centrum" (0, 0 po normalizacji)
+            dx_viewport = 0.0
+            dy_viewport = 0.0
+        else:
+            # Wektoryzowane obliczenia pozycji jedzenia względem głowy
+            food_viewport_x = self.food[1] - head[1] + self.half_view
+            food_viewport_y = self.food[0] - head[0] + self.half_view
+            
+            # Normalizacja do [-1, 1]
+            dx_viewport = (food_viewport_x - self.half_view) / self.half_view
+            dy_viewport = (food_viewport_y - self.half_view) / self.half_view
         
         # ZERO OBLICZEŃ - używamy pre-computed lookup table!
         direction_vec = DIRECTION_VECTORS[self.direction]

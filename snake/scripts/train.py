@@ -13,7 +13,7 @@ matplotlib.use('Agg')
 # Import lokalnych modułów
 from model import make_env
 from cnn import CustomFeaturesExtractor
-from utils.callbacks import TrainProgressCallback, CustomEvalCallback, LossRecorderCallback, EntropySchedulerCallback
+from utils.callbacks import TrainProgressCallback, CustomEvalCallback, LossRecorderCallback, EntropySchedulerCallback, VictoryTrackerCallback
 from utils.gradient_monitor import GradientWeightMonitor
 from utils.training_utils import (
     linear_schedule, 
@@ -154,6 +154,15 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                     print(f"Usunięto istniejący plik gradient monitor: {gradient_csv}")
             except Exception as e:
                 print(f"Nie udało się usunąć pliku gradient monitor: {e}")
+            
+            # ✅ RESETOWANIE LOG: victories.log
+            try:
+                victory_log = os.path.join(base_dir, 'logs', 'victories.log')
+                if os.path.exists(victory_log):
+                    os.remove(victory_log)
+                    print(f"Usunięto istniejący plik victory log: {victory_log}")
+            except Exception as e:
+                print(f"Nie udało się usunąć pliku victory log: {e}")
         else:
             try:
                 resp2 = input("Użyć hyperparametrów z configu zamiast z modelu? [[Y]/n]: ").strip()
@@ -331,6 +340,12 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         csv_path=os.path.join(base_dir, 'logs', 'gradient_monitor.csv'),
         log_freq=config['training'].get('gradient_log_freq', 2000)
     )
+    
+    # ✅ NOWE: Victory Tracker
+    victory_tracker = VictoryTrackerCallback(
+        log_dir=os.path.join(base_dir, 'logs'),
+        verbose=1
+    )
 
     # Debug logging (jeśli włączone)
     if enable_channel_logs:
@@ -376,7 +391,14 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             model.learn(
                 total_timesteps=remaining_timesteps,
                 reset_num_timesteps=not load_model,
-                callback=[eval_callback, train_progress_callback, loss_recorder, entropy_scheduler, gradient_monitor],
+                callback=[
+                    eval_callback, 
+                    train_progress_callback, 
+                    loss_recorder, 
+                    entropy_scheduler, 
+                    gradient_monitor,
+                    victory_tracker  # ✅ Victory tracker
+                ],
                 progress_bar=use_progress_bar,
                 tb_log_name=f"recurrent_ppo_snake_{total_timesteps}"
             )
