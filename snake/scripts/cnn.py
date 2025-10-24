@@ -18,8 +18,6 @@ _INFO_PRINTED = False
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     """
     ✅ Deep Bottleneck Architecture
-    Main path: 6144 → 2048 → 896 → 768 (3-stage compression)
-    Skip path: 6144 → 768 (direct projection)
     """
     def __init__(self, observation_space: spaces.Dict, features_dim=256):
         super().__init__(observation_space, features_dim)
