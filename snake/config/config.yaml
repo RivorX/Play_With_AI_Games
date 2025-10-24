@@ -12,8 +12,8 @@ environment:
   action_space:
     type: Discrete                   # Typ przestrzeni akcji
     n: 3                             # Liczba akcji (lewo, prosto, prawo)
-  max_steps_without_food: 20         # Max kroków bez jedzenia (skalowane z rozmiarem)
-  max_steps_factor: 200              # Mnożnik max kroków
+  max_steps_without_food: 20         # Max kroków bez jedzenia (skalowane z rozmiarem grid_size * max_steps_without_food)
+  max_steps_factor: 200              # Mnożnik max kroków (skalowany z rozmiarem grid_size * max_steps_factor)
 
   reward_scaling:
     enable: true                          # Włącz skalowanie nagród
@@ -25,7 +25,7 @@ environment:
     base_death_penalty: -10.0             # Podstawowa kara za śmierć
     step_penalty: -0.03                   # ⬆️ ZWIĘKSZONE z -0.01 (zachęca do efektywności)
     
-    # ⬇️ ZMNIEJSZONE Milestone bonusy (% zajęcia planszy)
+    # ⬇️ Milestone bonusy (% zajęcia planszy)
     milestones:
       0.10: 5.0       # ⬇️ Z 10.0
       0.20: 15.0      # ⬇️ Z 30.0
@@ -41,22 +41,22 @@ environment:
     # Opcjonalne: bonus za efektywność (małe steps_per_apple)
     efficiency_bonus:
       enable: true
-      threshold: 15.0               # Jeśli steps_per_apple < 15
-      reward: 2.0                   # Dodatkowy bonus +2.0
+      threshold: 18.0               # ⬆️ z 15.0 (łatwiej osiągnąć)
+      reward: 3.0                   # ⬆️ z 2.0 (większa zachęta)
 
 # Konfiguracja modelu RecurrentPPO
 model:
   policy: MultiInputLstmPolicy       # Policy dla RecurrentPPO
   learning_rate: 0.0002              # Szybkość uczenia 
   min_learning_rate: 0.00001         # Minimalny learning rate
-  n_steps: 512                       # Liczba kroków na aktualizację
+  n_steps: 1024                      # Liczba kroków na aktualizację
   n_epochs: 4                        # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.05                     # Współczynnik entropii (początkowy)
   min_ent_coef: 0.03                 # Minimalny współczynnik entropii (docelowy)
-  vf_coef: 0.5                       # Współczynnik funkcji wartości
+  vf_coef: 0.75                      # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   
   # ✅ Konfiguracja optymalizatora
@@ -68,28 +68,28 @@ model:
 
   # 🆕 LSTM Configuration
   lstm:
-    gradient_clip_val: 1.0           # Clip gradients LSTM
-    cell_state_penalty: 0.005        # L2 penalty na cell state
-    hidden_state_penalty: 0.0005     # L2 penalty na hidden state
-    dropout: 0.1                     # Dropout w LSTM
+    gradient_clip_val: 2.0           # Clip gradients LSTM
+    cell_state_penalty: 0.001        # L2 penalty na cell state
+    hidden_state_penalty: 0.0001     # L2 penalty na hidden state
+    dropout: 0.01                     # Dropout w LSTM
   
   # Selektywne dropouty
-  cnn_dropout: 0.003                 # ⬇️ Zmniejszone z 0.005
+  cnn_dropout: 0.0                 
   scalar_dropout: 0.01               # Dropout dla skalarów
   scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
-  fusion_dropout: 0.03               # ⬇️ Zmniejszone z 0.05
+  fusion_dropout: 0.01              
   
   # ✅ DEEP BOTTLENECK CNN ARCHITECTURE
   convlstm:
     cnn_channels: [32, 64]           # Kanały CNN (bez zmian)
     
-    # Deep Bottleneck (multi-stage compression)
-    # Main path: 4096 → 1536 → 768 → 512
-    cnn_bottleneck_dims: [1536, 768]
-    cnn_output_dim: 512
+    # Deep Bottleneck Layers
+    # Main path: 4096 → 1024 → 640
+    cnn_bottleneck_dims: [2048, 1024]
+    cnn_output_dim: 768
     
     # 🆕 Scalar Network Architecture  
-    scalar_hidden_dims: [128, 128] 
+    scalar_hidden_dims: [128, 192] 
     
     # 🆕 Architecture Options
     use_layernorm: true              # LayerNorm
@@ -100,17 +100,17 @@ model:
     features_extractor_kwargs:
       features_dim: 768              # Wymiar cech wyjściowych ekstraktora
     net_arch:
-      pi: [320, 160]                 # Wielkość sieci aktora
-      vf: [320, 160]                 # Wielkość sieci krytyka
-    lstm_hidden_size: 320            # Rozmiar ukryty LSTM
+      pi: [512, 256]                 # ⬆️ OPTYMALNE: bez bottlenecku po LSTM
+      vf: [512, 256]                 # ⬆️ OPTYMALNE: lepsza wycena wartości
+    lstm_hidden_size: 512            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
     enable_critic_lstm: false        # LSTM dla krytyka
 
 # Konfiguracja treningu
 training:
-  n_envs: 12                         # Liczba środowisk
-  batch_size: 512                    # Rozmiar partii
-  total_timesteps: 10000000          # Całkowita liczba kroków
+  n_envs: 6                          # Liczba środowisk
+  batch_size: 1024                   # Rozmiar partii
+  total_timesteps: 2000000           # Całkowita liczba kroków
   eval_freq: 4000                    # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 30       # Liczba ewaluacji bez poprawy przed zatrzymaniem

@@ -121,9 +121,9 @@ class SnakeEnv(gym.Env):
         # Reset milestone tracking
         self.milestones_achieved = set()
         
-        # Initialize snake (centrum planszy)
+        # Initialize snake (centrum planszy) - TYLKO GŁOWA
         center = self.grid_size // 2
-        self.snake = [(center, center), (center, center + 1), (center, center + 2)]
+        self.snake = [(center, center)]  # ✅ Tylko głowa na starcie
         self.direction = 0  # UP
         self.food = self._place_food()
         self.score = 0
@@ -150,6 +150,11 @@ class SnakeEnv(gym.Env):
         self.steps += 1
         self.steps_since_food += 1
         
+        # ✅ SPRAWDŹ SYGNAŁY KOLIZJI PRZED RUCHEM (dla reward shaping)
+        front_coll_before = self._check_collision_in_direction(0)
+        left_coll_before = self._check_collision_in_direction(-1)
+        right_coll_before = self._check_collision_in_direction(1)
+        
         # Zmiana kierunku (akcje: 0=lewo, 1=prosto, 2=prawo)
         if action == 0:  # Lewo
             self.direction = (self.direction - 1) % 4
@@ -167,6 +172,18 @@ class SnakeEnv(gym.Env):
         terminated = False
         truncated = False
         
+        # ✅ KARA ZA IGNOROWANIE SYGNAŁÓW KOLIZJI
+        # Jeśli agent wybrał akcję prowadzącą do kolizji (mimo że sygnał ostrzegał)
+        collision_warning_penalty = 0.0
+        if action == 0 and left_coll_before == 1.0:  # Skręcił w lewo mimo ostrzeżenia
+            collision_warning_penalty = -0.5 * self.difficulty_multiplier
+        elif action == 1 and front_coll_before == 1.0:  # Poszedł prosto mimo ostrzeżenia
+            collision_warning_penalty = -0.5 * self.difficulty_multiplier
+        elif action == 2 and right_coll_before == 1.0:  # Skręcił w prawo mimo ostrzeżenia
+            collision_warning_penalty = -0.5 * self.difficulty_multiplier
+        
+        reward += collision_warning_penalty
+        
         # ==================== KOLIZJA ====================
         # Sprawdź kolizję ze ścianą
         if not (0 <= new_head[0] < self.grid_size and 0 <= new_head[1] < self.grid_size):
@@ -176,14 +193,11 @@ class SnakeEnv(gym.Env):
             terminated = True
         
         if terminated:
-            # ✅ Kara za śmierć skalowana z trudnością planszy
+            # ✅ Kara za śmierć - stała, bez dodatkowych komplikacji
+            # Agent powinien się nauczyć unikać śmierci niezależnie od postępu
             death_penalty = self.base_death_penalty * self.difficulty_multiplier
             
-            # ✅ DODATKOWA kara proporcjonalna do postępu (im dalej zaszedł, tym więcej stracił)
-            map_occupancy = len(self.snake) / (self.grid_size ** 2)
-            progress_penalty = death_penalty * (0.5 + map_occupancy)  # -10 → -15 dla 50% planszy
-            
-            reward = progress_penalty
+            reward = death_penalty
             
             info = self._get_info()
             info['termination_reason'] = 'collision'
@@ -206,11 +220,7 @@ class SnakeEnv(gym.Env):
             # ✅ NAGRODA ZA JEDZENIE - skalowana z trudnością planszy
             food_reward = self.base_food_reward * self.difficulty_multiplier
             
-            # ✅ DODATKOWY BONUS za % zajęcia planszy (trudniej = więcej reward)
-            map_occupancy = len(self.snake) / (self.grid_size ** 2)
-            occupancy_bonus = food_reward * map_occupancy  # 0% → +0, 50% → +10, 100% → +20
-            
-            reward = food_reward + occupancy_bonus
+            reward = food_reward
             
             # ✅ MILESTONE BONUSY (progresywne, eksponencjalne)
             current_occupancy = len(self.snake) / (self.grid_size ** 2)
@@ -248,6 +258,14 @@ class SnakeEnv(gym.Env):
         # ==================== STEP PENALTY ====================
         # Mała kara za każdy krok (zachęca do efektywności)
         reward += self.step_penalty
+        
+        # ✅ DODATKOWA kara za zbyt długie krążenie (eskalująca)
+        # Im dłużej bez jedzenia, tym większa kara
+        if self.steps_since_food > self.max_steps_without_food * 0.5:
+            # Po przekroczeniu połowy limitu, dodatkowa kara
+            progress = (self.steps_since_food - self.max_steps_without_food * 0.5) / (self.max_steps_without_food * 0.5)
+            stalling_penalty = -0.02 * progress * self.difficulty_multiplier
+            reward += stalling_penalty
         
         # ==================== TIMEOUT ====================
         # Zbyt długo bez jedzenia
