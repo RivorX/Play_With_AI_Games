@@ -280,8 +280,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         # ✅ NOWE: Skonfiguruj AdamW po przeniesieniu wag
         model = setup_adamw_optimizer(model, config)
 
-    # Zastosuj gradient clipping (kluczowa naprawa!)
-    apply_gradient_clipping(model, clip_value=1.0)
+    # Zastosuj gradient clipping
+    apply_gradient_clipping(model, clip_value=2.0)
 
     global best_model_save_path
     best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))

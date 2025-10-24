@@ -55,7 +55,6 @@ class SnakeEnv(gym.Env):
         # Reward values
         self.base_food_reward = self.reward_config.get('base_food_reward', 10.0)
         self.base_death_penalty = self.reward_config.get('base_death_penalty', -10.0)
-        self.step_penalty = self.reward_config.get('step_penalty', -0.01)
         self.milestones = self.reward_config.get('milestones', {})
         self.efficiency_config = self.reward_config.get('efficiency_bonus', {})
         
@@ -142,18 +141,13 @@ class SnakeEnv(gym.Env):
 
     def step(self, action):
         """
-        ✅ NOWE: Progressive Reward Shaping
+        ✅ Progressive Reward Shaping
         - Nagrody skalują się z trudnością planszy (grid_size)
         - Milestone bonusy za % zajęcia planszy
         - Kara za śmierć proporcjonalna do postępu
         """
         self.steps += 1
         self.steps_since_food += 1
-        
-        # ✅ SPRAWDŹ SYGNAŁY KOLIZJI PRZED RUCHEM (dla reward shaping)
-        front_coll_before = self._check_collision_in_direction(0)
-        left_coll_before = self._check_collision_in_direction(-1)
-        right_coll_before = self._check_collision_in_direction(1)
         
         # Zmiana kierunku (akcje: 0=lewo, 1=prosto, 2=prawo)
         if action == 0:  # Lewo
@@ -172,18 +166,6 @@ class SnakeEnv(gym.Env):
         terminated = False
         truncated = False
         
-        # ✅ KARA ZA IGNOROWANIE SYGNAŁÓW KOLIZJI
-        # Jeśli agent wybrał akcję prowadzącą do kolizji (mimo że sygnał ostrzegał)
-        collision_warning_penalty = 0.0
-        if action == 0 and left_coll_before == 1.0:  # Skręcił w lewo mimo ostrzeżenia
-            collision_warning_penalty = -0.5 * self.difficulty_multiplier
-        elif action == 1 and front_coll_before == 1.0:  # Poszedł prosto mimo ostrzeżenia
-            collision_warning_penalty = -0.5 * self.difficulty_multiplier
-        elif action == 2 and right_coll_before == 1.0:  # Skręcił w prawo mimo ostrzeżenia
-            collision_warning_penalty = -0.5 * self.difficulty_multiplier
-        
-        reward += collision_warning_penalty
-        
         # ==================== KOLIZJA ====================
         # Sprawdź kolizję ze ścianą
         if not (0 <= new_head[0] < self.grid_size and 0 <= new_head[1] < self.grid_size):
@@ -193,10 +175,8 @@ class SnakeEnv(gym.Env):
             terminated = True
         
         if terminated:
-            # ✅ Kara za śmierć - stała, bez dodatkowych komplikacji
-            # Agent powinien się nauczyć unikać śmierci niezależnie od postępu
+            # ✅ Kara za śmierć - skalowana z trudnością
             death_penalty = self.base_death_penalty * self.difficulty_multiplier
-            
             reward = death_penalty
             
             info = self._get_info()
@@ -219,7 +199,6 @@ class SnakeEnv(gym.Env):
             
             # ✅ NAGRODA ZA JEDZENIE - skalowana z trudnością planszy
             food_reward = self.base_food_reward * self.difficulty_multiplier
-            
             reward = food_reward
             
             # ✅ MILESTONE BONUSY (progresywne, eksponencjalne)
@@ -254,18 +233,6 @@ class SnakeEnv(gym.Env):
         else:
             # Nie zjadł - usuń ogon
             self.snake.pop()
-        
-        # ==================== STEP PENALTY ====================
-        # Mała kara za każdy krok (zachęca do efektywności)
-        reward += self.step_penalty
-        
-        # ✅ DODATKOWA kara za zbyt długie krążenie (eskalująca)
-        # Im dłużej bez jedzenia, tym większa kara
-        if self.steps_since_food > self.max_steps_without_food * 0.5:
-            # Po przekroczeniu połowy limitu, dodatkowa kara
-            progress = (self.steps_since_food - self.max_steps_without_food * 0.5) / (self.max_steps_without_food * 0.5)
-            stalling_penalty = -0.02 * progress * self.difficulty_multiplier
-            reward += stalling_penalty
         
         # ==================== TIMEOUT ====================
         # Zbyt długo bez jedzenia

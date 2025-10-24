@@ -2,7 +2,7 @@
 environment:
   min_grid_size: 8                   # Minimalny rozmiar siatki
   max_grid_size: 25                  # Maksymalny rozmiar siatki
-  viewport_size: 16                  # Rozmiar viewport (stały dla wszystkich grid_size)
+  viewport_size: 12                  # Rozmiar viewport (stały dla wszystkich grid_size)
   snake_size: 20                     # Rozmiar kratki w pikselach
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
   observation_space:
@@ -22,25 +22,24 @@ environment:
     
     # Nagrody bazowe
     base_food_reward: 10.0                # Podstawowa nagroda za jabłko
-    base_death_penalty: -10.0             # Podstawowa kara za śmierć
-    step_penalty: -0.03                   # ⬆️ ZWIĘKSZONE z -0.01 (zachęca do efektywności)
+    base_death_penalty: -5.0              # Podstawowa kara za śmierć
     
     # ⬇️ Milestone bonusy (% zajęcia planszy)
     milestones:
-      0.10: 5.0       # ⬇️ Z 10.0
-      0.20: 15.0      # ⬇️ Z 30.0
-      0.30: 35.0      # ⬇️ Z 70.0
-      0.40: 70.0      # ⬇️ Z 140.0
-      0.50: 150.0     # ⬇️ Z 280.0
-      0.60: 300.0     # ⬇️ Z 600.0
-      0.70: 600.0     # ⬇️ Z 1200.0
-      0.80: 1200.0    # ⬇️ Z 2500.0
-      0.90: 2500.0    # ⬇️ Z 5000.0
-      1.00: 10000.0   # 🏆 Epic win!
+      0.10: 10.0     # ⬆️ Z 5.0 (2x więcej)
+      0.20: 30.0     # ⬆️ Z 15.0
+      0.30: 70.0     # ⬆️ Z 35.0
+      0.40: 140.0    # ⬆️ Z 70.0
+      0.50: 300.0    # ⬆️ Z 150.0
+      0.60: 600.0    # ⬆️ Z 300.0
+      0.70: 1200.0   # Bez zmian
+      0.80: 2500.0   # Bez zmian
+      0.90: 5000.0   # Bez zmian
+      1.00: 15000.0  # ⬆️ Z 10000.0
 
     # Opcjonalne: bonus za efektywność (małe steps_per_apple)
     efficiency_bonus:
-      enable: true
+      enable: false                # Włącz/wyłącz
       threshold: 18.0               # ⬆️ z 15.0 (łatwiej osiągnąć)
       reward: 3.0                   # ⬆️ z 2.0 (większa zachęta)
 
@@ -84,12 +83,12 @@ model:
     cnn_channels: [32, 64]           # Kanały CNN (bez zmian)
     
     # Deep Bottleneck Layers
-    # Main path: 4096 → 1024 → 640
-    cnn_bottleneck_dims: [1024]
-    cnn_output_dim: 512
+    # Main path: Wyjście z cnn_channels → cnn_bottleneck_dims → cnn_output_dim
+    cnn_bottleneck_dims: [896]
+    cnn_output_dim: 384
     
     # 🆕 Scalar Network Architecture  
-    scalar_hidden_dims: [64, 128] 
+    scalar_hidden_dims: [96, 128] 
     
     # 🆕 Architecture Options
     use_layernorm: true              # LayerNorm
@@ -100,9 +99,9 @@ model:
     features_extractor_kwargs:
       features_dim: 512              # Wymiar cech wyjściowych ekstraktora
     net_arch:
-      pi: [384, 256]                 # ⬆️ OPTYMALNE: bez bottlenecku po LSTM
-      vf: [384, 256]                 # ⬆️ OPTYMALNE: lepsza wycena wartości
-    lstm_hidden_size: 256            # Rozmiar ukryty LSTM
+      pi: [512, 384, 256]               
+      vf: [512, 256]                
+    lstm_hidden_size: 512            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
     enable_critic_lstm: false        # LSTM dla krytyka
 
