@@ -49,45 +49,59 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         # ==================== TRADITIONAL CNN (FAST!) ====================
         self.conv1 = nn.Conv2d(in_channels, cnn_channels[0], kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(cnn_channels[0])
-        
+
         self.conv2 = nn.Conv2d(cnn_channels[0], cnn_channels[1], kernel_size=3, stride=2, padding=1)
         self.bn2 = nn.BatchNorm2d(cnn_channels[1])
         self.dropout2 = nn.Dropout2d(cnn_dropout) if cnn_dropout > 0 else nn.Identity()
-        
+
         self.flatten = nn.Flatten()
-        
+
         # ==================== DEEP BOTTLENECK (Multi-stage) ====================
-        spatial_size = 8
-        cnn_raw_dim = cnn_channels[1] * spatial_size * spatial_size  # e.g., 6144
-        
+        # Wylicz spatial_size dynamicznie na podstawie viewport_size i architektury
+        # Zakładamy dwa bloki: pierwszy stride=1, drugi stride=2, oba kernel=3, padding=1
+        # spatial_size = floor((floor((viewport_size + 2*1 - 3)/1 + 1) + 2*1 - 3)/2 + 1)
+        def compute_spatial_size(input_size, convs):
+            size = input_size
+            for kernel, stride, padding in convs:
+                size = (size + 2*padding - kernel) // stride + 1
+            return size
+
+        viewport_size = config['environment']['viewport_size']
+        convs = [
+            (3, 1, 1),  # conv1
+            (3, 2, 1),  # conv2
+        ]
+        spatial_size = compute_spatial_size(viewport_size, convs)
+        cnn_raw_dim = cnn_channels[1] * spatial_size * spatial_size
+
         # ✅ Build multi-stage compression path
         main_layers = []
         prev_dim = cnn_raw_dim
-        
+
         for idx, bottleneck_dim in enumerate(cnn_bottleneck_dims):
             main_layers.append(nn.Linear(prev_dim, bottleneck_dim))
             if use_layernorm:
                 main_layers.append(nn.LayerNorm(bottleneck_dim))
             main_layers.append(nn.GELU())
-            
+
             # Add dropout between stages (not after last stage)
             if idx < len(cnn_bottleneck_dims) - 1:
                 main_layers.append(nn.Dropout(cnn_dropout))
-            
+
             prev_dim = bottleneck_dim
-        
+
         # Final projection to output_dim
         main_layers.append(nn.Linear(prev_dim, cnn_output_dim))
         if use_layernorm:
             main_layers.append(nn.LayerNorm(cnn_output_dim))
-        
+
         self.cnn_compress = nn.Sequential(*main_layers)
-        
+
         # ✅ Skip connection: cnn_raw_dim → output_dim (direct)
         skip_layers = [nn.Linear(cnn_raw_dim, cnn_output_dim, bias=False)]
         if use_layernorm:
             skip_layers.append(nn.LayerNorm(cnn_output_dim))
-        
+
         self.cnn_residual = nn.Sequential(*skip_layers)
         
         # 🆕 Learnable or fixed residual weight
