@@ -49,14 +49,14 @@ model:
   policy: MultiInputLstmPolicy       # Policy dla RecurrentPPO
   learning_rate: 0.0002              # Szybkość uczenia 
   min_learning_rate: 0.00001         # Minimalny learning rate
-  n_steps: 1024                      # Liczba kroków na aktualizację
+  n_steps: 512                       # Liczba kroków na aktualizację
   n_epochs: 4                        # Liczba epok 
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.05                     # Współczynnik entropii (początkowy)
-  min_ent_coef: 0.03                 # Minimalny współczynnik entropii (docelowy)
-  vf_coef: 0.75                      # Współczynnik funkcji wartości
+  min_ent_coef: 0.01                 # Minimalny współczynnik entropii (docelowy)
+  vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   
   # ✅ Konfiguracja optymalizatora
@@ -85,11 +85,11 @@ model:
     
     # Deep Bottleneck Layers
     # Main path: 4096 → 1024 → 640
-    cnn_bottleneck_dims: [2048, 1024]
-    cnn_output_dim: 768
+    cnn_bottleneck_dims: [1024]
+    cnn_output_dim: 512
     
     # 🆕 Scalar Network Architecture  
-    scalar_hidden_dims: [128, 192] 
+    scalar_hidden_dims: [64, 128] 
     
     # 🆕 Architecture Options
     use_layernorm: true              # LayerNorm
@@ -98,11 +98,11 @@ model:
 
   policy_kwargs:
     features_extractor_kwargs:
-      features_dim: 768              # Wymiar cech wyjściowych ekstraktora
+      features_dim: 512              # Wymiar cech wyjściowych ekstraktora
     net_arch:
-      pi: [512, 256]                 # ⬆️ OPTYMALNE: bez bottlenecku po LSTM
-      vf: [512, 256]                 # ⬆️ OPTYMALNE: lepsza wycena wartości
-    lstm_hidden_size: 512            # Rozmiar ukryty LSTM
+      pi: [384, 256]                 # ⬆️ OPTYMALNE: bez bottlenecku po LSTM
+      vf: [384, 256]                 # ⬆️ OPTYMALNE: lepsza wycena wartości
+    lstm_hidden_size: 256            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
     enable_critic_lstm: false        # LSTM dla krytyka
 
