@@ -58,6 +58,12 @@ class SnakeEnv(gym.Env):
         self.milestones = self.reward_config.get('milestones', {})
         self.efficiency_config = self.reward_config.get('efficiency_bonus', {})
         
+        # ✨ PROGRESSIVE BONUS CONFIG
+        self.progressive_config = self.reward_config.get('progressive_food_bonus', {})
+        self.progressive_enabled = self.progressive_config.get('enable', False)
+        self.bonus_per_apple = self.progressive_config.get('bonus_per_apple', 0.03)
+        self.max_progressive_multiplier = self.progressive_config.get('max_multiplier', 3.0)
+        
         # Tracking dla milestone
         self.milestones_achieved = set()
         
@@ -144,6 +150,7 @@ class SnakeEnv(gym.Env):
         ✅ Progressive Reward Shaping
         - Nagrody skalują się z trudnością planszy (grid_size)
         - Milestone bonusy za % zajęcia planszy
+        - ✨ PROGRESSIVE BONUS: każde kolejne jabłko daje +X% nagrody
         - Kara za śmierć proporcjonalna do postępu
         """
         self.steps += 1
@@ -199,6 +206,16 @@ class SnakeEnv(gym.Env):
             
             # ✅ NAGRODA ZA JEDZENIE - skalowana z trudnością planszy
             food_reward = self.base_food_reward * self.difficulty_multiplier
+            
+            # ✨ PROGRESSIVE BONUS - nagroda rośnie z każdym jabłkiem
+            if self.progressive_enabled:
+                # Oblicz progressive multiplier: 1.0 + (score * bonus_per_apple)
+                # np. score=5, bonus=0.03 → 1.0 + 0.15 = 1.15x (15% więcej)
+                progressive_mult = 1.0 + (self.score * self.bonus_per_apple)
+                progressive_mult = min(progressive_mult, self.max_progressive_multiplier)
+                
+                food_reward *= progressive_mult
+            
             reward = food_reward
             
             # ✅ MILESTONE BONUSY (progresywne, eksponencjalne)
@@ -211,9 +228,6 @@ class SnakeEnv(gym.Env):
                 if current_occupancy >= threshold and threshold not in self.milestones_achieved:
                     reward += bonus * self.difficulty_multiplier  # Skaluj milestone z trudnością
                     self.milestones_achieved.add(threshold)
-                    
-                    # Debug print
-                    print(f"🎯 MILESTONE! {int(threshold*100)}% planszy (grid={self.grid_size}x{self.grid_size}) → Bonus: +{bonus * self.difficulty_multiplier:.1f}")
                     
                     # Specjalne info dla 100% planszy
                     if threshold >= 0.99:
@@ -384,6 +398,12 @@ class SnakeEnv(gym.Env):
         steps_per_apple = self.steps / max(self.score, 1)
         map_occupancy = (len(self.snake) / (self.grid_size ** 2)) * 100.0
         
+        # Oblicz aktualny progressive multiplier
+        progressive_mult = 1.0
+        if self.progressive_enabled:
+            progressive_mult = 1.0 + (self.score * self.bonus_per_apple)
+            progressive_mult = min(progressive_mult, self.max_progressive_multiplier)
+        
         return {
             'score': self.score,
             'steps': self.steps,
@@ -393,7 +413,8 @@ class SnakeEnv(gym.Env):
             'total_reward': self.total_reward,
             'map_occupancy': map_occupancy,
             'difficulty_multiplier': self.difficulty_multiplier,
-            'milestones_achieved': len(self.milestones_achieved)
+            'milestones_achieved': len(self.milestones_achieved),
+            'progressive_multiplier': progressive_mult
         }
 
     def render(self):

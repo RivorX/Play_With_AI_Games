@@ -17,20 +17,20 @@ _INFO_PRINTED = False
 
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     """
-    ✅ Deep Bottleneck Architecture
+    ✅ Deep Bottleneck Architecture (Pure - NO Skip Connection)
     """
     def __init__(self, observation_space: spaces.Dict, features_dim=256):
         super().__init__(observation_space, features_dim)
         
         global _INFO_PRINTED
         
-        # 📧 Load from config
+        # 🔧 Load from config
         cnn_channels = config['model']['convlstm']['cnn_channels'][:2]
         
-        # ✅ NEW: Support for multi-stage bottleneck
+        # ✅ Multi-stage bottleneck
         cnn_bottleneck_dims = config['model']['convlstm'].get('cnn_bottleneck_dims', [896])
         if isinstance(cnn_bottleneck_dims, int):
-            cnn_bottleneck_dims = [cnn_bottleneck_dims]  # Backward compatibility
+            cnn_bottleneck_dims = [cnn_bottleneck_dims]
         
         cnn_output_dim = config['model']['convlstm'].get('cnn_output_dim', 768)
         scalar_hidden_dims = config['model']['convlstm'].get('scalar_hidden_dims', [128, 64])
@@ -40,13 +40,11 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         fusion_dropout = config['model'].get('fusion_dropout', 0.0)
         
         use_layernorm = config['model']['convlstm'].get('use_layernorm', True)
-        learnable_alpha = config['model']['convlstm'].get('learnable_alpha', True)
-        initial_alpha = config['model']['convlstm'].get('initial_alpha', 0.5)
         
         self.use_amp = torch.cuda.is_available()
         in_channels = 1
         
-        # ==================== TRADITIONAL CNN (FAST!) ====================
+        # ==================== TRADITIONAL CNN ====================
         self.conv1 = nn.Conv2d(in_channels, cnn_channels[0], kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(cnn_channels[0])
 
@@ -56,10 +54,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
 
         self.flatten = nn.Flatten()
 
-        # ==================== DEEP BOTTLENECK (Multi-stage) ====================
-        # Wylicz spatial_size dynamicznie na podstawie viewport_size i architektury
-        # Zakładamy dwa bloki: pierwszy stride=1, drugi stride=2, oba kernel=3, padding=1
-        # spatial_size = floor((floor((viewport_size + 2*1 - 3)/1 + 1) + 2*1 - 3)/2 + 1)
+        # ==================== DEEP BOTTLENECK ====================
         def compute_spatial_size(input_size, convs):
             size = input_size
             for kernel, stride, padding in convs:
@@ -74,43 +69,28 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         spatial_size = compute_spatial_size(viewport_size, convs)
         cnn_raw_dim = cnn_channels[1] * spatial_size * spatial_size
 
-        # ✅ Build multi-stage compression path
-        main_layers = []
+        # Build multi-stage compression path
+        bottleneck_layers = []
         prev_dim = cnn_raw_dim
 
         for idx, bottleneck_dim in enumerate(cnn_bottleneck_dims):
-            main_layers.append(nn.Linear(prev_dim, bottleneck_dim))
+            bottleneck_layers.append(nn.Linear(prev_dim, bottleneck_dim))
             if use_layernorm:
-                main_layers.append(nn.LayerNorm(bottleneck_dim))
-            main_layers.append(nn.GELU())
+                bottleneck_layers.append(nn.LayerNorm(bottleneck_dim))
+            bottleneck_layers.append(nn.GELU())
 
-            # Add dropout between stages (not after last stage)
+            # Dropout between stages (not after last stage)
             if idx < len(cnn_bottleneck_dims) - 1:
-                main_layers.append(nn.Dropout(cnn_dropout))
+                bottleneck_layers.append(nn.Dropout(cnn_dropout))
 
             prev_dim = bottleneck_dim
 
         # Final projection to output_dim
-        main_layers.append(nn.Linear(prev_dim, cnn_output_dim))
+        bottleneck_layers.append(nn.Linear(prev_dim, cnn_output_dim))
         if use_layernorm:
-            main_layers.append(nn.LayerNorm(cnn_output_dim))
+            bottleneck_layers.append(nn.LayerNorm(cnn_output_dim))
 
-        self.cnn_compress = nn.Sequential(*main_layers)
-
-        # ✅ Skip connection: cnn_raw_dim → output_dim (direct)
-        skip_layers = [nn.Linear(cnn_raw_dim, cnn_output_dim, bias=False)]
-        if use_layernorm:
-            skip_layers.append(nn.LayerNorm(cnn_output_dim))
-
-        self.cnn_residual = nn.Sequential(*skip_layers)
-        
-        # 🆕 Learnable or fixed residual weight
-        if learnable_alpha:
-            self.alpha = nn.Parameter(torch.tensor(initial_alpha))
-            self.alpha_mode = 'learnable'
-        else:
-            self.register_buffer('alpha', torch.tensor(initial_alpha))
-            self.alpha_mode = 'fixed'
+        self.cnn_bottleneck = nn.Sequential(*bottleneck_layers)
         
         # ==================== SCALARS ====================
         scalar_dim = 7
@@ -145,13 +125,12 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         # ==================== PARAMETER COUNT ====================
         cnn_params = sum(p.numel() for p in self.conv1.parameters()) + \
                      sum(p.numel() for p in self.conv2.parameters())
-        bottleneck_params = sum(p.numel() for p in self.cnn_compress.parameters()) + \
-                           sum(p.numel() for p in self.cnn_residual.parameters())
+        bottleneck_params = sum(p.numel() for p in self.cnn_bottleneck.parameters())
         scalar_params = sum(p.numel() for p in self.scalar_linear.parameters())
         fusion_params = sum(p.numel() for p in self.final_linear.parameters())
         total_params = cnn_params + bottleneck_params + scalar_params + fusion_params
         
-        # Calculate compression ratio
+        # Compression ratio
         if len(cnn_bottleneck_dims) > 0:
             compression_ratio = cnn_raw_dim / cnn_bottleneck_dims[0]
         else:
@@ -159,7 +138,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         
         if not _INFO_PRINTED:
             print(f"\n{'='*70}")
-            print(f"[CNN] ⚡ DEEP BOTTLENECK CNN")
+            print(f"[CNN] ⚡ PURE BOTTLENECK CNN (NO SKIP)")
             print(f"{'='*70}")
             
             # Architecture visualization
@@ -170,9 +149,8 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
             
             print(f"[CNN] Architecture: {arch_str}")
             print(f"[CNN] ✅ Bottleneck stages: {len(cnn_bottleneck_dims)}")
-            print(f"[CNN] ✅ Initial compression: {compression_ratio:.1f}x")
+            print(f"[CNN] ✅ Compression ratio: {compression_ratio:.1f}x")
             print(f"[CNN] ✅ LayerNorm: {use_layernorm}")
-            print(f"[CNN] ✅ Alpha mode: {self.alpha_mode} (init={initial_alpha:.2f})")
             print(f"[CNN] 📊 CNN params: {cnn_params:,}")
             print(f"[CNN] 📊 Bottleneck params: {bottleneck_params:,}")
             print(f"[CNN] 📊 Total CNN+Bottleneck: {cnn_params + bottleneck_params:,}")
@@ -207,16 +185,16 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         if image.dim() == 4 and image.shape[-1] == 1:
             image = image.permute(0, 3, 1, 2)
         
-        # ==================== TRADITIONAL CNN ====================
+        # ==================== CNN ====================
         with autocast('cuda', enabled=self.use_amp):
             x = image
             
-            # Block 1: 16×16 → 16×16
+            # Block 1: 12×12 → 12×12
             x = self.conv1(x)
             x = self.bn1(x)
             x = F.gelu(x)
             
-            # Block 2: 16×16 → 8×8
+            # Block 2: 12×12 → 6×6
             x = self.conv2(x)
             x = self.bn2(x)
             x = F.gelu(x)
@@ -226,20 +204,8 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         
         cnn_raw = cnn_raw.float()
         
-        # ==================== DEEP BOTTLENECK + RESIDUAL ====================
-        # Main path: multi-stage compression
-        main_path = self.cnn_compress(cnn_raw)
-        
-        # Skip path: direct projection
-        skip_path = self.cnn_residual(cnn_raw)
-        
-        # Weighted combination (learnable alpha)
-        if self.alpha_mode == 'learnable':
-            alpha = torch.sigmoid(self.alpha)  # Clamp to [0,1]
-        else:
-            alpha = self.alpha
-        
-        cnn_features = alpha * main_path + (1 - alpha) * skip_path
+        # ==================== PURE BOTTLENECK ====================
+        cnn_features = self.cnn_bottleneck(cnn_raw)
         
         # ==================== SCALARS ====================
         scalars = torch.cat([

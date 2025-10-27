@@ -3,6 +3,7 @@ import sys
 import yaml
 import pickle
 import torch
+import gc
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.env_util import make_vec_env
@@ -36,6 +37,14 @@ ensure_directories(base_dir)
 # Channel logging (opcjonalne)
 enable_channel_logs = config.get('training', {}).get('enable_channel_logs', False)
 channel_loggers = init_channel_loggers(base_dir) if enable_channel_logs else {}
+
+
+def clear_gpu_cache():
+    """🧹 Wyczyść cache GPU i usuń nieużywane obiekty"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
 
 
 def setup_adamw_optimizer(model, config):
@@ -220,6 +229,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         )
         print(f"✅ Utworzono nowy eval VecNormalize z ustawieniami z config.yaml")
 
+    # 🧹 Wyczyść pamięć przed utworzeniem modelu
+    clear_gpu_cache()
+
     # Tworzenie lub ładowanie modelu
     policy_kwargs = config['model']['policy_kwargs'].copy()
     policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
@@ -230,8 +242,11 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         model.learning_rate = linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate'])
         model._setup_lr_schedule()
         
-        # ✅ NOWE: Skonfiguruj AdamW dla załadowanego modelu
+        # ✅ Skonfiguruj AdamW dla załadowanego modelu
         model = setup_adamw_optimizer(model, config)
+        
+        # 🧹 Wyczyść cache po załadowaniu
+        clear_gpu_cache()
     else:
         model = RecurrentPPO(
             config['model']['policy'],
@@ -250,7 +265,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             device=config['model']['device']
         )
         
-        # ✅ NOWE: Skonfiguruj AdamW dla nowego modelu
+        # ✅ Skonfiguruj AdamW dla nowego modelu
         model = setup_adamw_optimizer(model, config)
 
     if use_config_hyperparams and load_model:
@@ -274,10 +289,13 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         )
         model_tmp = RecurrentPPO.load(model_path_absolute)
         model_new.policy.load_state_dict(model_tmp.policy.state_dict())
+        
+        # 🧹 Usuń stary model
+        del model
         model = model_new
         del model_tmp
         
-        # ✅ NOWE: Skonfiguruj AdamW po przeniesieniu wag
+        # ✅ Skonfiguruj AdamW po przeniesieniu wag
         model = setup_adamw_optimizer(model, config)
 
     # Zastosuj gradient clipping
@@ -335,13 +353,13 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     print(f"  Schedule:          Linear decay (similar to learning rate)")
     print(f"{'='*70}\n")
 
-    # ✅ NOWE: Gradient & Weight Monitor
+    # ✅ Gradient & Weight Monitor
     gradient_monitor = GradientWeightMonitor(
         csv_path=os.path.join(base_dir, 'logs', 'gradient_monitor.csv'),
         log_freq=config['training'].get('gradient_log_freq', 2000)
     )
     
-    # ✅ NOWE: Victory Tracker
+    # ✅ Victory Tracker
     victory_tracker = VictoryTrackerCallback(
         log_dir=os.path.join(base_dir, 'logs'),
         verbose=1
@@ -397,7 +415,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                     loss_recorder, 
                     entropy_scheduler, 
                     gradient_monitor,
-                    victory_tracker  # ✅ Victory tracker
+                    victory_tracker
                 ],
                 progress_bar=use_progress_bar,
                 tb_log_name=f"recurrent_ppo_snake_{total_timesteps}"
@@ -412,6 +430,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             eval_env.close()
         except:
             pass
+        # 🧹 Wyczyść pamięć
+        clear_gpu_cache()
         raise
     except Exception as e:
         print(f"Błąd podczas treningu: {e}")
@@ -422,6 +442,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             eval_env.close()
         except:
             pass
+        # 🧹 Wyczyść pamięć na koniec
+        clear_gpu_cache()
 
     print("Trening zakończony!")
 
@@ -431,10 +453,14 @@ if __name__ == "__main__":
         train(use_progress_bar=True)
     except KeyboardInterrupt:
         print("\n\nTrening przerwany.")
+        # 🧹 Finalne czyszczenie
+        clear_gpu_cache()
         os._exit(0)
     except Exception as e:
         print(f"Błąd podczas treningu: {e}")
         import traceback
         traceback.print_exc()
+        # 🧹 Finalne czyszczenie
+        clear_gpu_cache()
         sys.exit(1)
     print("Trening zakończony!")
