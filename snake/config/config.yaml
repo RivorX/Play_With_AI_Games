@@ -26,16 +26,16 @@ environment:
     
     # ⬇️ Milestone bonusy (% zajęcia planszy)
     milestones:
-      0.10: 10.0     # ⬆️ Z 5.0 (2x więcej)
-      0.20: 30.0     # ⬆️ Z 15.0
-      0.30: 70.0     # ⬆️ Z 35.0
-      0.40: 140.0    # ⬆️ Z 70.0
-      0.50: 300.0    # ⬆️ Z 150.0
-      0.60: 600.0    # ⬆️ Z 300.0
-      0.70: 1200.0   # Bez zmian
-      0.80: 2500.0   # Bez zmian
-      0.90: 5000.0   # Bez zmian
-      1.00: 15000.0  # ⬆️ Z 10000.0
+      0.10: 5.0   
+      0.20: 15.0  
+      0.30: 35.0   
+      0.40: 70.0  
+      0.50: 150.0    
+      0.60: 300.0   
+      0.70: 500.0  
+      0.80: 700.0  
+      0.90: 1000.0   
+      1.00: 1500.0  
 
     # Opcjonalne: bonus za efektywność (małe steps_per_apple)
     efficiency_bonus:
@@ -61,7 +61,7 @@ model:
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.05                     # Współczynnik entropii (początkowy)
   min_ent_coef: 0.01                 # Minimalny współczynnik entropii (docelowy)
-  vf_coef: 0.5                       # Współczynnik funkcji wartości
+  vf_coef: 1.0                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
   
   # ✅ Konfiguracja optymalizatora
@@ -73,10 +73,10 @@ model:
 
   # 🆕 LSTM Configuration
   lstm:
-    gradient_clip_val: 2.0           # Clip gradients LSTM
+    gradient_clip_val: 5.0           # Clip gradients LSTM
     cell_state_penalty: 0.001        # L2 penalty na cell state
     hidden_state_penalty: 0.0001     # L2 penalty na hidden state
-    dropout: 0.01                     # Dropout w LSTM
+    dropout: 0.0                     # Dropout w LSTM
   
   # Selektywne dropouty
   cnn_dropout: 0.0                 
@@ -90,11 +90,11 @@ model:
     
     # Deep Bottleneck Layers
     # Main path: Wyjście z cnn_channels → cnn_bottleneck_dims → cnn_output_dim
-    cnn_bottleneck_dims: [896]
-    cnn_output_dim: 384
+    cnn_bottleneck_dims: [896, 640]
+    cnn_output_dim: 461
     
     # 🆕 Scalar Network Architecture  
-    scalar_hidden_dims: [96, 128] 
+    scalar_hidden_dims: [32, 64] 
     
     # 🆕 Architecture Options
     use_layernorm: true              # LayerNorm
@@ -103,11 +103,11 @@ model:
     features_extractor_kwargs:
       features_dim: 512              # Wymiar cech wyjściowych ekstraktora
     net_arch:
-      pi: [512, 384, 256]               
+      pi: [512, 256]               
       vf: [512, 384, 256]                
     lstm_hidden_size: 512            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
-    enable_critic_lstm: false        # LSTM dla krytyka
+    enable_critic_lstm: true        # LSTM dla krytyka
 
 # Konfiguracja treningu
 training:
@@ -129,7 +129,7 @@ training:
     norm_obs: false                  # ❌ FALSE dla obrazów (CNN radzi sobie z surowymi pikselami)
     norm_reward: true                # ✅ TRUE - stabilizuje trening (running mean rewards)
     clip_obs: 10.0                   # Clipping obserwacji (tylko jeśli norm_obs=true)
-    clip_reward: 10.0                # Clipping nagród (10.0 = standardowa wartość)
+    clip_reward: 50.0                # Clipping nagród (10.0 = standardowa wartość)
     gamma: 0.99                      # Gamma dla running mean rewards (powinno = model.gamma)
     
     # DODATKOWE OPCJE (zaawansowane)

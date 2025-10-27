@@ -299,7 +299,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         model = setup_adamw_optimizer(model, config)
 
     # Zastosuj gradient clipping
-    apply_gradient_clipping(model, clip_value=2.0)
+    clip_value = config['model'].get('lstm', {}).get('gradient_clip_val', 5.0)
+    apply_gradient_clipping(model, clip_value=clip_value)
 
     global best_model_save_path
     best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
