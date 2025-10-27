@@ -18,7 +18,7 @@ environment:
   reward_scaling:
     enable: true                          # Włącz skalowanie nagród
     min_difficulty_multiplier: 1.0        # Mnożnik dla min_grid_size
-    max_difficulty_multiplier: 2.5        # Mnożnik dla max_grid_size
+    max_difficulty_multiplier: 3.0        # Mnożnik dla max_grid_size
     
     # Nagrody bazowe
     base_food_reward: 10.0                # Podstawowa nagroda za jabłko
@@ -42,6 +42,12 @@ environment:
       enable: false                # Włącz/wyłącz
       threshold: 18.0               # ⬆️ z 15.0 (łatwiej osiągnąć)
       reward: 3.0                   # ⬆️ z 2.0 (większa zachęta)
+
+    # ✨ PROGRESSIVE BONUS - +3% za każde kolejne jabłko
+    progressive_food_bonus:
+      enable: true
+      bonus_per_apple: 0.03           # +3% za każde jabłko
+      max_multiplier: 3.0              # Cap na 300%
 
 # Konfiguracja modelu RecurrentPPO
 model:
@@ -78,7 +84,7 @@ model:
   scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
   fusion_dropout: 0.01              
   
-  # ✅ DEEP BOTTLENECK CNN ARCHITECTURE
+  # ✅ DEEP BOTTLENECK CNN ARCHITECTURE (NO SKIP CONNECTION)
   convlstm:
     cnn_channels: [32, 64]           # Kanały CNN (bez zmian)
     
@@ -92,15 +98,13 @@ model:
     
     # 🆕 Architecture Options
     use_layernorm: true              # LayerNorm
-    learnable_alpha: true            # Learnable alpha
-    initial_alpha: 0.5               # Początkowa waga residual
 
   policy_kwargs:
     features_extractor_kwargs:
       features_dim: 512              # Wymiar cech wyjściowych ekstraktora
     net_arch:
       pi: [512, 384, 256]               
-      vf: [512, 256]                
+      vf: [512, 384, 256]                
     lstm_hidden_size: 512            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
     enable_critic_lstm: false        # LSTM dla krytyka

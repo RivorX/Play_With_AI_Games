@@ -10,7 +10,7 @@ from scipy.ndimage import gaussian_filter
 def analyze_basic_states(model, env, output_dirs, action_names, config):
     """
     Analiza podstawowych stanów: aktywacje, attention heatmaps, gradienty
-    🆕 UPDATED: Moderate Compression (1024) + Residual Connection
+    🆕 UPDATED: Pure Bottleneck (NO Skip)
     """
     policy = model.policy
     features_extractor = policy.features_extractor
@@ -108,22 +108,15 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             cnn_raw = features_extractor.flatten(x)
             cnn_raw = cnn_raw.float()
             
-            # 🆕 RESIDUAL CONNECTION
-            cnn_compressed = features_extractor.cnn_compress(cnn_raw)
-            cnn_skip = features_extractor.cnn_residual(cnn_raw)
-            cnn_features = cnn_compressed + cnn_skip  # ✅ Residual
+            # 🆕 PURE BOTTLENECK (NO SKIP)
+            cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
             
             state_activations['cnn_raw_mean'] = cnn_raw.abs().mean().item()
             state_activations['cnn_raw_max'] = cnn_raw.abs().max().item()
-            state_activations['cnn_compressed_mean'] = cnn_compressed.abs().mean().item()
-            state_activations['cnn_skip_mean'] = cnn_skip.abs().mean().item()
+            state_activations['cnn_bottleneck_mean'] = cnn_features.abs().mean().item()
             state_activations['cnn_output_mean'] = cnn_features.abs().mean().item()
             state_activations['cnn_output_max'] = cnn_features.abs().max().item()
             state_activations['cnn_output_std'] = cnn_features.std().item()
-            
-            # 🆕 Gradient scaling check (tylko w training mode)
-            if hasattr(features_extractor, 'cnn_gradient_scale'):
-                state_activations['cnn_gradient_scale'] = features_extractor.cnn_gradient_scale
             
             # SCALAR FEATURES
             scalars = torch.cat([
@@ -141,10 +134,6 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             state_activations['scalar_output_mean'] = scalar_features.abs().mean().item()
             state_activations['scalar_output_max'] = scalar_features.abs().max().item()
             state_activations['scalar_output_std'] = scalar_features.std().item()
-            
-            # 🆕 Gradient scaling check
-            if hasattr(features_extractor, 'scalar_gradient_scale'):
-                state_activations['scalar_gradient_scale'] = features_extractor.scalar_gradient_scale
             
             # COMBINED FEATURES
             features = features_extractor(obs_tensor)
@@ -222,7 +211,7 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
         
         print(f"  Wybrany action: {action_names[action_idx]}")
         print(f"  Prawdopodobieństwa: lewo={action_probs[0]:.3f}, prosto={action_probs[1]:.3f}, prawo={action_probs[2]:.3f}")
-        print(f"  🆕 CNN raw: {state_activations['cnn_raw_mean']:.4f}, compressed: {state_activations['cnn_compressed_mean']:.4f}, skip: {state_activations['cnn_skip_mean']:.4f}")
+        print(f"  🆕 CNN raw: {state_activations['cnn_raw_mean']:.4f}, bottleneck: {state_activations['cnn_bottleneck_mean']:.4f}, output: {state_activations['cnn_output_mean']:.4f}")
     
     return action_probs_list, detailed_activations, layer_gradients, attention_heatmaps
 
@@ -230,7 +219,7 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
 def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, output_dir, state_idx, action_names):
     """
     Generuje attention heatmap używając gradientów
-    🆕 UPDATED: Moderate Compression + Residual
+    🆕 UPDATED: Pure Bottleneck (NO Skip)
     """
     policy = model.policy
     features_extractor = policy.features_extractor
@@ -280,10 +269,8 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     cnn_raw = features_extractor.flatten(x)
     cnn_raw = cnn_raw.float()
     
-    # 🆕 RESIDUAL CONNECTION
-    cnn_compressed = features_extractor.cnn_compress(cnn_raw)
-    cnn_skip = features_extractor.cnn_residual(cnn_raw)
-    cnn_output = cnn_compressed + cnn_skip
+    # 🆕 PURE BOTTLENECK (NO SKIP)
+    cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
     
     # Scalars
     scalars_grad = torch.cat([
@@ -296,10 +283,10 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     ], dim=-1)
     
     scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
-    scalar_output = features_extractor.scalar_linear(scalars_grad)
+    scalar_features = features_extractor.scalar_linear(scalars_grad)
     
     # Fusion
-    combined = torch.cat([cnn_output, scalar_output], dim=-1)
+    combined = torch.cat([cnn_features, scalar_features], dim=-1)
     features_final = features_extractor.final_linear(combined)
     
     # LSTM
@@ -362,7 +349,7 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
 def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, features_extractor):
     """
     Oblicza gradienty dla wszystkich warstw
-    🆕 UPDATED: Moderate Compression + Residual
+    🆕 UPDATED: Pure Bottleneck (NO Skip)
     """
     policy = model.policy
     
@@ -418,18 +405,10 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     cnn_raw.retain_grad()
     cnn_intermediates.append(('cnn', 4, 'Flatten', cnn_raw))
     
-    # 🆕 RESIDUAL CONNECTION
-    cnn_compressed = features_extractor.cnn_compress(cnn_raw)
-    cnn_compressed.retain_grad()
-    cnn_intermediates.append(('cnn', 5, 'Compressed', cnn_compressed))
-    
-    cnn_skip = features_extractor.cnn_residual(cnn_raw)
-    cnn_skip.retain_grad()
-    cnn_intermediates.append(('cnn', 6, 'Residual', cnn_skip))
-    
-    cnn_output = cnn_compressed + cnn_skip
-    cnn_output.retain_grad()
-    cnn_intermediates.append(('cnn', 7, 'Residual+Main', cnn_output))
+    # 🆕 PURE BOTTLENECK (NO SKIP)
+    cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
+    cnn_features.retain_grad()
+    cnn_intermediates.append(('cnn', 5, 'Bottleneck', cnn_features))
     
     # Scalar layers
     scalars_grad = torch.cat([
@@ -451,12 +430,12 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
             x_scalar.retain_grad()
             scalar_intermediates.append(('scalar', i, layer.__class__.__name__, x_scalar))
     
-    scalar_output = x_scalar
-    scalar_output.retain_grad()
-    scalar_intermediates.append(('scalar', len(scalar_intermediates), 'Output', scalar_output))
+    scalar_features = x_scalar
+    scalar_features.retain_grad()
+    scalar_intermediates.append(('scalar', len(scalar_intermediates), 'Output', scalar_features))
     
     # Combined features
-    combined = torch.cat([cnn_output, scalar_output], dim=-1)
+    combined = torch.cat([cnn_features, scalar_features], dim=-1)
     combined.retain_grad()
     features_final = features_extractor.final_linear(combined)
     features_final.retain_grad()
@@ -576,7 +555,7 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
 def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
     """
     Wizualizuje output wszystkich warstw CNN
-    🆕 UPDATED: Conv1, Conv2, Bottleneck, Residual, Final Output
+    🆕 UPDATED: Pure Bottleneck (NO Skip)
     """
     with torch.no_grad():
         image = obs_tensor['image']
@@ -590,61 +569,53 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
         x = features_extractor.conv1(image)
         x = features_extractor.bn1(x)
         x = torch.nn.functional.gelu(x)
-        activations['conv1_output'] = x.detach().cpu().numpy()[0]  # [32, 16, 16]
+        activations['conv1_output'] = x.detach().cpu().numpy()[0]  # [32, H, W]
         
         # Warstwa 2: Conv2 + BN + GELU + Dropout
         x = features_extractor.conv2(x)
         x = features_extractor.bn2(x)
         x = torch.nn.functional.gelu(x)
         x = features_extractor.dropout2(x)
-        activations['conv2_output'] = x.detach().cpu().numpy()[0]  # [64, 8, 8]
+        activations['conv2_output'] = x.detach().cpu().numpy()[0]  # [64, H/2, W/2]
         
         # Flatten
         cnn_raw = features_extractor.flatten(x)
         cnn_raw = cnn_raw.float()
+        activations['cnn_raw'] = cnn_raw.detach().cpu().numpy()[0]  # [4608]
         
-        # Bottleneck path
-        cnn_compressed = features_extractor.cnn_compress(cnn_raw)
-        activations['bottleneck'] = cnn_compressed.detach().cpu().numpy()[0]  # [640]
-        
-        # Residual path
-        cnn_skip = features_extractor.cnn_residual(cnn_raw)
-        activations['residual'] = cnn_skip.detach().cpu().numpy()[0]  # [896]
-        
-        # Final output
-        cnn_output = cnn_compressed + cnn_skip
-        activations['cnn_final'] = cnn_output.detach().cpu().numpy()[0]  # [896]
+        # Pure Bottleneck
+        cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
+        activations['bottleneck'] = cnn_features.detach().cpu().numpy()[0]  # [output_dim]
     
     # ==================== WIZUALIZACJA ====================
     
-    # 🆕 1. CONV1 OUTPUT (32 kanały, 16x16)
+    # 1. CONV1 OUTPUT
     visualize_conv_layer(
         activations['conv1_output'], 
-        layer_name='Conv1 (32 channels, 16x16)',
+        layer_name='Conv1 Output',
         output_path=os.path.join(output_dir, f'cnn_conv1_state_{state_idx}.png'),
         num_channels=min(16, activations['conv1_output'].shape[0])
     )
     
-    # 🆕 2. CONV2 OUTPUT (64 kanały, 8x8)
+    # 2. CONV2 OUTPUT
     visualize_conv_layer(
         activations['conv2_output'], 
-        layer_name='Conv2 (64 channels, 8x8)',
+        layer_name='Conv2 Output',
         output_path=os.path.join(output_dir, f'cnn_conv2_state_{state_idx}.png'),
         num_channels=min(16, activations['conv2_output'].shape[0])
     )
     
-    # 🆕 3. BOTTLENECK VS RESIDUAL (1D features)
+    # 3. RAW vs BOTTLENECK (1D features)
     visualize_1d_features(
         {
-            'Bottleneck (640)': activations['bottleneck'],
-            'Residual (896)': activations['residual'],
-            'Final Output (896)': activations['cnn_final']
+            f'CNN Raw ({len(activations["cnn_raw"])})': activations['cnn_raw'],
+            f'Bottleneck ({len(activations["bottleneck"])})': activations['bottleneck']
         },
-        output_path=os.path.join(output_dir, f'cnn_bottleneck_residual_state_{state_idx}.png'),
+        output_path=os.path.join(output_dir, f'cnn_bottleneck_state_{state_idx}.png'),
         state_idx=state_idx
     )
     
-    # 🆕 4. HEATMAPA WSZYSTKICH KANAŁÓW CONV2 (64x8x8)
+    # 4. HEATMAPA WSZYSTKICH KANAŁÓW CONV2
     visualize_all_channels_heatmap(
         activations['conv2_output'],
         layer_name='Conv2 All Channels',

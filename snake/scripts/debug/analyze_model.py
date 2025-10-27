@@ -25,11 +25,8 @@ from utils.analyze_lstm import (
 from utils.analyze_advanced import (
     analyze_temporal_patterns,
     analyze_critical_moments,
-    analyze_feature_importance,
-    analyze_bottleneck_architecture
+    analyze_feature_importance
 )
-from utils.bottleneck_analyzer import run_bottleneck_analysis
-from utils.bottleneck_ablation_test import run_ablation_study
 
 # Wczytaj konfigurację
 base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -60,14 +57,10 @@ confusion_dir = os.path.join(output_dir, 'confusion_matrix')
 temporal_dir = os.path.join(output_dir, 'temporal_patterns')
 critical_dir = os.path.join(output_dir, 'critical_moments')
 feature_dir = os.path.join(output_dir, 'feature_importance')
-bottleneck_dir = os.path.join(output_dir, 'bottleneck_analysis')
-bottleneck_advanced_dir = os.path.join(output_dir, 'bottleneck_advanced')
-bottleneck_ablation_dir = os.path.join(output_dir, 'bottleneck_ablation')
 
 for dir_path in [output_dir, conv_viz_dir, viewport_dir, action_probs_dir, 
                  heatmap_dir, lstm_dir, uncertainty_dir, confusion_dir,
-                 temporal_dir, critical_dir, feature_dir, bottleneck_dir,
-                 bottleneck_advanced_dir, bottleneck_ablation_dir]:
+                 temporal_dir, critical_dir, feature_dir]:
     os.makedirs(dir_path, exist_ok=True)
 
 # Załaduj model RecurrentPPO
@@ -103,7 +96,7 @@ print("="*80)
 # ===================================================
 # CZĘŚĆ 1: ANALIZA PODSTAWOWA
 # ===================================================
-print("\n[1/13] Analiza podstawowych stanów, aktywacji i attention...")
+print("\n[1/10] Analiza podstawowych stanów, aktywacji i attention...")
 action_probs_list, detailed_activations, layer_gradients, attention_heatmaps = analyze_basic_states(
     model=model,
     env=env,
@@ -120,7 +113,7 @@ action_probs_list, detailed_activations, layer_gradients, attention_heatmaps = a
 # ===================================================
 # CZĘŚĆ 2: ANALIZA BOTTLENECKÓW
 # ===================================================
-print("\n[2/13] Analiza bottlenecków...")
+print("\n[2/10] Analiza bottlenecków...")
 bottleneck_report = analyze_bottlenecks(
     layer_gradients=layer_gradients,
     action_names=action_names,
@@ -130,7 +123,7 @@ bottleneck_report = analyze_bottlenecks(
 # ===================================================
 # CZĘŚĆ 3: PRZEGLĄD AKTYWACJI
 # ===================================================
-print("\n[3/13] Generowanie wykresów przeglądu aktywacji...")
+print("\n[3/10] Generowanie wykresów przeglądu aktywacji...")
 plot_activation_overview(
     detailed_activations=detailed_activations,
     action_probs_list=action_probs_list,
@@ -144,7 +137,7 @@ plot_activation_overview(
 # ===================================================
 # CZĘŚĆ 4: ANALIZA LSTM MEMORY
 # ===================================================
-print("\n[4/13] Analiza LSTM memory...")
+print("\n[4/10] Analiza LSTM memory...")
 analyze_lstm_memory(
     model=model,
     env=env,
@@ -156,7 +149,7 @@ analyze_lstm_memory(
 # ===================================================
 # CZĘŚĆ 5: CONFUSION MATRIX
 # ===================================================
-print("\n[5/13] Analiza Confusion Matrix...")
+print("\n[5/10] Analiza Confusion Matrix...")
 analyze_confusion_matrix(
     model=model,
     env=env,
@@ -168,7 +161,7 @@ analyze_confusion_matrix(
 # ===================================================
 # CZĘŚĆ 6: UNCERTAINTY ANALYSIS
 # ===================================================
-print("\n[6/13] Analiza Uncertainty...")
+print("\n[6/10] Analiza Uncertainty...")
 analyze_uncertainty(
     model=model,
     env=env,
@@ -180,7 +173,7 @@ analyze_uncertainty(
 # ===================================================
 # CZĘŚĆ 7: ANALIZA SPECJALIZACJI KANAŁÓW
 # ===================================================
-print("\n[7/13] Analiza specjalizacji kanałów CNN...")
+print("\n[7/10] Analiza specjalizacji kanałów CNN...")
 analyze_channel_specialization(
     model=model,
     env=env,
@@ -191,7 +184,7 @@ analyze_channel_specialization(
 # ===================================================
 # CZĘŚĆ 8: TEMPORAL PATTERNS ANALYSIS
 # ===================================================
-print("\n[8/13] Analiza wzorców temporalnych (LSTM memory patterns)...")
+print("\n[8/10] Analiza wzorców temporalnych (LSTM memory patterns)...")
 analyze_temporal_patterns(
     model=model,
     env=env,
@@ -203,7 +196,7 @@ analyze_temporal_patterns(
 # ===================================================
 # CZĘŚĆ 9: CRITICAL MOMENTS ANALYSIS
 # ===================================================
-print("\n[9/13] Analiza krytycznych momentów (near-death, food acquisition)...")
+print("\n[9/10] Analiza krytycznych momentów (near-death, food acquisition)...")
 analyze_critical_moments(
     model=model,
     env=env,
@@ -215,46 +208,13 @@ analyze_critical_moments(
 # ===================================================
 # CZĘŚĆ 10: FEATURE IMPORTANCE ANALYSIS
 # ===================================================
-print("\n[10/13] Analiza ważności cech (ablation study)...")
+print("\n[10/10] Analiza ważności cech (ablation study)...")
 analyze_feature_importance(
     model=model,
     env=env,
     output_dir=feature_dir,
     action_names=action_names,
     num_samples=100
-)
-
-# ===================================================
-# CZĘŚĆ 11: BOTTLENECK ARCHITECTURE ANALYSIS
-# ===================================================
-print("\n[11/13] Analiza architektury bottleneck...")
-analyze_bottleneck_architecture(
-    model=model,
-    env=env,
-    output_dir=bottleneck_dir,
-    num_samples=100
-)
-
-# ===================================================
-# CZĘŚĆ 12: BOTTLENECK ADVANCED ANALYSIS
-# ===================================================
-print("\n[12/13] Zaawansowana analiza bottleneck (gradient flow, correlation)...")
-run_bottleneck_analysis(
-    model=model,
-    env=env,
-    output_dir=bottleneck_advanced_dir,
-    config=config
-)
-
-# ===================================================
-# CZĘŚĆ 13: BOTTLENECK ABLATION STUDY
-# ===================================================
-print("\n[13/13] Ablation study bottleneck (skip vs main vs current)...")
-run_ablation_study(
-    model=model,
-    output_dir=bottleneck_ablation_dir,
-    config=config,
-    n_episodes=50
 )
 
 env.close()
@@ -276,10 +236,7 @@ print(f"   ├── confusion_matrix/                      📊 Confusion matri
 print(f"   ├── uncertainty_analysis/                  🎲 Uncertainty metrics")
 print(f"   ├── temporal_patterns/                     🕐 Wzorce temporalne")
 print(f"   ├── critical_moments/                      ⚠️ Krytyczne momenty")
-print(f"   ├── feature_importance/                    🎯 Ważność cech")
-print(f"   ├── bottleneck_analysis/                   🔧 Architektura bottleneck")
-print(f"   ├── bottleneck_advanced/                   🔬 Zaawansowana analiza bottleneck")
-print(f"   └── bottleneck_ablation/                   🧪 Ablation study bottleneck")
+print(f"   └── feature_importance/                    🎯 Ważność cech")
 
 print("\n" + "="*80)
 print("=== KLUCZOWE WYNIKI ===")
@@ -310,20 +267,6 @@ print("   - feature_ablation_study.png: wpływ CNN vs scalars")
 print("   - feature_gradient_importance.png: gradient-based importance")
 print("   - feature_importance_results.csv: szczegółowe wyniki")
 
-print("\n🔧 BOTTLENECK ARCHITECTURE:")
-print("   - bottleneck_information_flow.png: przepływ informacji przez bottleneck")
-print("   - bottleneck_path_comparison.png: main path vs residual path")
-print("   - bottleneck_statistics.csv: statystyki architektury")
-
-print("\n🔬 BOTTLENECK ADVANCED:")
-print("   - gradient_flow_test.png: czy gradienty płyną przez obie ścieżki?")
-print("   - path_correlation.png: czy main i skip uczą się różnych rzeczy?")
-print("   - information_loss.png: ile informacji traci bottleneck?")
-
-print("\n🧪 BOTTLENECK ABLATION:")
-print("   - bottleneck_ablation.png: porównanie 3 konfiguracji")
-print("   - VERDICT: którą architekturę wybrać (skip only / main only / current)?")
-
 print("\n⚠️ BOTTLENECKS:")
 if bottleneck_report:
     high_severity = [b for b in bottleneck_report if b['severity'] == 'HIGH']
@@ -336,5 +279,5 @@ if bottleneck_report:
         print("   - ✅ Brak krytycznych bottlenecków")
 
 print("\n" + "="*80)
-print("✅ ROZSZERZONA ANALIZA ZAKOŃCZONA!")
+print("✅ ANALIZA ZAKOŃCZONA!")
 print("="*80)
