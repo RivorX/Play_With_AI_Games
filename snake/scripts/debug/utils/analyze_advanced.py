@@ -948,6 +948,22 @@ def analyze_bottleneck_architecture(model, env, output_dir, num_samples=100):
             x = torch.nn.functional.gelu(x)
             x = features_extractor.dropout2(x)
             
+            # Conv3 (if exists)
+            if hasattr(features_extractor, 'has_conv3') and features_extractor.has_conv3:
+                identity = features_extractor.residual_proj(x)
+                
+                local = features_extractor.conv3_local(x)
+                local = features_extractor.bn3_local(local)
+                
+                global_ctx = features_extractor.conv3_global(x)
+                global_ctx = features_extractor.bn3_global(global_ctx)
+                
+                x = torch.cat([local, global_ctx], dim=1)
+                x = features_extractor.dropout3(x)
+                x = torch.nn.functional.gelu(x)
+                
+                x = x + identity
+            
             cnn_raw = features_extractor.flatten(x).float()
             
             # Bottleneck paths
