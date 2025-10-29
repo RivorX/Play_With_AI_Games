@@ -10,12 +10,18 @@ from sb3_contrib import RecurrentPPO
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from model import make_env
 
-# Import z utils/
-from utils.analyze_activations import (
+# Import z utils/ - NOWE MODUŁY
+from utils.analyze_basic import (
     analyze_basic_states,
+    plot_activation_overview
+)
+from utils.analyze_gradients import (
     analyze_bottlenecks,
-    plot_activation_overview,
-    analyze_channel_specialization
+    analyze_gradient_flow_detailed
+)
+from utils.analyze_channels import (
+    analyze_channel_specialization,
+    analyze_activation_saturation
 )
 from utils.analyze_lstm import (
     analyze_lstm_memory,
@@ -27,6 +33,9 @@ from utils.analyze_advanced import (
     analyze_critical_moments,
     analyze_feature_importance
 )
+
+# Note: analyze_loss_landscape przeniesiony do analyze_optimization.py
+# from utils.analyze_optimization import analyze_loss_landscape
 
 # Wczytaj konfigurację
 base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -57,10 +66,14 @@ confusion_dir = os.path.join(output_dir, 'confusion_matrix')
 temporal_dir = os.path.join(output_dir, 'temporal_patterns')
 critical_dir = os.path.join(output_dir, 'critical_moments')
 feature_dir = os.path.join(output_dir, 'feature_importance')
+gradient_dir = os.path.join(output_dir, 'gradient_flow')
+saturation_dir = os.path.join(output_dir, 'activation_saturation')
+landscape_dir = os.path.join(output_dir, 'loss_landscape')
 
 for dir_path in [output_dir, conv_viz_dir, viewport_dir, action_probs_dir, 
                  heatmap_dir, lstm_dir, uncertainty_dir, confusion_dir,
-                 temporal_dir, critical_dir, feature_dir]:
+                 temporal_dir, critical_dir, feature_dir, gradient_dir,
+                 saturation_dir, landscape_dir]:
     os.makedirs(dir_path, exist_ok=True)
 
 # Załaduj model RecurrentPPO
@@ -96,7 +109,7 @@ print("="*80)
 # ===================================================
 # CZĘŚĆ 1: ANALIZA PODSTAWOWA
 # ===================================================
-print("\n[1/10] Analiza podstawowych stanów, aktywacji i attention...")
+print("\n[1/13] Analiza podstawowych stanów, aktywacji i attention...")
 action_probs_list, detailed_activations, layer_gradients, attention_heatmaps = analyze_basic_states(
     model=model,
     env=env,
@@ -113,7 +126,7 @@ action_probs_list, detailed_activations, layer_gradients, attention_heatmaps = a
 # ===================================================
 # CZĘŚĆ 2: ANALIZA BOTTLENECKÓW
 # ===================================================
-print("\n[2/10] Analiza bottlenecków...")
+print("\n[2/13] Analiza bottlenecków...")
 bottleneck_report = analyze_bottlenecks(
     layer_gradients=layer_gradients,
     action_names=action_names,
@@ -123,7 +136,7 @@ bottleneck_report = analyze_bottlenecks(
 # ===================================================
 # CZĘŚĆ 3: PRZEGLĄD AKTYWACJI
 # ===================================================
-print("\n[3/10] Generowanie wykresów przeglądu aktywacji...")
+print("\n[3/13] Generowanie wykresów przeglądu aktywacji...")
 plot_activation_overview(
     detailed_activations=detailed_activations,
     action_probs_list=action_probs_list,
@@ -137,7 +150,7 @@ plot_activation_overview(
 # ===================================================
 # CZĘŚĆ 4: ANALIZA LSTM MEMORY
 # ===================================================
-print("\n[4/10] Analiza LSTM memory...")
+print("\n[4/13] Analiza LSTM memory...")
 analyze_lstm_memory(
     model=model,
     env=env,
@@ -149,7 +162,7 @@ analyze_lstm_memory(
 # ===================================================
 # CZĘŚĆ 5: CONFUSION MATRIX
 # ===================================================
-print("\n[5/10] Analiza Confusion Matrix...")
+print("\n[5/13] Analiza Confusion Matrix...")
 analyze_confusion_matrix(
     model=model,
     env=env,
@@ -161,7 +174,7 @@ analyze_confusion_matrix(
 # ===================================================
 # CZĘŚĆ 6: UNCERTAINTY ANALYSIS
 # ===================================================
-print("\n[6/10] Analiza Uncertainty...")
+print("\n[6/13] Analiza Uncertainty...")
 analyze_uncertainty(
     model=model,
     env=env,
@@ -173,7 +186,7 @@ analyze_uncertainty(
 # ===================================================
 # CZĘŚĆ 7: ANALIZA SPECJALIZACJI KANAŁÓW
 # ===================================================
-print("\n[7/10] Analiza specjalizacji kanałów CNN...")
+print("\n[7/13] Analiza specjalizacji kanałów CNN...")
 analyze_channel_specialization(
     model=model,
     env=env,
@@ -184,7 +197,7 @@ analyze_channel_specialization(
 # ===================================================
 # CZĘŚĆ 8: TEMPORAL PATTERNS ANALYSIS
 # ===================================================
-print("\n[8/10] Analiza wzorców temporalnych (LSTM memory patterns)...")
+print("\n[8/13] Analiza wzorców temporalnych (LSTM memory patterns)...")
 analyze_temporal_patterns(
     model=model,
     env=env,
@@ -196,7 +209,7 @@ analyze_temporal_patterns(
 # ===================================================
 # CZĘŚĆ 9: CRITICAL MOMENTS ANALYSIS
 # ===================================================
-print("\n[9/10] Analiza krytycznych momentów (near-death, food acquisition)...")
+print("\n[9/13] Analiza krytycznych momentów (near-death, food acquisition)...")
 analyze_critical_moments(
     model=model,
     env=env,
@@ -208,7 +221,7 @@ analyze_critical_moments(
 # ===================================================
 # CZĘŚĆ 10: FEATURE IMPORTANCE ANALYSIS
 # ===================================================
-print("\n[10/10] Analiza ważności cech (ablation study)...")
+print("\n[10/13] Analiza ważności cech (ablation study)...")
 analyze_feature_importance(
     model=model,
     env=env,
@@ -216,6 +229,42 @@ analyze_feature_importance(
     action_names=action_names,
     num_samples=100
 )
+
+# ===================================================
+# CZĘŚĆ 11: GRADIENT FLOW DETAILED ANALYSIS 🆕
+# ===================================================
+print("\n[11/13] Analiza przepływu gradientów (gradient flow)...")
+analyze_gradient_flow_detailed(
+    model=model,
+    env=env,
+    output_dir=gradient_dir,
+    num_samples=50
+)
+
+# ===================================================
+# CZĘŚĆ 12: ACTIVATION SATURATION ANALYSIS 🆕
+# ===================================================
+print("\n[12/13] Analiza saturacji aktywacji (activation saturation)...")
+analyze_activation_saturation(
+    model=model,
+    env=env,
+    output_dir=saturation_dir,
+    num_samples=100
+)
+
+# ===================================================
+# CZĘŚĆ 13: LOSS LANDSCAPE ANALYSIS 🆕
+# ===================================================
+# Note: Tymczasowo wyłączone - wymaga analyze_optimization.py
+# print("\n[13/13] Analiza krajobrazu strat (loss landscape)...")
+# from utils.analyze_optimization import analyze_loss_landscape
+# analyze_loss_landscape(
+#     model=model,
+#     env=env,
+#     output_dir=landscape_dir,
+#     num_samples=100,
+#     num_directions=20
+# )
 
 env.close()
 
@@ -236,7 +285,10 @@ print(f"   ├── confusion_matrix/                      📊 Confusion matri
 print(f"   ├── uncertainty_analysis/                  🎲 Uncertainty metrics")
 print(f"   ├── temporal_patterns/                     🕐 Wzorce temporalne")
 print(f"   ├── critical_moments/                      ⚠️ Krytyczne momenty")
-print(f"   └── feature_importance/                    🎯 Ważność cech")
+print(f"   ├── feature_importance/                    🎯 Ważność cech")
+print(f"   ├── gradient_flow/                         🌊 Przepływ gradientów 🆕")
+print(f"   ├── activation_saturation/                 🔥 Saturacja aktywacji 🆕")
+# print(f"   └── loss_landscape/                        🗺️ Krajobraz strat 🆕 (tymczasowo wyłączone)")
 
 print("\n" + "="*80)
 print("=== KLUCZOWE WYNIKI ===")
@@ -266,6 +318,22 @@ print("\n🎯 FEATURE IMPORTANCE:")
 print("   - feature_ablation_study.png: wpływ CNN vs scalars")
 print("   - feature_gradient_importance.png: gradient-based importance")
 print("   - feature_importance_results.csv: szczegółowe wyniki")
+
+print("\n🌊 GRADIENT FLOW (NOWA ANALIZA):")
+print("   - gradient_flow_detailed.png: przepływ gradientów przez warstwy")
+print("   - gradient_flow_stats.csv: statystyki gradient vanishing/explosion")
+print("   - Sprawdź które warstwy mają problem z gradientami!")
+
+print("\n🔥 ACTIVATION SATURATION (NOWA ANALIZA):")
+print("   - activation_saturation.png: histogramy pre/post aktywacji")
+print("   - activation_saturation_summary.png: podsumowanie saturacji")
+print("   - activation_saturation_stats.csv: statystyki dead neurons")
+print("   - Sprawdź czy GELU saturuje (|x| > 3) i ile neuronów jest martwych!")
+
+# print("\n🗺️ LOSS LANDSCAPE (NOWA ANALIZA):")
+# print("   - loss_landscape.png: wizualizacja krajobrazu strat")
+# print("   - loss_landscape_data.csv: dane perturbacji wag")
+# print("   - Sprawdź czy model jest w płaskim minimum (dobra generalizacja)!")
 
 print("\n⚠️ BOTTLENECKS:")
 if bottleneck_report:
