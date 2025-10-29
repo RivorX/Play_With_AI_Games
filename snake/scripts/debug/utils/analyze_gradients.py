@@ -16,7 +16,7 @@ from scipy.ndimage import gaussian_filter
 def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, features_extractor):
     """
     Oblicza gradienty dla wszystkich warstw
-    🆕 UPDATED: Pure Bottleneck (NO Skip)
+    🆕 UPDATED: Pure Bottleneck (NO Skip) + Fixed MLP naming
     """
     policy = model.policy
     
@@ -109,19 +109,32 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
         obs_grad['left_coll'],
         obs_grad['right_coll']
     ], dim=-1)
-    
+
     scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
-    
+
     scalar_intermediates = []
     x_scalar = scalars_grad
+    linear_idx = 0
     for i, layer in enumerate(features_extractor.scalar_linear):
         x_scalar = layer(x_scalar)
         x_scalar.retain_grad()
-        scalar_intermediates.append(('scalar', i, f'Linear-{i}', x_scalar))
+        
+        # ✅ Proper layer naming
+        if isinstance(layer, torch.nn.Linear):
+            layer_name = f'Linear-{linear_idx}'
+            linear_idx += 1
+        elif isinstance(layer, torch.nn.LayerNorm):
+            layer_name = f'LayerNorm-{i}'
+        elif isinstance(layer, torch.nn.SiLU):
+            layer_name = f'SiLU-{i}'
+        elif isinstance(layer, torch.nn.Dropout):
+            layer_name = f'Dropout-{i}'
+        else:
+            layer_name = f'Unknown-{i}'
+        
+        scalar_intermediates.append(('scalar', i, layer_name, x_scalar))
     
     scalar_features = x_scalar
-    scalar_features.retain_grad()
-    scalar_intermediates.append(('scalar', len(scalar_intermediates), 'Output', scalar_features))
     
     # Combined features
     combined = torch.cat([cnn_features, scalar_features], dim=-1)
@@ -141,14 +154,47 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     latent_pi_grad = lstm_out.squeeze(1)
     latent_pi_grad.retain_grad()
     
-    # MLP layers
+    # MLP layers - POLICY
     mlp_intermediates = []
     x_mlp = latent_pi_grad
+    linear_idx_policy = 0
     for i, layer in enumerate(policy.mlp_extractor.policy_net):
         x_mlp = layer(x_mlp)
         x_mlp.retain_grad()
-        mlp_intermediates.append(('mlp', i, f'MLP-{i}', x_mlp))
-    
+        
+        # ✅ Proper naming for policy MLP
+        if isinstance(layer, torch.nn.Linear):
+            layer_name = f'Policy-Linear-{linear_idx_policy}'
+            linear_idx_policy += 1
+        elif isinstance(layer, torch.nn.Tanh):
+            layer_name = f'Policy-Tanh-{i}'
+        elif isinstance(layer, torch.nn.ReLU):
+            layer_name = f'Policy-ReLU-{i}'
+        else:
+            layer_name = f'Policy-{type(layer).__name__}-{i}'
+        
+        mlp_intermediates.append(('mlp_policy', i, layer_name, x_mlp))
+
+    # MLP layers - VALUE
+    x_mlp_vf = latent_pi_grad
+    linear_idx_value = 0
+    for i, layer in enumerate(policy.mlp_extractor.value_net):
+        x_mlp_vf = layer(x_mlp_vf)
+        x_mlp_vf.retain_grad()
+        
+        # ✅ Proper naming for value MLP
+        if isinstance(layer, torch.nn.Linear):
+            layer_name = f'Value-Linear-{linear_idx_value}'
+            linear_idx_value += 1
+        elif isinstance(layer, torch.nn.Tanh):
+            layer_name = f'Value-Tanh-{i}'
+        elif isinstance(layer, torch.nn.ReLU):
+            layer_name = f'Value-ReLU-{i}'
+        else:
+            layer_name = f'Value-{type(layer).__name__}-{i}'
+        
+        mlp_intermediates.append(('mlp_value', i, layer_name, x_mlp_vf))
+
     latent_pi_final = x_mlp
     
     # Action logits
@@ -220,11 +266,11 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
             'gradient_norm': latent_pi_grad.grad.norm().item()
         })
     
-    # MLP gradienty
+    # MLP gradienty (POLICY + VALUE)
     for layer_type, layer_idx, layer_name, activation in mlp_intermediates:
         if activation.grad is not None:
             state_layer_grads['layers'].append({
-                'type': layer_type,
+                'type': layer_type,  # 'mlp_policy' lub 'mlp_value'
                 'index': layer_idx,
                 'name': layer_name,
                 'activation_mean': activation.mean().item(),
@@ -240,104 +286,416 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
 
 def analyze_bottlenecks(layer_gradients, action_names, output_dir):
     """
-    Analiza bottlenecków w sieci
-    🆕 UPDATED: Dodano etykiety dla residual connections
+    ENHANCED BOTTLENECK ANALYSIS
+    - Split visualization by network section (CNN/Scalars/Fusion/MLP)
+    - Cross-state gradient flow heatmap
+    - Adaptive thresholds per layer type
+    - Information flow metrics
     """
-    print("\n=== Analiza bottlenecków (aktywacje vs gradienty) ===")
+    print("\n" + "="*80)
+    print("\n=== ENHANCED BOTTLENECK ANALYSIS ===")
+    print("="*80)
     
-    fig, axes = plt.subplots(3, 1, figsize=(18, 14))
+    # ==================== ORGANIZE LAYERS BY SECTION ====================
+    sections = {
+        'cnn': [],
+        'scalar': [],
+        'fusion': [],
+        'lstm': [],
+        'mlp_policy': [],
+        'mlp_value': []
+    }
     
-    bottleneck_report = []
-    
+    # Collect all layers from all 3 states
+    all_layers_by_state = []
     for state_idx in range(3):
         state_data = layer_gradients[state_idx]
         layers = state_data['layers']
+        all_layers_by_state.append(layers)
         
-        # Przygotuj dane do wykresu
-        layer_names = [l['name'] for l in layers]
-        activation_means = [l['activation_mean'] for l in layers]
-        gradient_norms = [l['gradient_norm'] for l in layers]
+        # Organize by section
+        for layer in layers:
+            layer_type = layer['type']
+            if layer_type in sections:
+                # Check if layer already exists in section
+                layer_names = [l['name'] for l in sections[layer_type]]
+                if layer['name'] not in layer_names:
+                    sections[layer_type].append(layer)
+    
+    # ==================== FIGURE 1: SPLIT BY SECTION (4 subplots) ====================
+    fig = plt.figure(figsize=(20, 14))
+    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+    
+    section_axes = {
+        'cnn': fig.add_subplot(gs[0, 0]),
+        'scalar': fig.add_subplot(gs[0, 1]),
+        'fusion': fig.add_subplot(gs[1, 0]),
+        'mlp_policy': fig.add_subplot(gs[1, 1])
+    }
+    
+    bottleneck_report = []
+    
+    # Plot each section for all 3 states
+    for section_name, ax in section_axes.items():
+        if section_name not in sections or len(sections[section_name]) == 0:
+            ax.text(0.5, 0.5, f'No {section_name.upper()} layers', 
+                   ha='center', va='center', fontsize=14, color='gray')
+            ax.set_title(f'{section_name.upper()} Layers', fontsize=14, fontweight='bold')
+            ax.axis('off')
+            continue
         
-        # Normalizacja gradient norm (dla lepszej wizualizacji)
-        max_grad = max(gradient_norms) if max(gradient_norms) > 0 else 1.0
-        gradient_norms_normalized = [g / max_grad for g in gradient_norms]
+        # Collect data for this section across all states
+        layer_names_section = []
+        for state_idx in range(3):
+            state_layers = all_layers_by_state[state_idx]
+            for layer in state_layers:
+                if layer['type'] == section_name and layer['name'] not in layer_names_section:
+                    layer_names_section.append(layer['name'])
         
-        ax = axes[state_idx]
+        # Plot bars for each state
+        x = np.arange(len(layer_names_section))
+        width = 0.12  # Narrower bars for 6 series (3 states × 2 metrics)
         
-        x = np.arange(len(layer_names))
-        width = 0.35
+        colors_activation = ['#3498db', '#2980b9', '#1f618d']  # Blue shades
+        colors_gradient = ['#e74c3c', '#c0392b', '#922b21']     # Red shades
         
-        # Bars dla aktywacji i gradientów
-        bars1 = ax.bar(x - width/2, activation_means, width, label='Activation Mean', color='#3498db', alpha=0.8, edgecolor='black')
-        bars2 = ax.bar(x + width/2, gradient_norms_normalized, width, label='Gradient Norm (normalized)', color='#e74c3c', alpha=0.8, edgecolor='black')
+        for state_idx in range(3):
+            state_layers = all_layers_by_state[state_idx]
+            action_idx = layer_gradients[state_idx]['action']
+            
+            activation_means = []
+            gradient_norms = []
+            
+            for layer_name in layer_names_section:
+                # Find layer in this state
+                layer_data = None
+                for layer in state_layers:
+                    if layer['name'] == layer_name and layer['type'] == section_name:
+                        layer_data = layer
+                        break
+                
+                if layer_data:
+                    # USE RMS instead of mean
+                    act_rms = np.sqrt(layer_data['activation_mean']**2 + layer_data['activation_std']**2)
+                    activation_means.append(act_rms)
+                    gradient_norms.append(layer_data['gradient_norm'])
+                else:
+                    activation_means.append(0)
+                    gradient_norms.append(0)
+            
+            # Normalize gradients for visualization
+            max_grad = max(gradient_norms) if max(gradient_norms) > 0 else 1.0
+            gradient_norms_normalized = [g / max_grad for g in gradient_norms]
+            
+            # Plot bars
+            offset_act = -3*width + state_idx*width
+            offset_grad = state_idx*width
+            
+            ax.bar(x + offset_act, activation_means, width, 
+                  label=f'S{state_idx} Act', color=colors_activation[state_idx], 
+                  alpha=0.8, edgecolor='black', linewidth=0.5)
+            ax.bar(x + offset_grad, gradient_norms_normalized, width, 
+                  label=f'S{state_idx} Grad', color=colors_gradient[state_idx], 
+                  alpha=0.8, edgecolor='black', linewidth=0.5)
+            
+            # Detect bottlenecks with adaptive thresholds
+            for i, layer_name in enumerate(layer_names_section):
+                activation_rms = activation_means[i]
+                gradient_mag = gradient_norms[i]
+                
+                # Adaptive thresholds based on layer type
+                if section_name == 'cnn':
+                    act_threshold = 0.05
+                    grad_threshold_high = 0.001
+                    grad_threshold_medium = 0.01
+                elif section_name == 'scalar':
+                    act_threshold = 0.03
+                    grad_threshold_high = 0.0005
+                    grad_threshold_medium = 0.005
+                else:
+                    act_threshold = 0.05
+                    grad_threshold_high = 0.001
+                    grad_threshold_medium = 0.01
+                
+                # Check for bottleneck
+                if activation_rms > act_threshold:
+                    if gradient_mag < grad_threshold_high:
+                        severity = 'HIGH'
+                        color = 'red'
+                    elif gradient_mag < grad_threshold_medium:
+                        severity = 'MEDIUM'
+                        color = 'orange'
+                    else:
+                        continue
+                    
+                    bottleneck_report.append({
+                        'state': state_idx,
+                        'section': section_name,
+                        'layer': layer_name,
+                        'activation': activation_rms,
+                        'gradient': gradient_mag,
+                        'severity': severity
+                    })
+                    
+                    # Mark on plot
+                    y_pos = max(activation_rms, gradient_norms_normalized[i]) + 0.05
+                    ax.text(i + offset_grad, y_pos, '!', 
+                           ha='center', fontsize=12, color='white', weight='bold',
+                           bbox=dict(boxstyle='circle,pad=0.3', facecolor=color, alpha=0.8))
         
-        ax.set_xlabel('Layer', fontsize=12)
-        ax.set_ylabel('Value', fontsize=12)
-        ax.set_title(f'Stan {state_idx} - Akcja: {action_names[state_data["action"]]}', fontsize=14, fontweight='bold')
+        # Formatting
+        ax.set_xlabel('Layer', fontsize=11)
+        ax.set_ylabel('Magnitude (RMS for activations)', fontsize=11)
+        ax.set_title(f'{section_name.upper()} Layers - RMS Activations vs Gradients', 
+                    fontsize=13, fontweight='bold')
         ax.set_xticks(x)
-        ax.set_xticklabels(layer_names, rotation=45, ha='right', fontsize=9)
-        ax.legend()
+        ax.set_xticklabels(layer_names_section, rotation=45, ha='right', fontsize=9)
+        ax.legend(fontsize=8, ncol=2, loc='upper right')
         ax.grid(axis='y', alpha=0.3)
         
-        # Wykryj bottlenecki (niskie gradienty przy wysokich aktywacjach)
-        for i, layer in enumerate(layers):
-            activation_mag = abs(layer['activation_mean'])
-            gradient_mag = layer['gradient_norm']
+        # Add gradient max value as text
+        ax.text(0.02, 0.98, f'Grad max: {max_grad:.4f}', 
+               transform=ax.transAxes, fontsize=9, va='top',
+               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # ==================== FIGURE 1 BOTTOM: LSTM (single row) ====================
+    ax_lstm = fig.add_subplot(gs[2, :])
+    
+    if 'lstm' in sections and len(sections['lstm']) > 0:
+        lstm_data = []
+        for state_idx in range(3):
+            state_layers = all_layers_by_state[state_idx]
+            for layer in state_layers:
+                if layer['type'] == 'lstm':
+                    # Use RMS
+                    act_rms = np.sqrt(layer['activation_mean']**2 + layer['activation_std']**2)
+                    lstm_data.append({
+                        'state': state_idx,
+                        'activation': act_rms,
+                        'gradient': layer['gradient_norm']
+                    })
+        
+        states = [d['state'] for d in lstm_data]
+        activations = [d['activation'] for d in lstm_data]
+        gradients = [d['gradient'] for d in lstm_data]
+        
+        x = np.arange(len(states))
+        width = 0.35
+        
+        ax_lstm.bar(x - width/2, activations, width, label='Activation', 
+                   color='#9b59b6', alpha=0.8, edgecolor='black')
+        ax_lstm.bar(x + width/2, gradients, width, label='Gradient Norm', 
+                   color='#8e44ad', alpha=0.8, edgecolor='black')
+        
+        ax_lstm.set_xlabel('State', fontsize=11)
+        ax_lstm.set_ylabel('Magnitude', fontsize=11)
+        ax_lstm.set_title('LSTM Layer - Activations vs Gradients', 
+                         fontsize=13, fontweight='bold')
+        ax_lstm.set_xticks(x)
+        ax_lstm.set_xticklabels([f'State {s}' for s in states])
+        ax_lstm.legend(fontsize=10)
+        ax_lstm.grid(axis='y', alpha=0.3)
+    else:
+        ax_lstm.text(0.5, 0.5, 'No LSTM layer found', 
+                    ha='center', va='center', fontsize=14, color='gray')
+        ax_lstm.axis('off')
+    
+    plt.savefig(os.path.join(output_dir, 'bottleneck_analysis_split.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print('[OK] Split bottleneck analysis saved: bottleneck_analysis_split.png')
+    
+    # ==================== FIGURE 2: GRADIENT FLOW HEATMAP ====================
+    print("\n[INFO] Generating gradient flow heatmap...")
+    
+    # Collect all unique layer names (in order)
+    all_layer_names = []
+    for state_layers in all_layers_by_state:
+        for layer in state_layers:
+            if layer['name'] not in all_layer_names:
+                all_layer_names.append(layer['name'])
+    
+    # Build heatmap matrix: [layers × states]
+    heatmap_data = np.zeros((len(all_layer_names), 3))
+    
+    # Track min/max ratios
+    min_ratio = float('inf')
+    max_ratio = float('-inf')
+    
+    for state_idx in range(3):
+        state_layers = all_layers_by_state[state_idx]
+        for layer in state_layers:
+            layer_idx = all_layer_names.index(layer['name'])
             
-            # Bottleneck jeśli:
-            # 1. Aktywacja > 0.1 (layer jest aktywny)
-            # 2. Gradient norm < 0.01 (gradient vanishing)
-            if activation_mag > 0.1 and gradient_mag < 0.01:
-                severity = 'HIGH' if gradient_mag < 0.001 else 'MEDIUM'
-                bottleneck_report.append({
-                    'state': state_idx,
-                    'layer': layer['name'],
-                    'activation': activation_mag,
-                    'gradient': gradient_mag,
-                    'severity': severity
-                })
-                
-                # Oznacz na wykresie
-                color = 'red' if severity == 'HIGH' else 'orange'
-                ax.text(i, max(activation_mag, gradient_norms_normalized[i]) + 0.05, 
-                       '⚠️', ha='center', fontsize=14, color=color)
+            # Compute RMS activation
+            act_mean = layer['activation_mean']
+            act_std = layer['activation_std']
+            activation_rms = np.sqrt(act_mean**2 + act_std**2) + 1e-8
+            
+            gradient = layer['gradient_norm'] + 1e-8
+            
+            # Gradient-to-activation ratio (log scale)
+            ratio = gradient / activation_rms
+            log_ratio = np.log10(ratio)
+            heatmap_data[layer_idx, state_idx] = log_ratio
+            
+            # Track extremes
+            min_ratio = min(min_ratio, log_ratio)
+            max_ratio = max(max_ratio, log_ratio)
+    
+    print(f"   Heatmap range: log10(ratio) in [{min_ratio:.2f}, {max_ratio:.2f}]")
+    print(f"   Mapping: <-3 = Critical, -3 to -2 = Vanishing, >-2 = Healthy")
+    
+    # Plot heatmap with optimized figure size
+    num_layers = len(all_layer_names)
+    fig_height = max(8, num_layers * 0.3)  # Tighter spacing
+    fig, ax = plt.subplots(figsize=(8, fig_height))
+    
+    # Custom colormap: red (vanishing) → yellow (borderline) → green (healthy)
+    from matplotlib.colors import LinearSegmentedColormap
+    colors = ['#d73027', '#fc8d59', '#fee090', '#e0f3f8', '#91bfdb', '#4575b4']
+    n_bins = 100
+    cmap = LinearSegmentedColormap.from_list('gradient_flow', colors, N=n_bins)
+    
+    # Dynamic vmin/vmax based on actual data
+    vmin = max(-4, min_ratio - 0.5)
+    vmax = min(1, max_ratio + 0.5)
+    
+    print(f"   Colormap range: [{vmin:.2f}, {vmax:.2f}]")
+    
+    im = ax.imshow(heatmap_data, cmap=cmap, aspect='auto', vmin=vmin, vmax=vmax, interpolation='nearest')
+    
+    # Add text annotations (Windows-compatible symbols)
+    for i in range(len(all_layer_names)):
+        for j in range(3):
+            value = heatmap_data[i, j]
+            
+            # Determine severity (simplified symbols)
+            if value < -3:  # ratio < 0.001
+                symbol = 'X'
+                color = 'white'
+                bgcolor = '#d73027'
+            elif value < -2:  # ratio < 0.01
+                symbol = '!'
+                color = 'black'
+                bgcolor = '#fee090'
+            else:
+                symbol = 'OK'
+                color = 'white'
+                bgcolor = '#4575b4'
+            
+            ax.text(j, i, symbol, ha='center', va='center', fontsize=9, 
+                   color=color, weight='bold',
+                   bbox=dict(boxstyle='round,pad=0.25', facecolor=bgcolor, 
+                            edgecolor='none', alpha=0.7))
+    
+    # Labels
+    ax.set_xticks(np.arange(3))
+    ax.set_xticklabels([f'State {i}\n({action_names[layer_gradients[i]["action"]]})' 
+                        for i in range(3)], fontsize=11)
+    ax.set_yticks(np.arange(len(all_layer_names)))
+    ax.set_yticklabels(all_layer_names, fontsize=9)
+    
+    ax.set_xlabel('State (Action)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Layer', fontsize=12, fontweight='bold')
+    ax.set_title('Gradient Flow Heatmap (Gradient/Activation Ratio, log10)', 
+                fontsize=14, fontweight='bold')
+    
+    # Colorbar with compact layout
+    cbar = plt.colorbar(im, ax=ax, label='log10(Grad/Act)', pad=0.01, fraction=0.046)
+    
+    # Add threshold reference lines on colorbar
+    cbar.ax.axhline(-3, color='white', linewidth=1.5, linestyle='--', alpha=0.8)
+    cbar.ax.axhline(-2, color='white', linewidth=1.5, linestyle='--', alpha=0.8)
+    
+    # Add threshold labels INSIDE the colorbar
+    cbar.ax.text(0.5, -3, ' Critical', fontsize=7, color='white', 
+                va='center', ha='left', weight='bold')
+    cbar.ax.text(0.5, -2, ' Vanish', fontsize=7, color='white', 
+                va='center', ha='left', weight='bold')
+    cbar.ax.text(0.5, -1, ' Healthy', fontsize=7, color='white', 
+                va='center', ha='left', weight='bold')
+    
+    # Compact legend below the plot
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#d73027', edgecolor='black', label='X: Critical (<0.001)'),
+        Patch(facecolor='#fee090', edgecolor='black', label='!: Vanishing (0.001-0.01)'),
+        Patch(facecolor='#4575b4', edgecolor='black', label='OK: Healthy (>0.01)')
+    ]
+    ax.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.05), 
+             fontsize=8, framealpha=0.9, ncol=3)
     
     plt.tight_layout()
-    bottleneck_path = os.path.join(output_dir, 'bottleneck_analysis.png')
-    plt.savefig(bottleneck_path, dpi=150)
+    plt.subplots_adjust(bottom=0.08)  # Make room for legend
+    plt.savefig(os.path.join(output_dir, 'bottleneck_gradient_heatmap.png'), 
+               dpi=150, bbox_inches='tight', pad_inches=0.1)
     plt.close()
-    print(f'Analiza bottlenecków zapisana: {bottleneck_path}')
+    print('[OK] Gradient flow heatmap saved: bottleneck_gradient_heatmap.png')
     
-    # Raport bottlenecków
+    # ==================== BOTTLENECK REPORT ====================
     print("\n" + "="*80)
-    print("=== RAPORT BOTTLENECKÓW ===")
+    print("=== BOTTLENECK REPORT ===")
     print("="*80)
     
     high_severity = [b for b in bottleneck_report if b['severity'] == 'HIGH']
     medium_severity = [b for b in bottleneck_report if b['severity'] == 'MEDIUM']
     
     if high_severity:
-        print(f"\n🔴 WYSOKIE RYZYKO ({len(high_severity)} przypadków):")
+        print(f"\n[HIGH] HIGH SEVERITY BOTTLENECKS ({len(high_severity)} cases):")
         for b in high_severity:
-            print(f"   Stan {b['state']}, Layer: {b['layer']}")
-            print(f"   → Activation: {b['activation']:.4f}, Gradient: {b['gradient']:.6f}")
+            print(f"   State {b['state']}, {b['section'].upper()}: {b['layer']}")
+            print(f"   -> Activation: {b['activation']:.4f}, Gradient: {b['gradient']:.6f}")
     
     if medium_severity:
-        print(f"\n🟡 ŚREDNIE RYZYKO ({len(medium_severity)} przypadków):")
+        print(f"\n[MED] MEDIUM SEVERITY BOTTLENECKS ({len(medium_severity)} cases):")
         for b in medium_severity:
-            print(f"   Stan {b['state']}, Layer: {b['layer']}")
-            print(f"   → Activation: {b['activation']:.4f}, Gradient: {b['gradient']:.6f}")
+            print(f"   State {b['state']}, {b['section'].upper()}: {b['layer']}")
+            print(f"   -> Activation: {b['activation']:.4f}, Gradient: {b['gradient']:.6f}")
     
     if not high_severity and not medium_severity:
-        print("\n✅ Brak krytycznych bottlenecków!")
+        print("\n[OK] No critical bottlenecks detected!")
     
+    # ==================== CROSS-STATE CONSISTENCY ANALYSIS ====================
+    print("\n" + "="*80)
+    print("=== CROSS-STATE CONSISTENCY ===")
+    print("="*80)
+    
+    # Find layers that are ALWAYS problematic (across all 3 states)
+    layer_issue_count = {}
+    for b in bottleneck_report:
+        key = f"{b['section']}:{b['layer']}"
+        if key not in layer_issue_count:
+            layer_issue_count[key] = []
+        layer_issue_count[key].append(b['state'])
+    
+    persistent_bottlenecks = {k: v for k, v in layer_issue_count.items() if len(v) == 3}
+    inconsistent_bottlenecks = {k: v for k, v in layer_issue_count.items() if 0 < len(v) < 3}
+    
+    if persistent_bottlenecks:
+        print(f"\n[!] PERSISTENT BOTTLENECKS (all 3 states):")
+        for layer_key in persistent_bottlenecks:
+            section, layer_name = layer_key.split(':')
+            print(f"   {section.upper()}: {layer_name}")
+        print("\n[TIP] These layers need architectural changes!")
+    
+    if inconsistent_bottlenecks:
+        print(f"\n[~] INCONSISTENT BOTTLENECKS (1-2 states only):")
+        for layer_key, states in inconsistent_bottlenecks.items():
+            section, layer_name = layer_key.split(':')
+            print(f"   {section.upper()}: {layer_name} (states: {states})")
+        print("\n[TIP] These may be state-dependent issues (check input diversity)")
+    
+    # ==================== SAVE CSV REPORT ====================
     bottleneck_csv_path = os.path.join(output_dir, 'bottleneck_report.csv')
     if bottleneck_report:
         with open(bottleneck_csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['state', 'layer', 'activation', 'gradient', 'severity'])
+            writer = csv.DictWriter(f, fieldnames=['state', 'section', 'layer', 
+                                                   'activation', 'gradient', 'severity'])
             writer.writeheader()
             writer.writerows(bottleneck_report)
-        print(f"\n✅ Raport zapisany: {bottleneck_csv_path}")
+        print(f"\n[OK] Bottleneck report saved: {bottleneck_csv_path}")
+    
+    print("\n" + "="*80)
     
     return bottleneck_report
 

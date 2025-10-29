@@ -4,6 +4,7 @@
 - visualize_cnn_output: Wizualizacja warstw CNN (Conv1, Conv2, Conv3)
 - visualize_viewport: Wizualizacja viewport 16x16
 - generate_attention_heatmap: Generowanie attention heatmap
+✅ UPDATED: RMS metrics zamiast mean (pokazuje prawdziwą siłę CNN)
 """
 
 import os
@@ -16,7 +17,7 @@ from matplotlib.patches import Patch
 def analyze_basic_states(model, env, output_dirs, action_names, config):
     """
     Analiza podstawowych stanów: aktywacje, attention heatmaps, gradienty
-    🆕 UPDATED: Pure Bottleneck (NO Skip)
+    🆕 UPDATED: Pure Bottleneck (NO Skip) + RMS metrics
     """
     policy = model.policy
     features_extractor = policy.features_extractor
@@ -144,20 +145,25 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             'value': value.item()
         })
         
+        # ✅ Better metrics: RMS (Root Mean Square) pokazuje siłę sygnału
+        cnn_np = cnn_features[0].cpu().numpy()
+        scalar_np = scalar_features[0].cpu().numpy()
+        features_np = features_final[0].cpu().numpy()
+        lstm_np = latent_pi[0].cpu().numpy()
+        
         detailed_activations.append({
             'state': state_idx,
-            'cnn_output_mean': cnn_features[0].cpu().numpy().mean(),
-            'cnn_output_std': cnn_features[0].cpu().numpy().std(),
-            'scalar_output_mean': scalar_features[0].cpu().numpy().mean(),
-            'scalar_output_std': scalar_features[0].cpu().numpy().std(),
-            'features_mean': features_final[0].cpu().numpy().mean(),
-            'features_std': features_final[0].cpu().numpy().std(),
-            'lstm_output_mean': latent_pi[0].cpu().numpy().mean(),
-            'lstm_output_std': latent_pi[0].cpu().numpy().std(),
-            'lstm_hidden_mean': lstm_states[0][0].mean(),
-            'lstm_hidden_std': lstm_states[0][0].std(),
-            'lstm_cell_mean': lstm_states[1][0].mean(),
-            'lstm_cell_std': lstm_states[1][0].std(),
+            # RMS = sqrt(mean(x^2)) - pokazuje siłę aktywacji niezależnie od znaku
+            'cnn_rms': np.sqrt(np.mean(cnn_np**2)),
+            'cnn_absmax': np.abs(cnn_np).max(),
+            'cnn_active_ratio': (np.abs(cnn_np) > 0.01).mean(),  # % aktywnych neuronów
+            'scalar_rms': np.sqrt(np.mean(scalar_np**2)),
+            'scalar_absmax': np.abs(scalar_np).max(),
+            'scalar_active_ratio': (np.abs(scalar_np) > 0.01).mean(),
+            'features_rms': np.sqrt(np.mean(features_np**2)),
+            'lstm_rms': np.sqrt(np.mean(lstm_np**2)),
+            'lstm_hidden_rms': np.sqrt(np.mean(lstm_states[0][0]**2)),
+            'lstm_cell_rms': np.sqrt(np.mean(lstm_states[1][0]**2)),
         })
         
         # Wizualizacja CNN output
@@ -599,58 +605,75 @@ def visualize_viewport(obs, output_dir, state_idx):
 
 
 def plot_activation_overview(detailed_activations, action_probs_list, action_names, output_dirs):
-    """Generuje wykresy przeglądu aktywacji"""
+    """Generuje wykresy przeglądu aktywacji - używa RMS zamiast mean"""
     
-    # Wykres 1: Przegląd aktywacji neuronów
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    # Wykres 1: Przegląd aktywacji neuronów (RMS = siła sygnału)
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
     
     states = [0, 1, 2]
-    cnn_means = [d['cnn_output_mean'] for d in detailed_activations]
-    scalar_means = [d['scalar_output_mean'] for d in detailed_activations]
-    features_means = [d['features_mean'] for d in detailed_activations]
+    
+    # 📊 SUBPLOT 1: RMS (Root Mean Square) - pokazuje siłę sygnału
+    cnn_rms = [d['cnn_rms'] for d in detailed_activations]
+    scalar_rms = [d['scalar_rms'] for d in detailed_activations]
+    features_rms = [d['features_rms'] for d in detailed_activations]
     
     x = np.arange(len(states))
     width = 0.25
     
-    axes[0].bar(x - width, cnn_means, width, label='CNN Output', color='#e74c3c')
-    axes[0].bar(x, scalar_means, width, label='Scalar Output', color='#3498db')
-    axes[0].bar(x + width, features_means, width, label='Combined Features', color='#2ecc71')
-    axes[0].set_xlabel('Stan')
-    axes[0].set_ylabel('Średnia aktywacja')
-    axes[0].set_title('Porównanie CNN vs Scalar Features')
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels([f'Stan {s}' for s in states])
-    axes[0].legend()
-    axes[0].grid(axis='y', alpha=0.3)
+    axes[0, 0].bar(x - width, cnn_rms, width, label='CNN RMS', color='#e74c3c')
+    axes[0, 0].bar(x, scalar_rms, width, label='Scalar RMS', color='#3498db')
+    axes[0, 0].bar(x + width, features_rms, width, label='Fused RMS', color='#2ecc71')
+    axes[0, 0].set_xlabel('Stan')
+    axes[0, 0].set_ylabel('RMS Magnitude')
+    axes[0, 0].set_title('🔥 Siła Sygnału (RMS) - CNN vs Scalars')
+    axes[0, 0].set_xticks(x)
+    axes[0, 0].set_xticklabels([f'Stan {s}' for s in states])
+    axes[0, 0].legend()
+    axes[0, 0].grid(axis='y', alpha=0.3)
     
-    lstm_output_means = [d['lstm_output_mean'] for d in detailed_activations]
-    lstm_hidden_means = [d['lstm_hidden_mean'] for d in detailed_activations]
-    lstm_cell_means = [d['lstm_cell_mean'] for d in detailed_activations]
+    # 📊 SUBPLOT 2: Max Absolute Value (peak responses)
+    cnn_max = [d['cnn_absmax'] for d in detailed_activations]
+    scalar_max = [d['scalar_absmax'] for d in detailed_activations]
     
-    axes[1].bar(x - width, lstm_output_means, width, label='LSTM Output', color='#9b59b6')
-    axes[1].bar(x, lstm_hidden_means, width, label='Hidden State', color='#8e44ad')
-    axes[1].bar(x + width, lstm_cell_means, width, label='Cell State', color='#6c3483')
-    axes[1].set_xlabel('Stan')
-    axes[1].set_ylabel('Średnia aktywacja')
-    axes[1].set_title('Aktywacje LSTM')
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels([f'Stan {s}' for s in states])
-    axes[1].legend()
-    axes[1].grid(axis='y', alpha=0.3)
+    axes[0, 1].bar(x - width/2, cnn_max, width, label='CNN Max', color='#e74c3c')
+    axes[0, 1].bar(x + width/2, scalar_max, width, label='Scalar Max', color='#3498db')
+    axes[0, 1].set_xlabel('Stan')
+    axes[0, 1].set_ylabel('Max |Activation|')
+    axes[0, 1].set_title('⚡ Peak Responses')
+    axes[0, 1].set_xticks(x)
+    axes[0, 1].set_xticklabels([f'Stan {s}' for s in states])
+    axes[0, 1].legend()
+    axes[0, 1].grid(axis='y', alpha=0.3)
     
+    # 📊 SUBPLOT 3: Active Neuron Ratio (% neurons > threshold)
+    cnn_active = [d['cnn_active_ratio'] * 100 for d in detailed_activations]
+    scalar_active = [d['scalar_active_ratio'] * 100 for d in detailed_activations]
+    
+    axes[1, 0].bar(x - width/2, cnn_active, width, label='CNN Active %', color='#e74c3c')
+    axes[1, 0].bar(x + width/2, scalar_active, width, label='Scalar Active %', color='#3498db')
+    axes[1, 0].set_xlabel('Stan')
+    axes[1, 0].set_ylabel('Active Neurons (%)')
+    axes[1, 0].set_title('🎯 Sparsity (% neurons |x| > 0.01)')
+    axes[1, 0].set_xticks(x)
+    axes[1, 0].set_xticklabels([f'Stan {s}' for s in states])
+    axes[1, 0].legend()
+    axes[1, 0].grid(axis='y', alpha=0.3)
+    axes[1, 0].set_ylim(0, 100)
+    
+    # 📊 SUBPLOT 4: Action Probabilities (unchanged)
     action_probs = [a['probs'] for a in action_probs_list]
     action_probs_np = np.array(action_probs)
     
     for action_idx in range(len(action_names)):
-        axes[2].plot(states, action_probs_np[:, action_idx], marker='o', label=action_names[action_idx], linewidth=2)
+        axes[1, 1].plot(states, action_probs_np[:, action_idx], marker='o', label=action_names[action_idx], linewidth=2)
     
-    axes[2].set_xlabel('Stan')
-    axes[2].set_ylabel('Prawdopodobieństwo')
-    axes[2].set_title('Prawdopodobieństwa Akcji')
-    axes[2].set_xticks(states)
-    axes[2].set_xticklabels([f'Stan {s}' for s in states])
-    axes[2].legend()
-    axes[2].grid(alpha=0.3)
+    axes[1, 1].set_xlabel('Stan')
+    axes[1, 1].set_ylabel('Prawdopodobieństwo')
+    axes[1, 1].set_title('Prawdopodobieństwa Akcji')
+    axes[1, 1].set_xticks(states)
+    axes[1, 1].set_xticklabels([f'Stan {s}' for s in states])
+    axes[1, 1].legend()
+    axes[1, 1].grid(alpha=0.3)
     
     plt.tight_layout()
     overview_path = os.path.join(output_dirs['main'], 'neuron_activations_overview.png')
