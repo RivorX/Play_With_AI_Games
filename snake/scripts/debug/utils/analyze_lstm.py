@@ -1,157 +1,39 @@
+"""
+🧠 LSTM COMPREHENSIVE ANALYSIS MODULE
+
+Scalona analiza LSTM:
+- Memory evolution (hidden/cell states)
+- Temporal patterns (n-grams, forgetting curve)
+- Confusion matrix
+- Uncertainty analysis
+
+Wszystkie wyniki w jednym katalogu: 04_lstm_memory/
+"""
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import csv
 import os
+from collections import Counter
+from scipy.spatial.distance import cosine
 
 
-def analyze_lstm_memory(model, env, output_dir, action_names, config):
-    """Analiza konsystencji LSTM (pamięć)"""
-    print("\n=== Analiza konsystencji LSTM (pamięć) ===")
+def analyze_lstm_comprehensive(model, env, output_dir, action_names, config, num_episodes=20):
+    """
+    🧠 KOMPLEKSOWA ANALIZA LSTM
+    Łączy: memory evolution + temporal patterns + confusion matrix + uncertainty
+    """
+    print("\n" + "="*80)
+    print("🧠 LSTM COMPREHENSIVE ANALYSIS")
+    print("="*80)
     
     policy = model.policy
     
-    # Zbieramy dane z pełnego epizodu
-    obs, _ = env.reset()
-    lstm_states = None
-    episode_starts = np.ones((1,), dtype=bool)
-    
-    episode_lstm_data = []
-    step_count = 0
-    max_steps = config['model']['n_steps'] * 5
-    
-    while step_count < max_steps:
-        # Predict
-        with torch.no_grad():
-            action, new_lstm_states = model.predict(
-                obs, 
-                state=lstm_states, 
-                episode_start=episode_starts, 
-                deterministic=True
-            )
-            
-            if torch.is_tensor(action):
-                action_idx = int(action.item())
-            elif isinstance(action, np.ndarray):
-                action_idx = int(action.item())
-            else:
-                action_idx = int(action)
-            action_idx = int(np.clip(action_idx, 0, len(action_names) - 1))
-            
-            # Zapisz dane LSTM
-            if lstm_states is not None:
-                hidden_state = lstm_states[0]  # Shape: [n_layers, batch, hidden_size]
-                cell_state = lstm_states[1]
-                
-                # Mean magnitude per layer
-                hidden_mean = np.abs(hidden_state).mean(axis=(1, 2))  # [n_layers]
-                cell_mean = np.abs(cell_state).mean(axis=(1, 2))
-                
-                # Change from previous step
-                if len(episode_lstm_data) > 0:
-                    prev_hidden = episode_lstm_data[-1]['hidden_state']
-                    hidden_change = np.abs(hidden_state - prev_hidden).mean()
-                else:
-                    hidden_change = 0.0
-                
-                episode_lstm_data.append({
-                    'step': step_count,
-                    'action': action_names[action_idx],
-                    'hidden_state': hidden_state.copy(),
-                    'cell_state': cell_state.copy(),
-                    'hidden_mean_layer0': hidden_mean[0] if len(hidden_mean) > 0 else 0,
-                    'cell_mean_layer0': cell_mean[0] if len(cell_mean) > 0 else 0,
-                    'hidden_change': hidden_change
-                })
-            
-            lstm_states = new_lstm_states
-        
-        # Step
-        obs, reward, done, truncated, info = env.step(action_idx)
-        episode_starts = np.array([done or truncated], dtype=bool)
-        step_count += 1
-        
-        if done or truncated:
-            obs, _ = env.reset()
-            lstm_states = None
-            episode_starts = np.ones((1,), dtype=bool)
-    
-    # Wizualizacja LSTM memory evolution
-    if len(episode_lstm_data) > 0:
-        steps = [d['step'] for d in episode_lstm_data]
-        hidden_means = [d['hidden_mean_layer0'] for d in episode_lstm_data]
-        cell_means = [d['cell_mean_layer0'] for d in episode_lstm_data]
-        hidden_changes = [d['hidden_change'] for d in episode_lstm_data]
-        
-        fig, axes = plt.subplots(3, 1, figsize=(16, 12))
-        
-        # Plot 1: Hidden state magnitude over time
-        axes[0].plot(steps, hidden_means, label='Hidden State (Layer 0)', color='#9b59b6', linewidth=2)
-        axes[0].set_xlabel('Krok')
-        axes[0].set_ylabel('Średnia magnitude')
-        axes[0].set_title('Ewolucja Hidden State LSTM')
-        axes[0].legend()
-        axes[0].grid(alpha=0.3)
-        
-        # Plot 2: Cell state magnitude over time
-        axes[1].plot(steps, cell_means, label='Cell State (Layer 0)', color='#8e44ad', linewidth=2)
-        axes[1].set_xlabel('Krok')
-        axes[1].set_ylabel('Średnia magnitude')
-        axes[1].set_title('Ewolucja Cell State LSTM')
-        axes[1].legend()
-        axes[1].grid(alpha=0.3)
-        
-        # Plot 3: Hidden state change (memory update rate)
-        axes[2].plot(steps[1:], hidden_changes[1:], label='Zmiana Hidden State', color='#e74c3c', linewidth=2)
-        axes[2].set_xlabel('Krok')
-        axes[2].set_ylabel('Wielkość zmiany')
-        axes[2].set_title('Tempo aktualizacji pamięci LSTM')
-        axes[2].legend()
-        axes[2].grid(alpha=0.3)
-        
-        plt.tight_layout()
-        lstm_evolution_path = os.path.join(output_dir, 'lstm_memory_evolution.png')
-        plt.savefig(lstm_evolution_path, dpi=150)
-        plt.close()
-        print(f'✓ LSTM memory evolution zapisana: {lstm_evolution_path}')
-        
-        # Heatmapa hidden state w czasie
-        hidden_states_matrix = np.array([d['hidden_state'][0, 0, :] for d in episode_lstm_data])
-        
-        plt.figure(figsize=(16, 8))
-        plt.imshow(hidden_states_matrix.T, aspect='auto', cmap='coolwarm', interpolation='nearest')
-        plt.colorbar(label='Wartość aktywacji')
-        plt.xlabel('Krok czasowy')
-        plt.ylabel('Neuron LSTM')
-        plt.title('Aktywacja wszystkich neuronów LSTM w czasie')
-        plt.tight_layout()
-        lstm_heatmap_path = os.path.join(output_dir, 'lstm_neurons_heatmap.png')
-        plt.savefig(lstm_heatmap_path, dpi=150)
-        plt.close()
-        print(f'✓ LSTM neurons heatmap zapisana: {lstm_heatmap_path}')
-        
-        # Zapisz dane LSTM do CSV
-        lstm_csv_path = os.path.join(output_dir, 'lstm_memory_data.csv')
-        with open(lstm_csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['step', 'action', 'hidden_mean_layer0', 'cell_mean_layer0', 'hidden_change'])
-            for d in episode_lstm_data:
-                writer.writerow([
-                    d['step'],
-                    d['action'],
-                    d['hidden_mean_layer0'],
-                    d['cell_mean_layer0'],
-                    d['hidden_change']
-                ])
-        print(f'✓ LSTM memory data zapisana: {lstm_csv_path}')
-
-
-def analyze_confusion_matrix(model, env, output_dir, action_names, num_episodes=20):
-    """Analiza Confusion Matrix - porównanie z heurystyką"""
-    print("\n=== Zbieranie danych dla Confusion Matrix ===")
-    
-    confusion_matrix = np.zeros((3, 3))  # [expected_action, actual_action]
-    action_history = []
+    # ==================== ZBIERANIE DANYCH ====================
+    all_episodes_data = []
+    confusion_matrix = np.zeros((3, 3))
+    uncertainty_data = []
     
     for episode_idx in range(num_episodes):
         obs, _ = env.reset()
@@ -160,14 +42,23 @@ def analyze_confusion_matrix(model, env, output_dir, action_names, num_episodes=
         done = False
         step = 0
         
-        while not done and step < 100:
-            # Predict
+        episode_data = {
+            'actions': [],
+            'rewards': [],
+            'hidden_states': [],
+            'cell_states': [],
+            'action_probs': [],
+            'food_distances': []
+        }
+        
+        while not done and step < 512 * 2:
             with torch.no_grad():
-                action, lstm_states = model.predict(
+                # Predict
+                action, new_lstm_states = model.predict(
                     obs, 
                     state=lstm_states, 
                     episode_start=episode_starts, 
-                    deterministic=True
+                    deterministic=False
                 )
                 
                 if torch.is_tensor(action):
@@ -177,113 +68,8 @@ def analyze_confusion_matrix(model, env, output_dir, action_names, num_episodes=
                 else:
                     action_idx = int(action)
                 action_idx = int(np.clip(action_idx, 0, len(action_names) - 1))
-            
-            # Heurystyka: "oczekiwana akcja" na podstawie prostej logiki
-            dx = obs['dx_head'][0]
-            dy = obs['dy_head'][0]
-            front_coll = obs['front_coll'][0]
-            left_coll = obs['left_coll'][0]
-            right_coll = obs['right_coll'][0]
-            
-            expected_action = 1  # default: prosto
-            
-            if front_coll > 0.5:  # kolizja z przodu
-                if left_coll < 0.5:
-                    expected_action = 0  # lewo
-                elif right_coll < 0.5:
-                    expected_action = 2  # prawo
-            else:
-                # Skręcaj w stronę jedzenia
-                food_angle = np.arctan2(dy, dx) * 180 / np.pi
-                if abs(food_angle) < 30:
-                    expected_action = 1  # prosto
-                elif food_angle < -30:
-                    expected_action = 0  # lewo
-                elif food_angle > 30:
-                    expected_action = 2  # prawo
-            
-            confusion_matrix[expected_action, action_idx] += 1
-            action_history.append({
-                'episode': episode_idx,
-                'step': step,
-                'expected': action_names[expected_action],
-                'actual': action_names[action_idx],
-                'match': expected_action == action_idx
-            })
-            
-            # Step
-            obs, reward, done, truncated, info = env.step(action_idx)
-            episode_starts = np.array([done or truncated], dtype=bool)
-            done = done or truncated
-            step += 1
-        
-        if (episode_idx + 1) % 5 == 0:
-            print(f"  Przetworzono {episode_idx + 1}/{num_episodes} epizodów")
-    
-    # Wizualizacja Confusion Matrix
-    fig, ax = plt.subplots(figsize=(10, 8))
-    im = ax.imshow(confusion_matrix, cmap='YlOrRd', aspect='auto')
-    
-    # Dodaj wartości do komórek
-    for i in range(3):
-        for j in range(3):
-            text = ax.text(j, i, int(confusion_matrix[i, j]),
-                          ha="center", va="center", color="black", fontsize=14, fontweight='bold')
-    
-    ax.set_xticks(np.arange(3))
-    ax.set_yticks(np.arange(3))
-    ax.set_xticklabels(action_names)
-    ax.set_yticklabels(action_names)
-    ax.set_xlabel('Akcja Modelu (Actual)', fontsize=12)
-    ax.set_ylabel('Oczekiwana Akcja (Expected)', fontsize=12)
-    ax.set_title('Confusion Matrix - Porównanie z Heurystyką', fontsize=14, fontweight='bold')
-    
-    plt.colorbar(im, ax=ax, label='Liczba przypadków')
-    plt.tight_layout()
-    confusion_path = os.path.join(output_dir, 'confusion_matrix.png')
-    plt.savefig(confusion_path, dpi=150)
-    plt.close()
-    print(f'✓ Confusion matrix zapisana: {confusion_path}')
-    
-    # Accuracy
-    total = confusion_matrix.sum()
-    correct = np.trace(confusion_matrix)
-    accuracy = correct / total if total > 0 else 0
-    
-    print(f"\n📊 Confusion Matrix Stats:")
-    print(f"   Zgodność z heurystyką: {accuracy*100:.1f}%")
-    print(f"   Całkowita liczba akcji: {int(total)}")
-    print(f"   Zgodnych akcji: {int(correct)}")
-    
-    # Zapisz confusion matrix do CSV
-    confusion_csv_path = os.path.join(output_dir, 'confusion_matrix.csv')
-    confusion_df = np.vstack([
-        [''] + action_names,
-        *[[action_names[i]] + list(confusion_matrix[i, :]) for i in range(3)]
-    ])
-    np.savetxt(confusion_csv_path, confusion_df, delimiter=',', fmt='%s')
-    print(f'✓ Confusion matrix CSV zapisana: {confusion_csv_path}')
-
-
-def analyze_uncertainty(model, env, output_dir, action_names, num_episodes=10):
-    """Rozszerzona analiza uncertainty"""
-    print("\n=== Rozszerzona analiza uncertainty ===")
-    
-    policy = model.policy
-    features_extractor = policy.features_extractor
-    
-    extended_uncertainty = []
-    
-    for episode_idx in range(num_episodes):
-        obs, _ = env.reset()
-        lstm_states = None
-        episode_starts = np.ones((1,), dtype=bool)
-        done = False
-        step = 0
-        
-        while not done and step < 50:
-            with torch.no_grad():
-                # Przygotuj obs_tensor
+                
+                # Get action probabilities
                 obs_tensor = {}
                 for k, v in obs.items():
                     v_np = v if isinstance(v, np.ndarray) else np.array(v)
@@ -298,163 +84,317 @@ def analyze_uncertainty(model, env, output_dir, action_names, num_episodes=10):
                     
                     obs_tensor[k] = v_tensor
                 
-                # Get features
-                features = features_extractor(obs_tensor)
+                features = policy.features_extractor(obs_tensor)
                 
-                # LSTM
-                lstm_states_tensor = (
-                    torch.tensor(lstm_states[0], dtype=torch.float32, device=policy.device) if lstm_states is not None else None,
-                    torch.tensor(lstm_states[1], dtype=torch.float32, device=policy.device) if lstm_states is not None else None
-                )
-                
-                if lstm_states_tensor[0] is not None:
-                    features_seq = features.unsqueeze(1)
-                    lstm_output, new_lstm_states = policy.lstm_actor(features_seq, lstm_states_tensor)
-                    latent_pi = lstm_output.squeeze(1)
+                if new_lstm_states is not None:
+                    lstm_states_tensor = (
+                        torch.tensor(new_lstm_states[0], dtype=torch.float32, device=policy.device),
+                        torch.tensor(new_lstm_states[1], dtype=torch.float32, device=policy.device)
+                    )
                 else:
-                    # Initial state
                     batch_size = 1
                     n_layers = policy.lstm_actor.num_layers
                     hidden_size = policy.lstm_actor.hidden_size
-                    device = policy.device
-                    lstm_states_init = (
-                        torch.zeros(n_layers, batch_size, hidden_size, device=device),
-                        torch.zeros(n_layers, batch_size, hidden_size, device=device)
+                    lstm_states_tensor = (
+                        torch.zeros(n_layers, batch_size, hidden_size, device=policy.device),
+                        torch.zeros(n_layers, batch_size, hidden_size, device=policy.device)
                     )
-                    features_seq = features.unsqueeze(1)
-                    lstm_output, new_lstm_states = policy.lstm_actor(features_seq, lstm_states_init)
-                    latent_pi = lstm_output.squeeze(1)
                 
-                # MLP and action
+                features_seq = features.unsqueeze(1)
+                lstm_output, _ = policy.lstm_actor(features_seq, lstm_states_tensor)
+                latent_pi = lstm_output.squeeze(1)
                 latent_pi_mlp = policy.mlp_extractor.policy_net(latent_pi)
                 logits = policy.action_net(latent_pi_mlp)
                 action_probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                 
-                action_idx = np.argmax(action_probs)
+                # Store data
+                episode_data['actions'].append(action_idx)
+                episode_data['action_probs'].append(action_probs.copy())
+                
+                if new_lstm_states is not None:
+                    episode_data['hidden_states'].append(new_lstm_states[0].copy())
+                    episode_data['cell_states'].append(new_lstm_states[1].copy())
+                
+                food_dist = np.sqrt(obs['dx_head'][0]**2 + obs['dy_head'][0]**2)
+                episode_data['food_distances'].append(food_dist)
                 
                 # Uncertainty metrics
                 entropy = -np.sum(action_probs * np.log(action_probs + 1e-10))
                 max_prob = np.max(action_probs)
-                margin = np.partition(action_probs, -2)[-1] - np.partition(action_probs, -2)[-2]
                 
-                lstm_states = (new_lstm_states[0].cpu().numpy(), new_lstm_states[1].cpu().numpy())
+                uncertainty_data.append({
+                    'episode': episode_idx,
+                    'step': step,
+                    'entropy': entropy,
+                    'max_prob': max_prob,
+                    'action': action_names[action_idx]
+                })
+                
+                # Confusion matrix (heurystyka)
+                dx = obs['dx_head'][0]
+                dy = obs['dy_head'][0]
+                front_coll = obs['front_coll'][0]
+                left_coll = obs['left_coll'][0]
+                right_coll = obs['right_coll'][0]
+                
+                expected_action = 1  # default: prosto
+                if front_coll > 0.5:
+                    if left_coll < 0.5:
+                        expected_action = 0
+                    elif right_coll < 0.5:
+                        expected_action = 2
+                else:
+                    food_angle = np.arctan2(dy, dx) * 180 / np.pi
+                    if abs(food_angle) < 30:
+                        expected_action = 1
+                    elif food_angle < -30:
+                        expected_action = 0
+                    elif food_angle > 30:
+                        expected_action = 2
+                
+                confusion_matrix[expected_action, action_idx] += 1
+                
+                lstm_states = new_lstm_states
             
             # Step
             obs, reward, done, truncated, info = env.step(action_idx)
+            episode_data['rewards'].append(reward)
             episode_starts = np.array([done or truncated], dtype=bool)
-            
-            extended_uncertainty.append({
-                'episode': episode_idx,
-                'step': step,
-                'entropy': entropy,
-                'max_prob': max_prob,
-                'margin': margin,
-                'action': action_names[action_idx],
-                'reward': reward
-            })
-            
             done = done or truncated
             step += 1
+        
+        all_episodes_data.append(episode_data)
+        
+        if (episode_idx + 1) % 5 == 0:
+            print(f"  Processed {episode_idx + 1}/{num_episodes} episodes")
     
-    # Wizualizacja Uncertainty
+    # ==================== [1/4] MEMORY EVOLUTION ====================
+    print("\n📈 Generating memory evolution plots...")
+    
+    longest_episode = max(all_episodes_data, key=lambda x: len(x['hidden_states']))
+    hidden_states = longest_episode['hidden_states']
+    cell_states = longest_episode['cell_states']
+    
+    if len(hidden_states) > 0:
+        steps = list(range(len(hidden_states)))
+        hidden_means = [np.abs(h[0, 0, :]).mean() for h in hidden_states]
+        cell_means = [np.abs(c[0, 0, :]).mean() for c in cell_states]
+        
+        fig, axes = plt.subplots(2, 1, figsize=(16, 10))
+        
+        # Hidden state
+        axes[0].plot(steps, hidden_means, color='#9b59b6', linewidth=2)
+        axes[0].set_xlabel('Step')
+        axes[0].set_ylabel('Mean |Activation|')
+        axes[0].set_title('LSTM Hidden State Evolution')
+        axes[0].grid(alpha=0.3)
+        
+        # Cell state
+        axes[1].plot(steps, cell_means, color='#8e44ad', linewidth=2)
+        axes[1].set_xlabel('Step')
+        axes[1].set_ylabel('Mean |Activation|')
+        axes[1].set_title('LSTM Cell State Evolution')
+        axes[1].grid(alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'lstm_memory_evolution.png'), dpi=150)
+        plt.close()
+        
+        # Heatmap
+        hidden_states_matrix = np.array([h[0, 0, :] for h in hidden_states])
+        
+        plt.figure(figsize=(16, 8))
+        plt.imshow(hidden_states_matrix.T, aspect='auto', cmap='coolwarm', interpolation='nearest')
+        plt.colorbar(label='Activation Value')
+        plt.xlabel('Time Step')
+        plt.ylabel('LSTM Neuron')
+        plt.title('LSTM Hidden State Heatmap Over Time')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'lstm_neurons_heatmap.png'), dpi=150)
+        plt.close()
+        
+        print(f"✅ Memory evolution saved")
+    
+    # ==================== [2/4] TEMPORAL PATTERNS ====================
+    print("\n🕐 Analyzing temporal patterns...")
+    
+    # N-grams
+    bigrams = Counter()
+    trigrams = Counter()
+    
+    for ep_data in all_episodes_data:
+        actions = ep_data['actions']
+        
+        for i in range(len(actions) - 1):
+            bigram = (action_names[actions[i]], action_names[actions[i+1]])
+            bigrams[bigram] += 1
+        
+        for i in range(len(actions) - 2):
+            trigram = (action_names[actions[i]], action_names[actions[i+1]], action_names[actions[i+2]])
+            trigrams[trigram] += 1
+    
+    # Plot n-grams
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    top_bigrams = bigrams.most_common(10)
+    bigram_labels = [f"{b[0]}→{b[1]}" for b, _ in top_bigrams]
+    bigram_counts = [c for _, c in top_bigrams]
+    
+    axes[0].barh(bigram_labels, bigram_counts, color='#3498db', alpha=0.8, edgecolor='black')
+    axes[0].set_xlabel('Frequency')
+    axes[0].set_title('Top 10 Action Bigrams')
+    axes[0].grid(axis='x', alpha=0.3)
+    
+    top_trigrams = trigrams.most_common(10)
+    trigram_labels = [f"{t[0]}→{t[1]}→{t[2]}" for t, _ in top_trigrams]
+    trigram_counts = [c for _, c in top_trigrams]
+    
+    axes[1].barh(trigram_labels, trigram_counts, color='#e74c3c', alpha=0.8, edgecolor='black')
+    axes[1].set_xlabel('Frequency')
+    axes[1].set_title('Top 10 Action Trigrams')
+    axes[1].grid(axis='x', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'temporal_ngrams.png'), dpi=150)
+    plt.close()
+    print(f"✅ N-grams saved")
+    
+    # Forgetting curve
+    if len(hidden_states) > 10:
+        max_lag = min(50, len(hidden_states) - 1)
+        similarities = []
+        
+        for lag in range(1, max_lag + 1):
+            sim_values = []
+            for i in range(len(hidden_states) - lag):
+                h1 = hidden_states[i][0, 0, :].flatten()
+                h2 = hidden_states[i + lag][0, 0, :].flatten()
+                sim = 1 - cosine(h1, h2)
+                sim_values.append(sim)
+            similarities.append(np.mean(sim_values))
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        lags = list(range(1, max_lag + 1))
+        ax.plot(lags, similarities, marker='o', linewidth=2, markersize=4, color='#9b59b6')
+        ax.axhline(0.5, color='red', linestyle='--', alpha=0.5, label='Random threshold')
+        ax.set_xlabel('Time Lag (steps)')
+        ax.set_ylabel('Cosine Similarity')
+        ax.set_title('LSTM Memory Forgetting Curve')
+        ax.legend()
+        ax.grid(alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'temporal_forgetting_curve.png'), dpi=150)
+        plt.close()
+        print(f"✅ Forgetting curve saved")
+        
+        # Half-life
+        half_life = None
+        for i, sim in enumerate(similarities):
+            if sim < 0.7:
+                half_life = i + 1
+                break
+    
+    # ==================== [3/4] CONFUSION MATRIX ====================
+    print("\n🎯 Generating confusion matrix...")
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(confusion_matrix, cmap='YlOrRd', aspect='auto')
+    
+    for i in range(3):
+        for j in range(3):
+            text = ax.text(j, i, int(confusion_matrix[i, j]),
+                          ha="center", va="center", color="black", fontsize=14, fontweight='bold')
+    
+    ax.set_xticks(np.arange(3))
+    ax.set_yticks(np.arange(3))
+    ax.set_xticklabels(action_names)
+    ax.set_yticklabels(action_names)
+    ax.set_xlabel('Model Action (Actual)', fontsize=12)
+    ax.set_ylabel('Expected Action (Heuristic)', fontsize=12)
+    ax.set_title('Confusion Matrix vs Simple Heuristic', fontsize=14, fontweight='bold')
+    
+    plt.colorbar(im, ax=ax, label='Count')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'confusion_matrix.png'), dpi=150)
+    plt.close()
+    
+    accuracy = np.trace(confusion_matrix) / confusion_matrix.sum() if confusion_matrix.sum() > 0 else 0
+    print(f"✅ Confusion matrix saved (accuracy vs heuristic: {accuracy*100:.1f}%)")
+    
+    # ==================== [4/4] UNCERTAINTY ====================
+    print("\n🎲 Analyzing uncertainty...")
+    
+    entropies = [d['entropy'] for d in uncertainty_data]
+    max_probs = [d['max_prob'] for d in uncertainty_data]
+    
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
-    # Plot 1: Histogram entropii
-    entropies = [d['entropy'] for d in extended_uncertainty]
+    # Entropy histogram
     axes[0, 0].hist(entropies, bins=30, color='#3498db', alpha=0.7, edgecolor='black')
-    axes[0, 0].axvline(np.mean(entropies), color='red', linestyle='--', linewidth=2, label=f'Średnia: {np.mean(entropies):.3f}')
-    axes[0, 0].set_xlabel('Entropia')
-    axes[0, 0].set_ylabel('Częstość')
-    axes[0, 0].set_title('Rozkład Entropii Decyzji')
+    axes[0, 0].axvline(np.mean(entropies), color='red', linestyle='--', linewidth=2, 
+                      label=f'Mean: {np.mean(entropies):.3f}')
+    axes[0, 0].set_xlabel('Entropy')
+    axes[0, 0].set_ylabel('Frequency')
+    axes[0, 0].set_title('Decision Entropy Distribution')
     axes[0, 0].legend()
     axes[0, 0].grid(alpha=0.3)
     
-    # Plot 2: Max probability distribution
-    max_probs = [d['max_prob'] for d in extended_uncertainty]
+    # Max probability histogram
     axes[0, 1].hist(max_probs, bins=30, color='#2ecc71', alpha=0.7, edgecolor='black')
-    axes[0, 1].axvline(np.mean(max_probs), color='red', linestyle='--', linewidth=2, label=f'Średnia: {np.mean(max_probs):.3f}')
+    axes[0, 1].axvline(np.mean(max_probs), color='red', linestyle='--', linewidth=2,
+                      label=f'Mean: {np.mean(max_probs):.3f}')
     axes[0, 1].set_xlabel('Max Probability')
-    axes[0, 1].set_ylabel('Częstość')
-    axes[0, 1].set_title('Rozkład Pewności Modelu')
+    axes[0, 1].set_ylabel('Frequency')
+    axes[0, 1].set_title('Confidence Distribution')
     axes[0, 1].legend()
     axes[0, 1].grid(alpha=0.3)
     
-    # Plot 3: Entropy vs Reward (per episode)
-    episode_stats = []
-    current_episode_entropies = []
-    current_episode_rewards = []
-    current_episode = extended_uncertainty[0]['episode'] if extended_uncertainty else 0
-    for d in extended_uncertainty:
-        if d['episode'] != current_episode:
-            if current_episode_entropies:
-                mean_entropy = np.mean(current_episode_entropies)
-                sum_reward = np.sum(current_episode_rewards)
-                episode_stats.append({'mean_entropy': mean_entropy, 'sum_reward': sum_reward})
-            current_episode_entropies = []
-            current_episode_rewards = []
-            current_episode = d['episode']
-        current_episode_entropies.append(d['entropy'])
-        current_episode_rewards.append(d['reward'])
-    
-    if current_episode_entropies:
-        mean_entropy = np.mean(current_episode_entropies)
-        sum_reward = np.sum(current_episode_rewards)
-        episode_stats.append({'mean_entropy': mean_entropy, 'sum_reward': sum_reward})
-    
-    axes[1, 0].scatter([e['mean_entropy'] for e in episode_stats],
-                       [e['sum_reward'] for e in episode_stats],
-                       alpha=0.7, c='#e74c3c', s=40)
-    axes[1, 0].set_xlabel('Średnia entropia epizodu')
-    axes[1, 0].set_ylabel('Suma rewardów epizodu')
-    axes[1, 0].set_title('Entropia vs Reward (epizod)')
+    # Entropy over time (first episode)
+    first_ep_entropy = [d['entropy'] for d in uncertainty_data if d['episode'] == 0]
+    axes[1, 0].plot(first_ep_entropy, linewidth=2, color='#9b59b6')
+    axes[1, 0].set_xlabel('Step')
+    axes[1, 0].set_ylabel('Entropy')
+    axes[1, 0].set_title('Decision Uncertainty Over Time (Episode 0)')
     axes[1, 0].grid(alpha=0.3)
     
-    # Plot 4: Certainty categories
-    high_cert = [d for d in extended_uncertainty if d['max_prob'] > 0.8]
-    medium_cert = [d for d in extended_uncertainty if 0.5 <= d['max_prob'] <= 0.8]
-    low_cert = [d for d in extended_uncertainty if d['max_prob'] < 0.5]
+    # Confidence categories
+    high_cert = [d for d in uncertainty_data if d['max_prob'] > 0.8]
+    medium_cert = [d for d in uncertainty_data if 0.5 <= d['max_prob'] <= 0.8]
+    low_cert = [d for d in uncertainty_data if d['max_prob'] < 0.5]
     
     categories = ['High\n(>0.8)', 'Medium\n(0.5-0.8)', 'Low\n(<0.5)']
     counts = [len(high_cert), len(medium_cert), len(low_cert)]
     colors_cert = ['#2ecc71', '#f39c12', '#e74c3c']
     
     bars = axes[1, 1].bar(categories, counts, color=colors_cert, alpha=0.7, edgecolor='black')
-    axes[1, 1].set_ylabel('Liczba decyzji')
-    axes[1, 1].set_title('Kategorie Pewności Modelu')
+    axes[1, 1].set_ylabel('Number of Decisions')
+    axes[1, 1].set_title('Confidence Categories')
     axes[1, 1].grid(axis='y', alpha=0.3)
     
     for bar, count in zip(bars, counts):
         height = bar.get_height()
         axes[1, 1].text(bar.get_x() + bar.get_width()/2., height,
-                       f'{count}\n({count/len(extended_uncertainty)*100:.1f}%)',
+                       f'{count}\n({count/len(uncertainty_data)*100:.1f}%)',
                        ha='center', va='bottom', fontsize=10)
     
     plt.tight_layout()
-    uncertainty_path = os.path.join(output_dir, 'uncertainty_analysis.png')
-    plt.savefig(uncertainty_path, dpi=150)
+    plt.savefig(os.path.join(output_dir, 'uncertainty_analysis.png'), dpi=150)
     plt.close()
-    print(f'✓ Uncertainty analysis zapisana: {uncertainty_path}')
+    print(f"✅ Uncertainty analysis saved")
     
-    # Zapisz uncertainty data do CSV
-    uncertainty_csv_path = os.path.join(output_dir, 'uncertainty_data.csv')
-    with open(uncertainty_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['episode', 'step', 'entropy', 'max_prob', 'margin', 'action', 'reward'])
-        for d in extended_uncertainty:
-            writer.writerow([
-                d['episode'],
-                d['step'],
-                d['entropy'],
-                d['max_prob'],
-                d['margin'],
-                d['action'],
-                d['reward']
-            ])
-    print(f'✓ Uncertainty data zapisana: {uncertainty_csv_path}')
-    
-    print(f"\n📊 Uncertainty Stats:")
-    print(f"   Średnia entropia: {np.mean(entropies):.3f}")
-    print(f"   Średnia pewność (max_prob): {np.mean(max_probs):.3f}")
-    print(f"   Decyzje wysokiej pewności: {len(high_cert)} ({len(high_cert)/len(extended_uncertainty)*100:.1f}%)")
-    print(f"   Decyzje średniej pewności: {len(medium_cert)} ({len(medium_cert)/len(extended_uncertainty)*100:.1f}%)")
-    print(f"   Decyzje niskiej pewności: {len(low_cert)} ({len(low_cert)/len(extended_uncertainty)*100:.1f}%)")
+    # ==================== SUMMARY ====================
+    print("\n" + "="*80)
+    print("📋 LSTM ANALYSIS SUMMARY")
+    print("="*80)
+    if len(hidden_states) > 0:
+        print(f"Average hidden state magnitude: {np.mean(hidden_means):.4f}")
+        print(f"Average cell state magnitude: {np.mean(cell_means):.4f}")
+    if half_life:
+        print(f"Memory half-life: ~{half_life} steps")
+    print(f"Most common bigram: {top_bigrams[0][0]} ({top_bigrams[0][1]} times)")
+    print(f"Most common trigram: {top_trigrams[0][0]} ({top_trigrams[0][1]} times)")
+    print(f"Confusion matrix accuracy: {accuracy*100:.1f}%")
+    print(f"Average entropy: {np.mean(entropies):.3f}")
+    print(f"Average confidence: {np.mean(max_probs):.3f}")
+    print(f"High confidence decisions: {len(high_cert)}/{len(uncertainty_data)} ({len(high_cert)/len(uncertainty_data)*100:.1f}%)")

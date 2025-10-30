@@ -702,14 +702,18 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
 
 def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     """
-    🌊 GRADIENT FLOW DETAILED ANALYSIS
-    - Per-layer gradient magnitude
+    🌊 GRADIENT FLOW DETAILED ANALYSIS - FIXED RMS VERSION
+    - Per-layer gradient magnitude (RMS-based)
     - Gradient vanishing/explosion detection
     - Gradient-to-weight ratio analysis
     - Layer-wise gradient statistics
+    
+    ✅ CHANGES:
+    - Uses RMS for activations (sqrt(mean^2 + std^2)) instead of just mean
+    - More accurate for LayerNorm'ed layers
     """
     print("\n" + "="*80)
-    print("🌊 GRADIENT FLOW DETAILED ANALYSIS")
+    print("🌊 GRADIENT FLOW DETAILED ANALYSIS (RMS)")
     print("="*80)
     
     policy = model.policy
@@ -813,7 +817,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             model, obs, obs_tensor, lstm_states, action.item(), features_extractor
         )
         
-        # Agreguj statystyki per layer
+        # ✅ Agreguj statystyki per layer z RMS
         for layer_data in state_grads['layers']:
             layer_name = layer_data['name']
             
@@ -821,39 +825,49 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
                 layer_gradient_stats[layer_name] = {
                     'gradient_norms': [],
                     'gradient_means': [],
+                    'gradient_stds': [],
                     'activation_means': [],
+                    'activation_stds': [],
                     'type': layer_data['type']
                 }
             
             layer_gradient_stats[layer_name]['gradient_norms'].append(layer_data['gradient_norm'])
-            layer_gradient_stats[layer_name]['gradient_means'].append(abs(layer_data['gradient_mean']))
-            layer_gradient_stats[layer_name]['activation_means'].append(abs(layer_data['activation_mean']))
+            layer_gradient_stats[layer_name]['gradient_means'].append(layer_data['gradient_mean'])
+            layer_gradient_stats[layer_name]['gradient_stds'].append(layer_data['gradient_std'])
+            layer_gradient_stats[layer_name]['activation_means'].append(layer_data['activation_mean'])
+            layer_gradient_stats[layer_name]['activation_stds'].append(layer_data['activation_std'])
         
         if (sample_idx + 1) % 10 == 0:
             print(f"   Processed {sample_idx + 1}/{num_samples} samples...")
     
-    # ==================== ANALIZA STATYSTYK ====================
-    print("\n📊 Computing gradient flow statistics...")
+    # ==================== ANALIZA STATYSTYK (RMS-BASED) ====================
+    print("\n📊 Computing gradient flow statistics (RMS method)...")
     
     layer_names = list(layer_gradient_stats.keys())
     avg_gradient_norms = []
     std_gradient_norms = []
-    avg_activations = []
+    avg_activations_rms = []  # ✅ RMS zamiast mean
     gradient_to_activation_ratios = []
     
     for layer_name in layer_names:
         stats = layer_gradient_stats[layer_name]
         
+        # Gradient norm (average)
         avg_grad_norm = np.mean(stats['gradient_norms'])
         std_grad_norm = np.std(stats['gradient_norms'])
-        avg_activation = np.mean(stats['activation_means'])
+        
+        # ✅ ACTIVATION RMS: sqrt(mean^2 + std^2)
+        act_means = np.array(stats['activation_means'])
+        act_stds = np.array(stats['activation_stds'])
+        activation_rms_samples = np.sqrt(act_means**2 + act_stds**2)
+        avg_activation_rms = np.mean(activation_rms_samples)
         
         avg_gradient_norms.append(avg_grad_norm)
         std_gradient_norms.append(std_grad_norm)
-        avg_activations.append(avg_activation)
+        avg_activations_rms.append(avg_activation_rms)
         
-        # Gradient-to-activation ratio
-        ratio = avg_grad_norm / (avg_activation + 1e-8)
+        # Gradient-to-activation ratio (using RMS)
+        ratio = avg_grad_norm / (avg_activation_rms + 1e-8)
         gradient_to_activation_ratios.append(ratio)
     
     # ==================== WIZUALIZACJA ====================
@@ -873,18 +887,25 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     ax.set_xticklabels(layer_names, rotation=45, ha='right', fontsize=8)
     ax.grid(axis='y', alpha=0.3)
     
+    # Show max gradient value
+    max_grad = max(avg_gradient_norms)
+    ax.text(0.02, 0.98, f'Grad max: {max_grad:.4f}', 
+           transform=ax.transAxes, fontsize=9, va='top',
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
     # Highlight vanishing gradients (< 0.01)
     for i, (layer_name, avg_grad) in enumerate(zip(layer_names, avg_gradient_norms)):
         if avg_grad < 0.01:
-            ax.text(i, avg_grad + 0.005, '⚠️', ha='center', fontsize=12, color='red')
+            ax.text(i, avg_grad + max_grad*0.02, '⚠️', ha='center', fontsize=10, color='red')
     
-    # Plot 2: Gradient-to-Activation ratio
+    # Plot 2: Gradient-to-Activation ratio (RMS-based)
     ax = axes[0, 1]
     
-    colors_ratio = ['red' if r < 0.001 else 'orange' if r < 0.01 else 'green' for r in gradient_to_activation_ratios]
+    colors_ratio = ['red' if r < 0.001 else 'orange' if r < 0.01 else 'green' 
+                   for r in gradient_to_activation_ratios]
     bars = ax.bar(x, gradient_to_activation_ratios, color=colors_ratio, alpha=0.8, edgecolor='black')
     ax.set_xlabel('Layer')
-    ax.set_ylabel('Gradient / Activation Ratio')
+    ax.set_ylabel('Gradient / Activation (RMS) Ratio')
     ax.set_title('Gradient-to-Activation Ratio (Red = Vanishing)')
     ax.set_xticks(x)
     ax.set_xticklabels(layer_names, rotation=45, ha='right', fontsize=8)
@@ -894,13 +915,19 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     ax.grid(axis='y', alpha=0.3)
     ax.set_yscale('log')
     
-    # Plot 3: Activation magnitudes
+    # Add max ratio annotation
+    max_ratio = max(gradient_to_activation_ratios)
+    ax.text(0.02, 0.98, f'Grad max: {max_ratio:.4f}', 
+           transform=ax.transAxes, fontsize=9, va='top',
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Plot 3: Activation magnitudes (RMS)
     ax = axes[1, 0]
     
-    bars = ax.bar(x, avg_activations, color='#2ecc71', alpha=0.8, edgecolor='black')
+    bars = ax.bar(x, avg_activations_rms, color='#2ecc71', alpha=0.8, edgecolor='black')
     ax.set_xlabel('Layer')
-    ax.set_ylabel('Average Activation Magnitude')
-    ax.set_title('Per-Layer Activation Magnitudes')
+    ax.set_ylabel('Average Activation Magnitude (RMS)')
+    ax.set_title('Per-Layer Activation Magnitudes (RMS)')
     ax.set_xticks(x)
     ax.set_xticklabels(layer_names, rotation=45, ha='right', fontsize=8)
     ax.grid(axis='y', alpha=0.3)
@@ -909,9 +936,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     ax = axes[1, 1]
     
     # Select key layers for boxplot
-    key_layers = ['GELU-1', 'GELU-2', 'Bottleneck', 'Fusion', 'LSTM']
-    if features_extractor.has_conv3:
-        key_layers.insert(2, 'GELU-3')
+    key_layers = ['GELU-1', 'GELU-2', 'GELU-3', 'Bottleneck', 'Fusion', 'LSTM']
     
     boxplot_data = []
     boxplot_labels = []
@@ -933,7 +958,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     
     plt.tight_layout()
     gradient_flow_path = os.path.join(output_dir, 'gradient_flow_detailed.png')
-    plt.savefig(gradient_flow_path, dpi=150)
+    plt.savefig(gradient_flow_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"✅ Gradient flow analysis saved: {gradient_flow_path}")
     
@@ -942,7 +967,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     with open(stats_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['Layer', 'Type', 'Avg_Gradient_Norm', 'Std_Gradient_Norm', 
-                        'Avg_Activation', 'Gradient_to_Activation_Ratio', 'Status'])
+                        'Avg_Activation_RMS', 'Gradient_to_Activation_Ratio', 'Status'])
         
         for i, layer_name in enumerate(layer_names):
             ratio = gradient_to_activation_ratios[i]
@@ -961,7 +986,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
                 layer_gradient_stats[layer_name]['type'],
                 f"{avg_gradient_norms[i]:.6f}",
                 f"{std_gradient_norms[i]:.6f}",
-                f"{avg_activations[i]:.6f}",
+                f"{avg_activations_rms[i]:.6f}",  # ✅ RMS
                 f"{ratio:.6f}",
                 status
             ])
@@ -970,7 +995,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     
     # ==================== SUMMARY ====================
     print("\n" + "="*80)
-    print("📋 GRADIENT FLOW SUMMARY")
+    print("📋 GRADIENT FLOW SUMMARY (RMS-based)")
     print("="*80)
     
     vanishing_layers = [layer_names[i] for i, r in enumerate(gradient_to_activation_ratios) if r < 0.01]
@@ -980,21 +1005,37 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     if critical_vanishing:
         print(f"\n🔴 CRITICAL VANISHING GRADIENTS ({len(critical_vanishing)} layers):")
         for layer in critical_vanishing:
-            print(f"   - {layer}")
+            idx = layer_names.index(layer)
+            ratio = gradient_to_activation_ratios[idx]
+            grad = avg_gradient_norms[idx]
+            act = avg_activations_rms[idx]
+            print(f"   - {layer}: grad={grad:.6f}, act_rms={act:.6f}, ratio={ratio:.6f}")
     
     if vanishing_layers:
         print(f"\n🟡 VANISHING GRADIENTS ({len(vanishing_layers)} layers):")
         for layer in vanishing_layers:
             if layer not in critical_vanishing:
-                print(f"   - {layer}")
+                idx = layer_names.index(layer)
+                ratio = gradient_to_activation_ratios[idx]
+                grad = avg_gradient_norms[idx]
+                act = avg_activations_rms[idx]
+                print(f"   - {layer}: grad={grad:.6f}, act_rms={act:.6f}, ratio={ratio:.6f}")
     
     if exploding_layers:
         print(f"\n🔥 EXPLODING GRADIENTS ({len(exploding_layers)} layers):")
         for layer in exploding_layers:
-            print(f"   - {layer}")
+            idx = layer_names.index(layer)
+            ratio = gradient_to_activation_ratios[idx]
+            grad = avg_gradient_norms[idx]
+            act = avg_activations_rms[idx]
+            print(f"   - {layer}: grad={grad:.6f}, act_rms={act:.6f}, ratio={ratio:.6f}")
     
     if not vanishing_layers and not exploding_layers:
         print("\n✅ Gradient flow is HEALTHY across all layers!")
     
     print(f"\nAverage gradient norm (all layers): {np.mean(avg_gradient_norms):.6f}")
     print(f"Average gradient-to-activation ratio: {np.mean(gradient_to_activation_ratios):.6f}")
+    print(f"Max gradient norm: {max(avg_gradient_norms):.6f}")
+    print(f"Max activation RMS: {max(avg_activations_rms):.6f}")
+    
+    print("="*80)
