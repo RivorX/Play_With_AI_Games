@@ -10,32 +10,12 @@ from sb3_contrib import RecurrentPPO
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from model import make_env
 
-# Import z utils/ - NOWE MODUŁY
-from utils.analyze_basic import (
-    analyze_basic_states,
-    plot_activation_overview
-)
-from utils.analyze_gradients import (
-    analyze_bottlenecks,
-    analyze_gradient_flow_detailed
-)
-from utils.analyze_channels import (
-    analyze_channel_specialization,
-    analyze_activation_saturation
-)
-from utils.analyze_lstm import (
-    analyze_lstm_memory,
-    analyze_confusion_matrix,
-    analyze_uncertainty
-)
-from utils.analyze_advanced import (
-    analyze_temporal_patterns,
-    analyze_critical_moments,
-    analyze_feature_importance
-)
-
-# Note: analyze_loss_landscape przeniesiony do analyze_optimization.py
-# from utils.analyze_optimization import analyze_loss_landscape
+# Import modułów analizy
+from utils.analyze_basic import analyze_basic_states, plot_activation_overview
+from utils.analyze_gradients import analyze_bottlenecks, analyze_gradient_flow_detailed
+from utils.analyze_cnn import analyze_cnn_layers
+from utils.analyze_lstm import analyze_lstm_comprehensive
+from utils.analyze_performance import analyze_performance_metrics
 
 # Wczytaj konfigurację
 base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -56,24 +36,18 @@ if os.path.exists(output_dir):
     print("   ✓ Katalog wyczyszczony")
 
 # Utwórz strukturę katalogów
-conv_viz_dir = os.path.join(output_dir, 'conv_visualizations')
-viewport_dir = os.path.join(output_dir, 'viewports')
-action_probs_dir = os.path.join(output_dir, 'action_probs')
-heatmap_dir = os.path.join(output_dir, 'attention_heatmaps')
-lstm_dir = os.path.join(output_dir, 'lstm_analysis')
-uncertainty_dir = os.path.join(output_dir, 'uncertainty_analysis')
-confusion_dir = os.path.join(output_dir, 'confusion_matrix')
-temporal_dir = os.path.join(output_dir, 'temporal_patterns')
-critical_dir = os.path.join(output_dir, 'critical_moments')
-feature_dir = os.path.join(output_dir, 'feature_importance')
-gradient_dir = os.path.join(output_dir, 'gradient_flow')
-saturation_dir = os.path.join(output_dir, 'activation_saturation')
-landscape_dir = os.path.join(output_dir, 'loss_landscape')
+subdirs = {
+    'main': os.path.join(output_dir, '01_basic_analysis'),
+    'conv_viz': os.path.join(output_dir, '01_basic_analysis', 'conv_visualizations'),
+    'viewport': os.path.join(output_dir, '01_basic_analysis', 'viewports'),
+    'heatmap': os.path.join(output_dir, '01_basic_analysis', 'attention_heatmaps'),
+    'cnn': os.path.join(output_dir, '02_cnn_layers'),
+    'gradients': os.path.join(output_dir, '03_gradient_flow'),
+    'lstm': os.path.join(output_dir, '04_lstm_memory'),
+    'performance': os.path.join(output_dir, '05_performance')
+}
 
-for dir_path in [output_dir, conv_viz_dir, viewport_dir, action_probs_dir, 
-                 heatmap_dir, lstm_dir, uncertainty_dir, confusion_dir,
-                 temporal_dir, critical_dir, feature_dir, gradient_dir,
-                 saturation_dir, landscape_dir]:
+for dir_path in subdirs.values():
     os.makedirs(dir_path, exist_ok=True)
 
 # Załaduj model RecurrentPPO
@@ -103,168 +77,81 @@ env = make_env(render_mode=None, grid_size=16)()
 action_names = ['lewo', 'prosto', 'prawo']
 
 print("\n" + "="*80)
-print("=== ROZPOCZĘCIE ROZSZERZONEJ ANALIZY ===")
+print("=== ROZPOCZĘCIE ANALIZY ===")
 print("="*80)
 
 # ===================================================
-# CZĘŚĆ 1: ANALIZA PODSTAWOWA
+# CZĘŚĆ 1: ANALIZA PODSTAWOWA (viewport, activations, attention)
 # ===================================================
-print("\n[1/13] Analiza podstawowych stanów, aktywacji i attention...")
+print("\n[1/5] 📊 Analiza podstawowa: aktywacje, viewport, attention...")
 action_probs_list, detailed_activations, layer_gradients, attention_heatmaps = analyze_basic_states(
     model=model,
     env=env,
-    output_dirs={
-        'conv_viz': conv_viz_dir,
-        'viewport': viewport_dir,
-        'action_probs': action_probs_dir,
-        'heatmap': heatmap_dir
-    },
+    output_dirs=subdirs,  # ✅ POPRAWKA: output_dirs zamiast output_dir
     action_names=action_names,
     config=config
 )
 
-# ===================================================
-# CZĘŚĆ 2: ANALIZA BOTTLENECKÓW
-# ===================================================
-print("\n[2/13] Analiza bottlenecków...")
-bottleneck_report = analyze_bottlenecks(
-    layer_gradients=layer_gradients,
-    action_names=action_names,
-    output_dir=output_dir
-)
-
-# ===================================================
-# CZĘŚĆ 3: PRZEGLĄD AKTYWACJI
-# ===================================================
-print("\n[3/13] Generowanie wykresów przeglądu aktywacji...")
 plot_activation_overview(
     detailed_activations=detailed_activations,
     action_probs_list=action_probs_list,
     action_names=action_names,
-    output_dirs={
-        'main': output_dir,
-        'action_probs': action_probs_dir
-    }
+    output_dirs=subdirs  # ✅ POPRAWKA: output_dirs zamiast output_dir
 )
 
 # ===================================================
-# CZĘŚĆ 4: ANALIZA LSTM MEMORY
+# CZĘŚĆ 2: ANALIZA CNN (channels, saturation, specialization)
 # ===================================================
-print("\n[4/13] Analiza LSTM memory...")
-analyze_lstm_memory(
+print("\n[2/5] 🔍 Analiza warstw CNN (channels, saturation, specialization)...")
+analyze_cnn_layers(
     model=model,
     env=env,
-    output_dir=lstm_dir,
-    action_names=action_names,
-    config=config
-)
-
-# ===================================================
-# CZĘŚĆ 5: CONFUSION MATRIX
-# ===================================================
-print("\n[5/13] Analiza Confusion Matrix...")
-analyze_confusion_matrix(
-    model=model,
-    env=env,
-    output_dir=confusion_dir,
-    action_names=action_names,
-    num_episodes=20
-)
-
-# ===================================================
-# CZĘŚĆ 6: UNCERTAINTY ANALYSIS
-# ===================================================
-print("\n[6/13] Analiza Uncertainty...")
-analyze_uncertainty(
-    model=model,
-    env=env,
-    output_dir=uncertainty_dir,
-    action_names=action_names,
-    num_episodes=10
-)
-
-# ===================================================
-# CZĘŚĆ 7: ANALIZA SPECJALIZACJI KANAŁÓW
-# ===================================================
-print("\n[7/13] Analiza specjalizacji kanałów CNN...")
-analyze_channel_specialization(
-    model=model,
-    env=env,
-    output_dir=conv_viz_dir,
-    num_samples=50
-)
-
-# ===================================================
-# CZĘŚĆ 8: TEMPORAL PATTERNS ANALYSIS
-# ===================================================
-print("\n[8/13] Analiza wzorców temporalnych (LSTM memory patterns)...")
-analyze_temporal_patterns(
-    model=model,
-    env=env,
-    output_dir=temporal_dir,
-    action_names=action_names,
-    num_episodes=20
-)
-
-# ===================================================
-# CZĘŚĆ 9: CRITICAL MOMENTS ANALYSIS
-# ===================================================
-print("\n[9/13] Analiza krytycznych momentów (near-death, food acquisition)...")
-analyze_critical_moments(
-    model=model,
-    env=env,
-    output_dir=critical_dir,
-    action_names=action_names,
-    num_episodes=30
-)
-
-# ===================================================
-# CZĘŚĆ 10: FEATURE IMPORTANCE ANALYSIS
-# ===================================================
-print("\n[10/13] Analiza ważności cech (ablation study)...")
-analyze_feature_importance(
-    model=model,
-    env=env,
-    output_dir=feature_dir,
-    action_names=action_names,
+    output_dir=subdirs['cnn'],
     num_samples=100
 )
 
 # ===================================================
-# CZĘŚĆ 11: GRADIENT FLOW DETAILED ANALYSIS 🆕
+# CZĘŚĆ 3: ANALIZA GRADIENTÓW (bottlenecks, gradient flow)
 # ===================================================
-print("\n[11/13] Analiza przepływu gradientów (gradient flow)...")
+print("\n[3/5] 🌊 Analiza przepływu gradientów...")
+bottleneck_report = analyze_bottlenecks(
+    layer_gradients=layer_gradients,
+    action_names=action_names,
+    output_dir=subdirs['gradients']
+)
+
 analyze_gradient_flow_detailed(
     model=model,
     env=env,
-    output_dir=gradient_dir,
+    output_dir=subdirs['gradients'],
     num_samples=50
 )
 
 # ===================================================
-# CZĘŚĆ 12: ACTIVATION SATURATION ANALYSIS 🆕
+# CZĘŚĆ 4: ANALIZA LSTM (memory, temporal patterns, forgetting)
 # ===================================================
-print("\n[12/13] Analiza saturacji aktywacji (activation saturation)...")
-analyze_activation_saturation(
+print("\n[4/5] 🧠 Kompleksowa analiza LSTM...")
+analyze_lstm_comprehensive(
     model=model,
     env=env,
-    output_dir=saturation_dir,
-    num_samples=100
+    output_dir=subdirs['lstm'],
+    action_names=action_names,
+    config=config,
+    num_episodes=20
 )
 
 # ===================================================
-# CZĘŚĆ 13: LOSS LANDSCAPE ANALYSIS 🆕
+# CZĘŚĆ 5: ANALIZA WYDAJNOŚCI (critical moments, feature importance, uncertainty)
 # ===================================================
-# Note: Tymczasowo wyłączone - wymaga analyze_optimization.py
-# print("\n[13/13] Analiza krajobrazu strat (loss landscape)...")
-# from utils.analyze_optimization import analyze_loss_landscape
-# analyze_loss_landscape(
-#     model=model,
-#     env=env,
-#     output_dir=landscape_dir,
-#     num_samples=100,
-#     num_directions=20
-# )
+print("\n[5/5] 🎯 Analiza wydajności i zachowań modelu...")
+analyze_performance_metrics(
+    model=model,
+    env=env,
+    output_dir=subdirs['performance'],
+    action_names=action_names,
+    num_episodes=30,
+    num_samples=100
+)
 
 env.close()
 
@@ -274,66 +161,45 @@ env.close()
 print("\n" + "="*80)
 print("=== ANALIZA ZAKOŃCZONA ===")
 print("="*80)
-print(f"\n📂 Ważne pliki analizy:")
+print(f"\n📂 Wyniki analizy zapisane w:")
 print(f"   {output_dir}/")
-print(f"   ├── bottleneck_analysis.png                ⚠️ Analiza bottlenecków")
-print(f"   ├── bottleneck_report.csv                  📊 Raport bottlenecków")
-print(f"   ├── neuron_activations_overview.png        🧠 Przegląd aktywacji")
-print(f"   ├── attention_heatmaps/                    🔥 Attention heatmaps")
-print(f"   ├── lstm_analysis/                         🧠 Analiza LSTM memory")
-print(f"   ├── confusion_matrix/                      📊 Confusion matrix")
-print(f"   ├── uncertainty_analysis/                  🎲 Uncertainty metrics")
-print(f"   ├── temporal_patterns/                     🕐 Wzorce temporalne")
-print(f"   ├── critical_moments/                      ⚠️ Krytyczne momenty")
-print(f"   ├── feature_importance/                    🎯 Ważność cech")
-print(f"   ├── gradient_flow/                         🌊 Przepływ gradientów 🆕")
-print(f"   ├── activation_saturation/                 🔥 Saturacja aktywacji 🆕")
-# print(f"   └── loss_landscape/                        🗺️ Krajobraz strat 🆕 (tymczasowo wyłączone)")
+print(f"   ├── 01_basic_analysis/         📊 Podstawowe aktywacje i viewport")
+print(f"   ├── 02_cnn_layers/             🔍 Analiza warstw CNN")
+print(f"   ├── 03_gradient_flow/          🌊 Przepływ gradientów")
+print(f"   ├── 04_lstm_memory/            🧠 Pamięć i wzorce temporalne")
+print(f"   └── 05_performance/            🎯 Wydajność i zachowania")
 
 print("\n" + "="*80)
 print("=== KLUCZOWE WYNIKI ===")
 print("="*80)
 
-print("\n🔥 ATTENTION HEATMAPS:")
-print("   - Pokazują które regiony viewport są najważniejsze dla decyzji")
-print("   - Czerwone obszary = wysoka uwaga modelu")
-print("   - Sprawdź czy model patrzy na jedzenie, ściany, czy własne ciało")
+print("\n📊 BASIC ANALYSIS:")
+print("   - neuron_activations_overview.png: RMS aktywacji CNN vs Scalars")
+print("   - attention_heatmaps/: gdzie model skupia uwagę")
+print("   - viewports/: wizualizacja stanów gry")
 
-print("\n🧠 LSTM MEMORY ANALYSIS:")
-print("   - lstm_memory_evolution.png: jak zmienia się pamięć w czasie")
-print("   - lstm_neurons_heatmap.png: aktywacja wszystkich neuronów LSTM")
-print("   - Sprawdź czy LSTM faktycznie wykorzystuje pamięć długoterminową")
+print("\n🔍 CNN LAYERS:")
+print("   - channel_specialization.png: aktywne vs martwe kanały")
+print("   - activation_saturation.png: saturacja GELU")
+print("   - conv_visualizations/: filtry CNN dla każdej warstwy")
 
-print("\n🕐 TEMPORAL PATTERNS:")
-print("   - temporal_ngrams.png: najczęstsze sekwencje akcji (bigrams/trigrams)")
-print("   - temporal_forgetting_curve.png: jak szybko LSTM zapomina")
-print("   - temporal_entropy_evolution.png: niepewność decyzji w czasie")
+print("\n🌊 GRADIENT FLOW:")
+print("   - bottleneck_analysis_split.png: bottlenecki per sekcja")
+print("   - bottleneck_gradient_heatmap.png: flow przez warstwy")
+print("   - gradient_flow_detailed.png: vanishing/explosion")
 
-print("\n⚠️ CRITICAL MOMENTS:")
-print("   - critical_near_death.png: zachowanie modelu przed kolizją")
-print("   - critical_food_acquisition.png: efektywność zbierania jedzenia")
-print("   - critical_tight_spaces.png: decyzje w ciasnych przestrzeniach")
+print("\n🧠 LSTM MEMORY:")
+print("   - lstm_memory_evolution.png: ewolucja pamięci")
+print("   - lstm_neurons_heatmap.png: aktywacja neuronów")
+print("   - temporal_forgetting_curve.png: jak szybko zapomina")
+print("   - temporal_ngrams.png: sekwencje akcji")
 
-print("\n🎯 FEATURE IMPORTANCE:")
+print("\n🎯 PERFORMANCE:")
+print("   - critical_near_death.png: zachowanie przed kolizją")
+print("   - critical_food_acquisition.png: efektywność zbierania")
 print("   - feature_ablation_study.png: wpływ CNN vs scalars")
-print("   - feature_gradient_importance.png: gradient-based importance")
-print("   - feature_importance_results.csv: szczegółowe wyniki")
-
-print("\n🌊 GRADIENT FLOW (NOWA ANALIZA):")
-print("   - gradient_flow_detailed.png: przepływ gradientów przez warstwy")
-print("   - gradient_flow_stats.csv: statystyki gradient vanishing/explosion")
-print("   - Sprawdź które warstwy mają problem z gradientami!")
-
-print("\n🔥 ACTIVATION SATURATION (NOWA ANALIZA):")
-print("   - activation_saturation.png: histogramy pre/post aktywacji")
-print("   - activation_saturation_summary.png: podsumowanie saturacji")
-print("   - activation_saturation_stats.csv: statystyki dead neurons")
-print("   - Sprawdź czy GELU saturuje (|x| > 3) i ile neuronów jest martwych!")
-
-# print("\n🗺️ LOSS LANDSCAPE (NOWA ANALIZA):")
-# print("   - loss_landscape.png: wizualizacja krajobrazu strat")
-# print("   - loss_landscape_data.csv: dane perturbacji wag")
-# print("   - Sprawdź czy model jest w płaskim minimum (dobra generalizacja)!")
+print("   - confusion_matrix.png: porównanie z heurystyką")
+print("   - uncertainty_analysis.png: pewność decyzji")
 
 print("\n⚠️ BOTTLENECKS:")
 if bottleneck_report:
