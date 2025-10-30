@@ -12,8 +12,8 @@ environment:
   action_space:
     type: Discrete                   # Typ przestrzeni akcji
     n: 3                             # Liczba akcji (lewo, prosto, prawo)
-  max_steps_without_food: 20         # Max kroków bez jedzenia (skalowane z rozmiarem grid_size * max_steps_without_food)
-  max_steps_factor: 200              # Mnożnik max kroków (skalowany z rozmiarem grid_size * max_steps_factor)
+  max_steps_without_food: 30         # Max kroków bez jedzenia (skalowane z rozmiarem grid_size * max_steps_without_food)
+  max_steps_factor: 300              # Mnożnik max kroków (skalowany z rozmiarem grid_size * max_steps_factor)
 
   reward_scaling:
     enable: true                          # Włącz skalowanie nagród
@@ -24,7 +24,7 @@ environment:
     base_food_reward: 10.0                # Podstawowa nagroda za jabłko
     base_death_penalty: -5.0              # Podstawowa kara za śmierć
     
-    # ⬇️ Milestone bonusy (% zajęcia planszy)
+    # Milestone bonusy (% zajęcia planszy)
     milestones:
       0.10: 5.0   
       0.20: 15.0  
@@ -54,72 +54,88 @@ model:
   policy: MultiInputLstmPolicy       # Policy dla RecurrentPPO
   learning_rate: 0.0002              # Szybkość uczenia 
   min_learning_rate: 0.00001         # Minimalny learning rate
-  n_steps: 512                       # Liczba kroków na aktualizację
-  n_epochs: 4                        # Liczba epok 
+  n_steps: 1024                      # ✅ Liczba kroków na aktualizację (zwiększone z 512)
+  n_epochs: 3                        # ✅ Liczba epok (zmniejszone z 4)
   gamma: 0.99                        # Współczynnik dyskontowania
   gae_lambda: 0.95                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.05                     # Współczynnik entropii (początkowy)
   min_ent_coef: 0.01                 # Minimalny współczynnik entropii (docelowy)
-  vf_coef: 1.0                       # Współczynnik funkcji wartości
+  vf_coef: 0.8                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
+
+  # ✅ FIXED: Balanced gradient scaling (was too extreme)
+  cnn_gradient_scale: 5.0            # ⬆️ z 3.0 (było za słabe)
+  scalar_gradient_scale: 1.0         # ⬆️ z 0.8 (scalars muszą się uczyć!)
   
   # ✅ Konfiguracja optymalizatora
   optimizer:
     type: adamw                      # Typ: 'adam' lub 'adamw'
-    weight_decay: 0.005              # Weight decay dla AdamW (0.0 = wyłączone)
-    eps: 1.0e-7                      # Epsilon dla stabilności
+    weight_decay: 0.001              # Weight decay dla AdamW (0.0 = wyłączone)
+    eps: 1.0e-8                      # Epsilon dla stabilności
     betas: [0.9, 0.999]              # Beta1, Beta2 dla Adam/AdamW
 
-  # 🆕 LSTM Configuration
+  # LSTM Configuration
   lstm:
-    gradient_clip_val: 5.0           # Clip gradients LSTM
-    cell_state_penalty: 0.001        # L2 penalty na cell state
-    hidden_state_penalty: 0.0001     # L2 penalty na hidden state
-    dropout: 0.0                     # Dropout w LSTM
+    gradient_clip_val: 5.0          # Clip gradients LSTM
+    cell_state_penalty: 0.0         # L2 penalty na cell state
+    hidden_state_penalty: 0.0       # L2 penalty na hidden state
+    dropout: 0.01                   # Dropout w LSTM
   
   # Selektywne dropouty
-  cnn_dropout: 0.0                 
-  scalar_dropout: 0.01               # Dropout dla skalarów
+  cnn_dropout: 0.05                 
+  scalar_dropout: 0.05                # Dropout dla skalarów
   scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
   fusion_dropout: 0.01              
   
-  # ✅ DEEP BOTTLENECK CNN ARCHITECTURE (NO SKIP CONNECTION)
+  # CNN ARCHITECTURE
   convlstm:
-    cnn_channels: [32, 64]           # Kanały CNN (bez zmian)
+    cnn_channels: [32, 64, 128]           # Kanały CNN
     
-    # Deep Bottleneck Layers
-    # Main path: Wyjście z cnn_channels → cnn_bottleneck_dims → cnn_output_dim
-    cnn_bottleneck_dims: [896, 640]
-    cnn_output_dim: 461
+    # Bottleneck: Single-layer (najszybszy)
+    cnn_bottleneck_dims: []              # Empty = 4608 → 640 w jednym kroku
+    cnn_output_dim: 640
     
-    # 🆕 Scalar Network Architecture  
-    scalar_hidden_dims: [32, 64] 
+    # Scalar Network Architecture  
+    scalar_hidden_dims: [128, 128] 
     
-    # 🆕 Architecture Options
-    use_layernorm: true              # LayerNorm
+    # Architecture Options
+    use_layernorm: true          # Global switch
+    
+    # 🎯 Fine-grained LayerNorm control:
+    layernorm:
+      cnn_bottleneck: true       # ✅ ON - stabilizuje bottleneck output
+      scalars: true              # ✅ ON - stabilizuje małe wartości
+      fusion: true               # ✅ ON - stabilizuje LSTM input
+
+    # 🆕 ULTIMATE CNN Features
+    spatial_attention: true            # ✅ ENABLE - focus on important regions (+3-5%)
+    stochastic_depth_prob: 0.1         # 10% drop path probability (regularization)
+    residual_scale: 0.2                # Scale residual by 0.2x (prevent domination)
 
   policy_kwargs:
     features_extractor_kwargs:
       features_dim: 512              # Wymiar cech wyjściowych ekstraktora
     net_arch:
       pi: [512, 256]               
-      vf: [512, 384, 256]                
+      vf: [512, 256]               
     lstm_hidden_size: 512            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
-    enable_critic_lstm: true        # LSTM dla krytyka
+    enable_critic_lstm: true         # LSTM dla krytyka
 
 # Konfiguracja treningu
 training:
-  n_envs: 6                          # Liczba środowisk
-  batch_size: 1024                   # Rozmiar partii
-  total_timesteps: 2000000           # Całkowita liczba kroków
-  eval_freq: 4000                    # Częstotliwość ewaluacji
+  n_envs: 8                          # ✅ Liczba środowisk (zwiększone z 6)
+  batch_size: 1024                   # ✅ Rozmiar partii (zwiększone z 1024)
+  total_timesteps: 3000000           # Całkowita liczba kroków
+  eval_freq: 8192                    # ✅ Częstotliwość ewaluacji (zwiększone z 4000)
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 30       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 10                      # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
   enable_channel_logs: false         # Włącz logi kanałów
-  gradient_log_freq: 2000            # ✅ Co ile kroków logować gradienty/wagi
+  gradient_log_freq: 10000           # Co ile kroków logować gradienty/wagi
+  vecnorm_reset_freq: 50000          # Co ile kroków resetować VecNormalize
+  
   # Liczba środowisk do ewaluacji równoległej
   eval_n_envs: 6                     # Liczba środowisk ewaluacyjnych
   eval_n_repeats: 2                  # Ile razy każde środowisko ma wykonać ewaluację
@@ -129,15 +145,14 @@ training:
     norm_obs: false                  # ❌ FALSE dla obrazów (CNN radzi sobie z surowymi pikselami)
     norm_reward: true                # ✅ TRUE - stabilizuje trening (running mean rewards)
     clip_obs: 10.0                   # Clipping obserwacji (tylko jeśli norm_obs=true)
-    clip_reward: 50.0                # Clipping nagród (10.0 = standardowa wartość)
+    clip_reward: 500.0               # Clipping nagród (zwiększone dla progressive bonus)
     gamma: 0.99                      # Gamma dla running mean rewards (powinno = model.gamma)
     
     # DODATKOWE OPCJE (zaawansowane)
-    norm_obs_keys: []                # Lista kluczy do normalizacji (puste = wszystkie, jeśli norm_obs=true)
     epsilon: 1.0e-8                  # Epsilon dla stabilności numerycznej
     clip_obs_asymmetric: false       # Asymetryczne clipping
 
-# Ścieżki do zapisu
+# Ścieżki
 paths:
   models_dir: models
   logs_dir: logs
