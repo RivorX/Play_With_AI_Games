@@ -208,20 +208,28 @@ class SnakeEnv(gym.Env):
         # Wall collision
         if not (0 <= new_head[0] < self.grid_size and 0 <= new_head[1] < self.grid_size):
             terminated = True
-        # 🚀 OPTIMIZED: Check body set (excludes tail which will move)
-        elif new_head in self.snake_body_set:
-            terminated = True
-        
-        if terminated:
             death_penalty = self.base_death_penalty * self.difficulty_multiplier
             reward = death_penalty
-            
             info = self._get_info()
-            info['termination_reason'] = 'collision'
-            
+            info['termination_reason'] = 'wall'
             if self.render_mode == "human":
                 self._render_frame()
-            
+            return self._get_obs(), reward, terminated, truncated, info
+        # Kolizja z ciałem (z wyjątkiem ogona jeśli nie rośnie)
+        body_segments = list(self.snake)
+        will_grow = (new_head == self.food)
+        if will_grow:
+            body_to_check = body_segments
+        else:
+            body_to_check = body_segments[:-1]  # bez ogona
+        if new_head in body_to_check:
+            terminated = True
+            death_penalty = self.base_death_penalty * self.difficulty_multiplier
+            reward = death_penalty
+            info = self._get_info()
+            info['termination_reason'] = 'collision'
+            if self.render_mode == "human":
+                self._render_frame()
             return self._get_obs(), reward, terminated, truncated, info
         
         # ==================== MOVE SNAKE ====================
@@ -331,15 +339,14 @@ class SnakeEnv(gym.Env):
                 if grid_x < 0 or grid_x >= self.grid_size or grid_y < 0 or grid_y >= self.grid_size:
                     self.viewport_array[i, j] = -1.0
         
-        # 🚀 OPTIMIZATION: Draw snake body using body_set (O(1) lookup)
-        for i in range(self.viewport_size):
-            for j in range(self.viewport_size):
-                grid_x = start_x + i
-                grid_y = start_y + j
-                
-                if 0 <= grid_x < self.grid_size and 0 <= grid_y < self.grid_size:
-                    if (grid_x, grid_y) in self.snake_body_set:
-                        self.viewport_array[i, j] = 0.5
+        # Rysuj ciało węża na podstawie wszystkich segmentów oprócz głowy
+        snake_segments = list(self.snake)
+        for seg in snake_segments[1:]:
+            seg_x, seg_y = seg
+            vp_x = seg_x - start_x
+            vp_y = seg_y - start_y
+            if 0 <= vp_x < self.viewport_size and 0 <= vp_y < self.viewport_size:
+                self.viewport_array[vp_x, vp_y] = 0.5
         
         # Draw head
         vp_head_x = head_x - start_x

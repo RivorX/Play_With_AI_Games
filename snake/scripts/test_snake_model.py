@@ -28,17 +28,47 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 
-def test_snake_model(model_path, grid_size, episodes):
+def test_snake_model(model_path, grid_size, episodes, policy_pth=None):
     # Utwórz środowisko
     env = make_env(render_mode="human", grid_size=grid_size)()
 
     # Załaduj model
-    try:
-        model = RecurrentPPO.load(model_path)
-        logging.info(f"Załadowano model z: {model_path}")
-    except Exception as e:
-        logging.error(f"Błąd podczas ładowania modelu: {e}")
-        return
+    import torch
+    model = None
+    if policy_pth is not None:
+        try:
+            # Utwórz pusty model z odpowiednią architekturą
+            policy_kwargs = config['model']['policy_kwargs'].copy()
+            policy_kwargs['features_extractor_class'] = __import__('cnn').CustomFeaturesExtractor
+            model = RecurrentPPO(
+                config['model']['policy'],
+                env,
+                learning_rate=0.0001,  # nieistotne przy inferencji
+                n_steps=config['model']['n_steps'],
+                batch_size=config['training']['batch_size'],
+                n_epochs=config['model']['n_epochs'],
+                gamma=config['model']['gamma'],
+                gae_lambda=config['model']['gae_lambda'],
+                clip_range=config['model']['clip_range'],
+                ent_coef=config['model']['ent_coef'],
+                vf_coef=config['model']['vf_coef'],
+                policy_kwargs=policy_kwargs,
+                verbose=0,
+                device=config['model']['device']
+            )
+            state_dict = torch.load(policy_pth, map_location=config['model']['device'])
+            model.policy.load_state_dict(state_dict)
+            logging.info(f"Załadowano policy.pth z: {policy_pth}")
+        except Exception as e:
+            logging.error(f"Błąd podczas ładowania policy.pth: {e}")
+            return
+    else:
+        try:
+            model = RecurrentPPO.load(model_path)
+            logging.info(f"Załadowano model z: {model_path}")
+        except Exception as e:
+            logging.error(f"Błąd podczas ładowania modelu: {e}")
+            return
 
     # Testowanie
     for episode in range(episodes):
@@ -108,9 +138,10 @@ def test_snake_model(model_path, grid_size, episodes):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Testowanie modelu Snake PPO")
-    parser.add_argument("--model_path", type=str, default=os.path.join(base_dir, config['paths']['models_dir'], 'best_model.zip'), help="Ścieżka do modelu")
+    parser.add_argument("--model_path", type=str, default=os.path.join(base_dir, config['paths']['models_dir'], 'best_model.zip'), help="Ścieżka do modelu (zip)")
+    parser.add_argument("--policy_pth", type=str, default=None, help="Ścieżka do policy.pth (opcjonalnie) ./snake/models/policy.pth")
     parser.add_argument("--grid_size", type=int, default=8, help="Rozmiar siatki")
     parser.add_argument("--episodes", type=int, default=1, help="Liczba epizodów testowych")
     args = parser.parse_args()
-    
-    test_snake_model(args.model_path, args.grid_size, args.episodes)
+
+    test_snake_model(args.model_path, args.grid_size, args.episodes, policy_pth=args.policy_pth)
