@@ -172,6 +172,11 @@ class CustomEvalCallback(EvalCallback):
                 best_path = os.path.join(self.best_model_save_path, f'best_model_{total_timesteps}.zip')
                 self.model.save(best_path)
                 print(f"✅ Nowy najlepszy model! Zapisano: {best_path} (reward={self.last_mean_reward:.2f})")
+                # DODATKOWO: Zapisz tylko wagi policy.pth (do inferencji)
+                import torch
+                policy_pth_path = os.path.join(self.best_model_save_path, f'policy.pth')
+                torch.save(self.model.policy.state_dict(), policy_pth_path)
+                print(f"💾 Zapisano policy.pth: {policy_pth_path}")
             
             # Generuj wykresy co N ewaluacji
             if self.eval_count % self.plot_interval == 0:

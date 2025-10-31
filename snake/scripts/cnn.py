@@ -87,16 +87,7 @@ class DropPath(nn.Module):
 
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     """
-    🚀 ULTIMATE CNN - All proven improvements:
-    
-    ✅ 1. SiLU everywhere (consistent activation)
-    ✅ 2. Tuned BatchNorm (momentum=0.01, eps=1e-3)
-    ✅ 3. Residual scaling (0.2x to prevent domination)
-    ✅ 4. Spatial Attention (focus on important regions)
-    ✅ 5. Kaiming init for SiLU (better than Xavier)
-    ✅ 6. Balanced gradient scaling (3-5x CNN, 1-1.5x scalars)
-    ✅ 7. Stochastic Depth (regularization without dropout overhead)
-    ✅ 8. LayerNorm BEFORE activation (bounded outputs)
+
     
     Expected improvement: +10-15% over baseline
     """
@@ -314,18 +305,8 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         
         if not _INFO_PRINTED:
             print(f"\n{'='*70}")
-            print(f"[CNN] 🚀 ULTIMATE CNN - All Improvements")
+            print(f"[CNN] 🚀 CNN")
             print(f"{'='*70}")
-            
-            print(f"[CNN] ✅ Improvements Applied:")
-            print(f"[CNN]   1. SiLU everywhere (consistent activation)")
-            print(f"[CNN]   2. Tuned BatchNorm (momentum=0.01, eps=1e-3)")
-            print(f"[CNN]   3. Residual scaling ({self.residual_scale}x)")
-            print(f"[CNN]   4. Spatial Attention: {'✅ ENABLED' if self.use_spatial_attention else '❌ DISABLED'}")
-            print(f"[CNN]   5. Kaiming init for SiLU")
-            print(f"[CNN]   6. Gradient scaling (CNN={self.cnn_gradient_scale}x, Scalar={self.scalar_gradient_scale}x)")
-            print(f"[CNN]   7. Stochastic Depth: {'✅ ENABLED' if self.stochastic_depth_prob > 0 else '❌ DISABLED'} (p={self.stochastic_depth_prob})")
-            print(f"[CNN]   8. LayerNorm before activation")
             print(f"")
             print(f"[CNN] 🎯 LayerNorm Strategy:")
             print(f"[CNN]   CNN Bottleneck: {'✅ ENABLED' if self.use_ln_cnn_bottleneck else '❌ DISABLED'}")

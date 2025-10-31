@@ -93,8 +93,8 @@ model:
     cnn_channels: [32, 64, 128]           # Kanały CNN
     
     # Bottleneck: Single-layer (najszybszy)
-    cnn_bottleneck_dims: []              # Empty = 4608 → 640 w jednym kroku
-    cnn_output_dim: 640
+    cnn_bottleneck_dims: []              # Empty = 4608 → 1024 w jednym kroku
+    cnn_output_dim: 1024
     
     # Scalar Network Architecture  
     scalar_hidden_dims: [128, 128] 
@@ -125,10 +125,10 @@ model:
 
 # Konfiguracja treningu
 training:
-  n_envs: 8                          # ✅ Liczba środowisk (zwiększone z 6)
-  batch_size: 1024                   # ✅ Rozmiar partii (zwiększone z 1024)
-  total_timesteps: 3000000           # Całkowita liczba kroków
-  eval_freq: 8192                    # ✅ Częstotliwość ewaluacji (zwiększone z 4000)
+  n_envs: 16                         # Liczba środowisk 
+  batch_size: 1024                   # Rozmiar partii 
+  total_timesteps: 5000000           # Całkowita liczba kroków
+  eval_freq: 4096                    # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 30       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 10                      # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
