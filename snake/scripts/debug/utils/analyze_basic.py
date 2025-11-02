@@ -63,7 +63,7 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             x = features_extractor.dropout2(x)
             x = torch.nn.functional.gelu(x)
             
-            if features_extractor.has_conv3:
+            if getattr(features_extractor, "has_conv3", False):
                 identity = features_extractor.residual_proj(x)
                 
                 x_local = features_extractor.conv3_local(x)
@@ -83,14 +83,15 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             # Bottleneck
             cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
             
-            # Scalars
+            # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
             scalars = torch.cat([
                 obs_tensor['direction'],
                 obs_tensor['dx_head'],
                 obs_tensor['dy_head'],
                 obs_tensor['front_coll'],
                 obs_tensor['left_coll'],
-                obs_tensor['right_coll']
+                obs_tensor['right_coll'],
+                obs_tensor['snake_length']
             ], dim=-1)
             
             scalars = features_extractor.scalar_input_dropout(scalars)
@@ -98,7 +99,7 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             
             # Fusion
             combined = torch.cat([cnn_features, scalar_features], dim=-1)
-            features_final = features_extractor.fusion_main(combined)
+            features_final = features_extractor.final_linear(combined)
             
             # LSTM - inicjalizacja stanów jeśli potrzeba
             if lstm_states is None:
@@ -235,7 +236,7 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     x = torch.nn.functional.gelu(x)
 
     # Layer 3 - MULTI-SCALE (opcjonalna)
-    if features_extractor.has_conv3:
+    if getattr(features_extractor, "has_conv3", False):
         identity = features_extractor.residual_proj(x)
         
         x_local = features_extractor.conv3_local(x)
@@ -256,14 +257,15 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     # 🆕 BOTTLENECK
     cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
     
-    # Scalars
+    # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
     scalars_grad = torch.cat([
         obs_grad['direction'],
         obs_grad['dx_head'],
         obs_grad['dy_head'],
         obs_grad['front_coll'],
         obs_grad['left_coll'],
-        obs_grad['right_coll']
+        obs_grad['right_coll'],
+        obs_grad['snake_length']
     ], dim=-1)
     
     scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
@@ -271,7 +273,7 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     
     # Fusion
     combined = torch.cat([cnn_features, scalar_features], dim=-1)
-    features_final = features_extractor.fusion_main(combined)
+    features_final = features_extractor.final_linear(combined)
     
     # LSTM
     lstm_states_tensor = (
@@ -357,7 +359,7 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
         }
 
         # Conv3 (if exists)
-        if features_extractor.has_conv3:
+        if getattr(features_extractor, "has_conv3", False):
             identity = features_extractor.residual_proj(x)
 
             x_local = features_extractor.conv3_local(x)
@@ -384,14 +386,15 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
         activations['cnn_raw'] = cnn_raw[0].cpu().numpy()
         activations['bottleneck'] = cnn_features[0].cpu().numpy()
 
-        # Scalars
+        # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
         scalars = torch.cat([
             obs_tensor['direction'],
             obs_tensor['dx_head'],
             obs_tensor['dy_head'],
             obs_tensor['front_coll'],
             obs_tensor['left_coll'],
-            obs_tensor['right_coll']
+            obs_tensor['right_coll'],
+            obs_tensor['snake_length']
         ], dim=-1)
         scalars = features_extractor.scalar_input_dropout(scalars)
         scalar_features = features_extractor.scalar_linear(scalars)
@@ -399,7 +402,7 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
 
         # Fusion
         combined = torch.cat([cnn_features, scalar_features], dim=-1)
-        fusion = features_extractor.fusion_main(combined)
+        fusion = features_extractor.final_linear(combined)
         activations['fusion'] = fusion[0].cpu().numpy()
 
         # LSTM (jeśli dostępny)

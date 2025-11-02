@@ -76,16 +76,26 @@ def test_snake_model(model_path, grid_size, episodes, policy_pth=None):
         done = False
         total_reward = 0
         steps = 0
-        logging.info(f"\nEpizod {episode + 1}")
+        logging.info(f"\n{'='*80}")
+        logging.info(f"EPIZOD {episode + 1} | Grid: {grid_size}x{grid_size}")
+        logging.info(f"{'='*80}")
 
         while not done:
             # Obraz z viewportu
             mapa = obs['image'][:, :, 0]  # [H, W], pojedynczy kanał
 
-            # Wyodrębnij skalary
-            direction = obs['direction']
+            # 📊 WSZYSTKIE SKALARY W JEDNEJ LINII
+            direction = obs['direction']  # [sin, cos]
             dx_head = obs['dx_head'][0]
             dy_head = obs['dy_head'][0]
+            front_coll = obs['front_coll'][0]
+            left_coll = obs['left_coll'][0]
+            right_coll = obs['right_coll'][0]
+            snake_length = obs['snake_length'][0]
+            
+            # Konwersja direction na kąt (0=UP, 90=RIGHT, 180=DOWN, 270=LEFT)
+            angle_deg = int(np.degrees(np.arctan2(direction[0], direction[1])) % 360)
+            direction_name = {0: 'UP', 90: 'RIGHT', 180: 'DOWN', 270: 'LEFT'}.get(angle_deg, f'{angle_deg}°')
 
             # Znajdź pozycję głowy i jedzenia w mapie
             head_pos = np.where(mapa == 1.0)
@@ -101,30 +111,48 @@ def test_snake_model(model_path, grid_size, episodes, policy_pth=None):
 
             # Oblicz odległość Manhattan
             if head_x >= 0 and food_x >= 0:
-                distance = abs(head_x - food_x) + abs(head_y - food_y)
+                distance_manhattan = abs(head_x - food_x) + abs(head_y - food_y)
+                distance_euclidean = np.sqrt((head_x - food_x)**2 + (head_y - food_y)**2)
             else:
-                distance = float('inf')
+                distance_manhattan = float('inf')
+                distance_euclidean = float('inf')
 
-            # Zapisz informacje debugowania do pliku
-            logging.info("--- Obserwacja (fragment) ---")
-            logging.info(f"Kanał mapa:\n{np.array_str(mapa, precision=2, suppress_small=True, max_line_width=120)}")
-            logging.info(f"Direction: {direction}")
-            logging.info(f"dx_head: {dx_head}")
-            logging.info(f"dy_head: {dy_head}")
-            logging.info(f"Pozycja głowy: ({head_x}, {head_y}) | Pozycja jedzenia: ({food_x}, {food_y})")
-            logging.info(f"Dystans Manhattan: {distance}")
-            logging.info(f"Stan gry: done={done}, steps={steps}, snake={env.snake}, food={env.food}")
-            logging.info("-" * 60)
+            # ✅ KOMPAKTOWY LOG - WSZYSTKO W JEDNEJ LINII
+            scalars_compact = (
+                f"Dir:{direction_name:>5} | "
+                f"Food:({dx_head:+.2f},{dy_head:+.2f}) | "
+                f"Coll:[F:{front_coll:.0f} L:{left_coll:.0f} R:{right_coll:.0f}] | "
+                f"Len:{snake_length:+.2f} | "
+                f"Dist:M={distance_manhattan:>3.0f},E={distance_euclidean:>4.1f}"
+            )
+            
+            logging.info(f"[Step {steps:>3}] {scalars_compact}")
+            
+            # Opcjonalnie: Log mapy co N kroków (żeby nie zapychać pliku)
+            if steps % 10 == 0:  # Co 10 kroków
+                logging.info(f"  Map snapshot:\n{np.array_str(mapa, precision=1, suppress_small=True, max_line_width=100)}")
+                logging.info(f"  Head@({head_x},{head_y}) Food@({food_x},{food_y}) | Snake:{env.snake} | Score:{env.score}")
 
             # Wykonaj akcję
             action, _ = model.predict(obs, deterministic=True)
+            
+            # Nazwa akcji (0=Left, 1=Straight, 2=Right)
+            action_name = {0: 'LEFT', 1: 'STRAIGHT', 2: 'RIGHT'}.get(int(action), 'UNKNOWN')
+            
             obs, reward, done, truncated, info = env.step(action)
             total_reward += reward
             steps += 1
             env.render()
 
-            logging.info(f"Krok: {steps}, Wynik: {info['score']}, Nagroda: {total_reward}, Akcja: {action}")
-            logging.info("-" * 60)
+            # Log akcji i wyniku
+            logging.info(f"  Action: {action_name:>8} | Reward: {reward:>+6.1f} | Total: {total_reward:>+7.1f}")
+            
+            # Jeśli reward != 0, pokaż dlaczego
+            if reward > 5.0:
+                logging.info(f"      FOOD EATEN! Score: {info['score']}")
+            elif reward < -1.0:
+                termination_reason = info.get('termination_reason', 'unknown')
+                logging.info(f"      DEATH: {termination_reason}")
 
             # Obsługa zdarzeń Pygame
             for event in pygame.event.get():
@@ -132,7 +160,15 @@ def test_snake_model(model_path, grid_size, episodes, policy_pth=None):
                     done = True
             pygame.time.wait(50)
 
-        logging.info(f"Epizod {episode + 1} zakończony. Wynik: {info['score']}, Całkowita nagroda: {total_reward}, Kroki: {steps}")
+        # Podsumowanie epizodu
+        termination_reason = info.get('termination_reason', 'truncated')
+        logging.info(f"\n{'='*80}")
+        logging.info(f"EPIZOD {episode + 1} ZAKOŃCZONY | Reason: {termination_reason}")
+        logging.info(f"{'='*80}")
+        logging.info(f"Score: {info['score']} | Total Reward: {total_reward:.1f} | Steps: {steps}")
+        logging.info(f"Snake Length: {info.get('snake_length', 'N/A')} | Map Occupancy: {info.get('map_occupancy', 0):.1f}%")
+        logging.info(f"Steps per Apple: {info.get('steps_per_apple', 0):.1f}")
+        logging.info(f"{'='*80}\n")
 
     env.close()
 

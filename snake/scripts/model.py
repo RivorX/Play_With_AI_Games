@@ -1,4 +1,4 @@
-# model_ultra_optimized.py - 🚀 EXTREME PERFORMANCE
+# model_ultra_optimized.py - 🚀 EXTREME PERFORMANCE + 🔧 COLLISION BUG FIX
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -15,19 +15,9 @@ with open(config_path, 'r', encoding='utf-8') as f:
 
 class SnakeEnv(gym.Env):
     """
-    🚀 ULTRA-OPTIMIZED Snake Environment
+    🚀 ULTRA-OPTIMIZED Snake Environment + 🔧 COLLISION FIX
     
-    NEW optimizations (beyond your current version):
-    1. ✅ Deque instead of list for snake (O(1) append/pop on both ends)
-    2. ✅ Lazy set updates (only when needed)
-    3. ✅ Pre-allocated viewport array (reuse memory)
-    4. ✅ Cached direction vectors (no dict lookup)
-    5. ✅ Minimal set operations (track only body, not head/tail)
-    6. ✅ Fast food placement with random.choice on tuple
-    7. ✅ Disable pygame initialization until first render
-    8. ✅ Vectorized collision checks
-    
-    Expected: 15-25% FPS improvement on long snakes
+    FIXED: snake_body_set now correctly contains ALL body segments (excluding head)
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10}
 
@@ -98,7 +88,8 @@ class SnakeEnv(gym.Env):
             'dy_head': spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
             'front_coll': spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             'left_coll': spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
-            'right_coll': spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+            'right_coll': spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+            'snake_length': spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
         })
         
         self.render_mode = render_mode
@@ -114,17 +105,16 @@ class SnakeEnv(gym.Env):
         self.steps_since_food = 0
         self.total_reward = 0.0
         
-        # 🚀 OPTIMIZATION 1: Deque for O(1) operations
-        # 🚀 OPTIMIZATION 2: Set tracks only body (not head/tail for faster updates)
-        self.snake_body_set = None  # Excludes head and tail
+        # 🔧 FIX: Set tracks ALL body segments (excluding head)
+        self.snake_body_set = None
         
-        # 🚀 OPTIMIZATION 3: Occupancy grid
+        # Occupancy grid
         self.occupied_grid = None
         
-        # 🚀 OPTIMIZATION 4: Pre-allocated viewport (reuse memory)
+        # Pre-allocated viewport (reuse memory)
         self.viewport_array = np.zeros((self.viewport_size, self.viewport_size), dtype=np.float32)
         
-        # 🚀 OPTIMIZATION 5: Cached direction vectors (no dict lookup)
+        # Cached direction vectors (no dict lookup)
         self.DIRECTIONS = np.array([
             [0, -1],   # UP
             [1, 0],    # RIGHT
@@ -158,14 +148,14 @@ class SnakeEnv(gym.Env):
         # Reset milestone tracking
         self.milestones_achieved = set()
         
-        # Initialize snake (center) - 🚀 USE DEQUE
+        # Initialize snake (center) - USE DEQUE
         center = self.grid_size // 2
         self.snake = deque([(center, center)])
         
-        # 🚀 OPTIMIZATION: Empty set initially (only 1 segment)
+        # 🔧 FIX: Empty set initially (only 1 segment = head only, no body)
         self.snake_body_set = set()
         
-        # 🚀 OPTIMIZATION: Initialize occupancy grid
+        # Initialize occupancy grid
         self.occupied_grid = np.zeros((self.grid_size, self.grid_size), dtype=bool)
         self.occupied_grid[center, center] = True
         
@@ -195,7 +185,7 @@ class SnakeEnv(gym.Env):
         elif action == 2:  # Right
             self.direction = (self.direction + 1) % 4
         
-        # 🚀 OPTIMIZATION: Cached direction vectors (no dict lookup)
+        # Cached direction vectors (no dict lookup)
         head_x, head_y = self.snake[0]
         dx, dy = self.DIRECTIONS[self.direction]
         new_head = (head_x + dx, head_y + dy)
@@ -215,25 +205,39 @@ class SnakeEnv(gym.Env):
             if self.render_mode == "human":
                 self._render_frame()
             return self._get_obs(), reward, terminated, truncated, info
-        # Kolizja z ciałem (z wyjątkiem ogona jeśli nie rośnie)
-        body_segments = list(self.snake)
+        
+        # Body collision (excluding tail if not growing)
         will_grow = (new_head == self.food)
+        
+        # 🔧 FIX: Check collision properly
         if will_grow:
-            body_to_check = body_segments
+            # Growing: check collision with ALL segments (including tail)
+            if new_head in list(self.snake):
+                terminated = True
+                death_penalty = self.base_death_penalty * self.difficulty_multiplier
+                reward = death_penalty
+                info = self._get_info()
+                info['termination_reason'] = 'collision'
+                if self.render_mode == "human":
+                    self._render_frame()
+                return self._get_obs(), reward, terminated, truncated, info
         else:
-            body_to_check = body_segments[:-1]  # bez ogona
-        if new_head in body_to_check:
-            terminated = True
-            death_penalty = self.base_death_penalty * self.difficulty_multiplier
-            reward = death_penalty
-            info = self._get_info()
-            info['termination_reason'] = 'collision'
-            if self.render_mode == "human":
-                self._render_frame()
-            return self._get_obs(), reward, terminated, truncated, info
+            # Not growing: check collision with body (excluding tail)
+            if new_head in list(self.snake)[:-1]:
+                terminated = True
+                death_penalty = self.base_death_penalty * self.difficulty_multiplier
+                reward = death_penalty
+                info = self._get_info()
+                info['termination_reason'] = 'collision'
+                if self.render_mode == "human":
+                    self._render_frame()
+                return self._get_obs(), reward, terminated, truncated, info
         
         # ==================== MOVE SNAKE ====================
-        # 🚀 OPTIMIZATION: Deque appendleft is O(1)
+        # Save old head for body_set update
+        old_head = self.snake[0]
+        
+        # Add new head
         self.snake.appendleft(new_head)
         self.occupied_grid[new_head[0], new_head[1]] = True
         
@@ -241,6 +245,9 @@ class SnakeEnv(gym.Env):
         if new_head == self.food:
             self.score += 1
             self.food = self._place_food()
+            
+            # 🔧 FIX: Update snake_body_set (add old head, new head is at index 0)
+            self.snake_body_set.add(old_head)
             
             # Calculate food reward
             food_reward = self.base_food_reward * self.difficulty_multiplier
@@ -277,18 +284,13 @@ class SnakeEnv(gym.Env):
             
             # Reset steps counter
             self.steps_since_food = 0
-            
-            # 🚀 OPTIMIZATION: Update body set (add old head, new head is at index 0)
-            if len(self.snake) > 1:
-                self.snake_body_set.add(self.snake[1])
         else:
-            # 🚀 OPTIMIZATION: Deque pop is O(1)
+            # 🔧 FIX: Update snake_body_set (add old head, remove tail)
+            self.snake_body_set.add(old_head)
+            
             tail = self.snake.pop()
             self.occupied_grid[tail[0], tail[1]] = False
-            
-            # 🚀 OPTIMIZATION: Update body set (remove old tail)
-            if len(self.snake) > 2:
-                self.snake_body_set.discard(tail)
+            self.snake_body_set.discard(tail)
         
         # ==================== TIMEOUT ====================
         if self.steps_since_food > self.max_steps_without_food:
@@ -323,14 +325,14 @@ class SnakeEnv(gym.Env):
         head_x, head_y = self.snake[0]
         half_vp = self.viewport_size // 2
         
-        # 🚀 OPTIMIZATION: Reuse viewport array (faster than np.zeros)
+        # Reuse viewport array (faster than np.zeros)
         self.viewport_array.fill(0.0)
         
         # Calculate viewport bounds
         start_x = head_x - half_vp
         start_y = head_y - half_vp
         
-        # 🚀 OPTIMIZATION: Vectorized wall drawing
+        # Vectorized wall drawing
         for i in range(self.viewport_size):
             for j in range(self.viewport_size):
                 grid_x = start_x + i
@@ -339,7 +341,7 @@ class SnakeEnv(gym.Env):
                 if grid_x < 0 or grid_x >= self.grid_size or grid_y < 0 or grid_y >= self.grid_size:
                     self.viewport_array[i, j] = -1.0
         
-        # Rysuj ciało węża na podstawie wszystkich segmentów oprócz głowy
+        # Draw body (all segments except head)
         snake_segments = list(self.snake)
         for seg in snake_segments[1:]:
             seg_x, seg_y = seg
@@ -376,10 +378,14 @@ class SnakeEnv(gym.Env):
         dx_norm = np.clip(dx_raw / max_dist, -1.0, 1.0)
         dy_norm = np.clip(dy_raw / max_dist, -1.0, 1.0)
         
-        # 🚀 OPTIMIZATION: Vectorized collision checks
+        # Vectorized collision checks
         front_coll = self._check_collision_in_direction(0)
         left_coll = self._check_collision_in_direction(-1)
         right_coll = self._check_collision_in_direction(1)
+        
+        # Normalize snake_length to [-1, 1]
+        max_possible_length = self.grid_size * self.grid_size
+        snake_length_norm = (len(self.snake) / max_possible_length) * 2.0 - 1.0
         
         observation = {
             'image': obs_image.astype(np.float32),
@@ -388,13 +394,14 @@ class SnakeEnv(gym.Env):
             'dy_head': np.array([dy_norm], dtype=np.float32),
             'front_coll': np.array([front_coll], dtype=np.float32),
             'left_coll': np.array([left_coll], dtype=np.float32),
-            'right_coll': np.array([right_coll], dtype=np.float32)
+            'right_coll': np.array([right_coll], dtype=np.float32),
+            'snake_length': np.array([snake_length_norm], dtype=np.float32)
         }
         
         return observation
 
     def _check_collision_in_direction(self, turn):
-        """🚀 OPTIMIZED: Use cached directions and body_set"""
+        """🔧 FIXED: Use corrected snake_body_set"""
         new_dir = (self.direction + turn) % 4
         head_x, head_y = self.snake[0]
         dx, dy = self.DIRECTIONS[new_dir]
@@ -404,7 +411,7 @@ class SnakeEnv(gym.Env):
         if not (0 <= new_pos[0] < self.grid_size and 0 <= new_pos[1] < self.grid_size):
             return 1.0
         
-        # 🚀 OPTIMIZED: Check body_set (excludes tail)
+        # 🔧 FIXED: Check against full snake_body_set (all segments except head)
         if new_pos in self.snake_body_set:
             return 1.0
         
@@ -420,7 +427,7 @@ class SnakeEnv(gym.Env):
             # Board full!
             return self.snake[0]
         
-        # 🚀 OPTIMIZATION: NumPy random choice (faster than Python random)
+        # NumPy random choice (faster than Python random)
         idx = np.random.randint(len(free_coords))
         food_pos = tuple(free_coords[idx])
         
@@ -456,7 +463,7 @@ class SnakeEnv(gym.Env):
 
     def _render_frame(self):
         """🚀 OPTIMIZED: Lazy pygame initialization"""
-        # 🚀 OPTIMIZATION: Initialize pygame only on first render
+        # Initialize pygame only on first render
         if self.window is None and self.render_mode == "human":
             pygame.init()
             snake_size = config['environment']['snake_size']
