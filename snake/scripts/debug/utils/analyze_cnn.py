@@ -37,15 +37,12 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     
     conv1_activations = []
     conv2_activations = []
-    conv3_activations = [] if features_extractor.has_conv3 else None
     
     activation_data = {
         'conv1_pre': [],
         'conv1_post': [],
         'conv2_pre': [],
-        'conv2_post': [],
-        'conv3_pre': [],
-        'conv3_post': []
+        'conv2_post': []
     }
     
     for sample_idx in range(num_samples):
@@ -93,24 +90,6 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
             x = torch.nn.functional.gelu(x_pre)
             activation_data['conv2_post'].extend(x.flatten().cpu().numpy())
             conv2_activations.append(x.detach().cpu().numpy()[0])
-            
-            # Conv3
-            if features_extractor.has_conv3:
-                identity = features_extractor.residual_proj(x)
-                
-                x_local = features_extractor.conv3_local(x)
-                x_local = features_extractor.bn3_local(x_local)
-                
-                x_global = features_extractor.conv3_global(x)
-                x_global = features_extractor.bn3_global(x_global)
-                
-                x_pre = torch.cat([x_local, x_global], dim=1)
-                x_pre = features_extractor.dropout3(x_pre)
-                activation_data['conv3_pre'].extend(x_pre.flatten().cpu().numpy())
-                x_combined = torch.nn.functional.gelu(x_pre)
-                activation_data['conv3_post'].extend(x_combined.flatten().cpu().numpy())
-                x = x_combined + identity
-                conv3_activations.append(x.detach().cpu().numpy()[0])
         
         if (sample_idx + 1) % 20 == 0:
             print(f"  Processed {sample_idx + 1}/{num_samples} samples")
@@ -118,8 +97,6 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     # Convert to numpy
     conv1_activations = np.array(conv1_activations)
     conv2_activations = np.array(conv2_activations)
-    if conv3_activations is not None:
-        conv3_activations = np.array(conv3_activations)
     
     for key in activation_data.keys():
         if activation_data[key]:
@@ -156,14 +133,8 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     conv1_stats = analyze_channels(conv1_activations, 'Conv1')
     conv2_stats = analyze_channels(conv2_activations, 'Conv2')
     
-    if conv3_activations is not None:
-        conv3_stats = analyze_channels(conv3_activations, 'Conv3')
-    
-    # Plot specialization
-    if conv3_activations is not None:
-        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-    else:
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    # Plot specialization (2x2 grid dla Conv1 i Conv2)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
     # Conv1 - Mean activation
     channels_conv1 = [s['channel'] for s in conv1_stats]
@@ -189,19 +160,6 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     axes[0, 1].set_title('Conv2 - Channel Activity (Red = Dead)')
     axes[0, 1].grid(axis='y', alpha=0.3)
     
-    # Conv3 (if exists)
-    if conv3_activations is not None:
-        channels_conv3 = [s['channel'] for s in conv3_stats]
-        means_conv3 = [s['mean'] for s in conv3_stats]
-        dead_conv3 = [s['is_dead'] for s in conv3_stats]
-        colors_conv3 = ['red' if d else 'green' for d in dead_conv3]
-        
-        axes[0, 2].bar(channels_conv3, means_conv3, color=colors_conv3, alpha=0.7, edgecolor='black')
-        axes[0, 2].set_xlabel('Channel')
-        axes[0, 2].set_ylabel('Mean Activation')
-        axes[0, 2].set_title('Conv3 - Channel Activity (Red = Dead)')
-        axes[0, 2].grid(axis='y', alpha=0.3)
-    
     # Sparsity plots
     sparsity_conv1 = [s['sparsity'] for s in conv1_stats]
     axes[1, 0].bar(channels_conv1, sparsity_conv1, color='#3498db', alpha=0.7, edgecolor='black')
@@ -217,14 +175,6 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     axes[1, 1].set_title('Conv2 - Sparsity per Channel')
     axes[1, 1].grid(axis='y', alpha=0.3)
     
-    if conv3_activations is not None:
-        sparsity_conv3 = [s['sparsity'] for s in conv3_stats]
-        axes[1, 2].bar(channels_conv3, sparsity_conv3, color='#3498db', alpha=0.7, edgecolor='black')
-        axes[1, 2].set_xlabel('Channel')
-        axes[1, 2].set_ylabel('Sparsity (% near-zero)')
-        axes[1, 2].set_title('Conv3 - Sparsity per Channel')
-        axes[1, 2].grid(axis='y', alpha=0.3)
-    
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'channel_specialization.png'), dpi=150)
     plt.close()
@@ -234,7 +184,7 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     print("\n🔥 Analyzing activation saturation...")
     
     saturation_stats = {}
-    for layer_name in ['conv1', 'conv2', 'conv3']:
+    for layer_name in ['conv1', 'conv2']:
         pre_key = f'{layer_name}_pre'
         post_key = f'{layer_name}_post'
         
@@ -257,9 +207,9 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
             }
     
     # Plot saturation
-    fig, axes = plt.subplots(3, 2, figsize=(16, 18))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
-    for idx, layer_name in enumerate(['conv1', 'conv2', 'conv3']):
+    for idx, layer_name in enumerate(['conv1', 'conv2']):
         if layer_name in saturation_stats:
             stats = saturation_stats[layer_name]
             
@@ -384,13 +334,11 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
         writer.writerow(['layer', 'num_channels', 'dead_channels', 'dead_pct', 
                         'saturation_rate', 'dead_neuron_rate', 'status'])
         
-        for layer_name in ['conv1', 'conv2', 'conv3']:
+        for layer_name in ['conv1', 'conv2']:
             if layer_name == 'conv1':
                 stats_list = conv1_stats
             elif layer_name == 'conv2':
                 stats_list = conv2_stats
-            elif layer_name == 'conv3' and conv3_activations is not None:
-                stats_list = conv3_stats
             else:
                 continue
             
@@ -436,10 +384,6 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     
     print(f"Conv1: {dead_conv1_count}/{len(conv1_stats)} dead channels ({dead_conv1_count/len(conv1_stats)*100:.1f}%)")
     print(f"Conv2: {dead_conv2_count}/{len(conv2_stats)} dead channels ({dead_conv2_count/len(conv2_stats)*100:.1f}%)")
-    
-    if conv3_activations is not None:
-        dead_conv3_count = sum(dead_conv3)
-        print(f"Conv3: {dead_conv3_count}/{len(conv3_stats)} dead channels ({dead_conv3_count/len(conv3_stats)*100:.1f}%)")
     
     high_saturation = [name for name in layers if saturation_stats[name]['saturation_rate_pre'] > 30]
     high_dead = [name for name in layers if saturation_stats[name]['dead_rate'] > 30]

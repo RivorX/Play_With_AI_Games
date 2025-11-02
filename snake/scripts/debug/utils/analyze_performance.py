@@ -15,10 +15,9 @@ import csv
 import os
 from collections import Counter
 
-
 def analyze_performance_metrics(model, env, output_dir, action_names, num_episodes=30, num_samples=100):
     """
-    🎯 KOMPLEKSOWA ANALIZA WYDAJNOŚCI
+    🎯 KOMPLEKSOWA ANALIZA WYDAJNOŚCI (FIXED)
     Łączy: critical moments + ablation study
     """
     print("\n" + "="*80)
@@ -199,22 +198,54 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
         axes[0, 0].legend()
         axes[0, 0].grid(axis='y', alpha=0.3)
         
-        # Collision awareness
+        # 🔧 FIX: Collision awareness - CORRECTED VERSION
         front_colls = [m['front_coll'] for m in near_death_moments]
         left_colls = [m['left_coll'] for m in near_death_moments]
         right_colls = [m['right_coll'] for m in near_death_moments]
         
-        axes[0, 1].hist([front_colls, left_colls, right_colls], bins=2, 
-                       label=['Front', 'Left', 'Right'], 
-                       color=['#e74c3c', '#f39c12', '#2ecc71'], 
-                       alpha=0.7, edgecolor='black')
+        # Count occurrences properly
+        front_no = sum(1 for c in front_colls if c < 0.5)
+        front_yes = sum(1 for c in front_colls if c >= 0.5)
+        left_no = sum(1 for c in left_colls if c < 0.5)
+        left_yes = sum(1 for c in left_colls if c >= 0.5)
+        right_no = sum(1 for c in right_colls if c < 0.5)
+        right_yes = sum(1 for c in right_colls if c >= 0.5)
+        
+        # Plot as grouped bar chart
+        x_coll = np.arange(2)
+        width_coll = 0.25
+        
+        axes[0, 1].bar(x_coll - width_coll, [front_no, front_yes], width_coll, 
+                      label='Front', color='#e74c3c', alpha=0.8, edgecolor='black')
+        axes[0, 1].bar(x_coll, [left_no, left_yes], width_coll, 
+                      label='Left', color='#f39c12', alpha=0.8, edgecolor='black')
+        axes[0, 1].bar(x_coll + width_coll, [right_no, right_yes], width_coll, 
+                      label='Right', color='#2ecc71', alpha=0.8, edgecolor='black')
+        
         axes[0, 1].set_xlabel('Collision Detected')
         axes[0, 1].set_ylabel('Frequency')
         axes[0, 1].set_title('Collision Awareness Before Death')
         axes[0, 1].legend()
-        axes[0, 1].set_xticks([0.25, 0.75])
-        axes[0, 1].set_xticklabels(['No', 'Yes'])
+        axes[0, 1].set_xticks(x_coll)
+        axes[0, 1].set_xticklabels(['No Collision', 'Collision Detected'])
         axes[0, 1].grid(axis='y', alpha=0.3)
+        
+        # Add percentages on bars
+        total_moments = len(near_death_moments)
+        for i, (no_val, yes_val) in enumerate([(front_no, front_yes), (left_no, left_yes), (right_no, right_yes)]):
+            x_pos = x_coll + (i - 1) * width_coll
+            
+            # No collision percentage
+            pct_no = (no_val / total_moments) * 100
+            if no_val > 0:
+                axes[0, 1].text(x_pos[0], no_val + 0.5, f'{pct_no:.0f}%', 
+                               ha='center', va='bottom', fontsize=8)
+            
+            # Yes collision percentage
+            pct_yes = (yes_val / total_moments) * 100
+            if yes_val > 0:
+                axes[0, 1].text(x_pos[1], yes_val + 0.5, f'{pct_yes:.0f}%', 
+                               ha='center', va='bottom', fontsize=8)
         
         # Decision confidence before death
         entropy_by_step = {step: [] for step in steps_range}
@@ -449,7 +480,7 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
     axes[1].legend()
     
     baseline_reward = avg_rewards[0]
-    performance_drops = [(baseline_reward - r) / baseline_reward * 100 for r in avg_rewards]
+    performance_drops = [(baseline_reward - r) / baseline_reward * 100 if baseline_reward != 0 else 0 for r in avg_rewards]
     
     axes[2].bar(labels, performance_drops, color=colors, alpha=0.8, edgecolor='black')
     axes[2].set_ylabel('Performance Drop (%)')
@@ -471,11 +502,26 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
     if near_death_moments:
         most_common_action = Counter([m['action'] for m in near_death_moments]).most_common(1)[0]
         avg_entropy = np.mean([m['entropy'] for m in near_death_moments])
+        
+        # 🔧 NEW: Collision detection stats
+        total_moments = len(near_death_moments)
+        front_detected = sum(1 for m in near_death_moments if m['front_coll'] >= 0.5)
+        left_detected = sum(1 for m in near_death_moments if m['left_coll'] >= 0.5)
+        right_detected = sum(1 for m in near_death_moments if m['right_coll'] >= 0.5)
+        
         print(f"Most common action before death: {action_names[most_common_action[0]]} ({most_common_action[1]} times)")
         print(f"Average entropy before death: {avg_entropy:.3f}")
+        print(f"\n🔍 Collision Detection Stats (before death):")
+        print(f"  Front collisions detected: {front_detected}/{total_moments} ({front_detected/total_moments*100:.1f}%)")
+        print(f"  Left collisions detected:  {left_detected}/{total_moments} ({left_detected/total_moments*100:.1f}%)")
+        print(f"  Right collisions detected: {right_detected}/{total_moments} ({right_detected/total_moments*100:.1f}%)")
+        
+        any_collision = sum(1 for m in near_death_moments 
+                           if m['front_coll'] >= 0.5 or m['left_coll'] >= 0.5 or m['right_coll'] >= 0.5)
+        print(f"  ANY collision detected:    {any_collision}/{total_moments} ({any_collision/total_moments*100:.1f}%)")
     
     if death_positions:
-        print(f"Average snake length at death: {np.mean([d['snake_length'] for d in death_positions]):.1f}")
+        print(f"\nAverage snake length at death: {np.mean([d['snake_length'] for d in death_positions]):.1f}")
         print(f"Average map occupancy at death: {np.mean([d['map_occupancy'] for d in death_positions])*100:.1f}%")
     
     if food_acquisitions:

@@ -60,7 +60,7 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
 
     # Layer 3 - MULTI-SCALE (opcjonalna)
     layer_offset = 4
-    if features_extractor.has_conv3:
+    if getattr(features_extractor, "has_conv3", False):
         identity = features_extractor.residual_proj(x_cnn)
         identity.retain_grad()
         cnn_intermediates.append(('cnn', 4, 'Residual-Proj', identity))
@@ -100,14 +100,15 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     cnn_features.retain_grad()
     cnn_intermediates.append(('cnn', layer_offset + 1, 'Bottleneck', cnn_features))
     
-    # Scalar layers
+    # Scalar layers (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
     scalars_grad = torch.cat([
         obs_grad['direction'],
         obs_grad['dx_head'],
         obs_grad['dy_head'],
         obs_grad['front_coll'],
         obs_grad['left_coll'],
-        obs_grad['right_coll']
+        obs_grad['right_coll'],
+        obs_grad['snake_length']
     ], dim=-1)
 
     scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
@@ -139,7 +140,7 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     # Combined features
     combined = torch.cat([cnn_features, scalar_features], dim=-1)
     combined.retain_grad()
-    features_final = features_extractor.fusion_main(combined)
+    features_final = features_extractor.final_linear(combined)
     features_final.retain_grad()
     
     # LSTM
@@ -750,7 +751,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             x = features_extractor.dropout2(x)
             x = torch.nn.functional.gelu(x)
             
-            if features_extractor.has_conv3:
+            if getattr(features_extractor, "has_conv3", False):
                 identity = features_extractor.residual_proj(x)
                 
                 x_local = features_extractor.conv3_local(x)
@@ -768,14 +769,15 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             cnn_raw = cnn_raw.float()
             cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
             
-            # Scalars
+            # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
             scalars = torch.cat([
                 obs_tensor['direction'],
                 obs_tensor['dx_head'],
                 obs_tensor['dy_head'],
                 obs_tensor['front_coll'],
                 obs_tensor['left_coll'],
-                obs_tensor['right_coll']
+                obs_tensor['right_coll'],
+                obs_tensor['snake_length']
             ], dim=-1)
             
             scalars = features_extractor.scalar_input_dropout(scalars)
@@ -783,7 +785,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             
             # Fusion
             combined = torch.cat([cnn_features, scalar_features], dim=-1)
-            features_final = features_extractor.fusion_main(combined)
+            features_final = features_extractor.final_linear(combined)
             
             # LSTM - standardowa inicjalizacja stanów
             batch_size = features_final.shape[0]
