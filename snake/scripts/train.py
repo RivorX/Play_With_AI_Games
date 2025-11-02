@@ -1,12 +1,8 @@
-# train_optimized.py - ⚡ Performance optimizations
 import os
 import sys
 import yaml
 import pickle
 import torch
-import gc
-from threading import Thread
-from queue import Queue
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, DummyVecEnv
 from stable_baselines3.common.env_util import make_vec_env
@@ -25,7 +21,13 @@ from utils.training_utils import (
     ensure_directories,
     reset_channel_logs,
     init_channel_loggers,
-    log_observation
+    log_observation,
+    clear_gpu_cache,
+    enable_pin_memory,
+    AsyncRolloutPrefetcher,
+    setup_adamw_optimizer,
+    load_policy_weights_only,
+    cleanup_all_training_csvs
 )
 
 base_dir = os.path.dirname(os.path.dirname(__file__))
@@ -39,182 +41,114 @@ enable_channel_logs = config.get('training', {}).get('enable_channel_logs', Fals
 channel_loggers = init_channel_loggers(base_dir) if enable_channel_logs else {}
 
 
-def clear_gpu_cache():
-    """🧹 Wyczyść cache GPU i usuń nieużywane obiekty"""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    gc.collect()
-
-
-# ⚡ OPTIMIZATION: Pin Memory for faster GPU transfer
-def enable_pin_memory(env, eval_env):
-    """Włącza pin_memory dla szybszego transferu CPU→GPU"""
-    if torch.cuda.is_available():
-        try:
-            # Pin buffers obserwacji w CPU
-            if hasattr(env, 'buf_obs'):
-                for i in range(len(env.buf_obs)):
-                    env.buf_obs[i] = torch.from_numpy(env.buf_obs[i]).pin_memory().numpy()
-            
-            if hasattr(eval_env, 'buf_obs'):
-                for i in range(len(eval_env.buf_obs)):
-                    eval_env.buf_obs[i] = torch.from_numpy(eval_env.buf_obs[i]).pin_memory().numpy()
-            
-            print("✅ Pin Memory włączony (+10-15% transfer speed)")
-        except Exception as e:
-            print(f"⚠️ Pin Memory nieudany: {e}")
-    return env, eval_env
-
-
-
-
-# ⚡ OPTIMIZATION: Async Rollout Prefetching
-class AsyncRolloutPrefetcher:
-    """🚀 Async prefetching następnego batcha podczas treningu
-    
-    Pozwala GPU trenować bieżący batch, podczas gdy CPU preparuje kolejny.
-    Powinno dać +20-30% GPU utilization
+def prompt_training_mode(model_path, policy_path, state_path, models_dir):
     """
-    def __init__(self, env, batch_queue_size=2):
-        self.env = env
-        self.queue = Queue(maxsize=batch_queue_size)
-        self.stop_event = None
-        self.worker_thread = None
-        self.batch_size = 0
-        self.is_active = False
-        
-    def start(self):
-        """Uruchamia worker thread"""
-        if not torch.cuda.is_available():
-            print("⚠️ Async prefetch wymaga CUDA")
-            return
-        
-        self.is_active = True
-        print("\n🚀 Async Rollout Prefetcher uruchomiony")
-        print("   CPU będzie prefetchować batchea podczas GPU treningu")
+    🎯 Prompt użytkownika o wybór trybu treningu
     
-    def prefetch_next_batch(self):
-        """Preparuje następny batch w tle"""
+    Returns:
+        tuple: (mode, use_config_hyperparams, total_timesteps, model_to_load)
+            mode: 'continue' | 'restart' | 'policy_only'
+            model_to_load: 'best' | 'latest' | model_path
+    """
+    has_full_model = os.path.exists(model_path)
+    has_best_model = os.path.exists(os.path.join(models_dir, 'best_model.zip'))
+    has_latest_model = os.path.exists(os.path.join(models_dir, 'snake_ppo_model.zip'))
+    has_policy_only = os.path.exists(policy_path) and not has_full_model
+    has_state = os.path.exists(state_path)
+    
+    total_timesteps = 0
+    
+    # ✅ FIX: Wczytuj timesteps TYLKO dla pełnego modelu
+    if has_full_model and has_state:
         try:
-            obs = self.env.reset()
-            self.queue.put(obs, timeout=1)
+            with open(state_path, 'rb') as f:
+                state = pickle.load(f)
+                total_timesteps = state['total_timesteps']
         except:
             pass
-
-
-def clear_gpu_cache():
-    """🧹 Wyczyść cache GPU i usuń nieużywane obiekty"""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    gc.collect()
-
-
-# ⚡ OPTIMIZATION 8: Kompilacja modelu z torch.compile (PyTorch 2.0+)
-def compile_model_if_available(model):
-    """Kompiluje model dla szybszego wykonania (PyTorch 2.0+)"""
-    if hasattr(torch, 'compile') and torch.cuda.is_available():
-        try:
-            print("\n🚀 Kompilowanie modelu z torch.compile()...")
-            model.policy = torch.compile(
-                model.policy,
-                mode='reduce-overhead',  # Opcje: 'default', 'reduce-overhead', 'max-autotune'
-                fullgraph=False  # True może być szybsze ale mniej stabilne
-            )
-            print("✅ Model skompilowany - spodziewaj się 20-30% przyspieszenia po warm-upie\n")
-        except Exception as e:
-            print(f"⚠️ Nie udało się skompilować modelu: {e}")
-    else:
-        print("⚠️ torch.compile() niedostępne (wymaga PyTorch 2.0+)")
-    return model
-
-
-# ⚡ OPTIMIZATION 9: Mixed Precision Training
-def enable_mixed_precision(model):
-    """Włącza mixed precision training dla całego modelu"""
-    if torch.cuda.is_available():
-        print("\n⚡ Włączanie Mixed Precision Training (AMP)...")
-        # RecurrentPPO nie ma natywnego wsparcia dla AMP, ale można to obejść
-        original_train = model.train
-        
-        def train_with_amp(mode=True):
-            result = original_train(mode)
-            if mode and hasattr(model.policy, 'optimizer'):
-                # Wrap optimizer z GradScaler
-                if not hasattr(model, '_grad_scaler'):
-                    model._grad_scaler = torch.cuda.amp.GradScaler()
-                    print("✅ GradScaler utworzony dla AMP")
-            return result
-        
-        model.train = train_with_amp
-        print("✅ Mixed Precision Training włączony\n")
-    return model
-
-
-# ⚡ OPTIMIZATION 10: Gradient checkpointing dla LSTM
-def enable_gradient_checkpointing(model):
-    """Włącza gradient checkpointing dla LSTM (mniejsze zużycie VRAM)"""
-    try:
-        if hasattr(model.policy, 'lstm_actor'):
-            model.policy.lstm_actor.lstm.gradient_checkpointing = True
-            print("✅ Gradient checkpointing włączony dla LSTM Actor")
-        if hasattr(model.policy, 'lstm_critic'):
-            model.policy.lstm_critic.lstm.gradient_checkpointing = True
-            print("✅ Gradient checkpointing włączony dla LSTM Critic")
-    except Exception as e:
-        print(f"⚠️ Nie udało się włączyć gradient checkpointing: {e}")
-    return model
-
-
-def setup_adamw_optimizer(model, config):
-    """Konfiguruje optimizer AdamW dla modelu RecurrentPPO"""
-    opt_config = config['model'].get('optimizer', {})
-    optimizer_type = opt_config.get('type', 'adam').lower()
-    weight_decay = opt_config.get('weight_decay', 0.01)
-    eps = opt_config.get('eps', 1e-5)
-    betas = tuple(opt_config.get('betas', [0.9, 0.999]))
     
-    if optimizer_type == 'adamw':
-        # ⚡ OPTIMIZATION 11: Fused AdamW (szybsza implementacja CUDA)
+    print(f"\n{'='*70}")
+    print(f"[TRAINING MODE SELECTION]")
+    print(f"{'='*70}")
+    
+    if has_full_model:
+        print(f"✅ Znaleziono pełny model: {model_path}")
+        print(f"   Timesteps: {total_timesteps:,}")
+        
+        # 🔍 Pokaż dostępne modele
+        print(f"\n📁 Dostępne modele:")
+        if has_best_model:
+            print(f"   ✅ best_model.zip (najlepszy - najwyższy reward)")
+        if has_latest_model:
+            print(f"   ✅ snake_ppo_model.zip (najnowszy - bieżący)")
+        
+        print(f"\nWybierz tryb:")
+        print(f"  [1] Kontynuuj trening (zachowaj hyperparametry z modelu)")
+        print(f"  [2] Kontynuuj trening (użyj hyperparametrów z config.yaml)")
+        print(f"  [3] Rozpocznij od zera (usuń stary model)")
+        print(f"  [4] Wczytaj tylko wagi z policy.pth")
+        
         try:
-            optimizer = torch.optim.AdamW(
-                model.policy.parameters(),
-                lr=model.learning_rate if isinstance(model.learning_rate, float) else model.learning_rate(1.0),
-                betas=betas,
-                eps=eps,
-                weight_decay=weight_decay,
-                fused=True  # ⚡ Fused kernel (wymaga PyTorch 2.0+)
-            )
-            print(f"✅ AdamW FUSED optimizer (szybszy o ~10%)")
-        except TypeError:
-            # Fallback dla starszych wersji PyTorch
-            optimizer = torch.optim.AdamW(
-                model.policy.parameters(),
-                lr=model.learning_rate if isinstance(model.learning_rate, float) else model.learning_rate(1.0),
-                betas=betas,
-                eps=eps,
-                weight_decay=weight_decay
-            )
-            print(f"⚠️ Fused AdamW niedostępny, używam standardowego AdamW")
+            choice = input(f"\nWybór [1-4] (domyślnie: 2): ").strip()
+        except:
+            choice = '2'
         
-        model.policy.optimizer = optimizer
+        # 🎯 Pytaj o wybór modelu przy kontynuacji (PRZED sprawdzeniem choice)
+        model_choice = 'latest'
+        if choice in ['1', '2', '']:  # ✅ Dodaj '' dla domyślnej opcji
+            if has_best_model and has_latest_model:
+                print(f"\nJaki model wczytać?")
+                print(f"  [1] Najlepszy (best_model.zip - najwyższy reward)")
+                print(f"  [2] Najnowszy (snake_ppo_model.zip - bieżący)")
+                try:
+                    model_input = input(f"\nWybór [1-2] (domyślnie: 1): ").strip()
+                    model_choice = 'best' if model_input in ['1', ''] else 'latest'
+                except:
+                    model_choice = 'best'
+            elif has_best_model:
+                model_choice = 'best'
+                print(f"\n✅ Wczytam best_model.zip (brak snake_ppo_model.zip)")
+            elif has_latest_model:
+                model_choice = 'latest'
+                print(f"\n✅ Wczytam snake_ppo_model.zip (brak best_model.zip)")
         
-        print(f"\n{'='*70}")
-        print(f"[OPTIMIZER] ✅ AdamW ENABLED")
-        print(f"{'='*70}")
-        print(f"  Type:          AdamW (Fused: {hasattr(optimizer, 'fused') and optimizer.defaults.get('fused', False)})")
-        print(f"  Weight Decay:  {weight_decay}")
-        print(f"  Epsilon:       {eps}")
-        print(f"  Betas:         {betas}")
-        print(f"{'='*70}\n")
+        if choice == '1':
+            return 'continue', False, total_timesteps, model_choice
+        elif choice == '3':
+            return 'restart', True, 0, 'latest'  # ✅ Timesteps = 0
+        elif choice == '4':
+            if os.path.exists(policy_path):
+                return 'policy_only', True, 0, 'policy_only'  # ✅ Timesteps = 0
+            else:
+                print(f"❌ Nie znaleziono policy.pth: {policy_path}")
+                print(f"   Kontynuuję z domyślną opcją (2)")
+                return 'continue', True, total_timesteps, model_choice
+        else:  # '2' lub pusty
+            return 'continue', True, total_timesteps, model_choice
+    
+    elif has_policy_only:
+        print(f"⚠️  Znaleziono tylko policy.pth: {policy_path}")
+        print(f"   (brak pełnego modelu .zip)")
+        print(f"\nWybierz tryb:")
+        print(f"  [1] Wczytaj wagi z policy.pth (optimizer od zera)")
+        print(f"  [2] Rozpocznij od zera (ignoruj policy.pth)")
         
-    return model
+        try:
+            choice = input(f"\nWybór [1-2] (domyślnie: 1): ").strip()
+        except:
+            choice = '1'
+        
+        if choice == '2':
+            return 'restart', True, 0, 'latest'
+        else:
+            return 'policy_only', True, 0, 'policy_only'  # ✅ Zawsze 0 dla policy_only
+    
+    else:
+        print(f"ℹ️  Nie znaleziono zapisanego modelu")
+        print(f"   Rozpoczynam trening od zera")
+        return 'restart', True, 0, 'latest'
 
-
-def train(use_progress_bar=False, use_config_hyperparams=True):
-    global best_model_save_path
-
+def train(use_progress_bar=False):
     n_envs = config['training']['n_envs']
     n_steps = config['model']['n_steps']
     eval_freq = config['training']['eval_freq']
@@ -234,53 +168,70 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     vec_norm_path = model_path_absolute.replace('.zip', '_vecnorm.pkl')
     vec_norm_eval_path = model_path_absolute.replace('.zip', '_vecnorm_eval.pkl')
     state_path = model_path_absolute.replace('.zip', '_state.pkl')
+    policy_only_path = os.path.join(base_dir, 'models', 'policy.pth')
+    best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
 
-    load_model = os.path.exists(model_path_absolute)
-    total_timesteps = 0
+    # 🎯 INTERACTIVE MODE SELECTION
+    mode, use_config_hyperparams, total_timesteps, model_choice = prompt_training_mode(
+        model_path_absolute, 
+        policy_only_path, 
+        state_path,
+        best_model_save_path
+    )
     
-    if load_model:
-        try:
-            with open(state_path, 'rb') as f:
-                state = pickle.load(f)
-                total_timesteps = state['total_timesteps']
-            print(f"Wznowienie treningu od {total_timesteps} kroków.")
-        except Exception as e:
-            print(f"Błąd ładowania stanu: {e}. Zaczynam od zera.")
-        
-        try:
-            resp = input(f"Znaleziono istniejący model pod {model_path_absolute}. Czy kontynuować trening? [[Y]/n]: ").strip()
-        except Exception:
-            resp = ''
+    print(f"\n{'='*70}")
+    print(f"[SELECTED MODE]")
+    print(f"{'='*70}")
+    print(f"  Mode:                  {mode}")
+    print(f"  Use config hyperparams: {use_config_hyperparams}")
+    print(f"  Model to load:         {model_choice}")
+    print(f"  Starting timesteps:     {total_timesteps:,}")
+    print(f"{'='*70}\n")
+    
+    # 🎯 Wybierz ścieżkę modelu na podstawie model_choice
+    if model_choice == 'best':
+        actual_model_path = os.path.join(best_model_save_path, 'best_model.zip')
+        print(f"📁 Wczytam: best_model.zip (najlepszy)")
+    elif model_choice == 'latest':
+        actual_model_path = os.path.join(best_model_save_path, 'snake_ppo_model.zip')
+        print(f"📁 Wczytam: snake_ppo_model.zip (najnowszy)")
+        # Fallback na domyślny jeśli nie istnieje
+        if not os.path.exists(actual_model_path):
+            actual_model_path = model_path_absolute
+            print(f"⚠️  Fallback: {model_path_absolute}")
+    else:  # policy_only
+        actual_model_path = policy_only_path
+        print(f"📁 Wczytam: policy.pth")
+    print()
 
-        if resp.lower() in ('n', 'no'):
-            print("Użytkownik wybrał rozpoczęcie treningu od nowa. Zaczynam od zera i używam hyperparametrów z configu.")
-            load_model = False
-            total_timesteps = 0
-            use_config_hyperparams = True
-            
-            for csv_path in [
-                os.path.join(base_dir, config['paths']['train_csv_path']),
-                os.path.join(base_dir, 'logs', 'gradient_monitor.csv'),
-                os.path.join(base_dir, 'logs', 'victories.log')
-            ]:
-                try:
-                    if os.path.exists(csv_path):
-                        os.remove(csv_path)
-                        print(f"Usunięto: {csv_path}")
-                except Exception as e:
-                    print(f"Nie udało się usunąć {csv_path}: {e}")
-        else:
+    # 🔧 CLEANUP CSVs przy kontynuacji (usuń nadmiarowe wiersze)
+    if mode == 'continue' and total_timesteps > 0:
+        cleanup_all_training_csvs(base_dir, total_timesteps, verbose=True)
+    
+    # Reset logs przy restarcie lub policy_only
+    if mode in ['restart', 'policy_only']:
+        for csv_path in [
+            os.path.join(base_dir, config['paths']['train_csv_path']),
+            os.path.join(base_dir, 'logs', 'gradient_monitor.csv'),
+            os.path.join(base_dir, 'logs', 'victories.log')
+        ]:
             try:
-                resp2 = input("Użyć hyperparametrów z configu zamiast z modelu? [[Y]/n]: ").strip()
-            except Exception:
-                resp2 = ''
-            use_config_hyperparams = False if resp2.lower() in ('n', 'no') else True
+                if os.path.exists(csv_path):
+                    os.remove(csv_path)
+                    print(f"🗑️  Usunięto: {csv_path}")
+            except Exception as e:
+                print(f"⚠️  Nie udało się usunąć {csv_path}: {e}")
+        
+        reset_channel_logs(base_dir)
+        print(f"✅ Zresetowano logi\n")
+    else:
+        print(f"✅ Kontynuacja treningu - logi będą kontynuowane\n")
 
-    reset_channel_logs(base_dir)
+    # Inicjalizuj channel loggers
     if enable_channel_logs:
         channel_loggers.update(init_channel_loggers(base_dir))
 
-    print(f"\n{'='*70}")
+    print(f"{'='*70}")
     print(f"[NORMALIZATION CONFIG]")
     print(f"{'='*70}")
     print(f"  norm_obs:        {norm_obs}")
@@ -288,13 +239,12 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     print(f"  clip_reward:     {clip_reward}")
     print(f"{'='*70}\n")
 
-    # ⚡ OPTIMIZATION 12: DummyVecEnv dla małej liczby środowisk (n_envs < 8)
-    # SubprocVecEnv ma overhead, DummyVecEnv jest szybszy dla n_envs < 8
+    # ⚡ OPTIMIZATION: DummyVecEnv dla małej liczby środowisk
     vec_env_cls = DummyVecEnv if n_envs < 8 else SubprocVecEnv
-    print(f"🏗️ Używam {vec_env_cls.__name__} dla {n_envs} środowisk")
+    print(f"🗃️  Używam {vec_env_cls.__name__} dla {n_envs} środowisk\n")
     
     env = make_vec_env(make_env(render_mode=None, grid_size=None), n_envs=n_envs, vec_env_cls=vec_env_cls)
-    if load_model and os.path.exists(vec_norm_path):
+    if mode == 'continue' and os.path.exists(vec_norm_path):
         env = VecNormalize.load(vec_norm_path, env)
         print(f"✅ Załadowano VecNormalize z {vec_norm_path}")
     else:
@@ -309,9 +259,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         )
         print(f"✅ Utworzono nowy VecNormalize")
 
-    # Eval env - zawsze DummyVecEnv (eval nie potrzebuje równoległości)
+    # Eval env
     eval_env = make_vec_env(make_env(render_mode=None, grid_size=16), n_envs=eval_n_envs, vec_env_cls=DummyVecEnv)
-    if load_model and os.path.exists(vec_norm_eval_path):
+    if mode == 'continue' and os.path.exists(vec_norm_eval_path):
         eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
     else:
         eval_env = VecNormalize(
@@ -324,7 +274,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             epsilon=epsilon
         )
 
-    # ⚡ OPTIMIZATION: Enable pin_memory for faster GPU transfer
+    # ⚡ OPTIMIZATION: Enable pin_memory
     env, eval_env = enable_pin_memory(env, eval_env)
 
     clear_gpu_cache()
@@ -332,14 +282,69 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
     policy_kwargs = config['model']['policy_kwargs'].copy()
     policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
 
-    if load_model:
-        model = RecurrentPPO.load(model_path_absolute, env=env)
-        model.ent_coef = config['model']['ent_coef']
-        model.learning_rate = linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate'])
-        model._setup_lr_schedule()
+    # 🎯 MODEL LOADING BASED ON MODE
+    if mode == 'continue' and not use_config_hyperparams:
+        # Tryb 1: Kontynuacja z hyperparametrami z modelu
+        print(f"\n📥 Ładowanie pełnego modelu (hyperparametry z modelu)...\n")
+        model = RecurrentPPO.load(actual_model_path, env=env)
         model = setup_adamw_optimizer(model, config)
         clear_gpu_cache()
-    else:
+    
+    elif mode == 'continue' and use_config_hyperparams:
+        # Tryb 2: Kontynuacja z hyperparametrami z config
+        print(f"\n📥 Ładowanie modelu (hyperparametry z config.yaml)...\n")
+        model = RecurrentPPO(
+            config['model']['policy'],
+            env,
+            learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
+            n_steps=config['model']['n_steps'],
+            batch_size=config['training']['batch_size'],
+            n_epochs=config['model']['n_epochs'],
+            gamma=config['model']['gamma'],
+            gae_lambda=config['model']['gae_lambda'],
+            clip_range=config['model']['clip_range'],
+            ent_coef=config['model']['ent_coef'],
+            vf_coef=config['model']['vf_coef'],
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            device=config['model']['device']
+        )
+        
+        # Wczytaj tylko wagi policy
+        model_tmp = RecurrentPPO.load(actual_model_path)
+        model.policy.load_state_dict(model_tmp.policy.state_dict())
+        del model_tmp
+        
+        model = setup_adamw_optimizer(model, config)
+        clear_gpu_cache()
+    
+    elif mode == 'policy_only':
+        # Tryb 4: Wczytaj tylko wagi z policy.pth
+        print(f"\n📥 Tworzenie nowego modelu (wagi z policy.pth)...\n")
+        model = RecurrentPPO(
+            config['model']['policy'],
+            env,
+            learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
+            n_steps=config['model']['n_steps'],
+            batch_size=config['training']['batch_size'],
+            n_epochs=config['model']['n_epochs'],
+            gamma=config['model']['gamma'],
+            gae_lambda=config['model']['gae_lambda'],
+            clip_range=config['model']['clip_range'],
+            ent_coef=config['model']['ent_coef'],
+            vf_coef=config['model']['vf_coef'],
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            device=config['model']['device']
+        )
+        
+        model = load_policy_weights_only(model, policy_only_path)
+        model = setup_adamw_optimizer(model, config)
+        clear_gpu_cache()
+    
+    else:  # mode == 'restart'
+        # Tryb 3: Nowy model od zera
+        print(f"\n🆕 Tworzenie nowego modelu od zera...\n")
         model = RecurrentPPO(
             config['model']['policy'],
             env,
@@ -357,49 +362,11 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             device=config['model']['device']
         )
         model = setup_adamw_optimizer(model, config)
-
-    if use_config_hyperparams and load_model:
-        policy_kwargs = config['model']['policy_kwargs'].copy()
-        policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
-        model_new = RecurrentPPO(
-            config['model']['policy'],
-            env,
-            learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
-            n_steps=config['model']['n_steps'],
-            batch_size=config['training']['batch_size'],
-            n_epochs=config['model']['n_epochs'],
-            gamma=config['model']['gamma'],
-            gae_lambda=config['model']['gae_lambda'],
-            clip_range=config['model']['clip_range'],
-            ent_coef=config['model']['ent_coef'],
-            vf_coef=config['model']['vf_coef'],
-            policy_kwargs=policy_kwargs,
-            verbose=1,
-            device=config['model']['device']
-        )
-        model_tmp = RecurrentPPO.load(model_path_absolute)
-        model_new.policy.load_state_dict(model_tmp.policy.state_dict())
-        del model
-        model = model_new
-        del model_tmp
-        model = setup_adamw_optimizer(model, config)
-
-    # ⚡ APPLY OPTIMIZATIONS
-    print("\n⚡ Stosowanie optymalizacji wydajności...\n")
-    print("✅ Pin Memory: Enabled (+10-15% transfer speed)")
-    print("✅ CPU Optimization: itertools.islice (no deque→list conversions)")
-    print("✅ Async Prefetch: Enabled (GPU-CPU overlap)")
-    print()
-    
-    # model = compile_model_if_available(model)  # Odkomentuj dla PyTorch 2.0+
-    # model = enable_mixed_precision(model)      # Wymaga custom training loop
-    # model = enable_gradient_checkpointing(model)  # Oszczędza VRAM
     
     clip_value = config['model'].get('lstm', {}).get('gradient_clip_val', 5.0)
     apply_gradient_clipping(model, clip_value=clip_value)
 
-    global best_model_save_path
-    best_model_save_path = os.path.normpath(os.path.join(base_dir, config['paths']['models_dir']))
+    # ✅ best_model_save_path już zdefiniowany wcześniej (linia ~163)
 
     stop_on_plateau = StopTrainingOnNoModelImprovement(
         max_no_improvement_evals=config['training']['max_no_improvement_evals'],
@@ -442,7 +409,8 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
 
     gradient_monitor = GradientWeightMonitor(
         csv_path=os.path.join(base_dir, 'logs', 'gradient_monitor.csv'),
-        log_freq=config['training'].get('gradient_log_freq', 2000)
+        log_freq=config['training'].get('gradient_log_freq', 2000),
+        initial_timesteps=total_timesteps
     )
     
     victory_tracker = VictoryTrackerCallback(
@@ -450,7 +418,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         verbose=1
     )
 
-    # ⚡ OPTIMIZATION: Async Rollout Prefetcher (GPU-CPU overlap)
+    # ⚡ OPTIMIZATION: Async Rollout Prefetcher
     prefetcher = AsyncRolloutPrefetcher(env, batch_queue_size=2)
     prefetcher.start()
 
@@ -459,7 +427,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         remaining_timesteps = configured_total - total_timesteps
         
         if configured_total > 0 and total_timesteps / configured_total >= 0.8:
-            print(f"Użyto {total_timesteps}/{configured_total} kroków ({total_timesteps/configured_total:.1%}).")
+            print(f"ℹ️  Użyto {total_timesteps}/{configured_total} kroków ({total_timesteps/configured_total:.1%}).")
             try:
                 extra = input("Ile dodatkowych kroków dodać? (0 = brak): ").strip()
                 extra_int = int(extra) if extra != '' else 0
@@ -471,7 +439,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             print(f"\n🚀 Rozpoczynam trening: {remaining_timesteps:,} kroków\n")
             model.learn(
                 total_timesteps=remaining_timesteps,
-                reset_num_timesteps=not load_model,
+                reset_num_timesteps=(mode != 'continue'),
                 callback=[
                     eval_callback, 
                     train_progress_callback, 
@@ -484,9 +452,9 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
                 tb_log_name=f"recurrent_ppo_snake_{total_timesteps}"
             )
         else:
-            print(f"Trening zakończony: osiągnięto {total_timesteps} kroków.")
+            print(f"ℹ️  Trening zakończony: osiągnięto {total_timesteps} kroków.")
     except KeyboardInterrupt:
-        print("\n\n⚠️ Przerwanie treningu przez użytkownika (Ctrl+C)")
+        print("\n\n⚠️  Przerwanie treningu przez użytkownika (Ctrl+C)")
         try:
             env.close()
             eval_env.close()
@@ -495,7 +463,7 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
         clear_gpu_cache()
         raise
     except Exception as e:
-        print(f"Błąd podczas treningu: {e}")
+        print(f"❌ Błąd podczas treningu: {e}")
         raise
     finally:
         try:
@@ -505,18 +473,18 @@ def train(use_progress_bar=False, use_config_hyperparams=True):
             pass
         clear_gpu_cache()
 
-    print("Trening zakończony!")
+    print("\n✅ Trening zakończony!")
 
 
 if __name__ == "__main__":
     try:
         train(use_progress_bar=True)
     except KeyboardInterrupt:
-        print("\n\nTrening przerwany.")
+        print("\n\n⚠️  Trening przerwany.")
         clear_gpu_cache()
         os._exit(0)
     except Exception as e:
-        print(f"Błąd podczas treningu: {e}")
+        print(f"❌ Błąd podczas treningu: {e}")
         import traceback
         traceback.print_exc()
         clear_gpu_cache()

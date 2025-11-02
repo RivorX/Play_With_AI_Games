@@ -1,6 +1,14 @@
 """
-Gradient & Weight Monitor - Silent CSV logging + plotting
-Monitoruje przepływ gradientów i regularyzację AdamW bez zaśmiecania konsoli
+✅ FIXED Gradient & Weight Monitor
+- Przy wznowieniu treningu DOŁĄCZA dane zamiast nadpisywać CSV
+- Silent logging + plotting
+- Kontynuacja wykresu przy wznowieniu treningu
+
+GŁÓWNE ZMIANY:
+1. self._csv_exists - sprawdza czy CSV istnieje (wznowienie)
+2. _on_training_start() - header TYLKO jeśli plik nowy
+3. _log_to_csv() - append mode (dołączanie)
+4. ✅ initial_timesteps - timesteps kontynuowane przy wznowieniu!
 """
 
 import os
@@ -12,7 +20,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 class GradientWeightMonitor(BaseCallback):
     """
-    📊 CICHY MONITOR GRADIENTÓW I WAG
+    📊 CICHY MONITOR GRADIENTÓW I WAG (FIXED - kontynuacja przy wznowieniu)
     
     Zbiera dane co log_freq kroków i zapisuje do CSV:
     - Normy gradientów (gradient flow)
@@ -20,44 +28,44 @@ class GradientWeightMonitor(BaseCallback):
     - Learning rate
     - L2 penalty (weight decay * ||weights||²)
     
-    Użycie:
-        gradient_monitor = GradientWeightMonitor(
-            csv_path='logs/gradient_monitor.csv',
-            log_freq=1000
-        )
-        model.learn(..., callback=[..., gradient_monitor])
+    ✅ FIX: Przy wznowieniu treningu dołącza dane do istniejącego CSV
+    ✅ FIX: Timesteps kontynuowane przy wznowieniu (initial_timesteps)
     """
-    def __init__(self, csv_path, log_freq=1000, verbose=0):
+    def __init__(self, csv_path, log_freq=1000, initial_timesteps=0, verbose=0):
         super().__init__(verbose)
         self.csv_path = csv_path
         self.log_freq = log_freq
+        self.initial_timesteps = initial_timesteps
         self.last_logged = 0
-        self._csv_initialized = False
+        
+        # ✅ FIX: Sprawdź czy CSV już istnieje (wznowienie treningu)
+        self._csv_exists = os.path.exists(csv_path)
     
     def _on_training_start(self):
         """Inicjalizuj CSV przy starcie treningu"""
-        # Utwórz katalog jeśli nie istnieje
         os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
         
-        # Sprawdź czy plik już istnieje
-        if os.path.exists(self.csv_path):
-            self._csv_initialized = True
-        else:
-            # Stwórz nowy CSV z headerem
+        # ✅ FIX: Zapisz header TYLKO jeśli plik nie istnieje
+        if not self._csv_exists:
             self._write_csv_header()
-            self._csv_initialized = True
             if self.verbose > 0:
-                print(f"✅ Gradient monitor CSV: {self.csv_path}")
+                print(f"✅ Gradient monitor CSV (NOWY): {self.csv_path}")
+        else:
+            if self.verbose > 0:
+                print(f"✅ Gradient monitor CSV (WZNOWIENIE): {self.csv_path}")
     
     def _on_step(self) -> bool:
         """Monitoruj co log_freq kroków"""
-        if self.num_timesteps - self.last_logged >= self.log_freq:
+        # ✅ FIX: Użyj total_timesteps (z initial_timesteps)
+        total_timesteps = self.num_timesteps + self.initial_timesteps
+        
+        if total_timesteps - self.last_logged >= self.log_freq:
             self._log_to_csv()
-            self.last_logged = self.num_timesteps
+            self.last_logged = total_timesteps
         return True
     
     def _write_csv_header(self):
-        """Zapisz nagłówek CSV"""
+        """Zapisz nagłówek CSV (tylko raz przy tworzeniu pliku)"""
         with open(self.csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -68,21 +76,30 @@ class GradientWeightMonitor(BaseCallback):
             ])
     
     def _log_to_csv(self):
-        """Zbierz dane i zapisz wiersz do CSV"""
+        """Zbierz dane i zapisz wiersz do CSV (append mode), ignorując puste pomiary (same zera)"""
         policy = self.model.policy
-        
         # Oblicz metryki
         grad_norms = self._compute_gradient_norms(policy)
         weight_norms = self._compute_weight_norms(policy)
         lr = self._get_current_lr()
         l2_penalty = self._compute_l2_penalty(policy)
-        
-        # Zapisz do CSV
+        total_timesteps = self.num_timesteps + self.initial_timesteps
+
+        # IGNORUJ jeśli wszystkie grad_norm i weight_norm są równe 0.0 (pusty pomiar)
+        if all(
+            abs(grad_norms[k]) < 1e-8 for k in ['total', 'cnn', 'lstm', 'mlp']
+        ) and all(
+            abs(weight_norms[k]) < 1e-8 for k in ['total', 'cnn', 'lstm', 'mlp']
+        ):
+            if self.verbose > 0:
+                print(f"⏩ Pominięto pusty pomiar gradientów/wag (timesteps={total_timesteps})")
+            return
+
         try:
             with open(self.csv_path, 'a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    self.num_timesteps,
+                    total_timesteps,
                     grad_norms['total'], grad_norms['cnn'], grad_norms['lstm'], grad_norms['mlp'],
                     weight_norms['total'], weight_norms['cnn'], weight_norms['lstm'], weight_norms['mlp'],
                     lr if lr is not None else 0.0,
