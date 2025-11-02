@@ -1,10 +1,11 @@
-# model_ultra_optimized.py - 🚀 EXTREME PERFORMANCE + 🔧 COLLISION BUG FIX
+# model_ultra_optimized.py - 🚀 EXTREME PERFORMANCE + 🔧 COLLISION BUG FIX + 🎯 CPU OPTIMIZATION
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pygame
 import yaml
 import os
+import itertools  # 🚀 CPU Optimization: Avoid deque→list conversions
 from collections import deque
 
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -209,10 +210,10 @@ class SnakeEnv(gym.Env):
         # Body collision (excluding tail if not growing)
         will_grow = (new_head == self.food)
         
-        # 🔧 FIX: Check collision properly
+        # 🔧 FIX + 🚀 CPU OPT: Check collision properly without converting to list
         if will_grow:
             # Growing: check collision with ALL segments (including tail)
-            if new_head in list(self.snake):
+            if new_head in self.snake_body_set or new_head == self.snake[0]:
                 terminated = True
                 death_penalty = self.base_death_penalty * self.difficulty_multiplier
                 reward = death_penalty
@@ -222,8 +223,8 @@ class SnakeEnv(gym.Env):
                     self._render_frame()
                 return self._get_obs(), reward, terminated, truncated, info
         else:
-            # Not growing: check collision with body (excluding tail)
-            if new_head in list(self.snake)[:-1]:
+            # Not growing: check collision with body_set (excludes tail automatically)
+            if new_head in self.snake_body_set:
                 terminated = True
                 death_penalty = self.base_death_penalty * self.difficulty_multiplier
                 reward = death_penalty
@@ -341,9 +342,9 @@ class SnakeEnv(gym.Env):
                 if grid_x < 0 or grid_x >= self.grid_size or grid_y < 0 or grid_y >= self.grid_size:
                     self.viewport_array[i, j] = -1.0
         
-        # Draw body (all segments except head)
-        snake_segments = list(self.snake)
-        for seg in snake_segments[1:]:
+        # 🚀 CPU OPTIMIZATION: Draw body without converting deque to list
+        # Use itertools.islice instead of list() to avoid memory allocation
+        for seg in itertools.islice(self.snake, 1, None):
             seg_x, seg_y = seg
             vp_x = seg_x - start_x
             vp_y = seg_y - start_y
