@@ -426,6 +426,7 @@ class SnakeEnv(gym.Env):
         
         if len(free_coords) == 0:
             # Board full!
+            print("❌ BRAK WOLNYCH PÓL!")
             return self.snake[0]
         
         # NumPy random choice (faster than Python random)
