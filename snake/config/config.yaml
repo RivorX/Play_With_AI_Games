@@ -89,31 +89,31 @@ model:
     dropout: 0.0                    # Dropout w LSTM
   
   # Selektywne dropouty
-  cnn_dropout: 0.02                 
-  scalar_dropout: 0.02                # Dropout dla skalarów
+  cnn_dropout: 0.03                 
+  scalar_dropout: 0.04               # Dropout dla skalarów (wyższy - mniej skalarów)
   scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
-  fusion_dropout: 0.0              
+  fusion_dropout: 0.05               # Dropout po fusion (regularyzacja przed LSTM)              
   
   # CNN ARCHITECTURE
   convlstm:
     cnn_channels: [32, 64]           # Kanały CNN
     
     # Bottleneck
-    cnn_bottleneck_dims: [896]
-    cnn_output_dim: 461
+    cnn_bottleneck_dims: []
+    cnn_output_dim: 819              # 80% z 1024 (pre-fusion)
     
     # Scalar Network Architecture  
-    scalar_hidden_dims: [128, 64] 
+    scalar_hidden_dims: [256, 205]   # 20% z 1024 (pre-fusion) → 205
     
     # Architecture Options
     use_layernorm: true              # Global switch
 
   policy_kwargs:
     features_extractor_kwargs:
-      features_dim: 512              # Wymiar cech wyjściowych ekstraktora
+      features_dim: 512              # Wymiar cech wyjściowych ekstraktora (fusion output)
     net_arch:
       pi: [512, 256]               
-      vf: [512, 384, 256]               
+      vf: [512, 512, 256]               
     lstm_hidden_size: 600            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
     enable_critic_lstm: true         # LSTM dla krytyka

@@ -153,6 +153,16 @@ def test_snake_model(model_path, grid_size, episodes, policy_pth=None):
             elif reward < -1.0:
                 termination_reason = info.get('termination_reason', 'unknown')
                 logging.info(f"      DEATH: {termination_reason}")
+                
+                # 🔴 NOWE: Zapis pełnej mapy w momencie śmierci
+                logging.info(f"  Map snapshot at DEATH:")
+                logging.info(f"\n{np.array_str(mapa, precision=1, suppress_small=True, max_line_width=100)}")
+                logging.info(f"  Head Position (viewport): ({head_x}, {head_y})")
+                logging.info(f"  Food Position (viewport): ({food_x}, {food_y})")
+                logging.info(f"  Actual Head Position (grid): {env.snake[0]}")
+                logging.info(f"  Actual Food Position (grid): {env.food}")
+                logging.info(f"  Snake Body (grid): {list(env.snake)}")
+                logging.info(f"  Snake Length: {len(env.snake)} | Map Occupancy: {(len(env.snake) / (env.grid_size ** 2)) * 100:.1f}%")
 
             # Obsługa zdarzeń Pygame
             for event in pygame.event.get():
