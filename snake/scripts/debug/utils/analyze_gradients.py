@@ -1,6 +1,6 @@
 """
-🌊 GRADIENT ANALYSIS MODULE
-- compute_layer_gradients: Oblicza gradienty dla wszystkich warstw
+🌊 GRADIENT ANALYSIS MODULE - UPDATED FOR MULTI-QUERY CROSS-ATTENTION
+- compute_layer_gradients: Oblicza gradienty dla wszystkich warstw (INCLUDING ATTENTION)
 - analyze_bottlenecks: Analiza bottlenecków w sieci
 - analyze_gradient_flow_detailed: Szczegółowa analiza przepływu gradientów
 """
@@ -16,12 +16,14 @@ from scipy.ndimage import gaussian_filter
 def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, features_extractor):
     """
     Oblicza gradienty dla wszystkich warstw
-    🆕 UPDATED: Pure Bottleneck (NO Skip) + Fixed MLP naming
+    🆕 UPDATED: Multi-Query Cross-Attention + Positional Encoding
     """
     policy = model.policy
     
     features_extractor.eval()
     policy.lstm_actor.train()
+    policy.mlp_extractor.train()
+    policy.action_net.train()
     
     obs_grad = {}
     for k, v in obs.items():
@@ -35,72 +37,45 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     if image_grad.dim() == 4 and image_grad.shape[-1] == 1:
         image_grad = image_grad.permute(0, 3, 1, 2)
     
-    # 🆕 CNN layers - Multi-Scale Architecture
+    # CNN layers
     cnn_intermediates = []
     x_cnn = image_grad
 
-    # Layer 1
+    # Layer 1: Conv1
     x_cnn = features_extractor.conv1(x_cnn)
     x_cnn.retain_grad()
     cnn_intermediates.append(('cnn', 0, 'Conv2d-1', x_cnn))
     x_cnn = features_extractor.bn1(x_cnn)
-    x_cnn = torch.nn.functional.gelu(x_cnn)
+    x_cnn = torch.nn.functional.silu(x_cnn)
     x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 1, 'GELU-1', x_cnn))
+    cnn_intermediates.append(('cnn', 1, 'SiLU-1', x_cnn))
 
-    # Layer 2
+    # Layer 2: Conv2
     x_cnn = features_extractor.conv2(x_cnn)
     x_cnn.retain_grad()
     cnn_intermediates.append(('cnn', 2, 'Conv2d-2', x_cnn))
     x_cnn = features_extractor.bn2(x_cnn)
     x_cnn = features_extractor.dropout2(x_cnn)
-    x_cnn = torch.nn.functional.gelu(x_cnn)
+    x_cnn = torch.nn.functional.silu(x_cnn)
     x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 3, 'GELU-2', x_cnn))
-
-    # Layer 3 - MULTI-SCALE (opcjonalna)
-    layer_offset = 4
-    if getattr(features_extractor, "has_conv3", False):
-        identity = features_extractor.residual_proj(x_cnn)
-        identity.retain_grad()
-        cnn_intermediates.append(('cnn', 4, 'Residual-Proj', identity))
-        
-        x_local = features_extractor.conv3_local(x_cnn)
-        x_local.retain_grad()
-        cnn_intermediates.append(('cnn', 5, 'Conv3-Local', x_local))
-        x_local = features_extractor.bn3_local(x_local)
-        
-        x_global = features_extractor.conv3_global(x_cnn)
-        x_global.retain_grad()
-        cnn_intermediates.append(('cnn', 6, 'Conv3-Global', x_global))
-        x_global = features_extractor.bn3_global(x_global)
-        
-        x_combined = torch.cat([x_local, x_global], dim=1)
-        x_combined.retain_grad()
-        cnn_intermediates.append(('cnn', 7, 'Conv3-Concat', x_combined))
-        
-        x_combined = features_extractor.dropout3(x_combined)
-        x_combined = torch.nn.functional.gelu(x_combined)
-        x_combined.retain_grad()
-        cnn_intermediates.append(('cnn', 8, 'GELU-3', x_combined))
-        
-        x_cnn = x_combined + identity
-        x_cnn.retain_grad()
-        cnn_intermediates.append(('cnn', 9, 'Residual-Add', x_cnn))
-        layer_offset = 10
-
-    # Flatten
-    cnn_raw = features_extractor.flatten(x_cnn)
-    cnn_raw = cnn_raw.float()
-    cnn_raw.retain_grad()
-    cnn_intermediates.append(('cnn', layer_offset, 'Flatten', cnn_raw))
-
-    # 🆕 BOTTLENECK (single projection)
-    cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
-    cnn_features.retain_grad()
-    cnn_intermediates.append(('cnn', layer_offset + 1, 'Bottleneck', cnn_features))
+    cnn_intermediates.append(('cnn', 3, 'SiLU-2', x_cnn))
     
-    # Scalar layers (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
+    # MaxPool
+    x_cnn = features_extractor.maxpool(x_cnn)
+    x_cnn.retain_grad()
+    cnn_intermediates.append(('cnn', 4, 'MaxPool2d', x_cnn))
+    
+    # 🆕 POSITIONAL ENCODING
+    x_cnn = features_extractor.pos_encoding(x_cnn)
+    x_cnn.retain_grad()
+    cnn_intermediates.append(('cnn', 5, 'PosEncoding', x_cnn))
+    
+    # Flatten for attention
+    spatial_features = x_cnn.flatten(2).transpose(1, 2)
+    spatial_features.retain_grad()
+    cnn_intermediates.append(('cnn', 6, 'Flatten', spatial_features))
+    
+    # Scalar layers
     scalars_grad = torch.cat([
         obs_grad['direction'],
         obs_grad['dx_head'],
@@ -116,18 +91,17 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     scalar_intermediates = []
     x_scalar = scalars_grad
     linear_idx = 0
-    for i, layer in enumerate(features_extractor.scalar_linear):
+    for i, layer in enumerate(features_extractor.scalar_network):
         x_scalar = layer(x_scalar)
         x_scalar.retain_grad()
         
-        # ✅ Proper layer naming
         if isinstance(layer, torch.nn.Linear):
             layer_name = f'Linear-{linear_idx}'
             linear_idx += 1
         elif isinstance(layer, torch.nn.LayerNorm):
             layer_name = f'LayerNorm-{i}'
-        elif isinstance(layer, torch.nn.SiLU):
-            layer_name = f'SiLU-{i}'
+        elif isinstance(layer, torch.nn.GELU):
+            layer_name = f'GELU-{i}'
         elif isinstance(layer, torch.nn.Dropout):
             layer_name = f'Dropout-{i}'
         else:
@@ -137,10 +111,32 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     
     scalar_features = x_scalar
     
-    # Combined features
-    combined = torch.cat([cnn_features, scalar_features], dim=-1)
+    # ==================== PATH 1: ATTENTION PATH ====================
+    # 🔥 FIX: Normalize BEFORE attention
+    normalized_features = features_extractor.cnn_prenorm(spatial_features)
+    normalized_features.retain_grad()
+    cnn_intermediates.append(('cnn', 7, 'PreNorm', normalized_features))
+    
+    # 🆕 MULTI-QUERY CROSS-ATTENTION
+    attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
+    attended_cnn.retain_grad()
+    cnn_intermediates.append(('attention', 0, 'CrossAttention', attended_cnn))
+    
+    # ==================== PATH 2: SKIP CONNECTION (Direct CNN) ====================
+    # Bypass attention - use raw CNN features directly ✨ NEW!
+    cnn_raw = spatial_features.flatten(1)  # (B, H*W*C)
+    cnn_raw.retain_grad()
+    cnn_intermediates.append(('skip', 0, 'RawCNN', cnn_raw))
+    
+    direct_cnn = features_extractor.cnn_direct(cnn_raw)
+    direct_cnn.retain_grad()
+    cnn_intermediates.append(('skip', 1, 'DirectProjection', direct_cnn))
+    
+    # ==================== FUSION ====================
+    # THREE STREAMS: Attended CNN + Direct CNN + Scalars
+    combined = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)
     combined.retain_grad()
-    features_final = features_extractor.final_linear(combined)
+    features_final = features_extractor.fusion(combined)
     features_final.retain_grad()
     
     # LSTM
@@ -163,7 +159,6 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
         x_mlp = layer(x_mlp)
         x_mlp.retain_grad()
         
-        # ✅ Proper naming for policy MLP
         if isinstance(layer, torch.nn.Linear):
             layer_name = f'Policy-Linear-{linear_idx_policy}'
             linear_idx_policy += 1
@@ -183,7 +178,6 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
         x_mlp_vf = layer(x_mlp_vf)
         x_mlp_vf.retain_grad()
         
-        # ✅ Proper naming for value MLP
         if isinstance(layer, torch.nn.Linear):
             layer_name = f'Value-Linear-{linear_idx_value}'
             linear_idx_value += 1
@@ -271,7 +265,7 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     for layer_type, layer_idx, layer_name, activation in mlp_intermediates:
         if activation.grad is not None:
             state_layer_grads['layers'].append({
-                'type': layer_type,  # 'mlp_policy' lub 'mlp_value'
+                'type': layer_type,
                 'index': layer_idx,
                 'name': layer_name,
                 'activation_mean': activation.mean().item(),
@@ -288,19 +282,21 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
 def analyze_bottlenecks(layer_gradients, action_names, output_dir):
     """
     ENHANCED BOTTLENECK ANALYSIS
-    - Split visualization by network section (CNN/Scalars/Fusion/MLP)
+    - Split visualization by network section (CNN/Scalars/Attention/Skip/Fusion/MLP)
     - Cross-state gradient flow heatmap
     - Adaptive thresholds per layer type
-    - Information flow metrics
+    ✨ UPDATED: Skip Connection section added
     """
     print("\n" + "="*80)
-    print("\n=== ENHANCED BOTTLENECK ANALYSIS ===")
+    print("\n=== ENHANCED BOTTLENECK ANALYSIS (WITH SKIP CONNECTION) ===")
     print("="*80)
     
     # ==================== ORGANIZE LAYERS BY SECTION ====================
     sections = {
         'cnn': [],
         'scalar': [],
+        'attention': [],  # Attention path
+        'skip': [],       # ✨ NEW: Skip connection path
         'fusion': [],
         'lstm': [],
         'mlp_policy': [],
@@ -318,18 +314,19 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
         for layer in layers:
             layer_type = layer['type']
             if layer_type in sections:
-                # Check if layer already exists in section
                 layer_names = [l['name'] for l in sections[layer_type]]
                 if layer['name'] not in layer_names:
                     sections[layer_type].append(layer)
     
-    # ==================== FIGURE 1: SPLIT BY SECTION (4 subplots) ====================
-    fig = plt.figure(figsize=(20, 14))
-    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+    # ==================== FIGURE 1: SPLIT BY SECTION ====================
+    fig = plt.figure(figsize=(24, 18))
+    gs = fig.add_gridspec(3, 4, hspace=0.35, wspace=0.3)
     
     section_axes = {
         'cnn': fig.add_subplot(gs[0, 0]),
         'scalar': fig.add_subplot(gs[0, 1]),
+        'attention': fig.add_subplot(gs[0, 2]),
+        'skip': fig.add_subplot(gs[0, 3]),    # ✨ NEW!
         'fusion': fig.add_subplot(gs[1, 0]),
         'mlp_policy': fig.add_subplot(gs[1, 1])
     }
@@ -355,10 +352,10 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
         
         # Plot bars for each state
         x = np.arange(len(layer_names_section))
-        width = 0.12  # Narrower bars for 6 series (3 states × 2 metrics)
+        width = 0.12
         
-        colors_activation = ['#3498db', '#2980b9', '#1f618d']  # Blue shades
-        colors_gradient = ['#e74c3c', '#c0392b', '#922b21']     # Red shades
+        colors_activation = ['#3498db', '#2980b9', '#1f618d']
+        colors_gradient = ['#e74c3c', '#c0392b', '#922b21']
         
         for state_idx in range(3):
             state_layers = all_layers_by_state[state_idx]
@@ -368,7 +365,6 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
             gradient_norms = []
             
             for layer_name in layer_names_section:
-                # Find layer in this state
                 layer_data = None
                 for layer in state_layers:
                     if layer['name'] == layer_name and layer['type'] == section_name:
@@ -384,7 +380,7 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
                     activation_means.append(0)
                     gradient_norms.append(0)
             
-            # Normalize gradients for visualization
+            # Normalize gradients
             max_grad = max(gradient_norms) if max(gradient_norms) > 0 else 1.0
             gradient_norms_normalized = [g / max_grad for g in gradient_norms]
             
@@ -413,6 +409,10 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
                     act_threshold = 0.03
                     grad_threshold_high = 0.0005
                     grad_threshold_medium = 0.005
+                elif section_name == 'attention':  # 🆕 NEW
+                    act_threshold = 0.05
+                    grad_threshold_high = 0.001
+                    grad_threshold_medium = 0.01
                 else:
                     act_threshold = 0.05
                     grad_threshold_high = 0.001
@@ -454,12 +454,12 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
         ax.legend(fontsize=8, ncol=2, loc='upper right')
         ax.grid(axis='y', alpha=0.3)
         
-        # Add gradient max value as text
+        # Add gradient max value
         ax.text(0.02, 0.98, f'Grad max: {max_grad:.4f}', 
                transform=ax.transAxes, fontsize=9, va='top',
                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
-    # ==================== FIGURE 1 BOTTOM: LSTM (single row) ====================
+    # ==================== FIGURE 1 BOTTOM: LSTM ====================
     ax_lstm = fig.add_subplot(gs[2, :])
     
     if 'lstm' in sections and len(sections['lstm']) > 0:
@@ -468,7 +468,6 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
             state_layers = all_layers_by_state[state_idx]
             for layer in state_layers:
                 if layer['type'] == 'lstm':
-                    # Use RMS
                     act_rms = np.sqrt(layer['activation_mean']**2 + layer['activation_std']**2)
                     lstm_data.append({
                         'state': state_idx,
@@ -508,17 +507,16 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
     # ==================== FIGURE 2: GRADIENT FLOW HEATMAP ====================
     print("\n[INFO] Generating gradient flow heatmap...")
     
-    # Collect all unique layer names (in order)
+    # Collect all unique layer names
     all_layer_names = []
     for state_layers in all_layers_by_state:
         for layer in state_layers:
             if layer['name'] not in all_layer_names:
                 all_layer_names.append(layer['name'])
     
-    # Build heatmap matrix: [layers × states]
+    # Build heatmap matrix
     heatmap_data = np.zeros((len(all_layer_names), 3))
     
-    # Track min/max ratios
     min_ratio = float('inf')
     max_ratio = float('-inf')
     
@@ -527,55 +525,46 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
         for layer in state_layers:
             layer_idx = all_layer_names.index(layer['name'])
             
-            # Compute RMS activation
             act_mean = layer['activation_mean']
             act_std = layer['activation_std']
             activation_rms = np.sqrt(act_mean**2 + act_std**2) + 1e-8
             
             gradient = layer['gradient_norm'] + 1e-8
             
-            # Gradient-to-activation ratio (log scale)
             ratio = gradient / activation_rms
             log_ratio = np.log10(ratio)
             heatmap_data[layer_idx, state_idx] = log_ratio
             
-            # Track extremes
             min_ratio = min(min_ratio, log_ratio)
             max_ratio = max(max_ratio, log_ratio)
     
     print(f"   Heatmap range: log10(ratio) in [{min_ratio:.2f}, {max_ratio:.2f}]")
-    print(f"   Mapping: <-3 = Critical, -3 to -2 = Vanishing, >-2 = Healthy")
     
-    # Plot heatmap with optimized figure size
+    # Plot heatmap
     num_layers = len(all_layer_names)
-    fig_height = max(8, num_layers * 0.3)  # Tighter spacing
+    fig_height = max(8, num_layers * 0.3)
     fig, ax = plt.subplots(figsize=(8, fig_height))
     
-    # Custom colormap: red (vanishing) → yellow (borderline) → green (healthy)
     from matplotlib.colors import LinearSegmentedColormap
     colors = ['#d73027', '#fc8d59', '#fee090', '#e0f3f8', '#91bfdb', '#4575b4']
     n_bins = 100
     cmap = LinearSegmentedColormap.from_list('gradient_flow', colors, N=n_bins)
     
-    # Dynamic vmin/vmax based on actual data
     vmin = max(-4, min_ratio - 0.5)
     vmax = min(1, max_ratio + 0.5)
     
-    print(f"   Colormap range: [{vmin:.2f}, {vmax:.2f}]")
-    
     im = ax.imshow(heatmap_data, cmap=cmap, aspect='auto', vmin=vmin, vmax=vmax, interpolation='nearest')
     
-    # Add text annotations (Windows-compatible symbols)
+    # Add text annotations
     for i in range(len(all_layer_names)):
         for j in range(3):
             value = heatmap_data[i, j]
             
-            # Determine severity (simplified symbols)
-            if value < -3:  # ratio < 0.001
+            if value < -3:
                 symbol = 'X'
                 color = 'white'
                 bgcolor = '#d73027'
-            elif value < -2:  # ratio < 0.01
+            elif value < -2:
                 symbol = '!'
                 color = 'black'
                 bgcolor = '#fee090'
@@ -601,14 +590,11 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
     ax.set_title('Gradient Flow Heatmap (Gradient/Activation Ratio, log10)', 
                 fontsize=14, fontweight='bold')
     
-    # Colorbar with compact layout
     cbar = plt.colorbar(im, ax=ax, label='log10(Grad/Act)', pad=0.01, fraction=0.046)
     
-    # Add threshold reference lines on colorbar
     cbar.ax.axhline(-3, color='white', linewidth=1.5, linestyle='--', alpha=0.8)
     cbar.ax.axhline(-2, color='white', linewidth=1.5, linestyle='--', alpha=0.8)
     
-    # Add threshold labels INSIDE the colorbar
     cbar.ax.text(0.5, -3, ' Critical', fontsize=7, color='white', 
                 va='center', ha='left', weight='bold')
     cbar.ax.text(0.5, -2, ' Vanish', fontsize=7, color='white', 
@@ -616,7 +602,6 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
     cbar.ax.text(0.5, -1, ' Healthy', fontsize=7, color='white', 
                 va='center', ha='left', weight='bold')
     
-    # Compact legend below the plot
     from matplotlib.patches import Patch
     legend_elements = [
         Patch(facecolor='#d73027', edgecolor='black', label='X: Critical (<0.001)'),
@@ -627,7 +612,7 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
              fontsize=8, framealpha=0.9, ncol=3)
     
     plt.tight_layout()
-    plt.subplots_adjust(bottom=0.08)  # Make room for legend
+    plt.subplots_adjust(bottom=0.08)
     plt.savefig(os.path.join(output_dir, 'bottleneck_gradient_heatmap.png'), 
                dpi=150, bbox_inches='tight', pad_inches=0.1)
     plt.close()
@@ -656,37 +641,7 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
     if not high_severity and not medium_severity:
         print("\n[OK] No critical bottlenecks detected!")
     
-    # ==================== CROSS-STATE CONSISTENCY ANALYSIS ====================
-    print("\n" + "="*80)
-    print("=== CROSS-STATE CONSISTENCY ===")
-    print("="*80)
-    
-    # Find layers that are ALWAYS problematic (across all 3 states)
-    layer_issue_count = {}
-    for b in bottleneck_report:
-        key = f"{b['section']}:{b['layer']}"
-        if key not in layer_issue_count:
-            layer_issue_count[key] = []
-        layer_issue_count[key].append(b['state'])
-    
-    persistent_bottlenecks = {k: v for k, v in layer_issue_count.items() if len(v) == 3}
-    inconsistent_bottlenecks = {k: v for k, v in layer_issue_count.items() if 0 < len(v) < 3}
-    
-    if persistent_bottlenecks:
-        print(f"\n[!] PERSISTENT BOTTLENECKS (all 3 states):")
-        for layer_key in persistent_bottlenecks:
-            section, layer_name = layer_key.split(':')
-            print(f"   {section.upper()}: {layer_name}")
-        print("\n[TIP] These layers need architectural changes!")
-    
-    if inconsistent_bottlenecks:
-        print(f"\n[~] INCONSISTENT BOTTLENECKS (1-2 states only):")
-        for layer_key, states in inconsistent_bottlenecks.items():
-            section, layer_name = layer_key.split(':')
-            print(f"   {section.upper()}: {layer_name} (states: {states})")
-        print("\n[TIP] These may be state-dependent issues (check input diversity)")
-    
-    # ==================== SAVE CSV REPORT ====================
+    # Save CSV
     bottleneck_csv_path = os.path.join(output_dir, 'bottleneck_report.csv')
     if bottleneck_report:
         with open(bottleneck_csv_path, 'w', newline='', encoding='utf-8') as f:
@@ -703,18 +658,16 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
 
 def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     """
-    🌊 GRADIENT FLOW DETAILED ANALYSIS - FIXED RMS VERSION
+    🌊 GRADIENT FLOW DETAILED ANALYSIS - RMS VERSION WITH ATTENTION
     - Per-layer gradient magnitude (RMS-based)
     - Gradient vanishing/explosion detection
     - Gradient-to-weight ratio analysis
     - Layer-wise gradient statistics
     
-    ✅ CHANGES:
-    - Uses RMS for activations (sqrt(mean^2 + std^2)) instead of just mean
-    - More accurate for LayerNorm'ed layers
+    ✅ UPDATED: Multi-Query Cross-Attention support
     """
     print("\n" + "="*80)
-    print("🌊 GRADIENT FLOW DETAILED ANALYSIS (RMS)")
+    print("🌊 GRADIENT FLOW DETAILED ANALYSIS (RMS + ATTENTION)")
     print("="*80)
     
     policy = model.policy
@@ -744,32 +697,19 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             x = image
             x = features_extractor.conv1(x)
             x = features_extractor.bn1(x)
-            x = torch.nn.functional.gelu(x)
+            x = torch.nn.functional.silu(x)
             
             x = features_extractor.conv2(x)
             x = features_extractor.bn2(x)
             x = features_extractor.dropout2(x)
-            x = torch.nn.functional.gelu(x)
+            x = torch.nn.functional.silu(x)
             
-            if getattr(features_extractor, "has_conv3", False):
-                identity = features_extractor.residual_proj(x)
-                
-                x_local = features_extractor.conv3_local(x)
-                x_local = features_extractor.bn3_local(x_local)
-                
-                x_global = features_extractor.conv3_global(x)
-                x_global = features_extractor.bn3_global(x_global)
-                
-                x_combined = torch.cat([x_local, x_global], dim=1)
-                x_combined = features_extractor.dropout3(x_combined)
-                x_combined = torch.nn.functional.gelu(x_combined)
-                x = x_combined + identity  # Residual
+            x = features_extractor.maxpool(x)
+            x = features_extractor.pos_encoding(x)
             
-            cnn_raw = features_extractor.flatten(x)
-            cnn_raw = cnn_raw.float()
-            cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
+            spatial_features = x.flatten(2).transpose(1, 2)
             
-            # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
+            # Scalars
             scalars = torch.cat([
                 obs_tensor['direction'],
                 obs_tensor['dx_head'],
@@ -781,13 +721,21 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             ], dim=-1)
             
             scalars = features_extractor.scalar_input_dropout(scalars)
-            scalar_features = features_extractor.scalar_linear(scalars)
+            scalar_features = features_extractor.scalar_network(scalars)
             
-            # Fusion
-            combined = torch.cat([cnn_features, scalar_features], dim=-1)
-            features_final = features_extractor.final_linear(combined)
+            # ==================== PATH 1: ATTENTION ====================
+            normalized_features = features_extractor.cnn_prenorm(spatial_features)
+            attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
             
-            # LSTM - standardowa inicjalizacja stanów
+            # ==================== PATH 2: SKIP CONNECTION ====================
+            spatial_features_flat = spatial_features.flatten(1)
+            direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+            
+            # ==================== FUSION - THREE STREAMS ====================
+            fused = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)
+            features_final = features_extractor.fusion(fused)
+            
+            # LSTM
             batch_size = features_final.shape[0]
             num_layers = policy.lstm_actor.num_layers
             hidden_size = policy.lstm_actor.hidden_size
@@ -848,7 +796,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     layer_names = list(layer_gradient_stats.keys())
     avg_gradient_norms = []
     std_gradient_norms = []
-    avg_activations_rms = []  # ✅ RMS zamiast mean
+    avg_activations_rms = []
     gradient_to_activation_ratios = []
     
     for layer_name in layer_names:
@@ -889,13 +837,12 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     ax.set_xticklabels(layer_names, rotation=45, ha='right', fontsize=8)
     ax.grid(axis='y', alpha=0.3)
     
-    # Show max gradient value
     max_grad = max(avg_gradient_norms)
     ax.text(0.02, 0.98, f'Grad max: {max_grad:.4f}', 
            transform=ax.transAxes, fontsize=9, va='top',
            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
-    # Highlight vanishing gradients (< 0.01)
+    # Highlight vanishing gradients
     for i, (layer_name, avg_grad) in enumerate(zip(layer_names, avg_gradient_norms)):
         if avg_grad < 0.01:
             ax.text(i, avg_grad + max_grad*0.02, '⚠️', ha='center', fontsize=10, color='red')
@@ -917,9 +864,8 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     ax.grid(axis='y', alpha=0.3)
     ax.set_yscale('log')
     
-    # Add max ratio annotation
     max_ratio = max(gradient_to_activation_ratios)
-    ax.text(0.02, 0.98, f'Grad max: {max_ratio:.4f}', 
+    ax.text(0.02, 0.98, f'Ratio max: {max_ratio:.4f}', 
            transform=ax.transAxes, fontsize=9, va='top',
            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
@@ -938,7 +884,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     ax = axes[1, 1]
     
     # Select key layers for boxplot
-    key_layers = ['GELU-1', 'GELU-2', 'GELU-3', 'Bottleneck', 'Fusion', 'LSTM']
+    key_layers = ['SiLU-1', 'SiLU-2', 'CrossAttention', 'AttendedProjection', 'Fusion', 'LSTM']
     
     boxplot_data = []
     boxplot_labels = []
@@ -954,7 +900,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             patch.set_alpha(0.7)
         
         ax.set_ylabel('Gradient Norm Distribution')
-        ax.set_title('Gradient Distribution (Key Layers)')
+        ax.set_title('Gradient Distribution (Key Layers + Attention)')
         ax.grid(axis='y', alpha=0.3)
         ax.tick_params(axis='x', rotation=45)
     
@@ -988,7 +934,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
                 layer_gradient_stats[layer_name]['type'],
                 f"{avg_gradient_norms[i]:.6f}",
                 f"{std_gradient_norms[i]:.6f}",
-                f"{avg_activations_rms[i]:.6f}",  # ✅ RMS
+                f"{avg_activations_rms[i]:.6f}",
                 f"{ratio:.6f}",
                 status
             ])

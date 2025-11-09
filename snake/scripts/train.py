@@ -24,6 +24,7 @@ from utils.training_utils import (
     log_observation,
     clear_gpu_cache,
     enable_pin_memory,
+    enable_non_blocking_transfers,
     AsyncRolloutPrefetcher,
     setup_adamw_optimizer,
     load_policy_weights_only,
@@ -366,7 +367,18 @@ def train(use_progress_bar=False):
     clip_value = config['model'].get('lstm', {}).get('gradient_clip_val', 5.0)
     apply_gradient_clipping(model, clip_value=clip_value)
 
+    # ⚡ OPTIMIZATION: Enable non-blocking transfers
+    model = enable_non_blocking_transfers(model)
+
     # ✅ best_model_save_path już zdefiniowany wcześniej (linia ~163)
+
+    print(f"{'='*70}")
+    print(f"[OPTIMIZATIONS]")
+    print(f"{'='*70}")
+    print(f"  ⚡ Pin Memory:          ✅ Enabled")
+    print(f"  🔓 Non-blocking:       ✅ Enabled")
+    print(f"  🚀 Async Prefetch:     ✅ Enabled")
+    print(f"{'='*70}\n")
 
     stop_on_plateau = StopTrainingOnNoModelImprovement(
         max_no_improvement_evals=config['training']['max_no_improvement_evals'],

@@ -70,7 +70,7 @@ model:
   gae_lambda: 0.97                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
   ent_coef: 0.05                     # Współczynnik entropii (początkowy)
-  min_ent_coef: 0.01                 # Minimalny współczynnik entropii (docelowy)
+  min_ent_coef: 0.03                 # Minimalny współczynnik entropii (docelowy)
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
 
@@ -89,32 +89,37 @@ model:
     dropout: 0.0                    # Dropout w LSTM
   
   # Selektywne dropouty
-  cnn_dropout: 0.03                 
-  scalar_dropout: 0.04               # Dropout dla skalarów (wyższy - mniej skalarów)
+  cnn_dropout: 0.01                 
+  scalar_dropout: 0.1                # Dropout dla skalarów (wyższy - mniej skalarów)
   scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
-  fusion_dropout: 0.05               # Dropout po fusion (regularyzacja przed LSTM)              
+  fusion_dropout: 0.1                # Dropout po fusion (regularyzacja przed LSTM)              
   
   # CNN ARCHITECTURE
   convlstm:
-    cnn_channels: [32, 64]           # Kanały CNN
+    cnn_channels: [24, 48]           # Kanały CNN (raw: 48×6×6=1,728 features)
     
-    # Bottleneck
-    cnn_bottleneck_dims: []
-    cnn_output_dim: 819              # 80% z 1024 (pre-fusion)
+    # ✨ PROJECTION LAYERS - konfigurowalne wymiary przed fusion
+    attended_cnn_dim: 448            # Attended CNN output
+    direct_cnn_dim: 128              # ← Skip connection size (ZMNIEJSZONE z 256!)
     
     # Scalar Network Architecture  
-    scalar_hidden_dims: [256, 205]   # 20% z 1024 (pre-fusion) → 205
+    scalar_hidden_dims: [128, 256]   # Scalars output 
+    
+    # Multi-Query Attention Configuration
+    attention_heads: 4               # 6 heads (head_dim=8) - bardziej wyspecjalizowane
+    num_queries: 6                   # 4 queries: diverse spatial reasoning
     
     # Architecture Options
     use_layernorm: true              # Global switch
+    use_positional_encoding: true    # Enable/disable pos encoding
 
   policy_kwargs:
     features_extractor_kwargs:
       features_dim: 512              # Wymiar cech wyjściowych ekstraktora (fusion output)
     net_arch:
       pi: [512, 256]               
-      vf: [512, 512, 256]               
-    lstm_hidden_size: 600            # Rozmiar ukryty LSTM
+      vf: [512, 256]               
+    lstm_hidden_size: 512            # Rozmiar ukryty LSTM
     n_lstm_layers: 1                 # Liczba warstw LSTM
     enable_critic_lstm: true         # LSTM dla krytyka
 

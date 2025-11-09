@@ -61,14 +61,20 @@ features_extractor = policy.features_extractor
 
 print(f"\n=== Informacje o modelu ===")
 print(f"CNN channels: {config['model']['convlstm']['cnn_channels']}")
-print(f"Bottleneck dims: {config['model']['convlstm'].get('cnn_bottleneck_dims', 'N/A')}")
-print(f"CNN output dim: {config['model']['convlstm'].get('cnn_output_dim', 'N/A')}")
+print(f"Attended CNN dim: {config['model']['convlstm'].get('attended_cnn_dim', 448)}")
+print(f"Direct CNN dim (skip connection): {config['model']['convlstm'].get('direct_cnn_dim', 256)} ✨ NEW!")
 print(f"Scalar hidden dims: {config['model']['convlstm']['scalar_hidden_dims']}")
 print(f"Features dim: {config['model']['policy_kwargs']['features_extractor_kwargs']['features_dim']}")
 print(f"LSTM hidden size: {config['model']['policy_kwargs']['lstm_hidden_size']}")
 print(f"LSTM layers: {config['model']['policy_kwargs']['n_lstm_layers']}")
 print(f"Actor network: {config['model']['policy_kwargs']['net_arch']['pi']}")
 print(f"Critic network: {config['model']['policy_kwargs']['net_arch']['vf']}")
+
+print(f"\n✨ FIXED CNN ARCHITECTURE:")
+print(f"  ├─ PATH 1 (Attention): CNN → PreNorm → MultiQueryAttention → {config['model']['convlstm'].get('attended_cnn_dim', 448)} dim (46.7%)")
+print(f"  └─ PATH 2 (Skip Connection): CNN → Direct projection → {config['model']['convlstm'].get('direct_cnn_dim', 256)} dim (26.7%) ✨ NEW!")
+print(f"     Scalars → {config['model']['convlstm']['scalar_hidden_dims'][-1]} dim (26.7%)")
+print(f"  Total fusion input: {config['model']['convlstm'].get('attended_cnn_dim', 448) + config['model']['convlstm'].get('direct_cnn_dim', 256) + config['model']['convlstm']['scalar_hidden_dims'][-1]} dim")
 
 # Przygotuj środowisko
 env = make_env(render_mode=None, grid_size=16)()
@@ -174,11 +180,13 @@ print("=== KLUCZOWE WYNIKI ===")
 print("="*80)
 
 print("\n📊 BASIC ANALYSIS:")
+print("   - cnn_paths_comparison_state_*.png: Porównanie obu ścieżek CNN")
 print("   - neuron_activations_overview.png: RMS aktywacji CNN vs Scalars")
 print("   - attention_heatmaps/: gdzie model skupia uwagę")
 print("   - viewports/: wizualizacja stanów gry")
 
 print("\n🔍 CNN LAYERS:")
+print("   - cnn_paths_comparison.png: ✨ Porównanie Attention vs Skip Connection")
 print("   - channel_specialization.png: aktywne vs martwe kanały")
 print("   - activation_saturation.png: saturacja GELU")
 print("   - conv_visualizations/: filtry CNN dla każdej warstwy")

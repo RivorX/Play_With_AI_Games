@@ -1,10 +1,10 @@
 """
-🔍 BASIC ANALYSIS MODULE
+🔍 BASIC ANALYSIS MODULE - UPDATED FOR MULTI-QUERY CROSS-ATTENTION
 - analyze_basic_states: Analiza podstawowych stanów, aktywacje, attention heatmaps
-- visualize_cnn_output: Wizualizacja warstw CNN (Conv1, Conv2, Conv3)
-- visualize_viewport: Wizualizacja viewport 16x16
-- generate_attention_heatmap: Generowanie attention heatmap
-✅ UPDATED: RMS metrics zamiast mean (pokazuje prawdziwą siłę CNN)
+- visualize_cnn_output: Wizualizacja warstw CNN + Attention weights
+- visualize_viewport: Wizualizacja viewport 12x12
+- generate_attention_heatmap: Generowanie attention heatmap (IMPROVED: shows query patterns)
+✅ UPDATED: Multi-Query Attention support + Query-specific analysis
 """
 
 import os
@@ -17,7 +17,7 @@ from matplotlib.patches import Patch
 def analyze_basic_states(model, env, output_dirs, action_names, config):
     """
     Analiza podstawowych stanów: aktywacje, attention heatmaps, gradienty
-    🆕 UPDATED: Pure Bottleneck (NO Skip) + RMS metrics
+    🆕 UPDATED: Multi-Query Cross-Attention + Positional Encoding
     """
     policy = model.policy
     features_extractor = policy.features_extractor
@@ -52,38 +52,27 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             if image.dim() == 4 and image.shape[-1] == 1:
                 image = image.permute(0, 3, 1, 2)
             
-            # CNN - Multi-Scale Architecture
+            # CNN - 5×5 kernels with MaxPool
             x = image
             x = features_extractor.conv1(x)
             x = features_extractor.bn1(x)
-            x = torch.nn.functional.gelu(x)
+            x = torch.nn.functional.silu(x)
             
             x = features_extractor.conv2(x)
             x = features_extractor.bn2(x)
             x = features_extractor.dropout2(x)
-            x = torch.nn.functional.gelu(x)
+            x = torch.nn.functional.silu(x)
             
-            if getattr(features_extractor, "has_conv3", False):
-                identity = features_extractor.residual_proj(x)
-                
-                x_local = features_extractor.conv3_local(x)
-                x_local = features_extractor.bn3_local(x_local)
-                
-                x_global = features_extractor.conv3_global(x)
-                x_global = features_extractor.bn3_global(x_global)
-                
-                x_combined = torch.cat([x_local, x_global], dim=1)
-                x_combined = features_extractor.dropout3(x_combined)
-                x_combined = torch.nn.functional.gelu(x_combined)
-                x = x_combined + identity  # Residual
+            # Explicit MaxPool
+            x = features_extractor.maxpool(x)
             
-            cnn_raw = features_extractor.flatten(x)
-            cnn_raw = cnn_raw.float()
+            # 🆕 POSITIONAL ENCODING
+            x = features_extractor.pos_encoding(x)
             
-            # Bottleneck
-            cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
+            # Flatten spatial features for attention
+            spatial_features = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
             
-            # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
+            # Scalars
             scalars = torch.cat([
                 obs_tensor['direction'],
                 obs_tensor['dx_head'],
@@ -95,15 +84,23 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             ], dim=-1)
             
             scalars = features_extractor.scalar_input_dropout(scalars)
-            scalar_features = features_extractor.scalar_linear(scalars)
+            scalar_features = features_extractor.scalar_network(scalars)
             
-            # Fusion
-            combined = torch.cat([cnn_features, scalar_features], dim=-1)
-            features_final = features_extractor.final_linear(combined)
+            # ==================== PATH 1: ATTENTION ====================
+            # 🔥 FIX: Normalize BEFORE attention
+            normalized_features = features_extractor.cnn_prenorm(spatial_features)
+            attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
             
-            # LSTM - inicjalizacja stanów jeśli potrzeba
+            # ==================== PATH 2: SKIP CONNECTION ====================
+            spatial_features_flat = spatial_features.flatten(1)
+            direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+            
+            # ==================== FUSION - THREE STREAMS ====================
+            fused = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)
+            features_final = features_extractor.fusion(fused)
+            
+            # LSTM
             if lstm_states is None:
-                # Standard PyTorch LSTM: (num_layers, batch_size, hidden_size)
                 batch_size = features_final.shape[0]
                 num_layers = policy.lstm_actor.num_layers
                 hidden_size = policy.lstm_actor.hidden_size
@@ -146,18 +143,22 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             'value': value.item()
         })
         
-        # ✅ Better metrics: RMS (Root Mean Square) pokazuje siłę sygnału
-        cnn_np = cnn_features[0].cpu().numpy()
+        # ✅ Better metrics: RMS (Root Mean Square)
+        attended_np = attended_cnn[0].cpu().numpy()
+        direct_np = direct_cnn[0].cpu().numpy()  # ✨ NEW!
         scalar_np = scalar_features[0].cpu().numpy()
         features_np = features_final[0].cpu().numpy()
         lstm_np = latent_pi[0].cpu().numpy()
         
         detailed_activations.append({
             'state': state_idx,
-            # RMS = sqrt(mean(x^2)) - pokazuje siłę aktywacji niezależnie od znaku
-            'cnn_rms': np.sqrt(np.mean(cnn_np**2)),
-            'cnn_absmax': np.abs(cnn_np).max(),
-            'cnn_active_ratio': (np.abs(cnn_np) > 0.01).mean(),  # % aktywnych neuronów
+            # RMS = sqrt(mean(x^2))
+            'attended_rms': np.sqrt(np.mean(attended_np**2)),
+            'attended_absmax': np.abs(attended_np).max(),
+            'attended_active_ratio': (np.abs(attended_np) > 0.01).mean(),
+            'direct_rms': np.sqrt(np.mean(direct_np**2)),        # ✨ NEW!
+            'direct_absmax': np.abs(direct_np).max(),            # ✨ NEW!
+            'direct_active_ratio': (np.abs(direct_np) > 0.01).mean(),  # ✨ NEW!
             'scalar_rms': np.sqrt(np.mean(scalar_np**2)),
             'scalar_absmax': np.abs(scalar_np).max(),
             'scalar_active_ratio': (np.abs(scalar_np) > 0.01).mean(),
@@ -167,7 +168,7 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             'lstm_cell_rms': np.sqrt(np.mean(lstm_states[1][0]**2)),
         })
         
-        # Wizualizacja CNN output
+        # Wizualizacja CNN output + Attention
         visualize_cnn_output(obs_tensor, features_extractor, output_dirs['conv_viz'], state_idx)
         
         # Wizualizacja viewport
@@ -180,7 +181,7 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
         )
         layer_gradients.append(state_layer_grads)
         
-        # Generate attention heatmap
+        # Generate attention heatmap (🆕 IMPROVED: shows query patterns)
         attention_map = generate_attention_heatmap(
             model, obs, obs_tensor, lstm_states, action.item(),
             output_dirs['heatmap'], state_idx, action_names
@@ -196,7 +197,7 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
 def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, output_dir, state_idx, action_names):
     """
     Generuje attention heatmap używając gradientów
-    🆕 UPDATED: Pure Bottleneck (NO Skip)
+    🆕 UPDATED: Multi-Query Cross-Attention visualization
     """
     policy = model.policy
     features_extractor = policy.features_extractor
@@ -221,43 +222,23 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     
     image_grad.retain_grad()
     
-    # 🆕 CNN - Multi-Scale Architecture
+    # CNN
     x = image_grad
-
-    # Layer 1
     x = features_extractor.conv1(x)
     x = features_extractor.bn1(x)
-    x = torch.nn.functional.gelu(x)
-
-    # Layer 2
+    x = torch.nn.functional.silu(x)
+    
     x = features_extractor.conv2(x)
     x = features_extractor.bn2(x)
     x = features_extractor.dropout2(x)
-    x = torch.nn.functional.gelu(x)
-
-    # Layer 3 - MULTI-SCALE (opcjonalna)
-    if getattr(features_extractor, "has_conv3", False):
-        identity = features_extractor.residual_proj(x)
-        
-        x_local = features_extractor.conv3_local(x)
-        x_local = features_extractor.bn3_local(x_local)
-        
-        x_global = features_extractor.conv3_global(x)
-        x_global = features_extractor.bn3_global(x_global)
-        
-        x_combined = torch.cat([x_local, x_global], dim=1)
-        x_combined = features_extractor.dropout3(x_combined)
-        x_combined = torch.nn.functional.gelu(x_combined)
-        x = x_combined + identity  # Residual
-
-    # Flatten
-    cnn_raw = features_extractor.flatten(x)
-    cnn_raw = cnn_raw.float()
-
-    # 🆕 BOTTLENECK
-    cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
+    x = torch.nn.functional.silu(x)
     
-    # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
+    x = features_extractor.maxpool(x)
+    x = features_extractor.pos_encoding(x)
+    
+    spatial_features = x.flatten(2).transpose(1, 2)
+    
+    # Scalars
     scalars_grad = torch.cat([
         obs_grad['direction'],
         obs_grad['dx_head'],
@@ -269,11 +250,28 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     ], dim=-1)
     
     scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
-    scalar_features = features_extractor.scalar_linear(scalars_grad)
+    scalar_features = features_extractor.scalar_network(scalars_grad)
     
-    # Fusion
-    combined = torch.cat([cnn_features, scalar_features], dim=-1)
-    features_final = features_extractor.final_linear(combined)
+    # ==================== PATH 1: ATTENTION with gradient tracking ====================
+    # 🔥 FIX: Normalize BEFORE attention
+    normalized_features = features_extractor.cnn_prenorm(spatial_features)
+    normalized_features.retain_grad()
+    
+    attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
+    attended_cnn.retain_grad()
+    
+    # ==================== PATH 2: SKIP CONNECTION with gradient tracking ====================
+    spatial_features_flat = spatial_features.flatten(1)
+    spatial_features_flat.retain_grad()
+    
+    direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+    direct_cnn.retain_grad()
+    
+    # ==================== FUSION - THREE STREAMS ====================
+    fused = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)
+    fused.retain_grad()
+    features_final = features_extractor.fusion(fused)
+    features_final.retain_grad()
     
     # LSTM
     lstm_states_tensor = (
@@ -330,8 +328,12 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
 
 def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
     """
-    Wizualizuje output wszystkich warstw CNN
-    🆕 UPDATED: Multi-Scale Architecture with Local + Global paths
+    Wizualizuje output wszystkich warstw CNN + Attention + Skip Connection
+    🆕 UPDATED: Fixed CNN Architecture with Skip Connection (Direct CNN Path)
+    
+    Dwa główne ścieżki:
+    PATH 1 (Attention): CNN → Prenorm → Attention → 448 dim
+    PATH 2 (Skip): CNN → Direct projection → 256 dim ✨ NEW!
     """
     with torch.no_grad():
         image = obs_tensor['image']
@@ -343,50 +345,34 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
         # Conv1
         x = features_extractor.conv1(x)
         x = features_extractor.bn1(x)
-        x = torch.nn.functional.gelu(x)
+        x = torch.nn.functional.silu(x)
         conv1_output = x[0].cpu().numpy()
 
         # Conv2
         x = features_extractor.conv2(x)
         x = features_extractor.bn2(x)
         x = features_extractor.dropout2(x)
-        x = torch.nn.functional.gelu(x)
+        x = torch.nn.functional.silu(x)
         conv2_output = x[0].cpu().numpy()
+        
+        # MaxPool
+        x = features_extractor.maxpool(x)
+        
+        # Positional Encoding
+        x = features_extractor.pos_encoding(x)
+        pos_encoded_output = x[0].cpu().numpy()
 
         activations = {
             'conv1_output': conv1_output,
-            'conv2_output': conv2_output
+            'conv2_output': conv2_output,
+            'pos_encoded': pos_encoded_output
         }
+        
+        # Flatten for attention
+        spatial_features = x.flatten(2).transpose(1, 2)
+        spatial_features_flat = spatial_features.flatten(1)  # Raw CNN dla skip connection
 
-        # Conv3 (if exists)
-        if getattr(features_extractor, "has_conv3", False):
-            identity = features_extractor.residual_proj(x)
-
-            x_local = features_extractor.conv3_local(x)
-            x_local = features_extractor.bn3_local(x_local)
-
-            x_global = features_extractor.conv3_global(x)
-            x_global = features_extractor.bn3_global(x_global)
-
-            x_combined = torch.cat([x_local, x_global], dim=1)
-            x_combined = features_extractor.dropout3(x_combined)
-            x_combined = torch.nn.functional.gelu(x_combined)
-
-            x = x_combined + identity  # Residual
-
-            activations['conv3_output'] = x[0].cpu().numpy()
-            activations['conv3_local'] = x_local[0].cpu().numpy()
-            activations['conv3_global'] = x_global[0].cpu().numpy()
-
-        # Flatten + Bottleneck
-        cnn_raw = features_extractor.flatten(x)
-        cnn_raw = cnn_raw.float()
-        cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
-
-        activations['cnn_raw'] = cnn_raw[0].cpu().numpy()
-        activations['bottleneck'] = cnn_features[0].cpu().numpy()
-
-        # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
+        # Scalars
         scalars = torch.cat([
             obs_tensor['direction'],
             obs_tensor['dx_head'],
@@ -397,32 +383,29 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
             obs_tensor['snake_length']
         ], dim=-1)
         scalars = features_extractor.scalar_input_dropout(scalars)
-        scalar_features = features_extractor.scalar_linear(scalars)
+        scalar_features = features_extractor.scalar_network(scalars)
         activations['scalar'] = scalar_features[0].cpu().numpy()
+        
+        # ==================== PATH 1: ATTENTION PATH ====================
+        normalized_features = features_extractor.cnn_prenorm(spatial_features)
+        attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
+        activations['attended_cnn'] = attended_cnn[0].cpu().numpy()
+        
+        # ==================== PATH 2: SKIP CONNECTION (DIRECT CNN) ====================
+        direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+        activations['direct_cnn'] = direct_cnn[0].cpu().numpy()
 
-        # Fusion
-        combined = torch.cat([cnn_features, scalar_features], dim=-1)
-        fusion = features_extractor.final_linear(combined)
+        # Fusion z oboma ścieżkami
+        fused = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)
+        fusion = features_extractor.fusion(fused)
         activations['fusion'] = fusion[0].cpu().numpy()
-
-        # LSTM (jeśli dostępny)
-        lstm_out = None
-        policy = getattr(features_extractor, 'policy', None)
-        if policy is not None and hasattr(policy, 'lstm_actor'):
-            lstm_states = (
-                torch.zeros((1, policy.lstm_actor.hidden_size), device=cnn_raw.device),
-                torch.zeros((1, policy.lstm_actor.hidden_size), device=cnn_raw.device)
-            )
-            features_seq = fusion.unsqueeze(1)
-            lstm_out, _ = policy.lstm_actor(features_seq, lstm_states)
-            activations['lstm'] = lstm_out.squeeze(1)[0].cpu().numpy()
 
     # ==================== WIZUALIZACJA ====================
 
     # 1. CONV1 OUTPUT
     visualize_conv_layer(
         activations['conv1_output'],
-        layer_name='Conv1 Output',
+        layer_name='Conv1 Output (5×5 kernel)',
         output_path=os.path.join(output_dir, f'cnn_conv1_state_{state_idx}.png'),
         num_channels=min(16, activations['conv1_output'].shape[0])
     )
@@ -430,55 +413,34 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
     # 2. CONV2 OUTPUT
     visualize_conv_layer(
         activations['conv2_output'],
-        layer_name='Conv2 Output',
+        layer_name='Conv2 Output (5×5 kernel)',
         output_path=os.path.join(output_dir, f'cnn_conv2_state_{state_idx}.png'),
         num_channels=min(16, activations['conv2_output'].shape[0])
     )
+    
+    # 3. POSITIONAL ENCODING
+    visualize_conv_layer(
+        activations['pos_encoded'],
+        layer_name='After Positional Encoding',
+        output_path=os.path.join(output_dir, f'cnn_pos_enc_state_{state_idx}.png'),
+        num_channels=min(16, activations['pos_encoded'].shape[0])
+    )
 
-    # 3. CONV3 - Multi-Scale Branches (jeśli istnieje)
-    if 'conv3_output' in activations:
-        visualize_conv_layer(
-            activations['conv3_output'],
-            layer_name='Conv3 Output (Local + Global + Residual)',
-            output_path=os.path.join(output_dir, f'cnn_conv3_state_{state_idx}.png'),
-            num_channels=min(16, activations['conv3_output'].shape[0])
-        )
-
-        # Conv3 Local branch
-        if 'conv3_local' in activations:
-            visualize_conv_layer(
-                activations['conv3_local'],
-                layer_name='Conv3 Local Branch',
-                output_path=os.path.join(output_dir, f'cnn_conv3_local_state_{state_idx}.png'),
-                num_channels=min(16, activations['conv3_local'].shape[0])
-            )
-
-        # Conv3 Global branch
-        if 'conv3_global' in activations:
-            visualize_conv_layer(
-                activations['conv3_global'],
-                layer_name='Conv3 Global Branch',
-                output_path=os.path.join(output_dir, f'cnn_conv3_global_state_{state_idx}.png'),
-                num_channels=min(16, activations['conv3_global'].shape[0])
-            )
-
-    # 4. RAW vs BOTTLENECK (1D features)
+    # 4. BOTH CNN PATHS COMPARISON (1D) - 🔥 NEW!
     visualize_1d_features(
         {
-            f'CNN Raw ({len(activations["cnn_raw"])})': activations['cnn_raw'],
-            f'Bottleneck ({len(activations["bottleneck"])})': activations['bottleneck']
+            f'Attended CNN via Attention (448 dim)': activations['attended_cnn'],
+            f'Direct CNN (Skip Connection) (256 dim) ✨': activations['direct_cnn']
         },
-        output_path=os.path.join(output_dir, f'cnn_bottleneck_state_{state_idx}.png'),
+        output_path=os.path.join(output_dir, f'cnn_paths_comparison_state_{state_idx}.png'),
         state_idx=state_idx
     )
 
-    # 5. FUSION, SCALAR, LSTM (1D features)
+    # 5. FUSION WITH ALL 3 STREAMS (1D features)
     fusion_dict = {
-        f'Scalar ({len(activations["scalar"])})': activations['scalar'],
-        f'Fusion ({len(activations["fusion"])})': activations['fusion']
+        f'Scalar features (256 dim)': activations['scalar'],
+        f'Fused output (512 dim)': activations['fusion']
     }
-    if 'lstm' in activations:
-        fusion_dict[f'LSTM ({len(activations["lstm"])})'] = activations['lstm']
     visualize_1d_features(
         fusion_dict,
         output_path=os.path.join(output_dir, f'fusions_state_{state_idx}.png'),
@@ -492,8 +454,7 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
         output_path=os.path.join(output_dir, f'cnn_conv2_all_channels_state_{state_idx}.png')
     )
 
-    layer_info = 'Multi-Scale 3-layer' if 'conv3_output' in activations else '2-layer'
-    print(f'  ✅ CNN+Fusion+Scalar+LSTM visualization ({layer_info}) zapisana dla stanu {state_idx}')
+    print(f'  ✅ CNN+Attention+Skip Connection visualization zapisana dla stanu {state_idx}')
 
 
 def visualize_conv_layer(activation, layer_name, output_path, num_channels=16):
@@ -520,7 +481,7 @@ def visualize_conv_layer(activation, layer_name, output_path, num_channels=16):
 
 def visualize_1d_features(features_dict, output_path, state_idx):
     """
-    Wizualizuje 1D features (bottleneck, residual, final output)
+    Wizualizuje 1D features (attention, projection, final output)
     jako heatmapy poziome
     """
     fig, axes = plt.subplots(len(features_dict), 1, figsize=(16, 6))
@@ -557,11 +518,10 @@ def visualize_1d_features(features_dict, output_path, state_idx):
 def visualize_all_channels_heatmap(activation, layer_name, output_path):
     """
     Wizualizuje WSZYSTKIE kanały jako heatmapę (channels x spatial)
-    Użyteczne dla Conv2: 64 channels x 8x8 = 64 rows x 64 cols
     """
     num_channels, height, width = activation.shape
     
-    # Flatten spatial dimensions: [64, 8, 8] → [64, 64]
+    # Flatten spatial dimensions
     activation_flat = activation.reshape(num_channels, -1)
     
     fig, ax = plt.subplots(figsize=(14, 10))
@@ -574,10 +534,9 @@ def visualize_all_channels_heatmap(activation, layer_name, output_path):
     
     plt.colorbar(im, ax=ax, label='Activation Value')
     
-    # Dodaj linie co 8 pikseli (dla 8x8 spatial)
-    if width == 8:
-        for i in range(1, height):
-            ax.axvline(i * width - 0.5, color='white', linewidth=0.5, alpha=0.3)
+    # Dodaj linie co width pikseli
+    for i in range(1, height):
+        ax.axvline(i * width - 0.5, color='white', linewidth=0.5, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
@@ -585,12 +544,12 @@ def visualize_all_channels_heatmap(activation, layer_name, output_path):
 
 
 def visualize_viewport(obs, output_dir, state_idx):
-    """Wizualizuje viewport 16x16"""
+    """Wizualizuje viewport 12x12"""
     viewport = obs['image'][:, :, 0]
     plt.figure(figsize=(8, 8))
     plt.imshow(viewport, cmap='viridis', interpolation='nearest')
     plt.colorbar(label='Wartość')
-    plt.title(f'Viewport 16x16 - Stan {state_idx}')
+    plt.title(f'Viewport 12x12 - Stan {state_idx}')
     
     legend_elements = [
         Patch(facecolor='purple', label='Ściana (-1.0)'),
@@ -615,30 +574,30 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     
     states = [0, 1, 2]
     
-    # 📊 SUBPLOT 1: RMS (Root Mean Square) - pokazuje siłę sygnału
-    cnn_rms = [d['cnn_rms'] for d in detailed_activations]
+    # 📊 SUBPLOT 1: RMS (Root Mean Square)
+    attended_rms = [d['attended_rms'] for d in detailed_activations]
     scalar_rms = [d['scalar_rms'] for d in detailed_activations]
     features_rms = [d['features_rms'] for d in detailed_activations]
     
     x = np.arange(len(states))
     width = 0.25
     
-    axes[0, 0].bar(x - width, cnn_rms, width, label='CNN RMS', color='#e74c3c')
+    axes[0, 0].bar(x - width, attended_rms, width, label='Attended CNN RMS', color='#e74c3c')
     axes[0, 0].bar(x, scalar_rms, width, label='Scalar RMS', color='#3498db')
     axes[0, 0].bar(x + width, features_rms, width, label='Fused RMS', color='#2ecc71')
     axes[0, 0].set_xlabel('Stan')
     axes[0, 0].set_ylabel('RMS Magnitude')
-    axes[0, 0].set_title('🔥 Siła Sygnału (RMS) - CNN vs Scalars')
+    axes[0, 0].set_title('🔥 Siła Sygnału (RMS) - Attended CNN vs Scalars')
     axes[0, 0].set_xticks(x)
     axes[0, 0].set_xticklabels([f'Stan {s}' for s in states])
     axes[0, 0].legend()
     axes[0, 0].grid(axis='y', alpha=0.3)
     
-    # 📊 SUBPLOT 2: Max Absolute Value (peak responses)
-    cnn_max = [d['cnn_absmax'] for d in detailed_activations]
+    # 📊 SUBPLOT 2: Max Absolute Value
+    attended_max = [d['attended_absmax'] for d in detailed_activations]
     scalar_max = [d['scalar_absmax'] for d in detailed_activations]
     
-    axes[0, 1].bar(x - width/2, cnn_max, width, label='CNN Max', color='#e74c3c')
+    axes[0, 1].bar(x - width/2, attended_max, width, label='Attended Max', color='#e74c3c')
     axes[0, 1].bar(x + width/2, scalar_max, width, label='Scalar Max', color='#3498db')
     axes[0, 1].set_xlabel('Stan')
     axes[0, 1].set_ylabel('Max |Activation|')
@@ -648,11 +607,11 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     axes[0, 1].legend()
     axes[0, 1].grid(axis='y', alpha=0.3)
     
-    # 📊 SUBPLOT 3: Active Neuron Ratio (% neurons > threshold)
-    cnn_active = [d['cnn_active_ratio'] * 100 for d in detailed_activations]
+    # 📊 SUBPLOT 3: Active Neuron Ratio
+    attended_active = [d['attended_active_ratio'] * 100 for d in detailed_activations]
     scalar_active = [d['scalar_active_ratio'] * 100 for d in detailed_activations]
     
-    axes[1, 0].bar(x - width/2, cnn_active, width, label='CNN Active %', color='#e74c3c')
+    axes[1, 0].bar(x - width/2, attended_active, width, label='Attended Active %', color='#e74c3c')
     axes[1, 0].bar(x + width/2, scalar_active, width, label='Scalar Active %', color='#3498db')
     axes[1, 0].set_xlabel('Stan')
     axes[1, 0].set_ylabel('Active Neurons (%)')
@@ -663,7 +622,7 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     axes[1, 0].grid(axis='y', alpha=0.3)
     axes[1, 0].set_ylim(0, 100)
     
-    # 📊 SUBPLOT 4: Action Probabilities (unchanged)
+    # 📊 SUBPLOT 4: Action Probabilities
     action_probs = [a['probs'] for a in action_probs_list]
     action_probs_np = np.array(action_probs)
     

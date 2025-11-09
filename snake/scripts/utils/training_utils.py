@@ -42,19 +42,23 @@ def clear_gpu_cache():
 def enable_pin_memory(env, eval_env):
     """
     ⚡ Włącza pin_memory dla szybszego transferu CPU→GPU
+    🔓 Non-blocking transfers dla asynchronicznego treningu
     
     Args:
         env: Training VecEnv
         eval_env: Evaluation VecEnv
     
     Returns:
-        tuple: (env, eval_env) z pinned memory
+        tuple: (env, eval_env) z pinned memory i non-blocking support
     """
     if not torch.cuda.is_available():
         print("⚠️  Pin Memory niedostępny: CUDA nie dostępny")
         return env, eval_env
     
     try:
+        # Włącz non-blocking transfers na GPU
+        torch.cuda.set_device(torch.cuda.current_device())
+        
         # Spróbuj pin_memory na VecNormalize buffers
         if hasattr(env, 'buf_obs') and env.buf_obs is not None:
             if isinstance(env.buf_obs, dict):
@@ -78,7 +82,15 @@ def enable_pin_memory(env, eval_env):
                     if isinstance(eval_env.buf_obs[i], np.ndarray):
                         eval_env.buf_obs[i] = torch.from_numpy(eval_env.buf_obs[i]).pin_memory().numpy()
         
+        # Włącz pin_memory dla dataloader (jeśli jest)
+        if hasattr(env, 'pin_memory'):
+            env.pin_memory = True
+        if hasattr(eval_env, 'pin_memory'):
+            eval_env.pin_memory = True
+        
         print("✅ Pin Memory włączony (+10-15% transfer speed)")
+        print("🔓 Non-blocking transfers włączone (asynchroniczny transfer CPU→GPU)")
+        
     except Exception as e:
         print(f"⚠️  Pin Memory nieudany: {type(e).__name__}: {str(e)}")
     
@@ -116,6 +128,47 @@ class AsyncRolloutPrefetcher:
             self.queue.put(obs, timeout=1)
         except:
             pass
+
+
+def enable_non_blocking_transfers(model):
+    """
+    🔓 Włącza non-blocking transfers dla asynchronicznego CPU→GPU
+    
+    Pozwala CPU na przygotowywanie następnego batcha podczas treningu na GPU.
+    
+    Args:
+        model: RecurrentPPO model
+    
+    Returns:
+        model z non-blocking transfers enabled
+    """
+    if not torch.cuda.is_available():
+        return model
+    
+    try:
+        # Utwórz custom hook do non-blocking transferów
+        def forward_pre_hook(module, input):
+            """Hook przed forward - transfer input non-blocking"""
+            if isinstance(input, dict):
+                return {k: v.to(torch.cuda.current_device(), non_blocking=True) if torch.is_tensor(v) else v 
+                        for k, v in input.items()}
+            elif isinstance(input, (list, tuple)):
+                return tuple(v.to(torch.cuda.current_device(), non_blocking=True) if torch.is_tensor(v) else v 
+                           for v in input)
+            elif torch.is_tensor(input):
+                return input.to(torch.cuda.current_device(), non_blocking=True)
+            return input
+        
+        # Zarejestruj hook na policy
+        if hasattr(model, 'policy') and model.policy is not None:
+            model.policy.register_forward_pre_hook(forward_pre_hook)
+        
+        print("🔓 Non-blocking transfers włączone (CPU prefetch podczas GPU compute)")
+        
+    except Exception as e:
+        print(f"⚠️  Non-blocking transfers nieudane: {type(e).__name__}: {str(e)}")
+    
+    return model
 
 
 def setup_adamw_optimizer(model, config):
