@@ -20,6 +20,7 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     """
     🔍 KOMPLEKSOWA ANALIZA WARSTW CNN
     Łączy: specialization + saturation + visualizations
+    ✅ FIXED: Obsługuje tryb z i bez scalarów
     """
     print("\n" + "="*80)
     print("🔍 CNN LAYERS COMPREHENSIVE ANALYSIS")
@@ -27,6 +28,9 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     
     policy = model.policy
     features_extractor = policy.features_extractor
+    
+    # 🎯 DETECT SCALARS MODE
+    scalars_enabled = features_extractor.scalars_enabled
     
     # Utwórz podkatalogi
     viz_dir = os.path.join(output_dir, 'visualizations')
@@ -280,7 +284,7 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     print(f"✅ Saturation summary saved")
     
     # ==================== ✨ [NEW] TWO CNN PATHS ANALYSIS ====================
-    print("\n✨ Analyzing TWO CNN paths (Attention vs Skip Connection)...")
+    print("\n✨ Analyzing CNN paths...")
     
     attended_cnn_activations = []
     direct_cnn_activations = []
@@ -313,7 +317,7 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
             if image.dim() == 4 and image.shape[-1] == 1:
                 image = image.permute(0, 3, 1, 2)
             
-            # Forward pass to get both CNN paths
+            # Forward pass to get CNN paths
             x = image
             x = features_extractor.conv1(x)
             x = features_extractor.bn1(x)
@@ -327,106 +331,159 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
             x = features_extractor.maxpool(x)
             x = features_extractor.pos_encoding(x)
             
-            # PATH 1: Attention
             spatial_features = x.flatten(2).transpose(1, 2)
-            normalized = features_extractor.cnn_prenorm(spatial_features)
+            spatial_features_flat = spatial_features.flatten(1)
             
-            scalars = torch.cat([
-                obs_tensor['direction'],
-                obs_tensor['dx_head'],
-                obs_tensor['dy_head'],
-                obs_tensor['front_coll'],
-                obs_tensor['left_coll'],
-                obs_tensor['right_coll'],
-                obs_tensor['snake_length']
-            ], dim=-1)
-            scalars = features_extractor.scalar_input_dropout(scalars)
-            scalar_features = features_extractor.scalar_network(scalars)
+            # PATH 1: Attention (only if scalars enabled)
+            if scalars_enabled and features_extractor.scalar_network is not None:
+                normalized = features_extractor.cnn_prenorm(spatial_features)
+                
+                scalars = torch.cat([
+                    obs_tensor['direction'],
+                    obs_tensor['dx_head'],
+                    obs_tensor['dy_head'],
+                    obs_tensor['front_coll'],
+                    obs_tensor['left_coll'],
+                    obs_tensor['right_coll'],
+                    obs_tensor['snake_length']
+                ], dim=-1)
+                scalars = features_extractor.scalar_input_dropout(scalars)
+                scalar_features = features_extractor.scalar_network(scalars)
+                
+                attended = features_extractor.cross_attention(normalized, scalar_features)
+                attended_cnn_activations.append(attended.detach().cpu().numpy()[0])
             
-            attended = features_extractor.cross_attention(normalized, scalar_features)
-            attended_cnn_activations.append(attended.detach().cpu().numpy()[0])
+            # PATH 2: Direct CNN (Skip Connection) - only if scalars enabled
+            if scalars_enabled and features_extractor.cnn_direct is not None:
+                direct = features_extractor.cnn_direct(spatial_features_flat)
+                direct_cnn_activations.append(direct.detach().cpu().numpy()[0])
+            else:
+                # CNN-only: use raw spatial features
+                direct_cnn_activations.append(spatial_features_flat.detach().cpu().numpy()[0])
+    
+    attended_cnn_activations = np.array(attended_cnn_activations) if attended_cnn_activations else np.array([])
+    direct_cnn_activations = np.array(direct_cnn_activations) if direct_cnn_activations else np.array([])
+    
+    # ✅ CONDITIONAL: Only visualize with proper labels
+    if len(attended_cnn_activations) > 0 or len(direct_cnn_activations) > 0:
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # Prepare data
+        attended_mean = np.abs(attended_cnn_activations).mean(axis=0) if len(attended_cnn_activations) > 0 else np.array([])
+        direct_mean = np.abs(direct_cnn_activations).mean(axis=0) if len(direct_cnn_activations) > 0 else np.array([])
+        
+        # 1. Mean activation magnitude
+        ax = axes[0, 0]
+        
+        if len(attended_mean) > 0 and len(direct_mean) > 0:
+            num_features_viz = min(100, len(attended_mean), len(direct_mean))
+            x_pos = np.arange(num_features_viz)
+            width = 0.35
+            ax.bar(x_pos - width/2, attended_mean[:num_features_viz], width, label='Attended CNN (via Attention)', alpha=0.8, color='#3498db')
+            ax.bar(x_pos + width/2, direct_mean[:num_features_viz], width, label='Direct CNN (Skip Connection)', alpha=0.8, color='#e74c3c')
+            ax.set_xlabel(f'Feature Index (first {num_features_viz})')
+            ax.set_title('Activation Magnitude: Attention vs Skip')
+        elif len(direct_mean) > 0:
+            num_features_viz = min(100, len(direct_mean))
+            x_pos = np.arange(num_features_viz)
+            ax.bar(x_pos, direct_mean[:num_features_viz], alpha=0.8, color='#e74c3c', label='Raw CNN Features')
+            ax.set_xlabel(f'Feature Index (first {num_features_viz})')
+            ax.set_title('CNN Features (Raw Spatial)')
+        
+        ax.set_ylabel('Mean Abs Activation')
+        ax.legend()
+        ax.grid(axis='y', alpha=0.3)
+        
+        # 2. Sparsity comparison
+        ax = axes[0, 1]
+        if len(attended_cnn_activations) > 0 and len(direct_cnn_activations) > 0:
+            sparsity_attended = (np.abs(attended_cnn_activations) < 0.01).sum(axis=0) / len(attended_cnn_activations)
+            sparsity_direct = (np.abs(direct_cnn_activations) < 0.01).sum(axis=0) / len(direct_cnn_activations)
             
-            # PATH 2: Direct CNN (Skip Connection)
-            cnn_raw = spatial_features.flatten(1)
-            direct = features_extractor.cnn_direct(cnn_raw)
-            direct_cnn_activations.append(direct.detach().cpu().numpy()[0])
-    
-    attended_cnn_activations = np.array(attended_cnn_activations)
-    direct_cnn_activations = np.array(direct_cnn_activations)
-    
-    # Create comparison visualization
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    
-    # 1. Mean activation magnitude
-    attended_mean = np.abs(attended_cnn_activations).mean(axis=0)
-    direct_mean = np.abs(direct_cnn_activations).mean(axis=0)
-    
-    ax = axes[0, 0]
-    # Limit to first 100 features for visualization
-    num_features_viz = min(100, len(attended_mean), len(direct_mean))
-    x_pos = np.arange(num_features_viz)
-    width = 0.35
-    ax.bar(x_pos - width/2, attended_mean[:num_features_viz], width, label='Attended CNN (via Attention)', alpha=0.8, color='#3498db')
-    ax.bar(x_pos + width/2, direct_mean[:num_features_viz], width, label='Direct CNN (Skip Connection)', alpha=0.8, color='#e74c3c')
-    ax.set_xlabel(f'Feature Index (first {num_features_viz})')
-    ax.set_ylabel('Mean Abs Activation')
-    ax.set_title('Activation Magnitude: Attention vs Skip')
-    ax.legend()
-    ax.grid(axis='y', alpha=0.3)
-    
-    # 2. Sparsity comparison
-    sparsity_attended = (np.abs(attended_cnn_activations) < 0.01).sum(axis=0) / len(attended_cnn_activations)
-    sparsity_direct = (np.abs(direct_cnn_activations) < 0.01).sum(axis=0) / len(direct_cnn_activations)
-    
-    ax = axes[0, 1]
-    num_sparsity_viz = min(256, len(sparsity_attended), len(sparsity_direct))
-    ax.scatter(sparsity_attended[:num_sparsity_viz], sparsity_direct[:num_sparsity_viz], alpha=0.6, s=50)
-    ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, label='Equal sparsity')
-    ax.set_xlabel('Sparsity (Attended CNN)')
-    ax.set_ylabel('Sparsity (Direct CNN)')
-    ax.set_title('Feature Sparsity Comparison')
-    ax.legend()
-    ax.grid(alpha=0.3)
-    
-    # 3. Standard deviation comparison
-    std_attended = attended_cnn_activations.std(axis=0)
-    std_direct = direct_cnn_activations.std(axis=0)
-    
-    ax = axes[1, 0]
-    num_std_viz = min(100, len(std_attended), len(std_direct))
-    ax.plot(std_attended[:num_std_viz], label='Attended CNN', color='#3498db', linewidth=2)
-    ax.plot(std_direct[:num_std_viz], label='Direct CNN', color='#e74c3c', linewidth=2)
-    ax.set_xlabel('Feature Index')
-    ax.set_ylabel('Std Dev (across samples)')
-    ax.set_title('Feature Variability Comparison')
-    ax.legend()
-    ax.grid(alpha=0.3)
-    
-    # 4. Distribution comparison
-    ax = axes[1, 1]
-    ax.hist(attended_cnn_activations.flatten(), bins=50, alpha=0.6, label='Attended CNN', color='#3498db', density=True)
-    ax.hist(direct_cnn_activations.flatten(), bins=50, alpha=0.6, label='Direct CNN', color='#e74c3c', density=True)
-    ax.set_xlabel('Activation Value')
-    ax.set_ylabel('Density')
-    ax.set_title('Overall Distribution Comparison')
-    ax.legend()
-    ax.grid(alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'cnn_paths_comparison.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"✅ CNN paths comparison saved: cnn_paths_comparison.png")
-    
-    # Summary statistics
-    print(f"\n📊 CNN PATHS STATISTICS:")
-    print(f"  Attended CNN (via Attention):")
-    print(f"    - Mean activation: {attended_cnn_activations.mean():.4f}")
-    print(f"    - Std activation:  {attended_cnn_activations.std():.4f}")
-    print(f"    - Sparsity: {(np.abs(attended_cnn_activations) < 0.01).sum() / attended_cnn_activations.size * 100:.1f}%")
-    print(f"  Direct CNN (Skip Connection):")
-    print(f"    - Mean activation: {direct_cnn_activations.mean():.4f}")
-    print(f"    - Std activation:  {direct_cnn_activations.std():.4f}")
-    print(f"    - Sparsity: {(np.abs(direct_cnn_activations) < 0.01).sum() / direct_cnn_activations.size * 100:.1f}%")
+            num_sparsity_viz = min(256, len(sparsity_attended), len(sparsity_direct))
+            ax.scatter(sparsity_attended[:num_sparsity_viz], sparsity_direct[:num_sparsity_viz], alpha=0.6, s=50)
+            ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, label='Equal sparsity')
+            ax.set_xlabel('Sparsity (Attended CNN)')
+            ax.set_ylabel('Sparsity (Direct CNN)')
+            ax.set_title('Feature Sparsity Comparison')
+            ax.legend()
+        elif len(direct_cnn_activations) > 0:
+            sparsity_direct = (np.abs(direct_cnn_activations) < 0.01).sum(axis=0) / len(direct_cnn_activations)
+            ax.hist(sparsity_direct, bins=50, alpha=0.8, color='#e74c3c', edgecolor='black')
+            ax.set_xlabel('Sparsity (% near-zero)')
+            ax.set_ylabel('Frequency')
+            ax.set_title('CNN Features Sparsity Distribution')
+        
+        ax.grid(alpha=0.3)
+        
+        # 3. Standard deviation comparison
+        ax = axes[1, 0]
+        if len(attended_cnn_activations) > 0 and len(direct_cnn_activations) > 0:
+            std_attended = attended_cnn_activations.std(axis=0)
+            std_direct = direct_cnn_activations.std(axis=0)
+            
+            num_std_viz = min(100, len(std_attended), len(std_direct))
+            ax.plot(std_attended[:num_std_viz], label='Attended CNN', color='#3498db', linewidth=2)
+            ax.plot(std_direct[:num_std_viz], label='Direct CNN', color='#e74c3c', linewidth=2)
+            ax.set_xlabel('Feature Index')
+            ax.set_ylabel('Std Dev (across samples)')
+            ax.set_title('Feature Variability Comparison')
+            ax.legend()
+        elif len(direct_cnn_activations) > 0:
+            std_direct = direct_cnn_activations.std(axis=0)
+            num_std_viz = min(100, len(std_direct))
+            ax.plot(std_direct[:num_std_viz], color='#e74c3c', linewidth=2, label='Raw CNN')
+            ax.set_xlabel('Feature Index')
+            ax.set_ylabel('Std Dev (across samples)')
+            ax.set_title('CNN Features Variability')
+            ax.legend()
+        
+        ax.grid(alpha=0.3)
+        
+        # 4. Distribution comparison
+        ax = axes[1, 1]
+        if len(attended_cnn_activations) > 0 and len(direct_cnn_activations) > 0:
+            ax.hist(attended_cnn_activations.flatten(), bins=50, alpha=0.6, label='Attended CNN', color='#3498db', density=True)
+            ax.hist(direct_cnn_activations.flatten(), bins=50, alpha=0.6, label='Direct CNN', color='#e74c3c', density=True)
+            ax.set_title('Overall Distribution Comparison')
+        elif len(direct_cnn_activations) > 0:
+            ax.hist(direct_cnn_activations.flatten(), bins=50, alpha=0.8, color='#e74c3c', density=True, edgecolor='black')
+            ax.set_title('Raw CNN Features Distribution')
+        
+        ax.set_xlabel('Activation Value')
+        ax.set_ylabel('Density')
+        ax.legend()
+        ax.grid(alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'cnn_paths_comparison.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"✅ CNN paths comparison saved: cnn_paths_comparison.png")
+        
+        # Summary statistics
+        print(f"\n📊 CNN PATHS STATISTICS:")
+        if len(attended_cnn_activations) > 0:
+            print(f"  Attended CNN (via Attention):")
+            print(f"    - Mean activation: {attended_cnn_activations.mean():.4f}")
+            print(f"    - Std activation:  {attended_cnn_activations.std():.4f}")
+            print(f"    - Sparsity: {(np.abs(attended_cnn_activations) < 0.01).sum() / attended_cnn_activations.size * 100:.1f}%")
+        
+        if len(direct_cnn_activations) > 0:
+            path_label = "Direct CNN (Skip Connection)" if scalars_enabled else "Direct CNN (Raw Spatial)"
+            print(f"  {path_label}:")
+            print(f"    - Mean activation: {direct_cnn_activations.mean():.4f}")
+            print(f"    - Std activation:  {direct_cnn_activations.std():.4f}")
+            print(f"    - Sparsity: {(np.abs(direct_cnn_activations) < 0.01).sum() / direct_cnn_activations.size * 100:.1f}%")
+    else:
+        # CNN-ONLY or no data: skip comparison
+        print(f"\n⚠️  CNN PATHS: Skipping comparison (no scalars enabled)")
+        
+        # Summary statistics for Direct CNN only
+        if len(direct_cnn_activations) > 0:
+            print(f"\n📊 RAW CNN FEATURES STATISTICS:")
+            print(f"    - Mean activation: {direct_cnn_activations.mean():.4f}")
+            print(f"    - Std activation:  {direct_cnn_activations.std():.4f}")
+            print(f"    - Sparsity: {(np.abs(direct_cnn_activations) < 0.01).sum() / direct_cnn_activations.size * 100:.1f}%")
     
     # ==================== [3/3] SAMPLE VISUALIZATIONS ====================
     print("\n🖼️  Generating sample filter visualizations...")
@@ -456,14 +513,14 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
         # Conv1
         x = features_extractor.conv1(image)
         x = features_extractor.bn1(x)
-        x = torch.nn.functional.gelu(x)
+        x = torch.nn.functional.silu(x)
         conv1_out = x[0].cpu().numpy()
         
         # Conv2
         x = features_extractor.conv2(x)
         x = features_extractor.bn2(x)
         x = features_extractor.dropout2(x)
-        x = torch.nn.functional.gelu(x)
+        x = torch.nn.functional.silu(x)
         conv2_out = x[0].cpu().numpy()
         
         # Visualize Conv1 (first 16 channels)

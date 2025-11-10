@@ -18,9 +18,13 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
     """
     Analiza podstawowych stanów: aktywacje, attention heatmaps, gradienty
     🆕 UPDATED: Multi-Query Cross-Attention + Positional Encoding
+    ✅ FIXED: Obsługuje tryb z i bez scalarów (CNN-ONLY mode)
     """
     policy = model.policy
     features_extractor = policy.features_extractor
+    
+    # 🎯 DETECT SCALARS MODE
+    scalars_enabled = features_extractor.scalars_enabled
     
     action_probs_list = []
     detailed_activations = []
@@ -72,28 +76,39 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             # Flatten spatial features for attention
             spatial_features = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
             
-            # Scalars
-            scalars = torch.cat([
-                obs_tensor['direction'],
-                obs_tensor['dx_head'],
-                obs_tensor['dy_head'],
-                obs_tensor['front_coll'],
-                obs_tensor['left_coll'],
-                obs_tensor['right_coll'],
-                obs_tensor['snake_length']
-            ], dim=-1)
-            
-            scalars = features_extractor.scalar_input_dropout(scalars)
-            scalar_features = features_extractor.scalar_network(scalars)
-            
-            # ==================== PATH 1: ATTENTION ====================
-            # 🔥 FIX: Normalize BEFORE attention
-            normalized_features = features_extractor.cnn_prenorm(spatial_features)
-            attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
+            # ✅ CONDITIONAL: Scalars only if enabled
+            if scalars_enabled:
+                scalars = torch.cat([
+                    obs_tensor['direction'],
+                    obs_tensor['dx_head'],
+                    obs_tensor['dy_head'],
+                    obs_tensor['front_coll'],
+                    obs_tensor['left_coll'],
+                    obs_tensor['right_coll'],
+                    obs_tensor['snake_length']
+                ], dim=-1)
+                
+                scalars = features_extractor.scalar_input_dropout(scalars)
+                scalar_features = features_extractor.scalar_network(scalars)
+                
+                # ==================== PATH 1: ATTENTION ====================
+                # 🔥 FIX: Normalize BEFORE attention
+                normalized_features = features_extractor.cnn_prenorm(spatial_features)
+                attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
+            else:
+                # CNN-ONLY: no attention, no scalars
+                attended_cnn = torch.zeros(1, 0, device=policy.device)
+                scalar_features = torch.zeros(1, 0, device=policy.device)
             
             # ==================== PATH 2: SKIP CONNECTION ====================
             spatial_features_flat = spatial_features.flatten(1)
-            direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+            
+            if scalars_enabled and features_extractor.cnn_direct is not None:
+                # With scalars: use compressed direct CNN
+                direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+            else:
+                # Without scalars: use raw spatial features directly
+                direct_cnn = spatial_features_flat
             
             # ==================== FUSION - THREE STREAMS ====================
             fused = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)
@@ -150,26 +165,43 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
         features_np = features_final[0].cpu().numpy()
         lstm_np = latent_pi[0].cpu().numpy()
         
-        detailed_activations.append({
+        # ✅ CONDITIONAL: Handle empty arrays when scalars disabled
+        activation_data = {
             'state': state_idx,
             # RMS = sqrt(mean(x^2))
-            'attended_rms': np.sqrt(np.mean(attended_np**2)),
-            'attended_absmax': np.abs(attended_np).max(),
-            'attended_active_ratio': (np.abs(attended_np) > 0.01).mean(),
             'direct_rms': np.sqrt(np.mean(direct_np**2)),        # ✨ NEW!
-            'direct_absmax': np.abs(direct_np).max(),            # ✨ NEW!
-            'direct_active_ratio': (np.abs(direct_np) > 0.01).mean(),  # ✨ NEW!
-            'scalar_rms': np.sqrt(np.mean(scalar_np**2)),
-            'scalar_absmax': np.abs(scalar_np).max(),
-            'scalar_active_ratio': (np.abs(scalar_np) > 0.01).mean(),
+            'direct_absmax': np.abs(direct_np).max() if direct_np.size > 0 else 0,            # ✨ NEW!
+            'direct_active_ratio': (np.abs(direct_np) > 0.01).mean() if direct_np.size > 0 else 0,  # ✨ NEW!
             'features_rms': np.sqrt(np.mean(features_np**2)),
             'lstm_rms': np.sqrt(np.mean(lstm_np**2)),
             'lstm_hidden_rms': np.sqrt(np.mean(lstm_states[0][0]**2)),
             'lstm_cell_rms': np.sqrt(np.mean(lstm_states[1][0]**2)),
-        })
+        }
+        
+        # Add attention metrics only if scalars enabled
+        if scalars_enabled and attended_np.size > 0:
+            activation_data['attended_rms'] = np.sqrt(np.mean(attended_np**2))
+            activation_data['attended_absmax'] = np.abs(attended_np).max()
+            activation_data['attended_active_ratio'] = (np.abs(attended_np) > 0.01).mean()
+        else:
+            activation_data['attended_rms'] = 0
+            activation_data['attended_absmax'] = 0
+            activation_data['attended_active_ratio'] = 0
+        
+        # Add scalar metrics only if scalars enabled
+        if scalars_enabled and scalar_np.size > 0:
+            activation_data['scalar_rms'] = np.sqrt(np.mean(scalar_np**2))
+            activation_data['scalar_absmax'] = np.abs(scalar_np).max()
+            activation_data['scalar_active_ratio'] = (np.abs(scalar_np) > 0.01).mean()
+        else:
+            activation_data['scalar_rms'] = 0
+            activation_data['scalar_absmax'] = 0
+            activation_data['scalar_active_ratio'] = 0
+        
+        detailed_activations.append(activation_data)
         
         # Wizualizacja CNN output + Attention
-        visualize_cnn_output(obs_tensor, features_extractor, output_dirs['conv_viz'], state_idx)
+        visualize_cnn_output(obs_tensor, features_extractor, output_dirs['conv_viz'], state_idx, scalars_enabled)
         
         # Wizualizacja viewport
         visualize_viewport(obs, output_dirs['viewport'], state_idx)
@@ -198,9 +230,13 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     """
     Generuje attention heatmap używając gradientów
     🆕 UPDATED: Multi-Query Cross-Attention visualization
+    ✅ FIXED: Obsługuje tryb z i bez scalarów
     """
     policy = model.policy
     features_extractor = policy.features_extractor
+    
+    # 🎯 DETECT SCALARS MODE
+    scalars_enabled = features_extractor.scalars_enabled
     
     # Ustaw tryby
     features_extractor.eval()
@@ -238,34 +274,48 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     
     spatial_features = x.flatten(2).transpose(1, 2)
     
-    # Scalars
-    scalars_grad = torch.cat([
-        obs_grad['direction'],
-        obs_grad['dx_head'],
-        obs_grad['dy_head'],
-        obs_grad['front_coll'],
-        obs_grad['left_coll'],
-        obs_grad['right_coll'],
-        obs_grad['snake_length']
-    ], dim=-1)
-    
-    scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
-    scalar_features = features_extractor.scalar_network(scalars_grad)
-    
-    # ==================== PATH 1: ATTENTION with gradient tracking ====================
-    # 🔥 FIX: Normalize BEFORE attention
-    normalized_features = features_extractor.cnn_prenorm(spatial_features)
-    normalized_features.retain_grad()
-    
-    attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
-    attended_cnn.retain_grad()
-    
-    # ==================== PATH 2: SKIP CONNECTION with gradient tracking ====================
-    spatial_features_flat = spatial_features.flatten(1)
-    spatial_features_flat.retain_grad()
-    
-    direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
-    direct_cnn.retain_grad()
+    # ✅ CONDITIONAL: Scalars only if enabled
+    if scalars_enabled and features_extractor.scalar_network is not None:
+        scalars_grad = torch.cat([
+            obs_grad['direction'],
+            obs_grad['dx_head'],
+            obs_grad['dy_head'],
+            obs_grad['front_coll'],
+            obs_grad['left_coll'],
+            obs_grad['right_coll'],
+            obs_grad['snake_length']
+        ], dim=-1)
+        
+        scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
+        scalar_features = features_extractor.scalar_network(scalars_grad)
+        
+        # ==================== PATH 1: ATTENTION with gradient tracking ====================
+        # 🔥 FIX: Normalize BEFORE attention
+        normalized_features = features_extractor.cnn_prenorm(spatial_features)
+        normalized_features.retain_grad()
+        
+        attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
+        attended_cnn.retain_grad()
+        
+        # ==================== PATH 2: SKIP CONNECTION with gradient tracking ====================
+        spatial_features_flat = spatial_features.flatten(1)
+        spatial_features_flat.retain_grad()
+        
+        direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+        direct_cnn.retain_grad()
+    else:
+        # CNN-ONLY: no attention, no scalars
+        attended_cnn = torch.zeros(1, 0, device=policy.device, requires_grad=True)
+        scalar_features = torch.zeros(1, 0, device=policy.device, requires_grad=True)
+        
+        spatial_features_flat = spatial_features.flatten(1)
+        spatial_features_flat.retain_grad()
+        
+        direct_cnn = spatial_features_flat  # Raw features, but track gradients
+        direct_cnn.retain_grad()
+        
+        attended_cnn.retain_grad()
+        scalar_features.retain_grad()
     
     # ==================== FUSION - THREE STREAMS ====================
     fused = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)
@@ -326,15 +376,19 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     return None
 
 
-def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
+def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx, scalars_enabled=False):
     """
     Wizualizuje output wszystkich warstw CNN + Attention + Skip Connection
     🆕 UPDATED: Fixed CNN Architecture with Skip Connection (Direct CNN Path)
+    ✅ FIXED: Obsługuje tryb z i bez scalarów
     
     Dwa główne ścieżki:
-    PATH 1 (Attention): CNN → Prenorm → Attention → 448 dim
+    PATH 1 (Attention): CNN → Prenorm → Attention → 448 dim (gdy scalary enabled)
     PATH 2 (Skip): CNN → Direct projection → 256 dim ✨ NEW!
     """
+    # 🎯 DETECT SCALARS MODE
+    scalars_enabled = features_extractor.scalars_enabled
+    
     with torch.no_grad():
         image = obs_tensor['image']
         if image.dim() == 4 and image.shape[-1] == 1:
@@ -372,28 +426,37 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
         spatial_features = x.flatten(2).transpose(1, 2)
         spatial_features_flat = spatial_features.flatten(1)  # Raw CNN dla skip connection
 
-        # Scalars
-        scalars = torch.cat([
-            obs_tensor['direction'],
-            obs_tensor['dx_head'],
-            obs_tensor['dy_head'],
-            obs_tensor['front_coll'],
-            obs_tensor['left_coll'],
-            obs_tensor['right_coll'],
-            obs_tensor['snake_length']
-        ], dim=-1)
-        scalars = features_extractor.scalar_input_dropout(scalars)
-        scalar_features = features_extractor.scalar_network(scalars)
-        activations['scalar'] = scalar_features[0].cpu().numpy()
-        
-        # ==================== PATH 1: ATTENTION PATH ====================
-        normalized_features = features_extractor.cnn_prenorm(spatial_features)
-        attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
-        activations['attended_cnn'] = attended_cnn[0].cpu().numpy()
-        
-        # ==================== PATH 2: SKIP CONNECTION (DIRECT CNN) ====================
-        direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
-        activations['direct_cnn'] = direct_cnn[0].cpu().numpy()
+        # ✅ CONDITIONAL: Scalars only if enabled
+        if scalars_enabled and features_extractor.scalar_network is not None:
+            scalars = torch.cat([
+                obs_tensor['direction'],
+                obs_tensor['dx_head'],
+                obs_tensor['dy_head'],
+                obs_tensor['front_coll'],
+                obs_tensor['left_coll'],
+                obs_tensor['right_coll'],
+                obs_tensor['snake_length']
+            ], dim=-1)
+            scalars = features_extractor.scalar_input_dropout(scalars)
+            scalar_features = features_extractor.scalar_network(scalars)
+            activations['scalar'] = scalar_features[0].cpu().numpy()
+            
+            # ==================== PATH 1: ATTENTION PATH ====================
+            normalized_features = features_extractor.cnn_prenorm(spatial_features)
+            attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
+            activations['attended_cnn'] = attended_cnn[0].cpu().numpy()
+            
+            # ==================== PATH 2: SKIP CONNECTION (DIRECT CNN) ====================
+            direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+            activations['direct_cnn'] = direct_cnn[0].cpu().numpy()
+        else:
+            # CNN-ONLY: no attention, no scalars, use raw spatial features
+            attended_cnn = torch.zeros(1, 0, device=features_extractor.conv1.weight.device)
+            scalar_features = torch.zeros(1, 0, device=features_extractor.conv1.weight.device)
+            direct_cnn = spatial_features_flat  # Use full spatial features!
+            activations['scalar'] = np.array([])
+            activations['attended_cnn'] = np.array([])
+            activations['direct_cnn'] = direct_cnn[0].cpu().numpy()
 
         # Fusion z oboma ścieżkami
         fused = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)
@@ -427,20 +490,27 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
     )
 
     # 4. BOTH CNN PATHS COMPARISON (1D) - 🔥 NEW!
+    paths_dict = {}
+    
+    if scalars_enabled:
+        paths_dict[f'Attended CNN via Attention ({activations["attended_cnn"].shape[0]} dim)'] = activations['attended_cnn']
+    
+    paths_dict[f'Direct CNN ({activations["direct_cnn"].shape[0]} dim) {"✨ (Raw CNN)" if not scalars_enabled else "(Skip Connection)"}'] = activations['direct_cnn']
+    
     visualize_1d_features(
-        {
-            f'Attended CNN via Attention (448 dim)': activations['attended_cnn'],
-            f'Direct CNN (Skip Connection) (256 dim) ✨': activations['direct_cnn']
-        },
+        paths_dict,
         output_path=os.path.join(output_dir, f'cnn_paths_comparison_state_{state_idx}.png'),
         state_idx=state_idx
     )
 
-    # 5. FUSION WITH ALL 3 STREAMS (1D features)
-    fusion_dict = {
-        f'Scalar features (256 dim)': activations['scalar'],
-        f'Fused output (512 dim)': activations['fusion']
-    }
+    # 5. FUSION WITH ALL STREAMS (1D features)
+    fusion_dict = {}
+    
+    if scalars_enabled and activations['scalar'].size > 0:
+        fusion_dict[f'Scalar features ({activations["scalar"].shape[0]} dim)'] = activations['scalar']
+    
+    fusion_dict[f'Fused output ({activations["fusion"].shape[0]} dim)'] = activations['fusion']
+    
     visualize_1d_features(
         fusion_dict,
         output_path=os.path.join(output_dir, f'fusions_state_{state_idx}.png'),
@@ -483,6 +553,7 @@ def visualize_1d_features(features_dict, output_path, state_idx):
     """
     Wizualizuje 1D features (attention, projection, final output)
     jako heatmapy poziome
+    ✅ FIXED: Obsługuje puste tablice (gdy brak scalarów)
     """
     fig, axes = plt.subplots(len(features_dict), 1, figsize=(16, 6))
     
@@ -490,6 +561,14 @@ def visualize_1d_features(features_dict, output_path, state_idx):
         axes = [axes]
     
     for idx, (name, features) in enumerate(features_dict.items()):
+        # ✅ Skip empty features
+        if features.size == 0:
+            axes[idx].text(0.5, 0.5, f'{name}\n(disabled)', 
+                          ha='center', va='center', fontsize=12, transform=axes[idx].transAxes)
+            axes[idx].set_xticks([])
+            axes[idx].set_yticks([])
+            continue
+        
         # Reshape do 2D dla imshow
         features_2d = features.reshape(1, -1)
         
@@ -504,8 +583,8 @@ def visualize_1d_features(features_dict, output_path, state_idx):
         # Statystyki
         mean_val = features.mean()
         std_val = features.std()
-        max_val = features.max()
-        min_val = features.min()
+        max_val = features.max() if features.size > 0 else 0
+        min_val = features.min() if features.size > 0 else 0
         axes[idx].text(0.02, 0.95, f'Mean: {mean_val:.3f}, Std: {std_val:.3f}, Max: {max_val:.3f}, Min: {min_val:.3f}',
                       transform=axes[idx].transAxes, fontsize=10, verticalalignment='top',
                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))

@@ -2,7 +2,7 @@
 environment:
   min_grid_size: 8                   # Minimalny rozmiar siatki
   max_grid_size: 25                  # Maksymalny rozmiar siatki
-  viewport_size: 12                  # Rozmiar viewport (stały dla wszystkich grid_size)
+  viewport_size: 11                  # Rozmiar viewport (stały dla wszystkich grid_size)
   snake_size: 20                     # Rozmiar kratki w pikselach
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
   observation_space:
@@ -103,7 +103,7 @@ model:
     direct_cnn_dim: 128              # ← Skip connection size (ZMNIEJSZONE z 256!)
     
     # Scalar Network Architecture  
-    scalar_hidden_dims: [128, 256]   # Scalars output 
+    scalar_hidden_dims: [0]   # Scalars output 
     
     # Multi-Query Attention Configuration
     attention_heads: 4               # 6 heads (head_dim=8) - bardziej wyspecjalizowane

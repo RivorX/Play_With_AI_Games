@@ -17,8 +17,12 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     """
     Oblicza gradienty dla wszystkich warstw
     🆕 UPDATED: Multi-Query Cross-Attention + Positional Encoding
+    ✅ FIXED: Obsługuje tryb z i bez scalarów
     """
     policy = model.policy
+    
+    # 🎯 DETECT SCALARS MODE
+    scalars_enabled = features_extractor.scalars_enabled
     
     features_extractor.eval()
     policy.lstm_actor.train()
@@ -75,62 +79,74 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     spatial_features.retain_grad()
     cnn_intermediates.append(('cnn', 6, 'Flatten', spatial_features))
     
-    # Scalar layers
-    scalars_grad = torch.cat([
-        obs_grad['direction'],
-        obs_grad['dx_head'],
-        obs_grad['dy_head'],
-        obs_grad['front_coll'],
-        obs_grad['left_coll'],
-        obs_grad['right_coll'],
-        obs_grad['snake_length']
-    ], dim=-1)
-
-    scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
-
+    # ✅ CONDITIONAL: Scalars only if enabled
     scalar_intermediates = []
-    x_scalar = scalars_grad
-    linear_idx = 0
-    for i, layer in enumerate(features_extractor.scalar_network):
-        x_scalar = layer(x_scalar)
-        x_scalar.retain_grad()
+    if scalars_enabled and features_extractor.scalar_network is not None:
+        scalars_grad = torch.cat([
+            obs_grad['direction'],
+            obs_grad['dx_head'],
+            obs_grad['dy_head'],
+            obs_grad['front_coll'],
+            obs_grad['left_coll'],
+            obs_grad['right_coll'],
+            obs_grad['snake_length']
+        ], dim=-1)
+
+        scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
+
+        x_scalar = scalars_grad
+        linear_idx = 0
+        for i, layer in enumerate(features_extractor.scalar_network):
+            x_scalar = layer(x_scalar)
+            x_scalar.retain_grad()
+            
+            if isinstance(layer, torch.nn.Linear):
+                layer_name = f'Linear-{linear_idx}'
+                linear_idx += 1
+            elif isinstance(layer, torch.nn.LayerNorm):
+                layer_name = f'LayerNorm-{i}'
+            elif isinstance(layer, torch.nn.GELU):
+                layer_name = f'GELU-{i}'
+            elif isinstance(layer, torch.nn.Dropout):
+                layer_name = f'Dropout-{i}'
+            else:
+                layer_name = f'Unknown-{i}'
+            
+            scalar_intermediates.append(('scalar', i, layer_name, x_scalar))
         
-        if isinstance(layer, torch.nn.Linear):
-            layer_name = f'Linear-{linear_idx}'
-            linear_idx += 1
-        elif isinstance(layer, torch.nn.LayerNorm):
-            layer_name = f'LayerNorm-{i}'
-        elif isinstance(layer, torch.nn.GELU):
-            layer_name = f'GELU-{i}'
-        elif isinstance(layer, torch.nn.Dropout):
-            layer_name = f'Dropout-{i}'
-        else:
-            layer_name = f'Unknown-{i}'
+        scalar_features = x_scalar
         
-        scalar_intermediates.append(('scalar', i, layer_name, x_scalar))
-    
-    scalar_features = x_scalar
-    
-    # ==================== PATH 1: ATTENTION PATH ====================
-    # 🔥 FIX: Normalize BEFORE attention
-    normalized_features = features_extractor.cnn_prenorm(spatial_features)
-    normalized_features.retain_grad()
-    cnn_intermediates.append(('cnn', 7, 'PreNorm', normalized_features))
-    
-    # 🆕 MULTI-QUERY CROSS-ATTENTION
-    attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
-    attended_cnn.retain_grad()
-    cnn_intermediates.append(('attention', 0, 'CrossAttention', attended_cnn))
+        # ==================== PATH 1: ATTENTION PATH ====================
+        # 🔥 FIX: Normalize BEFORE attention
+        normalized_features = features_extractor.cnn_prenorm(spatial_features)
+        normalized_features.retain_grad()
+        cnn_intermediates.append(('cnn', 7, 'PreNorm', normalized_features))
+        
+        # 🆕 MULTI-QUERY CROSS-ATTENTION
+        attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
+        attended_cnn.retain_grad()
+        cnn_intermediates.append(('attention', 0, 'CrossAttention', attended_cnn))
+    else:
+        # CNN-ONLY: no scalars, no attention
+        scalar_features = torch.zeros(1, 0, device=policy.device, requires_grad=True)
+        attended_cnn = torch.zeros(1, 0, device=policy.device, requires_grad=True)
+        scalar_features.retain_grad()
+        attended_cnn.retain_grad()
     
     # ==================== PATH 2: SKIP CONNECTION (Direct CNN) ====================
-    # Bypass attention - use raw CNN features directly ✨ NEW!
     cnn_raw = spatial_features.flatten(1)  # (B, H*W*C)
     cnn_raw.retain_grad()
     cnn_intermediates.append(('skip', 0, 'RawCNN', cnn_raw))
     
-    direct_cnn = features_extractor.cnn_direct(cnn_raw)
-    direct_cnn.retain_grad()
-    cnn_intermediates.append(('skip', 1, 'DirectProjection', direct_cnn))
+    if scalars_enabled and features_extractor.cnn_direct is not None:
+        # With scalars: use compressed direct CNN
+        direct_cnn = features_extractor.cnn_direct(cnn_raw)
+        direct_cnn.retain_grad()
+        cnn_intermediates.append(('skip', 1, 'DirectProjection', direct_cnn))
+    else:
+        # Without scalars: use raw spatial features directly
+        direct_cnn = cnn_raw
+        cnn_intermediates.append(('skip', 1, 'RawSpatialFeatures', direct_cnn))
     
     # ==================== FUSION ====================
     # THREE STREAMS: Attended CNN + Direct CNN + Scalars
@@ -658,6 +674,20 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
 
 def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     """
+    🌊 SZCZEGÓŁOWA ANALIZA PRZEPŁYWU GRADIENTÓW
+    - Zbiera gradienty dla każdej warstwy
+    - Analizuje bottlenecks, vanishing/explosion gradientów
+    ✅ FIXED: Obsługuje tryb z i bez scalarów
+    """
+    print("\n[INFO] Analyzing gradient flow in detail...")
+    
+    policy = model.policy
+    features_extractor = policy.features_extractor
+    
+    # 🎯 DETECT SCALARS MODE
+    scalars_enabled = features_extractor.scalars_enabled
+    
+    """
     🌊 GRADIENT FLOW DETAILED ANALYSIS - RMS VERSION WITH ATTENTION
     - Per-layer gradient magnitude (RMS-based)
     - Gradient vanishing/explosion detection
@@ -665,6 +695,7 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
     - Layer-wise gradient statistics
     
     ✅ UPDATED: Multi-Query Cross-Attention support
+    ✅ FIXED: Obsługuje tryb z i bez scalarów
     """
     print("\n" + "="*80)
     print("🌊 GRADIENT FLOW DETAILED ANALYSIS (RMS + ATTENTION)")
@@ -709,27 +740,36 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             
             spatial_features = x.flatten(2).transpose(1, 2)
             
-            # Scalars
-            scalars = torch.cat([
-                obs_tensor['direction'],
-                obs_tensor['dx_head'],
-                obs_tensor['dy_head'],
-                obs_tensor['front_coll'],
-                obs_tensor['left_coll'],
-                obs_tensor['right_coll'],
-                obs_tensor['snake_length']
-            ], dim=-1)
-            
-            scalars = features_extractor.scalar_input_dropout(scalars)
-            scalar_features = features_extractor.scalar_network(scalars)
-            
-            # ==================== PATH 1: ATTENTION ====================
-            normalized_features = features_extractor.cnn_prenorm(spatial_features)
-            attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
+            # ✅ CONDITIONAL: Scalars only if enabled
+            if scalars_enabled:
+                scalars = torch.cat([
+                    obs_tensor['direction'],
+                    obs_tensor['dx_head'],
+                    obs_tensor['dy_head'],
+                    obs_tensor['front_coll'],
+                    obs_tensor['left_coll'],
+                    obs_tensor['right_coll'],
+                    obs_tensor['snake_length']
+                ], dim=-1)
+                
+                scalars = features_extractor.scalar_input_dropout(scalars)
+                scalar_features = features_extractor.scalar_network(scalars)
+                
+                # ==================== PATH 1: ATTENTION ====================
+                normalized_features = features_extractor.cnn_prenorm(spatial_features)
+                attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
+            else:
+                # CNN-ONLY: no scalars, no attention
+                attended_cnn = torch.zeros(1, 0, device=policy.device)
+                scalar_features = torch.zeros(1, 0, device=policy.device)
             
             # ==================== PATH 2: SKIP CONNECTION ====================
             spatial_features_flat = spatial_features.flatten(1)
-            direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+            
+            if scalars_enabled and features_extractor.cnn_direct is not None:
+                direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+            else:
+                direct_cnn = spatial_features_flat  # Raw spatial features
             
             # ==================== FUSION - THREE STREAMS ====================
             fused = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)
