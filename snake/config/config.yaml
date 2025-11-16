@@ -69,8 +69,8 @@ model:
   gamma: 0.995                       # Współczynnik dyskontowania
   gae_lambda: 0.97                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
-  ent_coef: 0.05                     # Współczynnik entropii (początkowy)
-  min_ent_coef: 0.03                 # Minimalny współczynnik entropii (docelowy)
+  ent_coef: 0.1                      # Współczynnik entropii (początkowy)
+  min_ent_coef: 0.01                 # Minimalny współczynnik entropii (docelowy)
   vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
 
@@ -83,34 +83,37 @@ model:
 
   # LSTM Configuration
   lstm:
-    gradient_clip_val: 5.0          # Clip gradients LSTM
+    gradient_clip_val: 3.0          # Clip gradients LSTM
     cell_state_penalty: 0.0         # L2 penalty na cell state
     hidden_state_penalty: 0.0       # L2 penalty na hidden state
-    dropout: 0.0                    # Dropout w LSTM
+    dropout: 0.15                   # Dropout w LSTM
   
-  # Selektywne dropouty
-  cnn_dropout: 0.01                 
-  scalar_dropout: 0.1                # Dropout dla skalarów (wyższy - mniej skalarów)
-  scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
-  fusion_dropout: 0.1                # Dropout po fusion (regularyzacja przed LSTM)              
+  # 🔥 FIXED: Selektywne dropouty (DISABLED dla CNN!)
+  cnn_dropout: 0.0                  # ✅ DISABLED - pozwól kanałom się rozwinąć!
+  scalar_dropout: 0.1               # Dropout dla skalarów
+  scalar_input_dropout: 0.0         # Dropout dla wejścia skalarów
+  fusion_dropout: 0.1               # Dropout po fusion              
   
   # CNN ARCHITECTURE
   convlstm:
-    cnn_channels: [24, 48]           # Kanały CNN (raw: 48×6×6=1,728 features)
+    cnn_channels: [32, 48, 64]           # 🔥 FIXED: Conv1=32 (więcej capacity dla ujemnych input!)
     
     # ✨ PROJECTION LAYERS - konfigurowalne wymiary przed fusion
-    attended_cnn_dim: 448            # Attended CNN output
-    direct_cnn_dim: 128              # ← Skip connection size (ZMNIEJSZONE z 256!)
+    attended_cnn_dim: 512            # Attended CNN output
+    direct_cnn_dim: 256              # Skip connection size (with scalars)
+    cnn_only_direct_dim: 1024        # 🔥 Direct path size (CNN-only mode) - better capacity!
+    pos_encoding_scale: 0.1          # ✅ Scale for positional encoding (0.1 = subtle)
     
     # Scalar Network Architecture  
-    scalar_hidden_dims: [0]   # Scalars output 
+    scalar_hidden_dims: [128, 256]   
     
     # Multi-Query Attention Configuration
-    attention_heads: 4               # 6 heads (head_dim=8) - bardziej wyspecjalizowane
-    num_queries: 6                   # 4 queries: diverse spatial reasoning
+    attention_heads: 8
+    num_queries: 8
+    attention_temperature: 0.5       # 🔥 <1.0 = sharper attention, >1.0 = softer (default: 1.0)
     
     # Architecture Options
-    use_layernorm: true              # Global switch
+    use_layernorm: true              # ✅ ALWAYS TRUE - LayerNorm > BatchNorm!
     use_positional_encoding: true    # Enable/disable pos encoding
 
   policy_kwargs:
@@ -126,7 +129,7 @@ model:
 # Konfiguracja treningu
 training:
   n_envs: 12                         # Liczba środowisk 
-  batch_size: 1024                   # Rozmiar partii 
+  batch_size: 512                    # Rozmiar partii 
   total_timesteps: 8000000           # Całkowita liczba kroków
   eval_freq: 4096                    # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model

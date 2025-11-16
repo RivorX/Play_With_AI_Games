@@ -41,43 +41,47 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     if image_grad.dim() == 4 and image_grad.shape[-1] == 1:
         image_grad = image_grad.permute(0, 3, 1, 2)
     
-    # CNN layers
+    # 🔥 HYBRID CNN: 5×5 → 3×3 → 3×3 (BEST OF BOTH!)
     cnn_intermediates = []
     x_cnn = image_grad
 
-    # Layer 1: Conv1
+    # Layer 1: Conv1 (5×5, RF: 5×5)
     x_cnn = features_extractor.conv1(x_cnn)
     x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 0, 'Conv2d-1', x_cnn))
-    x_cnn = features_extractor.bn1(x_cnn)
+    cnn_intermediates.append(('cnn', 0, 'Conv2d-1 (5×5)', x_cnn))
+    x_cnn = features_extractor.norm1(x_cnn)
     x_cnn = torch.nn.functional.silu(x_cnn)
     x_cnn.retain_grad()
     cnn_intermediates.append(('cnn', 1, 'SiLU-1', x_cnn))
 
-    # Layer 2: Conv2
+    # Layer 2: Conv2 (3×3, RF: 7×7)
     x_cnn = features_extractor.conv2(x_cnn)
     x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 2, 'Conv2d-2', x_cnn))
-    x_cnn = features_extractor.bn2(x_cnn)
-    x_cnn = features_extractor.dropout2(x_cnn)
+    cnn_intermediates.append(('cnn', 2, 'Conv2d-2 (3×3)', x_cnn))
+    x_cnn = features_extractor.norm2(x_cnn)
     x_cnn = torch.nn.functional.silu(x_cnn)
     x_cnn.retain_grad()
     cnn_intermediates.append(('cnn', 3, 'SiLU-2', x_cnn))
     
-    # MaxPool
-    x_cnn = features_extractor.maxpool(x_cnn)
+    # Layer 3: Conv3 (3×3 strided, RF: 9×9, NO MAXPOOL!) 🔥 NEW!
+    x_cnn = features_extractor.conv3(x_cnn)
     x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 4, 'MaxPool2d', x_cnn))
+    cnn_intermediates.append(('cnn', 4, 'Conv2d-3 (3×3, stride=2)', x_cnn))
+    x_cnn = features_extractor.norm3(x_cnn)
+    x_cnn = torch.nn.functional.silu(x_cnn)
+    x_cnn = features_extractor.dropout3(x_cnn)
+    x_cnn.retain_grad()
+    cnn_intermediates.append(('cnn', 5, 'SiLU-3 + Dropout', x_cnn))
     
     # 🆕 POSITIONAL ENCODING
     x_cnn = features_extractor.pos_encoding(x_cnn)
     x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 5, 'PosEncoding', x_cnn))
+    cnn_intermediates.append(('cnn', 6, 'PosEncoding', x_cnn))
     
     # Flatten for attention
     spatial_features = x_cnn.flatten(2).transpose(1, 2)
     spatial_features.retain_grad()
-    cnn_intermediates.append(('cnn', 6, 'Flatten', spatial_features))
+    cnn_intermediates.append(('cnn', 7, 'Flatten', spatial_features))
     
     # ✅ CONDITIONAL: Scalars only if enabled
     scalar_intermediates = []
@@ -120,7 +124,7 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
         # 🔥 FIX: Normalize BEFORE attention
         normalized_features = features_extractor.cnn_prenorm(spatial_features)
         normalized_features.retain_grad()
-        cnn_intermediates.append(('cnn', 7, 'PreNorm', normalized_features))
+        cnn_intermediates.append(('cnn', 8, 'PreNorm', normalized_features))
         
         # 🆕 MULTI-QUERY CROSS-ATTENTION
         attended_cnn = features_extractor.cross_attention(normalized_features, scalar_features)
@@ -143,10 +147,32 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
         direct_cnn = features_extractor.cnn_direct(cnn_raw)
         direct_cnn.retain_grad()
         cnn_intermediates.append(('skip', 1, 'DirectProjection', direct_cnn))
+    elif not scalars_enabled and hasattr(features_extractor, 'cnn_only_direct') and features_extractor.cnn_only_direct is not None:
+        # CNN-ONLY: use cnn_only_direct compression
+        direct_cnn = features_extractor.cnn_only_direct(cnn_raw)
+        direct_cnn.retain_grad()
+        cnn_intermediates.append(('skip', 1, 'CNNOnlyProjection', direct_cnn))
     else:
-        # Without scalars: use raw spatial features directly
-        direct_cnn = cnn_raw
-        cnn_intermediates.append(('skip', 1, 'RawSpatialFeatures', direct_cnn))
+        # Fallback for old models: detect expected fusion input size
+        # Note: at this point attended_cnn and scalar_features are already computed
+        expected_fusion_size = features_extractor.fusion[0].in_features
+        current_size = attended_cnn.shape[-1] + cnn_raw.shape[-1] + scalar_features.shape[-1]
+        
+        if current_size > expected_fusion_size:
+            # Need compression
+            direct_size = expected_fusion_size - attended_cnn.shape[-1] - scalar_features.shape[-1]
+            if not hasattr(features_extractor, '_temp_direct_projection'):
+                features_extractor._temp_direct_projection = torch.nn.Linear(
+                    cnn_raw.shape[-1], 
+                    direct_size,
+                    device=cnn_raw.device
+                )
+            direct_cnn = features_extractor._temp_direct_projection(cnn_raw)
+            direct_cnn.retain_grad()
+            cnn_intermediates.append(('skip', 1, 'TempProjection', direct_cnn))
+        else:
+            direct_cnn = cnn_raw
+            cnn_intermediates.append(('skip', 1, 'RawSpatialFeatures', direct_cnn))
     
     # ==================== FUSION ====================
     # THREE STREAMS: Attended CNN + Direct CNN + Scalars
@@ -732,10 +758,15 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             
             x = features_extractor.conv2(x)
             x = features_extractor.bn2(x)
-            x = features_extractor.dropout2(x)
             x = torch.nn.functional.silu(x)
             
-            x = features_extractor.maxpool(x)
+            x = features_extractor.conv3(x)
+            x = features_extractor.bn3(x)
+            x = torch.nn.functional.silu(x)
+            x = features_extractor.dropout3(x)
+            
+            # 🔥 NO MAXPOOL! Downsampling done by strided conv
+            
             x = features_extractor.pos_encoding(x)
             
             spatial_features = x.flatten(2).transpose(1, 2)
@@ -768,8 +799,26 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             
             if scalars_enabled and features_extractor.cnn_direct is not None:
                 direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+            elif not scalars_enabled and hasattr(features_extractor, 'cnn_only_direct') and features_extractor.cnn_only_direct is not None:
+                # CNN-ONLY: use cnn_only_direct compression
+                direct_cnn = features_extractor.cnn_only_direct(spatial_features_flat)
             else:
-                direct_cnn = spatial_features_flat  # Raw spatial features
+                # Fallback for old models: detect expected fusion input size
+                expected_fusion_size = features_extractor.fusion[0].in_features
+                current_size = attended_cnn.shape[-1] + spatial_features_flat.shape[-1] + scalar_features.shape[-1]
+                
+                if current_size > expected_fusion_size:
+                    # Need compression
+                    direct_size = expected_fusion_size - attended_cnn.shape[-1] - scalar_features.shape[-1]
+                    if not hasattr(features_extractor, '_temp_direct_projection'):
+                        features_extractor._temp_direct_projection = torch.nn.Linear(
+                            spatial_features_flat.shape[-1], 
+                            direct_size,
+                            device=spatial_features_flat.device
+                        )
+                    direct_cnn = features_extractor._temp_direct_projection(spatial_features_flat)
+                else:
+                    direct_cnn = spatial_features_flat
             
             # ==================== FUSION - THREE STREAMS ====================
             fused = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)

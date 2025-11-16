@@ -41,12 +41,15 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     
     conv1_activations = []
     conv2_activations = []
+    conv3_activations = []  # 🔥 NEW!
     
     activation_data = {
         'conv1_pre': [],
         'conv1_post': [],
         'conv2_pre': [],
-        'conv2_post': []
+        'conv2_post': [],
+        'conv3_pre': [],
+        'conv3_post': []
     }
     
     for sample_idx in range(num_samples):
@@ -78,22 +81,32 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
             if image.dim() == 4 and image.shape[-1] == 1:
                 image = image.permute(0, 3, 1, 2)
             
-            # Conv1
+            # 🔥 HYBRID CNN: 5×5 → 3×3 → 3×3 (use SiLU like in forward pass!)
+            
+            # Conv1 (5×5)
             x_pre = features_extractor.conv1(image)
-            x_pre = features_extractor.bn1(x_pre)
+            x_pre = features_extractor.norm1(x_pre)
             activation_data['conv1_pre'].extend(x_pre.flatten().cpu().numpy())
-            x = torch.nn.functional.gelu(x_pre)
+            x = torch.nn.functional.silu(x_pre)  # ✅ Use SiLU like in model!
             activation_data['conv1_post'].extend(x.flatten().cpu().numpy())
             conv1_activations.append(x.detach().cpu().numpy()[0])
             
-            # Conv2
+            # Conv2 (3×3)
             x_pre = features_extractor.conv2(x)
-            x_pre = features_extractor.bn2(x_pre)
-            x_pre = features_extractor.dropout2(x_pre)
+            x_pre = features_extractor.norm2(x_pre)
             activation_data['conv2_pre'].extend(x_pre.flatten().cpu().numpy())
-            x = torch.nn.functional.gelu(x_pre)
+            x = torch.nn.functional.silu(x_pre)  # ✅ Use SiLU
             activation_data['conv2_post'].extend(x.flatten().cpu().numpy())
             conv2_activations.append(x.detach().cpu().numpy()[0])
+            
+            # Conv3 (3×3 strided, NO MAXPOOL!) 🔥 NEW!
+            x_pre = features_extractor.conv3(x)
+            x_pre = features_extractor.norm3(x_pre)
+            activation_data['conv3_pre'].extend(x_pre.flatten().cpu().numpy())
+            x = torch.nn.functional.silu(x_pre)  # ✅ Use SiLU
+            x = features_extractor.dropout3(x)
+            activation_data['conv3_post'].extend(x.flatten().cpu().numpy())
+            conv3_activations.append(x.detach().cpu().numpy()[0])
         
         if (sample_idx + 1) % 20 == 0:
             print(f"  Processed {sample_idx + 1}/{num_samples} samples")
@@ -101,6 +114,7 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     # Convert to numpy
     conv1_activations = np.array(conv1_activations)
     conv2_activations = np.array(conv2_activations)
+    conv3_activations = np.array(conv3_activations)  # 🔥 NEW!
     
     for key in activation_data.keys():
         if activation_data[key]:
@@ -136,9 +150,10 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     
     conv1_stats = analyze_channels(conv1_activations, 'Conv1')
     conv2_stats = analyze_channels(conv2_activations, 'Conv2')
+    conv3_stats = analyze_channels(conv3_activations, 'Conv3')  # 🔥 NEW!
     
-    # Plot specialization (2x2 grid dla Conv1 i Conv2)
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    # Plot specialization (2x3 grid dla Conv1, Conv2, Conv3) - teraz 3 warstwy!
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
     
     # Conv1 - Mean activation
     channels_conv1 = [s['channel'] for s in conv1_stats]
@@ -164,6 +179,18 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     axes[0, 1].set_title('Conv2 - Channel Activity (Red = Dead)')
     axes[0, 1].grid(axis='y', alpha=0.3)
     
+    # Conv3 - Mean activation 🔥 NEW!
+    channels_conv3 = [s['channel'] for s in conv3_stats]
+    means_conv3 = [s['mean'] for s in conv3_stats]
+    dead_conv3 = [s['is_dead'] for s in conv3_stats]
+    colors_conv3 = ['red' if d else 'green' for d in dead_conv3]
+    
+    axes[0, 2].bar(channels_conv3, means_conv3, color=colors_conv3, alpha=0.7, edgecolor='black')
+    axes[0, 2].set_xlabel('Channel')
+    axes[0, 2].set_ylabel('Mean Activation')
+    axes[0, 2].set_title('Conv3 (Strided) - Channel Activity (Red = Dead)')
+    axes[0, 2].grid(axis='y', alpha=0.3)
+    
     # Sparsity plots
     sparsity_conv1 = [s['sparsity'] for s in conv1_stats]
     axes[1, 0].bar(channels_conv1, sparsity_conv1, color='#3498db', alpha=0.7, edgecolor='black')
@@ -179,6 +206,14 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     axes[1, 1].set_title('Conv2 - Sparsity per Channel')
     axes[1, 1].grid(axis='y', alpha=0.3)
     
+    # Conv3 sparsity 🔥 NEW!
+    sparsity_conv3 = [s['sparsity'] for s in conv3_stats]
+    axes[1, 2].bar(channels_conv3, sparsity_conv3, color='#3498db', alpha=0.7, edgecolor='black')
+    axes[1, 2].set_xlabel('Channel')
+    axes[1, 2].set_ylabel('Sparsity (% near-zero)')
+    axes[1, 2].set_title('Conv3 (Strided) - Sparsity per Channel')
+    axes[1, 2].grid(axis='y', alpha=0.3)
+    
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'channel_specialization.png'), dpi=150)
     plt.close()
@@ -188,7 +223,7 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     print("\n🔥 Analyzing activation saturation...")
     
     saturation_stats = {}
-    for layer_name in ['conv1', 'conv2']:
+    for layer_name in ['conv1', 'conv2', 'conv3']:  # 🔥 Include conv3!
         pre_key = f'{layer_name}_pre'
         post_key = f'{layer_name}_post'
         
@@ -320,15 +355,20 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
             # Forward pass to get CNN paths
             x = image
             x = features_extractor.conv1(x)
-            x = features_extractor.bn1(x)
+            x = features_extractor.norm1(x)
             x = torch.nn.functional.silu(x)
             
             x = features_extractor.conv2(x)
-            x = features_extractor.bn2(x)
-            x = features_extractor.dropout2(x)
+            x = features_extractor.norm2(x)
             x = torch.nn.functional.silu(x)
             
-            x = features_extractor.maxpool(x)
+            x = features_extractor.conv3(x)
+            x = features_extractor.norm3(x)
+            x = torch.nn.functional.silu(x)
+            x = features_extractor.dropout3(x)
+            
+            # 🔥 NO MAXPOOL! Downsampling done by strided conv
+            
             x = features_extractor.pos_encoding(x)
             
             spatial_features = x.flatten(2).transpose(1, 2)
@@ -357,9 +397,32 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
             if scalars_enabled and features_extractor.cnn_direct is not None:
                 direct = features_extractor.cnn_direct(spatial_features_flat)
                 direct_cnn_activations.append(direct.detach().cpu().numpy()[0])
+            elif not scalars_enabled and hasattr(features_extractor, 'cnn_only_direct') and features_extractor.cnn_only_direct is not None:
+                # CNN-only: use cnn_only_direct compression
+                direct = features_extractor.cnn_only_direct(spatial_features_flat)
+                direct_cnn_activations.append(direct.detach().cpu().numpy()[0])
             else:
-                # CNN-only: use raw spatial features
-                direct_cnn_activations.append(spatial_features_flat.detach().cpu().numpy()[0])
+                # Fallback for old models: detect expected fusion input size
+                # We need to compute attended_cnn first to know its size
+                attended_size = attended_cnn_activations[-1].shape[0] if attended_cnn_activations else 0
+                scalar_size = 0  # No scalars in CNN-only mode
+                
+                expected_fusion_size = features_extractor.fusion[0].in_features
+                current_size = attended_size + spatial_features_flat.shape[-1] + scalar_size
+                
+                if current_size > expected_fusion_size:
+                    # Need compression
+                    direct_size = expected_fusion_size - attended_size - scalar_size
+                    if not hasattr(features_extractor, '_temp_direct_projection'):
+                        features_extractor._temp_direct_projection = torch.nn.Linear(
+                            spatial_features_flat.shape[-1], 
+                            direct_size,
+                            device=spatial_features_flat.device
+                        )
+                    direct = features_extractor._temp_direct_projection(spatial_features_flat)
+                    direct_cnn_activations.append(direct.detach().cpu().numpy()[0])
+                else:
+                    direct_cnn_activations.append(spatial_features_flat.detach().cpu().numpy()[0])
     
     attended_cnn_activations = np.array(attended_cnn_activations) if attended_cnn_activations else np.array([])
     direct_cnn_activations = np.array(direct_cnn_activations) if direct_cnn_activations else np.array([])
@@ -510,26 +573,38 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
         if image.dim() == 4 and image.shape[-1] == 1:
             image = image.permute(0, 3, 1, 2)
         
-        # Conv1
+        # 🔥 HYBRID CNN: 5×5 → 3×3 → 3×3
+        
+        # Conv1 (5×5)
         x = features_extractor.conv1(image)
-        x = features_extractor.bn1(x)
+        x = features_extractor.norm1(x)
         x = torch.nn.functional.silu(x)
         conv1_out = x[0].cpu().numpy()
         
-        # Conv2
+        # Conv2 (3×3)
         x = features_extractor.conv2(x)
-        x = features_extractor.bn2(x)
-        x = features_extractor.dropout2(x)
+        x = features_extractor.norm2(x)
         x = torch.nn.functional.silu(x)
         conv2_out = x[0].cpu().numpy()
         
+        # Conv3 (3×3 strided, NO MAXPOOL!) 🔥 NEW!
+        x = features_extractor.conv3(x)
+        x = features_extractor.norm3(x)
+        x = torch.nn.functional.silu(x)
+        x = features_extractor.dropout3(x)
+        conv3_out = x[0].cpu().numpy()
+        
         # Visualize Conv1 (first 16 channels)
-        visualize_conv_layer(conv1_out, 'Conv1 Output', 
+        visualize_conv_layer(conv1_out, 'Conv1 Output (5×5)', 
                             os.path.join(viz_dir, 'conv1_sample.png'), num_channels=16)
         
         # Visualize Conv2 (first 16 channels)
-        visualize_conv_layer(conv2_out, 'Conv2 Output',
+        visualize_conv_layer(conv2_out, 'Conv2 Output (3×3)',
                             os.path.join(viz_dir, 'conv2_sample.png'), num_channels=16)
+        
+        # Visualize Conv3 (first 16 channels) 🔥 NEW!
+        visualize_conv_layer(conv3_out, 'Conv3 Output (3×3 Strided)',
+                            os.path.join(viz_dir, 'conv3_sample.png'), num_channels=16)
         
         print(f"✅ Sample visualizations saved in {viz_dir}")
     
@@ -540,11 +615,13 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
         writer.writerow(['layer', 'num_channels', 'dead_channels', 'dead_pct', 
                         'saturation_rate', 'dead_neuron_rate', 'status'])
         
-        for layer_name in ['conv1', 'conv2']:
+        for layer_name in ['conv1', 'conv2', 'conv3']:  # 🔥 Include conv3!
             if layer_name == 'conv1':
                 stats_list = conv1_stats
             elif layer_name == 'conv2':
                 stats_list = conv2_stats
+            elif layer_name == 'conv3':  # 🔥 NEW!
+                stats_list = conv3_stats
             else:
                 continue
             
@@ -587,9 +664,11 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     
     dead_conv1_count = sum(dead_conv1)
     dead_conv2_count = sum(dead_conv2)
+    dead_conv3_count = sum(dead_conv3)  # 🔥 NEW!
     
     print(f"Conv1: {dead_conv1_count}/{len(conv1_stats)} dead channels ({dead_conv1_count/len(conv1_stats)*100:.1f}%)")
     print(f"Conv2: {dead_conv2_count}/{len(conv2_stats)} dead channels ({dead_conv2_count/len(conv2_stats)*100:.1f}%)")
+    print(f"Conv3: {dead_conv3_count}/{len(conv3_stats)} dead channels ({dead_conv3_count/len(conv3_stats)*100:.1f}%)  [Strided Conv]")
     
     high_saturation = [name for name in layers if saturation_stats[name]['saturation_rate_pre'] > 30]
     high_dead = [name for name in layers if saturation_stats[name]['dead_rate'] > 30]

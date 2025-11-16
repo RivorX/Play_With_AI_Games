@@ -56,19 +56,26 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             if image.dim() == 4 and image.shape[-1] == 1:
                 image = image.permute(0, 3, 1, 2)
             
-            # CNN - 5×5 kernels with MaxPool
+            # 🔥 HYBRID CNN: 5×5 → 3×3 → 3×3 (BEST OF BOTH!)
             x = image
+            
+            # Block 1: Fast global context with 5×5 (RF: 5×5)
             x = features_extractor.conv1(x)
-            x = features_extractor.bn1(x)
+            x = features_extractor.norm1(x)
             x = torch.nn.functional.silu(x)
             
+            # Block 2: Local refinement with 3×3 (RF: 7×7)
             x = features_extractor.conv2(x)
-            x = features_extractor.bn2(x)
-            x = features_extractor.dropout2(x)
+            x = features_extractor.norm2(x)
             x = torch.nn.functional.silu(x)
             
-            # Explicit MaxPool
-            x = features_extractor.maxpool(x)
+            # Block 3: Final features + STRIDED DOWNSAMPLE with 3×3 (RF: 9×9)
+            x = features_extractor.conv3(x)
+            x = features_extractor.norm3(x)
+            x = torch.nn.functional.silu(x)
+            x = features_extractor.dropout3(x)
+            
+            # 🔥 NO MAXPOOL! Downsampling done by strided conv
             
             # 🆕 POSITIONAL ENCODING
             x = features_extractor.pos_encoding(x)
@@ -106,9 +113,28 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             if scalars_enabled and features_extractor.cnn_direct is not None:
                 # With scalars: use compressed direct CNN
                 direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
+            elif not scalars_enabled and hasattr(features_extractor, 'cnn_only_direct') and features_extractor.cnn_only_direct is not None:
+                # CNN-ONLY: use cnn_only_direct compression
+                direct_cnn = features_extractor.cnn_only_direct(spatial_features_flat)
             else:
-                # Without scalars: use raw spatial features directly
-                direct_cnn = spatial_features_flat
+                # Fallback for old models: detect expected fusion input size
+                # Old models: fusion expects 1024 (512 attended + 512 direct)
+                # But we have 1728 raw features, so we need to compress
+                expected_fusion_size = features_extractor.fusion[0].in_features
+                current_size = attended_cnn.shape[-1] + spatial_features_flat.shape[-1] + scalar_features.shape[-1]
+                
+                if current_size > expected_fusion_size:
+                    # Need compression - create temporary linear layer
+                    direct_size = expected_fusion_size - attended_cnn.shape[-1] - scalar_features.shape[-1]
+                    if not hasattr(features_extractor, '_temp_direct_projection'):
+                        features_extractor._temp_direct_projection = torch.nn.Linear(
+                            spatial_features_flat.shape[-1], 
+                            direct_size,
+                            device=spatial_features_flat.device
+                        )
+                    direct_cnn = features_extractor._temp_direct_projection(spatial_features_flat)
+                else:
+                    direct_cnn = spatial_features_flat
             
             # ==================== FUSION - THREE STREAMS ====================
             fused = torch.cat([attended_cnn, direct_cnn, scalar_features], dim=-1)
@@ -261,15 +287,20 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     # CNN
     x = image_grad
     x = features_extractor.conv1(x)
-    x = features_extractor.bn1(x)
+    x = features_extractor.norm1(x)
     x = torch.nn.functional.silu(x)
     
     x = features_extractor.conv2(x)
-    x = features_extractor.bn2(x)
-    x = features_extractor.dropout2(x)
+    x = features_extractor.norm2(x)
     x = torch.nn.functional.silu(x)
     
-    x = features_extractor.maxpool(x)
+    x = features_extractor.conv3(x)
+    x = features_extractor.norm3(x)
+    x = torch.nn.functional.silu(x)
+    x = features_extractor.dropout3(x)
+    
+    # 🔥 NO MAXPOOL! Downsampling done by strided conv in conv3
+    
     x = features_extractor.pos_encoding(x)
     
     spatial_features = x.flatten(2).transpose(1, 2)
@@ -311,7 +342,26 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
         spatial_features_flat = spatial_features.flatten(1)
         spatial_features_flat.retain_grad()
         
-        direct_cnn = spatial_features_flat  # Raw features, but track gradients
+        # ✅ Use cnn_only_direct compression for CNN-ONLY mode
+        if hasattr(features_extractor, 'cnn_only_direct') and features_extractor.cnn_only_direct is not None:
+            direct_cnn = features_extractor.cnn_only_direct(spatial_features_flat)
+        else:
+            # Fallback for old models: detect expected fusion input size
+            expected_fusion_size = features_extractor.fusion[0].in_features
+            current_size = attended_cnn.shape[-1] + spatial_features_flat.shape[-1] + scalar_features.shape[-1]
+            
+            if current_size > expected_fusion_size:
+                # Need compression
+                direct_size = expected_fusion_size - attended_cnn.shape[-1] - scalar_features.shape[-1]
+                if not hasattr(features_extractor, '_temp_direct_projection'):
+                    features_extractor._temp_direct_projection = torch.nn.Linear(
+                        spatial_features_flat.shape[-1], 
+                        direct_size,
+                        device=spatial_features_flat.device
+                    )
+                direct_cnn = features_extractor._temp_direct_projection(spatial_features_flat)
+            else:
+                direct_cnn = spatial_features_flat
         direct_cnn.retain_grad()
         
         attended_cnn.retain_grad()
@@ -380,11 +430,12 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx, 
     """
     Wizualizuje output wszystkich warstw CNN + Attention + Skip Connection
     🆕 UPDATED: Fixed CNN Architecture with Skip Connection (Direct CNN Path)
-    ✅ FIXED: Obsługuje tryb z i bez scalarów
+    ✅ FIXED: Obsługuje 3 warstwy CNN (5×5 → 3×3 → 3×3) bez MaxPool
     
-    Dwa główne ścieżki:
+    Trzy główne ścieżki:
     PATH 1 (Attention): CNN → Prenorm → Attention → 448 dim (gdy scalary enabled)
     PATH 2 (Skip): CNN → Direct projection → 256 dim ✨ NEW!
+    PATH 3 (Scalars): Scalar network → 256 dim
     """
     # 🎯 DETECT SCALARS MODE
     scalars_enabled = features_extractor.scalars_enabled
@@ -396,21 +447,28 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx, 
 
         x = image
 
-        # Conv1
-        x = features_extractor.conv1(x)
-        x = features_extractor.bn1(x)
+        # 🔥 HYBRID CNN: 5×5 → 3×3 → 3×3
+        
+        # Conv1: Fast global context with 5×5 (RF: 5×5)
+        x = features_extractor.conv1(image)
+        x = features_extractor.norm1(x)
         x = torch.nn.functional.silu(x)
         conv1_output = x[0].cpu().numpy()
 
-        # Conv2
+        # Conv2: Local refinement with 3×3 (RF: 7×7)
         x = features_extractor.conv2(x)
-        x = features_extractor.bn2(x)
-        x = features_extractor.dropout2(x)
+        x = features_extractor.norm2(x)
         x = torch.nn.functional.silu(x)
         conv2_output = x[0].cpu().numpy()
         
-        # MaxPool
-        x = features_extractor.maxpool(x)
+        # Conv3: Final features + STRIDED DOWNSAMPLE with 3×3 (RF: 9×9)
+        x = features_extractor.conv3(x)
+        x = features_extractor.norm3(x)
+        x = torch.nn.functional.silu(x)
+        x = features_extractor.dropout3(x)
+        conv3_output = x[0].cpu().numpy()
+        
+        # 🔥 NO MAXPOOL! Downsampling done by strided conv in conv3
         
         # Positional Encoding
         x = features_extractor.pos_encoding(x)
@@ -419,6 +477,7 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx, 
         activations = {
             'conv1_output': conv1_output,
             'conv2_output': conv2_output,
+            'conv3_output': conv3_output,
             'pos_encoded': pos_encoded_output
         }
         
@@ -450,10 +509,31 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx, 
             direct_cnn = features_extractor.cnn_direct(spatial_features_flat)
             activations['direct_cnn'] = direct_cnn[0].cpu().numpy()
         else:
-            # CNN-ONLY: no attention, no scalars, use raw spatial features
+            # CNN-ONLY: no attention, no scalars
             attended_cnn = torch.zeros(1, 0, device=features_extractor.conv1.weight.device)
             scalar_features = torch.zeros(1, 0, device=features_extractor.conv1.weight.device)
-            direct_cnn = spatial_features_flat  # Use full spatial features!
+            
+            # ✅ Use cnn_only_direct compression for CNN-ONLY mode
+            if hasattr(features_extractor, 'cnn_only_direct') and features_extractor.cnn_only_direct is not None:
+                direct_cnn = features_extractor.cnn_only_direct(spatial_features_flat)
+            else:
+                # Fallback for old models: detect expected fusion input size
+                expected_fusion_size = features_extractor.fusion[0].in_features
+                current_size = attended_cnn.shape[-1] + spatial_features_flat.shape[-1] + scalar_features.shape[-1]
+                
+                if current_size > expected_fusion_size:
+                    # Need compression
+                    direct_size = expected_fusion_size - attended_cnn.shape[-1] - scalar_features.shape[-1]
+                    if not hasattr(features_extractor, '_temp_direct_projection'):
+                        features_extractor._temp_direct_projection = torch.nn.Linear(
+                            spatial_features_flat.shape[-1], 
+                            direct_size,
+                            device=spatial_features_flat.device
+                        )
+                    direct_cnn = features_extractor._temp_direct_projection(spatial_features_flat)
+                else:
+                    direct_cnn = spatial_features_flat
+            
             activations['scalar'] = np.array([])
             activations['attended_cnn'] = np.array([])
             activations['direct_cnn'] = direct_cnn[0].cpu().numpy()
@@ -465,23 +545,31 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx, 
 
     # ==================== WIZUALIZACJA ====================
 
-    # 1. CONV1 OUTPUT
+    # 1. CONV1 OUTPUT (5×5)
     visualize_conv_layer(
         activations['conv1_output'],
-        layer_name='Conv1 Output (5×5 kernel)',
+        layer_name='Conv1 Output (5×5 kernel, RF=5×5)',
         output_path=os.path.join(output_dir, f'cnn_conv1_state_{state_idx}.png'),
         num_channels=min(16, activations['conv1_output'].shape[0])
     )
 
-    # 2. CONV2 OUTPUT
+    # 2. CONV2 OUTPUT (3×3)
     visualize_conv_layer(
         activations['conv2_output'],
-        layer_name='Conv2 Output (5×5 kernel)',
+        layer_name='Conv2 Output (3×3 kernel, RF=7×7)',
         output_path=os.path.join(output_dir, f'cnn_conv2_state_{state_idx}.png'),
         num_channels=min(16, activations['conv2_output'].shape[0])
     )
     
-    # 3. POSITIONAL ENCODING
+    # 3. CONV3 OUTPUT (3×3 strided, RF=9×9) 🔥 NEW!
+    visualize_conv_layer(
+        activations['conv3_output'],
+        layer_name='Conv3 Output (3×3 strided kernel, RF=9×9, stride=2)',
+        output_path=os.path.join(output_dir, f'cnn_conv3_state_{state_idx}.png'),
+        num_channels=min(16, activations['conv3_output'].shape[0])
+    )
+    
+    # 4. POSITIONAL ENCODING
     visualize_conv_layer(
         activations['pos_encoded'],
         layer_name='After Positional Encoding',
@@ -489,7 +577,7 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx, 
         num_channels=min(16, activations['pos_encoded'].shape[0])
     )
 
-    # 4. BOTH CNN PATHS COMPARISON (1D) - 🔥 NEW!
+    # 5. BOTH CNN PATHS COMPARISON (1D) - 🔥 NEW!
     paths_dict = {}
     
     if scalars_enabled:
@@ -503,7 +591,7 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx, 
         state_idx=state_idx
     )
 
-    # 5. FUSION WITH ALL STREAMS (1D features)
+    # 6. FUSION WITH ALL STREAMS (1D features)
     fusion_dict = {}
     
     if scalars_enabled and activations['scalar'].size > 0:
@@ -517,11 +605,11 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx, 
         state_idx=state_idx
     )
 
-    # 6. HEATMAPA WSZYSTKICH KANAŁÓW CONV2
+    # 7. HEATMAPA WSZYSTKICH KANAŁÓW CONV3 (final features before pos enc)
     visualize_all_channels_heatmap(
-        activations['conv2_output'],
-        layer_name='Conv2 All Channels',
-        output_path=os.path.join(output_dir, f'cnn_conv2_all_channels_state_{state_idx}.png')
+        activations['conv3_output'],
+        layer_name='Conv3 All Channels (Final CNN features)',
+        output_path=os.path.join(output_dir, f'cnn_conv3_all_channels_state_{state_idx}.png')
     )
 
     print(f'  ✅ CNN+Attention+Skip Connection visualization zapisana dla stanu {state_idx}')

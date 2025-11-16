@@ -108,8 +108,17 @@ plot_activation_overview(
 # ===================================================
 # CZĘŚĆ 2: ANALIZA CNN (channels, saturation, specialization)
 # ===================================================
-print("\n[2/5] 🔍 Analiza warstw CNN (channels, saturation, specialization)...")
+print("\n[2/6] 🔍 Analiza warstw CNN (channels, saturation, specialization)...")
 analyze_cnn_layers(
+    model=model,
+    env=env,
+    output_dir=subdirs['cnn'],
+    num_samples=100
+)
+
+print("\n[2.5/6] 🔬 Analiza aktywacji kanałów CNN (Conv1/Conv2/Conv3)...")
+from utils.analyze_channels import analyze_conv_channels_detailed
+analyze_conv_channels_detailed(
     model=model,
     env=env,
     output_dir=subdirs['cnn'],
@@ -119,7 +128,7 @@ analyze_cnn_layers(
 # ===================================================
 # CZĘŚĆ 3: ANALIZA GRADIENTÓW (bottlenecks, gradient flow)
 # ===================================================
-print("\n[3/5] 🌊 Analiza przepływu gradientów...")
+print("\n[3/6] 🌊 Analiza przepływu gradientów...")
 bottleneck_report = analyze_bottlenecks(
     layer_gradients=layer_gradients,
     action_names=action_names,
@@ -136,7 +145,7 @@ analyze_gradient_flow_detailed(
 # ===================================================
 # CZĘŚĆ 4: ANALIZA LSTM (memory, temporal patterns, forgetting)
 # ===================================================
-print("\n[4/5] 🧠 Kompleksowa analiza LSTM...")
+print("\n[4/6] 🧠 Kompleksowa analiza LSTM...")
 analyze_lstm_comprehensive(
     model=model,
     env=env,
@@ -149,7 +158,7 @@ analyze_lstm_comprehensive(
 # ===================================================
 # CZĘŚĆ 5: ANALIZA WYDAJNOŚCI (critical moments, feature importance, uncertainty)
 # ===================================================
-print("\n[5/5] 🎯 Analiza wydajności i zachowań modelu...")
+print("\n[5/6] 🎯 Analiza wydajności i zachowań modelu...")
 analyze_performance_metrics(
     model=model,
     env=env,
@@ -170,7 +179,7 @@ print("="*80)
 print(f"\n📂 Wyniki analizy zapisane w:")
 print(f"   {output_dir}/")
 print(f"   ├── 01_basic_analysis/         📊 Podstawowe aktywacje i viewport")
-print(f"   ├── 02_cnn_layers/             🔍 Analiza warstw CNN")
+print(f"   ├── 02_cnn_layers/             🔍 Analiza warstw CNN + kanałów")
 print(f"   ├── 03_gradient_flow/          🌊 Przepływ gradientów")
 print(f"   ├── 04_lstm_memory/            🧠 Pamięć i wzorce temporalne")
 print(f"   └── 05_performance/            🎯 Wydajność i zachowania")
@@ -190,6 +199,7 @@ print("   - cnn_paths_comparison.png: ✨ Porównanie Attention vs Skip Connecti
 print("   - channel_specialization.png: aktywne vs martwe kanały")
 print("   - activation_saturation.png: saturacja GELU")
 print("   - conv_visualizations/: filtry CNN dla każdej warstwy")
+print("   - all_conv_channels_analysis.png: 🔬 Analiza wszystkich kanałów (Conv1/2/3)")
 
 print("\n🌊 GRADIENT FLOW:")
 print("   - bottleneck_analysis_split.png: bottlenecki per sekcja")
