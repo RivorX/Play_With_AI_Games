@@ -480,6 +480,9 @@ class SnakeEnv(gym.Env):
         canvas = pygame.Surface((self.grid_size * snake_size, self.grid_size * snake_size))
         canvas.fill((0, 0, 0))
         
+        # Store canvas as screen for external access (e.g., GIF recording)
+        self.screen = canvas
+        
         # Draw food
         food_rect = pygame.Rect(
             self.food[1] * snake_size,
