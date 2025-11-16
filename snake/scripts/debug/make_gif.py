@@ -7,18 +7,159 @@ from pathlib import Path
 import imageio
 import numpy as np
 import pygame
+import torch
 from sb3_contrib import RecurrentPPO
+import yaml
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from model import make_env
+from cnn import CustomFeaturesExtractor
 
 
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
-def capture_run_as_gif(model_path, grid_size, episodes, out_path, fps=10, max_frames=1000, death_pause_duration=3.0):
+def select_grid_size_interactive(default_size=8):
+    """
+    🎯 Interaktywny wybór rozmiaru siatki
+    
+    Returns:
+        int: Wybrany rozmiar siatki
+    """
+    print(f"\n{'='*70}")
+    print(f"[GRID SIZE SELECTION]")
+    print(f"{'='*70}")
+    print(f"  [1] 🟩 8x8   (Easy - Mała siatka)")
+    print(f"  [2] 🟦 12x12 (Medium)")
+    print(f"  [3] 🟨 16x16 (Hard - Duża siatka)")
+    print(f"  [4] 🟪 Custom (Własny rozmiar)")
+    print(f"{'='*70}")
+    
+    while True:
+        choice = input(f"\nWybierz rozmiar siatki [1-4] (default: {default_size}x{default_size}): ").strip()
+        
+        if choice == '' or choice == '0':
+            print(f"✅ Używam domyślnego: {default_size}x{default_size}\n")
+            return default_size
+        elif choice == '1':
+            return 8
+        elif choice == '2':
+            return 12
+        elif choice == '3':
+            return 16
+        elif choice == '4':
+            while True:
+                try:
+                    custom = input("Podaj rozmiar siatki (4-32): ").strip()
+                    custom_size = int(custom)
+                    if 4 <= custom_size <= 32:
+                        return custom_size
+                    else:
+                        print("❌ Rozmiar musi być między 4 a 32.")
+                except ValueError:
+                    print("❌ Nieprawidłowa wartość. Podaj liczbę.")
+        else:
+            print("❌ Nieprawidłowy wybór. Wybierz 1-4 lub Enter dla domyślnego.")
+
+
+def load_model_interactive(model_path, policy_path, base_dir):
+    """
+    🎯 Interaktywny wybór źródła modelu
+    
+    Returns:
+        tuple: (model, source_name)
+    """
+    has_full_model = os.path.exists(model_path)
+    has_best_model = os.path.exists(base_dir / 'models' / 'best_model.zip')
+    has_policy = os.path.exists(policy_path)
+    
+    print(f"\n{'='*70}")
+    print(f"[MODEL SOURCE SELECTION]")
+    print(f"{'='*70}")
+    
+    options = []
+    
+    if has_best_model:
+        options.append(('1', 'best_model.zip', base_dir / 'models' / 'best_model.zip'))
+        print(f"  [1] 🏆 best_model.zip (najlepszy model z treningu)")
+    
+    if has_full_model and str(model_path) != str(base_dir / 'models' / 'best_model.zip'):
+        options.append(('2', 'snake_ppo_model.zip', model_path))
+        print(f"  [2] 📦 snake_ppo_model.zip (ostatni checkpoint)")
+    
+    if has_policy:
+        key = str(len(options) + 1)
+        options.append((key, 'policy.pth', policy_path))
+        print(f"  [{key}] 🎯 policy.pth (tylko wagi sieci)")
+    
+    print(f"{'='*70}")
+    
+    if not options:
+        raise FileNotFoundError("Nie znaleziono żadnego modelu! Sprawdź folder models/")
+    
+    if len(options) == 1:
+        choice = options[0][0]
+        print(f"\n✅ Automatycznie wybrany: {options[0][1]}\n")
+    else:
+        while True:
+            choice = input("\nWybierz źródło modelu [1-{}]: ".format(len(options))).strip()
+            if any(choice == opt[0] for opt in options):
+                break
+            print(f"❌ Nieprawidłowy wybór. Wybierz 1-{len(options)}.")
+    
+    selected = next(opt for opt in options if opt[0] == choice)
+    source_name = selected[1]
+    source_path = selected[2]
+    
+    print(f"\n🎬 Ładowanie: {source_name}...")
+    
+    # Załaduj model
+    if source_name == 'policy.pth':
+        # Wczytaj config
+        config_path = base_dir / 'config' / 'config.yaml'
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        
+        # Stwórz env do sprawdzenia observation_space
+        temp_env = make_env(render_mode=None, grid_size=8)()
+        
+        # Stwórz pusty model
+        policy_kwargs = config['model']['policy_kwargs'].copy()
+        policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
+        
+        model = RecurrentPPO(
+            config['model']['policy'],
+            temp_env,
+            learning_rate=0.0001,
+            n_steps=config['model']['n_steps'],
+            batch_size=config['training']['batch_size'],
+            n_epochs=config['model']['n_epochs'],
+            gamma=config['model']['gamma'],
+            gae_lambda=config['model']['gae_lambda'],
+            clip_range=config['model']['clip_range'],
+            ent_coef=config['model']['ent_coef'],
+            vf_coef=config['model']['vf_coef'],
+            policy_kwargs=policy_kwargs,
+            verbose=0,
+            device=config['model']['device']
+        )
+        
+        # Załaduj wagi
+        state_dict = torch.load(source_path, map_location=config['model']['device'])
+        model.policy.load_state_dict(state_dict)
+        
+        temp_env.close()
+        print(f"✅ Załadowano policy.pth\n")
+    else:
+        model = RecurrentPPO.load(source_path)
+        print(f"✅ Załadowano {source_name}\n")
+    
+    return model, source_name
+
+
+def capture_run_as_gif(model, grid_size, episodes, out_path, fps=10, max_frames=1000, death_pause_duration=3.0):
     """
     Nagrywa gameplay jako GIF z ulepszonymi funkcjami:
     - Automatyczne czyszczenie folderu tymczasowego
@@ -26,13 +167,11 @@ def capture_run_as_gif(model_path, grid_size, episodes, out_path, fps=10, max_fr
     - Pauza 3s na ostatniej klatce gdy wąż zginie
     
     Args:
+        model: Załadowany model RecurrentPPO
         death_pause_duration: Czas (w sekundach) pauzy na ostatniej klatce gdy wąż zginie
     """
     # Przygotuj env
     env = make_env(render_mode="human", grid_size=grid_size)()
-
-    # Załaduj model
-    model = RecurrentPPO.load(model_path)
 
     # Folder na klatki
     base_dir = Path(__file__).resolve().parents[2]
@@ -49,6 +188,9 @@ def capture_run_as_gif(model_path, grid_size, episodes, out_path, fps=10, max_fr
             obs, _ = env.reset()
             done = False
             steps = 0
+            
+            # Initialize rendering before first frame
+            env.render()
 
             while not done and len(frame_files) < max_frames:
                 # Predict action
@@ -57,8 +199,9 @@ def capture_run_as_gif(model_path, grid_size, episodes, out_path, fps=10, max_fr
 
                 # render to screen and capture surface
                 env.render()
-                # pygame surface -> array
-                surf = env.env.screen if hasattr(env, 'env') and getattr(env.env, 'screen', None) is not None else env.screen
+                
+                # Get screen surface - env.screen is set in _render_frame()
+                surf = env.screen
                 arr = pygame.surfarray.array3d(surf)
                 # array3d returns (W,H,3) with x horizontal; convert to HxW and flip axes
                 arr = np.transpose(arr, (1, 0, 2))
@@ -123,9 +266,7 @@ def capture_run_as_gif(model_path, grid_size, episodes, out_path, fps=10, max_fr
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Capture Snake model run as GIF')
-    parser.add_argument('--model_path', type=str, required=False,
-                        help='Path to RL model (zip/pkl). If omitted uses default best_model.zip in models dir')
-    parser.add_argument('--grid_size', type=int, default=8)
+    parser.add_argument('--grid_size', type=int, default=None, help='Grid size (if not provided, will prompt)')
     parser.add_argument('--episodes', type=int, default=1)
     parser.add_argument('--out', type=str, default=None, help='Output GIF path')
     parser.add_argument('--fps', type=int, default=8)
@@ -134,23 +275,30 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parents[2]
-    if args.model_path is None:
-        default_model = base_dir / 'models' / 'best_model.zip'
-        model_path = str(default_model)
+    default_model_path = base_dir / 'models' / 'snake_ppo_model.zip'
+    policy_path = base_dir / 'models' / 'policy.pth'
+    
+    # 🎯 Interaktywny wybór modelu
+    model, source_name = load_model_interactive(default_model_path, policy_path, base_dir)
+    
+    # 🎯 Interaktywny wybór rozmiaru siatki
+    if args.grid_size is None:
+        grid_size = select_grid_size_interactive(default_size=8)
     else:
-        model_path = args.model_path
+        grid_size = args.grid_size
+        print(f"\n✅ Używam rozmiaru z argumentu: {grid_size}x{grid_size}\n")
 
-    # ✅ Automatyczna nazwa z rozmiarem siatki
+    # ✅ Automatyczna nazwa z rozmiarem siatki (bez tagu źródła)
     if args.out is None:
-        out_path = base_dir / 'logs' / f'snake_run_{args.grid_size}.gif'
+        out_path = base_dir / 'logs' / f'snake_run_{grid_size}.gif'
     else:
         out_path = Path(args.out)
 
     out_path = str(out_path)
 
     print(f"🎬 Rozpoczynam nagrywanie GIF...")
-    print(f"   Model: {model_path}")
-    print(f"   Grid: {args.grid_size}")
+    print(f"   Source: {source_name}")
+    print(f"   Grid: {grid_size}x{grid_size}")
     print(f"   Episodes: {args.episodes}")
     print(f"   FPS: {args.fps}")
     print(f"   Death pause: {args.death_pause}s")
@@ -158,8 +306,8 @@ if __name__ == '__main__':
     print()
     
     gif = capture_run_as_gif(
-        model_path, 
-        args.grid_size, 
+        model,
+        grid_size, 
         args.episodes, 
         out_path, 
         fps=args.fps,
