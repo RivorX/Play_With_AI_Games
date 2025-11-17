@@ -628,13 +628,13 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     axes[0, 0].bar(x + width, features_rms, width, label='Fused RMS', color='#2ecc71')
     axes[0, 0].set_xlabel('Stan')
     axes[0, 0].set_ylabel('RMS Magnitude')
-    axes[0, 0].set_title('🔥 Siła Sygnału (RMS) - CNN vs Scalars')
+    axes[0, 0].set_title('Sila Sygnalu (RMS) - CNN vs Scalars')
     axes[0, 0].set_xticks(x)
     axes[0, 0].set_xticklabels([f'Stan {s}' for s in states])
     axes[0, 0].legend()
     axes[0, 0].grid(axis='y', alpha=0.3)
     
-    # 📊 SUBPLOT 2: Max Absolute Value (peak responses)
+    # SUBPLOT 2: Max Absolute Value (peak responses)
     cnn_max = [d['cnn_absmax'] for d in detailed_activations]
     scalar_max = [d['scalar_absmax'] for d in detailed_activations]
     
@@ -642,13 +642,13 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     axes[0, 1].bar(x + width/2, scalar_max, width, label='Scalar Max', color='#3498db')
     axes[0, 1].set_xlabel('Stan')
     axes[0, 1].set_ylabel('Max |Activation|')
-    axes[0, 1].set_title('⚡ Peak Responses')
+    axes[0, 1].set_title('Peak Responses')
     axes[0, 1].set_xticks(x)
     axes[0, 1].set_xticklabels([f'Stan {s}' for s in states])
     axes[0, 1].legend()
     axes[0, 1].grid(axis='y', alpha=0.3)
     
-    # 📊 SUBPLOT 3: Active Neuron Ratio (% neurons > threshold)
+    # SUBPLOT 3: Active Neuron Ratio (% neurons > threshold)
     cnn_active = [d['cnn_active_ratio'] * 100 for d in detailed_activations]
     scalar_active = [d['scalar_active_ratio'] * 100 for d in detailed_activations]
     
@@ -656,7 +656,7 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     axes[1, 0].bar(x + width/2, scalar_active, width, label='Scalar Active %', color='#3498db')
     axes[1, 0].set_xlabel('Stan')
     axes[1, 0].set_ylabel('Active Neurons (%)')
-    axes[1, 0].set_title('🎯 Sparsity (% neurons |x| > 0.01)')
+    axes[1, 0].set_title('Sparsity (% neurons |x| > 0.01)')
     axes[1, 0].set_xticks(x)
     axes[1, 0].set_xticklabels([f'Stan {s}' for s in states])
     axes[1, 0].legend()
