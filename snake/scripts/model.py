@@ -327,7 +327,7 @@ class SnakeEnv(gym.Env):
         half_vp = self.viewport_size // 2
         
         # Reuse viewport array (faster than np.zeros)
-        self.viewport_array.fill(0.0)
+        self.viewport_array.fill(0.0)  # Empty cells = 0.0
         
         # Calculate viewport bounds
         start_x = head_x - half_vp
@@ -336,11 +336,10 @@ class SnakeEnv(gym.Env):
         # Vectorized wall drawing
         for i in range(self.viewport_size):
             for j in range(self.viewport_size):
-                grid_x = start_x + i
-                grid_y = start_y + j
-                
-                if grid_x < 0 or grid_x >= self.grid_size or grid_y < 0 or grid_y >= self.grid_size:
-                    self.viewport_array[i, j] = -1.0
+                world_x = start_x + j
+                world_y = start_y + i
+                if not (0 <= world_x < self.grid_size and 0 <= world_y < self.grid_size):
+                    self.viewport_array[i, j] = 0.25  # Normalized: wall = 0.25
         
         # 🚀 CPU OPTIMIZATION: Draw body without converting deque to list
         # Use itertools.islice instead of list() to avoid memory allocation
@@ -349,20 +348,22 @@ class SnakeEnv(gym.Env):
             vp_x = seg_x - start_x
             vp_y = seg_y - start_y
             if 0 <= vp_x < self.viewport_size and 0 <= vp_y < self.viewport_size:
-                self.viewport_array[vp_x, vp_y] = 0.5
+                self.viewport_array[vp_y, vp_x] = 0.33  # Normalized: body = 0.33
         
         # Draw head
         vp_head_x = head_x - start_x
         vp_head_y = head_y - start_y
         if 0 <= vp_head_x < self.viewport_size and 0 <= vp_head_y < self.viewport_size:
-            self.viewport_array[vp_head_x, vp_head_y] = 1.0
+            self.viewport_array[vp_head_y, vp_head_x] = 0.67  # Normalized: head = 0.67
+        
+
         
         # Draw food
         food_x, food_y = self.food
         vp_food_x = food_x - start_x
         vp_food_y = food_y - start_y
         if 0 <= vp_food_x < self.viewport_size and 0 <= vp_food_y < self.viewport_size:
-            self.viewport_array[vp_food_x, vp_food_y] = 0.75
+            self.viewport_array[vp_food_y, vp_food_x] = 1.0  # Normalized: food = 1.0 (brightest)
         
         # Channel (H, W, 1)
         obs_image = np.expand_dims(self.viewport_array, axis=-1)

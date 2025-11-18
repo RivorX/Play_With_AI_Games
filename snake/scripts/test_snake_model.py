@@ -198,8 +198,8 @@ def test_snake_model(model, grid_size, episodes, source_name):
             direction_name = {0: 'UP', 90: 'RIGHT', 180: 'DOWN', 270: 'LEFT'}.get(angle_deg, f'{angle_deg}°')
 
             # Znajdź pozycję głowy i jedzenia w mapie
-            head_pos = np.where(mapa == 1.0)
-            food_pos = np.where(mapa == 0.75)
+            head_pos = np.where(mapa == 0.67)
+            food_pos = np.where(mapa == 1.0)
             if len(head_pos[0]) > 0:
                 head_x, head_y = head_pos[0][0], head_pos[1][0]
             else:
