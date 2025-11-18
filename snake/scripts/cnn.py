@@ -190,12 +190,12 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         with autocast('cuda', enabled=self.use_amp):
             x = image
             
-            # Block 1: 12×12 → 12×12
+            # Block 1: 11×11 → 11×11
             x = self.conv1(x)
             x = self.bn1(x)
             x = F.gelu(x)
             
-            # Block 2: 12×12 → 6×6
+            # Block 2: 11×11 → 6×6
             x = self.conv2(x)
             x = self.bn2(x)
             x = F.gelu(x)

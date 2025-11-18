@@ -364,7 +364,7 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
     # ==================== [2/2] FEATURE IMPORTANCE (ABLATION) ====================
     print("\n🔬 Running ablation study...")
     
-    def run_episode_with_ablation(ablation_type='none'):
+    def run_episode_with_ablation(ablation_type='full'):
         obs, _ = env.reset()
         lstm_states = None
         episode_starts = np.ones((1,), dtype=bool)
@@ -390,23 +390,18 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
                 
                 # Apply ablation
                 if ablation_type == 'no_cnn':
+                    # Zero out CNN input
                     obs_tensor['image'] = torch.zeros_like(obs_tensor['image'])
-                elif ablation_type == 'no_scalar':
+                elif ablation_type == 'no_scalars':
+                    # Zero out all scalar features
                     obs_tensor['direction'] = torch.zeros_like(obs_tensor['direction'])
                     obs_tensor['dx_head'] = torch.zeros_like(obs_tensor['dx_head'])
                     obs_tensor['dy_head'] = torch.zeros_like(obs_tensor['dy_head'])
                     obs_tensor['front_coll'] = torch.zeros_like(obs_tensor['front_coll'])
                     obs_tensor['left_coll'] = torch.zeros_like(obs_tensor['left_coll'])
                     obs_tensor['right_coll'] = torch.zeros_like(obs_tensor['right_coll'])
-                elif ablation_type == 'cnn_only':
-                    obs_tensor['direction'] = torch.zeros_like(obs_tensor['direction'])
-                    obs_tensor['dx_head'] = torch.zeros_like(obs_tensor['dx_head'])
-                    obs_tensor['dy_head'] = torch.zeros_like(obs_tensor['dy_head'])
-                    obs_tensor['front_coll'] = torch.zeros_like(obs_tensor['front_coll'])
-                    obs_tensor['left_coll'] = torch.zeros_like(obs_tensor['left_coll'])
-                    obs_tensor['right_coll'] = torch.zeros_like(obs_tensor['right_coll'])
-                elif ablation_type == 'scalar_only':
-                    obs_tensor['image'] = torch.zeros_like(obs_tensor['image'])
+                    obs_tensor['snake_length'] = torch.zeros_like(obs_tensor['snake_length'])
+                # else: 'full' - no modifications
                 
                 # Convert back to numpy
                 obs_numpy = {}
@@ -436,10 +431,10 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
         
         return total_reward, step, info.get('score', 0)
     
-    ablation_types = ['none', 'no_cnn', 'no_scalar', 'cnn_only', 'scalar_only']
+    ablation_types = ['full', 'no_cnn', 'no_scalars']
     ablation_results = {abl: {'rewards': [], 'steps': [], 'scores': []} for abl in ablation_types}
     
-    episodes_per_ablation = max(10, num_samples // 5)
+    episodes_per_ablation = max(10, num_samples // 3)
     
     for abl_type in ablation_types:
         print(f"  Testing: {abl_type}...")
@@ -450,10 +445,10 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
             ablation_results[abl_type]['scores'].append(score)
     
     # Plot ablation
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 6))
     
-    labels = ['Full Model', 'No CNN', 'No Scalars', 'CNN Only', 'Scalars Only']
-    colors = ['#2ecc71', '#e74c3c', '#f39c12', '#3498db', '#9b59b6']
+    labels = ['Full Model', 'Without CNN', 'Without Scalars']
+    colors = ['#2ecc71', '#e74c3c', '#f39c12']
     
     avg_rewards = [np.mean(ablation_results[abl]['rewards']) for abl in ablation_types]
     std_rewards = [np.std(ablation_results[abl]['rewards']) for abl in ablation_types]
@@ -463,7 +458,6 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
     axes[0].set_ylabel('Average Total Reward')
     axes[0].set_title('Ablation Study: Rewards')
     axes[0].grid(axis='y', alpha=0.3)
-    axes[0].tick_params(axis='x', rotation=45)
     axes[0].axhline(avg_rewards[0], color='red', linestyle='--', alpha=0.5, label='Baseline')
     axes[0].legend()
     
@@ -475,7 +469,6 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
     axes[1].set_ylabel('Average Score (food collected)')
     axes[1].set_title('Ablation Study: Scores')
     axes[1].grid(axis='y', alpha=0.3)
-    axes[1].tick_params(axis='x', rotation=45)
     axes[1].axhline(avg_scores[0], color='red', linestyle='--', alpha=0.5, label='Baseline')
     axes[1].legend()
     
@@ -486,7 +479,6 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
     axes[2].set_ylabel('Performance Drop (%)')
     axes[2].set_title('Ablation Study: Performance Impact')
     axes[2].grid(axis='y', alpha=0.3)
-    axes[2].tick_params(axis='x', rotation=45)
     axes[2].axhline(0, color='red', linestyle='--', alpha=0.5)
     
     plt.tight_layout()
@@ -528,8 +520,11 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
         print(f"Average food efficiency: {np.mean([f['efficiency'] for f in food_acquisitions]):.2f} steps/apple")
     
     print(f"\nAblation study:")
-    print(f"  Baseline: {avg_rewards[0]:.2f} reward, {avg_scores[0]:.2f} score")
-    print(f"  Without CNN: {performance_drops[1]:.1f}% drop")
-    print(f"  Without Scalars: {performance_drops[2]:.1f}% drop")
-    print(f"  CNN only: {performance_drops[3]:.1f}% drop")
-    print(f"  Scalars only: {performance_drops[4]:.1f}% drop")
+    print(f"  Full model:      {avg_rewards[0]:.2f} reward, {avg_scores[0]:.2f} score")
+    print(f"  Without CNN:     {avg_rewards[1]:.2f} reward ({performance_drops[1]:+.1f}% vs baseline)")
+    print(f"  Without Scalars: {avg_rewards[2]:.2f} reward ({performance_drops[2]:+.1f}% vs baseline)")
+    
+    print(f"\n  Score comparison:")
+    print(f"  Full model:      {avg_scores[0]:.2f} apples")
+    print(f"  Without CNN:     {avg_scores[1]:.2f} apples")
+    print(f"  Without Scalars: {avg_scores[2]:.2f} apples")

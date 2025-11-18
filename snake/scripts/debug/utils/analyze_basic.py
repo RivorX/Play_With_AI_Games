@@ -17,7 +17,7 @@ from matplotlib.patches import Patch
 def analyze_basic_states(model, env, output_dirs, action_names, config):
     """
     Analiza podstawowych stanów: aktywacje, attention heatmaps, gradienty
-    🆕 UPDATED: Pure Bottleneck (NO Skip) + RMS metrics
+    🆕 UPDATED: 4 scenarios - small snake, big snake, near wall, near collision
     """
     policy = model.policy
     features_extractor = policy.features_extractor
@@ -31,9 +31,106 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
     lstm_states = None
     episode_starts = np.ones((1,), dtype=bool)
     
-    # Analiza 3 stanów
-    for state_idx in range(3):
-        obs, _ = env.reset()
+    # 🎯 4 SCENARIOS
+    scenarios = [
+        {"name": "Mały wąż", "target_length": 3, "near_wall": False},
+        {"name": "Duży wąż", "target_length": 15, "near_wall": False},
+        {"name": "Przy ścianie", "target_length": 5, "near_wall": True},
+        {"name": "Random", "target_length": None, "near_wall": False}
+    ]
+    
+    for state_idx, scenario in enumerate(scenarios):
+        obs, info = env.reset()
+        
+        # Scenario 1: Small snake (just reset)
+        if scenario["target_length"] == 3:
+            pass  # Fresh reset
+        
+        # Scenario 2: Big snake (grow to 15+)
+        elif scenario["target_length"] == 15:
+            max_attempts = 500
+            attempt = 0
+            while info.get('snake_length', 3) < 15 and attempt < max_attempts:
+                # Use model to play (better survival than random)
+                with torch.no_grad():
+                    obs_temp = {}
+                    for k, v in obs.items():
+                        v_tensor = torch.tensor(v if isinstance(v, np.ndarray) else np.array(v), 
+                                               dtype=torch.float32, device=policy.device)
+                        if k == 'image' and v_tensor.ndim == 3:
+                            v_tensor = v_tensor.unsqueeze(0)
+                        elif v_tensor.ndim == 1:
+                            v_tensor = v_tensor.unsqueeze(0)
+                        obs_temp[k] = v_tensor
+                    
+                    action, lstm_states = model.predict(obs, state=lstm_states, 
+                                                       episode_start=episode_starts, 
+                                                       deterministic=False)
+                    action_idx = int(action.item()) if torch.is_tensor(action) else int(action)
+                
+                obs, reward, done, truncated, info = env.step(action_idx)
+                episode_starts = np.array([done or truncated], dtype=bool)
+                
+                if done or truncated:
+                    obs, info = env.reset()
+                    lstm_states = None
+                    episode_starts = np.ones((1,), dtype=bool)
+                
+                attempt += 1
+            
+            print(f"      Duży wąż: Osiągnięto długość {info.get('snake_length', 3)} po {attempt} krokach")
+        
+        # Scenario 3: Near wall - FORCE position near edge
+        elif scenario["near_wall"]:
+            # Manualnie ustaw węża przy ścianie (hack do analizy)
+            # Symuluj 10 kroków w stronę krawędzi
+            for step in range(30):
+                # Sprawdź czy głowa jest blisko ściany
+                head_x, head_y = env.unwrapped.snake[0]
+                grid_size = env.unwrapped.grid_size
+                
+                # Jeśli już przy ścianie (2 pola od brzegu), przerwij
+                if head_x <= 2 or head_x >= grid_size - 3 or head_y <= 2 or head_y >= grid_size - 3:
+                    break
+                
+                # Wybierz akcję która prowadzi do najbliższej ściany
+                # Kierunek: 0=UP, 1=RIGHT, 2=DOWN, 3=LEFT
+                direction = env.unwrapped.direction
+                
+                # Oblicz odległości do ścian
+                dist_left = head_x
+                dist_right = grid_size - 1 - head_x
+                dist_top = head_y
+                dist_bottom = grid_size - 1 - head_y
+                
+                min_dist = min(dist_left, dist_right, dist_top, dist_bottom)
+                
+                # Wybierz akcję która nie odwraca się od najbliższej ściany
+                if min_dist == dist_left and direction != 1:  # Idź w lewo
+                    action = 0 if direction == 0 else (2 if direction == 2 else 1)
+                elif min_dist == dist_right and direction != 3:  # Idź w prawo
+                    action = 2 if direction == 0 else (0 if direction == 2 else 1)
+                elif min_dist == dist_top and direction != 2:  # Idź w górę
+                    action = 2 if direction == 1 else (0 if direction == 3 else 1)
+                else:  # Idź w dół
+                    action = 0 if direction == 1 else (2 if direction == 3 else 1)
+                
+                obs, reward, done, truncated, info = env.step(action)
+                if done or truncated:
+                    obs, info = env.reset()
+                    break
+            
+            head_x, head_y = env.unwrapped.snake[0]
+            print(f"      Przy ścianie: Pozycja głowy ({head_x}, {head_y}) / grid {env.unwrapped.grid_size}")
+        
+        # Scenario 4: Random (take some random steps)
+        else:
+            for _ in range(np.random.randint(5, 20)):
+                action = env.action_space.sample()
+                obs, reward, done, truncated, info = env.step(action)
+                if done or truncated:
+                    obs, info = env.reset()
+                    break
         
         # Konwersja obs do tensora
         obs_tensor = {}
@@ -183,20 +280,21 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
         # Generate attention heatmap
         attention_map = generate_attention_heatmap(
             model, obs, obs_tensor, lstm_states, action.item(),
-            output_dirs['heatmap'], state_idx, action_names
+            output_dirs['heatmap'], state_idx, action_names, scenario["name"]
         )
         if attention_map is not None:
             attention_heatmaps.append(attention_map)
         
-        print(f"   Stan {state_idx}: Akcja={action_names[action.item()]} (probs={action_probs_np})")
+        snake_len = info.get('snake_length', 3)
+        print(f"   Stan {state_idx} ({scenario['name']}): Akcja={action_names[action.item()]} | Snake={snake_len} | Probs={action_probs_np}")
     
     return action_probs_list, detailed_activations, layer_gradients, attention_heatmaps
 
 
-def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, output_dir, state_idx, action_names):
+def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, output_dir, state_idx, action_names, scenario_name=""):
     """
     Generuje attention heatmap używając gradientów
-    🆕 UPDATED: Pure Bottleneck (NO Skip)
+    🆕 UPDATED: Pure Bottleneck (NO Skip) + scenario name
     """
     policy = model.policy
     features_extractor = policy.features_extractor
@@ -308,21 +406,22 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
         # Original viewport
         viewport = obs['image'][:, :, 0]
         axes[0].imshow(viewport, cmap='viridis', interpolation='nearest')
-        axes[0].set_title(f'Original Viewport - Stan {state_idx}')
+        axes[0].set_title(f'Original Viewport - {scenario_name}', fontsize=12, fontweight='bold')
         axes[0].axis('off')
         
         # Attention heatmap
         im = axes[1].imshow(grad_map, cmap='hot', interpolation='bilinear', alpha=0.8)
-        axes[1].set_title(f'Attention Heatmap - Akcja: {action_names[action_idx]}')
+        axes[1].set_title(f'Attention Heatmap - Akcja: {action_names[action_idx]}', fontsize=12, fontweight='bold')
         axes[1].axis('off')
         plt.colorbar(im, ax=axes[1], label='Gradient Magnitude')
         
         plt.tight_layout()
-        heatmap_path = os.path.join(output_dir, f'attention_state_{state_idx}.png')
-        plt.savefig(heatmap_path, dpi=150)
+        heatmap_path = os.path.join(output_dir, f'attention_state_{state_idx}_{scenario_name.replace(" ", "_")}.png')
+        plt.savefig(heatmap_path, dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f'  ✅ Attention heatmap zapisana: {heatmap_path}')
+        print(f'  ✅ Attention heatmap ({scenario_name}) zapisana: {heatmap_path}')
+        return grad_map
     
     model.policy.eval()
     return None
@@ -346,7 +445,7 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
         x = torch.nn.functional.gelu(x)
         conv1_output = x[0].cpu().numpy()
 
-        # Conv2
+        # Conv2: 11×11 → 6×6
         x = features_extractor.conv2(x)
         x = features_extractor.bn2(x)
         x = features_extractor.dropout2(x)
@@ -590,14 +689,14 @@ def visualize_viewport(obs, output_dir, state_idx):
     plt.figure(figsize=(8, 8))
     plt.imshow(viewport, cmap='viridis', interpolation='nearest')
     plt.colorbar(label='Wartość')
-    plt.title(f'Viewport 16x16 - Stan {state_idx}')
+    plt.title(f'Viewport 11x11 - Stan {state_idx}')
     
     legend_elements = [
-        Patch(facecolor='purple', label='Ściana (-1.0)'),
-        Patch(facecolor='black', label='Puste (0.0)'),
-        Patch(facecolor='cyan', label='Ciało (0.5)'),
-        Patch(facecolor='orange', label='Jedzenie (0.75)'),
-        Patch(facecolor='yellow', label='Głowa (1.0)')
+        Patch(facecolor='darkgray', label='Puste pole (0.0)'),
+        Patch(facecolor='gray', label='Ściana (0.25)'),
+        Patch(facecolor='cyan', label='Ciało węża (0.33)'),
+        Patch(facecolor='yellow', label='Głowa węża (0.67)'),
+        Patch(facecolor='red', label='Jedzenie (1.0)')
     ]
     plt.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.05, 1))
     
@@ -613,7 +712,8 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     # Wykres 1: Przegląd aktywacji neuronów (RMS = siła sygnału)
     fig, axes = plt.subplots(2, 2, figsize=(18, 12))
     
-    states = [0, 1, 2]
+    states = [0, 1, 2, 3]
+    state_labels = ['Mały wąż', 'Duży wąż', 'Przy ścianie', 'Random']
     
     # 📊 SUBPLOT 1: RMS (Root Mean Square) - pokazuje siłę sygnału
     cnn_rms = [d['cnn_rms'] for d in detailed_activations]
@@ -630,7 +730,7 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     axes[0, 0].set_ylabel('RMS Magnitude')
     axes[0, 0].set_title('Sila Sygnalu (RMS) - CNN vs Scalars')
     axes[0, 0].set_xticks(x)
-    axes[0, 0].set_xticklabels([f'Stan {s}' for s in states])
+    axes[0, 0].set_xticklabels(state_labels, rotation=15, ha='right')
     axes[0, 0].legend()
     axes[0, 0].grid(axis='y', alpha=0.3)
     
@@ -644,7 +744,7 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     axes[0, 1].set_ylabel('Max |Activation|')
     axes[0, 1].set_title('Peak Responses')
     axes[0, 1].set_xticks(x)
-    axes[0, 1].set_xticklabels([f'Stan {s}' for s in states])
+    axes[0, 1].set_xticklabels(state_labels, rotation=15, ha='right')
     axes[0, 1].legend()
     axes[0, 1].grid(axis='y', alpha=0.3)
     
@@ -658,7 +758,7 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     axes[1, 0].set_ylabel('Active Neurons (%)')
     axes[1, 0].set_title('Sparsity (% neurons |x| > 0.01)')
     axes[1, 0].set_xticks(x)
-    axes[1, 0].set_xticklabels([f'Stan {s}' for s in states])
+    axes[1, 0].set_xticklabels(state_labels, rotation=15, ha='right')
     axes[1, 0].legend()
     axes[1, 0].grid(axis='y', alpha=0.3)
     axes[1, 0].set_ylim(0, 100)
@@ -674,7 +774,7 @@ def plot_activation_overview(detailed_activations, action_probs_list, action_nam
     axes[1, 1].set_ylabel('Prawdopodobieństwo')
     axes[1, 1].set_title('Prawdopodobieństwa Akcji')
     axes[1, 1].set_xticks(states)
-    axes[1, 1].set_xticklabels([f'Stan {s}' for s in states])
+    axes[1, 1].set_xticklabels(state_labels, rotation=15, ha='right')
     axes[1, 1].legend()
     axes[1, 1].grid(alpha=0.3)
     

@@ -2,11 +2,11 @@
 environment:
   min_grid_size: 8                   # Minimalny rozmiar siatki
   max_grid_size: 25                  # Maksymalny rozmiar siatki
-  viewport_size: 12                  # Rozmiar viewport (stały dla wszystkich grid_size)
+  viewport_size: 11                  # Rozmiar viewport (stały dla wszystkich grid_size)
   snake_size: 20                     # Rozmiar kratki w pikselach
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
   observation_space:
-    low: -1.0                        # Minimalna wartość obserwacji
+    low: 0.0                         # Minimalna wartość obserwacji (znormalizowane)
     high: 1.0                        # Maksymalna wartość obserwacji
     dtype: float32                   # Typ danych obserwacji
   action_space:
@@ -96,9 +96,9 @@ model:
   
   # CNN ARCHITECTURE
   convlstm:
-    cnn_channels: [32, 64]           # Kanały CNN
+    cnn_channels: [64, 96]          # Kanały CNN (zwiększone dla 11x11 viewport)
     
-    # Bottleneck
+    # Bottleneck (11x11 → 6x6 → 3456 raw features)
     cnn_bottleneck_dims: []
     cnn_output_dim: 819              # 80% z 1024 (pre-fusion)
     
@@ -120,10 +120,10 @@ model:
 
 # Konfiguracja treningu
 training:
-  n_envs: 12                         # Liczba środowisk 
+  n_envs: 16                         # Liczba środowisk 
   batch_size: 1024                   # Rozmiar partii 
-  total_timesteps: 8000000           # Całkowita liczba kroków
-  eval_freq: 4096                    # Częstotliwość ewaluacji
+  total_timesteps: 16000000           # Całkowita liczba kroków
+  eval_freq: 8192                    # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 50       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 20                      # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
