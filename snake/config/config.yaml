@@ -1,52 +1,152 @@
-# Konfiguracja środowiska Snake
+# Konfiguracja Środowiska Snake
 environment:
-  min_grid_size: 5                   # Minimalny rozmiar siatki dla losowania
-  max_grid_size: 16                  # Maksymalny rozmiar siatki dla losowania
+  min_grid_size: 8                   # Minimalny rozmiar siatki
+  max_grid_size: 25                  # Maksymalny rozmiar siatki
+  viewport_size: 11                  # Rozmiar viewport (stały dla wszystkich grid_size)
   snake_size: 20                     # Rozmiar kratki w pikselach
   directions: [[0, -1], [1, 0], [0, 1], [-1, 0]]  # Kierunki ruchu węża
   observation_space:
-    low: -1.0                        # Minimalna wartość obserwacji
+    low: 0.0                         # Minimalna wartość obserwacji (znormalizowane)
     high: 1.0                        # Maksymalna wartość obserwacji
     dtype: float32                   # Typ danych obserwacji
   action_space:
-    type: Discrete                    # Typ przestrzeni akcji
+    type: Discrete                   # Typ przestrzeni akcji
     n: 3                             # Liczba akcji (lewo, prosto, prawo)
-  max_steps_without_food: 10         # Max kroków bez jedzenia (skalowane z rozmiarem)
-  max_steps_factor: 150              # Mnożnik max kroków
+  max_steps_without_food: 30         # Max kroków bez jedzenia (skalowane z rozmiarem grid_size * max_steps_without_food)
+  max_steps_factor: 300              # Mnożnik max kroków (skalowany z rozmiarem grid_size * max_steps_factor)
 
-# Konfiguracja modelu PPO
+  reward_scaling:
+    enable: true                          # Włącz skalowanie nagród
+    min_difficulty_multiplier: 1.0        # Mnożnik dla min_grid_size
+    max_difficulty_multiplier: 3.0        # Mnożnik dla max_grid_size
+    
+    # Nagrody bazowe
+    base_food_reward: 10.0                # Podstawowa nagroda za jabłko
+    base_death_penalty: -5.0              # Podstawowa kara za śmierć
+    
+    # Milestone bonusy (% zajęcia planszy)
+    milestones:
+      0.05: 2.0    
+      0.10: 5.0   
+      0.15: 10.0    
+      0.20: 18.0     
+      0.25: 28.0     
+      0.30: 40.0     
+      0.35: 55.0   
+      0.40: 75.0    
+      0.45: 100.0  
+      0.50: 130.0   
+      0.55: 170.0  
+      0.60: 220.0  
+      0.65: 280.0   
+      0.70: 350.0    
+      0.75: 450.0  
+      0.80: 570.0    
+      0.85: 720.0    
+      0.90: 900.0    
+      0.95: 1150.0   
+      1.00: 1500.0  
+
+    # Opcjonalne: bonus za efektywność (małe steps_per_apple)
+    efficiency_bonus:
+      enable: true                # Włącz/wyłącz
+      threshold: 20.0               # ⬆️ z 15.0 (łatwiej osiągnąć)
+      reward: 5.0                   # ⬆️ z 2.0 (większa zachęta)
+
+    # ✨ PROGRESSIVE BONUS - +3% za każde kolejne jabłko
+    progressive_food_bonus:
+      enable: true
+      bonus_per_apple: 0.03           # +3% za każde jabłko
+      max_multiplier: 3.0              # Cap na 300%
+
+# Konfiguracja modelu RecurrentPPO
 model:
-  policy: MultiInputPolicy           # Zmieniono na MultiInputPolicy dla przestrzeni Dict
-  learning_rate: 0.0002              # Szybkość uczenia 
-  min_learning_rate: 0.00005         # Minimalny learning rate (nie schodzi poniżej tej wartości)
-  n_steps: 2048                      # Liczba kroków na aktualizację
-  n_epochs: 10                       # Liczba epok 
-  gamma: 0.99                        # Współczynnik dyskontowania
-  gae_lambda: 0.95                   # Lambda dla GAE
+  policy: MultiInputLstmPolicy       # Policy dla RecurrentPPO
+  learning_rate: 0.0003              # Szybkość uczenia 
+  min_learning_rate: 0.00001         # Minimalny learning rate
+  n_steps: 1024                      # Liczba kroków na aktualizację 
+  n_epochs: 3                        # Liczba epok
+  gamma: 0.995                       # Współczynnik dyskontowania
+  gae_lambda: 0.97                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
-  ent_coef: 0.4                      # Współczynnik entropii
-  vf_coef: 1.0                       # Współczynnik funkcji wartości
+  ent_coef: 0.05                     # Współczynnik entropii (początkowy)
+  min_ent_coef: 0.01                 # Minimalny współczynnik entropii (docelowy)
+  vf_coef: 0.5                       # Współczynnik funkcji wartości
   device: cuda                       # Urządzenie (cuda/cpu)
-  dropout_rate: 0.2                  # Współczynnik dropout w CNN
+
+  # ✅ Konfiguracja optymalizatora
+  optimizer:
+    type: adamw                      # Typ: 'adam' lub 'adamw'
+    weight_decay: 0.0001              # Weight decay dla AdamW (0.0 = wyłączone)
+    eps: 1.0e-8                      # Epsilon dla stabilności
+    betas: [0.9, 0.999]              # Beta1, Beta2 dla Adam/AdamW
+
+  # LSTM Configuration
+  lstm:
+    gradient_clip_val: 5.0          # Clip gradients LSTM
+    cell_state_penalty: 0.0         # L2 penalty na cell state
+    hidden_state_penalty: 0.0       # L2 penalty na hidden state
+    dropout: 0.0                    # Dropout w LSTM
+  
+  # Selektywne dropouty
+  cnn_dropout: 0.03                 
+  scalar_dropout: 0.04               # Dropout dla skalarów (wyższy - mniej skalarów)
+  scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
+  fusion_dropout: 0.05               # Dropout po fusion (regularyzacja przed LSTM)              
+  
+  # CNN ARCHITECTURE
+  convlstm:
+    cnn_channels: [64, 96]          # Kanały CNN (zwiększone dla 11x11 viewport)
+    
+    # Bottleneck (11x11 → 6x6 → 3456 raw features)
+    cnn_bottleneck_dims: []
+    cnn_output_dim: 819              # 80% z 1024 (pre-fusion)
+    
+    # Scalar Network Architecture  
+    scalar_hidden_dims: [256, 205]   # 20% z 1024 (pre-fusion) → 205
+    
+    # Architecture Options
+    use_layernorm: true              # Global switch
+
   policy_kwargs:
     features_extractor_kwargs:
-      features_dim: 512
+      features_dim: 512              # Wymiar cech wyjściowych ekstraktora (fusion output)
     net_arch:
-      pi: [256, 256, 128]  # dla aktora
-      vf: [256, 256, 128]  # dla krytyka
+      pi: [512, 256]               
+      vf: [512, 512, 256]               
+    lstm_hidden_size: 600            # Rozmiar ukryty LSTM
+    n_lstm_layers: 1                 # Liczba warstw LSTM
+    enable_critic_lstm: true         # LSTM dla krytyka
 
 # Konfiguracja treningu
 training:
-  n_envs: 16                         # Liczba środowisk
-  batch_size: 2048                   # Rozmiar partii
-  total_timesteps: 10000000          # Całkowita liczba kroków
-  eval_freq: 5000                    # Częstotliwość ewaluacji (zwiększona dla rzadszej validacji)
+  n_envs: 16                         # Liczba środowisk 
+  batch_size: 1024                   # Rozmiar partii 
+  total_timesteps: 16000000           # Całkowita liczba kroków
+  eval_freq: 8192                    # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 50       # Liczba ewaluacji bez poprawy przed zatrzymaniem
-  min_evals: 5                       # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
-  enable_channel_logs: true          # Włącz logi kanałów
+  min_evals: 20                      # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania
+  enable_channel_logs: false         # Włącz logi kanałów
+  gradient_log_freq: 10000           # Co ile kroków logować gradienty/wagi
+  
+  # Liczba środowisk do ewaluacji równoległej
+  eval_n_envs: 6                     # Liczba środowisk ewaluacyjnych
+  eval_n_repeats: 2                  # Ile razy każde środowisko ma wykonać ewaluację
+  
+  # Konfiguracja normalizacji
+  normalization:
+    norm_obs: false                  # ❌ FALSE dla obrazów (CNN radzi sobie z surowymi pikselami)
+    norm_reward: true                # ✅ TRUE - stabilizuje trening (running mean rewards)
+    clip_obs: 10.0                   # Clipping obserwacji (tylko jeśli norm_obs=true)
+    clip_reward: 500.0               # Clipping nagród (zwiększone dla progressive bonus)
+    gamma: 0.995                      # Gamma dla running mean rewards (powinno = model.gamma)
+    
+    # DODATKOWE OPCJE (zaawansowane)
+    epsilon: 1.0e-8                  # Epsilon dla stabilności numerycznej
+    clip_obs_asymmetric: false       # Asymetryczne clipping
 
-# Ścieżki do zapisu
+# Ścieżki
 paths:
   models_dir: models
   logs_dir: logs
