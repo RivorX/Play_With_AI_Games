@@ -1,0 +1,74 @@
+# Konfiguracja Środowiska Solitaire (Klondike)
+environment:
+  max_steps: 1000                    # Maksymalna liczba kroków w epizodzie
+  
+  reward_scaling:
+    enable: true
+    
+    # Nagrody (priorytet: fundacje > odkrywanie > przygotowanie > neutralne)
+    move_to_foundation: 20.0         # Karta na stos bazowy - GŁÓWNY CEL
+    flip_tableau_card: 7.0           # Odsłonięcie karty na stole
+    move_waste_to_tableau: 2.0       # Z talii na stół - przygotowanie
+    move_tableau_to_tableau: -0.5    # Przełożenie na stole (silna kara by uniknąć farmienia punktów)
+    win_bonus: 2000.0                # Wygrana - znacznie wyższa nagroda końcowa
+    
+    # Kary
+    invalid_move_penalty: -0.5       # Jawna kara za nieprawidłowe ruchy
+    time_penalty: -0.1               # Kara za upływ czasu (zachęta do szybkości) - zwiększona
+    recycle_waste_penalty: -10.0     # Kara za przetasowanie talii - znacznie wyższa (ostateczność)
+    surrender_penalty: -100.0        # Kara za poddanie się (zwiększona, by nie opłacało się poddawać zbyt wcześnie)
+
+  # Przestrzeń obserwacji
+  observation_space:
+    max_tableau_height: 20           # Maksymalna wysokość stosu na stole
+    card_features: 4                 # Cechy karty: [Present, Suit, Rank, FaceUp]
+
+# Konfiguracja modelu MaskablePPO
+model:
+  policy: MultiInputPolicy           # Policy dla MaskablePPO (nie LSTM)
+  learning_rate: 0.0003
+  n_steps: 2048                      # Zwiększone n_steps dla stabilniejszego gradientu
+  batch_size: 2048                   # Znacznie większy batch size dla wykorzystania VRAM (4GB)
+  n_epochs: 10
+  gamma: 0.995                       # Zwiększone gamma dla lepszego planowania długoterminowego
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.02                     # Zwiększona entropia dla lepszej eksploracji
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  device: cuda
+
+  optimizer:
+    type: adamw
+    weight_decay: 0.0001
+
+  lstm:
+    hidden_size: 512
+    n_layers: 1
+
+  policy_kwargs:
+    features_extractor_kwargs:
+      features_dim: 256
+    net_arch:
+      pi: [256, 128]
+      vf: [256, 128]
+
+# Konfiguracja treningu
+training:
+  n_envs: 16                         # Zwiększona liczba środowisk (równoległość)
+  total_timesteps: 5000000
+  eval_freq: 20000                   # Rzadsza ewaluacja (bo szybciej lecą kroki)
+  plot_interval: 1
+  max_no_improvement_evals: 50
+  min_evals: 20
+  
+  eval_n_envs: 1                     # Ewaluacja na 1 środowisku (wystarczy)
+  eval_n_repeats: 5
+
+# Ścieżki
+paths:
+  models_dir: models
+  logs_dir: logs
+  model_path: models/solitaire_ppo_model.zip
+  train_csv_path: logs/train_progress.csv
+  plot_path: logs/training_progress.png

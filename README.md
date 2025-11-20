@@ -4,11 +4,31 @@ Zbiór prostych projektów i eksperymentów związanych z zastosowaniem algorytm
 
 W repo znajdziesz m.in. implementację agenta RL dla gry Snake wraz z narzędziami do treningu, testów i wizualizacji wyników.
 
-## Podprojekty
+## Projekty
 
-- [snake/](snake/README.md) — agent PPO dla gry Snake (trening, testy, analiza, generowanie GIF)
+### 🐍 Snake — RecurrentPPO Agent
 
-Każdy podkatalog zawiera własne instrukcje uruchomieniowe i opis konfiguracji.
+Agent RL trenowany do gry w Snake na siatkach o zmiennych rozmiarach.
+
+| Demo |
+|:---:|
+| ![Snake Run](snake/docs/snake_run_8.gif) |
+
+- [Więcej informacji](snake/README.md)
+- Trening, testowanie, analiza modelu, generowanie GIF
+
+### 🃏 Solitaire — MaskablePPO Agent
+
+Agent RL dla gry Pasjans Klondike z obsługą niewalidnych akcji (masked actions).
+
+| Demo |
+|:---:|
+| ![Solitaire Run](solitaire/docs/solitaire_run.gif) |
+
+- [Więcej informacji](solitaire/README.md)
+- Trening, testowanie w Pygame, nagrywanie GIF
+
+Każdy projekt zawiera własne instrukcje uruchomieniowe i opis konfiguracji.
 
 ## Wymagania
 
