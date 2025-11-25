@@ -40,3 +40,8 @@ logs/*
 logs
 snake/models/*.pkl
 snake/models/*.zip
+
+
+clash_royale/assets/*
+clash_royale/data/*
+debug/

@@ -1,3 +1,4 @@
+#All
 numpy
 gymnasium
 stable-baselines3[extra]
@@ -9,3 +10,10 @@ pyyaml
 imageio
 Pillow
 sb3-contrib
+#clash_royal
+opencv-python
+mss
+pyautogui
+pure-python-adb
+requests
+yt-dlp
