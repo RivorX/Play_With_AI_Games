@@ -6,8 +6,6 @@ game:
   crop_bottom: 40
   crop_left: 0
   crop_right: 0
-
-
 model:
   input_channels: 3
   input_width: 270
@@ -17,15 +15,13 @@ model:
   learning_rate: 0.001
   batch_size: 32
   epochs: 50
-
-
-
 paths:
   raw_videos: clash_royale/data/raw_videos
   processed_data: clash_royale/data/processed
   model_save: clash_royale/models/cr_policy.pth
   card_assets: clash_royale/assets/cards
-  
+  icons_assets: clash_royale/assets/icons
+
 cards:
   knight: 3
   archers: 3
@@ -147,8 +143,18 @@ cards:
   giant-snowball: 2
   royal-delivery: 3
   party-rocket: 5
+
 video_layout:
-  board_roi: [0.0, 0.0, 1.0, 0.6]
-  hand_roi: [0.0, 0.6, 1.0, 0.2]
+  board_roi:
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.6
+  hand_roi:
+  - 0.0
+  - 0.6
+  - 1.0
+  - 0.2
+
 imitation:
   confidence_threshold: 0.8
