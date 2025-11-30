@@ -6,6 +6,8 @@ game:
   crop_bottom: 40
   crop_left: 0
   crop_right: 0
+  save_lost_games: true
+
 model:
   input_channels: 3
   input_width: 270
@@ -15,125 +17,15 @@ model:
   learning_rate: 0.001
   batch_size: 32
   epochs: 50
+  
 paths:
   raw_videos: clash_royale/data/raw_videos
+  segmented_games: clash_royale/data/segmented_games
   processed_data: clash_royale/data/processed
   model_save: clash_royale/models/cr_policy.pth
   card_assets: clash_royale/assets/cards
   icons_assets: clash_royale/assets/icons
 
-cards:
-  knight: 3
-  archers: 3
-  goblins: 2
-  giant: 5
-  pekka: 7
-  minions: 3
-  balloon: 5
-  witch: 5
-  barbarians: 5
-  golem: 8
-  skeletons: 1
-  valkyrie: 4
-  skeleton-army: 3
-  bomber: 2
-  musketeer: 4
-  baby-dragon: 4
-  prince: 5
-  wizard: 5
-  mini-pekka: 4
-  spear-goblins: 2
-  giant-skeleton: 6
-  hog-rider: 4
-  minion-horde: 5
-  ice-wizard: 3
-  royal-giant: 6
-  guards: 3
-  princess: 3
-  dark-prince: 4
-  three-musketeers: 9
-  lava-hound: 7
-  ice-spirit: 1
-  fire-spirit: 1
-  miner: 3
-  sparky: 6
-  bowler: 5
-  lumberjack: 4
-  battle-ram: 4
-  inferno-dragon: 4
-  ice-golem: 2
-  mega-minion: 3
-  dart-goblin: 3
-  goblin-gang: 3
-  electro-wizard: 4
-  elite-barbarians: 6
-  hunter: 4
-  executioner: 5
-  bandit: 3
-  royal-recruits: 7
-  night-witch: 4
-  bats: 2
-  royal-ghost: 3
-  ram-rider: 5
-  zappies: 4
-  rascals: 5
-  cannon-cart: 5
-  mega-knight: 7
-  skeleton-barrel: 3
-  flying-machine: 4
-  wall-breakers: 2
-  royal-hogs: 5
-  goblin-giant: 6
-  fisherman: 3
-  magic-archer: 4
-  electro-dragon: 5
-  firecracker: 3
-  mighty-miner: 4
-  super-witch: 6
-  elixir-golem: 3
-  battle-healer: 4
-  skeleton-king: 4
-  super-lava-hound: 8
-  super-magic-archer: 5
-  archer-queen: 5
-  santa-hog-rider: 5
-  golden-knight: 4
-  super-ice-golem: 4
-  monk: 5
-  super-archers: 3
-  skeleton-dragons: 4
-  terry: 4
-  super-mini-pekka: 5
-  mother-witch: 4
-  electro-spirit: 1
-  electro-giant: 7
-  raging-prince: 5
-  phoenix: 4
-  cannon: 3
-  goblin-hut: 5
-  mortar: 4
-  inferno-tower: 5
-  bomb-tower: 4
-  barbarian-hut: 6
-  tesla: 4
-  elixir-collector: 6
-  x-bow: 6
-  tombstone: 3
-  furnace: 4
-  goblin-cage: 4
-  goblin-drill: 4
-  party-hut: 5
-  fireball: 4
-  arrows: 3
-  rage: 2
-  rocket: 6
-  goblin-barrel: 3
-  freeze: 4
-  mirror: 1
-  lightning: 6
-  zap: 2
-  poison: 4
-  graveyard: 5
   the-log: 2
   tornado: 3
   clone: 3
