@@ -1,0 +1,1 @@
+# Plik inicjalizacyjny modułu utils

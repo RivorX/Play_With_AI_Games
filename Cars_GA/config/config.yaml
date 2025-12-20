@@ -1,0 +1,57 @@
+# Konfiguracja algorytmu genetycznego dla samochodów
+
+# Parametry okna
+window:
+  width: 1200
+  height: 800
+  fps: 60
+
+# Parametry samochodu
+car:
+  width: 30
+  height: 50
+  max_speed: 10
+  acceleration: 0.3
+  friction: 0.95
+  rotation_speed: 5
+  sensor_range: 200
+  num_sensors: 6  # 5 z przodu + 1 z tyłu
+  action_threshold: 0.3  # Próg aktywacji akcji (output > threshold)
+  initial_speed: 1.0  # Początkowa prędkość (ułatwia start)
+
+# Parametry sieci neuronowej
+neural_network:
+  input_size: 6  # Liczba czujników (zaktualizowano)
+  hidden_layers: [8, 6]  # Warstwy ukryte
+  output_size: 4  # Lewo, Prawo, Przyspieszenie, Hamowanie
+
+# Parametry algorytmu genetycznego
+genetic_algorithm:
+  population_size: 50
+  generations: 100
+  mutation_rate: 0.1
+  mutation_strength: 0.5
+  crossover_rate: 0.7
+  elite_size: 5  # Liczba najlepszych osobników zachowanych bez zmian
+  tournament_size: 3
+
+# Parametry fitness
+fitness:
+  checkpoint_reward: 1000  # Zwiększono znaczenie checkpointów
+  distance_weight: 0.2  # Zmniejszono wagę dystansu (zapobiega kręceniu się w kółko)
+  time_penalty: 0.1  # Kara za czas
+  crash_penalty: -50  # Kara za zderzenie
+  max_time: 30  # Maksymalny czas w sekundach
+
+# Parametry treningowe
+training:
+  save_interval: 10  # Co ile generacji zapisywać model
+  show_best: true  # Pokazywać najlepszego osobnika
+  show_sensors: true  # Pokazywać czujniki
+  parallel_simulation: false  # Symulacja równoległa (szybsza, ale bez wizualizacji)
+
+# Parametry edytora torów
+track_editor:
+  grid_size: 20
+  wall_width: 10
+  checkpoint_width: 5
