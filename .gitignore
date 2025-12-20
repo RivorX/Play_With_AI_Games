@@ -40,3 +40,6 @@ logs/*
 logs
 snake/models/*.pkl
 snake/models/*.zip
+
+# Ignore train model Cars files
+Cars_GA/models/generation_*.json

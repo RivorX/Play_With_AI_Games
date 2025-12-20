@@ -121,6 +121,12 @@ class GeneticAlgorithm:
         # Oblicz fitness dla wszystkich
         for individual in self.population:
             individual['fitness'] = individual['car'].calculate_fitness(self.config)
+            
+            # Odejmij penalty za złożoność sieci
+            network = individual['network']
+            num_params = network.get_num_parameters()
+            complexity_penalty = num_params * self.config['fitness'].get('network_complexity_penalty', 0.001)
+            individual['fitness'] -= complexity_penalty
         
         # Pobierz statystyki PRZED resetowaniem w evolve()
         fitnesses = [ind['fitness'] for ind in self.population]

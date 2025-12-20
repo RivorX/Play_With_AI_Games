@@ -142,7 +142,7 @@ class NeuralNetwork:
     
     def mutate(self, mutation_rate, mutation_strength):
         """
-        Mutuje wagi sieci oraz rzadko jej architekturę
+        Mutuje wagi sieci oraz jej architekturę
         
         Args:
             mutation_rate: Prawdopodobieństwo mutacji każdej wagi
@@ -160,25 +160,80 @@ class NeuralNetwork:
             mutation = np.random.randn(*self.biases[i].shape) * mutation_strength
             self.biases[i] += mask * mutation
             
-        # 2. Mutacja architektury (rzadka: 2% szans)
-        if random.random() < 0.02:
-            change_type = random.choice(['add_neuron', 'remove_neuron', 'add_layer', 'remove_layer'])
+        # 2. Mutacja architektury (aktywna: 15% szans)
+        if random.random() < 0.15:
+            self._mutate_architecture()
+    
+    def _mutate_architecture(self):
+        """
+        Mutuje architekturę sieci - liczba warstw i rozmiar neuronów
+        """
+        change_type = random.choice([
+            'add_neuron', 'remove_neuron', 'add_neuron', 'remove_neuron',  # 40%
+            'resize_layer',  # 10%
+            'add_layer', 'remove_layer', 'add_layer',  # 30%
+            'swap_layers'  # 10%
+        ])
+        
+        if change_type == 'add_neuron' and self.hidden_layers:
+            idx = random.randint(0, len(self.hidden_layers) - 1)
+            self.hidden_layers[idx] = min(64, self.hidden_layers[idx] + random.randint(1, 3))
+            self._rebuild_with_expansion(idx)
             
-            if change_type == 'add_neuron' and self.hidden_layers:
-                idx = random.randint(0, len(self.hidden_layers) - 1)
-                self.hidden_layers[idx] = min(32, self.hidden_layers[idx] + 1)
-            elif change_type == 'remove_neuron' and self.hidden_layers:
-                idx = random.randint(0, len(self.hidden_layers) - 1)
-                self.hidden_layers[idx] = max(1, self.hidden_layers[idx] - 1)
-            elif change_type == 'add_layer':
-                if len(self.hidden_layers) < 4: # Max 4 warstwy ukryte
-                    self.hidden_layers.append(random.randint(4, 12))
-            elif change_type == 'remove_layer':
-                if len(self.hidden_layers) > 1:
-                    self.hidden_layers.pop()
+        elif change_type == 'remove_neuron' and self.hidden_layers:
+            idx = random.randint(0, len(self.hidden_layers) - 1)
+            self.hidden_layers[idx] = max(2, self.hidden_layers[idx] - random.randint(1, 2))
+            self._rebuild_with_pruning(idx)
             
-            # Przebuduj sieć (wagi zostaną zresetowane)
+        elif change_type == 'resize_layer' and self.hidden_layers:
+            idx = random.randint(0, len(self.hidden_layers) - 1)
+            new_size = random.randint(2, 32)
+            self.hidden_layers[idx] = new_size
             self._build_network()
+            
+        elif change_type == 'add_layer':
+            if len(self.hidden_layers) < 5:  # Max 5 warstw
+                new_layer_size = random.randint(4, 16)
+                insert_pos = random.randint(0, len(self.hidden_layers))
+                self.hidden_layers.insert(insert_pos, new_layer_size)
+                self._build_network()
+                
+        elif change_type == 'remove_layer':
+            if len(self.hidden_layers) > 1:
+                self.hidden_layers.pop(random.randint(0, len(self.hidden_layers) - 1))
+                self._build_network()
+                
+        elif change_type == 'swap_layers' and len(self.hidden_layers) > 1:
+            i, j = random.sample(range(len(self.hidden_layers)), 2)
+            self.hidden_layers[i], self.hidden_layers[j] = self.hidden_layers[j], self.hidden_layers[i]
+    
+    def _rebuild_with_expansion(self, layer_idx):
+        """Przebudowuje sieć po rozszerzeniu - inicjalizuje nowe neurony"""
+        old_weights = self.weights[:]
+        old_biases = self.biases[:]
+        self._build_network()
+        
+        for i in range(min(len(self.weights), len(old_weights))):
+            rows = min(old_weights[i].shape[0], self.weights[i].shape[0])
+            cols = min(old_weights[i].shape[1], self.weights[i].shape[1])
+            self.weights[i][:rows, :cols] = old_weights[i][:rows, :cols]
+            
+            size = min(len(old_biases[i]), len(self.biases[i]))
+            self.biases[i][:size] = old_biases[i][:size]
+    
+    def _rebuild_with_pruning(self, layer_idx):
+        """Przebudowuje sieć po zmniejszeniu"""
+        old_weights = self.weights[:]
+        old_biases = self.biases[:]
+        self._build_network()
+        
+        for i in range(min(len(self.weights), len(old_weights))):
+            rows = min(old_weights[i].shape[0], self.weights[i].shape[0])
+            cols = min(old_weights[i].shape[1], self.weights[i].shape[1])
+            self.weights[i][:rows, :cols] = old_weights[i][:rows, :cols]
+            
+            size = min(len(old_biases[i]), len(self.biases[i]))
+            self.biases[i][:size] = old_biases[i][:size]
     
     @staticmethod
     def crossover(parent1, parent2):
