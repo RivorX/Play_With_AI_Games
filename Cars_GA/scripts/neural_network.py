@@ -89,6 +89,28 @@ class NeuralNetwork:
             flat.extend(b.flatten())
         return np.array(flat)
     
+    def get_weights(self):
+        """
+        Zwraca wagi i biasy jako listy (do serializacji)
+        
+        Returns:
+            Tuple (weights_list, biases_list)
+        """
+        weights_list = [w.tolist() for w in self.weights]
+        biases_list = [b.tolist() for b in self.biases]
+        return (weights_list, biases_list)
+    
+    def set_weights(self, weights_data):
+        """
+        Ustawia wagi z tuple (weights_list, biases_list)
+        
+        Args:
+            weights_data: Tuple (weights_list, biases_list)
+        """
+        weights_list, biases_list = weights_data
+        self.weights = [np.array(w) for w in weights_list]
+        self.biases = [np.array(b) for b in biases_list]
+    
     def set_weights_flat(self, flat_weights):
         """
         Ustawia wagi i biasy z płaskiej tablicy
@@ -160,8 +182,8 @@ class NeuralNetwork:
             mutation = np.random.randn(*self.biases[i].shape) * mutation_strength
             self.biases[i] += mask * mutation
             
-        # 2. Mutacja architektury (aktywna: 15% szans)
-        if random.random() < 0.15:
+        # 2. Mutacja architektury (zwiększono szansę do 30%)
+        if random.random() < 0.30:
             self._mutate_architecture()
     
     def _mutate_architecture(self):
@@ -170,9 +192,8 @@ class NeuralNetwork:
         """
         change_type = random.choice([
             'add_neuron', 'remove_neuron', 'add_neuron', 'remove_neuron',  # 40%
-            'resize_layer',  # 10%
-            'add_layer', 'remove_layer', 'add_layer',  # 30%
-            'swap_layers'  # 10%
+            'resize_layer', 'resize_layer',  # 20%
+            'add_layer', 'remove_layer', 'add_layer', 'remove_layer',  # 40%
         ])
         
         if change_type == 'add_neuron' and self.hidden_layers:
@@ -192,8 +213,8 @@ class NeuralNetwork:
             self._build_network()
             
         elif change_type == 'add_layer':
-            if len(self.hidden_layers) < 5:  # Max 5 warstw
-                new_layer_size = random.randint(4, 16)
+            if len(self.hidden_layers) < 4:  # Max 4 warstwy (zmniejszono z 5)
+                new_layer_size = random.randint(4, 24)  # Zwiększono zakres
                 insert_pos = random.randint(0, len(self.hidden_layers))
                 self.hidden_layers.insert(insert_pos, new_layer_size)
                 self._build_network()
@@ -202,10 +223,6 @@ class NeuralNetwork:
             if len(self.hidden_layers) > 1:
                 self.hidden_layers.pop(random.randint(0, len(self.hidden_layers) - 1))
                 self._build_network()
-                
-        elif change_type == 'swap_layers' and len(self.hidden_layers) > 1:
-            i, j = random.sample(range(len(self.hidden_layers)), 2)
-            self.hidden_layers[i], self.hidden_layers[j] = self.hidden_layers[j], self.hidden_layers[i]
     
     def _rebuild_with_expansion(self, layer_idx):
         """Przebudowuje sieć po rozszerzeniu - inicjalizuje nowe neurony"""

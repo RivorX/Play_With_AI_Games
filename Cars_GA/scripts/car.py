@@ -45,6 +45,28 @@ class Car:
         self.sensor_range = config['car']['sensor_range']
         self.num_sensors = config['car']['num_sensors']
         self.sensor_readings = [1.0] * self.num_sensors  # 1.0 = nic nie wykryto
+        self.checkpoint_direction = 0.0  # Kierunek do najbliższego checkpointu (-1 do 1)
+        
+        # Wiatr
+        self.wind_strength = config['car'].get('wind_strength', 0.3)
+        self.wind_change_rate = config['car'].get('wind_change_rate', 0.05)
+        self.wind_side_strength = config['car'].get('wind_side_strength', 0.2)
+        self.wind_x = 0.0  # Siła wiatru w osi X
+        self.wind_y = 0.0  # Siła wiatru w osi Y
+        self.wind_angle = 0.0  # Aktualny kąt wiatru
+        
+        # Degradacja opon
+        self.tire_degradation_rate = config['car'].get('tire_degradation_rate', 0.0008)
+        self.base_tire_grip = config['car'].get('base_tire_grip', 1.0)
+        self.min_tire_grip = config['car'].get('min_tire_grip', 0.5)
+        self.tire_grip = self.base_tire_grip  # Aktualna przyczepność
+        
+        # Paliwo
+        self.fuel_capacity = config['car'].get('fuel_capacity', 100)
+        self.fuel_base_consumption = config['car'].get('fuel_base_consumption', 0.03)
+        self.fuel_speed_factor = config['car'].get('fuel_speed_factor', 0.008)
+        self.fuel_effect_on_speed = config['car'].get('fuel_effect_on_speed', 0.8)
+        self.fuel = self.fuel_capacity  # Paliwo
         
         # Status
         self.alive = True
@@ -52,6 +74,9 @@ class Car:
         self.distance_traveled = 0
         self.checkpoints_passed = 0
         self.time_alive = 0
+        self.completed_lap = False  # Czy przejechał pełne okrążenie (wszystkie checkpointy poza pierwszym)
+        self.in_pitstop = False  # Czy jest w pitstopie
+        self.pitstop_time = 0  # Czas spędzony w pitstopie
         
         # Kolory
         self.color = (0, 150, 255)
@@ -70,7 +95,18 @@ class Car:
         self.distance_traveled = 0
         self.checkpoints_passed = 0
         self.time_alive = 0
+        self.completed_lap = False
+        self.in_pitstop = False
+        self.pitstop_time = 0
         self.sensor_readings = [1.0] * self.num_sensors
+        self.checkpoint_direction = 0.0
+        
+        # Resetuj wiatr, opony i paliwo
+        self.wind_x = 0.0
+        self.wind_y = 0.0
+        self.wind_angle = 0.0
+        self.tire_grip = self.base_tire_grip
+        self.fuel = self.fuel_capacity
     
     def update(self, action, dt=1.0):
         """
@@ -84,6 +120,40 @@ class Car:
             return
         
         self.time_alive += dt
+        
+        # === WIATR ===
+        # Losowo zmień kierunek wiatru
+        self.wind_angle += (np.random.randn() * self.wind_change_rate)
+        wind_magnitude = np.random.uniform(0, self.wind_strength)
+        self.wind_x = np.cos(self.wind_angle) * wind_magnitude
+        
+        # Dodaj boczny wiatr (prostopadle do kierunku jazdy)
+        side_wind = np.random.randn() * self.wind_side_strength
+        angle_rad = math.radians(self.angle)
+        self.wind_y = np.sin(angle_rad) * side_wind
+        
+        # === DEGRADACJA OPON ===
+        # Opony degradują się w zależności od prędkości i obrotu
+        tire_stress = abs(self.speed) * 0.1 + abs(self.velocity_x + self.velocity_y) * 0.05
+        self.tire_grip = max(self.min_tire_grip, 
+                            self.tire_grip - self.tire_degradation_rate * tire_stress)
+        
+        # === PALIWO ===
+        # Zużywaj paliwo: stały pobór + pobór zależny od prędkości
+        # Stały pobór (silnik włączony) + pobór proporcjonalny do prędkości
+        fuel_burn = (self.fuel_base_consumption + abs(self.speed) * self.fuel_speed_factor) * dt
+        self.fuel = max(0, self.fuel - fuel_burn)
+        
+        # Jeśli nie ma paliwa, samochód nie żyje
+        if self.fuel <= 0:
+            self.alive = False
+            return
+        
+        # Wpływ paliwa na maksymalną prędkość
+        fuel_ratio = self.fuel / self.fuel_capacity
+        effective_max_speed = self.max_speed * (
+            self.fuel_effect_on_speed + (1 - self.fuel_effect_on_speed) * fuel_ratio
+        )
         
         # Rozpakowanie akcji
         left, right, accelerate, brake = action
@@ -100,16 +170,20 @@ class Car:
         if brake > self.action_threshold:
             self.speed -= self.acceleration * dt * 1.5
         
-        # Ograniczenie prędkości
-        self.speed = max(-self.max_speed/2, min(self.max_speed, self.speed))
+        # Ograniczenie prędkości (uwzględniaj paliwo)
+        self.speed = max(-effective_max_speed/2, min(effective_max_speed, self.speed))
         
-        # Tarcie
-        self.speed *= self.friction
+        # Tarcie (wpływ degradacji opon)
+        self.speed *= (self.friction * self.tire_grip)
         
         # Oblicz prędkość w osiach X i Y
         angle_rad = math.radians(self.angle)
         self.velocity_x = math.sin(angle_rad) * self.speed
         self.velocity_y = -math.cos(angle_rad) * self.speed
+        
+        # Dodaj wpływ wiatru
+        self.velocity_x += self.wind_x * (1 - self.tire_grip)  # Wiatr bardziej wpływa na zmęczone opony
+        self.velocity_y += self.wind_y * (1 - self.tire_grip)
         
         # Zapisz poprzednią pozycję
         old_x, old_y = self.x, self.y
@@ -313,9 +387,23 @@ class Car:
         if show_sensors:
             self._draw_sensors(screen)
         
+        # Zmień kolor samochodu w zależności od stanu
+        if self.in_pitstop:
+            car_color = (255, 140, 0)  # Pomarańczowy - w pitstopie
+        elif self.fuel > self.fuel_capacity * 0.5:
+            car_color = (0, 150, 255)  # Niebieski - pełne paliwo
+        elif self.fuel > self.fuel_capacity * 0.2:
+            car_color = (255, 200, 0)  # Żółty - mało paliwa
+        else:
+            car_color = (255, 50, 50)  # Czerwony - krytycznie mało paliwa
+        
+        # Zmień kolor w zależności od degradacji opon
+        if self.tire_grip < 0.7 and not self.in_pitstop:
+            car_color = tuple(max(0, c - 50) for c in car_color)  # Ciemniej
+        
         # Rysuj samochód
         corners = self._get_corners()
-        pygame.draw.polygon(screen, self.color, corners)
+        pygame.draw.polygon(screen, car_color, corners)
         
         # Rysuj kierunek (mały trójkąt z przodu)
         angle_rad = math.radians(self.angle)
@@ -324,6 +412,12 @@ class Car:
         
         # Mały znacznik kierunku
         pygame.draw.circle(screen, (255, 255, 255), (int(front_x), int(front_y)), 3)
+        
+        # Rysuj pasek paliwa nad samochodem
+        self._draw_fuel_bar(screen)
+        
+        # Rysuj wskaźnik degradacji opon
+        self._draw_tire_indicator(screen)
     
     def _draw_sensors(self, screen):
         """Rysuje czujniki odległości"""
@@ -339,6 +433,45 @@ class Car:
                            (int(self.x), int(self.y)), 
                            (int(end_x), int(end_y)), 1)
             pygame.draw.circle(screen, color, (int(end_x), int(end_y)), 3)
+    
+    def _draw_fuel_bar(self, screen):
+        """Rysuje pasek paliwa nad samochodem"""
+        bar_width = 30
+        bar_height = 5
+        bar_x = self.x - bar_width / 2
+        bar_y = self.y - self.height / 2 - 15
+        
+        # Tło paska
+        pygame.draw.rect(screen, (50, 50, 50), 
+                        (int(bar_x), int(bar_y), int(bar_width), int(bar_height)))
+        
+        # Pasek paliwa
+        fuel_ratio = max(0, self.fuel / self.fuel_capacity)
+        if fuel_ratio > 0.5:
+            color = (0, 200, 0)  # Zielony
+        elif fuel_ratio > 0.2:
+            color = (255, 200, 0)  # Żółty
+        else:
+            color = (255, 50, 50)  # Czerwony
+        
+        pygame.draw.rect(screen, color, 
+                        (int(bar_x), int(bar_y), int(bar_width * fuel_ratio), int(bar_height)))
+    
+    def _draw_tire_indicator(self, screen):
+        """Rysuje wskaźnik degradacji opon"""
+        indicator_x = self.x - 8
+        indicator_y = self.y - self.height / 2 - 25
+        indicator_size = 4
+        
+        # Kolor wskaźnika w zależności od stanu opon
+        if self.tire_grip > 0.9:
+            color = (0, 255, 0)  # Zielony
+        elif self.tire_grip > 0.7:
+            color = (255, 200, 0)  # Żółty
+        else:
+            color = (255, 50, 50)  # Czerwony
+        
+        pygame.draw.circle(screen, color, (int(indicator_x), int(indicator_y)), indicator_size)
     
     def calculate_fitness(self, config):
         """
@@ -368,9 +501,86 @@ class Car:
         if self.speed < 0:
             fitness -= abs(self.speed) * reverse_penalty * self.time_alive
         
-        # Kara za crash (jeśli nie żyje)
-        if not self.alive:
+        # Kara za brak paliwa (przedwczesna śmierć)
+        if not self.alive and self.fuel <= 0:
+            fitness -= fitness_config.get('crash_penalty', -50) * 0.5  # Mniejsza kara niż przy zderzeniu
+        
+        # Kara za crash (jeśli nie żyje i to nie z powodu paliwa)
+        if not self.alive and self.fuel > 0:
             fitness += fitness_config['crash_penalty']
+        
+        # Bonus za konserwację pojazdów (dobre opony = lepsze wyniki)
+        tire_efficiency = (self.tire_grip - self.min_tire_grip) / (self.base_tire_grip - self.min_tire_grip)
+        fitness += tire_efficiency * self.distance_traveled * 0.05  # Bonus za dobre opony
+        
+        # Bonus za oszczędzanie paliwa
+        fuel_efficiency = (self.fuel / self.fuel_capacity)
+        fitness += fuel_efficiency * self.distance_traveled * 0.03  # Bonus za pozostałe paliwo
         
         self.fitness = max(0, fitness)  # Fitness nie może być ujemne
         return self.fitness
+    
+    def update_checkpoint_direction(self, checkpoint):
+        """
+        Aktualizuje kierunek do najbliższego checkpointu
+        
+        Args:
+            checkpoint: Współrzędne checkpointu (x1, y1, x2, y2)
+        """
+        if not self.alive or not checkpoint:
+            self.checkpoint_direction = 0.0
+            return
+        
+        # Środek checkpointu
+        checkpoint_x = (checkpoint[0] + checkpoint[2]) / 2
+        checkpoint_y = (checkpoint[1] + checkpoint[3]) / 2
+        
+        # Wektor do checkpointu
+        dx = checkpoint_x - self.x
+        dy = checkpoint_y - self.y
+        
+        # Kąt do checkpointu w radianach
+        angle_to_checkpoint = math.atan2(dy, dx)
+        
+        # Aktualny kąt samochodu w radianach (0 stopni = góra, więc dodajemy 90 stopni)
+        car_angle_rad = math.radians(self.angle - 90)
+        
+        # Różnica kątów (-π do π)
+        angle_diff = angle_to_checkpoint - car_angle_rad
+        
+        # Normalizuj do zakresu -π do π
+        while angle_diff > math.pi:
+            angle_diff -= 2 * math.pi
+        while angle_diff < -math.pi:
+            angle_diff += 2 * math.pi
+        
+        # Znormalizuj do zakresu -1 do 1 (gdzie -1 = lewo, 0 = prosto, 1 = prawo)
+        self.checkpoint_direction = angle_diff / math.pi
+    
+    def get_sensor_inputs(self):
+        """
+        Zwraca wszystkie wejścia dla sieci neuronowej
+        
+        Returns:
+            Lista wartości: czujniki odległości + kierunek do checkpointu
+        """
+        return self.sensor_readings + [self.checkpoint_direction]
+    
+    def service_in_pitstop(self, dt):
+        """
+        Uzupełnia paliwo i regeneruje opony w pitstopie
+        
+        Args:
+            dt: Delta time
+        """
+        self.pitstop_time += dt
+        
+        # Szybkie tankowanie i wymiana opon (2 sekundy)
+        refuel_rate = self.fuel_capacity / 2.0  # Pełny bak w 2 sekundy
+        tire_repair_rate = (self.base_tire_grip - self.min_tire_grip) / 2.0
+        
+        # Uzupełnij paliwo
+        self.fuel = min(self.fuel_capacity, self.fuel + refuel_rate * dt)
+        
+        # Napraw opony
+        self.tire_grip = min(self.base_tire_grip, self.tire_grip + tire_repair_rate * dt)

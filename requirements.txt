@@ -10,3 +10,7 @@ imageio
 Pillow
 sb3-contrib
 scipy
+
+PyQt6
+PyQt6-Charts 
+PyQtWebEngine

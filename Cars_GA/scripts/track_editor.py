@@ -30,10 +30,12 @@ class TrackEditor:
         
         # Edytor
         self.track = Track("custom")
-        self.mode = "wall"  # "wall", "checkpoint", "start"
+        self.mode = "wall"  # "wall", "checkpoint", "start", "pitstop"
         self.drawing = False
         self.start_point = None
         self.temp_line = None
+        self.pitstop_rect_start = None  # Do rysowania prostokąta pitstopa
+        self.hover_element = None  # Element pod kursorem (do podświetlenia przed usunięciem)
         
         # Siatka
         self.grid_size = config['track_editor']['grid_size']
@@ -98,14 +100,16 @@ class TrackEditor:
                             self.track.save(tracks_dir)
                     
                     elif event.key == pygame.K_l:
-                        # Wczytaj tor
+                        # Wczytaj tor - graficzny wybór
                         tracks_dir = os.path.join(self.base_dir, 'tracks')
                         tracks = Track.list_tracks(tracks_dir)
                         if tracks:
-                            print("Dostępne tory:", tracks)
-                            name = input("Nazwa toru do wczytania: ")
-                            if name in tracks:
-                                self.track.load(name, tracks_dir)
+                            selected = self.show_track_selection(tracks)
+                            if selected:
+                                self.track = Track()
+                                self.track.load(selected, tracks_dir)
+                        else:
+                            print("Brak zapisanych torów!")
                     
                     elif event.key == pygame.K_1:
                         self.mode = "wall"
@@ -113,6 +117,17 @@ class TrackEditor:
                         self.mode = "checkpoint"
                     elif event.key == pygame.K_3:
                         self.mode = "start"
+                    elif event.key == pygame.K_4:
+                        self.mode = "pitstop"
+                    
+                    elif event.key == pygame.K_DELETE or event.key == pygame.K_BACKSPACE:
+                        # Usuń ostatni element
+                        if self.mode == "wall" and self.track.walls:
+                            self.track.walls.pop()
+                        elif self.mode == "checkpoint" and self.track.checkpoints:
+                            self.track.checkpoints.pop()
+                        elif self.mode == "pitstop":
+                            self.track.pitstop = None
                 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:  # LPM
@@ -121,17 +136,41 @@ class TrackEditor:
                         if self.mode == "start":
                             # Ustaw pozycję startową
                             self.track.set_start_position(pos[0], pos[1], 0)
+                        elif self.mode == "pitstop":
+                            # Rozpocznij rysowanie prostokąta pitstopa
+                            self.drawing = True
+                            self.pitstop_rect_start = pos
                         else:
                             # Rozpocznij rysowanie linii
                             self.drawing = True
                             self.start_point = pos
+                    
+                    elif event.button == 3:  # PPM - usuń element
+                        pos = event.pos
+                        self.delete_element_at(pos)
                 
                 elif event.type == pygame.MOUSEBUTTONUP:
                     if event.button == 1 and self.drawing:
-                        # Zakończ rysowanie linii
+                        # Zakończ rysowanie
                         end_point = self.snap_to_grid(event.pos)
                         
-                        if self.mode == "wall":
+                        if self.mode == "pitstop":
+                            # Utwórz prostokąt pitstopa
+                            x1, y1 = self.pitstop_rect_start
+                            x2, y2 = end_point
+                            x = min(x1, x2)
+                            y = min(y1, y2)
+                            w = abs(x2 - x1)
+                            h = abs(y2 - y1)
+                            
+                            if w > 0 and h > 0:
+                                self.track.pitstop = {
+                                    'zone': pygame.Rect(x, y, w, h),
+                                    'checkpoint': None,  # Użytkownik doda osobno
+                                    'refuel_time': 2.0
+                                }
+                            self.pitstop_rect_start = None
+                        elif self.mode == "wall":
                             self.track.add_wall(
                                 self.start_point[0], self.start_point[1],
                                 end_point[0], end_point[1]
@@ -146,6 +185,9 @@ class TrackEditor:
                         self.start_point = None
                         self.temp_line = None
                 
+                    else:
+                        # Podświetl element pod kursorem
+                        self.hover_element = self.find_element_at(event.pos)
                 elif event.type == pygame.MOUSEMOTION:
                     if self.drawing:
                         # Aktualizuj tymczasową linię
@@ -165,14 +207,29 @@ class TrackEditor:
         if self.show_grid:
             self.draw_grid()
         
+        # Podświetl element pod kursorem
+        if self.hover_element and not self.drawing:
+            self.draw_hover_highlight()
+        
         # Tor
         self.track.draw(self.screen)
         
-        # Tymczasowa linia
+        # Tymczasowa linia lub prostokąt
         if self.drawing and self.temp_line:
-            color = self.temp_line_color if self.mode == "wall" else (0, 255, 255)
-            pygame.draw.line(self.screen, color,
-                           self.start_point, self.temp_line, 2)
+            if self.mode == "pitstop" and self.pitstop_rect_start:
+                # Rysuj tymczasowy prostokąt pitstopa
+                x1, y1 = self.pitstop_rect_start
+                x2, y2 = self.temp_line
+                x = min(x1, x2)
+                y = min(y1, y2)
+                w = abs(x2 - x1)
+                h = abs(y2 - y1)
+                pygame.draw.rect(self.screen, (255, 140, 0), pygame.Rect(x, y, w, h))
+                pygame.draw.rect(self.screen, (255, 200, 100), pygame.Rect(x, y, w, h), 2)
+            else:
+                color = self.temp_line_color if self.mode == "wall" else (0, 255, 255)
+                pygame.draw.line(self.screen, color,
+                               self.start_point, self.temp_line, 2)
         
         # UI
         self.draw_ui()
@@ -202,7 +259,8 @@ class TrackEditor:
         mode_text = {
             "wall": "Ściany (1)",
             "checkpoint": "Checkpointy (2)",
-            "start": "Start (3)"
+            "start": "Start (3)",
+            "pitstop": "Pitstop (4)"
         }
         
         mode_color = (0, 255, 0) if self.mode == "wall" else (150, 150, 150)
@@ -218,6 +276,11 @@ class TrackEditor:
         mode_color = (0, 255, 0) if self.mode == "start" else (150, 150, 150)
         text = self.font.render(f"• {mode_text['start']}", True, mode_color)
         self.screen.blit(text, (10, y))
+        y += 30
+        
+        mode_color = (0, 255, 0) if self.mode == "pitstop" else (150, 150, 150)
+        text = self.font.render(f"• {mode_text['pitstop']}", True, mode_color)
+        self.screen.blit(text, (10, y))
         y += 50
         
         # Instrukcje
@@ -226,6 +289,8 @@ class TrackEditor:
             "C - Wyczyść",
             "S - Zapisz",
             "L - Wczytaj",
+            "DEL - Usuń ostatni",
+            "PPM - Usuń element",
             "ESC - Wyjdź"
         ]
         
@@ -235,17 +300,167 @@ class TrackEditor:
             y += 25
         
         # Statystyki toru
-        y = self.height - 100
+        y = self.height - 120
         stats = [
             f"Ścian: {len(self.track.walls)}",
             f"Checkpointów: {len(self.track.checkpoints)}",
-            f"Start: {self.track.start_position}"
+            f"Start: {self.track.start_position}",
+            f"Pitstop: {'TAK' if self.track.pitstop else 'NIE'}"
         ]
         
         for stat in stats:
             text = self.font.render(stat, True, (150, 150, 255))
             self.screen.blit(text, (10, y))
             y += 25
+    
+    def find_element_at(self, pos):
+        """
+        Znajduje element najbliższy pozycji kursora
+        
+        Args:
+            pos: Pozycja myszy (x, y)
+            
+        Returns:
+            Tuple ('type', index) lub None
+        """
+        x, y = pos
+        threshold = 10  # Maksymalna odległość w pikselach
+        
+        # Sprawdź ściany
+        for i, wall in enumerate(self.track.walls):
+            if self.point_to_line_distance(x, y, wall[0], wall[1], wall[2], wall[3]) < threshold:
+                return ('wall', i)
+        
+        # Sprawdź checkpointy
+        for i, checkpoint in enumerate(self.track.checkpoints):
+            if self.point_to_line_distance(x, y, checkpoint[0], checkpoint[1], checkpoint[2], checkpoint[3]) < threshold:
+                return ('checkpoint', i)
+        
+        # Sprawdź pitstop
+        if self.track.pitstop and 'zone' in self.track.pitstop:
+            if self.track.pitstop['zone'].collidepoint(pos):
+                return ('pitstop', 0)
+        
+        return None
+    
+    def point_to_line_distance(self, px, py, x1, y1, x2, y2):
+        """
+        Oblicza odległość punktu od odcinka
+        
+        Args:
+            px, py: Współrzędne punktu
+            x1, y1, x2, y2: Współrzędne odcinka
+            
+        Returns:
+            Odległość w pikselach
+        """
+        import math
+        
+        line_mag = math.hypot(x2 - x1, y2 - y1)
+        if line_mag < 1e-6:
+            return math.hypot(px - x1, py - y1)
+        
+        u = ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / (line_mag ** 2)
+        u = max(0, min(1, u))
+        
+        ix = x1 + u * (x2 - x1)
+        iy = y1 + u * (y2 - y1)
+        
+        return math.hypot(px - ix, py - iy)
+    
+    def delete_element_at(self, pos):
+        """
+        Usuwa element w danej pozycji
+        
+        Args:
+            pos: Pozycja myszy (x, y)
+        """
+        element = self.find_element_at(pos)
+        
+        if element:
+            elem_type, index = element
+            
+            if elem_type == 'wall':
+                self.track.walls.pop(index)
+                print(f"Usunięto ścianę #{index}")
+            elif elem_type == 'checkpoint':
+                self.track.checkpoints.pop(index)
+                print(f"Usunięto checkpoint #{index}")
+            elif elem_type == 'pitstop':
+                self.track.pitstop = None
+                print("Usunięto pitstop")
+            
+            self.hover_element = None
+    
+    def draw_hover_highlight(self):
+        """Podświetla element pod kursorem"""
+        if not self.hover_element:
+            return
+        
+        elem_type, index = self.hover_element
+        
+        if elem_type == 'wall':
+            wall = self.track.walls[index]
+            pygame.draw.line(self.screen, (255, 0, 0),
+                           (wall[0], wall[1]), (wall[2], wall[3]), 5)
+        elif elem_type == 'checkpoint':
+            checkpoint = self.track.checkpoints[index]
+            pygame.draw.line(self.screen, (255, 0, 0),
+                           (checkpoint[0], checkpoint[1]), (checkpoint[2], checkpoint[3]), 4)
+        elif elem_type == 'pitstop':
+            if self.track.pitstop and 'zone' in self.track.pitstop:
+                pygame.draw.rect(self.screen, (255, 0, 0), self.track.pitstop['zone'], 3)
+    
+    def show_track_selection(self, tracks):
+        """
+        Pokazuje graficzne menu wyboru toru
+        
+        Args:
+            tracks: Lista nazw torów
+            
+        Returns:
+            Wybrana nazwa toru lub None
+        """
+        selected = 0
+        choosing = True
+        
+        while choosing:
+            self.screen.fill(self.bg_color)
+            
+            # Tytuł
+            title = self.large_font.render("WYBIERZ TOR DO WCZYTANIA", True, (100, 200, 255))
+            self.screen.blit(title, (self.width//2 - title.get_width()//2, 60))
+            
+            # Lista torów
+            for i, track_name in enumerate(tracks):
+                color = (200, 200, 80) if i == selected else (100, 100, 100)
+                rect = pygame.Rect(self.width//2 - 300, 150 + i*60, 600, 50)
+                pygame.draw.rect(self.screen, color, rect, border_radius=8)
+                pygame.draw.rect(self.screen, (150, 150, 150), rect, 2, border_radius=8)
+                
+                text = self.font.render(track_name, True, (255, 255, 255))
+                self.screen.blit(text, (rect.x + 20, rect.y + 13))
+            
+            # Instrukcje
+            info = self.font.render("↑/↓: wybierz, Enter: zatwierdź, ESC: anuluj", True, (180, 180, 180))
+            self.screen.blit(info, (self.width//2 - info.get_width()//2, 150 + len(tracks)*60 + 20))
+            
+            pygame.display.flip()
+            
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return None
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        return None
+                    elif event.key == pygame.K_UP:
+                        selected = (selected - 1) % len(tracks)
+                    elif event.key == pygame.K_DOWN:
+                        selected = (selected + 1) % len(tracks)
+                    elif event.key == pygame.K_RETURN:
+                        return tracks[selected]
+        
+        return None
 
 
 def main():

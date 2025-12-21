@@ -19,11 +19,13 @@ class Track:
         self.checkpoints = []  # Lista checkpointów (x1, y1, x2, y2)
         self.start_position = (100, 100)  # Pozycja startowa
         self.start_angle = 0  # Kąt startowy
+        self.pitstop = None  # Dane pitstopa: {position, entry, exit}
         
         # Kolory
         self.wall_color = (100, 100, 100)
         self.checkpoint_color = (0, 255, 0)
         self.start_color = (255, 255, 0)
+        self.pitstop_color = (255, 165, 0)
     
     def add_wall(self, x1, y1, x2, y2):
         """Dodaje ścianę do toru"""
@@ -50,6 +52,24 @@ class Track:
         Args:
             screen: Powierzchnia pygame
         """
+        # Rysuj pitstop NAJPIERW (pod samochodami) jako wypełniony prostokąt
+        if self.pitstop and 'zone' in self.pitstop:
+            # Prostokąt pitstopa
+            pygame.draw.rect(screen, (255, 140, 0), self.pitstop['zone'])  # Wypełniony prostokąt
+            pygame.draw.rect(screen, (255, 200, 100), self.pitstop['zone'], 2)  # Obramowanie
+            
+            # Napis PIT
+            font = pygame.font.Font(None, 28)
+            text = font.render("PIT", True, (255, 255, 255))
+            text_rect = text.get_rect(center=self.pitstop['zone'].center)
+            screen.blit(text, text_rect)
+            
+            # Checkpoint pitstopa (niebieski)
+            if 'checkpoint' in self.pitstop and self.pitstop['checkpoint'] is not None:
+                cp = self.pitstop['checkpoint']
+                pygame.draw.line(screen, (100, 100, 255), 
+                               (cp[0], cp[1]), (cp[2], cp[3]), 3)
+        
         # Rysuj ściany
         for wall in self.walls:
             pygame.draw.line(screen, self.wall_color, 
@@ -87,6 +107,21 @@ class Track:
         Args:
             directory: Katalog do zapisu
         """
+        data = self.to_dict()
+        
+        filepath = os.path.join(directory, f"{self.name}.json")
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        print(f"Tor zapisany: {filepath}")
+    
+    def to_dict(self):
+        """
+        Konwertuje tor do słownika (dla serializacji)
+        
+        Returns:
+            Słownik z danymi toru
+        """
         data = {
             'name': self.name,
             'walls': self.walls,
@@ -95,11 +130,42 @@ class Track:
             'start_angle': self.start_angle
         }
         
-        filepath = os.path.join(directory, f"{self.name}.json")
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
+        if self.pitstop:
+            # Konwertuj pygame.Rect na listę jeśli istnieje
+            pitstop_data = self.pitstop.copy()
+            if 'zone' in pitstop_data and isinstance(pitstop_data['zone'], pygame.Rect):
+                rect = pitstop_data['zone']
+                pitstop_data['zone'] = [rect.x, rect.y, rect.width, rect.height]
+            data['pitstop'] = pitstop_data
         
-        print(f"Tor zapisany: {filepath}")
+        return data
+    
+    @staticmethod
+    def from_dict(data):
+        """
+        Tworzy tor ze słownika
+        
+        Args:
+            data: Słownik z danymi toru
+            
+        Returns:
+            Obiekt Track
+        """
+        track = Track(data.get('name', 'default'))
+        track.walls = [tuple(w) for w in data.get('walls', [])]
+        track.checkpoints = [tuple(c) for c in data.get('checkpoints', [])]
+        track.start_position = tuple(data.get('start_position', (100, 100)))
+        track.start_angle = data.get('start_angle', 0)
+        
+        # Wczytaj pitstop i konwertuj zone na pygame.Rect
+        pitstop_data = data.get('pitstop', None)
+        if pitstop_data and 'zone' in pitstop_data:
+            zone = pitstop_data['zone']
+            if isinstance(zone, list) and len(zone) == 4:
+                pitstop_data['zone'] = pygame.Rect(zone[0], zone[1], zone[2], zone[3])
+        track.pitstop = pitstop_data
+        
+        return track
     
     def load(self, name, directory="tracks"):
         """
@@ -122,11 +188,14 @@ class Track:
             with open(filepath, 'r') as f:
                 data = json.load(f)
             
-            self.name = data.get('name', name)
-            self.walls = [tuple(w) for w in data.get('walls', [])]
-            self.checkpoints = [tuple(c) for c in data.get('checkpoints', [])]
-            self.start_position = tuple(data.get('start_position', (100, 100)))
-            self.start_angle = data.get('start_angle', 0)
+            # Użyj from_dict do wczytania
+            loaded_track = Track.from_dict(data)
+            self.name = loaded_track.name
+            self.walls = loaded_track.walls
+            self.checkpoints = loaded_track.checkpoints
+            self.start_position = loaded_track.start_position
+            self.start_angle = loaded_track.start_angle
+            self.pitstop = loaded_track.pitstop
             
             print(f"Wczytano tor: {self.name}")
             return True
@@ -156,37 +225,22 @@ class Track:
         
         return sorted(tracks)
     
-    @staticmethod
-    def create_simple_track():
-        """
-        Tworzy prosty przykładowy tor
+    # Usunięto domyślną mapę wbudowaną. Teraz korzystaj tylko z map z katalogu tracks/default.
+        # Checkpointy (zmieniona kolejność: 2->1, reszta przesunięta, 1->4)
+        track.add_checkpoint(400, 100, 400, 200)  # 1 (był 2)
+        track.add_checkpoint(600, 300, 700, 300)  # 2 (był 3)
+        track.add_checkpoint(400, 400, 400, 500)  # 3 (był 4)
+        track.add_checkpoint(175, 300, 200, 300)  # 4 (był 1) - prawy pas (normalny)
         
-        Returns:
-            Obiekt Track
-        """
-        track = Track("simple")
-        
-        # Prostokątny tor
-        # Zewnętrzne ściany
-        track.add_wall(100, 100, 700, 100)  # Góra
-        track.add_wall(700, 100, 700, 500)  # Prawo
-        track.add_wall(700, 500, 100, 500)  # Dół
-        track.add_wall(100, 500, 100, 100)  # Lewo
-        
-        # Wewnętrzne ściany
-        track.add_wall(200, 200, 600, 200)  # Góra wewnętrzna
-        track.add_wall(600, 200, 600, 400)  # Prawo wewnętrzne
-        track.add_wall(600, 400, 200, 400)  # Dół wewnętrzny
-        track.add_wall(200, 400, 200, 200)  # Lewo wewnętrzne
-        
-        # Checkpointy
-        track.add_checkpoint(100, 300, 200, 300)  # 1
-        track.add_checkpoint(400, 100, 400, 200)  # 2
-        track.add_checkpoint(600, 300, 700, 300)  # 3
-        track.add_checkpoint(400, 400, 400, 500)  # 4
+        # Pitstop
+        track.pitstop = {
+            'zone': pygame.Rect(50, 230, 50, 140),  # Prostokąt strefy pitstopa
+            'checkpoint': [100, 300, 150, 300],  # Checkpoint pitstopa (lewy pas)
+            'refuel_time': 2.0  # Czas tankowania (sekundy)
+        }
         
         # Pozycja startowa
-        track.set_start_position(150, 300, 0)
+        track.set_start_position(175, 300, 0)
         
         return track
     
