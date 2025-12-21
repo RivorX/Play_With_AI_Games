@@ -473,50 +473,52 @@ class Car:
         
         pygame.draw.circle(screen, color, (int(indicator_x), int(indicator_y)), indicator_size)
     
-    def calculate_fitness(self, config):
+    def calculate_fitness(self, config, avg_fitness=None, generation=None, penalty_generation_threshold=50):
         """
         Oblicza fitness samochodu
-        
         Args:
-            config: Słownik z konfiguracją
-            
+            config: słownik z konfiguracją
+            avg_fitness: średni fitness populacji (opcjonalnie)
+            generation: numer generacji (opcjonalnie)
+            penalty_generation_threshold: od której generacji stosować karę za złożoność
         Returns:
             Wartość fitness
         """
         fitness_config = config['fitness']
-        
         fitness = 0
-        
         # Punkty za checkpointy
         fitness += self.checkpoints_passed * fitness_config['checkpoint_reward']
-        
         # Punkty za dystans
         fitness += self.distance_traveled * fitness_config['distance_weight']
-        
         # Kara za czas
         fitness -= self.time_alive * fitness_config['time_penalty']
-        
         # Kara za jazdę do tyłu
         reverse_penalty = fitness_config.get('reverse_penalty', 2.0)
         if self.speed < 0:
             fitness -= abs(self.speed) * reverse_penalty * self.time_alive
-        
         # Kara za brak paliwa (przedwczesna śmierć)
         if not self.alive and self.fuel <= 0:
             fitness -= fitness_config.get('crash_penalty', -50) * 0.5  # Mniejsza kara niż przy zderzeniu
-        
         # Kara za crash (jeśli nie żyje i to nie z powodu paliwa)
         if not self.alive and self.fuel > 0:
             fitness += fitness_config['crash_penalty']
-        
         # Bonus za konserwację pojazdów (dobre opony = lepsze wyniki)
         tire_efficiency = (self.tire_grip - self.min_tire_grip) / (self.base_tire_grip - self.min_tire_grip)
         fitness += tire_efficiency * self.distance_traveled * 0.05  # Bonus za dobre opony
-        
         # Bonus za oszczędzanie paliwa
         fuel_efficiency = (self.fuel / self.fuel_capacity)
         fitness += fuel_efficiency * self.distance_traveled * 0.03  # Bonus za pozostałe paliwo
-        
+
+        # --- ADAPTACYJNA KARA ZA ZŁOŻONOŚĆ SIECI ---
+        penalty = 0
+        # Kara tylko jeśli: generacja >= próg ORAZ fitness < średni_fitness
+        if avg_fitness is not None and generation is not None:
+            if generation >= penalty_generation_threshold:
+                if fitness < avg_fitness:
+                    num_params = self.network.get_num_parameters() if hasattr(self, 'network') else 0
+                    penalty = fitness_config.get('network_complexity_penalty', 0.0) * num_params
+        # W innych przypadkach (np. testy) - domyślnie bez kary
+        fitness -= penalty
         self.fitness = max(0, fitness)  # Fitness nie może być ujemne
         return self.fitness
     

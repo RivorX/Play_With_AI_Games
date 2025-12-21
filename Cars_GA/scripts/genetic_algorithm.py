@@ -169,15 +169,18 @@ class GeneticAlgorithm:
             
             frames += 1
         
-        # Oblicz fitness dla wszystkich
+        # Oblicz fitness dla wszystkich (najpierw bez kary, by policzyć średnią)
+        fitnesses_tmp = []
         for individual in self.population:
-            individual['fitness'] = individual['car'].calculate_fitness(self.config)
-            
-            # Odejmij penalty za złożoność sieci
-            network = individual['network']
-            num_params = network.get_num_parameters()
-            complexity_penalty = num_params * self.config['fitness'].get('network_complexity_penalty', 0.001)
-            individual['fitness'] -= complexity_penalty
+            fitness = individual['car'].calculate_fitness(self.config)
+            individual['fitness'] = fitness
+            fitnesses_tmp.append(fitness)
+
+        avg_fitness = sum(fitnesses_tmp) / len(fitnesses_tmp)
+        # Teraz policz fitness z adaptacyjną karą
+        for individual in self.population:
+            fitness = individual['car'].calculate_fitness(self.config, avg_fitness=avg_fitness, generation=self.generation)
+            individual['fitness'] = fitness
         
         # Pobierz statystyki PRZED resetowaniem w evolve()
         fitnesses = [ind['fitness'] for ind in self.population]
