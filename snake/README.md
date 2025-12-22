@@ -1,6 +1,6 @@
-# Snake — RL agent for Snake (RecurrentPPO)
+# Snake — RL agent for Snake (PPO)
 
-Projekt: lekki agent RecurrentPPO nauczony gry w Snake na siatkach o rozmiarach dowolnych (viewmap 16x16). Celem jest proste, czytelne środowisko Gym + Pygame używane do badań nad zachowaniami agenta i wizualizacją decyzji.
+Projekt: lekki agent PPO nauczony gry w Snake na siatkach o rozmiarach dowolnych. Celem jest proste, czytelne środowisko Gym + Pygame używane do badań nad zachowaniami agenta i wizualizacją decyzji.
 
 ---
 
@@ -73,13 +73,13 @@ Poniżej przykładowy wykres postępu treningu (średnia nagroda / epizod podcza
 ![Training progress](docs/training_progress.png)
 
 
-# Wyjaśnienie metryk RecurrentPPO
+# Wyjaśnienie metryk PPO
 
 Podczas treningu w logach pojawiają się metryki, które pomagają monitorować postęp i stabilność uczenia:
 
 - **approx_kl** — Przybliżona dywergencja KL. Pokazuje, jak bardzo zmieniła się polityka agenta po aktualizacji. Niska wartość = stabilne uczenie.
-- **clip_fraction** — Ułamek aktualizacji, które zostały „ucięte” przez mechanizm RecurrentPPO (clip_range). Wysoka wartość może oznaczać zbyt duże zmiany polityki.
-- **clip_range** — Maksymalny zakres zmiany polityki w jednej aktualizacji (ustawienie RecurrentPPO).
+- **clip_fraction** — Ułamek aktualizacji, które zostały „ucięte” przez mechanizm PPO (clip_range). Wysoka wartość może oznaczać zbyt duże zmiany polityki.
+- **clip_range** — Maksymalny zakres zmiany polityki w jednej aktualizacji (ustawienie PPO).
 - **entropy_loss** — Entropia polityki. Im bliżej zera, tym bardziej deterministyczne decyzje agenta. Wyższa wartość = więcej eksploracji.
 - **explained_variance** — Jak dobrze krytyk (value function) przewiduje nagrody. 0 = brak korelacji, 1 = idealne przewidywanie. Im wyżej, tym lepiej.
 - **learning_rate** — Aktualna szybkość uczenia.
