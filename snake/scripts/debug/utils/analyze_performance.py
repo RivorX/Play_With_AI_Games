@@ -36,7 +36,6 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
     
     for episode_idx in range(num_episodes):
         obs, info = env.reset()
-        lstm_states = None
         episode_starts = np.ones((1,), dtype=bool)
         done = False
         step = 0
@@ -69,30 +68,13 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
                 
                 features = policy.features_extractor(obs_tensor)
                 
-                if lstm_states is not None:
-                    lstm_states_tensor = (
-                        torch.tensor(lstm_states[0], dtype=torch.float32, device=policy.device),
-                        torch.tensor(lstm_states[1], dtype=torch.float32, device=policy.device)
-                    )
-                else:
-                    batch_size = 1
-                    n_layers = policy.lstm_actor.num_layers
-                    hidden_size = policy.lstm_actor.hidden_size
-                    lstm_states_tensor = (
-                        torch.zeros(n_layers, batch_size, hidden_size, device=policy.device),
-                        torch.zeros(n_layers, batch_size, hidden_size, device=policy.device)
-                    )
-                
-                features_seq = features.unsqueeze(1)
-                lstm_output, new_lstm_states_tensor = policy.lstm_actor(features_seq, lstm_states_tensor)
-                latent_pi = lstm_output.squeeze(1)
-                latent_pi_mlp = policy.mlp_extractor.policy_net(latent_pi)
+                # Pure PPO - no LSTM
+                latent_pi_mlp = policy.mlp_extractor.policy_net(features)
                 logits = policy.action_net(latent_pi_mlp)
                 action_probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                 
-                action, lstm_states = model.predict(
+                action, _ = model.predict(
                     obs, 
-                    state=lstm_states, 
                     episode_start=episode_starts, 
                     deterministic=False
                 )
@@ -366,7 +348,6 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
     
     def run_episode_with_ablation(ablation_type='full'):
         obs, _ = env.reset()
-        lstm_states = None
         episode_starts = np.ones((1,), dtype=bool)
         done = False
         step = 0
@@ -408,9 +389,8 @@ def analyze_performance_metrics(model, env, output_dir, action_names, num_episod
                 for k, v in obs_tensor.items():
                     obs_numpy[k] = v.cpu().numpy()
                 
-                action, lstm_states = model.predict(
+                action, _ = model.predict(
                     obs_numpy, 
-                    state=lstm_states, 
                     episode_start=episode_starts, 
                     deterministic=True
                 )

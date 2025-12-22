@@ -8,7 +8,7 @@ import imageio
 import numpy as np
 import pygame
 import torch
-from sb3_contrib import RecurrentPPO
+from stable_baselines3 import PPO
 import yaml
 
 import sys
@@ -129,7 +129,7 @@ def load_model_interactive(model_path, policy_path, base_dir):
         policy_kwargs = config['model']['policy_kwargs'].copy()
         policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
         
-        model = RecurrentPPO(
+        model = PPO(
             config['model']['policy'],
             temp_env,
             learning_rate=0.0001,
@@ -153,13 +153,13 @@ def load_model_interactive(model_path, policy_path, base_dir):
         temp_env.close()
         print(f"✅ Załadowano policy.pth\n")
     else:
-        model = RecurrentPPO.load(source_path)
+        model = PPO.load(source_path)
         print(f"✅ Załadowano {source_name}\n")
     
     return model, source_name
 
 
-def capture_run_as_gif(model, grid_size, episodes, out_path, fps=10, max_frames=1000, death_pause_duration=3.0):
+def capture_run_as_gif(model, grid_size, episodes, out_path, fps=10, max_frames=10000, death_pause_duration=3.0):
     """
     Nagrywa gameplay jako GIF z ulepszonymi funkcjami:
     - Automatyczne czyszczenie folderu tymczasowego
@@ -167,7 +167,7 @@ def capture_run_as_gif(model, grid_size, episodes, out_path, fps=10, max_frames=
     - Pauza 3s na ostatniej klatce gdy wąż zginie
     
     Args:
-        model: Załadowany model RecurrentPPO
+        model: Załadowany model PPO
         death_pause_duration: Czas (w sekundach) pauzy na ostatniej klatce gdy wąż zginie
     """
     # Przygotuj env

@@ -27,8 +27,7 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
     layer_gradients = []
     attention_heatmaps = []
     
-    # Inicjalizuj stany LSTM
-    lstm_states = None
+    # Pure PPO - no LSTM states needed
     episode_starts = np.ones((1,), dtype=bool)
     
     # 🎯 4 SCENARIOS
@@ -63,9 +62,9 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
                             v_tensor = v_tensor.unsqueeze(0)
                         obs_temp[k] = v_tensor
                     
-                    action, lstm_states = model.predict(obs, state=lstm_states, 
-                                                       episode_start=episode_starts, 
-                                                       deterministic=False)
+                    action, _ = model.predict(obs, 
+                                            episode_start=episode_starts, 
+                                            deterministic=False)
                     action_idx = int(action.item()) if torch.is_tensor(action) else int(action)
                 
                 obs, reward, done, truncated, info = env.step(action_idx)
@@ -73,7 +72,6 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
                 
                 if done or truncated:
                     obs, info = env.reset()
-                    lstm_states = None
                     episode_starts = np.ones((1,), dtype=bool)
                 
                 attempt += 1
@@ -149,36 +147,24 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             if image.dim() == 4 and image.shape[-1] == 1:
                 image = image.permute(0, 3, 1, 2)
             
-            # CNN - Multi-Scale Architecture
+            # CNN - 4-layer dynamic architecture
             x = image
-            x = features_extractor.conv1(x)
-            x = features_extractor.bn1(x)
-            x = torch.nn.functional.gelu(x)
+            for i, (conv, bn) in enumerate(zip(features_extractor.conv_layers, features_extractor.bn_layers)):
+                x = conv(x)
+                x = bn(x)
+                x = torch.nn.functional.gelu(x)
             
-            x = features_extractor.conv2(x)
-            x = features_extractor.bn2(x)
-            x = features_extractor.dropout2(x)
-            x = torch.nn.functional.gelu(x)
+            # Spatial attention (if enabled)
+            if getattr(features_extractor, 'use_spatial_attention', False):
+                x = features_extractor.spatial_attention(x)
             
-            if getattr(features_extractor, "has_conv3", False):
-                identity = features_extractor.residual_proj(x)
-                
-                x_local = features_extractor.conv3_local(x)
-                x_local = features_extractor.bn3_local(x_local)
-                
-                x_global = features_extractor.conv3_global(x)
-                x_global = features_extractor.bn3_global(x_global)
-                
-                x_combined = torch.cat([x_local, x_global], dim=1)
-                x_combined = features_extractor.dropout3(x_combined)
-                x_combined = torch.nn.functional.gelu(x_combined)
-                x = x_combined + identity  # Residual
-            
+            # Global Average Pooling
+            x = features_extractor.global_pool(x)
             cnn_raw = features_extractor.flatten(x)
             cnn_raw = cnn_raw.float()
             
-            # Bottleneck
-            cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
+            # CNN projection (768-dim)
+            cnn_features = features_extractor.cnn_projection(cnn_raw)
             
             # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
             scalars = torch.cat([
@@ -192,35 +178,15 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             ], dim=-1)
             
             scalars = features_extractor.scalar_input_dropout(scalars)
-            scalar_features = features_extractor.scalar_linear(scalars)
+            scalar_features = features_extractor.scalar_network(scalars)
             
             # Fusion
             combined = torch.cat([cnn_features, scalar_features], dim=-1)
-            features_final = features_extractor.final_linear(combined)
+            features_final = features_extractor.fusion(combined)
             
-            # LSTM - inicjalizacja stanów jeśli potrzeba
-            if lstm_states is None:
-                # Standard PyTorch LSTM: (num_layers, batch_size, hidden_size)
-                batch_size = features_final.shape[0]
-                num_layers = policy.lstm_actor.num_layers
-                hidden_size = policy.lstm_actor.hidden_size
-                
-                lstm_states = (
-                    np.zeros((num_layers, batch_size, hidden_size), dtype=np.float32),
-                    np.zeros((num_layers, batch_size, hidden_size), dtype=np.float32)
-                )
-            
-            lstm_states_tensor = (
-                torch.tensor(lstm_states[0], dtype=torch.float32, device=policy.device),
-                torch.tensor(lstm_states[1], dtype=torch.float32, device=policy.device)
-            )
-            
-            features_seq = features_final.unsqueeze(1)
-            lstm_out, new_lstm_states = policy.lstm_actor(features_seq, lstm_states_tensor)
-            lstm_states = (new_lstm_states[0].cpu().numpy(), new_lstm_states[1].cpu().numpy())
-            
-            latent_pi = lstm_out.squeeze(1)
-            latent_vf = lstm_out.squeeze(1)
+            # MLP (pure PPO)
+            latent_pi = features_final
+            latent_vf = features_final
             
             # MLP
             latent_pi_mlp = policy.mlp_extractor.policy_net(latent_pi)
@@ -247,7 +213,6 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
         cnn_np = cnn_features[0].cpu().numpy()
         scalar_np = scalar_features[0].cpu().numpy()
         features_np = features_final[0].cpu().numpy()
-        lstm_np = latent_pi[0].cpu().numpy()
         
         detailed_activations.append({
             'state': state_idx,
@@ -259,9 +224,6 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
             'scalar_absmax': np.abs(scalar_np).max(),
             'scalar_active_ratio': (np.abs(scalar_np) > 0.01).mean(),
             'features_rms': np.sqrt(np.mean(features_np**2)),
-            'lstm_rms': np.sqrt(np.mean(lstm_np**2)),
-            'lstm_hidden_rms': np.sqrt(np.mean(lstm_states[0][0]**2)),
-            'lstm_cell_rms': np.sqrt(np.mean(lstm_states[1][0]**2)),
         })
         
         # Wizualizacja CNN output
@@ -273,13 +235,13 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
         # Compute layer gradients
         from utils.analyze_gradients import compute_layer_gradients
         state_layer_grads = compute_layer_gradients(
-            model, obs, obs_tensor, lstm_states, action.item(), features_extractor
+            model, obs, obs_tensor, action.item(), features_extractor
         )
         layer_gradients.append(state_layer_grads)
         
-        # Generate attention heatmap
+        # Generate attention heatmap (Fusion layer visualization)
         attention_map = generate_attention_heatmap(
-            model, obs, obs_tensor, lstm_states, action.item(),
+            model, obs, obs_tensor, action.item(),
             output_dirs['heatmap'], state_idx, action_names, scenario["name"]
         )
         if attention_map is not None:
@@ -291,17 +253,16 @@ def analyze_basic_states(model, env, output_dirs, action_names, config):
     return action_probs_list, detailed_activations, layer_gradients, attention_heatmaps
 
 
-def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, output_dir, state_idx, action_names, scenario_name=""):
+def generate_attention_heatmap(model, obs, obs_tensor, action_idx, output_dir, state_idx, action_names, scenario_name=""):
     """
     Generuje attention heatmap używając gradientów
-    🆕 UPDATED: Pure Bottleneck (NO Skip) + scenario name
+    ✅ UPDATED: Pure PPO + scenario name
     """
     policy = model.policy
     features_extractor = policy.features_extractor
     
     # Ustaw tryby
     features_extractor.eval()
-    policy.lstm_actor.train()
     policy.mlp_extractor.train()
     policy.action_net.train()
     
@@ -319,41 +280,30 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     
     image_grad.retain_grad()
     
-    # 🆕 CNN - Multi-Scale Architecture
+    # 🆕 CNN - 4-layer dynamic architecture
     x = image_grad
-
-    # Layer 1
-    x = features_extractor.conv1(x)
-    x = features_extractor.bn1(x)
-    x = torch.nn.functional.gelu(x)
-
-    # Layer 2
-    x = features_extractor.conv2(x)
-    x = features_extractor.bn2(x)
-    x = features_extractor.dropout2(x)
-    x = torch.nn.functional.gelu(x)
-
-    # Layer 3 - MULTI-SCALE (opcjonalna)
-    if getattr(features_extractor, "has_conv3", False):
-        identity = features_extractor.residual_proj(x)
+    dropout_idx = 0
+    for i, (conv, bn) in enumerate(zip(features_extractor.conv_layers, features_extractor.bn_layers)):
+        x = conv(x)
+        x = bn(x)
+        x = torch.nn.functional.gelu(x)
         
-        x_local = features_extractor.conv3_local(x)
-        x_local = features_extractor.bn3_local(x_local)
-        
-        x_global = features_extractor.conv3_global(x)
-        x_global = features_extractor.bn3_global(x_global)
-        
-        x_combined = torch.cat([x_local, x_global], dim=1)
-        x_combined = features_extractor.dropout3(x_combined)
-        x_combined = torch.nn.functional.gelu(x_combined)
-        x = x_combined + identity  # Residual
-
-    # Flatten
+        # Apply dropout from layer 2 onwards (if exists)
+        if i > 0 and dropout_idx < len(features_extractor.dropout_layers):
+            x = features_extractor.dropout_layers[dropout_idx](x)
+            dropout_idx += 1
+    
+    # Spatial attention (if enabled)
+    if getattr(features_extractor, 'use_spatial_attention', False):
+        x = features_extractor.spatial_attention(x)
+    
+    # Global Average Pooling
+    x = features_extractor.global_pool(x)
     cnn_raw = features_extractor.flatten(x)
     cnn_raw = cnn_raw.float()
 
-    # 🆕 BOTTLENECK
-    cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
+    # CNN projection (768-dim)
+    cnn_features = features_extractor.cnn_projection(cnn_raw)
     
     # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
     scalars_grad = torch.cat([
@@ -367,23 +317,14 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
     ], dim=-1)
     
     scalars_grad = features_extractor.scalar_input_dropout(scalars_grad)
-    scalar_features = features_extractor.scalar_linear(scalars_grad)
+    scalar_features = features_extractor.scalar_network(scalars_grad)
     
     # Fusion
     combined = torch.cat([cnn_features, scalar_features], dim=-1)
-    features_final = features_extractor.final_linear(combined)
+    features_final = features_extractor.fusion(combined)
     
-    # LSTM
-    lstm_states_tensor = (
-        torch.tensor(lstm_states[0], dtype=torch.float32, device=policy.device, requires_grad=False),
-        torch.tensor(lstm_states[1], dtype=torch.float32, device=policy.device, requires_grad=False)
-    )
-    
-    features_seq = features_final.unsqueeze(1)
-    lstm_out, _ = policy.lstm_actor(features_seq, lstm_states_tensor)
-    latent_pi_grad = lstm_out.squeeze(1)
-    
-    latent_pi_mlp = policy.mlp_extractor.policy_net(latent_pi_grad)
+    # MLP (pure PPO)
+    latent_pi_mlp = policy.mlp_extractor.policy_net(features_final)
     logits_grad = policy.action_net(latent_pi_mlp)
     selected_logit = logits_grad[0, action_idx]
     
@@ -429,61 +370,48 @@ def generate_attention_heatmap(model, obs, obs_tensor, lstm_states, action_idx, 
 
 def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
     """
-    Wizualizuje output wszystkich warstw CNN
-    🆕 UPDATED: Multi-Scale Architecture with Local + Global paths
+    Wizualizuje output wszystkich warstw CNN (4 warstwy)
+    ✅ UPDATED: 4-layer CNN architecture (no multi-scale branches)
     """
     with torch.no_grad():
         image = obs_tensor['image']
         if image.dim() == 4 and image.shape[-1] == 1:
             image = image.permute(0, 3, 1, 2)
 
+        activations = {}
         x = image
+        
+        # Process all 4 CNN layers dynamically
+        num_layers = len(features_extractor.conv_layers)
+        dropout_idx = 0
+        
+        for layer_idx in range(num_layers):
+            x = features_extractor.conv_layers[layer_idx](x)
+            x = features_extractor.bn_layers[layer_idx](x)
+            x = torch.nn.functional.gelu(x)
+            
+            # Apply dropout from layer 2 onwards (if exists)
+            if layer_idx > 0 and dropout_idx < len(features_extractor.dropout_layers):
+                x = features_extractor.dropout_layers[dropout_idx](x)
+                dropout_idx += 1
+            
+            layer_name = f'conv{layer_idx+1}_output'
+            activations[layer_name] = x[0].cpu().numpy()
 
-        # Conv1
-        x = features_extractor.conv1(x)
-        x = features_extractor.bn1(x)
-        x = torch.nn.functional.gelu(x)
-        conv1_output = x[0].cpu().numpy()
+        # ✅ Spatial attention (if enabled)
+        if getattr(features_extractor, 'use_spatial_attention', False):
+            x = features_extractor.spatial_attention(x)
 
-        # Conv2: 11×11 → 6×6
-        x = features_extractor.conv2(x)
-        x = features_extractor.bn2(x)
-        x = features_extractor.dropout2(x)
-        x = torch.nn.functional.gelu(x)
-        conv2_output = x[0].cpu().numpy()
-
-        activations = {
-            'conv1_output': conv1_output,
-            'conv2_output': conv2_output
-        }
-
-        # Conv3 (if exists)
-        if getattr(features_extractor, "has_conv3", False):
-            identity = features_extractor.residual_proj(x)
-
-            x_local = features_extractor.conv3_local(x)
-            x_local = features_extractor.bn3_local(x_local)
-
-            x_global = features_extractor.conv3_global(x)
-            x_global = features_extractor.bn3_global(x_global)
-
-            x_combined = torch.cat([x_local, x_global], dim=1)
-            x_combined = features_extractor.dropout3(x_combined)
-            x_combined = torch.nn.functional.gelu(x_combined)
-
-            x = x_combined + identity  # Residual
-
-            activations['conv3_output'] = x[0].cpu().numpy()
-            activations['conv3_local'] = x_local[0].cpu().numpy()
-            activations['conv3_global'] = x_global[0].cpu().numpy()
-
-        # Flatten + Bottleneck
+        # Global Average Pooling + Flatten
+        x = features_extractor.global_pool(x)
         cnn_raw = features_extractor.flatten(x)
         cnn_raw = cnn_raw.float()
-        cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
+        
+        # CNN projection (768-dim)
+        cnn_features = features_extractor.cnn_projection(cnn_raw)
 
         activations['cnn_raw'] = cnn_raw[0].cpu().numpy()
-        activations['bottleneck'] = cnn_features[0].cpu().numpy()
+        activations['projection'] = cnn_features[0].cpu().numpy()
 
         # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
         scalars = torch.cat([
@@ -496,103 +424,56 @@ def visualize_cnn_output(obs_tensor, features_extractor, output_dir, state_idx):
             obs_tensor['snake_length']
         ], dim=-1)
         scalars = features_extractor.scalar_input_dropout(scalars)
-        scalar_features = features_extractor.scalar_linear(scalars)
+        scalar_features = features_extractor.scalar_network(scalars)
         activations['scalar'] = scalar_features[0].cpu().numpy()
 
         # Fusion
         combined = torch.cat([cnn_features, scalar_features], dim=-1)
-        fusion = features_extractor.final_linear(combined)
+        fusion = features_extractor.fusion(combined)
         activations['fusion'] = fusion[0].cpu().numpy()
-
-        # LSTM (jeśli dostępny)
-        lstm_out = None
-        policy = getattr(features_extractor, 'policy', None)
-        if policy is not None and hasattr(policy, 'lstm_actor'):
-            lstm_states = (
-                torch.zeros((1, policy.lstm_actor.hidden_size), device=cnn_raw.device),
-                torch.zeros((1, policy.lstm_actor.hidden_size), device=cnn_raw.device)
-            )
-            features_seq = fusion.unsqueeze(1)
-            lstm_out, _ = policy.lstm_actor(features_seq, lstm_states)
-            activations['lstm'] = lstm_out.squeeze(1)[0].cpu().numpy()
 
     # ==================== WIZUALIZACJA ====================
 
-    # 1. CONV1 OUTPUT
-    visualize_conv_layer(
-        activations['conv1_output'],
-        layer_name='Conv1 Output',
-        output_path=os.path.join(output_dir, f'cnn_conv1_state_{state_idx}.png'),
-        num_channels=min(16, activations['conv1_output'].shape[0])
-    )
-
-    # 2. CONV2 OUTPUT
-    visualize_conv_layer(
-        activations['conv2_output'],
-        layer_name='Conv2 Output',
-        output_path=os.path.join(output_dir, f'cnn_conv2_state_{state_idx}.png'),
-        num_channels=min(16, activations['conv2_output'].shape[0])
-    )
-
-    # 3. CONV3 - Multi-Scale Branches (jeśli istnieje)
-    if 'conv3_output' in activations:
+    # Visualize all 4 CNN layers
+    for layer_idx in range(num_layers):
+        layer_name = f'conv{layer_idx+1}_output'
         visualize_conv_layer(
-            activations['conv3_output'],
-            layer_name='Conv3 Output (Local + Global + Residual)',
-            output_path=os.path.join(output_dir, f'cnn_conv3_state_{state_idx}.png'),
-            num_channels=min(16, activations['conv3_output'].shape[0])
+            activations[layer_name],
+            layer_name=f'Conv{layer_idx+1} Output',
+            output_path=os.path.join(output_dir, f'cnn_conv{layer_idx+1}_state_{state_idx}.png'),
+            num_channels=min(16, activations[layer_name].shape[0])
         )
 
-        # Conv3 Local branch
-        if 'conv3_local' in activations:
-            visualize_conv_layer(
-                activations['conv3_local'],
-                layer_name='Conv3 Local Branch',
-                output_path=os.path.join(output_dir, f'cnn_conv3_local_state_{state_idx}.png'),
-                num_channels=min(16, activations['conv3_local'].shape[0])
-            )
-
-        # Conv3 Global branch
-        if 'conv3_global' in activations:
-            visualize_conv_layer(
-                activations['conv3_global'],
-                layer_name='Conv3 Global Branch',
-                output_path=os.path.join(output_dir, f'cnn_conv3_global_state_{state_idx}.png'),
-                num_channels=min(16, activations['conv3_global'].shape[0])
-            )
-
-    # 4. RAW vs BOTTLENECK (1D features)
+    # RAW vs PROJECTION (1D features)
     visualize_1d_features(
         {
             f'CNN Raw ({len(activations["cnn_raw"])})': activations['cnn_raw'],
-            f'Bottleneck ({len(activations["bottleneck"])})': activations['bottleneck']
+            f'Projection ({len(activations["projection"])})': activations['projection']
         },
-        output_path=os.path.join(output_dir, f'cnn_bottleneck_state_{state_idx}.png'),
+        output_path=os.path.join(output_dir, f'cnn_projection_state_{state_idx}.png'),
         state_idx=state_idx
     )
 
-    # 5. FUSION, SCALAR, LSTM (1D features)
+    # FUSION & SCALAR (1D features)
     fusion_dict = {
         f'Scalar ({len(activations["scalar"])})': activations['scalar'],
         f'Fusion ({len(activations["fusion"])})': activations['fusion']
     }
-    if 'lstm' in activations:
-        fusion_dict[f'LSTM ({len(activations["lstm"])})'] = activations['lstm']
     visualize_1d_features(
         fusion_dict,
         output_path=os.path.join(output_dir, f'fusions_state_{state_idx}.png'),
         state_idx=state_idx
     )
 
-    # 6. HEATMAPA WSZYSTKICH KANAŁÓW CONV2
+    # Heatmap of last CNN layer (Conv4) - BEFORE spatial attention
+    last_conv_layer = f'conv{num_layers}_output'
     visualize_all_channels_heatmap(
-        activations['conv2_output'],
-        layer_name='Conv2 All Channels',
-        output_path=os.path.join(output_dir, f'cnn_conv2_all_channels_state_{state_idx}.png')
+        activations[last_conv_layer],
+        layer_name=f'Conv{num_layers} Output (Before Spatial Attention)',
+        output_path=os.path.join(output_dir, f'cnn_conv{num_layers}_all_channels_state_{state_idx}.png')
     )
 
-    layer_info = 'Multi-Scale 3-layer' if 'conv3_output' in activations else '2-layer'
-    print(f'  ✅ CNN+Fusion+Scalar+LSTM visualization ({layer_info}) zapisana dla stanu {state_idx}')
+    print(f'  ✅ CNN (4-layer) + Spatial Attention + Fusion + Scalar visualization zapisana dla stanu {state_idx}')
 
 
 def visualize_conv_layer(activation, layer_name, output_path, num_channels=16):
