@@ -3,7 +3,7 @@ import os
 import numpy as np
 import pygame
 import torch
-from sb3_contrib import RecurrentPPO
+from stable_baselines3 import PPO
 from model import make_env
 from cnn import CustomFeaturesExtractor
 import yaml
@@ -134,7 +134,7 @@ def load_model_interactive(model_path, policy_path):
         policy_kwargs = config['model']['policy_kwargs'].copy()
         policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
         
-        model = RecurrentPPO(
+        model = PPO(
             config['model']['policy'],
             temp_env,
             learning_rate=0.0001,
@@ -159,7 +159,7 @@ def load_model_interactive(model_path, policy_path):
         print(f"✅ Załadowano policy.pth\n")
         logging.info(f"Załadowano policy.pth z: {source_path}")
     else:
-        model = RecurrentPPO.load(source_path)
+        model = PPO.load(source_path)
         print(f"✅ Załadowano {source_name}\n")
         logging.info(f"Załadowano model z: {source_path}")
     

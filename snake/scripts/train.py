@@ -3,7 +3,7 @@ import sys
 import yaml
 import pickle
 import torch
-from sb3_contrib import RecurrentPPO
+from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, DummyVecEnv
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import StopTrainingOnNoModelImprovement
@@ -17,14 +17,12 @@ from utils.gradient_monitor import GradientWeightMonitor
 from utils.training_utils import (
     linear_schedule, 
     entropy_schedule,
-    apply_gradient_clipping, 
     ensure_directories,
     reset_channel_logs,
     init_channel_loggers,
     log_observation,
     clear_gpu_cache,
     enable_pin_memory,
-    AsyncRolloutPrefetcher,
     setup_adamw_optimizer,
     load_policy_weights_only,
     cleanup_all_training_csvs
@@ -286,14 +284,15 @@ def train(use_progress_bar=False):
     if mode == 'continue' and not use_config_hyperparams:
         # Tryb 1: Kontynuacja z hyperparametrami z modelu
         print(f"\n📥 Ładowanie pełnego modelu (hyperparametry z modelu)...\n")
-        model = RecurrentPPO.load(actual_model_path, env=env)
+        model = PPO.load(actual_model_path, env=env)
+        model.num_timesteps = total_timesteps  # ✅ Ustaw prawidłowy licznik timesteps
         model = setup_adamw_optimizer(model, config)
         clear_gpu_cache()
     
     elif mode == 'continue' and use_config_hyperparams:
         # Tryb 2: Kontynuacja z hyperparametrami z config
         print(f"\n📥 Ładowanie modelu (hyperparametry z config.yaml)...\n")
-        model = RecurrentPPO(
+        model = PPO(
             config['model']['policy'],
             env,
             learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
@@ -311,17 +310,18 @@ def train(use_progress_bar=False):
         )
         
         # Wczytaj tylko wagi policy
-        model_tmp = RecurrentPPO.load(actual_model_path)
+        model_tmp = PPO.load(actual_model_path)
         model.policy.load_state_dict(model_tmp.policy.state_dict())
         del model_tmp
         
+        model.num_timesteps = total_timesteps  # ✅ Ustaw prawidłowy licznik timesteps
         model = setup_adamw_optimizer(model, config)
         clear_gpu_cache()
     
     elif mode == 'policy_only':
         # Tryb 4: Wczytaj tylko wagi z policy.pth
         print(f"\n📥 Tworzenie nowego modelu (wagi z policy.pth)...\n")
-        model = RecurrentPPO(
+        model = PPO(
             config['model']['policy'],
             env,
             learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
@@ -339,13 +339,14 @@ def train(use_progress_bar=False):
         )
         
         model = load_policy_weights_only(model, policy_only_path)
+        model.num_timesteps = total_timesteps  # ✅ Ustaw prawidłowy licznik timesteps
         model = setup_adamw_optimizer(model, config)
         clear_gpu_cache()
     
     else:  # mode == 'restart'
         # Tryb 3: Nowy model od zera
         print(f"\n🆕 Tworzenie nowego modelu od zera...\n")
-        model = RecurrentPPO(
+        model = PPO(
             config['model']['policy'],
             env,
             learning_rate=linear_schedule(config['model']['learning_rate'], config['model']['min_learning_rate']),
@@ -363,8 +364,6 @@ def train(use_progress_bar=False):
         )
         model = setup_adamw_optimizer(model, config)
     
-    clip_value = config['model'].get('lstm', {}).get('gradient_clip_val', 5.0)
-    apply_gradient_clipping(model, clip_value=clip_value)
 
     # ✅ best_model_save_path już zdefiniowany wcześniej (linia ~163)
 
@@ -418,10 +417,6 @@ def train(use_progress_bar=False):
         verbose=1
     )
 
-    # ⚡ OPTIMIZATION: Async Rollout Prefetcher
-    prefetcher = AsyncRolloutPrefetcher(env, batch_queue_size=2)
-    prefetcher.start()
-
     try:
         configured_total = config['training'].get('total_timesteps', 0)
         remaining_timesteps = configured_total - total_timesteps
@@ -437,9 +432,12 @@ def train(use_progress_bar=False):
         
         if remaining_timesteps > 0:
             print(f"\n🚀 Rozpoczynam trening: {remaining_timesteps:,} kroków\n")
+            # ⚠️ WAŻNE: Reset num_timesteps dla prawidłowego licznika
+            # model.num_timesteps będzie liczyć od 0, ale callback'i widzą initial_timesteps offset
+            model.num_timesteps = 0
             model.learn(
                 total_timesteps=remaining_timesteps,
-                reset_num_timesteps=(mode != 'continue'),
+                reset_num_timesteps=False,  # ✅ Nie resetuj wewnętrznego stanu
                 callback=[
                     eval_callback, 
                     train_progress_callback, 
