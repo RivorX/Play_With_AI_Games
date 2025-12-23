@@ -7,6 +7,7 @@ import yaml
 import os
 import itertools  # 🚀 CPU Optimization: Avoid deque→list conversions
 from collections import deque
+from utils.visual_styles import create_renderer
 
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
@@ -22,8 +23,12 @@ class SnakeEnv(gym.Env):
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10}
 
-    def __init__(self, render_mode=None, grid_size=None, viewport_size=None):
+    def __init__(self, render_mode=None, grid_size=None, viewport_size=None, visual_style='classic'):
         super().__init__()
+        
+        # Visual style
+        self.visual_style = visual_style
+        self.renderer = None
         
         # Grid size
         if grid_size is None:
@@ -485,7 +490,7 @@ class SnakeEnv(gym.Env):
             return self._render_frame()
 
     def _render_frame(self):
-        """🚀 OPTIMIZED: Lazy pygame initialization"""
+        """🚀 OPTIMIZED: Lazy pygame initialization with visual styles"""
         # Initialize pygame only on first render
         if self.window is None and self.render_mode == "human":
             pygame.init()
@@ -497,40 +502,19 @@ class SnakeEnv(gym.Env):
         if self.clock is None and self.render_mode == "human":
             self.clock = pygame.time.Clock()
         
+        # Initialize renderer (lazy initialization)
+        if self.renderer is None:
+            snake_size = config['environment']['snake_size']
+            self.renderer = create_renderer(self.visual_style, self.grid_size, snake_size)
+        
         snake_size = config['environment']['snake_size']
         canvas = pygame.Surface((self.grid_size * snake_size, self.grid_size * snake_size))
-        canvas.fill((0, 0, 0))
+        
+        # Use visual style renderer
+        self.renderer.render(canvas, list(self.snake), self.food, self.direction)
         
         # Store canvas as screen for external access (e.g., GIF recording)
         self.screen = canvas
-        
-        # Draw food
-        food_rect = pygame.Rect(
-            self.food[1] * snake_size,
-            self.food[0] * snake_size,
-            snake_size,
-            snake_size
-        )
-        pygame.draw.rect(canvas, (255, 0, 0), food_rect)
-        
-        # Draw snake body
-        for segment in self.snake:
-            seg_rect = pygame.Rect(
-                segment[1] * snake_size,
-                segment[0] * snake_size,
-                snake_size,
-                snake_size
-            )
-            pygame.draw.rect(canvas, (0, 255, 0), seg_rect)
-        
-        # Draw head (brighter)
-        head_rect = pygame.Rect(
-            self.snake[0][1] * snake_size,
-            self.snake[0][0] * snake_size,
-            snake_size,
-            snake_size
-        )
-        pygame.draw.rect(canvas, (150, 255, 150), head_rect)
         
         if self.render_mode == "human":
             self.window.blit(canvas, canvas.get_rect())
@@ -548,8 +532,8 @@ class SnakeEnv(gym.Env):
             pygame.quit()
 
 
-def make_env(render_mode=None, grid_size=None):
+def make_env(render_mode=None, grid_size=None, visual_style='classic'):
     """Factory function for creating environments"""
     def _init():
-        return SnakeEnv(render_mode=render_mode, grid_size=grid_size)
+        return SnakeEnv(render_mode=render_mode, grid_size=grid_size, visual_style=visual_style)
     return _init
