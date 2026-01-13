@@ -70,15 +70,14 @@ class GradientWeightMonitor(BaseCallback):
             writer = csv.writer(f)
             writer.writerow([
                 'timesteps',
-                'grad_norm_total', 'grad_norm_cnn', 'grad_norm_lstm', 'grad_norm_mlp',
-                'weight_norm_total', 'weight_norm_cnn', 'weight_norm_lstm', 'weight_norm_mlp',
+                'grad_norm_total', 'grad_norm_cnn', 'grad_norm_mlp',
+                'weight_norm_total', 'weight_norm_cnn', 'weight_norm_mlp',
                 'learning_rate', 'l2_penalty'
             ])
     
     def _log_to_csv(self):
         """Zbierz dane i zapisz wiersz do CSV (append mode), ignorując puste pomiary (same zera)"""
         policy = self.model.policy
-        # Oblicz metryki
         grad_norms = self._compute_gradient_norms(policy)
         weight_norms = self._compute_weight_norms(policy)
         lr = self._get_current_lr()
@@ -87,9 +86,9 @@ class GradientWeightMonitor(BaseCallback):
 
         # IGNORUJ jeśli wszystkie grad_norm i weight_norm są równe 0.0 (pusty pomiar)
         if all(
-            abs(grad_norms[k]) < 1e-8 for k in ['total', 'cnn', 'lstm', 'mlp']
+            abs(grad_norms[k]) < 1e-8 for k in ['total', 'cnn', 'mlp']
         ) and all(
-            abs(weight_norms[k]) < 1e-8 for k in ['total', 'cnn', 'lstm', 'mlp']
+            abs(weight_norms[k]) < 1e-8 for k in ['total', 'cnn', 'mlp']
         ):
             if self.verbose > 0:
                 print(f"⏩ Pominięto pusty pomiar gradientów/wag (timesteps={total_timesteps})")
@@ -100,8 +99,8 @@ class GradientWeightMonitor(BaseCallback):
                 writer = csv.writer(f)
                 writer.writerow([
                     total_timesteps,
-                    grad_norms['total'], grad_norms['cnn'], grad_norms['lstm'], grad_norms['mlp'],
-                    weight_norms['total'], weight_norms['cnn'], weight_norms['lstm'], weight_norms['mlp'],
+                    grad_norms['total'], grad_norms['cnn'], grad_norms['mlp'],
+                    weight_norms['total'], weight_norms['cnn'], weight_norms['mlp'],
                     lr if lr is not None else 0.0,
                     l2_penalty
                 ])
@@ -111,58 +110,42 @@ class GradientWeightMonitor(BaseCallback):
     
     def _compute_gradient_norms(self, policy):
         """Oblicz L2 normy gradientów"""
-        grad_norms = {'total': 0.0, 'cnn': 0.0, 'lstm': 0.0, 'mlp': 0.0}
-        
-        total_sq = cnn_sq = lstm_sq = mlp_sq = 0.0
-        
+        grad_norms = {'total': 0.0, 'cnn': 0.0, 'mlp': 0.0}
+        total_sq = cnn_sq = mlp_sq = 0.0
         for name, param in policy.named_parameters():
             if param.grad is not None:
                 param_norm_sq = param.grad.data.norm(2).item() ** 2
                 total_sq += param_norm_sq
-                
                 if 'features_extractor' in name:
                     if 'conv' in name or 'bn' in name:
                         cnn_sq += param_norm_sq
                     else:
                         mlp_sq += param_norm_sq
-                elif 'lstm' in name:
-                    lstm_sq += param_norm_sq
                 else:
                     mlp_sq += param_norm_sq
-        
         grad_norms['total'] = np.sqrt(total_sq)
         grad_norms['cnn'] = np.sqrt(cnn_sq)
-        grad_norms['lstm'] = np.sqrt(lstm_sq)
         grad_norms['mlp'] = np.sqrt(mlp_sq)
-        
         return grad_norms
     
     def _compute_weight_norms(self, policy):
         """Oblicz L2 normy wag"""
-        weight_norms = {'total': 0.0, 'cnn': 0.0, 'lstm': 0.0, 'mlp': 0.0}
-        
-        total_sq = cnn_sq = lstm_sq = mlp_sq = 0.0
-        
+        weight_norms = {'total': 0.0, 'cnn': 0.0, 'mlp': 0.0}
+        total_sq = cnn_sq = mlp_sq = 0.0
         for name, param in policy.named_parameters():
             if param.requires_grad:
                 param_norm_sq = param.data.norm(2).item() ** 2
                 total_sq += param_norm_sq
-                
                 if 'features_extractor' in name:
                     if 'conv' in name or 'bn' in name:
                         cnn_sq += param_norm_sq
                     else:
                         mlp_sq += param_norm_sq
-                elif 'lstm' in name:
-                    lstm_sq += param_norm_sq
                 else:
                     mlp_sq += param_norm_sq
-        
         weight_norms['total'] = np.sqrt(total_sq)
         weight_norms['cnn'] = np.sqrt(cnn_sq)
-        weight_norms['lstm'] = np.sqrt(lstm_sq)
         weight_norms['mlp'] = np.sqrt(mlp_sq)
-        
         return weight_norms
     
     def _get_current_lr(self):
@@ -221,83 +204,70 @@ def plot_gradient_monitor(csv_path, output_path='logs/gradient_monitor.png'):
     fig, axes = plt.subplots(3, 2, figsize=(16, 14))
     fig.suptitle('Gradient & Weight Monitor - AdamW Regularization', 
                  fontsize=18, fontweight='bold')
-    
     timesteps = df['timesteps'].values
-    
+
     # === WYKRES 1: Total Gradient Norm ===
     ax = axes[0, 0]
     grad_total = df['grad_norm_total'].values
     ax.plot(timesteps, grad_total, color='#3498db', linewidth=1, alpha=0.5, label='Raw')
-    
     if len(grad_total) >= window:
         grad_smooth = np.convolve(grad_total, np.ones(window)/window, mode='valid')
         ax.plot(timesteps[window-1:], grad_smooth, color='black', linewidth=2, 
                 label=f'Rolling Mean (w={window})')
-    
-    # Thresholdy dla vanishing/exploding
     ax.axhline(0.01, color='red', linestyle='--', alpha=0.3, linewidth=1)
     ax.axhline(10.0, color='orange', linestyle='--', alpha=0.3, linewidth=1)
-    
     ax.set_title('Total Gradient Norm', fontsize=12, fontweight='bold')
     ax.set_xlabel('Training Steps')
     ax.set_ylabel('L2 Norm')
     ax.grid(True, alpha=0.3)
     ax.set_yscale('log')
     ax.legend()
-    
-    # === WYKRES 2: Gradient Norms by Component ===
+
+    # === WYKRES 2: Gradient Norms by Component (bez LSTM) ===
     ax = axes[0, 1]
-    
-    for component, color in [('cnn', '#e74c3c'), ('lstm', '#9b59b6'), ('mlp', '#2ecc71')]:
+    for component, color in [('cnn', '#e74c3c'), ('mlp', '#2ecc71')]:
         grad_comp = df[f'grad_norm_{component}'].values
         ax.plot(timesteps, grad_comp, color=color, linewidth=1, alpha=0.4)
-        
         if len(grad_comp) >= window:
             grad_comp_smooth = np.convolve(grad_comp, np.ones(window)/window, mode='valid')
             ax.plot(timesteps[window-1:], grad_comp_smooth, color=color, linewidth=2, 
                     label=component.upper())
-    
     ax.set_title('Gradient Flow by Component', fontsize=12, fontweight='bold')
     ax.set_xlabel('Training Steps')
     ax.set_ylabel('L2 Norm')
     ax.grid(True, alpha=0.3)
     ax.set_yscale('log')
     ax.legend()
-    
+
     # === WYKRES 3: Total Weight Norm ===
     ax = axes[1, 0]
     weight_total = df['weight_norm_total'].values
     ax.plot(timesteps, weight_total, color='#f39c12', linewidth=1, alpha=0.5, label='Raw')
-    
     if len(weight_total) >= window:
         weight_smooth = np.convolve(weight_total, np.ones(window)/window, mode='valid')
         ax.plot(timesteps[window-1:], weight_smooth, color='black', linewidth=2, 
                 label=f'Rolling Mean (w={window})')
-    
     ax.set_title('Total Weight Norm (AdamW should decrease)', fontsize=12, fontweight='bold')
     ax.set_xlabel('Training Steps')
     ax.set_ylabel('L2 Norm')
     ax.grid(True, alpha=0.3)
     ax.legend()
-    
-    # === WYKRES 4: Weight Norms by Component ===
+
+    # === WYKRES 4: Weight Norms by Component (bez LSTM) ===
     ax = axes[1, 1]
-    
-    for component, color in [('cnn', '#e74c3c'), ('lstm', '#9b59b6'), ('mlp', '#2ecc71')]:
+    for component, color in [('cnn', '#e74c3c'), ('mlp', '#2ecc71')]:
         weight_comp = df[f'weight_norm_{component}'].values
         ax.plot(timesteps, weight_comp, color=color, linewidth=1, alpha=0.4)
-        
         if len(weight_comp) >= window:
             weight_comp_smooth = np.convolve(weight_comp, np.ones(window)/window, mode='valid')
             ax.plot(timesteps[window-1:], weight_comp_smooth, color=color, linewidth=2, 
                     label=component.upper())
-    
     ax.set_title('Weight Norms by Component', fontsize=12, fontweight='bold')
     ax.set_xlabel('Training Steps')
     ax.set_ylabel('L2 Norm')
     ax.grid(True, alpha=0.3)
     ax.legend()
-    
+
     # === WYKRES 5: Learning Rate ===
     ax = axes[2, 0]
     lr = df['learning_rate'].values
@@ -307,23 +277,21 @@ def plot_gradient_monitor(csv_path, output_path='logs/gradient_monitor.png'):
     ax.set_ylabel('Learning Rate')
     ax.grid(True, alpha=0.3)
     ax.set_ylim(bottom=0)
-    
+
     # === WYKRES 6: L2 Penalty (AdamW effect) ===
     ax = axes[2, 1]
     l2_penalty = df['l2_penalty'].values
     ax.plot(timesteps, l2_penalty, color='#e74c3c', linewidth=1, alpha=0.5, label='Raw')
-    
     if len(l2_penalty) >= window:
         l2_smooth = np.convolve(l2_penalty, np.ones(window)/window, mode='valid')
         ax.plot(timesteps[window-1:], l2_smooth, color='black', linewidth=2, 
                 label=f'Rolling Mean (w={window})')
-    
     ax.set_title('L2 Penalty (weight_decay × ||W||²)', fontsize=12, fontweight='bold')
     ax.set_xlabel('Training Steps')
     ax.set_ylabel('Penalty')
     ax.grid(True, alpha=0.3)
     ax.legend()
-    
+
     # Zapisz wykres
     plt.tight_layout()
     try:

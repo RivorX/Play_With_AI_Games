@@ -281,8 +281,8 @@ class EntropySchedulerCallback(BaseCallback):
         new_ent_coef = self.entropy_schedule_fn(progress_remaining)
         self.model.ent_coef = new_ent_coef
         
-        # Loguj co 10000 kroków
-        if total_timesteps - self._last_logged >= 10000:
+        # Loguj co 100'000 kroków
+        if total_timesteps - self._last_logged >= 100000:
             print(f"[ENTROPY SCHEDULE] timesteps={total_timesteps}, ent_coef={new_ent_coef:.6f}, progress={progress_remaining:.2%}")
             self._last_logged = total_timesteps
         

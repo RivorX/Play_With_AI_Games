@@ -10,7 +10,7 @@ def count_parameters(model, print_details=True):
     Zlicz parametry w całym modelu z podziałem na kategorie
     
     Args:
-        model: Model RecurrentPPO
+        model: Model PPO (bez LSTM)
         print_details: Czy drukować szczegółowe informacje
     
     Returns:
@@ -24,7 +24,6 @@ def count_parameters(model, print_details=True):
             'scalars': 0,
             'fusion': 0,
         },
-        'lstm': 0,
         'policy_head': 0,
         'value_head': 0,
         'other': 0
@@ -42,25 +41,16 @@ def count_parameters(model, print_details=True):
         if hasattr(policy, 'features_extractor'):
             params['extractor']['total'] = sum(p.numel() for p in policy.features_extractor.parameters())
     
-    # 2. LSTM (lstm_actor + lstm_critic jeśli enable_critic_lstm=True)
-    if hasattr(policy, 'lstm_actor'):
-        params['lstm'] = sum(p.numel() for p in policy.lstm_actor.parameters())
-        
-        # Jeśli jest osobny LSTM dla krytyka
-        if hasattr(policy, 'lstm_critic'):
-            params['lstm'] += sum(p.numel() for p in policy.lstm_critic.parameters())
-    
-    # 3. POLICY HEAD (action_net)
+    # 2. POLICY HEAD (action_net)
     if hasattr(policy, 'action_net'):
         params['policy_head'] = sum(p.numel() for p in policy.action_net.parameters())
     
-    # 4. VALUE HEAD (value_net)
+    # 3. VALUE HEAD (value_net)
     if hasattr(policy, 'value_net'):
         params['value_head'] = sum(p.numel() for p in policy.value_net.parameters())
     
-    # 5. OTHER (latent_pi, latent_vf, itp.)
+    # 4. OTHER (latent_pi, latent_vf, itp.)
     total_counted = (sum(params['extractor'].values()) + 
-                    params['lstm'] + 
                     params['policy_head'] + 
                     params['value_head'])
     
@@ -69,7 +59,7 @@ def count_parameters(model, print_details=True):
     
     # Oblicz sumy
     extractor_total = sum(params['extractor'].values())
-    grand_total = extractor_total + params['lstm'] + params['policy_head'] + params['value_head'] + params['other']
+    grand_total = extractor_total + params['policy_head'] + params['value_head'] + params['other']
     
     if print_details:
         print(f"\n{'='*80}")

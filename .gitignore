@@ -38,5 +38,3 @@ logs/*
 *.bak
 
 logs
-snake/models/*.pkl
-snake/models/*.zip

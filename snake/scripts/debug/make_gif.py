@@ -7,159 +7,18 @@ from pathlib import Path
 import imageio
 import numpy as np
 import pygame
-import torch
-from sb3_contrib import RecurrentPPO
-import yaml
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from model import make_env
-from cnn import CustomFeaturesExtractor
+from utils.test_utils import select_visual_style, select_grid_size_interactive, load_model_interactive
 
 
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
-def select_grid_size_interactive(default_size=8):
-    """
-    🎯 Interaktywny wybór rozmiaru siatki
-    
-    Returns:
-        int: Wybrany rozmiar siatki
-    """
-    print(f"\n{'='*70}")
-    print(f"[GRID SIZE SELECTION]")
-    print(f"{'='*70}")
-    print(f"  [1] 🟩 8x8   (Easy - Mała siatka)")
-    print(f"  [2] 🟦 12x12 (Medium)")
-    print(f"  [3] 🟨 16x16 (Hard - Duża siatka)")
-    print(f"  [4] 🟪 Custom (Własny rozmiar)")
-    print(f"{'='*70}")
-    
-    while True:
-        choice = input(f"\nWybierz rozmiar siatki [1-4] (default: {default_size}x{default_size}): ").strip()
-        
-        if choice == '' or choice == '0':
-            print(f"✅ Używam domyślnego: {default_size}x{default_size}\n")
-            return default_size
-        elif choice == '1':
-            return 8
-        elif choice == '2':
-            return 12
-        elif choice == '3':
-            return 16
-        elif choice == '4':
-            while True:
-                try:
-                    custom = input("Podaj rozmiar siatki (4-32): ").strip()
-                    custom_size = int(custom)
-                    if 4 <= custom_size <= 32:
-                        return custom_size
-                    else:
-                        print("❌ Rozmiar musi być między 4 a 32.")
-                except ValueError:
-                    print("❌ Nieprawidłowa wartość. Podaj liczbę.")
-        else:
-            print("❌ Nieprawidłowy wybór. Wybierz 1-4 lub Enter dla domyślnego.")
-
-
-def load_model_interactive(model_path, policy_path, base_dir):
-    """
-    🎯 Interaktywny wybór źródła modelu
-    
-    Returns:
-        tuple: (model, source_name)
-    """
-    has_full_model = os.path.exists(model_path)
-    has_best_model = os.path.exists(base_dir / 'models' / 'best_model.zip')
-    has_policy = os.path.exists(policy_path)
-    
-    print(f"\n{'='*70}")
-    print(f"[MODEL SOURCE SELECTION]")
-    print(f"{'='*70}")
-    
-    options = []
-    
-    if has_best_model:
-        options.append(('1', 'best_model.zip', base_dir / 'models' / 'best_model.zip'))
-        print(f"  [1] 🏆 best_model.zip (najlepszy model z treningu)")
-    
-    if has_full_model and str(model_path) != str(base_dir / 'models' / 'best_model.zip'):
-        options.append(('2', 'snake_ppo_model.zip', model_path))
-        print(f"  [2] 📦 snake_ppo_model.zip (ostatni checkpoint)")
-    
-    if has_policy:
-        key = str(len(options) + 1)
-        options.append((key, 'policy.pth', policy_path))
-        print(f"  [{key}] 🎯 policy.pth (tylko wagi sieci)")
-    
-    print(f"{'='*70}")
-    
-    if not options:
-        raise FileNotFoundError("Nie znaleziono żadnego modelu! Sprawdź folder models/")
-    
-    if len(options) == 1:
-        choice = options[0][0]
-        print(f"\n✅ Automatycznie wybrany: {options[0][1]}\n")
-    else:
-        while True:
-            choice = input("\nWybierz źródło modelu [1-{}]: ".format(len(options))).strip()
-            if any(choice == opt[0] for opt in options):
-                break
-            print(f"❌ Nieprawidłowy wybór. Wybierz 1-{len(options)}.")
-    
-    selected = next(opt for opt in options if opt[0] == choice)
-    source_name = selected[1]
-    source_path = selected[2]
-    
-    print(f"\n🎬 Ładowanie: {source_name}...")
-    
-    # Załaduj model
-    if source_name == 'policy.pth':
-        # Wczytaj config
-        config_path = base_dir / 'config' / 'config.yaml'
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-        
-        # Stwórz env do sprawdzenia observation_space
-        temp_env = make_env(render_mode=None, grid_size=8)()
-        
-        # Stwórz pusty model
-        policy_kwargs = config['model']['policy_kwargs'].copy()
-        policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
-        
-        model = RecurrentPPO(
-            config['model']['policy'],
-            temp_env,
-            learning_rate=0.0001,
-            n_steps=config['model']['n_steps'],
-            batch_size=config['training']['batch_size'],
-            n_epochs=config['model']['n_epochs'],
-            gamma=config['model']['gamma'],
-            gae_lambda=config['model']['gae_lambda'],
-            clip_range=config['model']['clip_range'],
-            ent_coef=config['model']['ent_coef'],
-            vf_coef=config['model']['vf_coef'],
-            policy_kwargs=policy_kwargs,
-            verbose=0,
-            device=config['model']['device']
-        )
-        
-        # Załaduj wagi
-        state_dict = torch.load(source_path, map_location=config['model']['device'])
-        model.policy.load_state_dict(state_dict)
-        
-        temp_env.close()
-        print(f"✅ Załadowano policy.pth\n")
-    else:
-        model = RecurrentPPO.load(source_path)
-        print(f"✅ Załadowano {source_name}\n")
-    
-    return model, source_name
-
-
-def capture_run_as_gif(model, grid_size, episodes, out_path, fps=10, max_frames=1000, death_pause_duration=3.0):
+def capture_run_as_gif(model, grid_size, episodes, out_path, visual_style='classic', fps=10, max_frames=10000, death_pause_duration=3.0):
     """
     Nagrywa gameplay jako GIF z ulepszonymi funkcjami:
     - Automatyczne czyszczenie folderu tymczasowego
@@ -167,11 +26,17 @@ def capture_run_as_gif(model, grid_size, episodes, out_path, fps=10, max_frames=
     - Pauza 3s na ostatniej klatce gdy wąż zginie
     
     Args:
-        model: Załadowany model RecurrentPPO
+        model: Załadowany model PPO
+        grid_size: Rozmiar siatki
+        episodes: Liczba epizodów
+        out_path: Ścieżka wyjścia
+        visual_style: Styl wizualny ('classic', 'modern', 'realistic')
+        fps: Liczba klatek na sekundę
+        max_frames: Maksymalna liczba klatek
         death_pause_duration: Czas (w sekundach) pauzy na ostatniej klatce gdy wąż zginie
     """
     # Przygotuj env
-    env = make_env(render_mode="human", grid_size=grid_size)()
+    env = make_env(render_mode="human", grid_size=grid_size, visual_style=visual_style)()
 
     # Folder na klatki
     base_dir = Path(__file__).resolve().parents[2]
@@ -269,6 +134,8 @@ if __name__ == '__main__':
     parser.add_argument('--grid_size', type=int, default=None, help='Grid size (if not provided, will prompt)')
     parser.add_argument('--episodes', type=int, default=1)
     parser.add_argument('--out', type=str, default=None, help='Output GIF path')
+    parser.add_argument('--style', type=str, default=None, choices=['classic', 'modern', 'realistic'], 
+                       help='Visual style (if not provided, will prompt)')
     parser.add_argument('--fps', type=int, default=8)
     parser.add_argument('--death_pause', type=float, default=3.0,
                         help='Duration (seconds) to pause on last frame if snake dies (default: 3.0)')
@@ -280,6 +147,13 @@ if __name__ == '__main__':
     
     # 🎯 Interaktywny wybór modelu
     model, source_name = load_model_interactive(default_model_path, policy_path, base_dir)
+    
+    # 🎨 Interaktywny wybór stylu wizualnego
+    if args.style is None:
+        visual_style = select_visual_style()
+    else:
+        visual_style = args.style
+        print(f"\n✅ Używam stylu z argumentu: {visual_style}\n")
     
     # 🎯 Interaktywny wybór rozmiaru siatki
     if args.grid_size is None:
@@ -301,6 +175,7 @@ if __name__ == '__main__':
     print(f"   Grid: {grid_size}x{grid_size}")
     print(f"   Episodes: {args.episodes}")
     print(f"   FPS: {args.fps}")
+    print(f"   Visual Style: {visual_style}")
     print(f"   Death pause: {args.death_pause}s")
     print(f"   Output: {out_path}")
     print()
@@ -310,6 +185,7 @@ if __name__ == '__main__':
         grid_size, 
         args.episodes, 
         out_path, 
+        visual_style=visual_style,
         fps=args.fps,
         death_pause_duration=args.death_pause
     )

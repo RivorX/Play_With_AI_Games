@@ -5,7 +5,7 @@ import torch
 import numpy as np
 import shutil
 from pathlib import Path
-from sb3_contrib import RecurrentPPO
+from stable_baselines3 import PPO
 
 # Dodaj scripts do path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -17,7 +17,6 @@ from utils.analyze_basic import analyze_basic_states, plot_activation_overview
 from utils.analyze_gradients import analyze_bottlenecks, analyze_gradient_flow_detailed
 from utils.analyze_cnn import analyze_cnn_layers
 from utils.analyze_channels import analyze_conv_channels_detailed
-from utils.analyze_lstm import analyze_lstm_comprehensive
 from utils.analyze_performance import analyze_performance_metrics
 
 # Wczytaj konfigurację
@@ -92,7 +91,7 @@ def load_model_interactive():
         policy_kwargs = config['model']['policy_kwargs'].copy()
         policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
         
-        model = RecurrentPPO(
+        model = PPO(
             config['model']['policy'],
             temp_env,
             learning_rate=0.0001,
@@ -116,7 +115,7 @@ def load_model_interactive():
         temp_env.close()
         print(f"✅ Załadowano policy.pth\n")
     else:
-        model = RecurrentPPO.load(source_path)
+        model = PPO.load(source_path)
         print(f"✅ Załadowano {source_name}\n")
     
     return model, source_name
@@ -142,14 +141,13 @@ subdirs = {
     'heatmap': os.path.join(output_dir, '01_basic_analysis', 'attention_heatmaps'),
     'cnn': os.path.join(output_dir, '02_cnn_layers'),
     'gradients': os.path.join(output_dir, '03_gradient_flow'),
-    'lstm': os.path.join(output_dir, '04_lstm_memory'),
-    'performance': os.path.join(output_dir, '05_performance')
+    'performance': os.path.join(output_dir, '04_performance')
 }
 
 for dir_path in subdirs.values():
     os.makedirs(dir_path, exist_ok=True)
 
-# Załaduj model RecurrentPPO
+# Załaduj model PPO
 print("="*80)
 print("🚀 MODEL ANALYSIS")
 print("="*80)
@@ -168,8 +166,6 @@ print(f"Bottleneck dims: {config['model']['convlstm'].get('cnn_bottleneck_dims',
 print(f"CNN output dim: {config['model']['convlstm'].get('cnn_output_dim', 'N/A')}")
 print(f"Scalar hidden dims: {config['model']['convlstm']['scalar_hidden_dims']}")
 print(f"Features dim: {config['model']['policy_kwargs']['features_extractor_kwargs']['features_dim']}")
-print(f"LSTM hidden size: {config['model']['policy_kwargs']['lstm_hidden_size']}")
-print(f"LSTM layers: {config['model']['policy_kwargs']['n_lstm_layers']}")
 print(f"Actor network: {config['model']['policy_kwargs']['net_arch']['pi']}")
 print(f"Critic network: {config['model']['policy_kwargs']['net_arch']['vf']}")
 
@@ -242,22 +238,9 @@ analyze_gradient_flow_detailed(
 )
 
 # ===================================================
-# CZĘŚĆ 4: ANALIZA LSTM (memory, temporal patterns, forgetting)
+# CZĘŚĆ 4: ANALIZA WYDAJNOŚCI (critical moments, feature importance)
 # ===================================================
-print("\n[4/6] 🧠 Kompleksowa analiza LSTM...")
-analyze_lstm_comprehensive(
-    model=model,
-    env=env,
-    output_dir=subdirs['lstm'],
-    action_names=action_names,
-    config=config,
-    num_episodes=20
-)
-
-# ===================================================
-# CZĘŚĆ 5: ANALIZA WYDAJNOŚCI (critical moments, feature importance, uncertainty)
-# ===================================================
-print("\n[5/6] 🎯 Analiza wydajności i zachowań modelu...")
+print("\n[4/5] 🎯 Analiza wydajności i zachowań modelu...")
 analyze_performance_metrics(
     model=model,
     env=env,
@@ -280,8 +263,7 @@ print(f"   {output_dir}/")
 print(f"   ├── 01_basic_analysis/         📊 Podstawowe aktywacje i viewport")
 print(f"   ├── 02_cnn_layers/             🔍 Analiza warstw CNN + szczegółowa analiza kanałów")
 print(f"   ├── 03_gradient_flow/          🌊 Przepływ gradientów")
-print(f"   ├── 04_lstm_memory/            🧠 Pamięć i wzorce temporalne")
-print(f"   └── 05_performance/            🎯 Wydajność i zachowania")
+print(f"   └── 04_performance/            🎯 Wydajność i zachowania")
 
 print("\n" + "="*80)
 print("=== KLUCZOWE WYNIKI ===")
@@ -298,25 +280,17 @@ print("\n🔍 CNN LAYERS:")
 print("   - channel_specialization.png: aktywne vs martwe kanały")
 print("   - activation_saturation.png: saturacja GELU")
 print("   - conv_visualizations/: filtry CNN dla każdej warstwy")
-print("   - all_conv_channels_analysis.png: 🆕 szczegółowa analiza każdego kanału")
+print("   - all_conv_channels_analysis.png: szczegółowa analiza każdego kanału")
 
 print("\n🌊 GRADIENT FLOW:")
 print("   - bottleneck_analysis_split.png: bottlenecki per sekcja")
 print("   - bottleneck_gradient_heatmap.png: flow przez warstwy")
 print("   - gradient_flow_detailed.png: vanishing/explosion")
 
-print("\n🧠 LSTM MEMORY:")
-print("   - lstm_memory_evolution.png: ewolucja pamięci")
-print("   - lstm_neurons_heatmap.png: aktywacja neuronów")
-print("   - temporal_forgetting_curve.png: jak szybko zapomina")
-print("   - temporal_ngrams.png: sekwencje akcji")
-
 print("\n🎯 PERFORMANCE:")
 print("   - critical_near_death.png: zachowanie przed kolizją")
 print("   - critical_food_acquisition.png: efektywność zbierania")
 print("   - feature_ablation_study.png: wpływ CNN vs scalars")
-print("   - confusion_matrix.png: porównanie z heurystyką")
-print("   - uncertainty_analysis.png: pewność decyzji")
 
 print("\n⚠️ BOTTLENECKS:")
 if bottleneck_report:

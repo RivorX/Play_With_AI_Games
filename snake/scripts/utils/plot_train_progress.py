@@ -106,7 +106,7 @@ def plot_train_progress(csv_path, output_path):
     
     # Setup figure
     fig, axes = plt.subplots(3, 3, figsize=(20, 14))
-    fig.suptitle('Training Progress - Snake RecurrentPPO', fontsize=18, fontweight='bold')
+    fig.suptitle('Training Progress - Snake PPO', fontsize=18, fontweight='bold')
     
     # Window dla rolling average
     window = 15

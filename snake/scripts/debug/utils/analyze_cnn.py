@@ -34,16 +34,15 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     
     # ==================== ZBIERANIE DANYCH ====================
     print(f"\n📊 Collecting data from {num_samples} samples...")
+    print(f"   Analyzing {len(features_extractor.conv_layers)} CNN layers...")
     
-    conv1_activations = []
-    conv2_activations = []
-    
-    activation_data = {
-        'conv1_pre': [],
-        'conv1_post': [],
-        'conv2_pre': [],
-        'conv2_post': []
-    }
+    # Dynamic handling of 4 conv layers
+    num_layers = len(features_extractor.conv_layers)
+    all_conv_activations = [[] for _ in range(num_layers)]
+    activation_data = {}
+    for i in range(num_layers):
+        activation_data[f'conv{i+1}_pre'] = []
+        activation_data[f'conv{i+1}_post'] = []
     
     for sample_idx in range(num_samples):
         obs, _ = env.reset()
@@ -74,29 +73,27 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
             if image.dim() == 4 and image.shape[-1] == 1:
                 image = image.permute(0, 3, 1, 2)
             
-            # Conv1
-            x_pre = features_extractor.conv1(image)
-            x_pre = features_extractor.bn1(x_pre)
-            activation_data['conv1_pre'].extend(x_pre.flatten().cpu().numpy())
-            x = torch.nn.functional.gelu(x_pre)
-            activation_data['conv1_post'].extend(x.flatten().cpu().numpy())
-            conv1_activations.append(x.detach().cpu().numpy()[0])
-            
-            # Conv2
-            x_pre = features_extractor.conv2(x)
-            x_pre = features_extractor.bn2(x_pre)
-            x_pre = features_extractor.dropout2(x_pre)
-            activation_data['conv2_pre'].extend(x_pre.flatten().cpu().numpy())
-            x = torch.nn.functional.gelu(x_pre)
-            activation_data['conv2_post'].extend(x.flatten().cpu().numpy())
-            conv2_activations.append(x.detach().cpu().numpy()[0])
+            # Process all 4 CNN layers
+            x = image
+            for layer_idx in range(num_layers):
+                x_pre = features_extractor.conv_layers[layer_idx](x)
+                x_pre = features_extractor.bn_layers[layer_idx](x_pre)
+                
+                pre_key = f'conv{layer_idx+1}_pre'
+                post_key = f'conv{layer_idx+1}_post'
+                
+                activation_data[pre_key].extend(x_pre.flatten().cpu().numpy())
+                
+                x = torch.nn.functional.gelu(x_pre)
+                activation_data[post_key].extend(x.flatten().cpu().numpy())
+                all_conv_activations[layer_idx].append(x.detach().cpu().numpy()[0])
         
         if (sample_idx + 1) % 20 == 0:
             print(f"  Processed {sample_idx + 1}/{num_samples} samples")
     
     # Convert to numpy
-    conv1_activations = np.array(conv1_activations)
-    conv2_activations = np.array(conv2_activations)
+    for i in range(num_layers):
+        all_conv_activations[i] = np.array(all_conv_activations[i])
     
     for key in activation_data.keys():
         if activation_data[key]:
@@ -130,50 +127,38 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
         
         return channel_stats
     
-    conv1_stats = analyze_channels(conv1_activations, 'Conv1')
-    conv2_stats = analyze_channels(conv2_activations, 'Conv2')
+    # Analyze all 4 layers
+    all_layer_stats = []
+    for i in range(num_layers):
+        stats = analyze_channels(all_conv_activations[i], f'Conv{i+1}')
+        all_layer_stats.append(stats)
     
-    # Plot specialization (2x2 grid dla Conv1 i Conv2)
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    # Plot specialization (2x2 grid dla każdej pary warstw)
+    fig, axes = plt.subplots(4, 2, figsize=(16, 16))
     
-    # Conv1 - Mean activation
-    channels_conv1 = [s['channel'] for s in conv1_stats]
-    means_conv1 = [s['mean'] for s in conv1_stats]
-    dead_conv1 = [s['is_dead'] for s in conv1_stats]
-    colors_conv1 = ['red' if d else 'green' for d in dead_conv1]
-    
-    axes[0, 0].bar(channels_conv1, means_conv1, color=colors_conv1, alpha=0.7, edgecolor='black')
-    axes[0, 0].set_xlabel('Channel')
-    axes[0, 0].set_ylabel('Mean Activation')
-    axes[0, 0].set_title('Conv1 - Channel Activity (Red = Dead)')
-    axes[0, 0].grid(axis='y', alpha=0.3)
-    
-    # Conv2 - Mean activation
-    channels_conv2 = [s['channel'] for s in conv2_stats]
-    means_conv2 = [s['mean'] for s in conv2_stats]
-    dead_conv2 = [s['is_dead'] for s in conv2_stats]
-    colors_conv2 = ['red' if d else 'green' for d in dead_conv2]
-    
-    axes[0, 1].bar(channels_conv2, means_conv2, color=colors_conv2, alpha=0.7, edgecolor='black')
-    axes[0, 1].set_xlabel('Channel')
-    axes[0, 1].set_ylabel('Mean Activation')
-    axes[0, 1].set_title('Conv2 - Channel Activity (Red = Dead)')
-    axes[0, 1].grid(axis='y', alpha=0.3)
-    
-    # Sparsity plots
-    sparsity_conv1 = [s['sparsity'] for s in conv1_stats]
-    axes[1, 0].bar(channels_conv1, sparsity_conv1, color='#3498db', alpha=0.7, edgecolor='black')
-    axes[1, 0].set_xlabel('Channel')
-    axes[1, 0].set_ylabel('Sparsity (% near-zero)')
-    axes[1, 0].set_title('Conv1 - Sparsity per Channel')
-    axes[1, 0].grid(axis='y', alpha=0.3)
-    
-    sparsity_conv2 = [s['sparsity'] for s in conv2_stats]
-    axes[1, 1].bar(channels_conv2, sparsity_conv2, color='#3498db', alpha=0.7, edgecolor='black')
-    axes[1, 1].set_xlabel('Channel')
-    axes[1, 1].set_ylabel('Sparsity (% near-zero)')
-    axes[1, 1].set_title('Conv2 - Sparsity per Channel')
-    axes[1, 1].grid(axis='y', alpha=0.3)
+    for layer_idx in range(num_layers):
+        layer_stats = all_layer_stats[layer_idx]
+        layer_name = f'Conv{layer_idx+1}'
+        
+        # Mean activation
+        channels = [s['channel'] for s in layer_stats]
+        means = [s['mean'] for s in layer_stats]
+        is_dead = [s['is_dead'] for s in layer_stats]
+        colors = ['red' if d else 'green' for d in is_dead]
+        
+        axes[layer_idx, 0].bar(channels, means, color=colors, alpha=0.7, edgecolor='black')
+        axes[layer_idx, 0].set_xlabel('Channel')
+        axes[layer_idx, 0].set_ylabel('Mean Activation')
+        axes[layer_idx, 0].set_title(f'{layer_name} - Channel Activity (Red = Dead)')
+        axes[layer_idx, 0].grid(axis='y', alpha=0.3)
+        
+        # Sparsity
+        sparsity = [s['sparsity'] for s in layer_stats]
+        axes[layer_idx, 1].bar(channels, sparsity, color='#3498db', alpha=0.7, edgecolor='black')
+        axes[layer_idx, 1].set_xlabel('Channel')
+        axes[layer_idx, 1].set_ylabel('Sparsity (% near-zero)')
+        axes[layer_idx, 1].set_title(f'{layer_name} - Sparsity per Channel')
+        axes[layer_idx, 1].grid(axis='y', alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'channel_specialization.png'), dpi=150)
@@ -184,7 +169,8 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     print("\n🔥 Analyzing activation saturation...")
     
     saturation_stats = {}
-    for layer_name in ['conv1', 'conv2']:
+    for i in range(num_layers):
+        layer_name = f'conv{i+1}'
         pre_key = f'{layer_name}_pre'
         post_key = f'{layer_name}_post'
         
@@ -206,15 +192,16 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
                 'post_vals': post_vals
             }
     
-    # Plot saturation
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    # Plot saturation (dynamic based on number of layers - use subplots for 4 layers)
+    fig, axes = plt.subplots(4, 2, figsize=(16, 16))
     
-    for idx, layer_name in enumerate(['conv1', 'conv2']):
+    for i in range(num_layers):
+        layer_name = f'conv{i+1}'
         if layer_name in saturation_stats:
             stats = saturation_stats[layer_name]
             
             # Pre-activation
-            ax = axes[idx, 0]
+            ax = axes[i, 0]
             pre_vals = stats['pre_vals']
             ax.hist(pre_vals, bins=100, alpha=0.7, edgecolor='black', color='#3498db', density=True)
             ax.axvline(-3, color='red', linestyle='--', alpha=0.7, label='Saturation')
@@ -231,7 +218,7 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
             
             # Post-activation
-            ax = axes[idx, 1]
+            ax = axes[i, 1]
             post_vals = stats['post_vals']
             ax.hist(post_vals, bins=100, alpha=0.7, edgecolor='black', color='#2ecc71', density=True)
             ax.axvline(0, color='red', linestyle='--', alpha=0.7, label='Dead threshold')
@@ -252,7 +239,7 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     print(f"✅ Activation saturation saved")
     
     # Summary plot
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 6))
     
     layers = list(saturation_stats.keys())
     sat_rates = [saturation_stats[l]['saturation_rate_pre'] for l in layers]
@@ -267,7 +254,7 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
            color='#95a5a6', alpha=0.8, edgecolor='black')
     
     ax.set_ylabel('Percentage (%)')
-    ax.set_title('CNN Layer Health: Saturation & Dead Neurons')
+    ax.set_title('CNN Layer Health: Saturation & Dead Neurons (4-Layer Architecture)')
     ax.set_xticks(x_pos)
     ax.set_xticklabels(layers, rotation=45, ha='right')
     ax.legend()
@@ -304,26 +291,20 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
         if image.dim() == 4 and image.shape[-1] == 1:
             image = image.permute(0, 3, 1, 2)
         
-        # Conv1
-        x = features_extractor.conv1(image)
-        x = features_extractor.bn1(x)
-        x = torch.nn.functional.gelu(x)
-        conv1_out = x[0].cpu().numpy()
-        
-        # Conv2
-        x = features_extractor.conv2(x)
-        x = features_extractor.bn2(x)
-        x = features_extractor.dropout2(x)
-        x = torch.nn.functional.gelu(x)
-        conv2_out = x[0].cpu().numpy()
-        
-        # Visualize Conv1 (first 16 channels)
-        visualize_conv_layer(conv1_out, 'Conv1 Output', 
-                            os.path.join(viz_dir, 'conv1_sample.png'), num_channels=16)
-        
-        # Visualize Conv2 (first 16 channels)
-        visualize_conv_layer(conv2_out, 'Conv2 Output',
-                            os.path.join(viz_dir, 'conv2_sample.png'), num_channels=16)
+        # Process all 4 layers and visualize each one
+        x = image
+        for layer_idx in range(num_layers):
+            x = features_extractor.conv_layers[layer_idx](x)
+            x = features_extractor.bn_layers[layer_idx](x)
+            x = torch.nn.functional.gelu(x)
+            
+            conv_out = x[0].cpu().numpy()
+            
+            # Visualize this layer (first 16 channels if available)
+            layer_name = f'Conv{layer_idx+1}'
+            visualize_conv_layer(conv_out, f'{layer_name} Output', 
+                                os.path.join(viz_dir, f'{layer_name.lower()}_sample.png'), 
+                                num_channels=min(16, conv_out.shape[0]))
         
         print(f"✅ Sample visualizations saved in {viz_dir}")
     
@@ -334,13 +315,9 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
         writer.writerow(['layer', 'num_channels', 'dead_channels', 'dead_pct', 
                         'saturation_rate', 'dead_neuron_rate', 'status'])
         
-        for layer_name in ['conv1', 'conv2']:
-            if layer_name == 'conv1':
-                stats_list = conv1_stats
-            elif layer_name == 'conv2':
-                stats_list = conv2_stats
-            else:
-                continue
+        for i in range(num_layers):
+            layer_name = f'conv{i+1}'
+            stats_list = all_layer_stats[i]
             
             num_channels = len(stats_list)
             dead_count = sum(1 for s in stats_list if s['is_dead'])
@@ -376,15 +353,16 @@ def analyze_cnn_layers(model, env, output_dir, num_samples=100):
     
     # ==================== SUMMARY ====================
     print("\n" + "="*80)
-    print("📋 CNN LAYERS SUMMARY")
+    print("📋 CNN LAYERS SUMMARY (4-Layer Architecture)")
     print("="*80)
     
-    dead_conv1_count = sum(dead_conv1)
-    dead_conv2_count = sum(dead_conv2)
+    for i in range(num_layers):
+        layer_name = f'Conv{i+1}'
+        stats_list = all_layer_stats[i]
+        dead_count = sum(1 for s in stats_list if s['is_dead'])
+        print(f"{layer_name}: {dead_count}/{len(stats_list)} dead channels ({dead_count/len(stats_list)*100:.1f}%)")
     
-    print(f"Conv1: {dead_conv1_count}/{len(conv1_stats)} dead channels ({dead_conv1_count/len(conv1_stats)*100:.1f}%)")
-    print(f"Conv2: {dead_conv2_count}/{len(conv2_stats)} dead channels ({dead_conv2_count/len(conv2_stats)*100:.1f}%)")
-    
+    layers = list(saturation_stats.keys())
     high_saturation = [name for name in layers if saturation_stats[name]['saturation_rate_pre'] > 30]
     high_dead = [name for name in layers if saturation_stats[name]['dead_rate'] > 30]
     

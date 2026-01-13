@@ -13,15 +13,14 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 
 
-def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, features_extractor):
+def compute_layer_gradients(model, obs, obs_tensor, action_idx, features_extractor):
     """
     Oblicza gradienty dla wszystkich warstw
-    🆕 UPDATED: Pure Bottleneck (NO Skip) + Fixed MLP naming
+    ✅ UPDATED: Pure PPO (NO LSTM) + 4-layer dynamic CNN + cnn_projection (zamiast cnn_bottleneck)
     """
     policy = model.policy
     
     features_extractor.eval()
-    policy.lstm_actor.train()
     
     obs_grad = {}
     for k, v in obs.items():
@@ -35,70 +34,52 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     if image_grad.dim() == 4 and image_grad.shape[-1] == 1:
         image_grad = image_grad.permute(0, 3, 1, 2)
     
-    # 🆕 CNN layers - Multi-Scale Architecture
+    # 🆕 CNN layers - Dynamic 4-layer architecture
     cnn_intermediates = []
     x_cnn = image_grad
-
-    # Layer 1
-    x_cnn = features_extractor.conv1(x_cnn)
-    x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 0, 'Conv2d-1', x_cnn))
-    x_cnn = features_extractor.bn1(x_cnn)
-    x_cnn = torch.nn.functional.gelu(x_cnn)
-    x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 1, 'GELU-1', x_cnn))
-
-    # Layer 2
-    x_cnn = features_extractor.conv2(x_cnn)
-    x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 2, 'Conv2d-2', x_cnn))
-    x_cnn = features_extractor.bn2(x_cnn)
-    x_cnn = features_extractor.dropout2(x_cnn)
-    x_cnn = torch.nn.functional.gelu(x_cnn)
-    x_cnn.retain_grad()
-    cnn_intermediates.append(('cnn', 3, 'GELU-2', x_cnn))
-
-    # Layer 3 - MULTI-SCALE (opcjonalna)
-    layer_offset = 4
-    if getattr(features_extractor, "has_conv3", False):
-        identity = features_extractor.residual_proj(x_cnn)
-        identity.retain_grad()
-        cnn_intermediates.append(('cnn', 4, 'Residual-Proj', identity))
-        
-        x_local = features_extractor.conv3_local(x_cnn)
-        x_local.retain_grad()
-        cnn_intermediates.append(('cnn', 5, 'Conv3-Local', x_local))
-        x_local = features_extractor.bn3_local(x_local)
-        
-        x_global = features_extractor.conv3_global(x_cnn)
-        x_global.retain_grad()
-        cnn_intermediates.append(('cnn', 6, 'Conv3-Global', x_global))
-        x_global = features_extractor.bn3_global(x_global)
-        
-        x_combined = torch.cat([x_local, x_global], dim=1)
-        x_combined.retain_grad()
-        cnn_intermediates.append(('cnn', 7, 'Conv3-Concat', x_combined))
-        
-        x_combined = features_extractor.dropout3(x_combined)
-        x_combined = torch.nn.functional.gelu(x_combined)
-        x_combined.retain_grad()
-        cnn_intermediates.append(('cnn', 8, 'GELU-3', x_combined))
-        
-        x_cnn = x_combined + identity
+    dropout_idx = 0
+    
+    # Process all 4 CNN layers dynamically
+    for layer_idx, (conv, bn) in enumerate(zip(features_extractor.conv_layers, features_extractor.bn_layers)):
+        x_cnn = conv(x_cnn)
         x_cnn.retain_grad()
-        cnn_intermediates.append(('cnn', 9, 'Residual-Add', x_cnn))
-        layer_offset = 10
+        cnn_intermediates.append(('cnn', layer_idx * 2, f'Conv2d-{layer_idx+1}', x_cnn))
+        
+        x_cnn = bn(x_cnn)
+        x_cnn = torch.nn.functional.gelu(x_cnn)
+        x_cnn.retain_grad()
+        cnn_intermediates.append(('cnn', layer_idx * 2 + 1, f'GELU-{layer_idx+1}', x_cnn))
+        
+        # Apply dropout from layer 2 onwards (if exists)
+        if layer_idx > 0 and dropout_idx < len(features_extractor.dropout_layers):
+            x_cnn = features_extractor.dropout_layers[dropout_idx](x_cnn)
+            x_cnn.retain_grad()
+            cnn_intermediates.append(('cnn', layer_idx * 2 + 1, f'Dropout-{layer_idx+1}', x_cnn))
+            dropout_idx += 1
+    
+    # ✅ Spatial attention (if enabled)
+    layer_offset = len(features_extractor.conv_layers) * 2
+    if getattr(features_extractor, 'use_spatial_attention', False):
+        x_cnn = features_extractor.spatial_attention(x_cnn)
+        x_cnn.retain_grad()
+        cnn_intermediates.append(('cnn', layer_offset, 'SpatialAttention', x_cnn))
+        layer_offset += 1
+
+    # Global Average Pooling
+    x_cnn = features_extractor.global_pool(x_cnn)
+    x_cnn.retain_grad()
+    cnn_intermediates.append(('cnn', layer_offset, 'GlobalAvgPool', x_cnn))
 
     # Flatten
     cnn_raw = features_extractor.flatten(x_cnn)
     cnn_raw = cnn_raw.float()
     cnn_raw.retain_grad()
-    cnn_intermediates.append(('cnn', layer_offset, 'Flatten', cnn_raw))
+    cnn_intermediates.append(('cnn', layer_offset + 1, 'Flatten', cnn_raw))
 
-    # 🆕 BOTTLENECK (single projection)
-    cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
+    # 🆕 CNN Projection (not cnn_bottleneck)
+    cnn_features = features_extractor.cnn_projection(cnn_raw)
     cnn_features.retain_grad()
-    cnn_intermediates.append(('cnn', layer_offset + 1, 'Bottleneck', cnn_features))
+    cnn_intermediates.append(('cnn', layer_offset + 2, 'Projection', cnn_features))
     
     # Scalar layers (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
     scalars_grad = torch.cat([
@@ -116,7 +97,7 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     scalar_intermediates = []
     x_scalar = scalars_grad
     linear_idx = 0
-    for i, layer in enumerate(features_extractor.scalar_linear):
+    for i, layer in enumerate(features_extractor.scalar_network):
         x_scalar = layer(x_scalar)
         x_scalar.retain_grad()
         
@@ -126,8 +107,8 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
             linear_idx += 1
         elif isinstance(layer, torch.nn.LayerNorm):
             layer_name = f'LayerNorm-{i}'
-        elif isinstance(layer, torch.nn.SiLU):
-            layer_name = f'SiLU-{i}'
+        elif isinstance(layer, torch.nn.GELU):
+            layer_name = f'GELU-{i}'
         elif isinstance(layer, torch.nn.Dropout):
             layer_name = f'Dropout-{i}'
         else:
@@ -140,24 +121,12 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
     # Combined features
     combined = torch.cat([cnn_features, scalar_features], dim=-1)
     combined.retain_grad()
-    features_final = features_extractor.final_linear(combined)
+    features_final = features_extractor.fusion(combined)
     features_final.retain_grad()
     
-    # LSTM
-    lstm_states_tensor = (
-        torch.tensor(lstm_states[0], dtype=torch.float32, device=policy.device, requires_grad=False),
-        torch.tensor(lstm_states[1], dtype=torch.float32, device=policy.device, requires_grad=False)
-    )
-    
-    features_seq = features_final.unsqueeze(1)
-    lstm_out, _ = policy.lstm_actor(features_seq, lstm_states_tensor)
-    lstm_out.retain_grad()
-    latent_pi_grad = lstm_out.squeeze(1)
-    latent_pi_grad.retain_grad()
-    
-    # MLP layers - POLICY
+    # MLP layers - POLICY (pure PPO, no LSTM)
     mlp_intermediates = []
-    x_mlp = latent_pi_grad
+    x_mlp = features_final
     linear_idx_policy = 0
     for i, layer in enumerate(policy.mlp_extractor.policy_net):
         x_mlp = layer(x_mlp)
@@ -177,7 +146,7 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
         mlp_intermediates.append(('mlp_policy', i, layer_name, x_mlp))
 
     # MLP layers - VALUE
-    x_mlp_vf = latent_pi_grad
+    x_mlp_vf = features_final
     linear_idx_value = 0
     for i, layer in enumerate(policy.mlp_extractor.value_net):
         x_mlp_vf = layer(x_mlp_vf)
@@ -241,7 +210,7 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
                 'gradient_norm': activation.grad.norm().item()
             })
     
-    # Combined features
+    # Combined features (Fusion)
     if features_final.grad is not None:
         state_layer_grads['layers'].append({
             'type': 'fusion',
@@ -252,19 +221,6 @@ def compute_layer_gradients(model, obs, obs_tensor, lstm_states, action_idx, fea
             'gradient_mean': features_final.grad.mean().item(),
             'gradient_std': features_final.grad.std().item(),
             'gradient_norm': features_final.grad.norm().item()
-        })
-    
-    # LSTM
-    if latent_pi_grad.grad is not None:
-        state_layer_grads['layers'].append({
-            'type': 'lstm',
-            'index': 0,
-            'name': 'LSTM',
-            'activation_mean': latent_pi_grad.mean().item(),
-            'activation_std': latent_pi_grad.std().item(),
-            'gradient_mean': latent_pi_grad.grad.mean().item(),
-            'gradient_std': latent_pi_grad.grad.std().item(),
-            'gradient_norm': latent_pi_grad.grad.norm().item()
         })
     
     # MLP gradienty (POLICY + VALUE)
@@ -459,47 +415,52 @@ def analyze_bottlenecks(layer_gradients, action_names, output_dir):
                transform=ax.transAxes, fontsize=9, va='top',
                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
-    # ==================== FIGURE 1 BOTTOM: LSTM (single row) ====================
-    ax_lstm = fig.add_subplot(gs[2, :])
+    # ==================== FIGURE 1 BOTTOM: Fusion Layer ====================
+    ax_fusion = fig.add_subplot(gs[2, :])
     
-    if 'lstm' in sections and len(sections['lstm']) > 0:
-        lstm_data = []
+    if 'fusion' in sections and len(sections['fusion']) > 0:
+        fusion_data = []
         for state_idx in range(3):
             state_layers = all_layers_by_state[state_idx]
             for layer in state_layers:
-                if layer['type'] == 'lstm':
+                if layer['type'] == 'fusion':
                     # Use RMS
                     act_rms = np.sqrt(layer['activation_mean']**2 + layer['activation_std']**2)
-                    lstm_data.append({
+                    fusion_data.append({
                         'state': state_idx,
                         'activation': act_rms,
                         'gradient': layer['gradient_norm']
                     })
         
-        states = [d['state'] for d in lstm_data]
-        activations = [d['activation'] for d in lstm_data]
-        gradients = [d['gradient'] for d in lstm_data]
-        
-        x = np.arange(len(states))
-        width = 0.35
-        
-        ax_lstm.bar(x - width/2, activations, width, label='Activation', 
-                   color='#9b59b6', alpha=0.8, edgecolor='black')
-        ax_lstm.bar(x + width/2, gradients, width, label='Gradient Norm', 
-                   color='#8e44ad', alpha=0.8, edgecolor='black')
-        
-        ax_lstm.set_xlabel('State', fontsize=11)
-        ax_lstm.set_ylabel('Magnitude', fontsize=11)
-        ax_lstm.set_title('LSTM Layer - Activations vs Gradients', 
-                         fontsize=13, fontweight='bold')
-        ax_lstm.set_xticks(x)
-        ax_lstm.set_xticklabels([f'State {s}' for s in states])
-        ax_lstm.legend(fontsize=10)
-        ax_lstm.grid(axis='y', alpha=0.3)
+        if fusion_data:
+            states = [d['state'] for d in fusion_data]
+            activations = [d['activation'] for d in fusion_data]
+            gradients = [d['gradient'] for d in fusion_data]
+            
+            x = np.arange(len(states))
+            width = 0.35
+            
+            ax_fusion.bar(x - width/2, activations, width, label='Activation', 
+                       color='#3498db', alpha=0.8, edgecolor='black')
+            ax_fusion.bar(x + width/2, gradients, width, label='Gradient Norm', 
+                       color='#2980b9', alpha=0.8, edgecolor='black')
+            
+            ax_fusion.set_xlabel('State', fontsize=11)
+            ax_fusion.set_ylabel('Magnitude', fontsize=11)
+            ax_fusion.set_title('Fusion Layer - Activations vs Gradients', 
+                             fontsize=13, fontweight='bold')
+            ax_fusion.set_xticks(x)
+            ax_fusion.set_xticklabels([f'State {s}' for s in states])
+            ax_fusion.legend(fontsize=10)
+            ax_fusion.grid(axis='y', alpha=0.3)
+        else:
+            ax_fusion.text(0.5, 0.5, 'No Fusion layer found', 
+                        ha='center', va='center', fontsize=14, color='gray')
+            ax_fusion.axis('off')
     else:
-        ax_lstm.text(0.5, 0.5, 'No LSTM layer found', 
+        ax_fusion.text(0.5, 0.5, 'No Fusion layer found', 
                     ha='center', va='center', fontsize=14, color='gray')
-        ax_lstm.axis('off')
+        ax_fusion.axis('off')
     
     plt.savefig(os.path.join(output_dir, 'bottleneck_analysis_split.png'), dpi=150, bbox_inches='tight')
     plt.close()
@@ -740,34 +701,30 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             if image.dim() == 4 and image.shape[-1] == 1:
                 image = image.permute(0, 3, 1, 2)
             
-            # CNN
+            # CNN - Dynamic 4-layer architecture
             x = image
-            x = features_extractor.conv1(x)
-            x = features_extractor.bn1(x)
-            x = torch.nn.functional.gelu(x)
-            
-            x = features_extractor.conv2(x)
-            x = features_extractor.bn2(x)
-            x = features_extractor.dropout2(x)
-            x = torch.nn.functional.gelu(x)
-            
-            if getattr(features_extractor, "has_conv3", False):
-                identity = features_extractor.residual_proj(x)
+            dropout_idx = 0
+            for layer_idx, (conv, bn) in enumerate(zip(features_extractor.conv_layers, features_extractor.bn_layers)):
+                x = conv(x)
+                x = bn(x)
+                x = torch.nn.functional.gelu(x)
                 
-                x_local = features_extractor.conv3_local(x)
-                x_local = features_extractor.bn3_local(x_local)
-                
-                x_global = features_extractor.conv3_global(x)
-                x_global = features_extractor.bn3_global(x_global)
-                
-                x_combined = torch.cat([x_local, x_global], dim=1)
-                x_combined = features_extractor.dropout3(x_combined)
-                x_combined = torch.nn.functional.gelu(x_combined)
-                x = x_combined + identity  # Residual
+                # Apply dropout from layer 2 onwards (if exists)
+                if layer_idx > 0 and dropout_idx < len(features_extractor.dropout_layers):
+                    x = features_extractor.dropout_layers[dropout_idx](x)
+                    dropout_idx += 1
             
+            # ✅ Spatial attention (if enabled)
+            if getattr(features_extractor, 'use_spatial_attention', False):
+                x = features_extractor.spatial_attention(x)
+            
+            # Global Average Pooling
+            x = features_extractor.global_pool(x)
             cnn_raw = features_extractor.flatten(x)
             cnn_raw = cnn_raw.float()
-            cnn_features = features_extractor.cnn_bottleneck(cnn_raw)
+            
+            # CNN projection
+            cnn_features = features_extractor.cnn_projection(cnn_raw)
             
             # Scalars (8: direction(2) + dx_head(1) + dy_head(1) + front_coll(1) + left_coll(1) + right_coll(1) + snake_length(1))
             scalars = torch.cat([
@@ -781,42 +738,23 @@ def analyze_gradient_flow_detailed(model, env, output_dir, num_samples=50):
             ], dim=-1)
             
             scalars = features_extractor.scalar_input_dropout(scalars)
-            scalar_features = features_extractor.scalar_linear(scalars)
+            scalar_features = features_extractor.scalar_network(scalars)
             
             # Fusion
             combined = torch.cat([cnn_features, scalar_features], dim=-1)
-            features_final = features_extractor.final_linear(combined)
+            features_final = features_extractor.fusion(combined)
             
-            # LSTM - standardowa inicjalizacja stanów
-            batch_size = features_final.shape[0]
-            num_layers = policy.lstm_actor.num_layers
-            hidden_size = policy.lstm_actor.hidden_size
-            
-            lstm_states = (
-                np.zeros((num_layers, batch_size, hidden_size), dtype=np.float32),
-                np.zeros((num_layers, batch_size, hidden_size), dtype=np.float32)
-            )
-            
-            lstm_states_tensor = (
-                torch.tensor(lstm_states[0], dtype=torch.float32, device=policy.device),
-                torch.tensor(lstm_states[1], dtype=torch.float32, device=policy.device)
-            )
-            
-            features_seq = features_final.unsqueeze(1)
-            lstm_out, _ = policy.lstm_actor(features_seq, lstm_states_tensor)
-            latent_pi = lstm_out.squeeze(1)
-            
-            # MLP
-            latent_pi_mlp = policy.mlp_extractor.policy_net(latent_pi)
+            # MLP (pure PPO - no LSTM)
+            latent_pi_mlp = policy.mlp_extractor.policy_net(features_final)
             action_logits = policy.action_net(latent_pi_mlp)
             action = torch.argmax(action_logits, dim=-1)
         
         # Backward pass z gradientami
         policy.zero_grad()
         
-        # Oblicz gradienty
+        # Oblicz gradienty (NO LSTM)
         state_grads = compute_layer_gradients(
-            model, obs, obs_tensor, lstm_states, action.item(), features_extractor
+            model, obs, obs_tensor, action.item(), features_extractor
         )
         
         # ✅ Agreguj statystyki per layer z RMS
