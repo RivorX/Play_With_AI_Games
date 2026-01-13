@@ -120,10 +120,10 @@ class AsyncRolloutPrefetcher:
 
 def setup_adamw_optimizer(model, config):
     """
-    ⚙️  Konfiguruje optimizer AdamW dla modelu RecurrentPPO
+    ⚙️  Konfiguruje optimizer AdamW dla modelu PPO
     
     Args:
-        model: RecurrentPPO model
+        model: PPO model
         config: Config dictionary
     
     Returns:
@@ -179,7 +179,7 @@ def load_policy_weights_only(model, policy_path):
     Pierwsze ~1000 kroków mogą mieć wyższy loss (rozgrzewka momentum).
     
     Args:
-        model: Nowy model RecurrentPPO
+        model: Nowy model PPO
         policy_path: Ścieżka do policy.pth
     
     Returns:
@@ -351,30 +351,7 @@ def cleanup_all_training_csvs(base_dir, max_timesteps, verbose=True):
     return stats
 
 
-def apply_gradient_clipping(model, clip_value=1.0):
-    """
-    ✅ KLUCZOWA NAPRAWA: Gradient Clipping dla LSTM
-    Zapobiega exploding gradients w LSTM (MLP gradient 1.0 → 0.4)
-    """
-    def clip_grad_hook(module, grad_input, grad_output):
-        """Hook który clippuje gradienty w backward pass"""
-        if grad_input is not None:
-            clipped = tuple(
-                torch.clamp(g, -clip_value, clip_value) if g is not None else g 
-                for g in grad_input
-            )
-            return clipped
-        return grad_input
-    
-    # Zarejestruj hook dla LSTM actor
-    if hasattr(model.policy, 'lstm_actor'):
-        model.policy.lstm_actor.register_full_backward_hook(clip_grad_hook)
-        print(f"[GRADIENT CLIPPING] ✅ Enabled for LSTM Actor (clip_value={clip_value})")
-    
-    # Opcjonalnie dla LSTM critic (jeśli enable_critic_lstm=true)
-    if hasattr(model.policy, 'lstm_critic') and model.policy.lstm_critic is not None:
-        model.policy.lstm_critic.register_full_backward_hook(clip_grad_hook)
-        print(f"[GRADIENT CLIPPING] ✅ Enabled for LSTM Critic (clip_value={clip_value})")
+
 
 
 def save_training_state(model, env, eval_env, total_timesteps, save_path):

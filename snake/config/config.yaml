@@ -59,13 +59,13 @@ environment:
       bonus_per_apple: 0.03           # +3% za każde jabłko
       max_multiplier: 3.0              # Cap na 300%
 
-# Konfiguracja modelu RecurrentPPO
+# Konfiguracja modelu PPO
 model:
-  policy: MultiInputLstmPolicy       # Policy dla RecurrentPPO
+  policy: MultiInputPolicy           # Policy dla PPO
   learning_rate: 0.0003              # Szybkość uczenia 
   min_learning_rate: 0.00001         # Minimalny learning rate
-  n_steps: 1024                      # Liczba kroków na aktualizację 
-  n_epochs: 3                        # Liczba epok
+  n_steps: 4096                      # Liczba kroków na aktualizację 
+  n_epochs: 5                        # Liczba epok
   gamma: 0.995                       # Współczynnik dyskontowania
   gae_lambda: 0.97                   # Lambda dla GAE
   clip_range: 0.2                    # Zakres obcinania PPO
@@ -80,33 +80,25 @@ model:
     weight_decay: 0.0001              # Weight decay dla AdamW (0.0 = wyłączone)
     eps: 1.0e-8                      # Epsilon dla stabilności
     betas: [0.9, 0.999]              # Beta1, Beta2 dla Adam/AdamW
-
-  # LSTM Configuration
-  lstm:
-    gradient_clip_val: 5.0          # Clip gradients LSTM
-    cell_state_penalty: 0.0         # L2 penalty na cell state
-    hidden_state_penalty: 0.0       # L2 penalty na hidden state
-    dropout: 0.0                    # Dropout w LSTM
   
   # Selektywne dropouty
   cnn_dropout: 0.03                 
   scalar_dropout: 0.04               # Dropout dla skalarów (wyższy - mniej skalarów)
   scalar_input_dropout: 0.0          # Dropout dla wejścia skalarów
-  fusion_dropout: 0.05               # Dropout po fusion (regularyzacja przed LSTM)              
+  fusion_dropout: 0.05               # Dropout po fusion         
   
   # CNN ARCHITECTURE
   convlstm:
-    cnn_channels: [64, 96]          # Kanały CNN (zwiększone dla 11x11 viewport)
-    
-    # Bottleneck (11x11 → 6x6 → 3456 raw features)
-    cnn_bottleneck_dims: []
-    cnn_output_dim: 819              # 80% z 1024 (pre-fusion)
+    cnn_channels: [96, 160, 224, 320]
+    cnn_output_dim: 768             
     
     # Scalar Network Architecture  
-    scalar_hidden_dims: [256, 205]   # 20% z 1024 (pre-fusion) → 205
+    scalar_hidden_dims: [192, 256]
+    scalar_output_dim: 192
     
     # Architecture Options
     use_layernorm: true              # Global switch
+    use_spatial_attention: true           # Spatial attention mechanism
 
   policy_kwargs:
     features_extractor_kwargs:
@@ -114,16 +106,13 @@ model:
     net_arch:
       pi: [512, 256]               
       vf: [512, 512, 256]               
-    lstm_hidden_size: 600            # Rozmiar ukryty LSTM
-    n_lstm_layers: 1                 # Liczba warstw LSTM
-    enable_critic_lstm: true         # LSTM dla krytyka
 
 # Konfiguracja treningu
 training:
-  n_envs: 16                         # Liczba środowisk 
-  batch_size: 1024                   # Rozmiar partii 
-  total_timesteps: 16000000           # Całkowita liczba kroków
-  eval_freq: 8192                    # Częstotliwość ewaluacji
+  n_envs: 48                         # Liczba środowisk 
+  batch_size: 8192                   # Rozmiar partii 
+  total_timesteps: 100000000          # Całkowita liczba kroków
+  eval_freq: 16384                   # Częstotliwość ewaluacji
   plot_interval: 1                   # Co ile walidacji robić wykres i zapisywać model
   max_no_improvement_evals: 50       # Liczba ewaluacji bez poprawy przed zatrzymaniem
   min_evals: 20                      # Minimalna liczba ewaluacji przed sprawdzeniem zatrzymania

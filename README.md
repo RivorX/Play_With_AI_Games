@@ -6,7 +6,7 @@ W repo znajdziesz m.in. implementację agenta RL dla gry Snake wraz z narzędzia
 
 ## Projekty
 
-### 🐍 Snake — RecurrentPPO Agent
+### 🐍 Snake — PPO Agent
 
 Agent RL trenowany do gry w Snake na siatkach o zmiennych rozmiarach.
 
