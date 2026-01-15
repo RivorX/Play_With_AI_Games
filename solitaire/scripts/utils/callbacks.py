@@ -1,109 +1,322 @@
-from stable_baselines3.common.callbacks import BaseCallback
 import os
-import numpy as np
-import matplotlib.pyplot as plt
-from collections import deque
 import csv
+import sys
+import numpy as np
+import torch
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from sb3_contrib.common.maskable.evaluation import evaluate_policy as evaluate_maskable_policy
+
 
 class TrainProgressCallback(BaseCallback):
-    def __init__(self, log_path, verbose=0):
+    """
+    Callback dla logowania postępów treningu Solitaire
+    """
+    def __init__(self, log_path, initial_timesteps=0, verbose=0):
         super().__init__(verbose)
-        self.log_path = log_path
-        self.episode_rewards = deque(maxlen=100)
-        self.episode_lengths = deque(maxlen=100)
-        self.episode_successes = deque(maxlen=100)
+        self.csv_path = log_path
+        self.initial_timesteps = initial_timesteps
+        self.last_logged = 0
         
-        # Create file with header if not exists
-        if not os.path.exists(log_path):
-            with open(log_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['timesteps', 'mean_reward', 'mean_ep_length', 'win_rate'])
+        # Pre-allocated lists
+        self.episode_scores = []
+        self.episode_wins = []
+        self.episode_foundations = []
+        self.episode_moves = []
+        
+        # Sprawdź czy CSV istnieje (wznowienie treningu)
+        self._csv_exists = os.path.exists(log_path)
 
     def _on_step(self) -> bool:
-        for info in self.locals['infos']:
-            if 'episode' in info:
-                reward = info['episode']['r']
-                length = info['episode']['l']
-                # ✅ FIX: Sprawdzaj czy gra się skończyła z flagą terminal=True
-                # W Pasjansie zwycięstwo ustawiamy flagę is_success w info
-                is_success = info.get('is_success', False)
+        """Zbiera dane z zakończonych epizodów"""
+        infos = self.locals.get('infos', [])
+        dones = self.locals.get('dones', [])
+        
+        # ✅ Zbieraj dane z zakończonych epizodów
+        for info, done in zip(infos, dones):
+            if done:
+                # Użyj score z info (który teraz jest aktualizowany w model.py)
+                score = info.get('score', 0)
+                won = info.get('won', False)
+                foundations_filled = sum(info.get('foundations', [0, 0, 0, 0]))
+                moves = info.get('moves', 0)
                 
-                self.episode_rewards.append(reward)
-                self.episode_lengths.append(length)
-                self.episode_successes.append(is_success)
-                
-        # Log aggregated stats co jakiś czas (nie każdy epizod)
-        if len(self.episode_rewards) > 0:
-            mean_reward = np.mean(self.episode_rewards)
-            mean_ep_length = np.mean(self.episode_lengths)
-            win_rate = np.mean(self.episode_successes)
+                self.episode_scores.append(score)
+                self.episode_wins.append(1.0 if won else 0.0)
+                self.episode_foundations.append(foundations_filled)
+                self.episode_moves.append(moves)
+        
+        # Logowanie co 1000 kroków
+        if any(dones) and (self.num_timesteps + self.initial_timesteps) - self.last_logged >= 1000:
+            # ✅ Sprawdź czy mamy wystarczająco danych do logowania
+            if not self.episode_scores:
+                return True  # Pomiń logowanie jeśli nie ma danych
             
-            # Log razem z info
-            with open(self.log_path, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([self.num_timesteps, mean_reward, mean_ep_length, win_rate])
+            ep_buffer = self.model.ep_info_buffer
+            
+            ep_rew_mean = np.mean([ep['r'] for ep in ep_buffer]) if ep_buffer else None
+            ep_len_mean = np.mean([ep['l'] for ep in ep_buffer]) if ep_buffer else None
+            
+            mean_score = np.mean(self.episode_scores) if self.episode_scores else 0.0
+            max_score = np.max(self.episode_scores) if self.episode_scores else 0.0
+            win_rate = np.mean(self.episode_wins) if self.episode_wins else 0.0
+            mean_foundations = np.mean(self.episode_foundations) if self.episode_foundations else 0.0
+            mean_moves = np.mean(self.episode_moves) if self.episode_moves else 0.0
+            
+            # Pobierz losses
+            policy_loss = getattr(self.model, '_last_policy_loss', None)
+            value_loss = getattr(self.model, '_last_value_loss', None)
+            entropy_loss = getattr(self.model, '_last_entropy_loss', None)
+            
+            try:
+                write_header = not self._csv_exists
+                with open(self.csv_path, 'a', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    if write_header:
+                        writer.writerow([
+                            'timesteps', 
+                            'mean_reward', 
+                            'mean_ep_length', 
+                            'mean_score', 
+                            'max_score', 
+                            'win_rate',
+                            'mean_foundations',
+                            'mean_moves',
+                            'policy_loss', 
+                            'value_loss', 
+                            'entropy_loss'
+                        ])
+                        self._csv_exists = True
+                    
+                    writer.writerow([
+                        self.num_timesteps + self.initial_timesteps, 
+                        ep_rew_mean, 
+                        ep_len_mean, 
+                        mean_score,
+                        max_score,
+                        win_rate,
+                        mean_foundations,
+                        mean_moves,
+                        policy_loss,
+                        value_loss,
+                        entropy_loss
+                    ])
                 
+                # Reset agregacji
+                self.last_logged = self.num_timesteps + self.initial_timesteps
+                self.episode_scores = []
+                self.episode_wins = []
+                self.episode_foundations = []
+                self.episode_moves = []
+            except Exception as e:
+                print(f"Warning: Failed to log training progress: {e}")
+        
         return True
 
+
 class CustomEvalCallback(BaseCallback):
-    def __init__(self, eval_env, best_model_save_path, log_path, eval_freq=10000, verbose=1, plot_script_path=None):
+    """
+    Custom EvalCallback z obsługą MaskablePPO i automatycznym plotowaniem
+    Zastępuje standardowy EvalCallback, który nie obsługuje maskowania akcji.
+    """
+    def __init__(self, eval_env, best_model_save_path, log_path, eval_freq, 
+                 plot_script_path=None, plot_interval=1, callback_on_new_best=None,
+                 deterministic=True, render=False, verbose=1, warn=True, n_eval_episodes=5):
         super().__init__(verbose)
         self.eval_env = eval_env
         self.best_model_save_path = best_model_save_path
         self.log_path = log_path
         self.eval_freq = eval_freq
-        self.best_mean_reward = -np.inf
         self.plot_script_path = plot_script_path
+        self.plot_interval = plot_interval
+        self.callback_on_new_best = callback_on_new_best
+        self.deterministic = deterministic
+        self.render = render
+        self.warn = warn
+        self.n_eval_episodes = n_eval_episodes
+        
+        self.eval_count = 0
+        self.best_mean_reward = -np.inf
+        
+        # Utwórz katalogi
+        if best_model_save_path is not None:
+            os.makedirs(os.path.dirname(best_model_save_path), exist_ok=True)
+            
+    def _init_callback(self) -> None:
+        # Does not work (warnings) with SubprocVecEnv
+        # if not isinstance(self.eval_env, VecEnv):
+        #     self.eval_env = DummyVecEnv([lambda: self.eval_env])
+        
+        # Inicjalizacja sub-callbacka (np. StopTrainingOnNoModelImprovement)
+        if self.callback_on_new_best is not None:
+            self.callback_on_new_best.init_callback(self.model)
+            # Ustaw parent dla StopTrainingOnNoModelImprovement, 
+            # ponieważ wymaga on dostępu do last_mean_reward z EvalCallback
+            self.callback_on_new_best.parent = self
 
     def _on_step(self) -> bool:
-        if self.n_calls % self.eval_freq == 0:
-            mean_reward, std_reward = self._evaluate()
+        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            self.eval_count += 1
+            
+            # --- EWALUACJA (Maskable) ---
             if self.verbose > 0:
-                print(f"Eval at step {self.num_timesteps}: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}")
+                print(f"Evaluating policy at {self.num_timesteps} timesteps...")
             
+            # Użyj evaluate_policy z sb3_contrib
+            episode_rewards, episode_lengths = evaluate_maskable_policy(
+                self.model,
+                self.eval_env,
+                n_eval_episodes=self.n_eval_episodes,
+                render=self.render,
+                deterministic=self.deterministic,
+                return_episode_rewards=True,
+                warn=self.warn,
+            )
+            
+            mean_reward = np.mean(episode_rewards)
+            std_reward = np.std(episode_rewards)
+            mean_ep_length = np.mean(episode_lengths)
+            
+            # Logowanie
+            if self.verbose > 0:
+                print(f"Eval result: reward={mean_reward:.2f} +/- {std_reward:.2f} | length={mean_ep_length:.2f}")
+            
+            self.logger.record("eval/mean_reward", float(mean_reward))
+            self.logger.record("eval/mean_ep_length", float(mean_ep_length))
+            
+            # Zapisz najlepszy model
             if mean_reward > self.best_mean_reward:
-                self.best_mean_reward = mean_reward
                 if self.verbose > 0:
-                    print("New best mean reward!")
-                self.model.save(os.path.join(self.best_model_save_path, "best_model"))
-            
-            # Zawsze nadpisuj aktualny model (solitaire_ppo_model.zip)
-            self.model.save(os.path.join(self.best_model_save_path, "solitaire_ppo_model"))
+                    print(f"🔥 New best mean reward! {self.best_mean_reward:.2f} -> {mean_reward:.2f}")
+                self.best_mean_reward = mean_reward
+                
+                if self.best_model_save_path is not None:
+                    save_path = os.path.join(self.best_model_save_path, "best_model.zip")
+                    self.model.save(save_path)
+                    print(f"📦 Saved best model to {save_path}")
+                
+                # Trigger callback
+                if self.callback_on_new_best is not None:
+                    self.callback_on_new_best.on_step()
 
-            # Trigger plotting
-            if self.plot_script_path:
+            # Plot co plot_interval ewaluacji
+            if self.plot_script_path and self.eval_count % self.plot_interval == 0:
                 try:
                     import subprocess
-                    subprocess.Popen(['python', self.plot_script_path])
+                    subprocess.run([sys.executable, self.plot_script_path], check=False)
                 except Exception as e:
-                    print(f"Failed to run plot script: {e}")
-                
+                    print(f"⚠️ Plotting failed: {e}")
+        
         return True
 
-    def _evaluate(self):
-        # Custom evaluation loop that handles Action Masks
-        total_rewards = []
+
+class LossRecorderCallback(BaseCallback):
+    """
+    Callback do zapisywania loss values do modelu
+    """
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        # Zapisz losses jeśli są dostępne
+        if hasattr(self.model, 'logger') and self.model.logger:
+            try:
+                # SB3 stores these in logger
+                self.model._last_policy_loss = self.model.logger.name_to_value.get('train/policy_loss', None)
+                self.model._last_value_loss = self.model.logger.name_to_value.get('train/value_loss', None)
+                self.model._last_entropy_loss = self.model.logger.name_to_value.get('train/entropy_loss', None)
+            except:
+                pass
         
-        for _ in range(5):  # n_eval_episodes
-            obs = self.eval_env.reset()
-            done = False
-            episode_reward = 0.0
-            
-            while not done:
-                # Get action masks from the environment
-                # Note: eval_env is a VecEnv, so we need to access the method properly
-                # sb3_contrib ActionMasker adds 'action_masks' method
-                action_masks = self.eval_env.env_method("action_masks")
-                # action_masks is a list of masks (one for each env in VecEnv)
-                # Since we use n_envs=1 for eval, we take the first one
-                action_mask = action_masks[0]
+        return True
+
+
+class EntropySchedulerCallback(BaseCallback):
+    """
+    Callback dla liniowego zmniejszania współczynnika entropii
+    """
+    def __init__(self, initial_ent_coef, min_ent_coef, total_timesteps, verbose=0):
+        super().__init__(verbose)
+        self.initial_ent_coef = initial_ent_coef
+        self.min_ent_coef = min_ent_coef
+        self.total_timesteps = total_timesteps
+
+    def _on_step(self) -> bool:
+        # Liniowa interpolacja
+        progress = min(self.num_timesteps / self.total_timesteps, 1.0)
+        new_ent_coef = self.initial_ent_coef - progress * (self.initial_ent_coef - self.min_ent_coef)
+        self.model.ent_coef = max(new_ent_coef, self.min_ent_coef)
+        
+        return True
+
+
+class WinTrackerCallback(BaseCallback):
+    """
+    Callback dla śledzenia wygranych i statystyk gry
+    """
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.total_games = 0
+        self.total_wins = 0
+        self.last_100_wins = []
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get('infos', [])
+        dones = self.locals.get('dones', [])
+        
+        for info, done in zip(infos, dones):
+            if done:
+                self.total_games += 1
+                won = info.get('won', False)
+                if won:
+                    self.total_wins += 1
+                    self.last_100_wins.append(1)
+                else:
+                    self.last_100_wins.append(0)
                 
-                action, _ = self.model.predict(obs, action_masks=action_mask, deterministic=True)
-                obs, reward, done, info = self.eval_env.step(action)
-                episode_reward += reward[0] # VecEnv returns list of rewards
-                
-            total_rewards.append(episode_reward)
+                # Zachowaj tylko ostatnie 100
+                if len(self.last_100_wins) > 100:
+                    self.last_100_wins.pop(0)
+        
+        # Log co 10000 kroków
+        if self.num_timesteps % 10000 == 0 and self.total_games > 0:
+            win_rate = self.total_wins / self.total_games
+            win_rate_100 = np.mean(self.last_100_wins) if self.last_100_wins else 0.0
             
-        mean_reward = np.mean(total_rewards)
-        std_reward = np.std(total_rewards)
-        return mean_reward, std_reward
+            if self.verbose > 0:
+                print(f"\n[Win Stats] Games: {self.total_games} | "
+                      f"Overall Win Rate: {win_rate:.2%} | "
+                      f"Last 100: {win_rate_100:.2%}")
+        
+        return True
+
+
+class PeriodicSaveCallback(BaseCallback):
+    """
+    Callback do zapisywania modelu co N ewaluacji, niezależnie od wyniku
+    """
+    def __init__(self, save_path, eval_freq, save_interval=10, verbose=0):
+        super().__init__(verbose)
+        self.save_path = save_path
+        self.eval_freq = eval_freq
+        self.save_interval = save_interval  # Zapisz co N ewaluacji
+        self.eval_count = 0
+        self.last_save_eval = 0
+        
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    def _on_step(self) -> bool:
+        # Sprawdzamy czy właśnie była ewaluacja
+        if self.num_timesteps % self.eval_freq == 0 and self.num_timesteps > 0:
+            self.eval_count += 1
+            
+            # Zapisz model co save_interval ewaluacji
+            if self.eval_count - self.last_save_eval >= self.save_interval:
+                try:
+                    self.model.save(self.save_path)
+                    if self.verbose > 0:
+                        print(f"✅ Model saved to {self.save_path} (eval #{self.eval_count})")
+                    self.last_save_eval = self.eval_count
+                except Exception as e:
+                    print(f"❌ Failed to save model: {e}")
+        
+        return True
