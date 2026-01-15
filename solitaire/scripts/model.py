@@ -52,10 +52,10 @@ class SolitaireEnv(gym.Env):
         self.max_tableau_height = config['environment']['observation_space']['max_tableau_height']
         
         self.observation_space = spaces.Dict({
-            'tableau': spaces.Box(low=0, high=1, shape=(7, self.max_tableau_height, 4), dtype=np.float32),
+            'tableau': spaces.Box(low=0, high=1, shape=(7, self.max_tableau_height, 5), dtype=np.float32), # Added Color
             'foundations': spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32), # Top rank for each suit
-            'waste': spaces.Box(low=0, high=1, shape=(3,), dtype=np.float32), # [Present, Suit, Rank]
-            'stock': spaces.Box(low=0, high=1, shape=(52, 3), dtype=np.float32) # [Present, Suit, Rank] - Full visibility
+            'waste': spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32), # [Present, Suit, Rank, Color]
+            'stock': spaces.Box(low=0, high=1, shape=(52, 4), dtype=np.float32) # [Present, Suit, Rank, Color]
         })
         
         # Action Space
@@ -206,8 +206,9 @@ class SolitaireEnv(gym.Env):
                     mask[82 + i] = True
         
         # 86: Surrender
-        # Always available
-        mask[86] = True
+        # Dostępny tylko po 100 krokach (ostateczność)
+        if self.steps >= 100:
+            mask[86] = True
                     
         return mask
 
@@ -247,35 +248,35 @@ class SolitaireEnv(gym.Env):
 
     def _get_obs(self):
         # Tableau
-        tableau_obs = np.zeros((7, self.max_tableau_height, 4), dtype=np.float32)
+        tableau_obs = np.zeros((7, self.max_tableau_height, 5), dtype=np.float32)
         for i, pile in enumerate(self.tableau):
             for j, card in enumerate(pile):
                 if j >= self.max_tableau_height: break
-                # [Present, Suit, Rank, FaceUp]
-                # Normalize: Suit / 3.0, Rank / 13.0
-                tableau_obs[i, j] = [1.0, card.suit / 3.0, card.rank / 13.0, 1.0 if card.face_up else 0.0]
+                # [Present, Suit, Rank, FaceUp, Color]
+                # Filter Color: 0 (Red) -> 0.0, 1 (Black) -> 1.0 (or vice versa, just consistent)
+                tableau_obs[i, j] = [1.0, card.suit / 3.0, card.rank / 13.0, 1.0 if card.face_up else 0.0, float(card.color())]
         
         # Foundations
         # Normalize: Rank / 13.0
         foundations_obs = np.array([r / 13.0 for r in self.foundations], dtype=np.float32)
         
         # Waste
-        waste_obs = np.zeros((3,), dtype=np.float32)
+        waste_obs = np.zeros((4,), dtype=np.float32)
         if self.waste:
             top_card = self.waste[-1]
-            waste_obs = np.array([1.0, top_card.suit / 3.0, top_card.rank / 13.0], dtype=np.float32)
+            waste_obs = np.array([1.0, top_card.suit / 3.0, top_card.rank / 13.0, float(top_card.color())], dtype=np.float32)
             
         # Stock
         # Show all cards in stock (reversed so index 0 is the next card to draw)
         # BUT only show cards that have been seen before (revealed through waste)
-        stock_obs = np.zeros((52, 3), dtype=np.float32)
+        stock_obs = np.zeros((52, 4), dtype=np.float32)
         for i, card in enumerate(reversed(self.stock)):
             if (card.suit, card.rank) in self.seen_stock_cards:
-                # [Present, Suit, Rank]
-                stock_obs[i] = [1.0, card.suit / 3.0, card.rank / 13.0]
+                # [Present, Suit, Rank, Color]
+                stock_obs[i] = [1.0, card.suit / 3.0, card.rank / 13.0, float(card.color())]
             else:
-                # Card not yet seen - show as present but unknown (0, 0)
-                stock_obs[i] = [1.0, 0.0, 0.0]
+                # Card not yet seen - show as present but unknown (0, 0, 0)
+                stock_obs[i] = [1.0, 0.0, 0.0, 0.0]
         
         return {
             'tableau': tableau_obs,
@@ -302,7 +303,13 @@ class SolitaireEnv(gym.Env):
         reward = 0.0
         terminated = False
         truncated = False
-        info = {'is_success': False}
+        info = {
+            'is_success': False,
+            'score': self.score,
+            'won': False,
+            'foundations': self.foundations.copy(),
+            'moves': self.steps
+        }
         
         # Penalty for time/step
         reward += self.rewards.get('time_penalty', -0.01)
@@ -339,13 +346,15 @@ class SolitaireEnv(gym.Env):
                 self.waste.append(card)
                 # Mark this card as seen
                 self.seen_stock_cards.add((card.suit, card.rank))
+                # Mała kara za dobieranie (priorytet odkrywania kart)
+                reward += self.rewards.get('draw_stock', -0.1)
                 valid_move = True
             elif self.waste:
                 # Recycle waste
                 self.stock = self.waste[::-1]
                 for c in self.stock: c.face_up = False
                 self.waste = []
-                reward += self.rewards.get('recycle_waste_penalty', -5.0)
+                reward += self.rewards.get('recycle_waste_penalty', -2.0)
                 valid_move = True
         
         # 1-7: Waste -> Tableau 0-6
@@ -393,6 +402,10 @@ class SolitaireEnv(gym.Env):
                             self.tableau[dst_idx].extend(moving_cards)
                             self.tableau[src_idx] = pile[:i]
                             
+                            # Check if we emptied a column
+                            if not self.tableau[src_idx]:
+                                reward += self.rewards.get('empty_column_bonus', 20.0)
+
                             # Flip new top of src if needed
                             flipped = False
                             if self.tableau[src_idx] and not self.tableau[src_idx][-1].face_up:
@@ -426,6 +439,10 @@ class SolitaireEnv(gym.Env):
                     self.tableau[src_idx].pop()
                     self.foundations[f_idx] = card.rank
                     
+                    # Check if we emptied a column
+                    if not self.tableau[src_idx]:
+                        reward += self.rewards.get('empty_column_bonus', 20.0)
+                    
                     if self.tableau[src_idx] and not self.tableau[src_idx][-1].face_up:
                         self.tableau[src_idx][-1].face_up = True
                         reward += self.rewards.get('flip_tableau_card', 5.0)
@@ -454,6 +471,9 @@ class SolitaireEnv(gym.Env):
 
         if not valid_move:
             reward += self.rewards.get('invalid_move_penalty', -1.0)
+        
+        # ✅ Aktualizuj score
+        self.score += reward
 
         # Update action mask for the new state
         self.current_action_mask = self._calculate_action_mask()
@@ -463,6 +483,7 @@ class SolitaireEnv(gym.Env):
             reward += self.rewards.get('win_bonus', 1000.0)
             terminated = True
             info['is_success'] = True
+            info['won'] = True
             
         # Check Deadlock (No moves left)
         if not terminated and not any(self.current_action_mask):
@@ -472,6 +493,11 @@ class SolitaireEnv(gym.Env):
             
         if self.steps >= self.max_steps:
             truncated = True
+        
+        # Update info with current stats
+        info['score'] = self.score
+        info['foundations'] = self.foundations.copy()
+        info['moves'] = self.steps
 
         return self._get_obs(), reward, terminated, truncated, info
 

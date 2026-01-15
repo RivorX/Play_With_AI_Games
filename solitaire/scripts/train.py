@@ -6,11 +6,18 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import StopTrainingOnNoModelImprovement
 
 from model import make_env
 from cnn import SolitaireFeaturesExtractor
-from utils.callbacks import TrainProgressCallback, CustomEvalCallback
+from utils.callbacks import (
+    TrainProgressCallback, 
+    CustomEvalCallback, 
+    LossRecorderCallback,
+    EntropySchedulerCallback,
+    WinTrackerCallback,
+    PeriodicSaveCallback
+)
 
 # Load config
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,11 +39,16 @@ def train():
     # Config
     n_envs = config['training']['n_envs']
     total_timesteps = config['training']['total_timesteps']
+    eval_freq = config['training']['eval_freq']
+    plot_interval = config['training']['plot_interval']
+    eval_n_envs = config['training'].get('eval_n_envs', 4)
+    eval_n_repeats = config['training'].get('eval_n_repeats', 3)
     
     # Paths
     models_dir = os.path.join(base_dir, config['paths']['models_dir'])
     logs_dir = os.path.join(base_dir, config['paths']['logs_dir'])
     train_csv_path = os.path.join(base_dir, config['paths']['train_csv_path'])
+    model_path = os.path.join(base_dir, config['paths']['model_path'])
     
     # Cleanup previous run
     if os.path.exists(train_csv_path):
@@ -60,19 +72,46 @@ def train():
     os.makedirs(logs_dir, exist_ok=True)
     
     # Environment
-    # Use DummyVecEnv for simplicity and debugging, Subproc for speed
-    vec_env_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
+    # Use SubprocVecEnv for speed with multiple envs
+    vec_env_cls = SubprocVecEnv if n_envs > 4 else DummyVecEnv
+    print(f"🗃️  Używam {vec_env_cls.__name__} dla {n_envs} środowisk\n")
     
     # Create vectorized environment with masking
     env = make_vec_env(make_masked_env(), n_envs=n_envs, vec_env_cls=vec_env_cls)
     
-    # Eval Env
-    eval_env = make_vec_env(make_masked_env(), n_envs=1, vec_env_cls=DummyVecEnv)
+    # Eval Env - użyj tego samego typu co training env
+    eval_env = make_vec_env(make_masked_env(), n_envs=eval_n_envs, vec_env_cls=vec_env_cls)
     
     # Model
     policy_kwargs = config['model']['policy_kwargs'].copy()
     policy_kwargs['features_extractor_class'] = SolitaireFeaturesExtractor
     
+    # Optimizer config
+    optimizer_config = config['model'].get('optimizer', {})
+    optimizer_type = optimizer_config.get('type', 'adam')
+    
+    # Build optimizer kwargs
+    optimizer_kwargs = {
+        'eps': optimizer_config.get('eps', 1e-8),
+        'betas': tuple(optimizer_config.get('betas', [0.9, 0.999]))
+    }
+    
+    if optimizer_type == 'adamw':
+        optimizer_kwargs['weight_decay'] = optimizer_config.get('weight_decay', 0.0001)
+        optimizer_class = torch.optim.AdamW
+    else:
+        optimizer_class = torch.optim.Adam
+    
+    print(f"\n{'='*70}")
+    print(f"[OPTIMIZER CONFIG]")
+    print(f"{'='*70}")
+    print(f"  Type:           {optimizer_type.upper()}")
+    print(f"  Weight Decay:   {optimizer_kwargs.get('weight_decay', 'N/A')}")
+    print(f"  Epsilon:        {optimizer_kwargs['eps']}")
+    print(f"  Betas:          {optimizer_kwargs['betas']}")
+    print(f"{'='*70}\n")
+    
+    # Create model
     model = MaskablePPO(
         config['model']['policy'],
         env,
@@ -92,32 +131,85 @@ def train():
         device=config['model']['device']
     )
     
-    # Callbacks
-    # Usunięto CheckpointCallback, aby nie zapisywać modelu co X kroków
+    # Set optimizer
+    model.policy.optimizer = optimizer_class(model.policy.parameters(), 
+                                             lr=config['model']['learning_rate'],
+                                             **optimizer_kwargs)
     
+    # Callbacks
     plot_script_path = os.path.join(os.path.dirname(__file__), 'utils', 'plot_train_progress.py')
+    
+    # Stop training callback
+    stop_train_callback = StopTrainingOnNoModelImprovement(
+        max_no_improvement_evals=config['training']['max_no_improvement_evals'],
+        min_evals=config['training']['min_evals'],
+        verbose=1
+    )
     
     eval_callback = CustomEvalCallback(
         eval_env=eval_env,
         best_model_save_path=models_dir,
         log_path=logs_dir,
-        eval_freq=config['training']['eval_freq'],
-        plot_script_path=plot_script_path
+        eval_freq=eval_freq // n_envs,  # Adjust for vectorized env
+        plot_script_path=plot_script_path,
+        plot_interval=plot_interval,
+        callback_on_new_best=stop_train_callback,  # Poprawnie przekazany callback
+        deterministic=False,  # Zmienione na False - lepiej ocenia eksploracyjną grę
+        verbose=1
     )
     
     train_progress_callback = TrainProgressCallback(
-        log_path=os.path.join(base_dir, config['paths']['train_csv_path'])
+        log_path=train_csv_path,
+        initial_timesteps=0
     )
     
-    print("Starting training with MaskablePPO...")
+    loss_recorder_callback = LossRecorderCallback()
+    
+    # Entropy scheduler
+    entropy_scheduler = EntropySchedulerCallback(
+        initial_ent_coef=config['model']['ent_coef'],
+        min_ent_coef=config['model'].get('min_ent_coef', 0.005),
+        total_timesteps=total_timesteps
+    )
+    
+    win_tracker = WinTrackerCallback(verbose=1)
+    
+    # Periodic save callback - zapisz model co 10 ewaluacji
+    periodic_save_callback = PeriodicSaveCallback(
+        save_path=model_path,
+        eval_freq=eval_freq,
+        save_interval=10,  # Zapisz co 10 ewaluacji
+        verbose=1
+    )
+    
+    callbacks = [
+        eval_callback,
+        train_progress_callback,
+        loss_recorder_callback,
+        entropy_scheduler,
+        win_tracker,
+        periodic_save_callback
+    ]
+    
+    print("\n" + "="*70)
+    print("[STARTING TRAINING]")
+    print("="*70)
+    print(f"  Total timesteps:    {total_timesteps:,}")
+    print(f"  Environments:       {n_envs}")
+    print(f"  Eval frequency:     {eval_freq:,}")
+    print(f"  Batch size:         {config['model']['batch_size']:,}")
+    print(f"  N steps:            {config['model']['n_steps']:,}")
+    print("="*70 + "\n")
+    
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[eval_callback, train_progress_callback],
+        callback=callbacks,
         tb_log_name="ppo"
     )
     
-    model.save(os.path.join(base_dir, config['paths']['model_path']))
-    print("Training finished!")
+    model.save(model_path)
+    print("\n✅ Training finished!")
+    print(f"📦 Model saved to: {model_path}")
 
 if __name__ == "__main__":
     train()

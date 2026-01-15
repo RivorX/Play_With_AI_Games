@@ -5,65 +5,87 @@ environment:
   reward_scaling:
     enable: true
     
-    # Nagrody (priorytet: fundacje > odkrywanie > przygotowanie > neutralne)
-    move_to_foundation: 20.0         # Karta na stos bazowy - GŁÓWNY CEL
-    flip_tableau_card: 7.0           # Odsłonięcie karty na stole
-    move_waste_to_tableau: 2.0       # Z talii na stół - przygotowanie
-    move_tableau_to_tableau: -0.5    # Przełożenie na stole (silna kara by uniknąć farmienia punktów)
+    # Nagrody (priorytet: fundacje > odkrywanie kart > ruchy > dobieranie)
+    move_to_foundation: 25.0         # Karta na stos bazowy - GŁÓWNY CEL
+    flip_tableau_card: 15.0          # Odsłonięcie karty - KLUCZOWE! (zwiększone z 7.0)
+    move_waste_to_tableau: 3.0       # Z waste na stół - przygotowanie
+    move_tableau_to_tableau: 1.0     # Przełożenie na stole (zmienione z -0.5 na pozytywne)
+    draw_stock: -0.1                 # Mała kara za dobieranie (priorytet odkrywania)
     win_bonus: 2000.0                # Wygrana - znacznie wyższa nagroda końcowa
+    empty_column_bonus: 20.0         # Nagroda za zwolnienie kolumny (ważne dla Króli)
     
-    # Kary
-    invalid_move_penalty: -0.5       # Jawna kara za nieprawidłowe ruchy
-    time_penalty: -0.1               # Kara za upływ czasu (zachęta do szybkości) - zwiększona
-    recycle_waste_penalty: -10.0     # Kara za przetasowanie talii - znacznie wyższa (ostateczność)
-    surrender_penalty: -100.0        # Kara za poddanie się (zwiększona, by nie opłacało się poddawać zbyt wcześnie)
+    # Kary (zmniejszone dla lepszej widoczności)
+    invalid_move_penalty: -0.5       # Zmniejszone z -2.0
+    time_penalty: -0.01              # Zmniejszone z -0.05 (nie karać za długą grę)
+    recycle_waste_penalty: -2.0      # Zmniejszone z -5.0 (czasem trzeba przetasować)
+    surrender_penalty: -100.0       # EKSTREMALNIE wysoka kara - tylko jako ostateczność!
 
   # Przestrzeń obserwacji
   observation_space:
     max_tableau_height: 20           # Maksymalna wysokość stosu na stole
-    card_features: 4                 # Cechy karty: [Present, Suit, Rank, FaceUp]
+    card_features: 5                 # Cechy karty: [Present, Suit, Rank, FaceUp, Color]
 
 # Konfiguracja modelu MaskablePPO
 model:
   policy: MultiInputPolicy           # Policy dla MaskablePPO (nie LSTM)
-  learning_rate: 0.0003
-  n_steps: 2048                      # Zwiększone n_steps dla stabilniejszego gradientu
-  batch_size: 2048                   # Znacznie większy batch size dla wykorzystania VRAM (4GB)
-  n_epochs: 10
-  gamma: 0.995                       # Zwiększone gamma dla lepszego planowania długoterminowego
-  gae_lambda: 0.95
-  clip_range: 0.2
-  ent_coef: 0.02                     # Zwiększona entropia dla lepszej eksploracji
-  vf_coef: 0.5
-  max_grad_norm: 0.5
+  learning_rate: 0.0003              # Learning rate
+  min_learning_rate: 0.00001         # Minimalny learning rate
+  n_steps: 2048                      # Więcej kroków = więcej danych
+  batch_size: 16384                  # Duży batch dla GPU (RTX 3060 12GB) - zwiększone z 8192
+  n_epochs: 6                        # Więcej epok dla większego batcha
+  gamma: 0.995                       # Dyskontowanie długoterminowe
+  gae_lambda: 0.97                   # Lambda dla GAE
+  clip_range: 0.2                    # Zakres obcinania PPO
+  ent_coef: 0.08                     # Zwiększony z 0.03 - więcej eksploracji!
+  min_ent_coef: 0.01                 # Zwiększony z 0.005 - utrzymuj eksplorację
+  vf_coef: 0.5                       # Współczynnik funkcji wartości
+  max_grad_norm: 0.5                 # Max gradient norm
   device: cuda
 
+  # ✅ Konfiguracja optymalizatora (jak w Snake)
   optimizer:
     type: adamw
-    weight_decay: 0.0001
+    weight_decay: 0.0001             # Weight decay dla AdamW
+    eps: 1.0e-8                      # Epsilon dla stabilności
+    betas: [0.9, 0.999]              # Beta1, Beta2
 
-  lstm:
-    hidden_size: 512
-    n_layers: 1
+  # ✅ Dropouty dla regularyzacji (dostosowane do Solitaire)
+  tableau_dropout: 0.02              # Dropout dla tablicy
+  foundations_dropout: 0.0           # Brak dropout dla fundacji (małe wejście)
+  waste_dropout: 0.0                 # Brak dropout dla waste (małe wejście)
+  stock_dropout: 0.02                # Dropout dla stock
+  fusion_dropout: 0.04               # Dropout po fusion
+
+  # ✅ Architektura sieci (ulepszona)
+  features_extractor:
+    tableau_hidden: [384, 256]       # Warstwy ukryte dla tableau
+    foundations_hidden: 64           # Warstwy dla fundacji
+    waste_hidden: 64                 # Warstwy dla waste
+    stock_hidden: [128, 96]          # Warstwy dla stock
+    features_dim: 512                # Wymiar końcowy
+    use_layernorm: true              # LayerNorm dla stabilności
+    use_attention: true              # Attention mechanism
 
   policy_kwargs:
     features_extractor_kwargs:
-      features_dim: 256
+      features_dim: 512              # Musi się zgadzać z features_extractor.features_dim
     net_arch:
-      pi: [256, 128]
-      vf: [256, 128]
+      pi: [512, 256, 128]            # Głębsza sieć dla policy
+      vf: [512, 512, 256]            # Głębsza sieć dla value function
 
 # Konfiguracja treningu
 training:
-  n_envs: 16                         # Zwiększona liczba środowisk (równoległość)
-  total_timesteps: 5000000
-  eval_freq: 20000                   # Rzadsza ewaluacja (bo szybciej lecą kroki)
-  plot_interval: 1
-  max_no_improvement_evals: 50
-  min_evals: 20
+  n_envs: 48                         # Zbalansowane dla 32GB RAM
+  total_timesteps: 100000000         # Zwiększone dla lepszego treningu
+  eval_freq: 49152                   # Dostosowane: 48 envs * 512 steps * 2 (rzadziej)
+  plot_interval: 1                   # Co ile walidacji robić wykres
+  max_no_improvement_evals: 80       # Cierpliwość przed zatrzymaniem
+  min_evals: 20                      # Minimalna liczba ewaluacji
+  gradient_log_freq: 10000           # Co ile kroków logować gradienty/wagi
   
-  eval_n_envs: 1                     # Ewaluacja na 1 środowisku (wystarczy)
-  eval_n_repeats: 5
+  # Liczba środowisk do ewaluacji równoległej
+  eval_n_envs: 6                     # Dostosowane dla RAM
+  eval_n_repeats: 3                  # Powtórzenia ewaluacji
 
 # Ścieżki
 paths:
