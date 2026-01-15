@@ -1,0 +1,97 @@
+# Konfiguracja Środowiska Minesweeper (Saper)
+environment:
+  min_grid_size: 9                   # Minimalny rozmiar siatki
+  max_grid_size: 16                  # Maksymalny rozmiar siatki
+  min_mines_fraction: 0.12           # Min ułamek min (12%)
+  max_mines_fraction: 0.20           # Max ułamek min (20%)
+  
+  # Observation Space mapping
+  # 3 Channel RGB-like input:
+  # Ch 0: Fog (1.0 = Hidden, 0.0 = Revealed)
+  # Ch 1: Values (Normalized 0.0-1.0 representing 0-8 neighbors)
+  # Ch 2: Valid Area (1.0 = Inside Grid, 0.0 = Padding/Border)
+  observation_space:
+    low: 0.0
+    high: 1.0
+    dtype: float32
+    channels: 3
+  
+  # Action Space is Discrete(height * width) - calculated dynamically in env
+  
+  reward_scaling:
+    enable: true
+    
+    # Nagrody bazowe
+    reveal_safe_reward: 1.0          # Nagroda za odkrycie bezpiecznego pola
+    reveal_safe_multiplier: 0.5      # Dodatkowa nagroda za każde '0' (recursive reveal)
+    win_reward: 100.0                # Nagroda za wygraną
+    explosion_penalty: -100.0        # Kara za minę
+    
+    # ⚡ TRAINING TWEAKS:
+    invalid_action_terminate: false  # NIE kończyć gry - pozwól agentowi się uczyć z błędów
+    invalid_action_penalty: -5.0     # Mniejsza kara (agent będzie eksplorował więcej)
+    guess_penalty: -0.5              # Mała kara za zgadywanie
+
+# Konfiguracja modelu PPO
+model:
+  policy: MultiInputPolicy           # Policy dla PPO
+  learning_rate: 0.0003
+  n_steps: 8192                     # ⬆️ Większy buffer (stabilniejszy gradient dla rzadkich nagród jak win)
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01                     
+  vf_coef: 0.5
+  device: cuda
+
+  optimizer:
+    type: adamw
+    weight_decay: 0.0001
+    eps: 1.0e-5
+
+  # CNN Architecture
+  cnn_architecture:
+    cnn_channels: [64, 128, 256]
+    cnn_output_dim: 512
+    use_layernorm: true
+    dropout: 0.05
+    
+  policy_kwargs:
+    features_extractor_kwargs:
+      features_dim: 512
+    net_arch:
+      pi: [512, 256]
+      vf: [512, 256]
+
+# Konfiguracja treningu
+training:
+  n_envs: 32                         
+  total_timesteps: 100000000         # 100M kroków
+  eval_freq: 262144                  # 32x n_steps (eval co ~262k kroków)
+  plot_interval: 1                   # Co ile ewaluacji robić wykres
+  batch_size: 16384                  # 🚀 Massive batch size for 16GB VRAM (2x n_steps) 
+  # Ewaluacja
+  eval_n_envs: 4
+  eval_n_repeats: 5
+  
+  # Early stopping
+  max_no_improvement_evals: 50
+  min_evals: 5
+  
+  # Normalizacja
+  normalization:
+    norm_obs: false                  # False dla dyskretnych wartości planszy
+    norm_reward: true                # True dla stabilizacji
+    clip_obs: 10.0
+    clip_reward: 10.0
+    gamma: 0.99
+    epsilon: 1.0e-8
+
+# Ścieżki
+paths:
+  models_dir: models
+  logs_dir: logs
+  model_path: models/minesweeper_ppo.zip
+  train_csv_path: logs/train_progress.csv
+  plot_path: logs/training_progress.png
