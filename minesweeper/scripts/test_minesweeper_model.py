@@ -89,15 +89,16 @@ def test_model(episodes=10, delay=0.1):
                 steps += 1
                 
                 # Logging
-                max_w = env.max_grid_size
-                is_flag = action >= env.total_cells
-                if is_flag:
-                    real_act = action - env.total_cells
-                    y, x = real_act // max_w, real_act % max_w
-                    act_str = f"FLAG ({x}, {y})"
-                else:
-                    y, x = action // max_w, action % max_w
-                    act_str = f"REVEAL ({x}, {y})"
+                # Action codes from model.py
+                action_names = {
+                    0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT",
+                    4: "REVEAL", 5: "FLAG"
+                }
+                act_str = action_names.get(int(action), f"UNKNOWN({action})")
+                
+                # Cursor Pos
+                cx, cy = env.unwrapped.cursor_x, env.unwrapped.cursor_y
+                act_str = f"{act_str:<7} @ ({cx}, {cy})"
                    
                 print(f"Step {steps:3}: {act_str} | Rew: {reward:5.2f} | Tot: {total_reward:6.2f}")
                 

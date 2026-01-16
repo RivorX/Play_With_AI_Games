@@ -5,6 +5,10 @@ environment:
   min_mines_fraction: 0.10           # Min ułamek min (10%) - łatwiej na start
   max_mines_fraction: 0.20           # Max ułamek min (20%)
   
+  # --- VIEWPORT MODE ---
+  # Agent widzi tylko wycinek planszy i porusza kursorami
+  viewport_size: 11                  # Stały rozmiar widoku (niezależny od mapy)
+  
   # Observation Space mapping (Optimized RAM)
   # 5 Channels:
   # Ch 0: State Map (Compressed: 0=Pad, 1-9=Values, 10=Fog)
@@ -12,6 +16,11 @@ environment:
   # Ch 2: Logic Hint - Mines (1.0 = Logically deduced MINE)
   # Ch 3: Logic Hint - Safe (1.0 = Logically deduced SAFE)
   # Ch 4: Unsolved Mines (Normalized: (Value - NeighborsFlagged)/8.0)
+  # + GLOBAL VECTOR (4 floats):
+  # 1. Norm X position
+  # 2. Norm Y position
+  # 3. DirToNearestUnknown X (Unit Vector)
+  # 4. DirToNearestUnknown Y (Unit Vector)
   # (CNN expands this to 11 (OneHot) + 1 (Numeric) + 4 = 16 channels internally)
   observation_space:
     low: 0.0
@@ -19,12 +28,20 @@ environment:
     dtype: float16
     channels: 5
   
-  # Action Space is Discrete(2 * max_grid * max_grid)
-  # 0 to HW-1: Reveal
-  # HW to 2HW-1: Flag
+  # Action Space (Cursor Mode):
+  # 0: Move Up
+  # 1: Move Down
+  # 2: Move Left
+  # 3: Move Right
+  # 4: Reveal (at cursor)
+  # 5: Flag (at cursor)
   
   reward_scaling:
     enable: true
+    
+    # Difficulty scaling (jak w Snake)
+    min_difficulty_multiplier: 1.0   # Dla min_grid_size
+    max_difficulty_multiplier: 2.0   # Dla max_grid_size
     
     # Nagrody bazowe
     reveal_safe_reward: 1.0          # Nagroda za odkrycie bezpiecznego pola
@@ -37,11 +54,41 @@ environment:
     flag_incorrect_penalty: -5.0     # Surowa kara za oflagowanie bezpiecznego pola (false positive)
     flag_redundant_penalty: -0.1     # Kara za spamowanie flagami w tym samym miejscu
     
+    # Movement Rewards (Cursor Mode)
+    move_penalty: -0.01              # Lekka presja czasu, żeby nie błądził
+    move_repeat_penalty: -0.1        # Kara za cofanie się od razu (oscylacja)
+    
     # ⚡ TRAINING TWEAKS:
     invalid_action_terminate: true  # MaskablePPO nie robi invalid actions, więc to mniej ważne
     invalid_action_penalty: -1.0     # Symboliczna kara (technicznie niemożliwe z maską)
     max_invalid_actions: 20          
     guess_penalty: -0.5              # Mała kara za zgadywanie
+    idle_penalty: -10.0              # Kara za timeout (chodzenie w kółko)
+    
+    # ✨ PROGRESSIVE BONUS - +2% za każde kolejne odkrycie
+    progressive_reveal_bonus:
+      enable: true
+      bonus_per_reveal: 0.02         # +2% za każde pole
+      max_multiplier: 3.0            # Cap na 300%
+    
+    # 🎯 MILESTONE BONUSES (% odkrycia planszy)
+    milestones:
+      0.10: 2.0
+      0.20: 5.0
+      0.30: 10.0
+      0.40: 15.0
+      0.50: 25.0
+      0.60: 40.0
+      0.70: 60.0
+      0.80: 90.0
+      0.90: 130.0
+      1.00: 200.0   # Win = 100% odkrycia
+    
+    # 💨 EFFICIENCY BONUS
+    efficiency_bonus:
+      enable: true
+      threshold: 1.5                 # Ratio: steps_per_reveal < 1.5
+      reward: 3.0
 
 # Konfiguracja modelu PPO
 model:
@@ -53,7 +100,8 @@ model:
   gamma: 0.995
   gae_lambda: 0.97
   clip_range: 0.2                    # ZMNIEJSZONE: Bardziej konserwatywne update'y (High KL fix)
-  ent_coef: 0.005                    # ZMNIEJSZONE (było 0.05): Mniej losowości, więcej logiki
+  ent_coef: 0.01                     # START: Exploration (będzie spadać do min_ent_coef)
+  min_ent_coef: 0.001                # END: Exploitation
   vf_coef: 0.5
   device: cuda
 
@@ -61,13 +109,15 @@ model:
     type: adamw
     weight_decay: 0.0001
     eps: 1.0e-5
+    betas: [0.9, 0.999]
 
   # CNN Architecture
   cnn_architecture:
-    cnn_channels: [64, 64, 96, 128]
-    cnn_output_dim: 768 
+    cnn_channels: [128, 256, 256]    # Deep, stronger features for small viewport
+    cnn_output_dim: 512 
     use_layernorm: true
     dropout: 0.0
+    use_spatial_attention: true      # Spatial attention (like Snake)
     
   policy_kwargs:
     features_extractor_kwargs:
@@ -83,7 +133,16 @@ training:
   # Eval freq: Co 4 update'y PPO (4 * 4096 = 16384 kroków VecEnv)
   eval_freq: 16384                   # Co 4 rollouty
   plot_interval: 1                   # Co ile ewaluacji robić wykres
-  batch_size: 4096                  #
+  batch_size: 4096
+  gradient_log_freq: 10000           # Co ile kroków logować gradienty/wagi
+  
+  # 🎓 CURRICULUM LEARNING
+  curriculum_learning:
+    enable: true
+    start_grid_size: 5               # Zacznij od małej mapy
+    target_grid_size: 16             # Docelowy rozmiar
+    progression_threshold: 0.3       # Win rate > 30% = zwiększ trudność
+    eval_window: 10                  # Okno do wyliczenia win rate
 
   # Ewaluacja
   eval_n_envs: 4
@@ -98,7 +157,7 @@ training:
     norm_obs: false                  # False dla dyskretnych wartości planszy
     norm_reward: true                # True dla stabilizacji
     clip_obs: 10.0
-    clip_reward: 20.0
+    clip_reward: 50.0                # Zwiększone dla progressive bonus
     gamma: 0.995
     epsilon: 1.0e-8
 

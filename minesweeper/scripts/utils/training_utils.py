@@ -460,3 +460,24 @@ def log_observation(obs, channel_loggers, grid_size, step):
             else:
                 logger.info(f"{scalar_name.capitalize()}: {obs[scalar_name][0]}")
             logger.info("-" * 60)
+
+
+def get_difficulty_multiplier(grid_size: int, config: dict) -> float:
+    """
+    Oblicza mnożnik trudności na podstawie rozmiaru siatki.
+    Skaluje nagrody - większe mapy = większy mnożnik.
+    """
+    diff_config = config.get('difficulty_multiplier', {})
+    min_grid = diff_config.get('min_grid_size', 5)
+    max_grid = diff_config.get('max_grid_size', 16)
+    min_mult = diff_config.get('min_multiplier', 1.0)
+    max_mult = diff_config.get('max_multiplier', 2.0)
+    
+    # Interpolacja liniowa
+    if max_grid == min_grid:
+        return min_mult
+    
+    t = (grid_size - min_grid) / (max_grid - min_grid)
+    t = max(0.0, min(1.0, t))  # Clamp do [0, 1]
+    
+    return min_mult + t * (max_mult - min_mult)

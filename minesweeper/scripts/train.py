@@ -15,8 +15,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model import make_env
 from cnn import CustomFeaturesExtractor
-from utils.callbacks import TrainProgressCallback, CustomEvalCallback, LossRecorderCallback
+from utils.callbacks import TrainProgressCallback, CustomEvalCallback, LossRecorderCallback, EntropySchedulerCallback
 from utils.gradient_monitor import GradientWeightMonitor
+from utils.training_utils import entropy_schedule
 
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
@@ -342,6 +343,21 @@ def train():
         verbose=0
     )
     
+    # Entropy scheduler - linear decay z config
+    entropy_cfg = config['model'].get('entropy_schedule', {})
+    if entropy_cfg.get('enabled', False):
+        entropy_cb = EntropySchedulerCallback(
+            schedule_fn=lambda progress: entropy_schedule(
+                progress, 
+                entropy_cfg.get('start', 0.01), 
+                entropy_cfg.get('end', 0.001)
+            ),
+            verbose=0
+        )
+        callbacks_list = [eval_callback, train_progress_callback, loss_recorder, gradient_monitor, entropy_cb]
+    else:
+        callbacks_list = [eval_callback, train_progress_callback, loss_recorder, gradient_monitor]
+    
     print(f"Rozpoczynanie treningu...")
     
     try:
@@ -362,7 +378,7 @@ def train():
             model.learn(
                 total_timesteps=remaining_timesteps,
                 reset_num_timesteps=False,
-                callback=[eval_callback, train_progress_callback, loss_recorder, gradient_monitor],
+                callback=callbacks_list,
                 progress_bar=True
             )
         else:

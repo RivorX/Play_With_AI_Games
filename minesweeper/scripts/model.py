@@ -5,6 +5,12 @@ import os
 import yaml
 import random
 import pygame
+import sys
+
+# Dodaj katalog scripts do ścieżki
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from utils.training_utils import get_difficulty_multiplier
 
 # Wczytanie konfiguracji
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,28 +50,45 @@ class MinesweeperEnv(gym.Env):
         self.min_mines_fraction = config['environment']['min_mines_fraction']
         self.max_mines_fraction = config['environment']['max_mines_fraction']
         
+        # Nowe mechanizmy nagród
+        self.progressive_config = config['environment']['reward_scaling'].get('progressive_reveal_bonus', {})
+        self.milestones = config['environment']['reward_scaling'].get('milestones', {})
+        self.efficiency_config = config['environment']['reward_scaling'].get('efficiency_bonus', {})
+        
         # Inicjalizacja wymiarów (domyślne lub zadane)
         self.grid_size = grid_size if grid_size else self.min_grid_size
         self._fixed_grid_size = grid_size is not None  # Flaga: czy rozmiar jest sztywny
         
+        # --- VIEWPORT CONFIG ---
+        self.viewport_size = config['environment']['viewport_size']
+        self.cursor_x = 0
+        self.cursor_y = 0
+        
         self.current_mines_count = mines_count if mines_count else 10
         self.max_steps = self.max_grid_size * self.max_grid_size * 2  # Limit kroków (2x plansza)
         
-        # Action space: flatten index of max grid * 2 (Reveal | Flag)
-        # 0 -> HW-1: Reveal
-        # HW -> 2HW-1: Flag
-        self.total_cells = self.max_grid_size * self.max_grid_size
-        self.action_space = spaces.Discrete(self.total_cells * 2)
+        # Action space (Cursor Mode):
+        # 0: Up, 1: Down, 2: Left, 3: Right
+        # 4: Reveal, 5: Flag
+        self.action_space = spaces.Discrete(6)
         
         # Observation space
         # Używamy Dict, aby było kompatybilne z MultiInputPolicy
         # 4 Kanały: [StateMap, Flags, LogicMine, LogicSafe]
+        # TERAZ: Wymiar stały 'viewport_size'
+        # + VECTOR: 4 liczby (NormX, NormY, DirToUnknownX, DirToUnknownY)
         self.observation_space = spaces.Dict({
             'image': spaces.Box(
                 low=0.0, 
                 high=10.0, 
-                shape=(5, self.max_grid_size, self.max_grid_size), 
-                dtype=np.float16 # FP16 dla RAMu
+                shape=(5, self.viewport_size, self.viewport_size), 
+                dtype=np.float16
+            ),
+            'vector': spaces.Box(
+                low=-1.0, 
+                high=1.0, 
+                shape=(4,), 
+                dtype=np.float32
             )
         })
         
@@ -108,6 +131,18 @@ class MinesweeperEnv(gym.Env):
         self.game_over = False
         self.steps = 0
         self.invalid_action_count = 0
+        self.steps_since_interaction = 0
+        
+        # Progressive bonus tracking
+        self.reveals_count = 0
+        self.milestones_achieved = set()
+        
+        # Difficulty multiplier for current grid
+        self.difficulty_multiplier = get_difficulty_multiplier(self.grid_size, config['environment']['reward_scaling'])
+        
+        # Reset kursora na środek
+        self.cursor_x = self.grid_size // 2
+        self.cursor_y = self.grid_size // 2
         
         return self._get_obs(), {}
 
@@ -148,20 +183,6 @@ class MinesweeperEnv(gym.Env):
     def step(self, action):
         self.steps += 1
         
-        # Konwersja akcji
-        max_w = self.max_grid_size
-        total_cells = max_w * max_w
-        
-        is_flag_action = False
-        if action >= total_cells:
-            is_flag_action = True
-            action_idx = action - total_cells
-        else:
-            action_idx = action
-            
-        y = action_idx // max_w
-        x = action_idx % max_w
-        
         reward = 0
         terminated = False
         truncated = False
@@ -170,28 +191,75 @@ class MinesweeperEnv(gym.Env):
         reward_cfg = config['environment']['reward_scaling']
         should_terminate_invalid = reward_cfg.get('invalid_action_terminate', False)
         
-        # Sprawdzenie czy ruch jest wewnątrz aktualnej planszy
-        if y >= self.grid_size or x >= self.grid_size:
-            reward = reward_cfg['invalid_action_penalty']
-            self.invalid_action_count += 1
-            max_invalid = reward_cfg.get('max_invalid_actions', 3)
+        # --- IDLE CHECK ---
+        # Jeśli agent tylko się rusza i nic nie robi przez N kroków -> Koniec
+        # Dostosowane do move_step: hver ruch przesuwa o 1/3 viewport'u
+        move_step = self.viewport_size // 3
+        idle_limit = (self.grid_size // move_step) * 2  # 2x przezentacja mapy
+        if self.steps_since_interaction > idle_limit:
+            reward = reward_cfg.get('idle_penalty', -10.0)
+            terminated = True
+            info['result'] = 'idle_timeout'
+            return self._get_obs(), reward, terminated, truncated, info
             
-            if should_terminate_invalid and self.invalid_action_count >= max_invalid:
-                terminated = True
-                info['result'] = 'invalid'
+        # --- MOVEMENT ACTIONS (0-3) ---
+        if action < 4:
+            self.steps_since_interaction += 1
+            
+            moved = False
+            move_step = self.viewport_size // 3  # Przesunięcie o 1/3 viewport'u
+            
+            # 0: Up, 1: Down, 2: Left, 3: Right
+            if action == 0 and self.cursor_y >= move_step:
+                self.cursor_y -= move_step
+                moved = True
+            elif action == 1 and self.cursor_y < self.grid_size - move_step:
+                self.cursor_y += move_step
+                moved = True
+            elif action == 2 and self.cursor_x >= move_step:
+                self.cursor_x -= move_step
+                moved = True
+            elif action == 3 and self.cursor_x < self.grid_size - move_step:
+                self.cursor_x += move_step
+                moved = True
+                
+            if moved:
+                reward += reward_cfg.get('move_penalty', -0.01)
+            else:
+                # Wall hit
+                reward += reward_cfg.get('invalid_action_penalty', -1.0)
+                
             return self._get_obs(), reward, terminated, False, info
+            
+        # --- INTERACTION ACTIONS (4-5) ---
+        # 4: Reveal, 5: Flag
+        
+        # Reset idle counter on attempted interaction
+        self.steps_since_interaction = 0
+        
+        # All interactions happen at cursor_x, cursor_y
+        x, y = self.cursor_x, self.cursor_y
             
         # Sprawdzenie czy pole już odkryte (wspólne dla Reveal i Flag)
         if self.revealed[y, x]:
             reward = reward_cfg['invalid_action_penalty']
             self.invalid_action_count += 1
-            if should_terminate_invalid and self.invalid_action_count >= 10:
-                terminated = True
-                info['result'] = 'invalid_repeat'
+            # W Cursor Mode: Nie przerywaj gry, po prostu kara
+            # Agent musi nauczyć się nie klikać odkrytych
             return self._get_obs(), reward, terminated, False, info
             
         ### OBSŁUGA FLAGI ###
-        if is_flag_action:
+        if action == 5:
+            # LIMIT FLAG = Liczba min (exploit prevention)
+            current_flag_count = np.sum(self.flags)
+            
+            # Jeśli próbuje postawić flagę a już osiągnął limit -> INSTANT LOSE
+            if not self.flags[y, x] and current_flag_count >= self.current_mines_count:
+                reward = reward_cfg.get('explosion_penalty', -10.0)  # Duża kara
+                terminated = True
+                info['result'] = 'flag_limit_exceeded'
+                return self._get_obs(), reward, terminated, False, info
+            
             # Eksploit Fix: Limit interakcji z flagą na jednym polu
             self.flag_interactions[y, x] += 1
             if self.flag_interactions[y, x] > 4:
@@ -230,6 +298,7 @@ class MinesweeperEnv(gym.Env):
             return self._get_obs(), reward, terminated, False, info
             
         ### OBSŁUGA ODKRYCIA (REVEAL) ###
+        # Action == 4
         
         # Nie można odkryć oflagowanego pola
         if self.flags[y, x]:
@@ -293,10 +362,31 @@ class MinesweeperEnv(gym.Env):
             # Bezpieczne
             reward += self._reveal(x, y)
             
+            # Milestone rewards - bonusy za osiągnięcie % postępu
+            total_safe = self.grid_size * self.grid_size - self.current_mines_count
+            revealed_fraction = np.sum(self.revealed) / total_safe
+            
+            for milestone_threshold, milestone_reward in self.milestones.items():
+                # milestone_threshold to już float (0.1, 0.25, etc.)
+                if revealed_fraction >= milestone_threshold and milestone_threshold not in self.milestones_achieved:
+                    reward += milestone_reward * self.difficulty_multiplier
+                    self.milestones_achieved.add(milestone_threshold)
+                    info[f'milestone_{int(milestone_threshold*100)}pct'] = True
+            
             # Sprawdzenie wygranej
             # Wygrana = wszystkie bezpieczne pola odkryte
-            if np.sum(self.revealed) == (self.grid_size * self.grid_size - self.current_mines_count):
-                reward += reward_cfg['win_reward']
+            if np.sum(self.revealed) == total_safe:
+                reward += reward_cfg['win_reward'] * self.difficulty_multiplier
+                
+                # Efficiency bonus - nagroda za mało kroków
+                if self.efficiency_config.get('enabled', False):
+                    threshold = self.efficiency_config.get('threshold_steps_per_reveal', 1.5)
+                    bonus_value = self.efficiency_config.get('bonus_value', 10.0)
+                    efficiency_ratio = self.steps / max(self.reveals_count, 1)
+                    if efficiency_ratio < threshold:
+                        reward += bonus_value * self.difficulty_multiplier
+                        info['efficiency_bonus'] = True
+                
                 terminated = True
                 info['result'] = 'win'
         
@@ -312,7 +402,17 @@ class MinesweeperEnv(gym.Env):
             return 0
         
         self.revealed[y, x] = True
-        reward = config['environment']['reward_scaling']['reveal_safe_reward']
+        self.reveals_count += 1
+        
+        # Progressive bonus - nagroda rośnie z każdym odkryciem
+        base_reward = config['environment']['reward_scaling']['reveal_safe_reward']
+        if self.progressive_config.get('enabled', False):
+            increment = self.progressive_config.get('increment_per_reveal', 0.02)
+            cap = self.progressive_config.get('max_multiplier', 3.0)
+            multiplier = min(1.0 + self.reveals_count * increment, cap)
+            reward = base_reward * multiplier * self.difficulty_multiplier
+        else:
+            reward = base_reward * self.difficulty_multiplier
         
         if self.neighbor_counts[y, x] == 0:
             # Jeśli 0 sąsiadów, odkryj wszystkich dookoła
@@ -331,7 +431,18 @@ class MinesweeperEnv(gym.Env):
                                 # Auto-reveal zdejmuje flagi (jeśli tam były błędnie postawione)
                                 self.flags[ny, nx] = False
                                 self.revealed[ny, nx] = True
-                                reward += config['environment']['reward_scaling']['reveal_safe_multiplier'] # Mniejsza nagroda za auto-reveal
+                                self.reveals_count += 1
+                                
+                                # Progressive bonus dla auto-reveal
+                                base_auto_reward = config['environment']['reward_scaling']['reveal_safe_multiplier']
+                                if self.progressive_config.get('enabled', False):
+                                    increment = self.progressive_config.get('increment_per_reveal', 0.02)
+                                    cap = self.progressive_config.get('max_multiplier', 3.0)
+                                    multiplier = min(1.0 + self.reveals_count * increment, cap)
+                                    reward += base_auto_reward * multiplier * self.difficulty_multiplier
+                                else:
+                                    reward += base_auto_reward * self.difficulty_multiplier
+                                    
                                 if self.neighbor_counts[ny, nx] == 0:
                                     stack.append((nx, ny))
         return reward
@@ -367,117 +478,148 @@ class MinesweeperEnv(gym.Env):
     def action_masks(self):
         """
         Zwraca maskę poprawnych akcji.
-        Action Space = [Reveal_H*W, Flag_H*W]
+        Action Space = [Up, Down, Left, Right, Reveal, Flag]
         """
-        total_cells = self.max_grid_size * self.max_grid_size
-        full_mask = np.zeros(total_cells * 2, dtype=bool)
+        mask = np.zeros(6, dtype=bool)
         
-        # 1. Mask for Reveal
-        # Valid: Inside Grid, Not Revealed, Not Flagged
-        reveal_mask = np.zeros((self.max_grid_size, self.max_grid_size), dtype=bool)
-        reveal_mask[:self.grid_size, :self.grid_size] = ~self.revealed & ~self.flags
+        # Movement
+        mask[0] = self.cursor_y > 0 # Up
+        mask[1] = self.cursor_y < self.grid_size - 1 # Down
+        mask[2] = self.cursor_x > 0 # Left
+        mask[3] = self.cursor_x < self.grid_size - 1 # Right
         
-        # 2. Mask for Flags
-        # Valid: Inside Grid, Not Revealed
-        # (Można flagować/odflagowywać dowolnie, byle nie odkryte)
-        flag_mask = np.zeros((self.max_grid_size, self.max_grid_size), dtype=bool)
-        flag_mask[:self.grid_size, :self.grid_size] = ~self.revealed
+        # Interaction (at cursor)
+        is_revealed = self.revealed[self.cursor_y, self.cursor_x]
+        is_flagged = self.flags[self.cursor_y, self.cursor_x]
+
+        # Reveal: Valid if not revealed AND not flagged
+        mask[4] = not is_revealed and not is_flagged
         
-        full_mask[:total_cells] = reveal_mask.flatten()
-        full_mask[total_cells:] = flag_mask.flatten()
+        # Flag: Valid if not revealed
+        mask[5] = not is_revealed
         
-        return full_mask
+        return mask
 
     def _get_obs(self):
-        # 5 Kanałów:
-        # Ch 0: State Map (0=Pad, 1-9=Val, 10=Fog)
-        # Ch 1: Flags (1.0 = Flagged)
-        # Ch 2: Logic Mine (1.0 = Deduced Mine)
-        # Ch 3: Logic Safe (1.0 = Deduced Safe)
-        # Ch 4: Needed Mines ((Val - SurroundingFlags) / 8.0)
+        # 5 Channels: State, Flags, LogicM, LogicS, Needed
+        # Output: V x V crop around cursor
+        
+        V = self.viewport_size
+        half_v = V // 2
         
         # Working on current grid slice only to save computation
         H, W = self.grid_size, self.grid_size
         
-        obs_grid = np.zeros((5, self.max_grid_size, self.max_grid_size), dtype=np.float16)
+        # --- 1. Compute FULL maps first (Optimization: only needed locally, but easier globally) ---
+        # Logic helpers works on full board
         
-        # --- Channel 0 (State) & 1 (Flags) Init ---
-        obs_grid[0, :H, :W] = 10.0 # Default Fog
-        
-        flags_slice = self.flags[:H, :W]
-        if np.any(flags_slice):
-             obs_grid[1, :H, :W] = flags_slice.astype(np.float16)
+        # Init maps (on grid_size)
+        state_map = np.full((H, W), 10.0, dtype=np.float16) # Fog
+        flag_map = self.flags[:H, :W].astype(np.float16)
+        logic_m = np.zeros((H, W), dtype=np.float16)
+        logic_s = np.zeros((H, W), dtype=np.float16)
+        needed_map = np.zeros((H, W), dtype=np.float16)
         
         revealed_slice = self.revealed[:H, :W]
-        
-        # Jeśli nic nie odkryte, zwracamy pustą planszę (z fogiem)
-        if not np.any(revealed_slice):
-            return {'image': obs_grid}
-
-        # --- Vectorized Calculations ---
-        
-        # Wartości liczbowe na planszy (0..8)
-        # neighbor_counts przechowuje rzeczywistą liczbę min (ground truth), ale my widzimy ją tylko tam, gdzie revealed
         vals_map = self.neighbor_counts[:H, :W]
         
-        # Wypełnienie Ch 0 (Odkryte)
-        # Mapowanie: 0->1.0, 1->2.0 ... 8->9.0
-        # Używamy maskowania bo jest bardzo szybkie
-        obs_grid[0, :H, :W][revealed_slice] = vals_map[revealed_slice].astype(np.float16) + 1.0
-
-        # Mapy pomocnicze do logiki
-        hidden_slice = ~revealed_slice # Zakryte (w tym flagi)
+        # Fill State Map
+        state_map[revealed_slice] = vals_map[revealed_slice].astype(np.float16) + 1.0
         
-        # Liczenie sąsiadów operacjami macierzowymi (Vectorized)
-        # Zastępuje pętle nested loop
-        neighbors_flags = self._count_neighbors_vectorized(flags_slice)
+        # Logic Computation (Vectorized on full board)
+        hidden_slice = ~revealed_slice
+        flags_bool = self.flags[:H, :W]
+        
+        neighbors_flags = self._count_neighbors_vectorized(flags_bool)
         neighbors_hidden_total = self._count_neighbors_vectorized(hidden_slice)
         
-        # --- LOGIC RULES (Heuristic Solver) ---
-        # Interesują nas tylko pola odkryte, które są cyframi (>0)
-        # Cells that provide info: Revealed AND Value > 0
         info_mask = revealed_slice & (vals_map > 0)
         
         if np.any(info_mask):
-            # Rule 1: Val == HiddenNeighbors (All hidden are mines)
-            # e.g. "3" with 3 hidden neighbors
+            # Rule 1
             rule1_triggers = info_mask & (vals_map == neighbors_hidden_total)
-            
-            # Rule 2: Val == FlaggedNeighbors (All remaining hidden are safe)
-            # e.g. "2" with 2 flags
-            rule2_triggers = info_mask & (vals_map == neighbors_flags)
-            
-            # Propagacja (Dilation)
-            # Jeśli pole triggeruje regułę, to WSZYSCY jego sąsiedzi są...
-            # Używamy tej samej funkcji count_neighbors, bo jeśli count > 0 to znaczy że jest sąsiadem triggera
-            
-            # Apply Rule 1 -> Mines
             if np.any(rule1_triggers):
-                # Gdzie sąsiedzi triggerów?
                 triggers_dilated = self._count_neighbors_vectorized(rule1_triggers) > 0
-                # Logic Mine = Sąsiad triggera AND Zakryty AND Nie Oflagowany (już wiemy, ale dla czystości)
-                # (Zaznaczamy tylko tam, gdzie jeszcze nie ma flagi, żeby zasugerować ruch)
-                logic_mine = triggers_dilated & hidden_slice & ~flags_slice
-                obs_grid[2, :H, :W][logic_mine] = 1.0
+                logic_m = (triggers_dilated & hidden_slice & ~flags_bool).astype(np.float16)
 
-            # Apply Rule 2 -> Safe
+            # Rule 2
+            rule2_triggers = info_mask & (vals_map == neighbors_flags)
             if np.any(rule2_triggers):
                 triggers_dilated = self._count_neighbors_vectorized(rule2_triggers) > 0
-                # Logic Safe = Sąsiad triggera AND Zakryty AND Nie Oflagowany
-                logic_safe = triggers_dilated & hidden_slice & ~flags_slice
-                obs_grid[3, :H, :W][logic_safe] = 1.0
-        
-        # --- Channel 4 (Needed Mines) ---
-        # (Val - NeighborsFlags) / 8.0
-        # Obliczamy dla całej mapy, nakładamy maskę info_mask (lub revealed)
+                logic_s = (triggers_dilated & hidden_slice & ~flags_bool).astype(np.float16)
+                
+        # Needed Calculation
         needed = vals_map - neighbors_flags
-        # Clip < 0 (gdy za dużo flag) i normalizacja
-        needed = np.clip(needed, 0, 8).astype(np.float16) / 8.0
+        needed_norm = np.clip(needed, 0, 8).astype(np.float16) / 8.0
+        needed_map[revealed_slice] = needed_norm[revealed_slice]
         
-        # Zapisujemy tylko dla odkrytych (dla zakrytych to bez sensu)
-        obs_grid[4, :H, :W][revealed_slice] = needed[revealed_slice]
+        # --- 2. CROP ---
+        # Stack channels: (5, H, W)
+        full_obs = np.stack([state_map, flag_map, logic_m, logic_s, needed_map], axis=0)
+        
+        # Pad with 0.0 (except State channel? Fog is 10.0, Pad is 0.0. Let's use 0.0 for pad)
+        # We need padding of size 'half_v' on all sides
+        # Using constant 0 (Pad) for all channels suits well
+        padded_obs = np.pad(full_obs, ((0,0), (half_v, half_v), (half_v, half_v)), mode='constant', constant_values=0)
+        
+        # Crop coordinates
+        # Original (cx, cy) -> In padded: (cx + half_v, cy + half_v)
+        # Top-Left of crop: (cx, cy)
+        y_start = self.cursor_y
+        x_start = self.cursor_x 
+        # range: [y_start : y_start+V]
+        
+        obs_crop = padded_obs[:, y_start : y_start+V, x_start : x_start+V]
+        
+        # --- 3. VECTOR (Global Stats) ---
+        # 1. Normalized Position (-1..1 is better for NN, but 0..1 is fine)
+        # Let's use -0.5 to 0.5 centered
+        norm_x = (self.cursor_x / max(1, W-1)) - 0.5
+        norm_y = (self.cursor_y / max(1, H-1)) - 0.5
+        
+        # 2. Direction to Nearest Unknown (Exploration Hint)
+        dir_x, dir_y = 0.0, 0.0
+        
+        # Find unrevealed indices
+        # Optimization: Don't scan everything if not needed?
+        # Scan is fast enough for 16x16 or 32x32
+        
+        # We need coords of ~revealed
+        # hidden_slice calculated earlier
+        # ~revealed is simply bool
+        
+        # Argwhere returns (y, x)
+        unrevealed_coords = np.argwhere(~self.revealed[:H, :W])
+        
+        if len(unrevealed_coords) > 0:
+            # Calculate distances to cursor (Manhattan or Euclidean)
+            # cursor is (self.cursor_y, self.cursor_x)
+            
+            # Vectors from cursor to targets
+            # dy = target_y - cursor_y
+            dy = unrevealed_coords[:, 0] - self.cursor_y
+            dx = unrevealed_coords[:, 1] - self.cursor_x
+            
+            # Squared Euclidean distance
+            dists_sq = dx*dx + dy*dy
+            
+            # Find nearest
+            nearest_idx = np.argmin(dists_sq)
+            
+            # Get vector
+            best_dy = dy[nearest_idx]
+            best_dx = dx[nearest_idx]
+            
+            # Normalize vector to length 1 (or by max dimension)
+            # Simply sign or normalized? Normalized gives smooth gradient
+            dist = np.sqrt(dists_sq[nearest_idx])
+            if dist > 0:
+                dir_x = best_dx / dist
+                dir_y = best_dy / dist
+        
+        vector_obs = np.array([norm_x, norm_y, dir_x, dir_y], dtype=np.float32)
                                     
-        return {'image': obs_grid}
+        return {'image': obs_crop, 'vector': vector_obs}
 
     def render(self):
         if self.render_mode == "ansi":
@@ -534,6 +676,8 @@ class MinesweeperEnv(gym.Env):
         }
         COLOR_MINE = (0, 0, 0)
         COLOR_MINE_BG = (255, 0, 0)
+        # New: Cursor Color
+        COLOR_CURSOR = (255, 255, 0) # Yellow outline
         
         # Font
         if not pygame.font.get_init():
@@ -580,6 +724,21 @@ class MinesweeperEnv(gym.Env):
                         pygame.draw.polygon(self.screen, flag_color, [p1, p2, p3])
                         # Pole
                         pygame.draw.line(self.screen, (0,0,0), (rect.centerx, rect.centery-5), (rect.centerx, rect.centery+10), 2)
+
+        # --- DRAW CURSOR ---
+        cx, cy = self.cursor_x * self.cell_size, self.cursor_y * self.cell_size
+        cursor_rect = pygame.Rect(cx, cy, self.cell_size, self.cell_size)
+        pygame.draw.rect(self.screen, COLOR_CURSOR, cursor_rect, 4) # 4px thickness
+        
+        # Draw Viewport Boundary (Optional visualization of what AI sees)
+        V = self.viewport_size
+        half_v = V // 2
+        # Calculate viewport top-left
+        vx = (self.cursor_x - half_v) * self.cell_size
+        vy = (self.cursor_y - half_v) * self.cell_size
+        vw = V * self.cell_size
+        vh = V * self.cell_size
+        pygame.draw.rect(self.screen, (0, 255, 255), (vx, vy, vw, vh), 1) # Cyan thin line
 
         if self.render_mode == "human":
             self.window.blit(self.screen, (0, 0))
