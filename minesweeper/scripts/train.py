@@ -3,7 +3,9 @@ import sys
 import yaml
 import pickle
 import torch
-from stable_baselines3 import PPO
+import math
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import StopTrainingOnNoModelImprovement
@@ -14,11 +16,29 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from model import make_env
 from cnn import CustomFeaturesExtractor
 from utils.callbacks import TrainProgressCallback, CustomEvalCallback, LossRecorderCallback
+from utils.gradient_monitor import GradientWeightMonitor
 
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
+
+def mask_fn(env):
+    # Sięgamy do env.unwrapped, aby pominąć wrappery (np. Monitor)
+    # i wywołać metodę bezpośrednio z klasy MinesweeperEnv
+    return env.unwrapped.action_masks()
+
+def get_cosine_schedule(initial_value: float, min_value: float = 0.0):
+    """
+    Tworzy funkcję schedulera Cosine Annealing dla SB3.
+    SB3 przekazuje `progress_remaining` (1.0 -> 0.0).
+    """
+    def func(progress_remaining: float) -> float:
+        # progress goes 1.0 -> 0.0
+        # t goes 0.0 -> 1.0
+        t = 1.0 - progress_remaining
+        return min_value + 0.5 * (initial_value - min_value) * (1 + math.cos(t * math.pi))
+    return func
 
 def ensure_directories():
     os.makedirs(os.path.join(base_dir, config['paths']['models_dir']), exist_ok=True)
@@ -153,6 +173,7 @@ def train():
     if mode == 'restart':
         for csv_path in [
             os.path.join(base_dir, config['paths']['train_csv_path']),
+            os.path.join(base_dir, config['paths']['logs_dir'], 'gradient_monitor.csv'),
         ]:
             try:
                 if os.path.exists(csv_path):
@@ -177,7 +198,14 @@ def train():
     print(f"🗃️  Używam {vec_env_cls.__name__} dla {n_envs} środowisk\n")
     
     # Środowisko treningowe
-    env = make_vec_env(make_env(), n_envs=n_envs, vec_env_cls=vec_env_cls)
+    # Użycie ActionMasker dla MaskablePPO
+    env = make_vec_env(
+        make_env(), 
+        n_envs=n_envs, 
+        vec_env_cls=vec_env_cls,
+        wrapper_class=ActionMasker,
+        wrapper_kwargs={'action_mask_fn': mask_fn}
+    )
     if mode == 'continue' and os.path.exists(vec_norm_path):
         env = VecNormalize.load(vec_norm_path, env)
         print(f"✅ Załadowano VecNormalize z {vec_norm_path}")
@@ -194,7 +222,16 @@ def train():
         print(f"✅ Utworzono nowy VecNormalize")
     
     # Środowisko ewaluacyjne
-    eval_env = make_vec_env(make_env(), n_envs=eval_n_envs, vec_env_cls=DummyVecEnv)
+    # Ustawiamy SZTYWNY rozmiar 9x9 dla stabilnej metryki postępów
+    eval_env_grid_size = 9 
+    
+    eval_env = make_vec_env(
+        make_env(grid_size=eval_env_grid_size), 
+        n_envs=eval_n_envs, 
+        vec_env_cls=DummyVecEnv,
+        wrapper_class=ActionMasker,
+        wrapper_kwargs={'action_mask_fn': mask_fn}
+    )
     if mode == 'continue' and os.path.exists(vec_norm_eval_path):
         eval_env = VecNormalize.load(vec_norm_eval_path, eval_env)
     else:
@@ -207,25 +244,30 @@ def train():
             gamma=norm_gamma,
             epsilon=epsilon
         )
-    
+
     # Model Setup
     policy_kwargs = config['model']['policy_kwargs'].copy()
     policy_kwargs['features_extractor_class'] = CustomFeaturesExtractor
+
+    # LR Scheduler setup
+    initial_lr = config['model']['learning_rate']
+    min_lr = config['model'].get('min_learning_rate', 0.0)
+    lr_schedule = get_cosine_schedule(initial_lr, min_lr)
     
     # 🎯 MODEL LOADING BASED ON MODE
     if mode == 'continue' and not use_config_hyperparams:
         # Tryb 1: Kontynuacja z hyperparametrami z modelu
         print(f"\n📥 Ładowanie pełnego modelu (hyperparametry z modelu)...\n")
-        model = PPO.load(actual_model_path, env=env)
+        model = MaskablePPO.load(actual_model_path, env=env)
         model.num_timesteps = total_timesteps
     
     elif mode == 'continue' and use_config_hyperparams:
         # Tryb 2: Kontynuacja z hyperparametrami z config
         print(f"\n📥 Ładowanie modelu (hyperparametry z config.yaml)...\n")
-        model = PPO(
+        model = MaskablePPO(
             config['model']['policy'],
             env,
-            learning_rate=config['model']['learning_rate'],
+            learning_rate=lr_schedule,
             n_steps=config['model']['n_steps'],
             batch_size=config['training']['batch_size'],
             n_epochs=config['model']['n_epochs'],
@@ -240,7 +282,7 @@ def train():
         )
         
         # Wczytaj tylko wagi policy
-        model_tmp = PPO.load(actual_model_path)
+        model_tmp = MaskablePPO.load(actual_model_path)
         model.policy.load_state_dict(model_tmp.policy.state_dict())
         del model_tmp
         
@@ -249,10 +291,10 @@ def train():
     else:  # mode == 'restart'
         # Tryb 3: Nowy model od zera
         print(f"\n🆕 Tworzenie nowego modelu od zera...\n")
-        model = PPO(
+        model = MaskablePPO(
             config['model']['policy'],
             env,
-            learning_rate=config['model']['learning_rate'],
+            learning_rate=lr_schedule,
             n_steps=config['model']['n_steps'],
             batch_size=config['training']['batch_size'],
             n_epochs=config['model']['n_epochs'],
@@ -267,11 +309,7 @@ def train():
         )
     
     # Callbacks
-    stop_on_plateau = StopTrainingOnNoModelImprovement(
-        max_no_improvement_evals=config['training'].get('max_no_improvement_evals', 50),
-        min_evals=config['training'].get('min_evals', 5),
-        verbose=1
-    )
+    # (Disabled Early Stopping for stability)
     
     plot_script_path = os.path.join(os.path.dirname(__file__), 'utils', 'plot_train_progress.py')
     n_eval_episodes = eval_n_envs * eval_n_repeats
@@ -280,10 +318,10 @@ def train():
         eval_env=eval_env,
         best_model_save_path=best_model_save_path,
         log_path=os.path.normpath(os.path.join(base_dir, config['paths']['logs_dir'])),
-        eval_freq=max(eval_freq // n_envs, 1),
+        eval_freq=eval_freq,
         deterministic=True,
         render=False,
-        callback_after_eval=stop_on_plateau,
+        # callback_after_eval=stop_on_plateau, 
         plot_interval=plot_interval,
         plot_script_path=plot_script_path,
         initial_timesteps=total_timesteps,
@@ -296,6 +334,13 @@ def train():
     )
     
     loss_recorder = LossRecorderCallback()
+    
+    gradient_monitor = GradientWeightMonitor(
+        csv_path=os.path.join(base_dir, config['paths']['logs_dir'], 'gradient_monitor.csv'),
+        log_freq=1000,
+        initial_timesteps=total_timesteps,
+        verbose=0
+    )
     
     print(f"Rozpoczynanie treningu...")
     
@@ -317,7 +362,7 @@ def train():
             model.learn(
                 total_timesteps=remaining_timesteps,
                 reset_num_timesteps=False,
-                callback=[eval_callback, train_progress_callback, loss_recorder],
+                callback=[eval_callback, train_progress_callback, loss_recorder, gradient_monitor],
                 progress_bar=True
             )
         else:

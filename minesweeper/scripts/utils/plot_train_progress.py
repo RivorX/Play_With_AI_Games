@@ -1,5 +1,7 @@
 import os
 import csv
+import matplotlib
+matplotlib.use('Agg')  # Force non-interactive backend BEFORE importing pyplot
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -97,9 +99,9 @@ def plot_train_progress(csv_path, output_path):
     loss_rate_arr = np.array(data['loss_rate'])
     invalid_rate_arr = np.array(data['invalid_rate'])
     
-    # Setup figure
-    fig, axes = plt.subplots(3, 3, figsize=(20, 14))
-    fig.suptitle('Training Progress - Minesweeper PPO', fontsize=18, fontweight='bold')
+    # Setup figure - 2x3 grid (usunięto nieaktualne Loss Rate i Invalid Rate z głównego widoku)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
+    fig.suptitle('Training Progress - Minesweeper PPO (MaskablePPO)', fontsize=16, fontweight='bold')
     
     # Window dla rolling average
     window = 15
@@ -141,124 +143,59 @@ def plot_train_progress(csv_path, output_path):
     axes[0, 2].grid(True, alpha=0.3)
     axes[0, 2].legend()
     
-    # === WYKRES 4: Loss Rate ===
-    axes[1, 0].plot(timesteps, loss_rate_arr, color='#e74c3c', linewidth=1, alpha=0.5, label='Raw')
-    if len(loss_rate_arr) >= window:
-        loss_rate_smooth = np.convolve(loss_rate_arr, np.ones(window)/window, mode='valid')
-        axes[1, 0].plot(timesteps[window-1:], loss_rate_smooth, color='black', linewidth=2, 
+    # === WYKRES 4: Policy Loss ===
+    policy_loss_arr = np.array(data['policy_loss'])
+    # Filtruj NaN values
+    valid_mask = ~np.isnan(policy_loss_arr)
+    axes[1, 0].plot(timesteps[valid_mask], policy_loss_arr[valid_mask], 
+                    color='#e74c3c', linewidth=1, alpha=0.5, label='Raw')
+    if np.sum(valid_mask) >= window:
+        policy_loss_clean = policy_loss_arr[valid_mask]
+        timesteps_clean = timesteps[valid_mask]
+        policy_loss_smooth = np.convolve(policy_loss_clean, np.ones(window)/window, mode='valid')
+        axes[1, 0].plot(timesteps_clean[window-1:], policy_loss_smooth, color='black', linewidth=2, 
                        label=f'Rolling Mean (w={window})')
-    axes[1, 0].set_title('Loss Rate (%) - Hit Mine', fontsize=12, fontweight='bold')
+    axes[1, 0].set_title('Policy Loss', fontsize=12, fontweight='bold')
     axes[1, 0].set_xlabel('Timesteps')
-    axes[1, 0].set_ylabel('Loss Rate (%)')
-    axes[1, 0].set_ylim(0, 100)
+    axes[1, 0].set_ylabel('Loss')
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].legend()
     
-    # === WYKRES 5: Invalid Action Rate ===
-    axes[1, 1].plot(timesteps, invalid_rate_arr, color='#f39c12', linewidth=1, alpha=0.5, label='Raw')
-    if len(invalid_rate_arr) >= window:
-        invalid_rate_smooth = np.convolve(invalid_rate_arr, np.ones(window)/window, mode='valid')
-        axes[1, 1].plot(timesteps[window-1:], invalid_rate_smooth, color='black', linewidth=2, 
+    # === WYKRES 5: Value Loss ===
+    value_loss_arr = np.array(data['value_loss'])
+    # Filtruj NaN values
+    valid_mask = ~np.isnan(value_loss_arr)
+    axes[1, 1].plot(timesteps[valid_mask], value_loss_arr[valid_mask], 
+                    color='#3498db', linewidth=1, alpha=0.5, label='Raw')
+    if np.sum(valid_mask) >= window:
+        value_loss_clean = value_loss_arr[valid_mask]
+        timesteps_clean = timesteps[valid_mask]
+        value_loss_smooth = np.convolve(value_loss_clean, np.ones(window)/window, mode='valid')
+        axes[1, 1].plot(timesteps_clean[window-1:], value_loss_smooth, color='black', linewidth=2, 
                        label=f'Rolling Mean (w={window})')
-    axes[1, 1].set_title('Invalid Action Rate (%)', fontsize=12, fontweight='bold')
+    axes[1, 1].set_title('Value Loss', fontsize=12, fontweight='bold')
     axes[1, 1].set_xlabel('Timesteps')
-    axes[1, 1].set_ylabel('Invalid Rate (%)')
-    axes[1, 1].set_ylim(0, 100)
+    axes[1, 1].set_ylabel('Loss')
     axes[1, 1].grid(True, alpha=0.3)
     axes[1, 1].legend()
     
-    # === WYKRES 6: Policy Loss ===
-    policy_loss_arr = np.array(data['policy_loss'])
-    axes[1, 2].plot(timesteps, policy_loss_arr, color='#e74c3c', linewidth=1, alpha=0.5, label='Raw')
-    if len(policy_loss_arr) >= window:
-        policy_loss_clean = np.nan_to_num(policy_loss_arr, nan=0.0)
-        policy_loss_smooth = np.convolve(policy_loss_clean, np.ones(window)/window, mode='valid')
-        axes[1, 2].plot(timesteps[window-1:], policy_loss_smooth, color='black', linewidth=2, 
+    # === WYKRES 6: Entropy Loss ===
+    entropy_loss_arr = np.array(data['entropy_loss'])
+    # Filtruj NaN values
+    valid_mask = ~np.isnan(entropy_loss_arr)
+    axes[1, 2].plot(timesteps[valid_mask], entropy_loss_arr[valid_mask], 
+                    color='#9b59b6', linewidth=1, alpha=0.5, label='Raw')
+    if np.sum(valid_mask) >= window:
+        entropy_loss_clean = entropy_loss_arr[valid_mask]
+        timesteps_clean = timesteps[valid_mask]
+        entropy_loss_smooth = np.convolve(entropy_loss_clean, np.ones(window)/window, mode='valid')
+        axes[1, 2].plot(timesteps_clean[window-1:], entropy_loss_smooth, color='black', linewidth=2, 
                        label=f'Rolling Mean (w={window})')
-    axes[1, 2].set_title('Policy Loss', fontsize=12, fontweight='bold')
+    axes[1, 2].set_title('Entropy Loss', fontsize=12, fontweight='bold')
     axes[1, 2].set_xlabel('Timesteps')
     axes[1, 2].set_ylabel('Loss')
     axes[1, 2].grid(True, alpha=0.3)
     axes[1, 2].legend()
-    
-    # === WYKRES 7: Value Loss (log scale) ===
-    value_loss_arr = np.array(data['value_loss'])
-    axes[2, 0].plot(timesteps, value_loss_arr, color='#3498db', linewidth=1, alpha=0.5, label='Raw')
-    if len(value_loss_arr) >= window:
-        value_loss_clean = np.nan_to_num(value_loss_arr, nan=0.0)
-        value_loss_smooth = np.convolve(value_loss_clean, np.ones(window)/window, mode='valid')
-        axes[2, 0].plot(timesteps[window-1:], value_loss_smooth, color='black', linewidth=2, 
-                       label=f'Rolling Mean (w={window})')
-    axes[2, 0].set_title('Value Loss', fontsize=12, fontweight='bold')
-    axes[2, 0].set_xlabel('Timesteps')
-    axes[2, 0].set_ylabel('Loss (log scale)')
-    axes[2, 0].set_yscale('log')
-    axes[2, 0].grid(True, alpha=0.3, which='both')
-    axes[2, 0].legend()
-    
-    # === WYKRES 8: Entropy Loss ===
-    axes[2, 1].plot(timesteps, data['entropy_loss'], color='#9b59b6', linewidth=2)
-    axes[2, 1].set_title('Entropy Loss', fontsize=12, fontweight='bold')
-    axes[2, 1].set_xlabel('Timesteps')
-    axes[2, 1].set_ylabel('Loss')
-    axes[2, 1].grid(True, alpha=0.3)
-    
-    # === WYKRES 9: Mean Reward vs Episode Length (trajectory) ===
-    sc = axes[2, 2].scatter(mean_ep_length_arr, mean_reward_arr, 
-                            c=timesteps, cmap='viridis', alpha=0.6, s=20, label='Raw')
-    
-    # Smoothing dla trajektorii (Savitzky-Golay lub rolling average)
-    if len(mean_reward_arr) >= window:
-        smooth_window = max(window * 3, 21)
-        
-        try:
-            if HAS_SCIPY and len(mean_reward_arr) >= smooth_window:
-                # Savitzky-Golay (lepsze wygładzanie)
-                if smooth_window % 2 == 0:
-                    smooth_window += 1
-                sg_poly = 3 if smooth_window > 3 else 2
-                mean_ep_length_smooth = savgol_filter(mean_ep_length_arr, smooth_window, sg_poly)
-                mean_reward_smooth = savgol_filter(mean_reward_arr, smooth_window, sg_poly)
-            else:
-                # Rolling average (fallback)
-                smooth_window = min(smooth_window, len(mean_reward_arr))
-                mean_ep_length_smooth = np.convolve(mean_ep_length_arr, 
-                                                    np.ones(smooth_window)/smooth_window, 
-                                                    mode='valid')
-                mean_reward_smooth = np.convolve(mean_reward_arr, 
-                                               np.ones(smooth_window)/smooth_window, 
-                                               mode='valid')
-                # Adjust timesteps dla valid mode
-                timesteps_smooth = timesteps[smooth_window-1:]
-            
-            # LineCollection dla kolorowej trajektorii
-            from matplotlib.collections import LineCollection
-            points = np.array([mean_ep_length_smooth, mean_reward_smooth]).T.reshape(-1, 1, 2)
-            segments = np.concatenate([points[:-1], points[1:]], axis=1)
-            
-            norm = plt.Normalize(timesteps.min(), timesteps.max())
-            
-            # Outline (czarny)
-            lc_outline = LineCollection(segments, colors='black', linewidth=4, alpha=0.5, zorder=2)
-            axes[2, 2].add_collection(lc_outline)
-            
-            # Główna linia (kolorowa)
-            lc = LineCollection(segments, cmap='viridis', norm=norm, linewidth=2.5, zorder=3)
-            lc.set_array(timesteps if HAS_SCIPY else timesteps_smooth)
-            axes[2, 2].add_collection(lc)
-        except Exception as e:
-            print(f"⚠️ Nie udało się wygładzić trajektorii: {e}")
-    
-    axes[2, 2].set_title('Mean Reward vs Episode Length', fontsize=12, fontweight='bold')
-    axes[2, 2].set_xlabel('Mean Episode Length')
-    axes[2, 2].set_ylabel('Mean Reward')
-    axes[2, 2].grid(True, alpha=0.3)
-    
-    # Colorbar
-    if len(axes[2, 2].collections) > 0:
-        cbar = plt.colorbar(sc, ax=axes[2, 2])
-        cbar.set_label('Timesteps', rotation=270, labelpad=15)
-    axes[2, 2].legend()
     
     # Zapisz wykres
     plt.tight_layout()

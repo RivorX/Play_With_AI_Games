@@ -1,47 +1,59 @@
 # Konfiguracja Środowiska Minesweeper (Saper)
 environment:
-  min_grid_size: 9                   # Minimalny rozmiar siatki
+  min_grid_size: 5                   # ZMNIESZONE z 9: Łatwiejszy start dla modelu (Curriculum Learning)
   max_grid_size: 16                  # Maksymalny rozmiar siatki
-  min_mines_fraction: 0.12           # Min ułamek min (12%)
+  min_mines_fraction: 0.10           # Min ułamek min (10%) - łatwiej na start
   max_mines_fraction: 0.20           # Max ułamek min (20%)
   
-  # Observation Space mapping
-  # 3 Channel RGB-like input:
-  # Ch 0: Fog (1.0 = Hidden, 0.0 = Revealed)
-  # Ch 1: Values (Normalized 0.0-1.0 representing 0-8 neighbors)
-  # Ch 2: Valid Area (1.0 = Inside Grid, 0.0 = Padding/Border)
+  # Observation Space mapping (Optimized RAM)
+  # 5 Channels:
+  # Ch 0: State Map (Compressed: 0=Pad, 1-9=Values, 10=Fog)
+  # Ch 1: Flags Map (0=Empty, 1=Flagged)
+  # Ch 2: Logic Hint - Mines (1.0 = Logically deduced MINE)
+  # Ch 3: Logic Hint - Safe (1.0 = Logically deduced SAFE)
+  # Ch 4: Unsolved Mines (Normalized: (Value - NeighborsFlagged)/8.0)
+  # (CNN expands this to 11 (OneHot) + 1 (Numeric) + 4 = 16 channels internally)
   observation_space:
     low: 0.0
-    high: 1.0
-    dtype: float32
-    channels: 3
+    high: 10.0
+    dtype: float16
+    channels: 5
   
-  # Action Space is Discrete(height * width) - calculated dynamically in env
+  # Action Space is Discrete(2 * max_grid * max_grid)
+  # 0 to HW-1: Reveal
+  # HW to 2HW-1: Flag
   
   reward_scaling:
     enable: true
     
     # Nagrody bazowe
     reveal_safe_reward: 1.0          # Nagroda za odkrycie bezpiecznego pola
-    reveal_safe_multiplier: 0.5      # Dodatkowa nagroda za każde '0' (recursive reveal)
+    reveal_safe_multiplier: 1.0      # Multiplier
     win_reward: 100.0                # Nagroda za wygraną
-    explosion_penalty: -100.0        # Kara za minę
+    explosion_penalty: -200.0        # Kara za minę (ZWIĘKSZONA)
+    
+    # Flags & Logic Rewards
+    flag_correct_reward: 1.0         # Nagroda za oflagowanie miny (uczy zasad)
+    flag_incorrect_penalty: -5.0     # Surowa kara za oflagowanie bezpiecznego pola (false positive)
+    flag_redundant_penalty: -0.1     # Kara za spamowanie flagami w tym samym miejscu
     
     # ⚡ TRAINING TWEAKS:
-    invalid_action_terminate: false  # NIE kończyć gry - pozwól agentowi się uczyć z błędów
-    invalid_action_penalty: -5.0     # Mniejsza kara (agent będzie eksplorował więcej)
+    invalid_action_terminate: true  # MaskablePPO nie robi invalid actions, więc to mniej ważne
+    invalid_action_penalty: -1.0     # Symboliczna kara (technicznie niemożliwe z maską)
+    max_invalid_actions: 20          
     guess_penalty: -0.5              # Mała kara za zgadywanie
 
 # Konfiguracja modelu PPO
 model:
   policy: MultiInputPolicy           # Policy dla PPO
-  learning_rate: 0.0003
-  n_steps: 8192                     # ⬆️ Większy buffer (stabilniejszy gradient dla rzadkich nagród jak win)
-  n_epochs: 10
-  gamma: 0.99
-  gae_lambda: 0.95
-  clip_range: 0.2
-  ent_coef: 0.01                     
+  learning_rate: 0.0003              # ZMNIEJSZONE: Stabilizacja treningu (High KL fix)
+  min_learning_rate: 0.00001         # Nowe: Minimum dla Cosine Annealing
+  n_steps: 4096                      # ZWIĘKSZONE (było 2048): Większy bufor danych dla stabilniejszego gradientu
+  n_epochs: 6                        # ZMNIEJSZONE: Mniej epochów na batch (High KL fix)
+  gamma: 0.995
+  gae_lambda: 0.97
+  clip_range: 0.2                    # ZMNIEJSZONE: Bardziej konserwatywne update'y (High KL fix)
+  ent_coef: 0.005                    # ZMNIEJSZONE (było 0.05): Mniej losowości, więcej logiki
   vf_coef: 0.5
   device: cuda
 
@@ -52,10 +64,10 @@ model:
 
   # CNN Architecture
   cnn_architecture:
-    cnn_channels: [64, 128, 256]
-    cnn_output_dim: 512
+    cnn_channels: [64, 64, 96, 128]
+    cnn_output_dim: 768 
     use_layernorm: true
-    dropout: 0.05
+    dropout: 0.0
     
   policy_kwargs:
     features_extractor_kwargs:
@@ -66,17 +78,19 @@ model:
 
 # Konfiguracja treningu
 training:
-  n_envs: 32                         
+  n_envs: 48                         
   total_timesteps: 100000000         # 100M kroków
-  eval_freq: 262144                  # 32x n_steps (eval co ~262k kroków)
+  # Eval freq: Co 4 update'y PPO (4 * 4096 = 16384 kroków VecEnv)
+  eval_freq: 16384                   # Co 4 rollouty
   plot_interval: 1                   # Co ile ewaluacji robić wykres
-  batch_size: 16384                  # 🚀 Massive batch size for 16GB VRAM (2x n_steps) 
+  batch_size: 4096                  #
+
   # Ewaluacja
   eval_n_envs: 4
   eval_n_repeats: 5
   
   # Early stopping
-  max_no_improvement_evals: 50
+  max_no_improvement_evals: 80
   min_evals: 5
   
   # Normalizacja
@@ -84,8 +98,8 @@ training:
     norm_obs: false                  # False dla dyskretnych wartości planszy
     norm_reward: true                # True dla stabilizacji
     clip_obs: 10.0
-    clip_reward: 10.0
-    gamma: 0.99
+    clip_reward: 20.0
+    gamma: 0.995
     epsilon: 1.0e-8
 
 # Ścieżki

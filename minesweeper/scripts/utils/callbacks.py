@@ -213,31 +213,33 @@ class CustomEvalCallback(EvalCallback):
 
 
 class LossRecorderCallback(BaseCallback):
-    """Callback zapisujący wartości loss"""
+    """Callback zapisujący wartości loss - kompatybilny z MaskablePPO"""
     def __init__(self, verbose=0):
         super().__init__(verbose)
-        self._has_logger = False
-        self._checked_logger = False
 
-    def _on_step(self) -> bool:
-        """Zapisuje losses do modelu"""
-        if not self._checked_logger:
-            self._has_logger = (
-                hasattr(self.model, 'logger') and 
-                self.model.logger is not None and
-                hasattr(self.model.logger, 'name_to_value')
-            )
-            self._checked_logger = True
-        
-        if self._has_logger:
-            try:
+    def _on_rollout_end(self) -> None:
+        """Wywoływane po zakończeniu rollout - zapisuje losses do modelu"""
+        try:
+            # MaskablePPO używa tego samego loggera co PPO
+            if hasattr(self.model, 'logger') and self.model.logger is not None:
                 losses = self.model.logger.name_to_value
+                
+                # Zapisz ostatnie wartości loss (mogą być None jeśli jeszcze nie trenowano)
                 self.model._last_policy_loss = losses.get('train/policy_gradient_loss')
                 self.model._last_value_loss = losses.get('train/value_loss')
                 self.model._last_entropy_loss = losses.get('train/entropy_loss')
-            except (AttributeError, KeyError):
-                self._has_logger = False
+                
+                # Alternatywne klucze dla MaskablePPO (czasem używa innych nazw)
+                if self.model._last_policy_loss is None:
+                    self.model._last_policy_loss = losses.get('train/policy_loss')
+                if self.model._last_entropy_loss is None:
+                    self.model._last_entropy_loss = losses.get('train/ent_loss')
+                    
+        except (AttributeError, KeyError) as e:
+            if self.verbose > 0:
+                print(f"⚠️ LossRecorder: {e}")
         
+    def _on_step(self) -> bool:
         return True
 
 

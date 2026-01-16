@@ -3,7 +3,8 @@ import sys
 import yaml
 import numpy as np
 import time
-from stable_baselines3 import PPO
+import pygame
+from sb3_contrib import MaskablePPO
 
 # Dodaj katalog scripts do ścieżki
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -16,44 +17,7 @@ config_path = os.path.join(base_dir, 'config', 'config.yaml')
 with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 
-def print_board(env: MinesweeperEnv, last_action=None):
-    size = env.grid_size
-    print(f"\nStep: {env.steps} | Mines: {env.current_mines_count}")
-    
-    # Header
-    print("   " + " ".join([f"{i:2}" for i in range(size)]))
-    print("   " + "-" * (size * 3))
-    
-    for r in range(size):
-        line = []
-        for c in range(size):
-            char = "?"
-            # Check last action
-            is_last_action = False
-            if last_action is not None:
-                max_w = env.max_grid_size
-                ay, ax = last_action // max_w, last_action % max_w
-                if r == ay and c == ax:
-                    is_last_action = True
-            
-            if env.revealed[r, c]:
-                if env.board[r, c] == 1:
-                    char = "X" # Mine
-                elif env.neighbor_counts[r, c] == 0:
-                    char = "."
-                else:
-                    char = str(env.neighbor_counts[r, c])
-            else:
-                char = "#"
-                
-            if is_last_action:
-                line.append(f"[{char}]") # Highlight last action
-            else:
-                line.append(f" {char} ")
-        print(f"{r:2} " + "".join(line))
-    print("\n")
-
-def test_model(episodes=5, delay=1.0):
+def test_model(episodes=10, delay=0.1):
     model_path = os.path.join(base_dir, config['paths']['model_path'])
     
     if not os.path.exists(model_path):
@@ -61,56 +25,96 @@ def test_model(episodes=5, delay=1.0):
         return
 
     print(f"Ładowanie modelu: {model_path}")
-    model = PPO.load(model_path)
+    model = MaskablePPO.load(model_path)
     
+    # Inicjalizacja Pygame
+    pygame.init()
+    
+    # Użycie wbudowanego renderowania z visual styles ('human' mode w env)
+    # Env sam obsłuży okno
     env_creator = make_env(render_mode="human")
     env = env_creator()
     
-    for ep in range(episodes):
-        print(f"{'='*30}")
-        print(f"EPISODE {ep + 1}")
-        print(f"{'='*30}")
-        
-        obs, _ = env.reset()
-        done = False
-        total_reward = 0
-        
-        print_board(env)
-        
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
+    print("\n[STEROWANIE]")
+    print(" SPACE - Pauza / Wznowienie")
+    print(" S     - Krok po kroku (gdy zapauzowane)")
+    print(" ESC   - Wyjście")
+    print(f"{'='*30}\n")
+    
+    try:
+        for ep in range(episodes):
+            print(f"{'='*30}")
+            print(f"EPISODE {ep + 1}")
+            print(f"{'='*30}")
             
-            # Decode action for info
-            max_w = env.max_grid_size
-            y, x = action // max_w, action % max_w
+            obs, _ = env.reset()
+            done = False
+            total_reward = 0
+            steps = 0
             
-            # Check validity just for logging
-            valid_str = "VALID"
-            if y >= env.grid_size or x >= env.grid_size:
-                valid_str = "INVALID (Out of bounds)"
-            elif env.revealed[y, x]:
-                valid_str = "INVALID (Already revealed)"
+            paused = False
+            
+            # Initial render
+            env.render()
+            
+            while not done:
+                # Event handling
+                step_once = False
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        env.close()
+                        return
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_ESCAPE:
+                            env.close()
+                            return
+                        elif event.key == pygame.K_SPACE:
+                            paused = not paused
+                            print("PAUSED" if paused else "RESUMED")
+                        elif event.key == pygame.K_s and paused:
+                            step_once = True
                 
-            print(f"Action: ({x}, {y}) -> {valid_str}")
-            
-            obs, reward, done, truncated, info = env.step(action)
-            total_reward += reward
-            
-            # Wizualizacja warstw wejściowych dla debugowania
-            if ep == 0 and total_reward == reward: # Tylko raz na początku
-                 print("\nInput Channels Debug:")
-                 print("Fog Channel (part):", obs['image'][0, :5, :5])
-                 print("Values Channel (part):", obs['image'][1, :5, :5])
-            
-            print_board(env, last_action=action)
-            print(f"Reward: {reward:.2f} | Total: {total_reward:.2f}")
-            
-            if delay > 0:
-                time.sleep(delay)
+                if paused and not step_once:
+                    env.render()
+                    time.sleep(0.1)
+                    continue
                 
-        result = info.get('result', 'Incomplete')
-        print(f"GAME OVER! Result: {result} | Final Reward: {total_reward:.2f}")
-        time.sleep(2)
+                # AI Action
+                action_masks = env.action_masks()
+                action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
+                
+                # Execute
+                obs, reward, done, truncated, info = env.step(action)
+                total_reward += reward
+                steps += 1
+                
+                # Logging
+                max_w = env.max_grid_size
+                is_flag = action >= env.total_cells
+                if is_flag:
+                    real_act = action - env.total_cells
+                    y, x = real_act // max_w, real_act % max_w
+                    act_str = f"FLAG ({x}, {y})"
+                else:
+                    y, x = action // max_w, action % max_w
+                    act_str = f"REVEAL ({x}, {y})"
+                   
+                print(f"Step {steps:3}: {act_str} | Rew: {reward:5.2f} | Tot: {total_reward:6.2f}")
+                
+                env.render()
+                
+                if delay > 0:
+                    time.sleep(delay)
+                    
+                if done or truncated:
+                    result = info.get('result', 'Incomplete')
+                    print(f"GAME OVER! Result: {result} | Final Reward: {total_reward:.2f}")
+                    time.sleep(1.0) # Chwila na zobaczenie wyniku
+    except KeyboardInterrupt:
+        print("\nPrzerwano.")
+    finally:
+        env.close()
+        pygame.quit()
 
 if __name__ == "__main__":
     test_model()
