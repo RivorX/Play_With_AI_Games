@@ -1,170 +1,119 @@
-# Konfiguracja Środowiska Minesweeper (Saper)
+# Konfiguracja Środowiska Minesweeper
 environment:
-  min_grid_size: 5                   # ZMNIESZONE z 9: Łatwiejszy start dla modelu (Curriculum Learning)
+  min_grid_size: 8                   # Minimalny rozmiar siatki
   max_grid_size: 16                  # Maksymalny rozmiar siatki
-  min_mines_fraction: 0.10           # Min ułamek min (10%) - łatwiej na start
-  max_mines_fraction: 0.20           # Max ułamek min (20%)
+  viewport_size: 16                  # Stały rozmiar viewport (zawsze 16x16)
+  cell_size: 30                      # Rozmiar komórki w pikselach
+  mine_density: 0.15                 # Gęstość min (15% pól to miny)
   
-  # --- VIEWPORT MODE ---
-  # Agent widzi tylko wycinek planszy i porusza kursorami
-  viewport_size: 11                  # Stały rozmiar widoku (niezależny od mapy)
-  
-  # Observation Space mapping (Optimized RAM)
-  # 5 Channels:
-  # Ch 0: State Map (Compressed: 0=Pad, 1-9=Values, 10=Fog)
-  # Ch 1: Flags Map (0=Empty, 1=Flagged)
-  # Ch 2: Logic Hint - Mines (1.0 = Logically deduced MINE)
-  # Ch 3: Logic Hint - Safe (1.0 = Logically deduced SAFE)
-  # Ch 4: Unsolved Mines (Normalized: (Value - NeighborsFlagged)/8.0)
-  # + GLOBAL VECTOR (4 floats):
-  # 1. Norm X position
-  # 2. Norm Y position
-  # 3. DirToNearestUnknown X (Unit Vector)
-  # 4. DirToNearestUnknown Y (Unit Vector)
-  # (CNN expands this to 11 (OneHot) + 1 (Numeric) + 4 = 16 channels internally)
   observation_space:
-    low: 0.0
-    high: 10.0
-    dtype: float16
-    channels: 5
+    low: 0.0                         # Minimalna wartość obserwacji
+    high: 1.0                        # Maksymalna wartość obserwacji
+    dtype: float32                   # Typ danych obserwacji
   
-  # Action Space (Cursor Mode):
-  # 0: Move Up
-  # 1: Move Down
-  # 2: Move Left
-  # 3: Move Right
-  # 4: Reveal (at cursor)
-  # 5: Flag (at cursor)
+  action_space:
+    type: Discrete                   # Typ przestrzeni akcji
+    # n: grid_size * grid_size      # Liczba akcji (pozycja do odkrycia)
   
+  max_steps_factor: 300              # Mnożnik max kroków (grid_size * max_steps_factor)
+
   reward_scaling:
-    enable: true
-    
-    # Difficulty scaling (jak w Snake)
-    min_difficulty_multiplier: 1.0   # Dla min_grid_size
-    max_difficulty_multiplier: 2.0   # Dla max_grid_size
+    enable: true                          # Włącz skalowanie nagród
+    min_difficulty_multiplier: 1.0        # Mnożnik dla min_grid_size
+    max_difficulty_multiplier: 2.5        # Mnożnik dla max_grid_size
     
     # Nagrody bazowe
-    reveal_safe_reward: 1.0          # Nagroda za odkrycie bezpiecznego pola
-    reveal_safe_multiplier: 1.0      # Multiplier
-    win_reward: 100.0                # Nagroda za wygraną
-    explosion_penalty: -200.0        # Kara za minę (ZWIĘKSZONA)
+    base_safe_cell_reward: 1.0            # Nagroda za odkrycie bezpiecznej komórki
+    base_mine_penalty: -10.0              # Kara za minę
+    base_victory_bonus: 100.0             # Bonus za wygraną
     
-    # Flags & Logic Rewards
-    flag_correct_reward: 1.0         # Nagroda za oflagowanie miny (uczy zasad)
-    flag_incorrect_penalty: -5.0     # Surowa kara za oflagowanie bezpiecznego pola (false positive)
-    flag_redundant_penalty: -0.1     # Kara za spamowanie flagami w tym samym miejscu
-    
-    # Movement Rewards (Cursor Mode)
-    move_penalty: -0.01              # Lekka presja czasu, żeby nie błądził
-    move_repeat_penalty: -0.1        # Kara za cofanie się od razu (oscylacja)
-    
-    # ⚡ TRAINING TWEAKS:
-    invalid_action_terminate: true  # MaskablePPO nie robi invalid actions, więc to mniej ważne
-    invalid_action_penalty: -1.0     # Symboliczna kara (technicznie niemożliwe z maską)
-    max_invalid_actions: 20          
-    guess_penalty: -0.5              # Mała kara za zgadywanie
-    idle_penalty: -10.0              # Kara za timeout (chodzenie w kółko)
-    
-    # ✨ PROGRESSIVE BONUS - +2% za każde kolejne odkrycie
-    progressive_reveal_bonus:
-      enable: true
-      bonus_per_reveal: 0.02         # +2% za każde pole
-      max_multiplier: 3.0            # Cap na 300%
-    
-    # 🎯 MILESTONE BONUSES (% odkrycia planszy)
+    # Milestone bonusy (% odkrytych bezpiecznych pól)
     milestones:
-      0.10: 2.0
-      0.20: 5.0
-      0.30: 10.0
-      0.40: 15.0
-      0.50: 25.0
-      0.60: 40.0
-      0.70: 60.0
-      0.80: 90.0
-      0.90: 130.0
-      1.00: 200.0   # Win = 100% odkrycia
-    
-    # 💨 EFFICIENCY BONUS
+      0.10: 5.0    
+      0.25: 10.0   
+      0.50: 25.0    
+      0.75: 50.0     
+      0.90: 100.0     
+      1.00: 200.0  
+
+    # Bonus za efektywność (małe kroki na pole)
     efficiency_bonus:
       enable: true
-      threshold: 1.5                 # Ratio: steps_per_reveal < 1.5
-      reward: 3.0
+      threshold: 1.5                # Średnio 1.5 kroku na pole
+      reward: 10.0
 
 # Konfiguracja modelu PPO
 model:
-  policy: MultiInputPolicy           # Policy dla PPO
-  learning_rate: 0.0003              # ZMNIEJSZONE: Stabilizacja treningu (High KL fix)
-  min_learning_rate: 0.00001         # Nowe: Minimum dla Cosine Annealing
-  n_steps: 4096                      # ZWIĘKSZONE (było 2048): Większy bufor danych dla stabilniejszego gradientu
-  n_epochs: 6                        # ZMNIEJSZONE: Mniej epochów na batch (High KL fix)
-  gamma: 0.995
-  gae_lambda: 0.97
-  clip_range: 0.2                    # ZMNIEJSZONE: Bardziej konserwatywne update'y (High KL fix)
-  ent_coef: 0.01                     # START: Exploration (będzie spadać do min_ent_coef)
-  min_ent_coef: 0.001                # END: Exploitation
+  policy: MultiInputPolicy
+  learning_rate: 0.0003
+  min_learning_rate: 0.00001
+  n_steps: 4096
+  n_epochs: 5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.05
+  min_ent_coef: 0.01
   vf_coef: 0.5
   device: cuda
 
   optimizer:
     type: adamw
     weight_decay: 0.0001
-    eps: 1.0e-5
+    eps: 1.0e-8
     betas: [0.9, 0.999]
-
-  # CNN Architecture
-  cnn_architecture:
-    cnn_channels: [128, 256, 256]    # Deep, stronger features for small viewport
-    cnn_output_dim: 512 
-    use_layernorm: true
-    dropout: 0.0
-    use_spatial_attention: true      # Spatial attention (like Snake)
+  
+  cnn_dropout: 0.03
+  scalar_dropout: 0.04
+  scalar_input_dropout: 0.0
+  fusion_dropout: 0.05
+  
+  convlstm:
+    cnn_channels: [64, 128, 256]
+    cnn_output_dim: 512
     
+    scalar_hidden_dims: [128, 192]
+    scalar_output_dim: 128
+    
+    use_layernorm: true
+    use_spatial_attention: true
+
   policy_kwargs:
     features_extractor_kwargs:
       features_dim: 512
     net_arch:
       pi: [512, 256]
-      vf: [512, 256]
+      vf: [512, 512, 256]
 
 # Konfiguracja treningu
 training:
-  n_envs: 48                         
-  total_timesteps: 100000000         # 100M kroków
-  # Eval freq: Co 4 update'y PPO (4 * 4096 = 16384 kroków VecEnv)
-  eval_freq: 16384                   # Co 4 rollouty
-  plot_interval: 1                   # Co ile ewaluacji robić wykres
-  batch_size: 4096
-  gradient_log_freq: 10000           # Co ile kroków logować gradienty/wagi
+  n_envs: 32
+  batch_size: 8192
+  total_timesteps: 50000000
+  eval_freq: 16384
+  plot_interval: 1
+  max_no_improvement_evals: 50
+  min_evals: 20
+  enable_channel_logs: false
+  gradient_log_freq: 10000
   
-  # 🎓 CURRICULUM LEARNING
-  curriculum_learning:
-    enable: true
-    start_grid_size: 5               # Zacznij od małej mapy
-    target_grid_size: 16             # Docelowy rozmiar
-    progression_threshold: 0.3       # Win rate > 30% = zwiększ trudność
-    eval_window: 10                  # Okno do wyliczenia win rate
-
-  # Ewaluacja
   eval_n_envs: 4
-  eval_n_repeats: 5
+  eval_n_repeats: 2
   
-  # Early stopping
-  max_no_improvement_evals: 80
-  min_evals: 5
-  
-  # Normalizacja
   normalization:
-    norm_obs: false                  # False dla dyskretnych wartości planszy
-    norm_reward: true                # True dla stabilizacji
+    norm_obs: false
+    norm_reward: true
     clip_obs: 10.0
-    clip_reward: 50.0                # Zwiększone dla progressive bonus
-    gamma: 0.995
+    clip_reward: 500.0
+    gamma: 0.99
     epsilon: 1.0e-8
+    clip_obs_asymmetric: false
 
 # Ścieżki
 paths:
   models_dir: models
   logs_dir: logs
-  model_path: models/minesweeper_ppo.zip
+  model_path: models/minesweeper_ppo_model.zip
   train_csv_path: logs/train_progress.csv
   plot_path: logs/training_progress.png
+  test_progress_path: logs/test_progress.png

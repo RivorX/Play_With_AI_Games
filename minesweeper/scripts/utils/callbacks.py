@@ -7,8 +7,7 @@ from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 
 class TrainProgressCallback(BaseCallback):
     """
-    ✅ FIXED: Przy wznowieniu treningu dołącza dane zamiast nadpisywać
-    Dostosowany dla Minesweeper
+    ✅ Callback zapisujący progress treningu do CSV
     """
     def __init__(self, csv_path, initial_timesteps=0, verbose=0):
         super().__init__(verbose)
@@ -16,11 +15,12 @@ class TrainProgressCallback(BaseCallback):
         self.initial_timesteps = initial_timesteps
         self.last_logged = 0
         
-        # Pre-allocated lists dla Minesweeper
-        self.episode_results = []  # win/loss/invalid
-        self.episode_revealed = []  # liczba odkrytych pól
+        # Pre-allocated lists
+        self.episode_scores = []
+        self.episode_safe_cells = []
+        self.episode_steps_per_cell = []
+        self.episode_progress = []
         
-        # ✅ FIX: Sprawdź czy CSV istnieje (wznowienie treningu)
         self._csv_exists = os.path.exists(csv_path)
 
     def _on_step(self) -> bool:
@@ -29,10 +29,14 @@ class TrainProgressCallback(BaseCallback):
         dones = self.locals.get('dones', [])
         
         for info, done in zip(infos, dones):
-            if done:
-                result = info.get('result', 'unknown')
-                self.episode_results.append(result)
-                # Możesz też dodać inne metryki specyficzne dla minesweeper
+            if done and 'score' in info:
+                score = info['score']
+                safe_cells = info.get('safe_cells_revealed', 0)
+                
+                self.episode_scores.append(score)
+                self.episode_safe_cells.append(safe_cells)
+                self.episode_steps_per_cell.append(info.get('steps_per_cell', 0))
+                self.episode_progress.append(info.get('progress', 0))
         
         # Logowanie co 1000 kroków
         if any(dones) and (self.num_timesteps + self.initial_timesteps) - self.last_logged >= 1000:
@@ -41,17 +45,17 @@ class TrainProgressCallback(BaseCallback):
             ep_rew_mean = np.mean([ep['r'] for ep in ep_buffer]) if ep_buffer else None
             ep_len_mean = np.mean([ep['l'] for ep in ep_buffer]) if ep_buffer else None
             
-            # Statystyki dla minesweeper
-            win_rate = (self.episode_results.count('win') / len(self.episode_results) * 100.0) if self.episode_results else 0.0
-            loss_rate = (self.episode_results.count('loss') / len(self.episode_results) * 100.0) if self.episode_results else 0.0
-            invalid_rate = ((self.episode_results.count('invalid') + self.episode_results.count('invalid_repeat')) / len(self.episode_results) * 100.0) if self.episode_results else 0.0
+            mean_score = np.mean(self.episode_scores) if self.episode_scores else 0.0
+            max_score = np.max(self.episode_scores) if self.episode_scores else 0.0
+            mean_safe_cells = np.mean(self.episode_safe_cells) if self.episode_safe_cells else 0.0
+            mean_steps_per_cell = np.mean(self.episode_steps_per_cell) if self.episode_steps_per_cell else 0.0
+            mean_progress = np.mean(self.episode_progress) if self.episode_progress else 0.0
             
             # Pobierz losses
             policy_loss = getattr(self.model, '_last_policy_loss', None)
             value_loss = getattr(self.model, '_last_value_loss', None)
             entropy_loss = getattr(self.model, '_last_entropy_loss', None)
             
-            # ✅ FIX: Nagłówek tylko jeśli CSV nie istnieje
             try:
                 write_header = not self._csv_exists
                 with open(self.csv_path, 'a', newline='') as csvfile:
@@ -61,30 +65,36 @@ class TrainProgressCallback(BaseCallback):
                             'timesteps', 
                             'mean_reward', 
                             'mean_ep_length', 
-                            'win_rate', 
-                            'loss_rate',
-                            'invalid_rate',
+                            'mean_score', 
+                            'max_score', 
+                            'mean_safe_cells', 
+                            'mean_steps_per_cell', 
+                            'mean_progress',
                             'policy_loss', 
                             'value_loss', 
                             'entropy_loss'
                         ])
-                        self._csv_exists = True  # Oznacz że istnieje
+                        self._csv_exists = True
                     
                     writer.writerow([
                         self.num_timesteps + self.initial_timesteps, 
                         ep_rew_mean, 
                         ep_len_mean, 
-                        win_rate,
-                        loss_rate,
-                        invalid_rate,
+                        mean_score,
+                        max_score,
+                        mean_safe_cells,
+                        mean_steps_per_cell,
+                        mean_progress,
                         policy_loss,
                         value_loss,
                         entropy_loss
                     ])
                 
-                # Reset agregacji
                 self.last_logged = self.num_timesteps + self.initial_timesteps
-                self.episode_results.clear()
+                self.episode_scores.clear()
+                self.episode_safe_cells.clear()
+                self.episode_steps_per_cell.clear()
+                self.episode_progress.clear()
                 
             except Exception as e:
                 print(f"Błąd zapisu train_progress.csv: {e}")
@@ -94,10 +104,7 @@ class TrainProgressCallback(BaseCallback):
 
 class CustomEvalCallback(EvalCallback):
     """
-    ✅ FIXED: 
-    1. Wyłączona duplikacja zapisu best_model.zip (używa parent class)
-    2. Dodane zapisywanie policy.pth w odpowiedniej lokalizacji
-    3. Usunięte save_training_state() (duplikacja z parent)
+    ✅ Custom eval callback z zapisywaniem modeli
     """
     def __init__(self, eval_env, callback_on_new_best=None, callback_after_eval=None, 
                  best_model_save_path=None, log_path=None, eval_freq=10000, 
@@ -124,19 +131,16 @@ class CustomEvalCallback(EvalCallback):
     def _on_step(self) -> bool:
         """Wykonuje ewaluację i zapisuje modele"""
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
-            # 🔍 Zapisz stary best_mean_reward PRZED wywołaniem parent
             old_best_reward = self.best_mean_reward
             
-            # ✅ Parent class zapisuje best_model.zip automatycznie
             continue_training = super()._on_step()
             self.eval_count += 1
             total_timesteps = self.model.num_timesteps + self.initial_timesteps
             
-            # ✅ Zapisz bieżący model (minesweeper_ppo.zip) po KAŻDEJ ewaluacji
-            current_model_path = os.path.join(self.best_model_save_path, 'minesweeper_ppo.zip')
+            # Zapisz bieżący model
+            current_model_path = os.path.join(self.best_model_save_path, 'minesweeper_ppo_model.zip')
             try:
                 self.model.save(current_model_path)
-                # 💾 Zapisz też timesteps do _state.pkl
                 state_path = current_model_path.replace('.zip', '_state.pkl')
                 import pickle
                 with open(state_path, 'wb') as f:
@@ -145,11 +149,10 @@ class CustomEvalCallback(EvalCallback):
                     print(f"💾 Zapisano bieżący model: {current_model_path}")
                     print(f"💾 Zapisano timesteps: {total_timesteps:,}")
             except Exception as e:
-                print(f"⚠️ Błąd zapisu minesweeper_ppo.zip: {e}")
+                print(f"⚠️ Błąd zapisu minesweeper_ppo_model.zip: {e}")
             
-            # ✅ FIXED: Sprawdź czy parent zaktualizował best (nowy rekord!)
+            # Sprawdź czy nowy best
             if self.best_mean_reward > old_best_reward:
-                # Parent class już zapisał best_model.zip, teraz zapisz policy.pth
                 policy_pth_path = os.path.join(self.best_model_save_path, 'policy.pth')
                 try:
                     torch.save(self.model.policy.state_dict(), policy_pth_path)
@@ -158,11 +161,10 @@ class CustomEvalCallback(EvalCallback):
                 except Exception as e:
                     print(f"⚠️ Błąd zapisu policy.pth: {e}")
             
-            # ✅ Generuj wykresy co N ewaluacji
+            # Generuj wykresy
             if self.eval_count % self.plot_interval == 0:
                 self._generate_plots()
             
-            # Stop training jeśli callback zwrócił False
             if not continue_training:
                 print(f"\n{'='*70}")
                 print(f"🛑 TRENING ZATRZYMANY przez StopTrainingOnNoModelImprovement")
@@ -173,7 +175,6 @@ class CustomEvalCallback(EvalCallback):
     
     def _generate_plots(self):
         """Generuj wykresy treningu i gradientów"""
-        # === 1. WYKRES TRENINGU ===
         try:
             if self.plot_script_path:
                 import importlib.util
@@ -189,13 +190,10 @@ class CustomEvalCallback(EvalCallback):
                     if os.path.exists(csv_path):
                         plot_module.plot_train_progress(csv_path, output_path)
                         print(f"📊 Wygenerowano wykres treningu po {self.eval_count} walidacji.")
-                    else:
-                        print(f"⚠️ CSV nie istnieje jeszcze: {csv_path}")
         
         except Exception as e:
             print(f"⚠️ Błąd podczas generowania wykresu treningu: {e}")
         
-        # === 2. WYKRES GRADIENT MONITORA ===
         try:
             from utils.gradient_monitor import plot_gradient_monitor
             
@@ -213,33 +211,31 @@ class CustomEvalCallback(EvalCallback):
 
 
 class LossRecorderCallback(BaseCallback):
-    """Callback zapisujący wartości loss - kompatybilny z MaskablePPO"""
+    """Callback zapisujący wartości loss"""
     def __init__(self, verbose=0):
         super().__init__(verbose)
+        self._has_logger = False
+        self._checked_logger = False
 
-    def _on_rollout_end(self) -> None:
-        """Wywoływane po zakończeniu rollout - zapisuje losses do modelu"""
-        try:
-            # MaskablePPO używa tego samego loggera co PPO
-            if hasattr(self.model, 'logger') and self.model.logger is not None:
+    def _on_step(self) -> bool:
+        """Zapisuje losses do modelu"""
+        if not self._checked_logger:
+            self._has_logger = (
+                hasattr(self.model, 'logger') and 
+                self.model.logger is not None and
+                hasattr(self.model.logger, 'name_to_value')
+            )
+            self._checked_logger = True
+        
+        if self._has_logger:
+            try:
                 losses = self.model.logger.name_to_value
-                
-                # Zapisz ostatnie wartości loss (mogą być None jeśli jeszcze nie trenowano)
                 self.model._last_policy_loss = losses.get('train/policy_gradient_loss')
                 self.model._last_value_loss = losses.get('train/value_loss')
                 self.model._last_entropy_loss = losses.get('train/entropy_loss')
-                
-                # Alternatywne klucze dla MaskablePPO (czasem używa innych nazw)
-                if self.model._last_policy_loss is None:
-                    self.model._last_policy_loss = losses.get('train/policy_loss')
-                if self.model._last_entropy_loss is None:
-                    self.model._last_entropy_loss = losses.get('train/ent_loss')
-                    
-        except (AttributeError, KeyError) as e:
-            if self.verbose > 0:
-                print(f"⚠️ LossRecorder: {e}")
+            except (AttributeError, KeyError):
+                self._has_logger = False
         
-    def _on_step(self) -> bool:
         return True
 
 
@@ -266,7 +262,6 @@ class EntropySchedulerCallback(BaseCallback):
         new_ent_coef = self.entropy_schedule_fn(progress_remaining)
         self.model.ent_coef = new_ent_coef
         
-        # Loguj co 100'000 kroków
         if total_timesteps - self._last_logged >= 100000:
             print(f"[ENTROPY SCHEDULE] timesteps={total_timesteps}, ent_coef={new_ent_coef:.6f}, progress={progress_remaining:.2%}")
             self._last_logged = total_timesteps
@@ -276,7 +271,7 @@ class EntropySchedulerCallback(BaseCallback):
 
 class VictoryTrackerCallback(BaseCallback):
     """
-    ✅ FIXED: Przy wznowieniu treningu dołącza do logu zamiast nadpisywać
+    ✅ Callback śledzący pełne rozegrania planszy (100% progress)
     """
     def __init__(self, log_dir: str, verbose: int = 0):
         super().__init__(verbose)
@@ -284,21 +279,17 @@ class VictoryTrackerCallback(BaseCallback):
         self.log_file = os.path.join(log_dir, 'victories.log')
         os.makedirs(log_dir, exist_ok=True)
         
-        # ✅ FIX: Inicjalizuj TYLKO jeśli plik nie istnieje
         if not os.path.exists(self.log_file):
             with open(self.log_file, 'w', encoding='utf-8') as f:
                 f.write("="*70 + "\n")
-                f.write("SNAKE AI - VICTORY LOG\n")
-                f.write("Full Board Completions Tracker\n")
+                f.write("MINESWEEPER AI - VICTORY LOG\n")
+                f.write("Full Board Clearances Tracker\n")
                 f.write("="*70 + "\n\n")
     
     def _on_step(self) -> bool:
         for i, info in enumerate(self.locals['infos']):
-            if 'snake_length' in info and 'grid_size' in info:
-                snake_len = info['snake_length']
-                grid_size = info['grid_size']
-                
-                if snake_len == grid_size * grid_size:
+            if 'progress' in info and info.get('termination_reason') == 'victory':
+                if info['progress'] >= 99.9:  # 100% cleared
                     self._log_victory(info, env_idx=i)
         
         return True
@@ -312,9 +303,9 @@ class VictoryTrackerCallback(BaseCallback):
         victory_count = self._count_victories() + 1
         
         grid_size = info['grid_size']
-        snake_length = info['snake_length']
+        safe_cells = info['safe_cells_revealed']
         total_reward = info.get('total_reward', 0)
-        steps_per_apple = info.get('steps_per_apple', 0)
+        steps_per_cell = info.get('steps_per_cell', 0)
         
         log_entry = (
             f"\n{'='*70}\n"
@@ -324,8 +315,8 @@ class VictoryTrackerCallback(BaseCallback):
             f"Total Timesteps:   {total_timesteps:,}\n"
             f"Environment:       #{env_idx}\n"
             f"Grid Size:         {grid_size}x{grid_size}\n"
-            f"Snake Length:      {snake_length} / {grid_size * grid_size} (FULL BOARD!)\n"
-            f"Steps per Apple:   {steps_per_apple:.2f}\n"
+            f"Safe Cells:        {safe_cells} (FULL BOARD!)\n"
+            f"Steps per Cell:    {steps_per_cell:.2f}\n"
             f"Total Reward:      {total_reward:.2f}\n"
             f"{'='*70}\n"
         )
