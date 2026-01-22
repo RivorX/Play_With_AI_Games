@@ -38,3 +38,5 @@ logs/*
 *.bak
 
 logs
+
+chess/data/*
