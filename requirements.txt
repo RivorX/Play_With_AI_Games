@@ -9,3 +9,6 @@ pyyaml
 imageio
 Pillow
 sb3-contrib
+
+# Dodatkowe dla Chess
+python-chess>=1.999

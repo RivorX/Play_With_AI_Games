@@ -1,0 +1,90 @@
+# Chess AI Training Configuration
+
+# Paths (relative to project root)
+paths:
+  data_dir: "data"
+  models_dir: "models"
+  logs_dir: "logs"
+  best_model: "models/best_model.pt"
+  il_checkpoint: "models/il_checkpoint.pt"
+  rl_checkpoint: "models/rl_checkpoint.pt"
+
+# Data Processing
+data:
+  min_elo: 2000  # Minimum Elo rating for games
+  max_games: 100000  # Maximum number of games to load (divided among PGN files)
+  train_split: 0.9  # Train/validation split
+  max_moves_per_game: 200  # Skip longer games
+  
+# Model Architecture
+model:
+  num_residual_blocks: 6  # Number of residual blocks (6-10 for balance)
+  filters: 128  # Convolutional filters
+  policy_head_filters: 2
+  value_head_filters: 1
+  value_hidden_dim: 256
+  dropout: 0.3
+
+# Imitation Learning
+imitation_learning:
+  batch_size: 256
+  learning_rate: 0.001
+  epochs: 30
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  
+  # Loss weights
+  policy_loss_weight: 1.0
+  value_loss_weight: 0.5
+  
+  # Evaluation
+  eval_every: 1  # Evaluate every N epochs
+  save_every: 5  # Save checkpoint every N epochs
+  
+  # Early stopping
+  patience: 10  # Stop if no improvement for N epochs
+  min_delta: 0.001  # Minimum improvement to count
+
+# Reinforcement Learning
+reinforcement_learning:
+  # Self-play
+  games_per_iteration: 100  # Games to generate per iteration
+  iterations: 1000  # Total RL iterations
+  
+  # MCTS parameters
+  mcts_simulations: 100  # Number of MCTS simulations per move
+  mcts_c_puct: 1.5  # Exploration constant
+  mcts_temperature: 1.0  # Temperature for move selection (high = exploration)
+  mcts_temperature_threshold: 15  # Move number to reduce temperature
+  mcts_dirichlet_alpha: 0.3  # Dirichlet noise for exploration
+  mcts_dirichlet_weight: 0.25  # Weight of Dirichlet noise
+  
+  # Training
+  batch_size: 256
+  learning_rate: 0.0005  # Lower than IL
+  train_epochs_per_iteration: 5  # Epochs per iteration
+  replay_buffer_size: 50000  # Max positions in replay buffer
+  
+  # Evaluation
+  eval_games: 20  # Games to play for evaluation
+  eval_every: 5  # Evaluate every N iterations
+  win_rate_threshold: 0.55  # Win rate to update best model
+  
+  # Loss weights
+  policy_loss_weight: 1.0
+  value_loss_weight: 1.0
+
+# Hardware
+hardware:
+  device: "cuda"  # cuda, cpu, or mps (Mac)
+  num_workers: 8  # DataLoader workers (0 to disable multiprocessing)
+  pin_memory: true
+
+# Logging
+logging:
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  tensorboard: true
+  print_every: 10  # Print stats every N batches
+  
+# Random seed for reproducibility
+seed: 42
