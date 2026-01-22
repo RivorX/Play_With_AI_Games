@@ -72,7 +72,7 @@ def train_epoch(model, train_loader, optimizer, config, device):
                 'value': f"{value_loss.item():.4f}"
             })
         
-        # Periodic garbage collection to prevent memory buildup
+        # Periodic garbage collection
         if batch_idx % 100 == 0:
             gc.collect()
             if torch.cuda.is_available():
@@ -118,7 +118,7 @@ def evaluate(model, val_loader, config, device):
 
 
 def main():
-    # Load config (relative to script location)
+    # Load config
     config_path = script_dir.parent / 'config' / 'config.yaml'
     
     print(f"Loading config from: {config_path}")
@@ -133,7 +133,7 @@ def main():
     device = torch.device(config['hardware']['device'])
     print(f"Using device: {device}")
     
-    # Create directories (relative to project root)
+    # Create directories
     base_dir = script_dir.parent
     models_dir = base_dir / config['paths']['models_dir']
     logs_dir = base_dir / config['paths']['logs_dir']
@@ -141,22 +141,41 @@ def main():
     models_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load and prepare data
+    # Load and prepare data (now returns metadata instead of full data)
     print("\n=== Loading data ===")
-    data = parse_pgn_files(
+    
+    # Check if we should use cached data
+    preprocessing_dir = base_dir / "data" / "preprocessing"
+    min_elo = config['data']['min_elo']
+    max_games = config['data']['max_games']
+    max_moves = config['data']['max_moves_per_game']
+    
+    binary_file = preprocessing_dir / f"positions_elo{min_elo}_games{max_games}_moves{max_moves}.bin"
+    metadata_file = preprocessing_dir / f"positions_elo{min_elo}_games{max_games}_moves{max_moves}_meta.pkl"
+    
+    use_cache = True
+    if binary_file.exists() and metadata_file.exists():
+        file_size_mb = binary_file.stat().st_size / (1024**2)
+        response = input(f"\nFound cached binary data:\n{binary_file}\nSize: {file_size_mb:.2f} MB\n\nUse cached data? (y/n): ").strip().lower()
+        use_cache = response == 'y'
+        
+        if not use_cache:
+            print("Will reprocess PGN files...")
+            # Delete old cache files
+            binary_file.unlink()
+            metadata_file.unlink()
+            print(f"Deleted cache files")
+    
+    metadata = parse_pgn_files(
         config['paths']['data_dir'], 
         config,
         num_workers=config['hardware']['num_workers']
     )
     
-    print(f"Total positions: {len(data)}")
+    print(f"Total positions: {metadata['total_positions']}")
     
-    # Create dataloaders
-    train_loader, val_loader = create_dataloaders(data, config)
-    
-    # Free original data to save memory
-    del data
-    gc.collect()
+    # Create dataloaders (now uses chunked lazy loading)
+    train_loader, val_loader = create_dataloaders(metadata, config)
     
     # Create model
     print("\n=== Creating model ===")

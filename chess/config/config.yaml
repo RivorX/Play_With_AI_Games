@@ -27,7 +27,7 @@ model:
 
 # Imitation Learning
 imitation_learning:
-  batch_size: 256
+  batch_size: 2048
   learning_rate: 0.001
   epochs: 30
   weight_decay: 0.0001
@@ -60,7 +60,7 @@ reinforcement_learning:
   mcts_dirichlet_weight: 0.25  # Weight of Dirichlet noise
   
   # Training
-  batch_size: 256
+  batch_size: 2048
   learning_rate: 0.0005  # Lower than IL
   train_epochs_per_iteration: 5  # Epochs per iteration
   replay_buffer_size: 50000  # Max positions in replay buffer
@@ -77,7 +77,7 @@ reinforcement_learning:
 # Hardware
 hardware:
   device: "cuda"  # cuda, cpu, or mps (Mac)
-  num_workers: 8  # DataLoader workers (0 to disable multiprocessing)
+  num_workers: 12  # DataLoader workers (0 to disable multiprocessing)
   pin_memory: true
 
 # Logging
