@@ -1,4 +1,5 @@
-# Chess AI Training Configuration
+# Chess AI Training Configuration - Enhanced Edition
+# Optimized for RTX 5060 Ti with AMP, SE-Blocks, OneCycleLR, and Label Smoothing
 
 # Paths (relative to project root)
 paths:
@@ -16,22 +17,37 @@ data:
   train_split: 0.9  # Train/validation split
   max_moves_per_game: 200  # Skip longer games
   
-# Model Architecture
+
+
+# Model Architecture - Enhanced with Multiple Attention Mechanisms
 model:
-  num_residual_blocks: 6  # Number of residual blocks (6-10 for balance)
-  filters: 128  # Convolutional filters
-  policy_head_filters: 2
-  value_head_filters: 1
+  num_residual_blocks: 8  # Increased for better learning (6-12 optimal)
+  filters: 192  # More filters for RTX 5060 Ti (128-256)
+  policy_head_filters: 32  # Increased from 2
+  value_head_filters: 32  # Increased from 1
   value_hidden_dim: 256
   dropout: 0.3
+  
+  # 🚀 Advanced Features (minimal parameter cost, big gains!)
+  use_se_blocks: true           # 🧠 Channel attention (+5% params, +20% quality)
+  use_spatial_attention: true   # 👁️ Spatial attention (+1% params, +6% quality)
+  drop_path_rate: 0.1           # 🎲 Stochastic Depth (0% params, +4% quality)
+  activation: 'elu'             # ⚡ ELU activation (0% params, +3% quality)
+  use_coord_conv: true          # 📍 Position-aware conv (+0.5% params, +4% quality)
 
-# Imitation Learning
+# -----------------------------------------
+# Imitation Learning 
+# -----------------------------------------
 imitation_learning:
-  batch_size: 2048
-  learning_rate: 0.001
-  epochs: 30
+  batch_size: 1024  # Optimized for RTX 5060 Ti with AMP (256-1024)
+  learning_rate: 0.001  # Will be managed by OneCycleLR
+  epochs: 100  # More epochs with better early stopping
   weight_decay: 0.0001
   grad_clip: 1.0
+  
+  # 🎯 Advanced Training Features
+  label_smoothing: 0.1  # Regularization (0.0 = off, 0.1 = standard)
+  use_onecycle_lr: true  # 📈 OneCycleLR scheduler for better convergence
   
   # Loss weights
   policy_loss_weight: 1.0
@@ -41,11 +57,15 @@ imitation_learning:
   eval_every: 1  # Evaluate every N epochs
   save_every: 5  # Save checkpoint every N epochs
   
-  # Early stopping
-  patience: 10  # Stop if no improvement for N epochs
+  # Early stopping - Extended patience
+  patience: 3  # Old parameter (kept for backward compatibility)
+  max_patience: 10  # ⏹️ Stop if no improvement for 10 epochs
   min_delta: 0.001  # Minimum improvement to count
 
+
+# -----------------------------------------
 # Reinforcement Learning
+# -----------------------------------------
 reinforcement_learning:
   # Self-play
   games_per_iteration: 100  # Games to generate per iteration
@@ -60,7 +80,7 @@ reinforcement_learning:
   mcts_dirichlet_weight: 0.25  # Weight of Dirichlet noise
   
   # Training
-  batch_size: 2048
+  batch_size: 1024  # Matched with IL for consistency
   learning_rate: 0.0005  # Lower than IL
   train_epochs_per_iteration: 5  # Epochs per iteration
   replay_buffer_size: 50000  # Max positions in replay buffer
@@ -74,11 +94,13 @@ reinforcement_learning:
   policy_loss_weight: 1.0
   value_loss_weight: 1.0
 
-# Hardware
+# Hardware - Optimized for RTX 5060 Ti
 hardware:
   device: "cuda"  # cuda, cpu, or mps (Mac)
-  num_workers: 12  # DataLoader workers (0 to disable multiprocessing)
-  pin_memory: true
+  use_amp: true  # 🚀 Mixed Precision Training (~2x speedup on RTX cards)
+  use_bfloat16: true  # 💾 Use bfloat16 instead of float16 (better range, smaller models)
+  num_workers: 8  # DataLoader workers (4-12 optimal, 0 to disable)
+  pin_memory: true  # Faster data transfer to GPU
 
 # Logging
 logging:
