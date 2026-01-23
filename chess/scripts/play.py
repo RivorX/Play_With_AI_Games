@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 import pygame
 import os
+from datetime import datetime
 
 # Add src to path
 script_dir = Path(__file__).parent
@@ -77,12 +78,123 @@ def create_piece_surfaces():
     return pieces
 
 
+def load_model_from_checkpoint(checkpoint_path, config, device):
+    """Load model from checkpoint file"""
+    model = ChessNet(config).to(device)
+    
+    if checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"✓ Model loaded from {checkpoint_path.name}")
+        
+        # Display metadata if available
+        if 'val_policy_loss' in checkpoint:
+            print(f"  Val Loss: {checkpoint.get('loss', 'N/A'):.4f}")
+            print(f"  Policy Loss: {checkpoint['val_policy_loss']:.4f}")
+            print(f"  Value Loss: {checkpoint['val_value_loss']:.4f}")
+        elif 'win_rate' in checkpoint:
+            print(f"  Win Rate: {checkpoint['win_rate']:.2%}")
+    else:
+        print(f"⚠️  Model file not found: {checkpoint_path}")
+        print("Using untrained model!")
+    
+    model.eval()
+    return model
+
+
+def select_models(base_dir, config):
+    """Interactive model selection"""
+    models_dir = base_dir / config['paths']['models_dir']
+    
+    # Find all .pt files
+    all_models = list(models_dir.glob("*.pt"))
+    all_models.extend(models_dir.glob("IL/*.pt"))
+    all_models.extend(models_dir.glob("RL/*.pt"))
+    
+    if not all_models:
+        print("⚠️  No models found in models directory!")
+        return None, None, "human_vs_ai"
+    
+    # Sort by modification time (newest first)
+    all_models.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    
+    print("\n" + "="*70)
+    print("GAME MODE SELECTION")
+    print("="*70)
+    print("\n1. Human vs AI")
+    print("2. AI vs AI (Watch two models play)")
+    print("3. Human vs Human")
+    
+    mode_choice = input("\nSelect game mode (1-3): ").strip()
+    
+    if mode_choice == "3":
+        return None, None, "human_vs_human"
+    
+    game_mode = "ai_vs_ai" if mode_choice == "2" else "human_vs_ai"
+    
+    print("\n" + "="*70)
+    print("MODEL SELECTION")
+    print("="*70)
+    print("\nAvailable models:\n")
+    
+    for idx, model_path in enumerate(all_models, 1):
+        rel_path = model_path.relative_to(models_dir)
+        size_mb = model_path.stat().st_size / (1024 ** 2)
+        mod_time = model_path.stat().st_mtime
+        
+        # Format timestamp
+        timestamp = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M")
+        
+        print(f"{idx:2d}. {rel_path}")
+        print(f"    Size: {size_mb:.1f} MB | Modified: {timestamp}")
+    
+    # Select first model (or white in AI vs AI)
+    print(f"\n{'Select White AI model:' if game_mode == 'ai_vs_ai' else 'Select AI model:'}")
+    model1_idx = input(f"Enter number (1-{len(all_models)}): ").strip()
+    
+    try:
+        model1_idx = int(model1_idx) - 1
+        if model1_idx < 0 or model1_idx >= len(all_models):
+            print("Invalid selection!")
+            return None, None, game_mode
+    except ValueError:
+        print("Invalid input!")
+        return None, None, game_mode
+    
+    model1_path = all_models[model1_idx]
+    
+    # If AI vs AI, select second model
+    model2_path = None
+    if game_mode == "ai_vs_ai":
+        print("\nSelect Black AI model:")
+        model2_idx = input(f"Enter number (1-{len(all_models)}): ").strip()
+        
+        try:
+            model2_idx = int(model2_idx) - 1
+            if model2_idx < 0 or model2_idx >= len(all_models):
+                print("Invalid selection!")
+                return None, None, game_mode
+        except ValueError:
+            print("Invalid input!")
+            return None, None, game_mode
+        
+        model2_path = all_models[model2_idx]
+    
+    return model1_path, model2_path, game_mode
+
+
 class ChessGUI:
-    def __init__(self, model, config, device):
-        self.model = model
+    def __init__(self, model1, model2, config, device, game_mode="human_vs_ai"):
+        self.model1 = model1  # White AI or main AI
+        self.model2 = model2  # Black AI (for AI vs AI mode)
         self.config = config
         self.device = device
-        self.mcts = MCTS(model, config, device)
+        self.game_mode = game_mode  # "human_vs_ai", "ai_vs_ai", "human_vs_human"
+        
+        if model1:
+            self.mcts1 = MCTS(model1, config, device)
+        if model2:
+            self.mcts2 = MCTS(model2, config, device)
         
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption("Chess AI")
@@ -99,7 +211,7 @@ class ChessGUI:
         self.board = chess.Board()
         self.selected_square = None
         self.legal_moves = []
-        self.human_color = chess.WHITE
+        self.human_color = chess.WHITE  # Only used in human_vs_ai mode
         self.use_mcts = True
         self.ai_thinking = False
         self.game_over = False
@@ -217,22 +329,41 @@ class ChessGUI:
         pygame.draw.line(self.screen, (80, 80, 80), (x_start + 20, y), (x_start + SIDEBAR_WIDTH - 20, y), 2)
         y += 20
         
+        # Game mode info
+        if self.game_mode == "human_vs_ai":
+            mode_text = "Human vs AI"
+            you_text = f"You: {'White' if self.human_color == chess.WHITE else 'Black'}"
+        elif self.game_mode == "ai_vs_ai":
+            mode_text = "AI vs AI"
+            you_text = "Spectator Mode"
+        else:  # human_vs_human
+            mode_text = "Human vs Human"
+            you_text = "2 Player Mode"
+        
+        mode = self.small_font.render(mode_text, True, (150, 200, 255))
+        self.screen.blit(mode, (x_start + 20, y))
+        y += 25
+        
+        you = self.small_font.render(you_text, True, TEXT_COLOR)
+        self.screen.blit(you, (x_start + 20, y))
+        y += 35
+        
         # Game info
         turn_text = "White's turn" if self.board.turn == chess.WHITE else "Black's turn"
-        turn_color = (255, 255, 200) if self.board.turn == self.human_color else (200, 200, 255)
+        
+        if self.game_mode == "human_vs_ai":
+            turn_color = (255, 255, 200) if self.board.turn == self.human_color else (200, 200, 255)
+        else:
+            turn_color = (255, 255, 200) if self.board.turn == chess.WHITE else (200, 200, 255)
+        
         turn = self.text_font.render(turn_text, True, turn_color)
         self.screen.blit(turn, (x_start + 20, y))
         y += 40
         
-        you_text = f"You: {'White' if self.human_color == chess.WHITE else 'Black'}"
-        you = self.small_font.render(you_text, True, TEXT_COLOR)
-        self.screen.blit(you, (x_start + 20, y))
-        y += 30
-        
-        mode = "MCTS" if self.use_mcts else "Network"
-        ai_mode = self.small_font.render(f"AI Mode: {mode}", True, TEXT_COLOR)
-        self.screen.blit(ai_mode, (x_start + 20, y))
-        y += 40
+        if self.game_mode == "human_vs_ai" and self.model1:
+            ai_mode = self.small_font.render(f"AI Mode: {'MCTS' if self.use_mcts else 'Network'}", True, TEXT_COLOR)
+            self.screen.blit(ai_mode, (x_start + 20, y))
+            y += 30
         
         # AI status
         if self.ai_thinking:
@@ -300,11 +431,11 @@ class ChessGUI:
         self.screen.blit(controls_title, (x_start + 20, y))
         y += 25
         
-        controls = [
-            "R - Restart game",
-            "F - Flip board",
-            "M - Toggle MCTS"
-        ]
+        controls = ["R - Restart game", "F - Flip board"]
+        
+        if self.game_mode == "human_vs_ai":
+            controls.append("M - Toggle MCTS")
+        
         for control in controls:
             text = self.small_font.render(control, True, (120, 120, 120))
             self.screen.blit(text, (x_start + 20, y))
@@ -315,7 +446,12 @@ class ChessGUI:
         if self.game_over or self.ai_thinking:
             return
         
-        if self.board.turn != self.human_color:
+        # In AI vs AI mode, no human interaction
+        if self.game_mode == "ai_vs_ai":
+            return
+        
+        # In human vs AI mode, check if it's human's turn
+        if self.game_mode == "human_vs_ai" and self.board.turn != self.human_color:
             return
         
         square = self.coords_to_square(pos[0], pos[1])
@@ -356,23 +492,39 @@ class ChessGUI:
     
     def ai_move(self):
         """Make AI move"""
-        if self.board.turn == self.human_color or self.game_over:
+        # In human vs human mode, no AI moves
+        if self.game_mode == "human_vs_human":
+            return
+        
+        # In human vs AI mode, check if it's AI's turn
+        if self.game_mode == "human_vs_ai" and self.board.turn == self.human_color:
+            return
+        
+        if self.game_over:
             return
         
         if not self.ai_thinking:
             self.ai_thinking = True
             return
         
+        # Select the appropriate model
+        if self.game_mode == "ai_vs_ai":
+            current_model = self.model1 if self.board.turn == chess.WHITE else self.model2
+            current_mcts = self.mcts1 if self.board.turn == chess.WHITE else self.mcts2
+        else:  # human_vs_ai
+            current_model = self.model1
+            current_mcts = self.mcts1
+        
         # Get AI move
         if self.use_mcts:
-            visit_counts = self.mcts.search(
+            visit_counts = current_mcts.search(
                 self.board, 
                 self.config['reinforcement_learning']['mcts_simulations']
             )
             move, _ = select_move_by_visits(visit_counts, temperature=0)
         else:
             board_tensor = torch.FloatTensor(board_to_tensor(self.board)).unsqueeze(0).to(self.device)
-            policy, _ = self.model.predict(board_tensor)
+            policy, _ = current_model.predict(board_tensor)
             
             best_score = -1
             best_move = None
@@ -422,11 +574,12 @@ class ChessGUI:
                         self.restart_game()
                     elif event.key == pygame.K_f:
                         self.flipped = not self.flipped
-                    elif event.key == pygame.K_m:
+                    elif event.key == pygame.K_m and self.game_mode == "human_vs_ai":
                         self.use_mcts = not self.use_mcts
             
             # AI move
-            if not self.game_over and self.board.turn != self.human_color:
+            if not self.game_over and (self.game_mode == "ai_vs_ai" or 
+                                        (self.game_mode == "human_vs_ai" and self.board.turn != self.human_color)):
                 self.ai_move()
             
             # Draw everything
@@ -451,22 +604,29 @@ def main():
     device = torch.device(config['hardware']['device'])
     print(f"Using device: {device}")
     
-    # Load model
-    print("Loading model...")
-    model = ChessNet(config).to(device)
-    
     base_dir = script_dir.parent
-    model_path = base_dir / config['paths']['best_model']
     
-    if model_path.exists():
-        checkpoint = torch.load(model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Model loaded from {model_path}")
-    else:
-        print(f"Warning: No model found at {model_path}")
-        print("Using untrained model!")
+    # Select models and game mode
+    model1_path, model2_path, game_mode = select_models(base_dir, config)
     
-    model.eval()
+    if game_mode in ["human_vs_ai", "ai_vs_ai"]:
+        if model1_path is None:
+            print("⚠️  No model selected. Exiting.")
+            return
+        
+        # Load models
+        print("\nLoading models...")
+        model1 = load_model_from_checkpoint(model1_path, config, device)
+        
+        model2 = None
+        if game_mode == "ai_vs_ai":
+            if model2_path is None:
+                print("⚠️  No second model selected. Exiting.")
+                return
+            model2 = load_model_from_checkpoint(model2_path, config, device)
+    else:  # human_vs_human
+        model1 = None
+        model2 = None
     
     # Start GUI
     print("\n" + "="*50)
@@ -476,23 +636,31 @@ def main():
     print("  • Click to select and move pieces")
     print("  • R - Restart game")
     print("  • F - Flip board")
-    print("  • M - Toggle MCTS on/off")
+    if game_mode == "human_vs_ai":
+        print("  • M - Toggle MCTS on/off")
     print()
     
-    gui = ChessGUI(model, config, device)
+    gui = ChessGUI(model1, model2, config, device, game_mode)
     
-    # Choose color
-    print("Choose your color:")
-    print("  1. White (you start)")
-    print("  2. Black (AI starts)")
-    choice = input("Enter choice (1/2): ").strip()
-    
-    if choice == '2':
-        gui.human_color = chess.BLACK
-        gui.flipped = True
-        print("\nYou are playing as Black!")
+    # Choose color (only for human vs AI)
+    if game_mode == "human_vs_ai":
+        print("Choose your color:")
+        print("  1. White (you start)")
+        print("  2. Black (AI starts)")
+        choice = input("Enter choice (1/2): ").strip()
+        
+        if choice == '2':
+            gui.human_color = chess.BLACK
+            gui.flipped = True
+            print("\nYou are playing as Black!")
+        else:
+            print("\nYou are playing as White!")
+    elif game_mode == "ai_vs_ai":
+        print("\nWatching AI vs AI match...")
+        print(f"White: {model1_path.name}")
+        print(f"Black: {model2_path.name}")
     else:
-        print("\nYou are playing as White!")
+        print("\n2-Player mode activated!")
     
     print("\nStarting game... Good luck! 🎮\n")
     

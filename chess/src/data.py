@@ -10,7 +10,7 @@ from tqdm import tqdm
 import gc
 import struct
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 
 
 def board_to_tensor(board):
@@ -43,15 +43,8 @@ def board_to_tensor(board):
 def board_to_compact(board):
     """
     Convert board to ultra-compact binary representation
-    Each position: 64 squares × 4 bits (16 piece types: empty + 6×2 colors + padding)
-    = 32 bytes per position (vs 3072 bytes for tensor!)
-    
-    Piece encoding:
-    0 = empty
-    1-6 = white pieces (pawn, knight, bishop, rook, queen, king)
-    7-12 = black pieces (pawn, knight, bishop, rook, queen, king)
+    Each position: 64 squares × 4 bits = 32 bytes
     """
-    # Pack two squares per byte (4 bits each)
     piece_to_code = {
         (chess.PAWN, chess.WHITE): 1,
         (chess.KNIGHT, chess.WHITE): 2,
@@ -88,7 +81,6 @@ def compact_to_tensor(compact_board):
     """Convert compact representation back to tensor"""
     tensor = np.zeros((12, 8, 8), dtype=np.float32)
     
-    # Unpack
     for i in range(32):
         byte = compact_board[i]
         code1 = (byte >> 4) & 0x0F
@@ -104,9 +96,9 @@ def compact_to_tensor(compact_board):
             row = square // 8
             col = square % 8
             
-            if 1 <= code <= 6:  # White pieces
+            if 1 <= code <= 6:
                 channel = code - 1
-            else:  # Black pieces (7-12)
+            else:
                 channel = code - 1
             
             tensor[channel, row, col] = 1.0
@@ -115,102 +107,15 @@ def compact_to_tensor(compact_board):
 
 
 def move_to_index(move):
-    """Convert chess.Move to index (0-4095) for from_square*64 + to_square"""
+    """Convert chess.Move to index (0-4095)"""
     return move.from_square * 64 + move.to_square
 
 
 def index_to_move(index):
-    """Convert index back to move (for decoding predictions)"""
+    """Convert index back to move"""
     from_square = index // 64
     to_square = index % 64
     return chess.Move(from_square, to_square)
-
-
-def process_game(game, min_elo, max_moves):
-    """
-    Process a single chess.pgn.Game object
-    Returns list of compact positions
-    """
-    try:
-        if game is None:
-            return []
-        
-        # Filter by Elo
-        white_elo = game.headers.get('WhiteElo', '?')
-        black_elo = game.headers.get('BlackElo', '?')
-        
-        if white_elo == '?' or black_elo == '?':
-            return []
-        
-        try:
-            white_elo_int = int(white_elo)
-            black_elo_int = int(black_elo)
-            
-            if white_elo_int < min_elo or black_elo_int < min_elo:
-                return []
-        except (ValueError, TypeError):
-            return []
-        
-        # Get outcome
-        result = game.headers.get('Result', '*')
-        if result == '1-0':
-            outcome = 1.0
-        elif result == '0-1':
-            outcome = -1.0
-        elif result == '1/2-1/2':
-            outcome = 0.0
-        else:
-            return []
-        
-        # Extract positions as compact format
-        data = []
-        board = game.board()
-        move_count = 0
-        
-        for move in game.mainline_moves():
-            if move_count >= max_moves:
-                break
-            
-            # Store in ultra-compact format
-            compact_board = board_to_compact(board)
-            move_index = np.uint16(move_to_index(move))
-            current_outcome = outcome if board.turn == chess.WHITE else -outcome
-            
-            # Store as: 32 bytes (board) + 2 bytes (move) + 4 bytes (outcome) = 38 bytes total
-            data.append((compact_board, move_index, np.float32(current_outcome)))
-            
-            board.push(move)
-            move_count += 1
-        
-        return data
-    
-    except Exception:
-        return []
-
-
-class BinaryDataWriter:
-    """Write positions to binary file for maximum compression"""
-    
-    def __init__(self, filepath):
-        self.filepath = filepath
-        self.file = open(filepath, 'wb')
-        self.count = 0
-    
-    def write_position(self, compact_board, move_index, outcome):
-        """Write one position (38 bytes total)"""
-        self.file.write(compact_board)  # 32 bytes
-        self.file.write(struct.pack('H', move_index))  # 2 bytes (unsigned short)
-        self.file.write(struct.pack('f', outcome))  # 4 bytes (float)
-        self.count += 1
-    
-    def close(self):
-        self.file.close()
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        self.close()
 
 
 def extract_game_data(game):
@@ -219,12 +124,10 @@ def extract_game_data(game):
         if game is None:
             return None
         
-        # Extract headers
         white_elo = game.headers.get('WhiteElo', '?')
         black_elo = game.headers.get('BlackElo', '?')
         result = game.headers.get('Result', '*')
         
-        # Extract moves as UCI strings
         moves = []
         for move in game.mainline_moves():
             moves.append(move.uci())
@@ -240,12 +143,11 @@ def extract_game_data(game):
 
 
 def process_extracted_game(game_data, min_elo, max_moves):
-    """Process extracted game data (serializable)"""
+    """Process extracted game data"""
     try:
         if game_data is None:
             return []
         
-        # Filter by Elo
         white_elo = game_data['white_elo']
         black_elo = game_data['black_elo']
         
@@ -261,7 +163,6 @@ def process_extracted_game(game_data, min_elo, max_moves):
         except (ValueError, TypeError):
             return []
         
-        # Get outcome
         result = game_data['result']
         if result == '1-0':
             outcome = 1.0
@@ -272,7 +173,6 @@ def process_extracted_game(game_data, min_elo, max_moves):
         else:
             return []
         
-        # Replay game and extract positions
         data = []
         board = chess.Board()
         move_count = 0
@@ -284,7 +184,6 @@ def process_extracted_game(game_data, min_elo, max_moves):
             try:
                 move = chess.Move.from_uci(move_uci)
                 
-                # Store position before move
                 compact_board = board_to_compact(board)
                 move_index = np.uint16(move_to_index(move))
                 current_outcome = outcome if board.turn == chess.WHITE else -outcome
@@ -313,82 +212,110 @@ def process_game_batch(args):
     return all_positions
 
 
-def parse_pgn_file_to_binary(pgn_path, output_path, config, num_workers=None):
+class BinaryDataWriter:
+    """Write positions to binary file for maximum compression"""
+    
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.file = open(filepath, 'wb')
+        self.count = 0
+    
+    def write_position(self, compact_board, move_index, outcome):
+        """Write one position (38 bytes total)"""
+        self.file.write(compact_board)  # 32 bytes
+        self.file.write(struct.pack('H', move_index))  # 2 bytes
+        self.file.write(struct.pack('f', outcome))  # 4 bytes
+        self.count += 1
+    
+    def close(self):
+        self.file.close()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        self.close()
+
+
+def parse_single_pgn_file(args):
     """
-    Parse PGN file directly to binary format with parallel processing
-    Returns: number of positions written
+    🚀 Process a single PGN file - designed for parallel execution
+    Returns: (filename, positions_count, output_path)
     """
-    import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    pgn_path, output_path, min_elo, max_games, max_moves, file_index, select_top, sort_by_elo = args
     
-    min_elo = config['data']['min_elo']
-    max_games = config['data']['max_games']
-    max_moves = config['data']['max_moves_per_game']
+    print(f"[Worker {file_index}] Processing: {pgn_path.name}")
     
-    # Use all available cores
-    if num_workers is None:
-        num_workers = mp.cpu_count()
-    
-    print(f"Reading PGN file: {pgn_path}")
-    print(f"Writing to: {output_path}")
-    print(f"Using {num_workers} worker processes")
-    
-    # First pass: extract serializable data from games
-    print("Extracting game data from PGN...")
+    # Extract ALL games that meet min_elo threshold
     games_data = []
     with open(pgn_path, 'r', encoding='utf-8', errors='ignore') as f:
-        pbar = tqdm(desc="Extracting", total=max_games)
-        for _ in range(max_games):
+        while True:
             game = chess.pgn.read_game(f)
             if game is None:
                 break
             
             game_data = extract_game_data(game)
             if game_data:
-                games_data.append(game_data)
-            
-            pbar.update(1)
-        pbar.close()
+                # Check min_elo threshold
+                try:
+                    white_elo = int(game_data['white_elo']) if game_data['white_elo'] != '?' else 0
+                    black_elo = int(game_data['black_elo']) if game_data['black_elo'] != '?' else 0
+                    
+                    if white_elo >= min_elo and black_elo >= min_elo:
+                        # Store with average Elo for sorting
+                        avg_elo = (white_elo + black_elo) / 2
+                        games_data.append((game_data, avg_elo))
+                except (ValueError, TypeError):
+                    pass
     
-    print(f"Extracted {len(games_data)} games")
+    print(f"[Worker {file_index}] Extracted {len(games_data)} games (Elo >= {min_elo}) from {pgn_path.name}")
     
-    # Split games into batches for parallel processing
-    batch_size = max(1, len(games_data) // (num_workers * 4))  # 4 batches per worker
+    # 🎯 Sort by Elo and select top games
+    if select_top and sort_by_elo and len(games_data) > 0:
+        print(f"[Worker {file_index}] Sorting by average Elo...")
+        games_data.sort(key=lambda x: x[1], reverse=True)  # Highest Elo first
+        
+        # Take top N games
+        games_to_process = min(max_games, len(games_data))
+        games_data = games_data[:games_to_process]
+        
+        if len(games_data) > 0:
+            top_elo = games_data[0][1]
+            bottom_elo = games_data[-1][1]
+            print(f"[Worker {file_index}] Selected top {len(games_data)} games (Elo range: {bottom_elo:.0f}-{top_elo:.0f})")
+    
+    # Extract just the game_data (without Elo)
+    games_data = [g[0] for g in games_data]
+    
+    # Process games in batches (using multiprocessing within this file)
+    batch_size = max(1, len(games_data) // (mp.cpu_count() * 2))
     batches = []
     for i in range(0, len(games_data), batch_size):
         batch = games_data[i:i + batch_size]
         batches.append((batch, min_elo, max_moves))
     
-    print(f"Processing {len(batches)} batches with {num_workers} workers...")
-    
-    # Process batches in parallel
     all_positions = []
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+    with ProcessPoolExecutor(max_workers=mp.cpu_count()) as executor:
         futures = [executor.submit(process_game_batch, batch) for batch in batches]
         
-        pbar = tqdm(desc="Processing", total=len(batches))
         for future in as_completed(futures):
             positions = future.result()
             all_positions.extend(positions)
-            pbar.update(1)
-        pbar.close()
     
-    # Write all positions to binary file
-    print(f"Writing {len(all_positions)} positions to disk...")
+    # Write to binary file
     with BinaryDataWriter(output_path) as writer:
-        for compact_board, move_index, outcome in tqdm(all_positions, desc="Writing"):
+        for compact_board, move_index, outcome in all_positions:
             writer.write_position(compact_board, move_index, outcome)
     
-    print(f"Processed {len(games_data)} games")
-    print(f"Valid positions: {len(all_positions)}")
-    print(f"File size: {output_path.stat().st_size / (1024**2):.2f} MB")
+    print(f"[Worker {file_index}] ✓ {pgn_path.name}: {len(all_positions)} positions → {output_path.name}")
     
-    return len(all_positions)
+    return pgn_path.name, len(all_positions), output_path
 
 
 def parse_pgn_files(data_dir, config, num_workers=None):
     """
-    Parse PGN files to binary format with memory mapping support
+    🚀 Parse multiple PGN files in parallel - one process per file
+    Extracts ALL games above min_elo, sorts by Elo, then takes top max_games
     Returns: metadata dict
     """
     script_dir = Path(__file__).parent.parent
@@ -396,92 +323,150 @@ def parse_pgn_files(data_dir, config, num_workers=None):
     preprocessing_dir = script_dir / "data" / "preprocessing"
     preprocessing_dir.mkdir(parents=True, exist_ok=True)
     
-    pgn_files = list(data_path.glob("*.pgn"))
+    pgn_files = sorted(list(data_path.glob("*.pgn")))
     
     if not pgn_files:
         raise FileNotFoundError(f"No PGN files found in {data_path}")
     
-    print(f"Found {len(pgn_files)} PGN file(s): {[f.name for f in pgn_files]}")
+    print(f"\n{'='*70}")
+    print(f"Found {len(pgn_files)} PGN file(s):")
+    for pgn in pgn_files:
+        size_mb = pgn.stat().st_size / (1024**2)
+        print(f"  • {pgn.name} ({size_mb:.1f} MB)")
+    print(f"{'='*70}\n")
     
     min_elo = config['data']['min_elo']
     max_games = config['data']['max_games']
     max_moves = config['data']['max_moves_per_game']
+    select_top = config['data'].get('select_top_games', True)
+    sort_by_elo = config['data'].get('sort_by_avg_elo', True)
     
-    binary_file = preprocessing_dir / f"positions_elo{min_elo}_games{max_games}_moves{max_moves}.bin"
-    metadata_file = preprocessing_dir / f"positions_elo{min_elo}_games{max_games}_moves{max_moves}_meta.pkl"
+    # Cache filename includes selection strategy
+    cache_suffix = f"_top{max_games}" if select_top else f"_first{max_games}"
+    binary_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}.bin"
+    metadata_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}_meta.pkl"
     
-    # Check if cache exists
+    # Check cache
     if binary_file.exists() and metadata_file.exists():
-        print(f"Loading from cache: {binary_file}")
+        print(f"📦 Loading from cache: {binary_file.name}")
         try:
             with open(metadata_file, 'rb') as f:
                 metadata = pickle.load(f)
             
             if metadata['total_positions'] > 0:
-                print(f"Loaded metadata: {metadata['total_positions']} positions")
-                print(f"File size: {binary_file.stat().st_size / (1024**2):.2f} MB")
+                size_mb = binary_file.stat().st_size / (1024**2)
+                print(f"✓ Loaded {metadata['total_positions']:,} positions ({size_mb:.1f} MB)")
                 return metadata
         except Exception as e:
-            print(f"Failed to load cache: {e}")
+            print(f"⚠️  Failed to load cache: {e}")
+            print("Will reprocess PGN files...")
     
-    # Process PGN files
-    print("\nProcessing PGN files to binary format...")
+    # Parallel processing configuration
+    use_parallel = config['data'].get('parallel_pgn_processing', True)
+    max_parallel_workers = config['data'].get('max_workers', None)
     
-    total_positions = 0
+    if max_parallel_workers is None:
+        max_parallel_workers = len(pgn_files)  # One worker per file
+    
     games_per_file = max_games // len(pgn_files) if len(pgn_files) > 1 else max_games
     
-    # Create temporary files for each PGN
-    temp_files = []
-    for idx, pgn_file in enumerate(pgn_files):
-        print(f"\nProcessing: {pgn_file.name}")
-        
-        temp_output = preprocessing_dir / f"temp_{idx}.bin"
-        
-        file_config = config.copy()
-        file_config['data'] = config['data'].copy()
-        file_config['data']['max_games'] = games_per_file
-        
-        positions_count = parse_pgn_file_to_binary(
-            pgn_file, temp_output, file_config, 
-            num_workers=num_workers
-        )
-        total_positions += positions_count
-        temp_files.append(temp_output)
-        
-        gc.collect()
+    print(f"🚀 Processing Configuration:")
+    print(f"  • Parallel processing: {'ENABLED' if use_parallel else 'DISABLED'}")
+    print(f"  • Workers: {max_parallel_workers if use_parallel else 1}")
+    print(f"  • Strategy: {'TOP games by Elo' if select_top else 'FIRST games found'}")
+    print(f"  • Min Elo: {min_elo}")
+    print(f"  • Target games per file: {games_per_file:,}")
+    print()
     
-    # Merge temporary files into one
-    if len(temp_files) > 1:
-        print("\nMerging files...")
-        with open(binary_file, 'wb') as outfile:
-            for temp_file in temp_files:
-                with open(temp_file, 'rb') as infile:
-                    outfile.write(infile.read())
-                temp_file.unlink()  # Delete temp file
+    # Prepare tasks for parallel processing
+    tasks = []
+    temp_files = []
+    
+    for idx, pgn_file in enumerate(pgn_files):
+        temp_output = preprocessing_dir / f"temp_{idx}_{pgn_file.stem}.bin"
+        temp_files.append(temp_output)
+        tasks.append((
+            pgn_file,           # pgn_path
+            temp_output,        # output_path
+            min_elo,            # min_elo
+            games_per_file,     # max_games (per file)
+            max_moves,          # max_moves
+            idx,                # file_index
+            select_top,         # select_top_games
+            sort_by_elo         # sort_by_avg_elo
+        ))
+    
+    # Process files
+    results = []
+    total_positions = 0
+    
+    if use_parallel and len(pgn_files) > 1:
+        # 🚀 PARALLEL: Process multiple PGN files simultaneously
+        print(f"🚀 Processing {len(pgn_files)} PGN files in parallel...\n")
+        
+        with ProcessPoolExecutor(max_workers=max_parallel_workers) as executor:
+            futures = [executor.submit(parse_single_pgn_file, task) for task in tasks]
+            
+            # Progress bar
+            pbar = tqdm(total=len(futures), desc="Processing PGN files")
+            
+            for future in as_completed(futures):
+                filename, positions_count, output_path = future.result()
+                results.append((filename, positions_count, output_path))
+                total_positions += positions_count
+                pbar.update(1)
+            
+            pbar.close()
     else:
-        temp_files[0].rename(binary_file)
+        # Sequential processing (for single file or if parallel disabled)
+        print(f"Processing PGN files sequentially...\n")
+        
+        for task in tasks:
+            filename, positions_count, output_path = parse_single_pgn_file(task)
+            results.append((filename, positions_count, output_path))
+            total_positions += positions_count
+    
+    # Summary
+    print(f"\n{'='*70}")
+    print("Processing Summary:")
+    for filename, positions_count, _ in sorted(results, key=lambda x: x[1], reverse=True):
+        print(f"  • {filename}: {positions_count:,} positions")
+    print(f"{'='*70}")
+    print(f"Total: {total_positions:,} positions\n")
     
     if total_positions == 0:
-        print("\n" + "="*60)
-        print("WARNING: No positions extracted!")
-        print("="*60)
+        print("⚠️  WARNING: No positions extracted!")
         return {'binary_file': str(binary_file), 'total_positions': 0}
+    
+    # Merge temporary files
+    if len(temp_files) > 1:
+        print("📦 Merging binary files...")
+        with open(binary_file, 'wb') as outfile:
+            for temp_file in tqdm(temp_files, desc="Merging"):
+                if temp_file.exists():
+                    with open(temp_file, 'rb') as infile:
+                        outfile.write(infile.read())
+                    temp_file.unlink()
+    else:
+        if temp_files[0].exists():
+            temp_files[0].rename(binary_file)
     
     # Save metadata
     metadata = {
         'binary_file': str(binary_file),
         'total_positions': total_positions,
-        'position_size': 38  # bytes per position
+        'position_size': 38
     }
     
-    print(f"\nSaving metadata: {metadata_file}")
     with open(metadata_file, 'wb') as f:
         pickle.dump(metadata, f)
     
     final_size_mb = binary_file.stat().st_size / (1024**2)
-    print(f"Total: {total_positions} positions")
-    print(f"Final file size: {final_size_mb:.2f} MB")
-    print(f"Compression: {100 * (1 - final_size_mb / (total_positions * 3072 / 1024**2)):.1f}% saved")
+    compression_ratio = 100 * (1 - final_size_mb / (total_positions * 3072 / 1024**2))
+    
+    print(f"✓ Final file: {binary_file.name}")
+    print(f"✓ Size: {final_size_mb:.1f} MB")
+    print(f"✓ Compression: {compression_ratio:.1f}% saved vs raw tensors")
     
     return metadata
 
@@ -490,17 +475,9 @@ class BinaryChessDataset(Dataset):
     """Memory-mapped binary dataset - no RAM needed!"""
     
     def __init__(self, binary_file, indices, position_size=38):
-        """
-        Args:
-            binary_file: path to binary data file
-            indices: list of position indices for this split
-            position_size: bytes per position (38)
-        """
         self.binary_file = binary_file
         self.indices = indices
         self.position_size = position_size
-        
-        # Don't open file here - will be opened per worker
         self._mmap = None
         self._file = None
     
@@ -515,23 +492,16 @@ class BinaryChessDataset(Dataset):
         return len(self.indices)
     
     def __getitem__(self, idx):
-        # Ensure mmap is open in this worker
         self._ensure_mmap()
         
         position_idx = self.indices[idx]
-        
-        # Seek to position in file
         offset = position_idx * self.position_size
-        
-        # Read 38 bytes
         data = self._mmap[offset:offset + self.position_size]
         
-        # Parse: 32 bytes (board) + 2 bytes (move) + 4 bytes (outcome)
         compact_board = data[:32]
         move_index = struct.unpack('H', data[32:34])[0]
         outcome = struct.unpack('f', data[34:38])[0]
         
-        # Convert compact board to tensor
         board_tensor = compact_to_tensor(compact_board)
         
         return (
@@ -541,7 +511,6 @@ class BinaryChessDataset(Dataset):
         )
     
     def __del__(self):
-        """Clean up when dataset is destroyed"""
         if self._mmap is not None:
             self._mmap.close()
         if self._file is not None:
@@ -555,29 +524,26 @@ def create_dataloaders(metadata, config):
         raise ValueError("Cannot create dataloaders with 0 positions.")
     
     total_positions = metadata['total_positions']
-    
-    # Create indices
     all_indices = list(range(total_positions))
     
     # Split
     split_idx = int(len(all_indices) * config['data']['train_split'])
-    
-    if split_idx == 0:
-        split_idx = 1
-    if split_idx >= len(all_indices):
-        split_idx = len(all_indices) - 1
+    split_idx = max(1, min(split_idx, len(all_indices) - 1))
     
     train_indices = all_indices[:split_idx]
     val_indices = all_indices[split_idx:]
     
-    print(f"Train dataset: {len(train_indices)} positions")
-    print(f"Val dataset: {len(val_indices)} positions")
+    print(f"📊 Dataset split:")
+    print(f"  • Train: {len(train_indices):,} positions")
+    print(f"  • Val: {len(val_indices):,} positions")
     
-    # Create datasets (memory-mapped, no RAM!)
+    # Create datasets
     train_dataset = BinaryChessDataset(metadata['binary_file'], train_indices)
     val_dataset = BinaryChessDataset(metadata['binary_file'], val_indices)
     
-    # Create dataloaders
+    # Dataloaders
+    prefetch_factor = 4
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['imitation_learning']['batch_size'],
@@ -585,7 +551,7 @@ def create_dataloaders(metadata, config):
         num_workers=config['hardware']['num_workers'],
         pin_memory=config['hardware']['pin_memory'],
         persistent_workers=True if config['hardware']['num_workers'] > 0 else False,
-        prefetch_factor=2 if config['hardware']['num_workers'] > 0 else None
+        prefetch_factor=prefetch_factor if config['hardware']['num_workers'] > 0 else None
     )
     
     val_loader = DataLoader(
@@ -595,7 +561,9 @@ def create_dataloaders(metadata, config):
         num_workers=config['hardware']['num_workers'],
         pin_memory=config['hardware']['pin_memory'],
         persistent_workers=True if config['hardware']['num_workers'] > 0 else False,
-        prefetch_factor=2 if config['hardware']['num_workers'] > 0 else None
+        prefetch_factor=prefetch_factor if config['hardware']['num_workers'] > 0 else None
     )
+    
+    print(f"✓ DataLoaders created (prefetch_factor={prefetch_factor})")
     
     return train_loader, val_loader

@@ -1,112 +1,146 @@
-# Chess AI Training Configuration - Enhanced Edition
-# Optimized for RTX 5060 Ti with AMP, SE-Blocks, OneCycleLR, and Label Smoothing
+# ==============================================================================
+# CHESS AI CONFIGURATION
+# ==============================================================================
 
-# Paths (relative to project root)
+# ------------------------------------------------------------------------------
+# FILE PATHS
+# ------------------------------------------------------------------------------
 paths:
   data_dir: "data"
   models_dir: "models"
   logs_dir: "logs"
-  best_model: "models/best_model.pt"
-  il_checkpoint: "models/il_checkpoint.pt"
-  rl_checkpoint: "models/rl_checkpoint.pt"
+  
+  # Best models (single file, overwritten when improved)
+  best_model_il: "models/best_model_il.pt"
+  best_model_rl: "models/best_model_rl.pt"
+  
+  # Checkpoint directories (saved every N epochs/iterations)
+  il_checkpoints_dir: "models/IL"
+  rl_checkpoints_dir: "models/RL"
 
-# Data Processing
+
+# ------------------------------------------------------------------------------
+# DATA PROCESSING
+# ------------------------------------------------------------------------------
 data:
-  min_elo: 2000  # Minimum Elo rating for games
-  max_games: 100000  # Maximum number of games to load (divided among PGN files)
-  train_split: 0.9  # Train/validation split
-  max_moves_per_game: 200  # Skip longer games
+  min_elo: 1800              # Minimum Elo rating for games (lowered for more data)
+  max_games: 100000          # Top N games to use (sorted by avg Elo, best first)
+  train_split: 0.9           # Train/validation split ratio
+  max_moves_per_game: 200    # Skip longer games
   
+  # Quality filtering
+  select_top_games: true     # Sort by Elo and take top max_games (higher quality)
+  sort_by_avg_elo: true      # Sort by average Elo of both players
+  
+  # Parallel processing (one process per PGN file)
+  parallel_pgn_processing: true   # Process multiple PGN files in parallel
+  max_workers: null               # null = auto-detect CPU count, or set manually
 
 
-# Model Architecture - Enhanced with Multiple Attention Mechanisms
+# ------------------------------------------------------------------------------
+# MODEL ARCHITECTURE
+# ------------------------------------------------------------------------------
 model:
-  num_residual_blocks: 8  # Increased for better learning (6-12 optimal)
-  filters: 192  # More filters for RTX 5060 Ti (128-256)
-  policy_head_filters: 32  # Increased from 2
-  value_head_filters: 32  # Increased from 1
-  value_hidden_dim: 256
-  dropout: 0.3
+  # Base architecture
+  num_residual_blocks: 10     # Number of residual blocks (6-12 optimal)
+  filters: 192               # Convolutional filters (128-256 for RTX 5060 Ti)
+  policy_head_filters: 32    # Policy head filters
+  value_head_filters: 32     # Value head filters
+  value_hidden_dim: 256      # Value head hidden dimension
+  dropout: 0.3               # Dropout rate
   
-  # 🚀 Advanced Features (minimal parameter cost, big gains!)
+  # Advanced features (minimal params, significant quality gains)
   use_se_blocks: true           # 🧠 Channel attention (+5% params, +20% quality)
   use_spatial_attention: true   # 👁️ Spatial attention (+1% params, +6% quality)
   drop_path_rate: 0.1           # 🎲 Stochastic Depth (0% params, +4% quality)
   activation: 'elu'             # ⚡ ELU activation (0% params, +3% quality)
-  use_coord_conv: true          # 📍 Position-aware conv (+0.5% params, +4% quality)
+  use_coord_conv: true          # 🗺️ Position-aware conv (+0.5% params, +4% quality)
 
-# -----------------------------------------
-# Imitation Learning 
-# -----------------------------------------
+
+# ------------------------------------------------------------------------------
+# IMITATION LEARNING (IL)
+# ------------------------------------------------------------------------------
 imitation_learning:
-  batch_size: 1024  # Optimized for RTX 5060 Ti with AMP (256-1024)
-  learning_rate: 0.001  # Will be managed by OneCycleLR
-  epochs: 100  # More epochs with better early stopping
-  weight_decay: 0.0001
-  grad_clip: 1.0
+  # Training hyperparameters
+  batch_size: 4096           # Batch size (doubled for better GPU utilization)
+  learning_rate: 0.0014      # Learning rate (scaled with batch size)
+  epochs: 100                # Maximum training epochs
+  weight_decay: 0.0001       # L2 regularization
+  grad_clip: 1.0             # Gradient clipping threshold
   
-  # 🎯 Advanced Training Features
-  label_smoothing: 0.1  # Regularization (0.0 = off, 0.1 = standard)
-  use_onecycle_lr: true  # 📈 OneCycleLR scheduler for better convergence
+  # Advanced training features
+  label_smoothing: 0.1       # Label smoothing (0.0 = off, 0.1 = standard)
+  use_onecycle_lr: true      # 📈 OneCycleLR scheduler for better convergence
   
   # Loss weights
-  policy_loss_weight: 1.0
-  value_loss_weight: 0.5
+  policy_loss_weight: 1.0    # Policy loss weight
+  value_loss_weight: 0.5     # Value loss weight
   
-  # Evaluation
-  eval_every: 1  # Evaluate every N epochs
-  save_every: 5  # Save checkpoint every N epochs
+  # Evaluation & checkpointing
+  eval_every: 1              # Evaluate every N epochs
+  checkpoint_every: 5        # Save checkpoint every N epochs
   
-  # Early stopping - Extended patience
-  patience: 3  # Old parameter (kept for backward compatibility)
-  max_patience: 10  # ⏹️ Stop if no improvement for 10 epochs
-  min_delta: 0.001  # Minimum improvement to count
+  # Early stopping
+  max_patience: 15           # ℹ️ Stop if no improvement for N epochs
+  min_delta: 0.001           # Minimum improvement threshold
 
 
-# -----------------------------------------
-# Reinforcement Learning
-# -----------------------------------------
+# ------------------------------------------------------------------------------
+# REINFORCEMENT LEARNING (RL)
+# ------------------------------------------------------------------------------
 reinforcement_learning:
-  # Self-play
-  games_per_iteration: 100  # Games to generate per iteration
-  iterations: 1000  # Total RL iterations
+  # Self-play configuration
+  games_per_iteration: 100   # Games to generate per iteration
+  iterations: 1000           # Total RL iterations
   
   # MCTS parameters
-  mcts_simulations: 100  # Number of MCTS simulations per move
-  mcts_c_puct: 1.5  # Exploration constant
-  mcts_temperature: 1.0  # Temperature for move selection (high = exploration)
+  mcts_simulations: 100      # Number of MCTS simulations per move
+  mcts_c_puct: 1.5           # Exploration constant (UCB)
+  mcts_temperature: 1.0      # Temperature for move selection
   mcts_temperature_threshold: 15  # Move number to reduce temperature
-  mcts_dirichlet_alpha: 0.3  # Dirichlet noise for exploration
+  mcts_dirichlet_alpha: 0.3  # Dirichlet noise alpha
   mcts_dirichlet_weight: 0.25  # Weight of Dirichlet noise
   
-  # Training
-  batch_size: 1024  # Matched with IL for consistency
-  learning_rate: 0.0005  # Lower than IL
+  # Training parameters
+  batch_size: 4096           # Batch size (matched with IL)
+  learning_rate: 0.0007      # Learning rate
+  weight_decay: 0.01         # L2 regularization (AdamW)
   train_epochs_per_iteration: 5  # Epochs per iteration
   replay_buffer_size: 50000  # Max positions in replay buffer
   
   # Evaluation
-  eval_games: 20  # Games to play for evaluation
-  eval_every: 5  # Evaluate every N iterations
-  win_rate_threshold: 0.55  # Win rate to update best model
+  eval_games: 20             # Games to play for evaluation
+  eval_every: 5              # Evaluate every N iterations
+  win_rate_threshold: 0.55   # Win rate to update best model
+  checkpoint_every: 5        # Save checkpoint every N iterations
   
   # Loss weights
-  policy_loss_weight: 1.0
-  value_loss_weight: 1.0
+  policy_loss_weight: 1.0    # Policy loss weight
+  value_loss_weight: 1.0     # Value loss weight
 
-# Hardware - Optimized for RTX 5060 Ti
+
+# ------------------------------------------------------------------------------
+# HARDWARE & OPTIMIZATION
+# ------------------------------------------------------------------------------
 hardware:
-  device: "cuda"  # cuda, cpu, or mps (Mac)
-  use_amp: true  # 🚀 Mixed Precision Training (~2x speedup on RTX cards)
-  use_bfloat16: true  # 💾 Use bfloat16 instead of float16 (better range, smaller models)
-  num_workers: 8  # DataLoader workers (4-12 optimal, 0 to disable)
-  pin_memory: true  # Faster data transfer to GPU
-
-# Logging
-logging:
-  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
-  tensorboard: true
-  print_every: 10  # Print stats every N batches
+  device: "cuda"             # Device: cuda, cpu, or mps (Mac)
   
-# Random seed for reproducibility
-seed: 42
+  # Performance optimizations
+  use_amp: true              # 🚀 Mixed Precision Training (~2x speedup)
+  use_bfloat16: true         # 💾 bfloat16 instead of float16 (better range)
+  num_workers: 12            # CPU workers for data loading
+  pin_memory: true           # Faster GPU data transfer
+
+
+# ------------------------------------------------------------------------------
+# LOGGING
+# ------------------------------------------------------------------------------
+logging:
+  log_level: "INFO"          # DEBUG, INFO, WARNING, ERROR
+  tensorboard: true          # Enable TensorBoard logging
+  print_every: 10            # Print stats every N batches
+
+# ------------------------------------------------------------------------------
+# REPRODUCIBILITY
+# ------------------------------------------------------------------------------
+seed: 42                     # Random seed
