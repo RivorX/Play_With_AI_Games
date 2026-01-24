@@ -118,6 +118,106 @@ def index_to_move(index):
     return chess.Move(from_square, to_square)
 
 
+# ==============================================================================
+# 🆕 MULTI-TASK LEARNING HELPER FUNCTIONS
+# ==============================================================================
+
+def compute_material_balance(board):
+    """
+    Compute material balance for current player
+    
+    Returns:
+        float: Material advantage in pawns (-10 to +10)
+               Positive = current player ahead
+               Negative = current player behind
+    """
+    piece_values = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9,
+        chess.KING: 0  # King doesn't count for material
+    }
+    
+    white_material = 0
+    black_material = 0
+    
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece:
+            value = piece_values[piece.piece_type]
+            if piece.color == chess.WHITE:
+                white_material += value
+            else:
+                black_material += value
+    
+    # Return from perspective of current player
+    if board.turn == chess.WHITE:
+        balance = white_material - black_material
+    else:
+        balance = black_material - white_material
+    
+    # Normalize to [-1, 1] (divide by max possible material ~40)
+    return np.tanh(balance / 10.0)
+
+
+def is_in_check(board):
+    """
+    Check if current player's king is in check
+    
+    Returns:
+        float: 1.0 if in check, 0.0 otherwise
+    """
+    return 1.0 if board.is_check() else 0.0
+
+
+def will_win(board, game_result):
+    """
+    Determine if current player will win based on game result
+    
+    Args:
+        board: chess.Board at current position
+        game_result: Game result string ('1-0', '0-1', '1/2-1/2')
+    
+    Returns:
+        float: 1.0 if current player wins, 0.0 otherwise
+    """
+    if game_result == '1/2-1/2':
+        return 0.0
+    
+    if board.turn == chess.WHITE:
+        return 1.0 if game_result == '1-0' else 0.0
+    else:
+        return 1.0 if game_result == '0-1' else 0.0
+
+
+def extract_auxiliary_labels(board, game_result):
+    """
+    Extract all auxiliary task labels for Multi-Task Learning
+    
+    Args:
+        board: chess.Board at current position
+        game_result: Game result string
+    
+    Returns:
+        dict: {
+            'win': float,        # Will current player win? (0.0 or 1.0)
+            'material': float,   # Material balance (-1.0 to 1.0)
+            'check': float       # Is in check? (0.0 or 1.0)
+        }
+    """
+    return {
+        'win': will_win(board, game_result),
+        'material': compute_material_balance(board),
+        'check': is_in_check(board)
+    }
+
+
+# ==============================================================================
+# PGN EXTRACTION AND PROCESSING
+# ==============================================================================
+
 def extract_game_data(game):
     """Extract serializable data from chess.pgn.Game"""
     try:
@@ -142,8 +242,16 @@ def extract_game_data(game):
         return None
 
 
-def process_extracted_game(game_data, min_elo, max_moves):
-    """Process extracted game data"""
+def process_extracted_game(game_data, min_elo, max_moves, use_mtl=True):
+    """
+    🆕 Process extracted game data with MTL support
+    
+    Args:
+        game_data: Extracted game data
+        min_elo: Minimum Elo threshold
+        max_moves: Maximum moves per game
+        use_mtl: If True, extract auxiliary labels
+    """
     try:
         if game_data is None:
             return []
@@ -188,7 +296,23 @@ def process_extracted_game(game_data, min_elo, max_moves):
                 move_index = np.uint16(move_to_index(move))
                 current_outcome = outcome if board.turn == chess.WHITE else -outcome
                 
-                data.append((compact_board, move_index, np.float32(current_outcome)))
+                # 🆕 Extract auxiliary labels if MTL is enabled
+                if use_mtl:
+                    aux_labels = extract_auxiliary_labels(board, result)
+                    win_label = np.float32(aux_labels['win'])
+                    material_label = np.float32(aux_labels['material'])
+                    check_label = np.float32(aux_labels['check'])
+                    
+                    data.append((
+                        compact_board, 
+                        move_index, 
+                        np.float32(current_outcome),
+                        win_label,
+                        material_label,
+                        check_label
+                    ))
+                else:
+                    data.append((compact_board, move_index, np.float32(current_outcome)))
                 
                 board.push(move)
                 move_count += 1
@@ -202,29 +326,71 @@ def process_extracted_game(game_data, min_elo, max_moves):
 
 def process_game_batch(args):
     """Process a batch of extracted game data in parallel worker"""
-    games_data, min_elo, max_moves = args
+    games_data, min_elo, max_moves, use_mtl = args
     all_positions = []
     
     for game_data in games_data:
-        positions = process_extracted_game(game_data, min_elo, max_moves)
+        positions = process_extracted_game(game_data, min_elo, max_moves, use_mtl)
         all_positions.extend(positions)
     
     return all_positions
 
 
 class BinaryDataWriter:
-    """Write positions to binary file for maximum compression"""
+    """
+    🆕 Write positions to binary file with MTL support
     
-    def __init__(self, filepath):
+    Format without MTL (38 bytes):
+    - Board: 32 bytes
+    - Move: 2 bytes
+    - Outcome: 4 bytes
+    
+    Format with MTL (50 bytes):
+    - Board: 32 bytes
+    - Move: 2 bytes
+    - Outcome: 4 bytes
+    - Win: 4 bytes
+    - Material: 4 bytes
+    - Check: 4 bytes
+    """
+    
+    def __init__(self, filepath, use_mtl=True):
         self.filepath = filepath
+        self.use_mtl = use_mtl
         self.file = open(filepath, 'wb')
         self.count = 0
+        self.position_size = 50 if use_mtl else 38
     
-    def write_position(self, compact_board, move_index, outcome):
-        """Write one position (38 bytes total)"""
-        self.file.write(compact_board)  # 32 bytes
-        self.file.write(struct.pack('H', move_index))  # 2 bytes
-        self.file.write(struct.pack('f', outcome))  # 4 bytes
+    def write_position(self, *args):
+        """
+        Write one position
+        
+        Args (without MTL):
+            compact_board, move_index, outcome
+        
+        Args (with MTL):
+            compact_board, move_index, outcome, win, material, check
+        """
+        if self.use_mtl:
+            if len(args) != 6:
+                raise ValueError(f"Expected 6 args for MTL, got {len(args)}")
+            compact_board, move_index, outcome, win, material, check = args
+            
+            self.file.write(compact_board)  # 32 bytes
+            self.file.write(struct.pack('H', move_index))  # 2 bytes
+            self.file.write(struct.pack('f', outcome))  # 4 bytes
+            self.file.write(struct.pack('f', win))  # 4 bytes
+            self.file.write(struct.pack('f', material))  # 4 bytes
+            self.file.write(struct.pack('f', check))  # 4 bytes
+        else:
+            if len(args) != 3:
+                raise ValueError(f"Expected 3 args for non-MTL, got {len(args)}")
+            compact_board, move_index, outcome = args
+            
+            self.file.write(compact_board)  # 32 bytes
+            self.file.write(struct.pack('H', move_index))  # 2 bytes
+            self.file.write(struct.pack('f', outcome))  # 4 bytes
+        
         self.count += 1
     
     def close(self):
@@ -239,10 +405,9 @@ class BinaryDataWriter:
 
 def parse_single_pgn_file(args):
     """
-    🚀 Process a single PGN file - designed for parallel execution
-    Returns: (filename, positions_count, output_path)
+    🆕 Process a single PGN file with MTL support
     """
-    pgn_path, output_path, min_elo, max_games, max_moves, file_index, select_top, sort_by_elo = args
+    pgn_path, output_path, min_elo, max_games, max_moves, file_index, select_top, sort_by_elo, use_mtl = args
     
     print(f"[Worker {file_index}] Processing: {pgn_path.name}")
     
@@ -256,13 +421,11 @@ def parse_single_pgn_file(args):
             
             game_data = extract_game_data(game)
             if game_data:
-                # Check min_elo threshold
                 try:
                     white_elo = int(game_data['white_elo']) if game_data['white_elo'] != '?' else 0
                     black_elo = int(game_data['black_elo']) if game_data['black_elo'] != '?' else 0
                     
                     if white_elo >= min_elo and black_elo >= min_elo:
-                        # Store with average Elo for sorting
                         avg_elo = (white_elo + black_elo) / 2
                         games_data.append((game_data, avg_elo))
                 except (ValueError, TypeError):
@@ -270,12 +433,11 @@ def parse_single_pgn_file(args):
     
     print(f"[Worker {file_index}] Extracted {len(games_data)} games (Elo >= {min_elo}) from {pgn_path.name}")
     
-    # 🎯 Sort by Elo and select top games
+    # Sort by Elo and select top games
     if select_top and sort_by_elo and len(games_data) > 0:
         print(f"[Worker {file_index}] Sorting by average Elo...")
-        games_data.sort(key=lambda x: x[1], reverse=True)  # Highest Elo first
+        games_data.sort(key=lambda x: x[1], reverse=True)
         
-        # Take top N games
         games_to_process = min(max_games, len(games_data))
         games_data = games_data[:games_to_process]
         
@@ -284,15 +446,14 @@ def parse_single_pgn_file(args):
             bottom_elo = games_data[-1][1]
             print(f"[Worker {file_index}] Selected top {len(games_data)} games (Elo range: {bottom_elo:.0f}-{top_elo:.0f})")
     
-    # Extract just the game_data (without Elo)
     games_data = [g[0] for g in games_data]
     
-    # Process games in batches (using multiprocessing within this file)
+    # Process games in batches
     batch_size = max(1, len(games_data) // (mp.cpu_count() * 2))
     batches = []
     for i in range(0, len(games_data), batch_size):
         batch = games_data[i:i + batch_size]
-        batches.append((batch, min_elo, max_moves))
+        batches.append((batch, min_elo, max_moves, use_mtl))
     
     all_positions = []
     with ProcessPoolExecutor(max_workers=mp.cpu_count()) as executor:
@@ -303,9 +464,9 @@ def parse_single_pgn_file(args):
             all_positions.extend(positions)
     
     # Write to binary file
-    with BinaryDataWriter(output_path) as writer:
-        for compact_board, move_index, outcome in all_positions:
-            writer.write_position(compact_board, move_index, outcome)
+    with BinaryDataWriter(output_path, use_mtl=use_mtl) as writer:
+        for position_data in all_positions:
+            writer.write_position(*position_data)
     
     print(f"[Worker {file_index}] ✓ {pgn_path.name}: {len(all_positions)} positions → {output_path.name}")
     
@@ -314,9 +475,7 @@ def parse_single_pgn_file(args):
 
 def parse_pgn_files(data_dir, config, num_workers=None):
     """
-    🚀 Parse multiple PGN files in parallel - one process per file
-    Extracts ALL games above min_elo, sorts by Elo, then takes top max_games
-    Returns: metadata dict
+    🆕 Parse multiple PGN files with MTL support
     """
     script_dir = Path(__file__).parent.parent
     data_path = script_dir / data_dir
@@ -341,10 +500,15 @@ def parse_pgn_files(data_dir, config, num_workers=None):
     select_top = config['data'].get('select_top_games', True)
     sort_by_elo = config['data'].get('sort_by_avg_elo', True)
     
-    # Cache filename includes selection strategy
+    # 🆕 Check if MTL is enabled
+    use_mtl = config['model'].get('use_multitask_learning', False)
+    
+    # Cache filename
     cache_suffix = f"_top{max_games}" if select_top else f"_first{max_games}"
-    binary_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}.bin"
-    metadata_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}_meta.pkl"
+    mtl_suffix = "_mtl" if use_mtl else ""
+    
+    binary_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}{mtl_suffix}.bin"
+    metadata_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}{mtl_suffix}_meta.pkl"
     
     # Check cache
     if binary_file.exists() and metadata_file.exists():
@@ -356,9 +520,10 @@ def parse_pgn_files(data_dir, config, num_workers=None):
             if metadata['total_positions'] > 0:
                 size_mb = binary_file.stat().st_size / (1024**2)
                 print(f"✓ Loaded {metadata['total_positions']:,} positions ({size_mb:.1f} MB)")
+                print(f"  • Multi-Task Learning: {metadata.get('use_mtl', False)}")
                 return metadata
         except Exception as e:
-            print(f"⚠️  Failed to load cache: {e}")
+            print(f"⚠️ Failed to load cache: {e}")
             print("Will reprocess PGN files...")
     
     # Parallel processing configuration
@@ -366,7 +531,7 @@ def parse_pgn_files(data_dir, config, num_workers=None):
     max_parallel_workers = config['data'].get('max_workers', None)
     
     if max_parallel_workers is None:
-        max_parallel_workers = len(pgn_files)  # One worker per file
+        max_parallel_workers = len(pgn_files)
     
     games_per_file = max_games // len(pgn_files) if len(pgn_files) > 1 else max_games
     
@@ -376,9 +541,14 @@ def parse_pgn_files(data_dir, config, num_workers=None):
     print(f"  • Strategy: {'TOP games by Elo' if select_top else 'FIRST games found'}")
     print(f"  • Min Elo: {min_elo}")
     print(f"  • Target games per file: {games_per_file:,}")
+    print(f"  • 🆕 Multi-Task Learning: {use_mtl}")
+    if use_mtl:
+        print(f"    - Position size: 50 bytes (with auxiliary labels)")
+    else:
+        print(f"    - Position size: 38 bytes (standard)")
     print()
     
-    # Prepare tasks for parallel processing
+    # Prepare tasks
     tasks = []
     temp_files = []
     
@@ -386,14 +556,15 @@ def parse_pgn_files(data_dir, config, num_workers=None):
         temp_output = preprocessing_dir / f"temp_{idx}_{pgn_file.stem}.bin"
         temp_files.append(temp_output)
         tasks.append((
-            pgn_file,           # pgn_path
-            temp_output,        # output_path
-            min_elo,            # min_elo
-            games_per_file,     # max_games (per file)
-            max_moves,          # max_moves
-            idx,                # file_index
-            select_top,         # select_top_games
-            sort_by_elo         # sort_by_avg_elo
+            pgn_file,
+            temp_output,
+            min_elo,
+            games_per_file,
+            max_moves,
+            idx,
+            select_top,
+            sort_by_elo,
+            use_mtl  # 🆕
         ))
     
     # Process files
@@ -401,13 +572,11 @@ def parse_pgn_files(data_dir, config, num_workers=None):
     total_positions = 0
     
     if use_parallel and len(pgn_files) > 1:
-        # 🚀 PARALLEL: Process multiple PGN files simultaneously
         print(f"🚀 Processing {len(pgn_files)} PGN files in parallel...\n")
         
         with ProcessPoolExecutor(max_workers=max_parallel_workers) as executor:
             futures = [executor.submit(parse_single_pgn_file, task) for task in tasks]
             
-            # Progress bar
             pbar = tqdm(total=len(futures), desc="Processing PGN files")
             
             for future in as_completed(futures):
@@ -418,7 +587,6 @@ def parse_pgn_files(data_dir, config, num_workers=None):
             
             pbar.close()
     else:
-        # Sequential processing (for single file or if parallel disabled)
         print(f"Processing PGN files sequentially...\n")
         
         for task in tasks:
@@ -435,8 +603,13 @@ def parse_pgn_files(data_dir, config, num_workers=None):
     print(f"Total: {total_positions:,} positions\n")
     
     if total_positions == 0:
-        print("⚠️  WARNING: No positions extracted!")
-        return {'binary_file': str(binary_file), 'total_positions': 0}
+        print("⚠️ WARNING: No positions extracted!")
+        return {
+            'binary_file': str(binary_file), 
+            'total_positions': 0, 
+            'position_size': 50 if use_mtl else 38,
+            'use_mtl': use_mtl
+        }
     
     # Merge temporary files
     if len(temp_files) > 1:
@@ -452,10 +625,13 @@ def parse_pgn_files(data_dir, config, num_workers=None):
             temp_files[0].rename(binary_file)
     
     # Save metadata
+    position_size = 50 if use_mtl else 38
+    
     metadata = {
         'binary_file': str(binary_file),
         'total_positions': total_positions,
-        'position_size': 38
+        'position_size': position_size,
+        'use_mtl': use_mtl
     }
     
     with open(metadata_file, 'wb') as f:
@@ -467,17 +643,33 @@ def parse_pgn_files(data_dir, config, num_workers=None):
     print(f"✓ Final file: {binary_file.name}")
     print(f"✓ Size: {final_size_mb:.1f} MB")
     print(f"✓ Compression: {compression_ratio:.1f}% saved vs raw tensors")
+    print(f"✓ Multi-Task Learning: {use_mtl}")
     
     return metadata
 
 
+# ==============================================================================
+# 🆕 DATASET WITH MTL SUPPORT
+# ==============================================================================
+
 class BinaryChessDataset(Dataset):
-    """Memory-mapped binary dataset - no RAM needed!"""
+    """
+    🆕 Memory-mapped binary dataset with Multi-Task Learning support
     
-    def __init__(self, binary_file, indices, position_size=38):
+    Automatically detects if data includes MTL labels based on position_size
+    """
+    
+    def __init__(self, binary_file, indices, position_size=38, use_mtl=None):
         self.binary_file = binary_file
         self.indices = indices
         self.position_size = position_size
+        
+        # Auto-detect MTL from position size if not specified
+        if use_mtl is None:
+            self.use_mtl = (position_size == 50)
+        else:
+            self.use_mtl = use_mtl
+        
         self._mmap = None
         self._file = None
     
@@ -498,17 +690,34 @@ class BinaryChessDataset(Dataset):
         offset = position_idx * self.position_size
         data = self._mmap[offset:offset + self.position_size]
         
+        # Unpack standard fields
         compact_board = data[:32]
         move_index = struct.unpack('H', data[32:34])[0]
         outcome = struct.unpack('f', data[34:38])[0]
         
         board_tensor = compact_to_tensor(compact_board)
         
-        return (
-            torch.FloatTensor(board_tensor),
-            torch.LongTensor([move_index])[0],
-            torch.FloatTensor([outcome])
-        )
+        if self.use_mtl:
+            # Unpack MTL fields
+            win = struct.unpack('f', data[38:42])[0]
+            material = struct.unpack('f', data[42:46])[0]
+            check = struct.unpack('f', data[46:50])[0]
+            
+            return {
+                'board': torch.FloatTensor(board_tensor),
+                'move': torch.LongTensor([move_index])[0],
+                'value': torch.FloatTensor([outcome]),
+                'win': torch.FloatTensor([win]),
+                'material': torch.FloatTensor([material]),
+                'check': torch.FloatTensor([check])
+            }
+        else:
+            # Standard format (backwards compatibility)
+            return (
+                torch.FloatTensor(board_tensor),
+                torch.LongTensor([move_index])[0],
+                torch.FloatTensor([outcome])
+            )
     
     def __del__(self):
         if self._mmap is not None:
@@ -518,7 +727,9 @@ class BinaryChessDataset(Dataset):
 
 
 def create_dataloaders(metadata, config):
-    """Create train and validation dataloaders from binary file"""
+    """
+    🆕 Create train and validation dataloaders with MTL support
+    """
     
     if metadata['total_positions'] == 0:
         raise ValueError("Cannot create dataloaders with 0 positions.")
@@ -537,9 +748,26 @@ def create_dataloaders(metadata, config):
     print(f"  • Train: {len(train_indices):,} positions")
     print(f"  • Val: {len(val_indices):,} positions")
     
+    # Get position size and MTL flag
+    position_size = metadata.get('position_size', 38)
+    use_mtl = metadata.get('use_mtl', False)
+    
+    print(f"  • Position size: {position_size} bytes")
+    print(f"  • Multi-Task Learning: {use_mtl}")
+    
     # Create datasets
-    train_dataset = BinaryChessDataset(metadata['binary_file'], train_indices)
-    val_dataset = BinaryChessDataset(metadata['binary_file'], val_indices)
+    train_dataset = BinaryChessDataset(
+        metadata['binary_file'], 
+        train_indices, 
+        position_size=position_size,
+        use_mtl=use_mtl
+    )
+    val_dataset = BinaryChessDataset(
+        metadata['binary_file'], 
+        val_indices,
+        position_size=position_size,
+        use_mtl=use_mtl
+    )
     
     # Dataloaders
     prefetch_factor = 4

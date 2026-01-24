@@ -56,6 +56,12 @@ model:
   activation: 'elu'             # ⚡ ELU activation (0% params, +3% quality)
   use_coord_conv: true          # 🗺️ Position-aware conv (+0.5% params, +4% quality)
 
+  # 🆕 MULTI-TASK LEARNING
+  use_multitask_learning: true        # Enable auxiliary tasks
+  win_prediction_weight: 0.3          # Weight for win prediction task
+  material_prediction_weight: 0.2     # Weight for material count task
+  check_prediction_weight: 0.15       # Weight for check prediction task
+
 
 # ------------------------------------------------------------------------------
 # IMITATION LEARNING (IL)
@@ -90,6 +96,7 @@ imitation_learning:
 # ------------------------------------------------------------------------------
 reinforcement_learning:
   # 🚀 Self-play configuration (PARALLEL)
+  use_prioritized_replay: true        # Enable prioritized experience replay (default: false)
   games_per_iteration: 2048    # ⬇️ Reduced for faster iterations (adjust based on CPU)
   iterations: 1000           # Total RL iterations
   self_play_workers: 4       # 🚀 Parallel game workers (Windows: CPU only, Linux: can use GPU)
@@ -97,6 +104,12 @@ reinforcement_learning:
   # 🚀 Batch self-play mode
   use_batch_selfplay: true         # 🚀 NEW: Play multiple games simultaneously (5-10x faster)
   batch_games_per_worker: 512       # 🚀 NEW: Games per worker in batch mode (adjust for VRAM)
+
+  # 🆕 TEMPERATURE SCHEDULE
+  use_temperature_schedule: true      # Enable adaptive temperature
+  temperature_start: 1.5              # High exploration at start
+  temperature_end: 0.5                # Lower exploration at end
+  temperature_decay_iterations: 500   # Decay over N iterations
 
   # 🚀 MCTS parameters (BATCH OPTIMIZED)
   mcts_simulations: 100      # Number of MCTS simulations per move
@@ -147,6 +160,7 @@ logging:
   log_level: "INFO"          # DEBUG, INFO, WARNING, ERROR
   tensorboard: true          # Enable TensorBoard logging
   print_every: 10            # Print stats every N batches
+
 
 # ------------------------------------------------------------------------------
 # REPRODUCIBILITY
