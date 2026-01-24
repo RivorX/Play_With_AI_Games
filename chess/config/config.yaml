@@ -90,13 +90,18 @@ imitation_learning:
 # ------------------------------------------------------------------------------
 reinforcement_learning:
   # 🚀 Self-play configuration (PARALLEL)
-  games_per_iteration: 16    # ⬇️ Reduced for faster iterations (adjust based on CPU)
+  games_per_iteration: 2048    # ⬇️ Reduced for faster iterations (adjust based on CPU)
   iterations: 1000           # Total RL iterations
   self_play_workers: 4       # 🚀 Parallel game workers (Windows: CPU only, Linux: can use GPU)
   
+  # 🚀 Batch self-play mode
+  use_batch_selfplay: true         # 🚀 NEW: Play multiple games simultaneously (5-10x faster)
+  batch_games_per_worker: 512       # 🚀 NEW: Games per worker in batch mode (adjust for VRAM)
+
   # 🚀 MCTS parameters (BATCH OPTIMIZED)
-  mcts_simulations: 50       # ⬇️ Reduced from 100 (faster, still effective)
-  mcts_batch_size: 64        # 🚀 NEW: Batch MCTS evaluations (32-128 optimal)
+  mcts_simulations: 100      # Number of MCTS simulations per move
+  mcts_batch_size: 256       # Batch MCTS evaluations (32-128 optimal)
+  mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
   mcts_c_puct: 1.5           # Exploration constant (UCB)
   mcts_temperature: 1.0      # Temperature for move selection
   mcts_temperature_threshold: 15  # Move number to reduce temperature
@@ -104,18 +109,18 @@ reinforcement_learning:
   mcts_dirichlet_weight: 0.25  # Weight of Dirichlet noise
   
   # Training parameters
-  batch_size: 2048           # Training batch size (GPU)
-  learning_rate: 0.001       # Learning rate
-  weight_decay: 0.01         # L2 regularization (AdamW)
-  grad_clip: 1.0             # Gradient clipping
+  batch_size: 4096           # Training batch size (GPU)
+  learning_rate: 0.0002       # Learning rate
+  weight_decay: 0.05         # L2 regularization (AdamW)
+  grad_clip: 0.5             # Gradient clipping
   train_epochs_per_iteration: 3  # ⬇️ Reduced from 5 (faster iteration)
-  replay_buffer_size: 50000  # Max positions in replay buffer
+  replay_buffer_size: 500000  # Max positions in replay buffer
   
   # Evaluation
-  eval_games: 10             # ⬇️ Reduced from 20 (faster eval)
-  eval_every: 5              # Evaluate every N iterations
-  win_rate_threshold: 0.55   # Win rate to update best model
-  checkpoint_every: 5        # Save checkpoint every N iterations
+  eval_games: 30             # ⬇️ Reduced from 20 (faster eval)
+  eval_every: 2              # Evaluate every N iterations
+  win_rate_threshold: 0.53   # Win rate to update best model
+  checkpoint_every: 10        # Save checkpoint every N iterations
   
   # Loss weights
   policy_loss_weight: 1.0    # Policy loss weight

@@ -4,6 +4,7 @@ import math
 from src.data import board_to_tensor, move_to_index
 import torch
 from collections import defaultdict
+import threading
 
 
 class MCTSNode:
@@ -12,29 +13,44 @@ class MCTSNode:
     def __init__(self, board, parent=None, move=None, prior=0):
         self.board = board.copy()
         self.parent = parent
-        self.move = move  # Move that led to this node
-        self.prior = prior  # Prior probability from network
+        self.move = move
+        self.prior = prior
         
-        self.children = {}  # Dict of move -> MCTSNode
+        self.children = {}
         self.visit_count = 0
         self.value_sum = 0.0
         self.expanded = False
+        
+        # 🚀 Virtual Loss for thread-safe parallel MCTS
+        self.virtual_loss = 0
+        self.lock = threading.Lock()
     
     def value(self):
-        """Average value of this node"""
+        """Average value with virtual loss"""
         if self.visit_count == 0:
             return 0
-        return self.value_sum / self.visit_count
+        return (self.value_sum - self.virtual_loss) / (self.visit_count + self.virtual_loss)
     
     def is_leaf(self):
-        """Check if node is a leaf (not expanded)"""
         return not self.expanded
+    
+    def add_virtual_loss(self, n=1):
+        """Add virtual loss for thread safety"""
+        with self.lock:
+            self.virtual_loss += n
+    
+    def remove_virtual_loss(self, n=1):
+        """Remove virtual loss after backup"""
+        with self.lock:
+            self.virtual_loss -= n
 
 
 class BatchMCTS:
     """
-    🚀 Batch MCTS - evaluates multiple positions in parallel
-    Key optimization: batch neural network calls instead of sequential
+    🚀 Optimized Batch MCTS with:
+    - Tree reuse between moves
+    - Virtual loss for parallel search
+    - Efficient batch evaluation
     """
     
     def __init__(self, model, config, device):
@@ -42,52 +58,71 @@ class BatchMCTS:
         self.config = config
         self.device = device
         self.c_puct = config['reinforcement_learning']['mcts_c_puct']
-        
-        # Batch evaluation cache
         self.eval_batch_size = config['reinforcement_learning'].get('mcts_batch_size', 32)
-    
-    def search(self, board, num_simulations):
-        """
-        Run MCTS from given board position with batch evaluation
-        Returns: dict of move -> visit_count
-        """
-        root = MCTSNode(board)
         
-        # Add Dirichlet noise to root for exploration (RL only)
+        # 🚀 Tree reuse
+        self.root = None
+        self.reuse_tree = config['reinforcement_learning'].get('mcts_reuse_tree', True)
+    
+    def search(self, board, num_simulations, temperature=1.0):
+        """
+        Run MCTS with tree reuse and batch evaluation
+        """
+        # 🚀 Tree reuse: if root exists and matches board, reuse it
+        if self.reuse_tree and self.root is not None:
+            # Try to find current position in existing tree
+            for move, child in self.root.children.items():
+                if child.board.fen() == board.fen():
+                    # Found it! Reuse this subtree
+                    self.root = child
+                    self.root.parent = None  # Make it new root
+                    break
+            else:
+                # Position not found, create new tree
+                self.root = MCTSNode(board)
+        else:
+            self.root = MCTSNode(board)
+        
+        # Add Dirichlet noise to root
         add_noise = self.config['reinforcement_learning'].get('mcts_dirichlet_weight', 0) > 0
         
-        # Batch simulations for better GPU utilization
+        # Batch simulations
         for batch_start in range(0, num_simulations, self.eval_batch_size):
             batch_size = min(self.eval_batch_size, num_simulations - batch_start)
             
-            # Collect leaf nodes to evaluate in batch
             search_paths = []
             leaf_nodes = []
             
             for _ in range(batch_size):
-                node = root
+                node = self.root
                 search_path = [node]
                 
-                # Selection: traverse tree to leaf
+                # 🚀 Add virtual loss during traversal
+                node.add_virtual_loss()
+                
+                # Selection
                 while not node.is_leaf() and not node.board.is_game_over():
                     node = self._select_child(node)
+                    node.add_virtual_loss()
                     search_path.append(node)
                 
                 search_paths.append(search_path)
                 leaf_nodes.append(node)
             
-            # Batch expansion and evaluation
+            # Batch evaluation
             values = self._batch_expand_and_evaluate(
-                leaf_nodes, 
-                add_noise=(leaf_nodes[0] == root and add_noise)
+                leaf_nodes,
+                add_noise=(leaf_nodes[0] == self.root and add_noise)
             )
             
-            # Backpropagation
+            # Backpropagation + remove virtual loss
             for search_path, value in zip(search_paths, values):
                 self._backpropagate(search_path, value)
+                # Remove virtual loss
+                for node in search_path:
+                    node.remove_virtual_loss()
         
-        # Return visit counts for each move
-        return {move: child.visit_count for move, child in root.children.items()}
+        return {move: child.visit_count for move, child in self.root.children.items()}
     
     def _select_child(self, node):
         """Select child with highest UCB score"""
@@ -103,26 +138,21 @@ class BatchMCTS:
         return best_child
     
     def _ucb_score(self, parent, child):
-        """Upper Confidence Bound score"""
-        # Q(s,a) + U(s,a)
-        q_value = child.value()
+        """Upper Confidence Bound with virtual loss"""
+        q_value = child.value()  # Already includes virtual loss
         u_value = (self.c_puct * child.prior * 
-                   math.sqrt(parent.visit_count) / (1 + child.visit_count))
+                   math.sqrt(parent.visit_count + parent.virtual_loss) / 
+                   (1 + child.visit_count + child.virtual_loss))
         return q_value + u_value
     
     def _batch_expand_and_evaluate(self, nodes, add_noise=False):
-        """
-        🚀 KEY OPTIMIZATION: Batch expansion and evaluation
-        Evaluates multiple positions in one GPU call
-        """
-        # Separate terminal and non-terminal nodes
+        """Batch expansion and evaluation"""
         terminal_values = []
         non_terminal_indices = []
         non_terminal_nodes = []
         
         for i, node in enumerate(nodes):
             if node.board.is_game_over():
-                # Terminal node - compute value directly
                 result = node.board.result()
                 if result == '1-0':
                     value = 1.0 if node.board.turn == chess.WHITE else -1.0
@@ -135,26 +165,24 @@ class BatchMCTS:
                 non_terminal_indices.append(i)
                 non_terminal_nodes.append(node)
         
-        # Batch evaluate non-terminal nodes
         all_values = [None] * len(nodes)
         
         if non_terminal_nodes:
-            # Stack all board tensors into a batch
+            # Stack tensors
             board_tensors = torch.stack([
                 torch.FloatTensor(board_to_tensor(node.board))
                 for node in non_terminal_nodes
             ]).to(self.device)
             
-            # Single GPU call for entire batch! 🚀
+            # Single GPU call
             with torch.no_grad():
                 policy_logits_batch, values_batch = self.model(board_tensors)
             
-            # Process each node's results
+            # Process results
             for idx, node in enumerate(non_terminal_nodes):
                 policy_logits = policy_logits_batch[idx].cpu().numpy()
                 value = values_batch[idx].cpu().item()
                 
-                # Expand node
                 legal_moves = list(node.board.legal_moves)
                 policy = np.zeros(4096)
                 
@@ -162,10 +190,9 @@ class BatchMCTS:
                     move_idx = move_to_index(move)
                     policy[move_idx] = np.exp(policy_logits[move_idx])
                 
-                # Normalize
                 policy = policy / (policy.sum() + 1e-8)
                 
-                # Add Dirichlet noise for exploration (at root)
+                # Dirichlet noise
                 if add_noise and len(legal_moves) > 0:
                     alpha = self.config['reinforcement_learning']['mcts_dirichlet_alpha']
                     weight = self.config['reinforcement_learning']['mcts_dirichlet_weight']
@@ -181,52 +208,46 @@ class BatchMCTS:
                     child_board = node.board.copy()
                     child_board.push(move)
                     node.children[move] = MCTSNode(
-                        child_board, 
-                        parent=node, 
-                        move=move, 
+                        child_board,
+                        parent=node,
+                        move=move,
                         prior=policy[move_idx]
                     )
                 
                 node.expanded = True
-                
-                # Store value for this node
-                original_idx = non_terminal_indices[idx]
-                all_values[original_idx] = value
+                all_values[non_terminal_indices[idx]] = value
         
-        # Add terminal values
         for idx, value in terminal_values:
             all_values[idx] = value
         
         return all_values
     
     def _backpropagate(self, search_path, value):
-        """Backpropagate value up the tree"""
+        """Backpropagate value"""
         for node in reversed(search_path):
             node.value_sum += value if node.board.turn == chess.WHITE else -value
             node.visit_count += 1
-            value = -value  # Flip value for opponent
+            value = -value
+    
+    def reset_tree(self):
+        """Reset tree (call after game ends)"""
+        self.root = None
 
 
 def select_move_by_visits(visit_counts, temperature=1.0):
-    """
-    Select move based on visit counts with temperature
-    temperature=0: argmax (greedy)
-    temperature=1: sample proportional to visits
-    """
+    """Select move based on visit counts with temperature"""
     moves = list(visit_counts.keys())
     visits = np.array([visit_counts[m] for m in moves])
     
-    if temperature == 0:
-        # Greedy
+    if temperature == 0 or len(moves) == 1:
         best_idx = np.argmax(visits)
         return moves[best_idx], visits
     else:
-        # Sample with temperature
-        visits = visits ** (1.0 / temperature)
-        probs = visits / visits.sum()
+        visits_temp = visits ** (1.0 / temperature)
+        probs = visits_temp / visits_temp.sum()
         idx = np.random.choice(len(moves), p=probs)
         return moves[idx], probs
 
 
-# Backwards compatibility - alias old class name
+# Backwards compatibility
 MCTS = BatchMCTS
