@@ -1,5 +1,5 @@
 # ==============================================================================
-# CHESS AI CONFIGURATION
+# CHESS AI CONFIGURATION - OPTIMIZED FOR RTX 5060 Ti
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -86,15 +86,17 @@ imitation_learning:
 
 
 # ------------------------------------------------------------------------------
-# REINFORCEMENT LEARNING (RL)
+# REINFORCEMENT LEARNING (RL) - 🚀 OPTIMIZED FOR RTX 5060 Ti
 # ------------------------------------------------------------------------------
 reinforcement_learning:
-  # Self-play configuration
-  games_per_iteration: 100   # Games to generate per iteration
+  # 🚀 Self-play configuration (PARALLEL)
+  games_per_iteration: 16    # ⬇️ Reduced for faster iterations (adjust based on CPU)
   iterations: 1000           # Total RL iterations
+  self_play_workers: 4       # 🚀 Parallel game workers (Windows: CPU only, Linux: can use GPU)
   
-  # MCTS parameters
-  mcts_simulations: 100      # Number of MCTS simulations per move
+  # 🚀 MCTS parameters (BATCH OPTIMIZED)
+  mcts_simulations: 50       # ⬇️ Reduced from 100 (faster, still effective)
+  mcts_batch_size: 64        # 🚀 NEW: Batch MCTS evaluations (32-128 optimal)
   mcts_c_puct: 1.5           # Exploration constant (UCB)
   mcts_temperature: 1.0      # Temperature for move selection
   mcts_temperature_threshold: 15  # Move number to reduce temperature
@@ -102,14 +104,15 @@ reinforcement_learning:
   mcts_dirichlet_weight: 0.25  # Weight of Dirichlet noise
   
   # Training parameters
-  batch_size: 4096           # Batch size (matched with IL)
-  learning_rate: 0.0007      # Learning rate
+  batch_size: 2048           # Training batch size (GPU)
+  learning_rate: 0.001       # Learning rate
   weight_decay: 0.01         # L2 regularization (AdamW)
-  train_epochs_per_iteration: 5  # Epochs per iteration
+  grad_clip: 1.0             # Gradient clipping
+  train_epochs_per_iteration: 3  # ⬇️ Reduced from 5 (faster iteration)
   replay_buffer_size: 50000  # Max positions in replay buffer
   
   # Evaluation
-  eval_games: 20             # Games to play for evaluation
+  eval_games: 10             # ⬇️ Reduced from 20 (faster eval)
   eval_every: 5              # Evaluate every N iterations
   win_rate_threshold: 0.55   # Win rate to update best model
   checkpoint_every: 5        # Save checkpoint every N iterations
