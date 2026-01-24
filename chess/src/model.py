@@ -122,7 +122,18 @@ class ResidualBlock(nn.Module):
 
 
 class ChessNet(nn.Module):
-    """Enhanced Chess neural network"""
+    """
+    🆕 Enhanced Chess neural network with Multi-Task Learning
+    
+    Main tasks:
+    - Policy prediction (move probabilities)
+    - Value prediction (position evaluation)
+    
+    Auxiliary tasks (improve representation learning):
+    - Win prediction (will current player win?)
+    - Material count (piece advantage)
+    - Check detection (is king in check?)
+    """
     def __init__(self, config):
         super().__init__()
         
@@ -136,12 +147,23 @@ class ChessNet(nn.Module):
         use_elu = config['model'].get('activation', 'elu') == 'elu'
         use_coord_conv = config['model'].get('use_coord_conv', True)
         
+        # 🆕 Multi-Task Learning
+        self.use_mtl = config['model'].get('use_multitask_learning', False)
+        self.win_weight = config['model'].get('win_prediction_weight', 0.3)
+        self.material_weight = config['model'].get('material_prediction_weight', 0.2)
+        self.check_weight = config['model'].get('check_prediction_weight', 0.15)
+        
         print(f"🧠 Model Features:")
         print(f"  • SE-Blocks (channel attention): {use_se}")
         print(f"  • Spatial Attention: {use_spatial}")
         print(f"  • Stochastic Depth: {drop_path_rate}")
         print(f"  • Activation: {'ELU' if use_elu else 'ReLU'}")
         print(f"  • CoordConv: {use_coord_conv}")
+        print(f"  • 🆕 Multi-Task Learning: {self.use_mtl}")
+        if self.use_mtl:
+            print(f"    - Win prediction: {self.win_weight}")
+            print(f"    - Material count: {self.material_weight}")
+            print(f"    - Check detection: {self.check_weight}")
         print(f"  • Memory Format: Channels Last (GPU optimized)")
         
         self.use_elu = use_elu
@@ -170,12 +192,14 @@ class ChessNet(nn.Module):
             ) for i in range(num_blocks)
         ])
         
+        # Policy head (main task)
         policy_filters = config['model']['policy_head_filters']
         self.policy_conv = nn.Conv2d(filters, policy_filters, kernel_size=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(policy_filters)
         self.policy_fc = nn.Linear(policy_filters * 8 * 8, 4096)
         self.policy_dropout = nn.Dropout(dropout)
         
+        # Value head (main task)
         value_filters = config['model']['value_head_filters']
         value_hidden = config['model']['value_hidden_dim']
         self.value_conv = nn.Conv2d(filters, value_filters, kernel_size=1, bias=False)
@@ -184,7 +208,38 @@ class ChessNet(nn.Module):
         self.value_fc2 = nn.Linear(value_hidden, 1)
         self.value_dropout = nn.Dropout(dropout)
         
-    def forward(self, x):
+        # 🆕 Auxiliary heads (Multi-Task Learning)
+        if self.use_mtl:
+            # Win prediction head (binary: will current player win?)
+            self.win_conv = nn.Conv2d(filters, 16, kernel_size=1, bias=False)
+            self.win_bn = nn.BatchNorm2d(16)
+            self.win_fc1 = nn.Linear(16 * 8 * 8, 128)
+            self.win_fc2 = nn.Linear(128, 1)
+            self.win_dropout = nn.Dropout(dropout * 0.5)
+            
+            # Material count head (regression: piece advantage)
+            self.material_conv = nn.Conv2d(filters, 16, kernel_size=1, bias=False)
+            self.material_bn = nn.BatchNorm2d(16)
+            self.material_fc1 = nn.Linear(16 * 8 * 8, 64)
+            self.material_fc2 = nn.Linear(64, 1)
+            
+            # Check detection head (binary: is king in check?)
+            self.check_conv = nn.Conv2d(filters, 8, kernel_size=1, bias=False)
+            self.check_bn = nn.BatchNorm2d(8)
+            self.check_fc = nn.Linear(8 * 8 * 8, 1)
+        
+    def forward(self, x, return_aux=False):
+        """
+        Forward pass
+        
+        Args:
+            x: Input board tensor (B, 12, 8, 8)
+            return_aux: If True, return auxiliary predictions (for training)
+        
+        Returns:
+            If return_aux=False: (policy, value)
+            If return_aux=True: (policy, value, win_pred, material_pred, check_pred)
+        """
         x = x.contiguous(memory_format=torch.channels_last)
         
         x = self.conv_block(x)
@@ -193,19 +248,44 @@ class ChessNet(nn.Module):
         for block in self.residual_blocks:
             x = block(x)
         
+        # Policy head
         policy = self.activation(self.policy_bn(self.policy_conv(x)))
         policy = policy.reshape(policy.size(0), -1)
         policy = self.policy_dropout(policy)
         policy = self.policy_fc(policy)
         policy = F.log_softmax(policy, dim=1)
         
+        # Value head
         value = self.activation(self.value_bn(self.value_conv(x)))
         value = value.reshape(value.size(0), -1)
         value = self.activation(self.value_fc1(value))
         value = self.value_dropout(value)
         value = torch.tanh(self.value_fc2(value))
         
-        return policy, value
+        # Return only main tasks if auxiliary not needed
+        if not return_aux or not self.use_mtl:
+            return policy, value
+        
+        # 🆕 Auxiliary predictions
+        # Win prediction
+        win_pred = self.activation(self.win_bn(self.win_conv(x)))
+        win_pred = win_pred.reshape(win_pred.size(0), -1)
+        win_pred = self.activation(self.win_fc1(win_pred))
+        win_pred = self.win_dropout(win_pred)
+        win_pred = self.win_fc2(win_pred)  # ← USUŃ sigmoid!
+
+        # Material count (to zostaje tanh)
+        material_pred = self.activation(self.material_bn(self.material_conv(x)))
+        material_pred = material_pred.reshape(material_pred.size(0), -1)
+        material_pred = self.activation(self.material_fc1(material_pred))
+        material_pred = torch.tanh(self.material_fc2(material_pred))  # ✓ tanh OK
+
+        # Check detection
+        check_pred = self.activation(self.check_bn(self.check_conv(x)))
+        check_pred = check_pred.reshape(check_pred.size(0), -1)
+        check_pred = self.check_fc(check_pred)  # ← USUŃ sigmoid!
+
+        return policy, value, win_pred, material_pred, check_pred
     
     def predict(self, board_tensor):
         """Predict for a single position (used in MCTS)"""
@@ -213,7 +293,7 @@ class ChessNet(nn.Module):
         with torch.no_grad():
             if len(board_tensor.shape) == 3:
                 board_tensor = board_tensor.unsqueeze(0)
-            policy, value = self.forward(board_tensor)
+            policy, value = self.forward(board_tensor, return_aux=False)
             return torch.exp(policy).cpu().numpy()[0], value.cpu().item()
 
 
@@ -228,10 +308,6 @@ def load_model(checkpoint_path, config, device):
     
     return model
 
-
-# ============================================================================
-# SAVE CHECKPOINT - ZMIENIONA FUNKCJA
-# ============================================================================
 
 def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None, save_optimizer=False):
     """
@@ -249,13 +325,6 @@ def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None, save_opt
     File sizes:
         save_optimizer=True:  ~100 MB (for resume training)
         save_optimizer=False: ~2-4 MB (for inference/deployment)
-    
-    Examples:
-        # Best model (minimal size for Git/deployment)
-        save_checkpoint(model, None, epoch, loss, 'best.pt', save_optimizer=False)
-        
-        # Checkpoint (for resume training)
-        save_checkpoint(model, optimizer, epoch, loss, 'ckpt.pt', save_optimizer=True)
     """
     checkpoint = {
         'epoch': epoch,
@@ -263,7 +332,6 @@ def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None, save_opt
         'loss': loss,
     }
     
-    # ⭐ KLUCZOWA ZMIANA: Optimizer jest opcjonalny
     if save_optimizer and optimizer is not None:
         checkpoint['optimizer_state_dict'] = optimizer.state_dict()
     
