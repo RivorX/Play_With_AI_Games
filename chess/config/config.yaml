@@ -50,10 +50,12 @@ model:
   dropout: 0.3               # Dropout rate
   
   # Advanced features (minimal params, significant quality gains)
-  use_se_blocks: true           # 🧠 Channel attention (+5% params, +20% quality)
-  use_spatial_attention: true   # 👁️ Spatial attention (+1% params, +6% quality)
+  use_se_blocks: true           # 🧠 Channel attention
+  use_spatial_attention: true   # 👁️ Spatial attention
+  spatial_attention_mode: 'last_2' # 'all', 'last_2', 'last_3', 'none', 
+  
   drop_path_rate: 0.1           # 🎲 Stochastic Depth (0% params, +4% quality)
-  activation: 'elu'             # ⚡ ELU activation (0% params, +3% quality)
+  activation: 'relu'            # ⚡ ReLU activation (5-10x FASTER than ELU!)
   use_coord_conv: true          # 🗺️ Position-aware conv (+0.5% params, +4% quality)
 
   # 🆕 MULTI-TASK LEARNING

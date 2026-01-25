@@ -1,5 +1,6 @@
 """
 Training and evaluation functions with comprehensive metrics
+🆕 UPDATED: Fixed MTL loss functions for optimized model
 """
 
 import torch
@@ -28,7 +29,12 @@ from src.mcts import BatchMCTS, select_move_by_visits
 
 def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, scaler):
     """
-    Train for one epoch with Multi-Task Learning support and metrics
+    🆕 UPDATED: Train for one epoch with FIXED MTL loss functions
+    
+    Changes:
+    - ✅ BCEWithLogitsLoss for win_pred (NO sigmoid in model)
+    - ✅ BCEWithLogitsLoss for check_pred (NO sigmoid in model)
+    - ✅ MSELoss for material_pred (tanh in model)
     
     Returns:
         Tuple of (losses_dict, metrics_dict)
@@ -56,11 +62,11 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
     criterion_policy = LabelSmoothingNLLLoss(smoothing=label_smoothing)
     criterion_value = nn.MSELoss()
     
-    # MTL criteria
+    # 🆕 FIXED MTL criteria
     if use_mtl:
-        criterion_win = nn.BCEWithLogitsLoss()
-        criterion_material = nn.MSELoss()
-        criterion_check = nn.BCEWithLogitsLoss()
+        criterion_win = nn.BCEWithLogitsLoss()      # ✅ Expects logits (no sigmoid)
+        criterion_material = nn.MSELoss()            # ✅ Expects tanh output
+        criterion_check = nn.BCEWithLogitsLoss()     # ✅ Expects logits (no sigmoid)
     
     # 📊 Metrics calculator
     metrics_calc = MetricsCalculator()
@@ -112,11 +118,16 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             # Total loss
             loss = policy_weight * policy_loss + value_weight * value_loss
             
-            # Add auxiliary losses
+            # 🆕 FIXED: Add auxiliary losses with correct criteria
             if use_mtl:
-                win_loss = criterion_win(win_pred, win_targets)
+                # Win prediction: BCEWithLogitsLoss (win_pred = logits)
+                win_loss = criterion_win(win_pred.squeeze(), win_targets.squeeze())
+                
+                # Material: MSELoss (material_pred = tanh output)
                 material_loss = criterion_material(material_pred, material_targets)
-                check_loss = criterion_check(check_pred, check_targets)
+                
+                # Check detection: BCEWithLogitsLoss (check_pred = logits)
+                check_loss = criterion_check(check_pred.squeeze(), check_targets.squeeze())
                 
                 loss = loss + win_weight * win_loss + material_weight * material_loss + check_weight * check_loss
                 
@@ -204,7 +215,7 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
 
 def evaluate_il(model, val_loader, config, device):
     """
-    Evaluate model with MTL support and metrics
+    🆕 UPDATED: Evaluate model with FIXED MTL loss functions
     
     Returns:
         Tuple of (losses_dict, metrics_dict)
@@ -231,6 +242,7 @@ def evaluate_il(model, val_loader, config, device):
     criterion_policy = LabelSmoothingNLLLoss(smoothing=label_smoothing)
     criterion_value = nn.MSELoss()
     
+    # 🆕 FIXED MTL criteria
     if use_mtl:
         criterion_win = nn.BCEWithLogitsLoss()
         criterion_material = nn.MSELoss()
@@ -281,11 +293,11 @@ def evaluate_il(model, val_loader, config, device):
                 
                 loss = policy_weight * policy_loss + value_weight * value_loss
                 
-                # MTL losses
+                # 🆕 FIXED: MTL losses
                 if use_mtl:
-                    win_loss = criterion_win(win_pred, win_targets)
+                    win_loss = criterion_win(win_pred.squeeze(), win_targets.squeeze())
                     material_loss = criterion_material(material_pred, material_targets)
-                    check_loss = criterion_check(check_pred, check_targets)
+                    check_loss = criterion_check(check_pred.squeeze(), check_targets.squeeze())
                     
                     loss = loss + win_weight * win_loss + material_weight * material_loss + check_weight * check_loss
                     
@@ -359,7 +371,8 @@ def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device,
     amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
     
     with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-        policy_pred, value_pred = model(boards)
+        # 🆕 UPDATED: Only return main outputs (policy, value) for RL
+        policy_pred, value_pred = model(boards, return_aux=False)
         
         # Policy loss
         policy_loss = -(policy_targets * policy_pred).sum(dim=1)
