@@ -1,18 +1,21 @@
+"""
+Reinforcement Learning Training Script with Comprehensive Metrics
+
+NEW Features:
+- 📊 Policy Accuracy tracking during training
+- 📊 Value MAE monitoring
+- 📊 Enhanced self-play statistics
+"""
+
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
 import yaml
 import sys
-import chess
-from tqdm import tqdm
-import numpy as np
-from collections import deque
 from pathlib import Path
+import numpy as np
+from tqdm import tqdm
 import gc
-import csv
-import matplotlib.pyplot as plt
-from datetime import datetime
 import time
 import pickle
 import tempfile
@@ -21,8 +24,6 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet, save_checkpoint
-from src.mcts import BatchMCTS, select_move_by_visits
-from src.data import board_to_tensor, move_to_index
 
 # Import MCTS self-play
 try:
@@ -32,322 +33,25 @@ except ImportError:
     MCTS_SELFPLAY_AVAILABLE = False
     print("⚠️ MCTS self-play not available")
 
-
-# ==============================================================================
-# 🆕 PRIORITIZED REPLAY BUFFER
-# ==============================================================================
-
-class PrioritizedReplayBuffer:
-    """
-    🆕 Prioritized Experience Replay
-    
-    Samples positions based on TD error priority:
-    - High error positions → sampled more often
-    - Low error positions → sampled less often
-    
-    Benefits:
-    - Faster learning from "difficult" positions
-    - Better sample efficiency
-    - Improved convergence
-    """
-    
-    def __init__(self, max_size, alpha=0.6, beta_start=0.4, beta_end=1.0, epsilon=0.01):
-        """
-        Args:
-            max_size: Maximum buffer size
-            alpha: Priority exponent (0=uniform, 1=full priority)
-            beta_start: Initial importance sampling correction
-            beta_end: Final beta value
-            epsilon: Small constant to avoid zero priority
-        """
-        self.max_size = max_size
-        self.alpha = alpha
-        self.beta = beta_start
-        self.beta_start = beta_start
-        self.beta_end = beta_end
-        self.epsilon = epsilon
-        
-        self.buffer = []
-        self.priorities = np.zeros(max_size, dtype=np.float32)
-        self.position = 0
-        self.size = 0
-        
-        print(f"🎯 Prioritized Replay Buffer:")
-        print(f"   Alpha (priority): {alpha}")
-        print(f"   Beta (IS correction): {beta_start} → {beta_end}")
-        print(f"   Epsilon: {epsilon}")
-    
-    def add(self, position, priority=None):
-        """Add position with optional initial priority"""
-        if priority is None:
-            # New positions get max priority (will be sampled quickly)
-            priority = self.priorities.max() if self.size > 0 else 1.0
-        
-        if len(self.buffer) < self.max_size:
-            self.buffer.append(position)
-        else:
-            self.buffer[self.position] = position
-        
-        self.priorities[self.position] = priority
-        
-        self.position = (self.position + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
-    
-    def sample(self, batch_size, beta=None):
-        """
-        Sample batch with prioritized sampling
-        
-        Returns:
-            batch: List of positions
-            indices: Indices of sampled positions
-            weights: Importance sampling weights
-        """
-        if beta is None:
-            beta = self.beta
-        
-        # Get priorities for all positions
-        priorities = self.priorities[:self.size]
-        
-        # Compute sampling probabilities
-        probs = priorities ** self.alpha
-        probs = probs / probs.sum()
-        
-        # Sample indices
-        indices = np.random.choice(self.size, batch_size, p=probs, replace=False)
-        
-        # Compute importance sampling weights
-        weights = (self.size * probs[indices]) ** (-beta)
-        weights = weights / weights.max()  # Normalize
-        
-        # Get batch
-        batch = [self.buffer[i] for i in indices]
-        
-        return batch, indices, weights
-    
-    def update_priorities(self, indices, priorities):
-        """Update priorities for sampled positions"""
-        for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority + self.epsilon
-    
-    def update_beta(self, progress):
-        """Update beta (importance sampling correction) based on training progress"""
-        self.beta = self.beta_start + (self.beta_end - self.beta_start) * progress
-    
-    def __len__(self):
-        return self.size
+# Import from utils
+from utils import (
+    TrainingLogger,
+    ReplayBuffer,
+    PrioritizedReplayBuffer,
+    TemperatureSchedule,
+    train_on_batch_rl,
+    evaluate_models
+)
+from utils.metrics import MetricsCalculator
 
 
 # ==============================================================================
-# 🆕 TEMPERATURE SCHEDULE (Curriculum Learning)
-# ==============================================================================
-
-class TemperatureSchedule:
-    """
-    🆕 Adaptive temperature schedule for exploration
-    
-    Strategy:
-    - Start with HIGH temperature → more exploration
-    - Gradually DECREASE → more exploitation
-    - Helps model learn diverse strategies early, then refine
-    
-    Benefits:
-    - Better exploration-exploitation balance
-    - Faster convergence
-    - More robust policies
-    """
-    
-    def __init__(self, start_temp, end_temp, decay_iterations):
-        self.start_temp = start_temp
-        self.end_temp = end_temp
-        self.decay_iterations = decay_iterations
-        
-        print(f"🌡️ Temperature Schedule:")
-        print(f"   Start: {start_temp} (high exploration)")
-        print(f"   End: {end_temp} (low exploration)")
-        print(f"   Decay over: {decay_iterations} iterations")
-    
-    def get_temperature(self, iteration):
-        """Get temperature for current iteration"""
-        if iteration >= self.decay_iterations:
-            return self.end_temp
-        
-        # Linear decay
-        progress = iteration / self.decay_iterations
-        temp = self.start_temp + (self.end_temp - self.start_temp) * progress
-        
-        return temp
-
-
-# ==============================================================================
-# STANDARD REPLAY BUFFER (Fallback)
-# ==============================================================================
-
-class ReplayBuffer:
-    """Standard replay buffer (uniform sampling)"""
-    
-    def __init__(self, max_size):
-        self.buffer = deque(maxlen=max_size)
-    
-    def add(self, position):
-        self.buffer.append(position)
-    
-    def sample(self, batch_size):
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        batch = [self.buffer[i] for i in indices]
-        
-        boards = torch.stack([b for b, _, _ in batch])
-        policies = torch.stack([p for _, p, _ in batch])
-        values = torch.stack([v for _, _, v in batch])
-        
-        return boards, policies, values
-    
-    def __len__(self):
-        return len(self.buffer)
-
-
-# ==============================================================================
-# TRAINING LOGGER
-# ==============================================================================
-
-class TrainingLogger:
-    """Logger for RL training"""
-    
-    def __init__(self, log_dir, experiment_name="rl_training"):
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.csv_path = self.log_dir / f"{experiment_name}_{timestamp}.csv"
-        self.plot_path = self.log_dir / f"{experiment_name}_{timestamp}.png"
-        
-        with open(self.csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                'iteration', 'avg_loss', 'policy_loss', 'value_loss',
-                'win_rate', 'buffer_size', 'avg_game_length', 'positions_per_sec',
-                'selfplay_time', 'data_collection_time', 'temperature', 'beta'
-            ])
-        
-        self.iterations = []
-        self.losses = []
-        self.policy_losses = []
-        self.value_losses = []
-        self.win_rates = []
-        self.temperatures = []
-        
-        print(f"📊 Logging to: {self.csv_path}")
-    
-    def log(self, iteration, avg_loss, policy_loss, value_loss, 
-            win_rate=None, buffer_size=None, avg_game_length=None, 
-            positions_per_sec=None, selfplay_time=None, data_collection_time=None,
-            temperature=None, beta=None):
-        with open(self.csv_path, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                iteration, avg_loss, policy_loss, value_loss,
-                win_rate if win_rate is not None else '',
-                buffer_size if buffer_size is not None else '',
-                avg_game_length if avg_game_length is not None else '',
-                positions_per_sec if positions_per_sec is not None else '',
-                selfplay_time if selfplay_time is not None else '',
-                data_collection_time if data_collection_time is not None else '',
-                temperature if temperature is not None else '',
-                beta if beta is not None else ''
-            ])
-        
-        self.iterations.append(iteration)
-        self.losses.append(avg_loss)
-        self.policy_losses.append(policy_loss)
-        self.value_losses.append(value_loss)
-        
-        if win_rate is not None:
-            self.win_rates.append((iteration, win_rate))
-        
-        if temperature is not None:
-            self.temperatures.append((iteration, temperature))
-    
-    def plot(self):
-        if len(self.iterations) < 2:
-            return
-        
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        fig.suptitle('RL Training Progress', fontsize=16, fontweight='bold')
-        
-        # Total Loss
-        ax = axes[0, 0]
-        ax.plot(self.iterations, self.losses, 'b-', label='Total Loss', linewidth=2)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Loss')
-        ax.set_title('Total Loss')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Policy Loss
-        ax = axes[0, 1]
-        ax.plot(self.iterations, self.policy_losses, 'g-', label='Policy Loss', linewidth=2)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Policy Loss')
-        ax.set_title('Policy Loss')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Value Loss
-        ax = axes[0, 2]
-        ax.plot(self.iterations, self.value_losses, 'r-', label='Value Loss', linewidth=2)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Value Loss')
-        ax.set_title('Value Loss')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Win Rate
-        ax = axes[1, 0]
-        if self.win_rates:
-            win_iters, win_vals = zip(*self.win_rates)
-            ax.plot(win_iters, win_vals, 'mo-', label='Win Rate', linewidth=2, markersize=8)
-            ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
-            ax.axhline(y=0.55, color='green', linestyle='--', alpha=0.5)
-            ax.set_xlabel('Iteration')
-            ax.set_ylabel('Win Rate')
-            ax.set_title('Win Rate vs Best')
-            ax.set_ylim([0, 1])
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        
-        # 🆕 Temperature Schedule
-        ax = axes[1, 1]
-        if self.temperatures:
-            temp_iters, temp_vals = zip(*self.temperatures)
-            ax.plot(temp_iters, temp_vals, 'orange', linewidth=2, label='Temperature')
-            ax.set_xlabel('Iteration')
-            ax.set_ylabel('Temperature')
-            ax.set_title('🌡️ Temperature Schedule')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        
-        # Loss Comparison
-        ax = axes[1, 2]
-        ax.plot(self.iterations, self.losses, 'b-', label='Total', linewidth=2, alpha=0.7)
-        ax.plot(self.iterations, self.policy_losses, 'g--', label='Policy', linewidth=1.5, alpha=0.7)
-        ax.plot(self.iterations, self.value_losses, 'r--', label='Value', linewidth=1.5, alpha=0.7)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Loss')
-        ax.set_title('All Losses Comparison')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-
-# ==============================================================================
-# 🎯 SELF-PLAY WITH PROPER MCTS
+# SELF-PLAY WITH PROPER MCTS
 # ==============================================================================
 
 def play_games_parallel_mcts(model, config, device, num_games):
     """
-    ✅ CORRECT: Parallel self-play using MCTS
+    Parallel self-play using MCTS
     
     This is the PROPER AlphaZero approach:
     - Each worker plays games using MCTS
@@ -453,148 +157,6 @@ def play_games_parallel_mcts(model, config, device, num_games):
 
 
 # ==============================================================================
-# 🆕 TRAINING FUNCTION WITH PRIORITIZED REPLAY
-# ==============================================================================
-
-def train_on_batch_prioritized(model, optimizer, batch, indices, weights, config, device, scaler, replay_buffer):
-    """
-    🆕 Train on batch with prioritized replay
-    
-    Returns TD errors for priority update
-    """
-    boards, policy_targets, value_targets = batch
-    boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
-    policy_targets = policy_targets.to(device, non_blocking=True)
-    value_targets = value_targets.to(device, non_blocking=True)
-    weights = torch.FloatTensor(weights).to(device, non_blocking=True)
-    
-    optimizer.zero_grad(set_to_none=True)
-    
-    use_amp = config['hardware'].get('use_amp', True)
-    amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
-    
-    with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-        policy_pred, value_pred = model(boards)
-        
-        # Policy loss
-        policy_loss = -(policy_targets * policy_pred).sum(dim=1)
-        
-        # Value loss (TD error for prioritization)
-        value_loss = (value_pred.squeeze() - value_targets.squeeze()) ** 2
-        
-        # 🆕 Apply importance sampling weights
-        policy_loss = (policy_loss * weights).mean()
-        value_loss = (value_loss * weights).mean()
-        
-        policy_weight = config['reinforcement_learning']['policy_loss_weight']
-        value_weight = config['reinforcement_learning']['value_loss_weight']
-        loss = policy_weight * policy_loss + value_weight * value_loss
-    
-    scaler.scale(loss).backward()
-    
-    grad_clip = config['reinforcement_learning'].get('grad_clip', 1.0)
-    if grad_clip > 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    
-    scaler.step(optimizer)
-    scaler.update()
-    
-    # 🆕 Compute TD errors for priority update (detached, on CPU)
-    with torch.no_grad():
-        td_errors = torch.abs(value_pred.squeeze() - value_targets.squeeze()).cpu().numpy()
-    
-    # 🆕 Update priorities
-    if isinstance(replay_buffer, PrioritizedReplayBuffer):
-        replay_buffer.update_priorities(indices, td_errors)
-    
-    return loss.item(), policy_loss.item(), value_loss.item()
-
-
-def train_on_batch(model, optimizer, batch, config, device, scaler):
-    """Standard training (for regular replay buffer)"""
-    boards, policy_targets, value_targets = batch
-    boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
-    policy_targets = policy_targets.to(device, non_blocking=True)
-    value_targets = value_targets.to(device, non_blocking=True)
-    
-    optimizer.zero_grad(set_to_none=True)
-    
-    use_amp = config['hardware'].get('use_amp', True)
-    amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
-    
-    with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-        policy_pred, value_pred = model(boards)
-        
-        policy_loss = -(policy_targets * policy_pred).sum(dim=1).mean()
-        value_loss = nn.MSELoss()(value_pred, value_targets)
-        
-        policy_weight = config['reinforcement_learning']['policy_loss_weight']
-        value_weight = config['reinforcement_learning']['value_loss_weight']
-        loss = policy_weight * policy_loss + value_weight * value_loss
-    
-    scaler.scale(loss).backward()
-    
-    grad_clip = config['reinforcement_learning'].get('grad_clip', 1.0)
-    if grad_clip > 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    
-    scaler.step(optimizer)
-    scaler.update()
-    
-    return loss.item(), policy_loss.item(), value_loss.item()
-
-
-# ==============================================================================
-# EVALUATION
-# ==============================================================================
-
-def evaluate_models(model1, model2, config, device, num_games=20):
-    """Evaluate model1 vs model2"""
-    mcts1 = BatchMCTS(model1, config, device)
-    mcts2 = BatchMCTS(model2, config, device)
-    
-    wins = 0
-    draws = 0
-    
-    for game_idx in range(num_games):
-        board = chess.Board()
-        
-        if game_idx % 2 == 0:
-            current_mcts = mcts1
-            other_mcts = mcts2
-        else:
-            current_mcts = mcts2
-            other_mcts = mcts1
-        
-        move_count = 0
-        while not board.is_game_over() and move_count < 200:
-            mcts = current_mcts if board.turn == chess.WHITE else other_mcts
-            visit_counts = mcts.search(board, num_simulations=50)
-            move, _ = select_move_by_visits(visit_counts, temperature=0)
-            board.push(move)
-            move_count += 1
-        
-        mcts1.reset_tree()
-        mcts2.reset_tree()
-        
-        result = board.result()
-        if game_idx % 2 == 0:
-            if result == '1-0':
-                wins += 1
-            elif result == '1/2-1/2':
-                draws += 0.5
-        else:
-            if result == '0-1':
-                wins += 1
-            elif result == '1/2-1/2':
-                draws += 0.5
-    
-    return (wins + draws) / num_games
-
-
-# ==============================================================================
 # MAIN TRAINING LOOP
 # ==============================================================================
 
@@ -638,7 +200,12 @@ def main():
             print("⚠️ bfloat16 not supported")
             use_bfloat16 = False
     
-    logger = TrainingLogger(logs_dir, experiment_name="rl_training_mcts")
+    # Initialize logger
+    logger = TrainingLogger(
+        logs_dir, 
+        experiment_name="rl_training_mcts",
+        mode="rl"
+    )
     
     print("\n=== Loading IL model ===")
     model = ChessNet(config).to(device)
@@ -665,7 +232,7 @@ def main():
     
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     
-    # 🆕 Initialize replay buffer (prioritized or standard)
+    # Initialize replay buffer (prioritized or standard)
     use_prioritized = config['reinforcement_learning'].get('use_prioritized_replay', False)
     
     if use_prioritized:
@@ -679,7 +246,7 @@ def main():
     else:
         replay_buffer = ReplayBuffer(config['reinforcement_learning']['replay_buffer_size'])
     
-    # 🆕 Initialize temperature schedule
+    # Initialize temperature schedule
     use_temp_schedule = config['reinforcement_learning'].get('use_temperature_schedule', False)
     
     if use_temp_schedule:
@@ -700,6 +267,7 @@ def main():
     print(f"   • Batch MCTS: {config['reinforcement_learning'].get('mcts_batch_size', 32)}")
     print(f"   • 🆕 Prioritized Replay: {use_prioritized}")
     print(f"   • 🆕 Temperature Schedule: {use_temp_schedule}")
+    print(f"   • 📊 Policy Accuracy & Value MAE tracking")
     
     total_iterations = config['reinforcement_learning']['iterations']
     
@@ -708,22 +276,21 @@ def main():
         print(f"Iteration {iteration + 1}/{total_iterations}")
         print('='*70)
         
-        # 🆕 Get current temperature
+        # Get current temperature
         if use_temp_schedule:
             current_temp = temp_schedule.get_temperature(iteration)
             print(f"🌡️ Temperature: {current_temp:.2f}")
-            # Update config for self-play
             config['reinforcement_learning']['mcts_temperature'] = current_temp
         else:
             current_temp = config['reinforcement_learning']['mcts_temperature']
         
-        # 🆕 Update beta for importance sampling
+        # Update beta for importance sampling
         if use_prioritized:
             progress = iteration / total_iterations
             replay_buffer.update_beta(progress)
             print(f"🎯 Beta (IS): {replay_buffer.beta:.3f}")
         
-        # 🎯 Self-play with MCTS
+        # Self-play with MCTS
         model.eval()
         
         positions, avg_game_length, positions_per_sec, selfplay_time, collection_time = \
@@ -740,7 +307,7 @@ def main():
         
         print(f"Replay buffer: {len(replay_buffer)} positions")
         
-        # Training
+        # Training with metrics
         if len(replay_buffer) >= config['reinforcement_learning']['batch_size']:
             print("Training...")
             model.train()
@@ -748,10 +315,13 @@ def main():
             total_policy = 0
             total_value = 0
             
+            # 📊 Initialize metrics calculator
+            metrics_calc = MetricsCalculator()
+            
             num_batches = len(replay_buffer) // config['reinforcement_learning']['batch_size']
             
             for batch_idx in tqdm(range(config['reinforcement_learning']['train_epochs_per_iteration'] * num_batches), desc="Training"):
-                # 🆕 Prioritized sampling
+                # Prioritized or standard sampling
                 if use_prioritized:
                     batch_data, indices, weights = replay_buffer.sample(
                         config['reinforcement_learning']['batch_size']
@@ -763,14 +333,13 @@ def main():
                     values = torch.stack([v for _, _, v in batch_data])
                     batch = (boards, policies, values)
                     
-                    loss, policy_loss, value_loss = train_on_batch_prioritized(
-                        model, optimizer, batch, indices, weights, config, device, scaler, replay_buffer
+                    loss, policy_loss, value_loss = train_on_batch_rl(
+                        model, optimizer, batch, indices, weights, config, device, scaler, replay_buffer, metrics_calc
                     )
                 else:
-                    # Standard sampling
                     batch = replay_buffer.sample(config['reinforcement_learning']['batch_size'])
-                    loss, policy_loss, value_loss = train_on_batch(
-                        model, optimizer, batch, config, device, scaler
+                    loss, policy_loss, value_loss = train_on_batch_rl(
+                        model, optimizer, batch, None, None, config, device, scaler, replay_buffer, metrics_calc
                     )
                 
                 total_loss += loss
@@ -786,9 +355,16 @@ def main():
             avg_policy = total_policy / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
             avg_value = total_value / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
             
+            # 📊 Compute metrics
+            train_metrics = metrics_calc.compute()
+            
             print(f"Loss: {avg_loss:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}")
+            print(f"📊 Top-1: {train_metrics['policy_top1_acc']:.2%}, "
+                  f"Top-3: {train_metrics['policy_top3_acc']:.2%}, "
+                  f"MAE: {train_metrics['value_mae']:.4f}")
         else:
             avg_loss = avg_policy = avg_value = 0
+            train_metrics = {}
         
         # Evaluation
         win_rate = None
@@ -801,11 +377,19 @@ def main():
             )
             print(f"Win rate: {win_rate:.2%}")
             
-            # Log with temperature and beta
+            # Log with all metrics
             logger.log(
-                iteration + 1, avg_loss, avg_policy, avg_value,
-                win_rate, len(replay_buffer), avg_game_length, positions_per_sec,
-                selfplay_time, collection_time,
+                iteration + 1,
+                train_metrics=train_metrics,
+                avg_loss=avg_loss,
+                policy_loss=avg_policy,
+                value_loss=avg_value,
+                win_rate=win_rate,
+                buffer_size=len(replay_buffer),
+                avg_game_length=avg_game_length,
+                positions_per_sec=positions_per_sec,
+                selfplay_time=selfplay_time,
+                data_collection_time=collection_time,
                 temperature=current_temp,
                 beta=replay_buffer.beta if use_prioritized else None
             )
@@ -819,7 +403,11 @@ def main():
                 save_checkpoint(
                     model_to_save, None, iteration, avg_loss,
                     str(best_model_rl_path),
-                    {'win_rate': win_rate},
+                    {
+                        'win_rate': win_rate,
+                        'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
+                        'value_mae': train_metrics.get('value_mae', 0)
+                    },
                     save_optimizer=False
                 )
                 
@@ -830,9 +418,15 @@ def main():
                 print(f"💾 Saved: {best_model_rl_path} ({size_mb:.1f} MB)")
         else:
             logger.log(
-                iteration + 1, avg_loss, avg_policy, avg_value,
-                buffer_size=len(replay_buffer), avg_game_length=avg_game_length,
-                positions_per_sec=positions_per_sec, selfplay_time=selfplay_time,
+                iteration + 1,
+                train_metrics=train_metrics,
+                avg_loss=avg_loss,
+                policy_loss=avg_policy,
+                value_loss=avg_value,
+                buffer_size=len(replay_buffer),
+                avg_game_length=avg_game_length,
+                positions_per_sec=positions_per_sec,
+                selfplay_time=selfplay_time,
                 data_collection_time=collection_time,
                 temperature=current_temp,
                 beta=replay_buffer.beta if use_prioritized else None
@@ -844,14 +438,18 @@ def main():
                 win_rate = evaluate_models(model, best_model, config, device,
                                         config['reinforcement_learning']['eval_games'])
             
-            checkpoint_name = f"rl_iter_{iteration+1}_wr_{win_rate:.3f}.pt"
+            checkpoint_name = f"rl_iter_{iteration+1}_wr_{win_rate:.3f}_top1_{train_metrics.get('policy_top1_acc', 0):.3f}.pt"
             checkpoint_path = rl_dir / checkpoint_name
             
             model_to_save = model.to(torch.bfloat16) if use_bfloat16 else model
             save_checkpoint(
                 model_to_save, None, iteration, avg_loss,
                 str(checkpoint_path),
-                {'win_rate': win_rate},
+                {
+                    'win_rate': win_rate,
+                    'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
+                    'value_mae': train_metrics.get('value_mae', 0)
+                },
                 save_optimizer=False
             )
             
@@ -859,7 +457,7 @@ def main():
                 model = model.to(torch.float32)
             
             size_mb = checkpoint_path.stat().st_size / (1024**2)
-            print(f"💾 Checkpoint: {checkpoint_path} ({size_mb:.1f} MB)")
+            print(f"💾 Checkpoint: {checkpoint_path.name} ({size_mb:.1f} MB)")
         
         gc.collect()
         if torch.cuda.is_available():
@@ -867,3 +465,7 @@ def main():
 
     logger.plot()
     print("\n=== Training complete ===")
+
+
+if __name__ == "__main__":
+    main()

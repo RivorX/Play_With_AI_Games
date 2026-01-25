@@ -42,7 +42,7 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Base architecture
-  num_residual_blocks: 10     # Number of residual blocks (6-12 optimal)
+  num_residual_blocks: 6     # Number of residual blocks (6-12 optimal)
   filters: 192               # Convolutional filters (128-256 for RTX 5060 Ti)
   policy_head_filters: 32    # Policy head filters
   value_head_filters: 32     # Value head filters
