@@ -176,6 +176,16 @@ logging:
 
 
 # ------------------------------------------------------------------------------
+# 🆕 DEBUG & PROFILING
+# ------------------------------------------------------------------------------
+debug:
+  enabled: false                    # Master switch for debug mode
+  profile_training: true           # Time breakdown per epoch
+  log_gpu_memory: false             # GPU memory usage
+  profile_every_n_epochs: 1         # Profile frequency (if enabled)
+
+
+# ------------------------------------------------------------------------------
 # REPRODUCIBILITY
 # ------------------------------------------------------------------------------
 seed: 42                     # Random seed
