@@ -75,7 +75,7 @@ def load_model_from_checkpoint(checkpoint_path, config, device, model_class):
     model = model_class(config).to(device)
     
     if checkpoint_path.exists():
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"✓ Model loaded from {checkpoint_path.name}")
         

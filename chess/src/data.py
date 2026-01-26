@@ -13,10 +13,18 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 
 
-def board_to_tensor(board):
+def board_to_tensor(board, history_boards=None, history_positions=0):
     """
-    Convert chess.Board to tensor representation
-    Returns: (12, 8, 8) tensor - 6 piece types x 2 colors
+    Convert chess.Board to tensor representation with optional history
+    
+    Args:
+        board: Current chess.Board
+        history_boards: List of previous chess.Board objects (oldest to newest)
+        history_positions: Number of history positions to include
+    
+    Returns: 
+        - Without history: (12, 8, 8) tensor
+        - With history: (12 * (1 + history_positions), 8, 8) tensor
     """
     tensor = np.zeros((12, 8, 8), dtype=np.float32)
     
@@ -37,7 +45,47 @@ def board_to_tensor(board):
                 channel = piece_idx + 6
             tensor[channel, row, col] = 1.0
     
-    return tensor
+    # If no history needed, return current board only
+    if history_positions == 0 or history_boards is None:
+        return tensor
+    
+    # Build history tensors
+    history_tensors = []
+    
+    # Get last N boards from history
+    if history_boards:
+        history_list = history_boards[-history_positions:]
+    else:
+        history_list = []
+    
+    # Pad with empty boards if not enough history
+    while len(history_list) < history_positions:
+        empty_board = np.zeros((12, 8, 8), dtype=np.float32)
+        history_tensors.append(empty_board)
+    
+    # Add actual history boards (convert each to tensor)
+    for hist_board in history_list:
+        hist_tensor = np.zeros((12, 8, 8), dtype=np.float32)
+        
+        for square in chess.SQUARES:
+            piece = hist_board.piece_at(square)
+            if piece:
+                row = square // 8
+                col = square % 8
+                piece_idx = piece_to_idx[piece.piece_type]
+                if piece.color == chess.WHITE:
+                    channel = piece_idx
+                else:
+                    channel = piece_idx + 6
+                hist_tensor[channel, row, col] = 1.0
+        
+        history_tensors.append(hist_tensor)
+    
+    # Stack: [oldest_history, ..., newest_history, current]
+    all_tensors = history_tensors + [tensor]
+    stacked = np.concatenate(all_tensors, axis=0)
+    
+    return stacked
 
 
 def board_to_compact(board):
@@ -242,15 +290,16 @@ def extract_game_data(game):
         return None
 
 
-def process_extracted_game(game_data, min_elo, max_moves, use_mtl=True):
+def process_extracted_game(game_data, min_elo, max_moves, use_mtl=True, history_positions=0):
     """
-    🆕 Process extracted game data with MTL support
+    🆕 Process extracted game data with MTL and HISTORY support
     
     Args:
         game_data: Extracted game data
         min_elo: Minimum Elo threshold
         max_moves: Maximum moves per game
         use_mtl: If True, extract auxiliary labels
+        history_positions: Number of previous positions to include (0 = disabled)
     """
     try:
         if game_data is None:
@@ -285,6 +334,9 @@ def process_extracted_game(game_data, min_elo, max_moves, use_mtl=True):
         board = chess.Board()
         move_count = 0
         
+        # 🆕 History tracking
+        board_history = []  # List of compact boards
+        
         for move_uci in game_data['moves']:
             if move_count >= max_moves:
                 break
@@ -292,11 +344,27 @@ def process_extracted_game(game_data, min_elo, max_moves, use_mtl=True):
             try:
                 move = chess.Move.from_uci(move_uci)
                 
+                # Current board
                 compact_board = board_to_compact(board)
                 move_index = np.uint16(move_to_index(move))
                 current_outcome = outcome if board.turn == chess.WHITE else -outcome
                 
-                # 🆕 Extract auxiliary labels if MTL is enabled
+                # 🆕 Prepare history (pad with empty boards if needed)
+                if history_positions > 0:
+                    # Get last N positions, pad with empty if not enough
+                    history_list = board_history[-history_positions:] if len(board_history) > 0 else []
+                    
+                    # Pad with empty boards if needed
+                    empty_board = bytes(32)  # All zeros = empty board
+                    while len(history_list) < history_positions:
+                        history_list.insert(0, empty_board)
+                    
+                    # Concatenate history (oldest to newest, then current)
+                    full_history = b''.join(history_list)
+                else:
+                    full_history = b''  # No history
+                
+                # Extract auxiliary labels if MTL is enabled
                 if use_mtl:
                     aux_labels = extract_auxiliary_labels(board, result)
                     win_label = np.float32(aux_labels['win'])
@@ -304,7 +372,8 @@ def process_extracted_game(game_data, min_elo, max_moves, use_mtl=True):
                     check_label = np.float32(aux_labels['check'])
                     
                     data.append((
-                        compact_board, 
+                        compact_board,
+                        full_history,  # 🆕 History bytes
                         move_index, 
                         np.float32(current_outcome),
                         win_label,
@@ -312,7 +381,15 @@ def process_extracted_game(game_data, min_elo, max_moves, use_mtl=True):
                         check_label
                     ))
                 else:
-                    data.append((compact_board, move_index, np.float32(current_outcome)))
+                    data.append((
+                        compact_board,
+                        full_history,  # 🆕 History bytes
+                        move_index,
+                        np.float32(current_outcome)
+                    ))
+                
+                # 🆕 Add current board to history
+                board_history.append(compact_board)
                 
                 board.push(move)
                 move_count += 1
@@ -326,11 +403,11 @@ def process_extracted_game(game_data, min_elo, max_moves, use_mtl=True):
 
 def process_game_batch(args):
     """Process a batch of extracted game data in parallel worker"""
-    games_data, min_elo, max_moves, use_mtl = args
+    games_data, min_elo, max_moves, use_mtl, history_positions = args
     all_positions = []
     
     for game_data in games_data:
-        positions = process_extracted_game(game_data, min_elo, max_moves, use_mtl)
+        positions = process_extracted_game(game_data, min_elo, max_moves, use_mtl, history_positions)
         all_positions.extend(positions)
     
     return all_positions
@@ -338,56 +415,71 @@ def process_game_batch(args):
 
 class BinaryDataWriter:
     """
-    🆕 Write positions to binary file with MTL support
+    🆕 Write positions to binary file with MTL and HISTORY support
     
-    Format without MTL (38 bytes):
+    Format without MTL, no history (38 bytes):
     - Board: 32 bytes
     - Move: 2 bytes
     - Outcome: 4 bytes
     
-    Format with MTL (50 bytes):
+    Format with MTL, no history (50 bytes):
     - Board: 32 bytes
     - Move: 2 bytes
     - Outcome: 4 bytes
     - Win: 4 bytes
     - Material: 4 bytes
     - Check: 4 bytes
+    
+    Format with history:
+    - Board: 32 bytes
+    - History: 32 * history_positions bytes
+    - Move: 2 bytes
+    - Outcome: 4 bytes
+    - [MTL labels if enabled: 12 bytes]
     """
     
-    def __init__(self, filepath, use_mtl=True):
+    def __init__(self, filepath, use_mtl=True, history_positions=0):
         self.filepath = filepath
         self.use_mtl = use_mtl
+        self.history_positions = history_positions
+        
+        # Calculate position size
+        base_size = 32 + (32 * history_positions) + 2 + 4  # board + history + move + outcome
+        mtl_size = 12 if use_mtl else 0  # win + material + check
+        self.position_size = base_size + mtl_size
+        
         self.file = open(filepath, 'wb')
         self.count = 0
-        self.position_size = 50 if use_mtl else 38
     
     def write_position(self, *args):
         """
         Write one position
         
         Args (without MTL):
-            compact_board, move_index, outcome
+            compact_board, history_bytes, move_index, outcome
         
         Args (with MTL):
-            compact_board, move_index, outcome, win, material, check
+            compact_board, history_bytes, move_index, outcome, win, material, check
         """
         if self.use_mtl:
-            if len(args) != 6:
-                raise ValueError(f"Expected 6 args for MTL, got {len(args)}")
-            compact_board, move_index, outcome, win, material, check = args
+            if len(args) != 7:
+                raise ValueError(f"Expected 7 args for MTL, got {len(args)}")
+            compact_board, history_bytes, move_index, outcome, win, material, check = args
             
             self.file.write(compact_board)  # 32 bytes
+            self.file.write(history_bytes)  # 32 * history_positions bytes
             self.file.write(struct.pack('H', move_index))  # 2 bytes
             self.file.write(struct.pack('f', outcome))  # 4 bytes
             self.file.write(struct.pack('f', win))  # 4 bytes
             self.file.write(struct.pack('f', material))  # 4 bytes
             self.file.write(struct.pack('f', check))  # 4 bytes
         else:
-            if len(args) != 3:
-                raise ValueError(f"Expected 3 args for non-MTL, got {len(args)}")
-            compact_board, move_index, outcome = args
+            if len(args) != 4:
+                raise ValueError(f"Expected 4 args for non-MTL, got {len(args)}")
+            compact_board, history_bytes, move_index, outcome = args
             
             self.file.write(compact_board)  # 32 bytes
+            self.file.write(history_bytes)  # 32 * history_positions bytes
             self.file.write(struct.pack('H', move_index))  # 2 bytes
             self.file.write(struct.pack('f', outcome))  # 4 bytes
         
@@ -404,14 +496,12 @@ class BinaryDataWriter:
 
 
 def parse_single_pgn_file(args):
-    """
-    🆕 Process a single PGN file with MTL support
-    """
-    pgn_path, output_path, min_elo, max_games, max_moves, file_index, select_top, sort_by_elo, use_mtl = args
+    """🆕 Process single PGN with MTL and HISTORY"""
+    pgn_path, output_path, min_elo, max_games, max_moves, file_index, select_top, sort_by_elo, use_mtl, history_positions = args
     
     print(f"[Worker {file_index}] Processing: {pgn_path.name}")
     
-    # Extract ALL games that meet min_elo threshold
+    # Extract games
     games_data = []
     with open(pgn_path, 'r', encoding='utf-8', errors='ignore') as f:
         while True:
@@ -431,52 +521,42 @@ def parse_single_pgn_file(args):
                 except (ValueError, TypeError):
                     pass
     
-    print(f"[Worker {file_index}] Extracted {len(games_data)} games (Elo >= {min_elo}) from {pgn_path.name}")
+    print(f"[Worker {file_index}] Extracted {len(games_data)} games (Elo >= {min_elo})")
     
-    # Sort by Elo and select top games
-    if select_top and sort_by_elo and len(games_data) > 0:
-        print(f"[Worker {file_index}] Sorting by average Elo...")
+    # Sort and select
+    if select_top and sort_by_elo and games_data:
         games_data.sort(key=lambda x: x[1], reverse=True)
-        
         games_to_process = min(max_games, len(games_data))
         games_data = games_data[:games_to_process]
         
-        if len(games_data) > 0:
-            top_elo = games_data[0][1]
-            bottom_elo = games_data[-1][1]
-            print(f"[Worker {file_index}] Selected top {len(games_data)} games (Elo range: {bottom_elo:.0f}-{top_elo:.0f})")
+        if games_data:
+            print(f"[Worker {file_index}] Selected top {len(games_data)} (Elo: {games_data[-1][1]:.0f}-{games_data[0][1]:.0f})")
     
     games_data = [g[0] for g in games_data]
     
-    # Process games in batches
+    # Process in batches
     batch_size = max(1, len(games_data) // (mp.cpu_count() * 2))
-    batches = []
-    for i in range(0, len(games_data), batch_size):
-        batch = games_data[i:i + batch_size]
-        batches.append((batch, min_elo, max_moves, use_mtl))
+    batches = [(games_data[i:i + batch_size], min_elo, max_moves, use_mtl, history_positions) 
+               for i in range(0, len(games_data), batch_size)]
     
     all_positions = []
     with ProcessPoolExecutor(max_workers=mp.cpu_count()) as executor:
         futures = [executor.submit(process_game_batch, batch) for batch in batches]
-        
         for future in as_completed(futures):
-            positions = future.result()
-            all_positions.extend(positions)
+            all_positions.extend(future.result())
     
-    # Write to binary file
-    with BinaryDataWriter(output_path, use_mtl=use_mtl) as writer:
+    # Write to binary
+    with BinaryDataWriter(output_path, use_mtl=use_mtl, history_positions=history_positions) as writer:
         for position_data in all_positions:
             writer.write_position(*position_data)
     
-    print(f"[Worker {file_index}] ✓ {pgn_path.name}: {len(all_positions)} positions → {output_path.name}")
+    print(f"[Worker {file_index}] ✓ {pgn_path.name}: {len(all_positions)} positions")
     
     return pgn_path.name, len(all_positions), output_path
 
 
 def parse_pgn_files(data_dir, config, num_workers=None):
-    """
-    🆕 Parse multiple PGN files with MTL support
-    """
+    """🆕 Parse PGN files with MTL and HISTORY support"""
     script_dir = Path(__file__).parent.parent
     data_path = script_dir / data_dir
     preprocessing_dir = script_dir / "data" / "preprocessing"
@@ -500,15 +580,16 @@ def parse_pgn_files(data_dir, config, num_workers=None):
     select_top = config['data'].get('select_top_games', True)
     sort_by_elo = config['data'].get('sort_by_avg_elo', True)
     
-    # 🆕 Check if MTL is enabled
     use_mtl = config['model'].get('use_multitask_learning', False)
+    history_positions = config['model'].get('history_positions', 0)
     
     # Cache filename
     cache_suffix = f"_top{max_games}" if select_top else f"_first{max_games}"
     mtl_suffix = "_mtl" if use_mtl else ""
+    history_suffix = f"_hist{history_positions}" if history_positions > 0 else ""
     
-    binary_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}{mtl_suffix}.bin"
-    metadata_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}{mtl_suffix}_meta.pkl"
+    binary_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}{mtl_suffix}{history_suffix}.bin"
+    metadata_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}{mtl_suffix}{history_suffix}_meta.pkl"
     
     # Check cache
     if binary_file.exists() and metadata_file.exists():
@@ -520,33 +601,32 @@ def parse_pgn_files(data_dir, config, num_workers=None):
             if metadata['total_positions'] > 0:
                 size_mb = binary_file.stat().st_size / (1024**2)
                 print(f"✓ Loaded {metadata['total_positions']:,} positions ({size_mb:.1f} MB)")
-                print(f"  • Multi-Task Learning: {metadata.get('use_mtl', False)}")
+                print(f"  • MTL: {metadata.get('use_mtl', False)}")
+                print(f"  • History: {metadata.get('history_positions', 0)}")
+                print(f"  • Input planes: {metadata.get('input_planes', 12)}")
                 return metadata
         except Exception as e:
             print(f"⚠️ Failed to load cache: {e}")
-            print("Will reprocess PGN files...")
     
-    # Parallel processing configuration
+    # Processing config
     use_parallel = config['data'].get('parallel_pgn_processing', True)
-    max_parallel_workers = config['data'].get('max_workers', None)
-    
-    if max_parallel_workers is None:
-        max_parallel_workers = len(pgn_files)
-    
+    max_parallel_workers = config['data'].get('max_workers', None) or len(pgn_files)
     games_per_file = max_games // len(pgn_files) if len(pgn_files) > 1 else max_games
     
+    # Calculate dimensions
+    base_size = 32 + (32 * history_positions) + 2 + 4
+    mtl_size = 12 if use_mtl else 0
+    position_size = base_size + mtl_size
+    input_planes = 12 * (1 + history_positions)  # 🆕 AUTO-CALCULATE
+    
     print(f"🚀 Processing Configuration:")
-    print(f"  • Parallel processing: {'ENABLED' if use_parallel else 'DISABLED'}")
-    print(f"  • Workers: {max_parallel_workers if use_parallel else 1}")
-    print(f"  • Strategy: {'TOP games by Elo' if select_top else 'FIRST games found'}")
-    print(f"  • Min Elo: {min_elo}")
-    print(f"  • Target games per file: {games_per_file:,}")
-    print(f"  • 🆕 Multi-Task Learning: {use_mtl}")
-    if use_mtl:
-        print(f"    - Position size: 50 bytes (with auxiliary labels)")
-    else:
-        print(f"    - Position size: 38 bytes (standard)")
-    print()
+    print(f"  • Parallel: {use_parallel} (workers: {max_parallel_workers if use_parallel else 1})")
+    print(f"  • Strategy: {'TOP games by Elo' if select_top else 'FIRST games'}")
+    print(f"  • Min Elo: {min_elo}, Games/file: {games_per_file:,}")
+    print(f"  • 🆕 MTL: {use_mtl}")
+    print(f"  • 🆕 History: {history_positions} positions")
+    print(f"  • 🆕 Input planes: {input_planes} (12 × {1 + history_positions})")
+    print(f"  • Position size: {position_size} bytes\n")
     
     # Prepare tasks
     tasks = []
@@ -555,50 +635,39 @@ def parse_pgn_files(data_dir, config, num_workers=None):
     for idx, pgn_file in enumerate(pgn_files):
         temp_output = preprocessing_dir / f"temp_{idx}_{pgn_file.stem}.bin"
         temp_files.append(temp_output)
-        tasks.append((
-            pgn_file,
-            temp_output,
-            min_elo,
-            games_per_file,
-            max_moves,
-            idx,
-            select_top,
-            sort_by_elo,
-            use_mtl  # 🆕
-        ))
+        tasks.append((pgn_file, temp_output, min_elo, games_per_file, max_moves,
+                     idx, select_top, sort_by_elo, use_mtl, history_positions))
     
     # Process files
     results = []
     total_positions = 0
     
     if use_parallel and len(pgn_files) > 1:
-        print(f"🚀 Processing {len(pgn_files)} PGN files in parallel...\n")
+        print(f"🚀 Processing {len(pgn_files)} files in parallel...\n")
         
         with ProcessPoolExecutor(max_workers=max_parallel_workers) as executor:
             futures = [executor.submit(parse_single_pgn_file, task) for task in tasks]
-            
-            pbar = tqdm(total=len(futures), desc="Processing PGN files")
+            pbar = tqdm(total=len(futures), desc="Processing")
             
             for future in as_completed(futures):
-                filename, positions_count, output_path = future.result()
-                results.append((filename, positions_count, output_path))
-                total_positions += positions_count
+                filename, count, output = future.result()
+                results.append((filename, count, output))
+                total_positions += count
                 pbar.update(1)
             
             pbar.close()
     else:
-        print(f"Processing PGN files sequentially...\n")
-        
+        print("Processing sequentially...\n")
         for task in tasks:
-            filename, positions_count, output_path = parse_single_pgn_file(task)
-            results.append((filename, positions_count, output_path))
-            total_positions += positions_count
+            filename, count, output = parse_single_pgn_file(task)
+            results.append((filename, count, output))
+            total_positions += count
     
     # Summary
     print(f"\n{'='*70}")
     print("Processing Summary:")
-    for filename, positions_count, _ in sorted(results, key=lambda x: x[1], reverse=True):
-        print(f"  • {filename}: {positions_count:,} positions")
+    for filename, count, _ in sorted(results, key=lambda x: x[1], reverse=True):
+        print(f"  • {filename}: {count:,} positions")
     print(f"{'='*70}")
     print(f"Total: {total_positions:,} positions\n")
     
@@ -607,11 +676,13 @@ def parse_pgn_files(data_dir, config, num_workers=None):
         return {
             'binary_file': str(binary_file), 
             'total_positions': 0, 
-            'position_size': 50 if use_mtl else 38,
-            'use_mtl': use_mtl
+            'position_size': position_size,
+            'use_mtl': use_mtl,
+            'history_positions': history_positions,
+            'input_planes': input_planes
         }
     
-    # Merge temporary files
+    # Merge temp files
     if len(temp_files) > 1:
         print("📦 Merging binary files...")
         with open(binary_file, 'wb') as outfile:
@@ -625,48 +696,41 @@ def parse_pgn_files(data_dir, config, num_workers=None):
             temp_files[0].rename(binary_file)
     
     # Save metadata
-    position_size = 50 if use_mtl else 38
-    
     metadata = {
         'binary_file': str(binary_file),
         'total_positions': total_positions,
         'position_size': position_size,
-        'use_mtl': use_mtl
+        'use_mtl': use_mtl,
+        'history_positions': history_positions,
+        'input_planes': input_planes  # 🆕
     }
     
     with open(metadata_file, 'wb') as f:
         pickle.dump(metadata, f)
     
     final_size_mb = binary_file.stat().st_size / (1024**2)
-    compression_ratio = 100 * (1 - final_size_mb / (total_positions * 3072 / 1024**2))
+    compression = 100 * (1 - final_size_mb / (total_positions * 3072 / 1024**2))
     
-    print(f"✓ Final file: {binary_file.name}")
-    print(f"✓ Size: {final_size_mb:.1f} MB")
-    print(f"✓ Compression: {compression_ratio:.1f}% saved vs raw tensors")
-    print(f"✓ Multi-Task Learning: {use_mtl}")
+    print(f"✓ File: {binary_file.name}")
+    print(f"✓ Size: {final_size_mb:.1f} MB (compression: {compression:.1f}%)")
+    print(f"✓ MTL: {use_mtl}, History: {history_positions}, Input planes: {input_planes}")
     
     return metadata
 
 
-# ==============================================================================
-# 🆕 DATASET WITH MTL SUPPORT
-# ==============================================================================
-
 class BinaryChessDataset(Dataset):
-    """
-    🆕 Memory-mapped binary dataset with Multi-Task Learning support
+    """🆕 Memory-mapped dataset with MTL and HISTORY support"""
     
-    Automatically detects if data includes MTL labels based on position_size
-    """
-    
-    def __init__(self, binary_file, indices, position_size=38, use_mtl=None):
+    def __init__(self, binary_file, indices, position_size=38, use_mtl=None, history_positions=0):
         self.binary_file = binary_file
         self.indices = indices
         self.position_size = position_size
+        self.history_positions = history_positions
         
-        # Auto-detect MTL from position size if not specified
+        # Auto-detect MTL
         if use_mtl is None:
-            self.use_mtl = (position_size == 50)
+            base_size = 32 + (32 * history_positions) + 2 + 4
+            self.use_mtl = (position_size == base_size + 12)
         else:
             self.use_mtl = use_mtl
         
@@ -674,7 +738,7 @@ class BinaryChessDataset(Dataset):
         self._file = None
     
     def _ensure_mmap(self):
-        """Open memory-mapped file if not already open (per worker)"""
+        """Open memory-mapped file (per worker)"""
         if self._mmap is None:
             import mmap
             self._file = open(self.binary_file, 'rb')
@@ -690,21 +754,52 @@ class BinaryChessDataset(Dataset):
         offset = position_idx * self.position_size
         data = self._mmap[offset:offset + self.position_size]
         
-        # Unpack standard fields
+        # Unpack current board
         compact_board = data[:32]
-        move_index = struct.unpack('H', data[32:34])[0]
-        outcome = struct.unpack('f', data[34:38])[0]
+        current_offset = 32
         
+        # 🆕 Unpack history
+        history_size = 32 * self.history_positions
+        if history_size > 0:
+            history_bytes = data[current_offset:current_offset + history_size]
+            current_offset += history_size
+            
+            # Convert history boards to tensors
+            history_tensors = []
+            for i in range(self.history_positions):
+                hist_board = history_bytes[i*32:(i+1)*32]
+                history_tensors.append(compact_to_tensor(hist_board))
+        else:
+            history_tensors = []
+        
+        # Unpack move and outcome
+        move_index = struct.unpack('H', data[current_offset:current_offset+2])[0]
+        current_offset += 2
+        outcome = struct.unpack('f', data[current_offset:current_offset+4])[0]
+        current_offset += 4
+        
+        # Convert current board
         board_tensor = compact_to_tensor(compact_board)
         
+        # 🆕 Stack history with current board
+        if history_tensors:
+            # Stack: [oldest_history, ..., newest_history, current]
+            # Shape: (12 * (history_positions + 1), 8, 8)
+            all_tensors = history_tensors + [board_tensor]
+            stacked_board = np.concatenate(all_tensors, axis=0)
+        else:
+            stacked_board = board_tensor
+        
         if self.use_mtl:
-            # Unpack MTL fields
-            win = struct.unpack('f', data[38:42])[0]
-            material = struct.unpack('f', data[42:46])[0]
-            check = struct.unpack('f', data[46:50])[0]
+            # Unpack MTL labels
+            win = struct.unpack('f', data[current_offset:current_offset+4])[0]
+            current_offset += 4
+            material = struct.unpack('f', data[current_offset:current_offset+4])[0]
+            current_offset += 4
+            check = struct.unpack('f', data[current_offset:current_offset+4])[0]
             
             return {
-                'board': torch.FloatTensor(board_tensor),
+                'board': torch.FloatTensor(stacked_board),
                 'move': torch.LongTensor([move_index])[0],
                 'value': torch.FloatTensor([outcome]),
                 'win': torch.FloatTensor([win]),
@@ -712,9 +807,8 @@ class BinaryChessDataset(Dataset):
                 'check': torch.FloatTensor([check])
             }
         else:
-            # Standard format (backwards compatibility)
             return (
-                torch.FloatTensor(board_tensor),
+                torch.FloatTensor(stacked_board),
                 torch.LongTensor([move_index])[0],
                 torch.FloatTensor([outcome])
             )
@@ -727,9 +821,7 @@ class BinaryChessDataset(Dataset):
 
 
 def create_dataloaders(metadata, config):
-    """
-    🆕 Create train and validation dataloaders with MTL support
-    """
+    """🆕 Create dataloaders with MTL and HISTORY support"""
     
     if metadata['total_positions'] == 0:
         raise ValueError("Cannot create dataloaders with 0 positions.")
@@ -748,25 +840,31 @@ def create_dataloaders(metadata, config):
     print(f"  • Train: {len(train_indices):,} positions")
     print(f"  • Val: {len(val_indices):,} positions")
     
-    # Get position size and MTL flag
+    # Get metadata
     position_size = metadata.get('position_size', 38)
     use_mtl = metadata.get('use_mtl', False)
+    history_positions = metadata.get('history_positions', 0)
+    input_planes = metadata.get('input_planes', 12)
     
     print(f"  • Position size: {position_size} bytes")
-    print(f"  • Multi-Task Learning: {use_mtl}")
+    print(f"  • MTL: {use_mtl}")
+    print(f"  • History: {history_positions} positions")
+    print(f"  • Input planes: {input_planes}")
     
     # Create datasets
     train_dataset = BinaryChessDataset(
         metadata['binary_file'], 
         train_indices, 
         position_size=position_size,
-        use_mtl=use_mtl
+        use_mtl=use_mtl,
+        history_positions=history_positions
     )
     val_dataset = BinaryChessDataset(
         metadata['binary_file'], 
         val_indices,
         position_size=position_size,
-        use_mtl=use_mtl
+        use_mtl=use_mtl,
+        history_positions=history_positions
     )
     
     # Dataloaders
