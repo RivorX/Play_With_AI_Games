@@ -770,7 +770,7 @@ def create_dataloaders(metadata, config):
     )
     
     # Dataloaders
-    prefetch_factor = 4
+    prefetch_factor = config['hardware']['prefetch_factor']
     
     train_loader = DataLoader(
         train_dataset,
