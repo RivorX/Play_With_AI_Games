@@ -40,3 +40,5 @@ logs/*
 logs
 
 chess/data/*
+chess/models/IL/*
+chess/models/RL/*
