@@ -193,15 +193,7 @@ def drop_path(x, drop_prob: float = 0., training: bool = False):
 
 
 class ResidualBlock(nn.Module):
-    """
-    🚀 OPTIMIZED Residual block v3.1 with ADVANCED FEATURES
-    
-    v3.1 ADDITIONS:
-    - ✅ LayerScale support
-    - ✅ SE2DBlock option (spatial-aware attention)
-    - ✅ FactorizedConv option
-    - ✅ Mixed-pooling SEBlock
-    """
+    """Residual block with advanced features"""
     def __init__(self, filters, use_se=True, use_se2d=False, use_spatial=True, 
                  drop_path_rate=0.0, use_layer_scale=False, layer_scale_init=1e-5,
                  use_factorized=False):
@@ -233,7 +225,6 @@ class ResidualBlock(nn.Module):
         
         self.drop_path_rate = drop_path_rate
         
-        # 🆕 LayerScale
         self.use_layer_scale = use_layer_scale
         if use_layer_scale:
             self.layer_scale = LayerScale(filters, init_value=layer_scale_init)
@@ -248,21 +239,17 @@ class ResidualBlock(nn.Module):
         out = self.conv2(out)
         out = self.bn2(out)
         
-        # SE-Block (channel attention)
         if self.use_se2d:
-            out = self.se(out)  # SE2DBlock
+            out = self.se(out)
         elif self.use_se:
-            out = self.se(out)  # Standard SEBlock
+            out = self.se(out)
         
-        # Spatial Attention (selective)
         if self.use_spatial:
             out = self.spatial(out)
         
-        # 🆕 LayerScale (before residual connection)
         if self.use_layer_scale:
             out = self.layer_scale(out)
         
-        # Stochastic Depth
         if self.drop_path_rate > 0:
             out = drop_path(out, self.drop_path_rate, self.training)
         
@@ -318,22 +305,19 @@ class AdaptivePolicyPool(nn.Module):
 
 class ChessNet(nn.Module):
     """
-    🚀 ULTRA-OPTIMIZED Chess Neural Network v3.1
+    🆕 Chess Neural Network v3.1 with AUTO input_planes
     
-    v3.1 NEW FEATURES:
-    1. ✅ LayerScale for training stability
-    2. ✅ SE2DBlock option (spatial-aware channel attention)
-    3. ✅ FactorizedConv option (fewer params)
-    4. ✅ AdaptivePolicyPool (smarter policy head)
-    5. ✅ Mixed-pooling SEBlock (richer features)
-    
-    RECOMMENDED CONFIG:
-    - use_layer_scale=True (always, 0% cost)
-    - use_se2d_blocks=False (only if you have compute budget)
-    - use_factorized_conv=False (standard 3x3 is fine for 6-12 blocks)
-    - use_adaptive_policy_pool=True (+2-3% accuracy, 0% cost)
+    CHANGES:
+    - ✅ Automatically calculates input_planes from history_positions
+    - ✅ No need to specify input_planes in config
+    - ✅ Formula: input_planes = 12 * (1 + history_positions)
     """
-    def __init__(self, config):
+    def __init__(self, config, input_planes=None):
+        """
+        Args:
+            config: Configuration dict
+            input_planes: Optional override (auto-calculated if None)
+        """
         super().__init__()
         
         filters = config['model']['filters']
@@ -346,13 +330,11 @@ class ChessNet(nn.Module):
         drop_path_rate = config['model'].get('drop_path_rate', 0.1)
         use_coord_conv = config['model'].get('use_coord_conv', True)
         
-        # 🆕 v3.1 features
         use_layer_scale = config['model'].get('use_layer_scale', True)
         layer_scale_init = config['model'].get('layer_scale_init', 1e-5)
         use_factorized = config['model'].get('use_factorized_conv', False)
         use_adaptive_policy = config['model'].get('use_adaptive_policy_pool', True)
         
-        # SELECTIVE ATTENTION CONFIG
         spatial_attention_mode = config['model'].get('spatial_attention_mode', 'last_2')
         
         # Multi-Task Learning
@@ -361,7 +343,17 @@ class ChessNet(nn.Module):
         self.material_weight = config['model'].get('material_prediction_weight', 0.2)
         self.check_weight = config['model'].get('check_prediction_weight', 0.15)
         
+        # 🆕 AUTO-CALCULATE input_planes from history_positions
+        history_positions = config['model']['history_positions']
+        if input_planes is None:
+            input_planes = 12 * (1 + history_positions)
+        
+        self.input_planes = input_planes
+        self.history_positions = history_positions
+        
         print(f"🧠 ULTRA-OPTIMIZED Model v3.1:")
+        print(f"  • 🆕 History positions: {history_positions}")
+        print(f"  • 🆕 Input planes: {input_planes} (12 × {1 + history_positions})")
         print(f"  • ✅ SE-Block: Mixed pooling (avg+max)")
         
         if use_se2d:
@@ -393,15 +385,15 @@ class ChessNet(nn.Module):
             print(f"    - Material: {self.material_weight}")
             print(f"    - Check: {self.check_weight}")
         
-        # Input conv
+        # 🆕 Input conv with dynamic input_planes
         if use_coord_conv:
             self.conv_block = nn.Sequential(
-                CoordConv2d(12, filters, kernel_size=3, padding=1),
+                CoordConv2d(input_planes, filters, kernel_size=3, padding=1),
                 nn.BatchNorm2d(filters),
             )
         else:
             self.conv_block = nn.Sequential(
-                nn.Conv2d(12, filters, kernel_size=3, padding=1, bias=False),
+                nn.Conv2d(input_planes, filters, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(filters),
             )
         
@@ -411,9 +403,9 @@ class ChessNet(nn.Module):
         # SELECTIVE ATTENTION: Determine which blocks get spatial attention
         spatial_blocks = self._get_spatial_blocks(num_blocks, spatial_attention_mode)
         
-        print(f"  • 📍 Spatial attention in blocks: {spatial_blocks}")
+        print(f"  • 🔍 Spatial attention in blocks: {spatial_blocks}")
         
-        # Residual tower with v3.1 features
+        # Residual tower
         blocks = []
         for i in range(num_blocks):
             use_spatial_this_block = i in spatial_blocks if use_spatial else False
@@ -437,11 +429,9 @@ class ChessNet(nn.Module):
         self.policy_bn = nn.BatchNorm2d(policy_filters)
         
         if use_adaptive_policy:
-            # 🆕 Adaptive pooling head
             self.policy_pool = AdaptivePolicyPool(policy_filters, 4096)
-            self.policy_fc = None  # Not needed with adaptive pooling
+            self.policy_fc = None
         else:
-            # Standard flatten + FC
             self.policy_pool = None
             self.policy_fc = nn.Linear(policy_filters * 8 * 8, 4096)
         
@@ -471,23 +461,7 @@ class ChessNet(nn.Module):
             self.check_fc = nn.Linear(filters, 1)
     
     def _get_spatial_blocks(self, num_blocks, mode):
-        """
-        Determine which blocks should have spatial attention
-        
-        STRATEGY:
-        - 'all': All blocks (original, slowest)
-        - 'last_2': Only last 2 blocks (recommended for 8x8 board)
-        - 'last_3': Last 3 blocks (middle ground)
-        - 'none': No spatial attention (fastest, -8% quality)
-        
-        REASONING:
-        On 8x8 board, receptive field grows quickly:
-        - Block 0-1: Receptive field ~3x3-5x5 (local patterns)
-        - Block 2-3: Receptive field ~7x7-11x11 (near-global)
-        - Block 4+: Receptive field covers entire board
-        
-        Spatial attention most valuable when features are already global.
-        """
+        """Determine which blocks should have spatial attention"""
         if mode == 'all':
             return set(range(num_blocks))
         elif mode == 'last_2':
@@ -497,7 +471,6 @@ class ChessNet(nn.Module):
         elif mode == 'none':
             return set()
         else:
-            # Default to last_2 for unknown modes
             print(f"⚠️ Unknown spatial_attention_mode '{mode}', using 'last_2'")
             return set(range(max(0, num_blocks - 2), num_blocks))
     
@@ -516,11 +489,9 @@ class ChessNet(nn.Module):
         policy = F.relu(policy, inplace=True)
         
         if self.policy_pool is not None:
-            # 🆕 Adaptive pooling path
             policy = self.policy_dropout(policy)
-            policy = self.policy_pool(policy)  # Already includes FC
+            policy = self.policy_pool(policy)
         else:
-            # Standard path
             policy = policy.flatten(1)
             policy = self.policy_dropout(policy)
             policy = self.policy_fc(policy)

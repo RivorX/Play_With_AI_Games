@@ -1,5 +1,5 @@
 """
-Imitation Learning Training Script with Comprehensive Metrics
+Imitation Learning Training Script with History Support
 """
 
 import torch
@@ -72,8 +72,9 @@ def main():
     logs_dir.mkdir(parents=True, exist_ok=True)
     il_dir.mkdir(parents=True, exist_ok=True)
     
-    # Check if MTL is enabled
+    # Check if MTL and History are enabled
     use_mtl = config['model'].get('use_multitask_learning', False)
+    history_positions = config['model'].get('history_positions', 0)
     
     # Initialize logger
     logger = TrainingLogger(
@@ -92,11 +93,24 @@ def main():
     )
     
     print(f"Total positions: {metadata['total_positions']}")
+    print(f"Input planes (from data): {metadata.get('input_planes', 12)}")
+    
+    # 🆕 Verify input_planes matches model config
+    expected_input_planes = 12 * (1 + history_positions)
+    actual_input_planes = metadata.get('input_planes', 12)
+    
+    if expected_input_planes != actual_input_planes:
+        print(f"\n⚠️ WARNING: Input planes mismatch!")
+        print(f"  • Expected (from config): {expected_input_planes}")
+        print(f"  • Actual (from data): {actual_input_planes}")
+        print(f"  • This usually means data was preprocessed with different history_positions")
+        print(f"  • Please delete cache and reprocess data, or adjust history_positions in config")
+        raise ValueError("Input planes mismatch between model config and preprocessed data")
     
     # Create dataloaders
     train_loader, val_loader = create_dataloaders(metadata, config)
     
-    # Create model
+    # Create model (input_planes auto-calculated from history_positions)
     print("\n=== Creating model ===")
     model = ChessNet(config).to(device)
     model = model.to(memory_format=torch.channels_last)
@@ -143,6 +157,10 @@ def main():
     print("\n=== Starting training ===")
     print("💾 Saving strategy: NO optimizer state (minimal file size)")
     print("📊 NEW: Tracking Policy Accuracy (Top-1, Top-3) and Value MAE")
+    
+    if history_positions > 0:
+        print(f"📜 History: {history_positions} previous positions included")
+        print(f"🔢 Input planes: {expected_input_planes}")
     
     best_val_loss = float('inf')
     patience_counter = 0
@@ -225,7 +243,9 @@ def main():
                         'val_value_mae': val_metrics['value_mae'],
                         'use_amp': use_amp,
                         'use_bfloat16': use_bfloat16,
-                        'use_mtl': use_mtl
+                        'use_mtl': use_mtl,
+                        'history_positions': history_positions,
+                        'input_planes': expected_input_planes
                     },
                     save_optimizer=False
                 )
@@ -272,7 +292,9 @@ def main():
                     'val_policy_top1': val_metrics['policy_top1_acc'],
                     'val_policy_top3': val_metrics['policy_top3_acc'],
                     'val_value_mae': val_metrics['value_mae'],
-                    'use_mtl': use_mtl
+                    'use_mtl': use_mtl,
+                    'history_positions': history_positions,
+                    'input_planes': expected_input_planes
                 },
                 save_optimizer=False
             )

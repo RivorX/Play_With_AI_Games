@@ -1,10 +1,10 @@
 """
-Chess GUI Game Interface (REFACTORED)
+Chess GUI Game Interface (WITH MCTS TOGGLE)
 
-Moved to utils/:
-- create_piece_surfaces() → utils/gui_helpers.py
-- load_model_from_checkpoint() → utils/gui_helpers.py
-- select_models() → utils/gui_helpers.py
+🆕 CHANGES:
+- Added --no-mcts flag to disable MCTS
+- Network-only mode for faster testing
+- Fixed history handling for both modes
 """
 
 import torch
@@ -13,6 +13,7 @@ import yaml
 import sys
 from pathlib import Path
 import pygame
+import argparse
 
 # Add src to path
 script_dir = Path(__file__).parent
@@ -48,19 +49,31 @@ TEXT_COLOR = (255, 255, 255)
 
 
 class ChessGUI:
-    """Chess game GUI with support for multiple game modes"""
+    """Chess game GUI with support for multiple game modes and MCTS toggle"""
     
-    def __init__(self, model1, model2, config, device, game_mode="human_vs_ai"):
+    def __init__(self, model1, model2, config, device, game_mode="human_vs_ai", enable_mcts=True):
         self.model1 = model1  # White AI or main AI
         self.model2 = model2  # Black AI (for AI vs AI mode)
         self.config = config
         self.device = device
         self.game_mode = game_mode  # "human_vs_ai", "ai_vs_ai", "human_vs_human"
         
-        if model1:
+        # 🆕 MCTS toggle
+        self.mcts_enabled = enable_mcts
+        
+        # Get history_positions from config
+        self.history_positions = config['model'].get('history_positions', 0)
+        
+        # Only create MCTS if enabled
+        if model1 and self.mcts_enabled:
             self.mcts1 = MCTS(model1, config, device)
-        if model2:
+        else:
+            self.mcts1 = None
+            
+        if model2 and self.mcts_enabled:
             self.mcts2 = MCTS(model2, config, device)
+        else:
+            self.mcts2 = None
         
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
         pygame.display.set_caption("Chess AI")
@@ -78,10 +91,13 @@ class ChessGUI:
         self.selected_square = None
         self.legal_moves = []
         self.human_color = chess.WHITE  # Only used in human_vs_ai mode
-        self.use_mcts = True
+        self.use_mcts = self.mcts_enabled  # Can be toggled during game
         self.ai_thinking = False
         self.game_over = False
         self.move_history = []
+        
+        # 🆕 Board history for neural network input
+        self.board_history = []  # List of chess.Board objects
         
         # Flip board for black
         self.flipped = False
@@ -233,11 +249,16 @@ class ChessGUI:
         self.screen.blit(turn, (x_start + 20, y))
         y += 40
         
+        # 🆕 AI Mode indicator
         if self.game_mode == "human_vs_ai" and self.model1:
-            ai_mode = self.small_font.render(
-                f"AI Mode: {'MCTS' if self.use_mcts else 'Network'}", 
-                True, TEXT_COLOR
-            )
+            if self.mcts_enabled:
+                ai_mode_text = f"AI Mode: {'MCTS' if self.use_mcts else 'Network'}"
+                ai_mode_color = (100, 255, 100) if self.use_mcts else (255, 200, 100)
+            else:
+                ai_mode_text = "AI Mode: Network Only"
+                ai_mode_color = (255, 200, 100)
+            
+            ai_mode = self.small_font.render(ai_mode_text, True, ai_mode_color)
             self.screen.blit(ai_mode, (x_start + 20, y))
             y += 30
         
@@ -303,14 +324,15 @@ class ChessGUI:
             self.screen.blit(restart_text, rect)
         
         # Controls (bottom)
-        y = WINDOW_HEIGHT - 90
+        y = WINDOW_HEIGHT - 110
         controls_title = self.small_font.render("Controls:", True, (150, 150, 150))
         self.screen.blit(controls_title, (x_start + 20, y))
         y += 25
         
         controls = ["R - Restart game", "F - Flip board"]
         
-        if self.game_mode == "human_vs_ai":
+        # 🆕 Show MCTS toggle only if enabled
+        if self.game_mode == "human_vs_ai" and self.mcts_enabled:
             controls.append("M - Toggle MCTS")
         
         for control in controls:
@@ -350,6 +372,9 @@ class ChessGUI:
                         move = chess.Move(self.selected_square, square, promotion=chess.QUEEN)
                 
                 if move in self.board.legal_moves:
+                    # 🆕 Save current board to history before making move
+                    self.board_history.append(self.board.copy())
+                    
                     self.board.push(move)
                     self.move_history.append(move)
                     self.selected_square = None
@@ -366,6 +391,44 @@ class ChessGUI:
         else:
             self.selected_square = None
             self.legal_moves = []
+    
+    def _get_network_move(self, model):
+        """
+        🆕 Get move directly from network (no MCTS)
+        
+        Handles history positions correctly
+        """
+        # Prepare board history
+        if self.history_positions > 0:
+            # Get last N boards, pad with empty if needed
+            history_list = self.board_history[-self.history_positions:] if self.board_history else []
+            
+            # Pad with empty boards if not enough history
+            while len(history_list) < self.history_positions:
+                history_list.insert(0, chess.Board())  # Empty board at start
+        else:
+            history_list = None
+        
+        # Convert to tensor with history
+        board_tensor = torch.FloatTensor(
+            board_to_tensor(self.board, history_list, self.history_positions)
+        ).unsqueeze(0).to(self.device)
+        
+        # Get policy from model
+        with torch.no_grad():
+            policy_log_probs, _ = model(board_tensor, return_aux=False)
+            policy = torch.exp(policy_log_probs).cpu().numpy()[0]
+        
+        # Find best legal move
+        best_score = -1
+        best_move = None
+        for move in self.board.legal_moves:
+            idx = move.from_square * 64 + move.to_square
+            if policy[idx] > best_score:
+                best_score = policy[idx]
+                best_move = move
+        
+        return best_move
     
     def ai_move(self):
         """Make AI move"""
@@ -392,27 +455,22 @@ class ChessGUI:
             current_model = self.model1
             current_mcts = self.mcts1
         
-        # Get AI move
-        if self.use_mcts:
+        # 🆕 Get AI move - with MCTS or network-only
+        if self.use_mcts and current_mcts is not None:
+            # MCTS mode (if available)
             visit_counts = current_mcts.search(
                 self.board, 
                 self.config['reinforcement_learning']['mcts_simulations']
             )
             move, _ = select_move_by_visits(visit_counts, temperature=0)
         else:
-            board_tensor = torch.FloatTensor(board_to_tensor(self.board)).unsqueeze(0).to(self.device)
-            policy, _ = current_model.predict(board_tensor)
-            
-            best_score = -1
-            best_move = None
-            for move in self.board.legal_moves:
-                idx = move.from_square * 64 + move.to_square
-                if policy[idx] > best_score:
-                    best_score = policy[idx]
-                    best_move = move
-            move = best_move
+            # 🆕 Network-only mode (SAFE for history)
+            move = self._get_network_move(current_model)
         
         if move:
+            # 🆕 Save current board to history before making move
+            self.board_history.append(self.board.copy())
+            
             self.board.push(move)
             self.move_history.append(move)
         
@@ -429,6 +487,7 @@ class ChessGUI:
         self.ai_thinking = False
         self.game_over = False
         self.move_history = []
+        self.board_history = []  # 🆕 Clear board history
     
     def run(self):
         """Main game loop"""
@@ -451,8 +510,9 @@ class ChessGUI:
                         self.restart_game()
                     elif event.key == pygame.K_f:
                         self.flipped = not self.flipped
-                    elif event.key == pygame.K_m and self.game_mode == "human_vs_ai":
+                    elif event.key == pygame.K_m and self.game_mode == "human_vs_ai" and self.mcts_enabled:
                         self.use_mcts = not self.use_mcts
+                        print(f"🔄 Toggled AI mode: {'MCTS' if self.use_mcts else 'Network-only'}")
             
             # AI move
             if not self.game_over and (self.game_mode == "ai_vs_ai" or 
@@ -470,6 +530,12 @@ class ChessGUI:
 
 
 def main():
+    # 🆕 Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Chess AI Game')
+    parser.add_argument('--no-mcts', action='store_true', 
+                       help='Disable MCTS (use network-only mode)')
+    args = parser.parse_args()
+    
     # Load config
     config_path = script_dir.parent / 'config' / 'config.yaml'
     
@@ -480,6 +546,11 @@ def main():
     # Setup device
     device = torch.device(config['hardware']['device'])
     print(f"Using device: {device}")
+    
+    # 🆕 MCTS toggle
+    enable_mcts = not args.no_mcts
+    if not enable_mcts:
+        print("⚠️  MCTS DISABLED - Using network-only mode")
     
     base_dir = script_dir.parent
     
@@ -513,11 +584,12 @@ def main():
     print("  • Click to select and move pieces")
     print("  • R - Restart game")
     print("  • F - Flip board")
-    if game_mode == "human_vs_ai":
+    if game_mode == "human_vs_ai" and enable_mcts:
         print("  • M - Toggle MCTS on/off")
     print()
     
-    gui = ChessGUI(model1, model2, config, device, game_mode)
+    # 🆕 Pass enable_mcts to GUI
+    gui = ChessGUI(model1, model2, config, device, game_mode, enable_mcts=enable_mcts)
     
     # Choose color (only for human vs AI)
     if game_mode == "human_vs_ai":
@@ -538,6 +610,12 @@ def main():
         print(f"Black: {model2_path.name}")
     else:
         print("\n2-Player mode activated!")
+    
+    # 🆕 Display mode
+    if enable_mcts:
+        print(f"\n🎮 AI Mode: MCTS (press M to toggle)")
+    else:
+        print(f"\n🎮 AI Mode: Network-only (faster)")
     
     print("\nStarting game... Good luck! 🎮\n")
     

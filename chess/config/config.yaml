@@ -48,10 +48,12 @@ model:
   value_head_filters: 32     # Value head filters
   value_hidden_dim: 256      # Value head hidden dimension
   dropout: 0.3               # Dropout rate
+
+  history_positions: 4       # Number of previous positions to include
   
   # Advanced features (minimal params, significant quality gains)
   use_se_blocks: true           # 🧠 Channel attention (with mixed pooling v3.1)
-  use_se2d_blocks: false        # 🆕 v3.1: SE-Net v2 with spatial info (+0.5-1%, +5% time)
+  use_se2d_blocks: true         # 🆕 v3.1: SE-Net v2 with spatial info (+0.5-1%, +5% time)
   use_spatial_attention: true   # 👁️ Spatial attention
   spatial_attention_mode: 'last_2' # 'all', 'last_2', 'last_3', 'none'
   
@@ -63,7 +65,7 @@ model:
   use_layer_scale: true         # LayerScale for better training stability (+0% params)
   layer_scale_init: 1e-5        # Initial LayerScale value (1e-6 to 1e-4)
   
-  use_factorized_conv: false    # Factorized 3x3 convs (1x3 + 3x1, -30% params, ~same quality)
+  use_factorized_conv: true     # Factorized 3x3 convs (1x3 + 3x1, -30% params, ~same quality)
   use_adaptive_policy_pool: true # Adaptive pooling in policy head (+2-3% accuracy, 0% params)
 
   # Multi-Task Learning
