@@ -1,5 +1,6 @@
 """
-Imitation Learning Training Script with History Support
+Imitation Learning Training Script with History Support and Profiling
+🆕 UPDATED: Pass epoch number to train_epoch_il for profiling
 """
 
 import torch
@@ -76,6 +77,42 @@ def main():
     use_mtl = config['model'].get('use_multitask_learning', False)
     history_positions = config['model'].get('history_positions', 0)
     
+    # 🆕 Setup debug logging (AFTER logs_dir is created)
+    debug_enabled = config.get('debug', {}).get('enabled', False)
+    debug_log_file = None
+    
+    if debug_enabled:
+        # Create debug directory
+        debug_dir = logs_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create timestamped debug log file
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_log_file = debug_dir / f"training_profile_{timestamp}.txt"
+        
+        print("\n" + "="*70)
+        print("🐛 DEBUG MODE ENABLED")
+        print("="*70)
+        print(f"  • Profile training:  {config['debug'].get('profile_training', False)}")
+        print(f"  • Log GPU memory:    {config['debug'].get('log_gpu_memory', False)}")
+        print(f"  • Profile every:     {config['debug'].get('profile_every_n_epochs', 1)} epochs")
+        print(f"  • Log file:          {debug_log_file}")
+        print("="*70 + "\n")
+        
+        # Write header to debug log
+        with open(debug_log_file, 'w', encoding='utf-8') as f:
+            f.write("="*70 + "\n")
+            f.write("🐛 TRAINING DEBUG LOG\n")
+            f.write("="*70 + "\n")
+            f.write(f"Timestamp: {timestamp}\n")
+            f.write(f"Model: {config['model']['filters']} filters, {config['model']['num_residual_blocks']} blocks\n")
+            f.write(f"Batch size: {config['imitation_learning']['batch_size']}\n")
+            f.write(f"Learning rate: {config['imitation_learning']['learning_rate']}\n")
+            f.write(f"History positions: {history_positions}\n")
+            f.write(f"MTL enabled: {use_mtl}\n")
+            f.write("="*70 + "\n\n")
+    
     # Initialize logger
     logger = TrainingLogger(
         logs_dir, 
@@ -95,7 +132,7 @@ def main():
     print(f"Total positions: {metadata['total_positions']}")
     print(f"Input planes (from data): {metadata.get('input_planes', 12)}")
     
-    # 🆕 Verify input_planes matches model config
+    # Verify input_planes matches model config
     expected_input_planes = 12 * (1 + history_positions)
     actual_input_planes = metadata.get('input_planes', 12)
     
@@ -162,6 +199,9 @@ def main():
         print(f"📜 History: {history_positions} previous positions included")
         print(f"🔢 Input planes: {expected_input_planes}")
     
+    if debug_enabled:
+        print("🐛 Debug mode active - profiling enabled")
+    
     best_val_loss = float('inf')
     patience_counter = 0
     max_patience = config['imitation_learning'].get('max_patience', 15)
@@ -175,9 +215,10 @@ def main():
     for epoch in range(config['imitation_learning']['epochs']):
         print(f"\nEpoch {epoch + 1}/{config['imitation_learning']['epochs']}")
         
-        # Train
+        # 🆕 Pass epoch number and debug log file for profiling
         train_losses, train_metrics = train_epoch_il(
-            model, train_loader, optimizer, scheduler, config, device, scaler
+            model, train_loader, optimizer, scheduler, config, device, scaler, 
+            epoch=epoch, debug_log_file=debug_log_file
         )
         
         current_lr = optimizer.param_groups[0]['lr']
@@ -319,6 +360,8 @@ def main():
     print(f"Best model: {best_model_path}")
     print(f"Checkpoints: {il_dir}")
     print(f"Logs: {logs_dir}")
+    if debug_log_file:
+        print(f"Debug log: {debug_log_file}")
 
 
 if __name__ == "__main__":

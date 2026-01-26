@@ -1,6 +1,6 @@
 """
-Training and evaluation functions with comprehensive metrics
-🆕 UPDATED: Fixed MTL loss functions for optimized model
+Training and evaluation functions with comprehensive metrics and profiling
+🆕 UPDATED: Added epoch profiling and GPU memory tracking
 """
 
 import torch
@@ -8,6 +8,7 @@ import torch.nn as nn
 import chess
 from tqdm import tqdm
 import gc
+import time
 
 from .loss import LabelSmoothingNLLLoss
 from .replay import PrioritizedReplayBuffer
@@ -24,22 +25,132 @@ from src.mcts import BatchMCTS, select_move_by_visits
 
 
 # ==============================================================================
+# 🆕 PROFILING UTILITIES
+# ==============================================================================
+
+class EpochProfiler:
+    """Profile time breakdown per epoch and save to file"""
+    
+    def __init__(self, enabled=True, log_file=None):
+        self.enabled = enabled
+        self.log_file = log_file
+        self.reset()
+    
+    def reset(self):
+        self.times = {
+            'data_loading': 0.0,
+            'data_transfer': 0.0,
+            'forward': 0.0,
+            'backward': 0.0,
+            'optimizer': 0.0,
+            'metrics': 0.0,
+        }
+        self.start_time = None
+    
+    def start(self):
+        if self.enabled:
+            self.start_time = time.perf_counter()
+    
+    def record(self, key):
+        if self.enabled and self.start_time is not None:
+            elapsed = time.perf_counter() - self.start_time
+            self.times[key] += elapsed
+            self.start_time = None
+    
+    def print_and_save_summary(self, epoch):
+        """Print summary and save to file"""
+        if not self.enabled:
+            return
+        
+        total = sum(self.times.values())
+        if total == 0:
+            return
+        
+        labels = {
+            'data_loading': '📊 Data Loading',
+            'data_transfer': '🔄 Data Transfer',
+            'forward': '➡️  Forward Pass',
+            'backward': '⬅️  Backward Pass',
+            'optimizer': '🔧 Optimizer Step',
+            'metrics': '📈 Metrics',
+        }
+        
+        # Build output
+        lines = []
+        lines.append("=" * 70)
+        lines.append(f"⏱️  EPOCH {epoch} TIME BREAKDOWN")
+        lines.append("=" * 70)
+        
+        for key, label in labels.items():
+            t = self.times[key]
+            pct = 100 * t / total if total > 0 else 0
+            lines.append(f"{label:20s} {t:7.2f}s ({pct:5.1f}%)")
+        
+        lines.append("=" * 70)
+        lines.append(f"TOTAL:              {total:7.2f}s")
+        lines.append("")
+        
+        output = "\n".join(lines)
+        
+        # Print to console
+        print("\n" + output)
+        
+        # Save to file
+        if self.log_file:
+            try:
+                with open(self.log_file, 'a', encoding='utf-8') as f:
+                    f.write(output + "\n")
+            except Exception as e:
+                print(f"⚠️ Failed to write profiling log: {e}")
+
+
+def log_gpu_memory(log_file=None):
+    """Log current GPU memory usage to console and file"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        
+        msg = (f"🎮 GPU Memory: {allocated:.2f}GB allocated, "
+               f"{reserved:.2f}GB reserved, "
+               f"{max_allocated:.2f}GB peak\n")
+        
+        print(msg, end='')
+        
+        # Save to file
+        if log_file:
+            try:
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(msg)
+            except Exception as e:
+                print(f"⚠️ Failed to write memory log: {e}")
+
+
+# ==============================================================================
 # IMITATION LEARNING FUNCTIONS
 # ==============================================================================
 
-def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, scaler):
+def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, scaler, epoch=0, debug_log_file=None):
     """
-    🆕 UPDATED: Train for one epoch with FIXED MTL loss functions
+    🆕 UPDATED: Train for one epoch with profiling support
     
-    Changes:
-    - ✅ BCEWithLogitsLoss for win_pred (NO sigmoid in model)
-    - ✅ BCEWithLogitsLoss for check_pred (NO sigmoid in model)
-    - ✅ MSELoss for material_pred (tanh in model)
+    Args:
+        debug_log_file: Path to debug log file (optional)
     
     Returns:
         Tuple of (losses_dict, metrics_dict)
     """
     model.train()
+    
+    # Debug config
+    debug_enabled = config.get('debug', {}).get('enabled', False)
+    profile_training = config.get('debug', {}).get('profile_training', False) and debug_enabled
+    log_memory = config.get('debug', {}).get('log_gpu_memory', False) and debug_enabled
+    profile_every = config.get('debug', {}).get('profile_every_n_epochs', 1)
+    
+    # Only profile if it's the right epoch
+    should_profile = profile_training and (epoch % profile_every == 0)
+    profiler = EpochProfiler(enabled=should_profile, log_file=debug_log_file)
     
     # Loss weights
     policy_weight = config['imitation_learning']['policy_loss_weight']
@@ -62,18 +173,19 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
     criterion_policy = LabelSmoothingNLLLoss(smoothing=label_smoothing)
     criterion_value = nn.MSELoss()
     
-    # 🆕 FIXED MTL criteria
     if use_mtl:
-        criterion_win = nn.BCEWithLogitsLoss()      # ✅ Expects logits (no sigmoid)
-        criterion_material = nn.MSELoss()            # ✅ Expects tanh output
-        criterion_check = nn.BCEWithLogitsLoss()     # ✅ Expects logits (no sigmoid)
+        criterion_win = nn.BCEWithLogitsLoss()
+        criterion_material = nn.MSELoss()
+        criterion_check = nn.BCEWithLogitsLoss()
     
-    # 📊 Metrics calculator
     metrics_calc = MetricsCalculator()
     
     pbar = tqdm(train_loader, desc="Training")
     
     for batch_idx, batch_data in enumerate(pbar):
+        # ⏱️ Profile: Data loading
+        profiler.start()
+        
         # Unpack batch
         if isinstance(batch_data, dict):
             boards = batch_data['board']
@@ -88,6 +200,11 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             boards, moves, outcomes = batch_data
             use_mtl = False
         
+        profiler.record('data_loading')
+        
+        # ⏱️ Profile: Data transfer
+        profiler.start()
+        
         # Move to device
         boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
         moves = moves.to(device, non_blocking=True)
@@ -98,11 +215,16 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             material_targets = material_targets.to(device, non_blocking=True)
             check_targets = check_targets.to(device, non_blocking=True)
         
+        profiler.record('data_transfer')
+        
         optimizer.zero_grad(set_to_none=True)
         
         # Mixed Precision Training
         use_amp = config['hardware'].get('use_amp', True)
         amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
+        
+        # ⏱️ Profile: Forward pass
+        profiler.start()
         
         with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
             # Forward pass
@@ -118,15 +240,10 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             # Total loss
             loss = policy_weight * policy_loss + value_weight * value_loss
             
-            # 🆕 FIXED: Add auxiliary losses with correct criteria
+            # Add auxiliary losses
             if use_mtl:
-                # Win prediction: BCEWithLogitsLoss (win_pred = logits)
                 win_loss = criterion_win(win_pred.squeeze(), win_targets.squeeze())
-                
-                # Material: MSELoss (material_pred = tanh output)
                 material_loss = criterion_material(material_pred, material_targets)
-                
-                # Check detection: BCEWithLogitsLoss (check_pred = logits)
                 check_loss = criterion_check(check_pred.squeeze(), check_targets.squeeze())
                 
                 loss = loss + win_weight * win_loss + material_weight * material_loss + check_weight * check_loss
@@ -135,7 +252,11 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
                 total_material_loss += material_loss.item()
                 total_check_loss += check_loss.item()
         
-        # Backward pass
+        profiler.record('forward')
+        
+        # ⏱️ Profile: Backward pass
+        profiler.start()
+        
         scaler.scale(loss).backward()
         
         # Gradient clipping
@@ -146,6 +267,11 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
                 config['imitation_learning']['grad_clip']
             )
         
+        profiler.record('backward')
+        
+        # ⏱️ Profile: Optimizer step
+        profiler.start()
+        
         scaler.step(optimizer)
         scaler.update()
         
@@ -153,14 +279,21 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
         if scheduler is not None:
             scheduler.step()
         
+        profiler.record('optimizer')
+        
         # Track losses
         total_loss += loss.item()
         total_policy_loss += policy_loss.item()
         total_value_loss += value_loss.item()
         
-        # 📊 Update metrics
+        # ⏱️ Profile: Metrics
+        profiler.start()
+        
+        # Update metrics
         with torch.no_grad():
             metrics_calc.update(policy_pred, value_pred, moves, outcomes)
+        
+        profiler.record('metrics')
         
         # Progress bar
         if batch_idx % config['logging']['print_every'] == 0:
@@ -191,6 +324,14 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     
+    # Print profiling summary
+    if should_profile:
+        profiler.print_and_save_summary(epoch + 1)
+    
+    # Log GPU memory
+    if log_memory:
+        log_gpu_memory(log_file=debug_log_file)
+    
     n = len(train_loader)
     
     # Return losses
@@ -207,19 +348,14 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             'check': total_check_loss / n
         })
     
-    # 📊 Compute final metrics
+    # Compute final metrics
     metrics = metrics_calc.compute()
     
     return losses, metrics
 
 
 def evaluate_il(model, val_loader, config, device):
-    """
-    🆕 UPDATED: Evaluate model with FIXED MTL loss functions
-    
-    Returns:
-        Tuple of (losses_dict, metrics_dict)
-    """
+    """Evaluate model (unchanged)"""
     model.eval()
     
     policy_weight = config['imitation_learning']['policy_loss_weight']
@@ -242,18 +378,15 @@ def evaluate_il(model, val_loader, config, device):
     criterion_policy = LabelSmoothingNLLLoss(smoothing=label_smoothing)
     criterion_value = nn.MSELoss()
     
-    # 🆕 FIXED MTL criteria
     if use_mtl:
         criterion_win = nn.BCEWithLogitsLoss()
         criterion_material = nn.MSELoss()
         criterion_check = nn.BCEWithLogitsLoss()
     
-    # 📊 Metrics calculator
     metrics_calc = MetricsCalculator()
     
     with torch.no_grad():
         for batch_data in tqdm(val_loader, desc="Evaluating"):
-            # Unpack batch
             if isinstance(batch_data, dict):
                 boards = batch_data['board']
                 moves = batch_data['move']
@@ -267,7 +400,6 @@ def evaluate_il(model, val_loader, config, device):
                 boards, moves, outcomes = batch_data
                 use_mtl = False
             
-            # Move to device
             boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
             moves = moves.to(device, non_blocking=True)
             outcomes = outcomes.to(device, non_blocking=True)
@@ -281,19 +413,16 @@ def evaluate_il(model, val_loader, config, device):
             amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
             
             with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                # Forward pass
                 if use_mtl:
                     policy_pred, value_pred, win_pred, material_pred, check_pred = model(boards, return_aux=True)
                 else:
                     policy_pred, value_pred = model(boards, return_aux=False)
                 
-                # Main losses
                 policy_loss = criterion_policy(policy_pred, moves)
                 value_loss = criterion_value(value_pred, outcomes)
                 
                 loss = policy_weight * policy_loss + value_weight * value_loss
                 
-                # 🆕 FIXED: MTL losses
                 if use_mtl:
                     win_loss = criterion_win(win_pred.squeeze(), win_targets.squeeze())
                     material_loss = criterion_material(material_pred, material_targets)
@@ -309,7 +438,6 @@ def evaluate_il(model, val_loader, config, device):
             total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
             
-            # 📊 Update metrics
             metrics_calc.update(policy_pred, value_pred, moves, outcomes)
     
     n = len(val_loader)
@@ -327,41 +455,22 @@ def evaluate_il(model, val_loader, config, device):
             'check': total_check_loss / n
         })
     
-    # 📊 Compute final metrics
     metrics = metrics_calc.compute()
     
     return losses, metrics
 
 
 # ==============================================================================
-# REINFORCEMENT LEARNING FUNCTIONS
+# REINFORCEMENT LEARNING FUNCTIONS (unchanged)
 # ==============================================================================
 
 def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device, scaler, replay_buffer, metrics_calc=None):
-    """
-    Train on batch with optional prioritized replay and metrics
-    
-    Args:
-        model: Neural network model
-        optimizer: Optimizer
-        batch: Batch data (boards, policies, values)
-        indices: Sample indices (for prioritized replay)
-        weights: Importance sampling weights (for prioritized replay)
-        config: Configuration dict
-        device: Device
-        scaler: GradScaler for AMP
-        replay_buffer: Replay buffer (to update priorities)
-        metrics_calc: Optional MetricsCalculator for tracking metrics
-    
-    Returns:
-        Tuple of (total_loss, policy_loss, value_loss)
-    """
+    """Train on batch with optional prioritized replay and metrics"""
     boards, policy_targets, value_targets = batch
     boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
     policy_targets = policy_targets.to(device, non_blocking=True)
     value_targets = value_targets.to(device, non_blocking=True)
     
-    # Convert weights to tensor if using prioritized replay
     if weights is not None:
         weights = torch.FloatTensor(weights).to(device, non_blocking=True)
     
@@ -371,16 +480,11 @@ def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device,
     amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
     
     with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-        # 🆕 UPDATED: Only return main outputs (policy, value) for RL
         policy_pred, value_pred = model(boards, return_aux=False)
         
-        # Policy loss
         policy_loss = -(policy_targets * policy_pred).sum(dim=1)
-        
-        # Value loss (TD error for prioritization)
         value_loss = (value_pred.squeeze() - value_targets.squeeze()) ** 2
         
-        # Apply importance sampling weights if using prioritized replay
         if weights is not None:
             policy_loss = (policy_loss * weights).mean()
             value_loss = (value_loss * weights).mean()
@@ -402,16 +506,13 @@ def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device,
     scaler.step(optimizer)
     scaler.update()
     
-    # Compute TD errors for priority update (if using prioritized replay)
     if isinstance(replay_buffer, PrioritizedReplayBuffer):
         with torch.no_grad():
             td_errors = torch.abs(value_pred.squeeze() - value_targets.squeeze()).cpu().numpy()
         replay_buffer.update_priorities(indices, td_errors)
     
-    # 📊 Update metrics if calculator provided
     if metrics_calc is not None:
         with torch.no_grad():
-            # Get target moves from policy targets (argmax of one-hot)
             target_moves = policy_targets.argmax(dim=1)
             metrics_calc.update(policy_pred, value_pred, target_moves, value_targets.unsqueeze(1))
     
@@ -419,19 +520,7 @@ def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device,
 
 
 def evaluate_models(model1, model2, config, device, num_games=20):
-    """
-    Evaluate model1 vs model2
-    
-    Args:
-        model1: First model (challenger)
-        model2: Second model (current best)
-        config: Configuration dict
-        device: Device
-        num_games: Number of games to play
-    
-    Returns:
-        Win rate of model1 (0.0 to 1.0)
-    """
+    """Evaluate model1 vs model2"""
     mcts1 = BatchMCTS(model1, config, device)
     mcts2 = BatchMCTS(model2, config, device)
     
@@ -441,7 +530,6 @@ def evaluate_models(model1, model2, config, device, num_games=20):
     for game_idx in range(num_games):
         board = chess.Board()
         
-        # Alternate colors
         if game_idx % 2 == 0:
             current_mcts = mcts1
             other_mcts = mcts2
