@@ -1,7 +1,7 @@
 import chess
 import numpy as np
 import math
-from src.data import board_to_tensor, move_to_index
+from src.utils.data_helpers import board_to_tensor, move_to_index
 import torch
 from collections import defaultdict
 import threading

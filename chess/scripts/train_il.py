@@ -1,6 +1,6 @@
 """
 Imitation Learning Training Script with History Support and Profiling
-🆕 UPDATED: Pass epoch number to train_epoch_il for profiling
+🆕 UPDATED: Compatible with multi-phase data processing
 """
 
 import torch
@@ -16,7 +16,7 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet, save_checkpoint
-from src.data import parse_pgn_files, create_dataloaders
+from src.data import process_pgn_files_smart, create_dataloaders
 
 # Import from utils
 from utils import TrainingLogger, train_epoch_il, evaluate_il
@@ -77,16 +77,14 @@ def main():
     use_mtl = config['model'].get('use_multitask_learning', False)
     history_positions = config['model'].get('history_positions', 0)
     
-    # 🆕 Setup debug logging (AFTER logs_dir is created)
+    # Setup debug logging
     debug_enabled = config.get('debug', {}).get('enabled', False)
     debug_log_file = None
     
     if debug_enabled:
-        # Create debug directory
         debug_dir = logs_dir / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
         
-        # Create timestamped debug log file
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         debug_log_file = debug_dir / f"training_profile_{timestamp}.txt"
@@ -100,7 +98,6 @@ def main():
         print(f"  • Log file:          {debug_log_file}")
         print("="*70 + "\n")
         
-        # Write header to debug log
         with open(debug_log_file, 'w', encoding='utf-8') as f:
             f.write("="*70 + "\n")
             f.write("🐛 TRAINING DEBUG LOG\n")
@@ -121,15 +118,30 @@ def main():
         use_mtl=use_mtl
     )
     
-    # Load data
-    print("\n=== Loading data ===")
-    metadata = parse_pgn_files(
-        config['paths']['data_dir'], 
-        config,
-        num_workers=config['hardware']['num_workers']
-    )
+    # Load data with multi-phase processing (v4.1 smart tracking)
+    print("\n=== Loading data (v4.1 smart processing with tracking) ===")
+    print(f"Mode: {'SEQUENTIAL' if config['data']['files_at_once'] == 1 else 'BATCH'}")
+    print(f"Files at once: {config['data']['files_at_once']}")
+    print(f"Phase 1 workers: {config['data'].get('phase1_threads', 1)}")
+    print(f"Phase 2 workers: {config['data'].get('phase2_threads', 1)}")
     
-    print(f"Total positions: {metadata['total_positions']}")
+    # Find PGN files (relative to script location)
+    # script_dir.parent gives us chess/, then we add data_dir from config
+    data_dir = script_dir.parent / config['paths']['data_dir']
+    pgn_files = sorted(data_dir.glob('*.pgn'))
+    
+    if not pgn_files:
+        raise FileNotFoundError(f"No PGN files found in {data_dir}")
+    
+    print(f"Found {len(pgn_files)} PGN file(s):")
+    for pgn in pgn_files:
+        print(f"  • {pgn.name}")
+    
+    # Process with smart tracking (v4.1)
+    metadata = process_pgn_files_smart(pgn_files, config)
+    
+    print(f"\n✅ Data loaded successfully!")
+    print(f"Total positions: {metadata['total_positions']:,}")
     print(f"Input planes (from data): {metadata.get('input_planes', 12)}")
     
     # Verify input_planes matches model config
@@ -147,7 +159,7 @@ def main():
     # Create dataloaders
     train_loader, val_loader = create_dataloaders(metadata, config)
     
-    # Create model (input_planes auto-calculated from history_positions)
+    # Create model
     print("\n=== Creating model ===")
     model = ChessNet(config).to(device)
     model = model.to(memory_format=torch.channels_last)
@@ -215,7 +227,7 @@ def main():
     for epoch in range(config['imitation_learning']['epochs']):
         print(f"\nEpoch {epoch + 1}/{config['imitation_learning']['epochs']}")
         
-        # 🆕 Pass epoch number and debug log file for profiling
+        # Train epoch
         train_losses, train_metrics = train_epoch_il(
             model, train_loader, optimizer, scheduler, config, device, scaler, 
             epoch=epoch, debug_log_file=debug_log_file

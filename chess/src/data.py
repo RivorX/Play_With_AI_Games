@@ -1,3 +1,12 @@
+"""
+Chess data processing and dataset management - OPTIMIZED FOR LOW RAM
+🆕 v4.1: Smart dataset management with tracking and auto-cleanup
+- ♻️ Auto-cleanup: Removes intermediate files after position creation
+- 📝 Dataset tracking: Tracks processed datasets to avoid reprocessing
+- 🔗 Smart merging: Reuses compatible preprocessed datasets
+- 📁 New location: data/preprocessing instead of cache
+"""
+
 import chess
 import chess.pgn
 import numpy as np
@@ -10,234 +19,23 @@ from tqdm import tqdm
 import gc
 import struct
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import hashlib
+import json
+from datetime import datetime
 
 
-def board_to_tensor(board, history_boards=None, history_positions=0):
-    """
-    Convert chess.Board to tensor representation with optional history
-    
-    Args:
-        board: Current chess.Board
-        history_boards: List of previous chess.Board objects (oldest to newest)
-        history_positions: Number of history positions to include
-    
-    Returns: 
-        - Without history: (12, 8, 8) tensor
-        - With history: (12 * (1 + history_positions), 8, 8) tensor
-    """
-    tensor = np.zeros((12, 8, 8), dtype=np.float32)
-    
-    piece_to_idx = {
-        chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
-        chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
-    }
-    
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            row = square // 8
-            col = square % 8
-            piece_idx = piece_to_idx[piece.piece_type]
-            if piece.color == chess.WHITE:
-                channel = piece_idx
-            else:
-                channel = piece_idx + 6
-            tensor[channel, row, col] = 1.0
-    
-    # If no history needed, return current board only
-    if history_positions == 0 or history_boards is None:
-        return tensor
-    
-    # Build history tensors
-    history_tensors = []
-    
-    # Get last N boards from history
-    if history_boards:
-        history_list = history_boards[-history_positions:]
-    else:
-        history_list = []
-    
-    # Pad with empty boards if not enough history
-    while len(history_list) < history_positions:
-        empty_board = np.zeros((12, 8, 8), dtype=np.float32)
-        history_tensors.append(empty_board)
-    
-    # Add actual history boards (convert each to tensor)
-    for hist_board in history_list:
-        hist_tensor = np.zeros((12, 8, 8), dtype=np.float32)
-        
-        for square in chess.SQUARES:
-            piece = hist_board.piece_at(square)
-            if piece:
-                row = square // 8
-                col = square % 8
-                piece_idx = piece_to_idx[piece.piece_type]
-                if piece.color == chess.WHITE:
-                    channel = piece_idx
-                else:
-                    channel = piece_idx + 6
-                hist_tensor[channel, row, col] = 1.0
-        
-        history_tensors.append(hist_tensor)
-    
-    # Stack: [oldest_history, ..., newest_history, current]
-    all_tensors = history_tensors + [tensor]
-    stacked = np.concatenate(all_tensors, axis=0)
-    
-    return stacked
-
-
-def board_to_compact(board):
-    """
-    Convert board to ultra-compact binary representation
-    Each position: 64 squares × 4 bits = 32 bytes
-    """
-    piece_to_code = {
-        (chess.PAWN, chess.WHITE): 1,
-        (chess.KNIGHT, chess.WHITE): 2,
-        (chess.BISHOP, chess.WHITE): 3,
-        (chess.ROOK, chess.WHITE): 4,
-        (chess.QUEEN, chess.WHITE): 5,
-        (chess.KING, chess.WHITE): 6,
-        (chess.PAWN, chess.BLACK): 7,
-        (chess.KNIGHT, chess.BLACK): 8,
-        (chess.BISHOP, chess.BLACK): 9,
-        (chess.ROOK, chess.BLACK): 10,
-        (chess.QUEEN, chess.BLACK): 11,
-        (chess.KING, chess.BLACK): 12,
-    }
-    
-    codes = []
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            code = piece_to_code[(piece.piece_type, piece.color)]
-        else:
-            code = 0
-        codes.append(code)
-    
-    # Pack pairs of codes into bytes
-    packed = bytearray(32)
-    for i in range(0, 64, 2):
-        packed[i // 2] = (codes[i] << 4) | codes[i + 1]
-    
-    return bytes(packed)
-
-
-def compact_to_tensor(compact_board):
-    """Convert compact representation back to tensor"""
-    tensor = np.zeros((12, 8, 8), dtype=np.float32)
-    
-    for i in range(32):
-        byte = compact_board[i]
-        code1 = (byte >> 4) & 0x0F
-        code2 = byte & 0x0F
-        
-        square1 = i * 2
-        square2 = i * 2 + 1
-        
-        for square, code in [(square1, code1), (square2, code2)]:
-            if code == 0:
-                continue
-            
-            row = square // 8
-            col = square % 8
-            
-            if 1 <= code <= 6:
-                channel = code - 1
-            else:
-                channel = code - 1
-            
-            tensor[channel, row, col] = 1.0
-    
-    return tensor
-
-
-def move_to_index(move):
-    """Convert chess.Move to index (0-4095)"""
-    return move.from_square * 64 + move.to_square
-
-
-def index_to_move(index):
-    """Convert index back to move"""
-    from_square = index // 64
-    to_square = index % 64
-    return chess.Move(from_square, to_square)
-
-
-# ==============================================================================
-# 🆕 MULTI-TASK LEARNING HELPER FUNCTIONS
-# ==============================================================================
-
-def compute_material_balance(board):
-    """
-    Compute material balance for current player
-    
-    Returns:
-        float: Material advantage in pawns (-10 to +10)
-               Positive = current player ahead
-               Negative = current player behind
-    """
-    piece_values = {
-        chess.PAWN: 1,
-        chess.KNIGHT: 3,
-        chess.BISHOP: 3,
-        chess.ROOK: 5,
-        chess.QUEEN: 9,
-        chess.KING: 0  # King doesn't count for material
-    }
-    
-    white_material = 0
-    black_material = 0
-    
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            value = piece_values[piece.piece_type]
-            if piece.color == chess.WHITE:
-                white_material += value
-            else:
-                black_material += value
-    
-    # Return from perspective of current player
-    if board.turn == chess.WHITE:
-        balance = white_material - black_material
-    else:
-        balance = black_material - white_material
-    
-    # Normalize to [-1, 1] (divide by max possible material ~40)
-    return np.tanh(balance / 10.0)
-
-
-def is_in_check(board):
-    """
-    Check if current player's king is in check
-    
-    Returns:
-        float: 1.0 if in check, 0.0 otherwise
-    """
-    return 1.0 if board.is_check() else 0.0
-
-
-def will_win(board, game_result):
-    """
-    Determine if current player will win based on game result
-    
-    Args:
-        board: chess.Board at current position
-        game_result: Game result string ('1-0', '0-1', '1/2-1/2')
-    
-    Returns:
-        float: 1.0 if current player wins, 0.0 otherwise
-    """
-    if game_result == '1/2-1/2':
-        return 0.0
-    
-    if board.turn == chess.WHITE:
-        return 1.0 if game_result == '1-0' else 0.0
-    else:
-        return 1.0 if game_result == '0-1' else 0.0
+# Import helper functions from utils
+from .utils.data_helpers import (
+    board_to_tensor, 
+    board_to_compact, 
+    compact_to_tensor,
+    move_to_index, 
+    index_to_move,
+    compute_material_balance,
+    is_in_check,
+    will_win
+)
 
 
 def extract_auxiliary_labels(board, game_result):
@@ -263,7 +61,300 @@ def extract_auxiliary_labels(board, game_result):
 
 
 # ==============================================================================
-# PGN EXTRACTION AND PROCESSING
+# 🆕 DATASET TRACKING SYSTEM
+# ==============================================================================
+
+class DatasetTracker:
+    """
+    Tracks processed datasets to avoid reprocessing
+    Stores metadata about each processed PGN file
+    """
+    
+    def __init__(self, preprocessing_dir):
+        """
+        Args:
+            preprocessing_dir: Path to data/preprocessing directory
+        """
+        self.preprocessing_dir = Path(preprocessing_dir)
+        self.preprocessing_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Tracking file location
+        self.tracking_file = self.preprocessing_dir / "processed_datasets.json"
+        
+        # Load existing tracking data
+        self.tracking_data = self._load_tracking()
+    
+    def _load_tracking(self):
+        """Load tracking data from JSON file"""
+        if self.tracking_file.exists():
+            try:
+                with open(self.tracking_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+    
+    def _save_tracking(self):
+        """Save tracking data to JSON file"""
+        with open(self.tracking_file, 'w') as f:
+            json.dump(self.tracking_data, f, indent=2)
+    
+    def _compute_file_hash(self, pgn_path):
+        """Compute hash of PGN file (first 10MB for speed)"""
+        hasher = hashlib.md5()
+        
+        with open(pgn_path, 'rb') as f:
+            # Read first 10MB (enough to detect file changes)
+            chunk = f.read(10 * 1024 * 1024)
+            hasher.update(chunk)
+        
+        return hasher.hexdigest()
+    
+    def _compute_config_hash(self, config):
+        """
+        Compute hash of processing configuration
+        Only includes parameters that affect binary output
+        """
+        relevant_config = {
+            'min_elo': config['data'].get('min_elo', 0),
+            'max_games': config['data'].get('max_games', float('inf')),
+            'max_moves_per_game': config['data'].get('max_moves_per_game', 200),
+            'history_positions': config['model'].get('history_positions', 0),
+            'use_multitask_learning': config['model'].get('use_multitask_learning', False),
+        }
+        
+        config_str = json.dumps(relevant_config, sort_keys=True)
+        return hashlib.md5(config_str.encode()).hexdigest()
+    
+    def get_processed_dataset(self, pgn_path, config):
+        """
+        Check if dataset was already processed with same config
+        
+        Returns:
+            Path to existing binary file if found and compatible, None otherwise
+        """
+        pgn_path = Path(pgn_path)
+        file_hash = self._compute_file_hash(pgn_path)
+        config_hash = self._compute_config_hash(config)
+        
+        # Check if this file+config combo exists
+        key = f"{pgn_path.name}_{file_hash}_{config_hash}"
+        
+        if key in self.tracking_data:
+            entry = self.tracking_data[key]
+            binary_path = Path(entry['binary_file'])
+            metadata_path = Path(entry['metadata_file'])
+            
+            # Verify files still exist
+            if binary_path.exists() and metadata_path.exists():
+                print(f"  ♻️ Found preprocessed dataset: {binary_path.name}")
+                print(f"     Processed on: {entry['processed_date']}")
+                print(f"     Positions: {entry['total_positions']:,}")
+                return binary_path, metadata_path
+        
+        return None, None
+    
+    def register_dataset(self, pgn_path, config, binary_file, metadata_file, total_positions):
+        """
+        Register a newly processed dataset
+        
+        Args:
+            pgn_path: Path to source PGN file
+            config: Processing configuration
+            binary_file: Path to output binary file
+            metadata_file: Path to metadata file
+            total_positions: Number of positions in dataset
+        """
+        pgn_path = Path(pgn_path)
+        file_hash = self._compute_file_hash(pgn_path)
+        config_hash = self._compute_config_hash(config)
+        
+        key = f"{pgn_path.name}_{file_hash}_{config_hash}"
+        
+        self.tracking_data[key] = {
+            'pgn_file': str(pgn_path),
+            'pgn_hash': file_hash,
+            'config_hash': config_hash,
+            'binary_file': str(binary_file),
+            'metadata_file': str(metadata_file),
+            'total_positions': total_positions,
+            'processed_date': datetime.now().isoformat(),
+            'config': {
+                'min_elo': config['data'].get('min_elo', 0),
+                'max_games': config['data'].get('max_games', float('inf')),
+                'history_positions': config['model'].get('history_positions', 0),
+                'use_mtl': config['model'].get('use_multitask_learning', False),
+            }
+        }
+        
+        self._save_tracking()
+        print(f"  ✅ Dataset registered in tracking system")
+    
+    def list_processed_datasets(self):
+        """List all processed datasets"""
+        if not self.tracking_data:
+            print("  No processed datasets found")
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"📚 Processed Datasets ({len(self.tracking_data)} total)")
+        print(f"{'='*80}")
+        
+        for i, (key, entry) in enumerate(self.tracking_data.items(), 1):
+            binary_exists = Path(entry['binary_file']).exists()
+            status = "✅" if binary_exists else "❌"
+            
+            print(f"\n{i}. {status} {entry['pgn_file']}")
+            print(f"   Binary: {Path(entry['binary_file']).name}")
+            print(f"   Positions: {entry['total_positions']:,}")
+            print(f"   Date: {entry['processed_date'][:10]}")
+            print(f"   Config: min_elo={entry['config']['min_elo']}, "
+                  f"history={entry['config']['history_positions']}, "
+                  f"mtl={entry['config']['use_mtl']}")
+        
+        print(f"\n{'='*80}\n")
+
+
+# ==============================================================================
+# 🆕 AUTO-CLEANUP SYSTEM
+# ==============================================================================
+
+def cleanup_intermediate_files(games_data_list, temp_dir):
+    """
+    Clean up intermediate files after position creation
+    
+    Args:
+        games_data_list: List of (pgn_path, games_data, temp_file) tuples
+        temp_dir: Temporary directory containing intermediate files
+    """
+    print(f"\n{'='*70}")
+    print("♻️  Cleaning up intermediate files...")
+    print(f"{'='*70}")
+    
+    cleaned_count = 0
+    freed_mb = 0
+    
+    # Clean up game data temp files
+    for pgn_path, games_data, temp_file in games_data_list:
+        if temp_file and temp_file.exists():
+            size_mb = temp_file.stat().st_size / (1024**2)
+            temp_file.unlink()
+            cleaned_count += 1
+            freed_mb += size_mb
+            print(f"  🗑️  Deleted: {temp_file.name} ({size_mb:.1f} MB)")
+    
+    # Clean up any other temporary files in temp_dir
+    if temp_dir.exists():
+        for temp_file in temp_dir.glob("*.tmp"):
+            if temp_file.exists():
+                size_mb = temp_file.stat().st_size / (1024**2)
+                temp_file.unlink()
+                cleaned_count += 1
+                freed_mb += size_mb
+                print(f"  🗑️  Deleted: {temp_file.name} ({size_mb:.1f} MB)")
+    
+    gc.collect()
+    
+    print(f"\n✅ Cleanup complete!")
+    print(f"  • Files deleted: {cleaned_count}")
+    print(f"  • Space freed: {freed_mb:.1f} MB")
+    print(f"{'='*70}\n")
+
+
+# ==============================================================================
+# 🆕 SMART DATASET MERGING
+# ==============================================================================
+
+def merge_binary_datasets(binary_files, metadata_files, output_binary, output_metadata):
+    """
+    Merge multiple binary datasets into one
+    
+    Args:
+        binary_files: List of binary file paths
+        metadata_files: List of metadata file paths
+        output_binary: Output binary file path
+        output_metadata: Output metadata file path
+    
+    Returns:
+        Combined metadata dictionary
+    """
+    print(f"\n{'='*70}")
+    print(f"🔗 Merging {len(binary_files)} datasets...")
+    print(f"{'='*70}")
+    
+    # Load all metadata
+    all_metadata = []
+    total_positions = 0
+    
+    for meta_file in metadata_files:
+        with open(meta_file, 'rb') as f:
+            meta = pickle.load(f)
+            all_metadata.append(meta)
+            total_positions += meta['total_positions']
+            print(f"  • {Path(meta['binary_file']).name}: {meta['total_positions']:,} positions")
+    
+    # Verify compatibility
+    first_meta = all_metadata[0]
+    position_size = first_meta['position_size']
+    use_mtl = first_meta['use_mtl']
+    history_positions = first_meta['history_positions']
+    input_planes = first_meta['input_planes']
+    
+    for meta in all_metadata[1:]:
+        if (meta['position_size'] != position_size or 
+            meta['use_mtl'] != use_mtl or
+            meta['history_positions'] != history_positions):
+            raise ValueError("Cannot merge incompatible datasets! Different configs detected.")
+    
+    print(f"\n  ✅ All datasets compatible")
+    print(f"  📊 Total positions: {total_positions:,}")
+    
+    # Merge binary files
+    print(f"\n  🔨 Writing merged binary file...")
+    chunk_size = 100 * 1024 * 1024  # 100 MB chunks
+    
+    with open(output_binary, 'wb') as outfile:
+        for i, binary_file in enumerate(binary_files, 1):
+            print(f"     Merging file {i}/{len(binary_files)}: {Path(binary_file).name}")
+            
+            with open(binary_file, 'rb') as infile:
+                while True:
+                    chunk = infile.read(chunk_size)
+                    if not chunk:
+                        break
+                    outfile.write(chunk)
+    
+    # Create combined metadata
+    combined_metadata = {
+        'binary_file': str(output_binary),
+        'total_positions': total_positions,
+        'position_size': position_size,
+        'use_mtl': use_mtl,
+        'history_positions': history_positions,
+        'input_planes': input_planes,
+        'source_files': [str(Path(meta['binary_file']).name) for meta in all_metadata],
+        'merged_date': datetime.now().isoformat()
+    }
+    
+    with open(output_metadata, 'wb') as f:
+        pickle.dump(combined_metadata, f)
+    
+    final_size_mb = output_binary.stat().st_size / (1024**2)
+    
+    print(f"\n{'='*70}")
+    print("✅ Merge Complete!")
+    print(f"{'='*70}")
+    print(f"  • Output: {output_binary.name}")
+    print(f"  • Size: {final_size_mb:.1f} MB")
+    print(f"  • Total positions: {total_positions:,}")
+    print(f"  • Source files: {len(binary_files)}")
+    print(f"{'='*70}\n")
+    
+    return combined_metadata
+
+
+# ==============================================================================
+# PHASE 1: PGN EXTRACTION (Multi-processing for real CPU parallelism)
 # ==============================================================================
 
 def extract_game_data(game):
@@ -290,436 +381,571 @@ def extract_game_data(game):
         return None
 
 
-def process_extracted_game(game_data, min_elo, max_moves, use_mtl=True, history_positions=0):
+def parse_games_batch_worker(args):
     """
-    🆕 Process extracted game data with MTL and HISTORY support
+    PHASE 1 WORKER: Parse a batch of games (runs in separate process)
+    This runs in a separate process, so it bypasses GIL!
+    """
+    pgn_path, start_game, num_games = args
+    
+    import chess.pgn
+    
+    games_data = []
+    
+    try:
+        with open(pgn_path, 'r', encoding='utf-8', errors='ignore') as f:
+            # Skip to start position
+            for _ in range(start_game):
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    return games_data
+            
+            # Read our batch
+            for _ in range(num_games):
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    break
+                
+                game_data = extract_game_data(game)
+                if game_data:
+                    games_data.append(game_data)
+    
+    except Exception as e:
+        print(f"⚠️ Worker error: {e}")
+    
+    return games_data
+
+
+def extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_workers):
+    """
+    PHASE 1: Extract games using multi-processing (bypasses GIL)
+    
+    Each worker is a separate Python process with its own interpreter.
+    This gives TRUE parallelism for CPU-bound parsing!
+    """
+    if phase1_workers <= 1:
+        # Single process fallback
+        return extract_games_sequential(pgn_path, max_games)
+    
+    print(f"  Using {phase1_workers} processes for parallel parsing...")
+    
+    # Calculate games per worker
+    games_per_worker = (max_games + phase1_workers - 1) // phase1_workers
+    
+    # Create tasks
+    tasks = []
+    for i in range(phase1_workers):
+        start_game = i * games_per_worker
+        num_games = min(games_per_worker, max_games - start_game)
+        
+        if num_games <= 0:
+            break
+        
+        tasks.append((pgn_path, start_game, num_games))
+    
+    # Process in parallel with separate processes
+    all_games = []
+    
+    with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
+        futures = {executor.submit(parse_games_batch_worker, task): i for i, task in enumerate(tasks)}
+        
+        with tqdm(total=len(futures), desc="  Phase 1 workers") as pbar:
+            for future in as_completed(futures):
+                games_chunk = future.result()
+                all_games.extend(games_chunk)
+                pbar.update(1)
+                pbar.set_postfix({'games': len(all_games)})
+    
+    return all_games[:max_games]
+
+
+def extract_games_sequential(pgn_path, max_games):
+    """
+    PHASE 1: Sequential extraction (fallback for single worker)
+    """
+    games_data = []
+    
+    with open(pgn_path, 'r', encoding='utf-8', errors='ignore') as f:
+        with tqdm(total=max_games, desc="  Extracting games") as pbar:
+            game_count = 0
+            while game_count < max_games:
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    break
+                
+                game_data = extract_game_data(game)
+                if game_data:
+                    games_data.append(game_data)
+                    game_count += 1
+                    pbar.update(1)
+    
+    return games_data
+
+
+def sort_games_by_elo(games_data):
+    """
+    Sort games by average Elo (descending)
+    Returns sorted list with highest Elo games first
+    """
+    def get_avg_elo(game):
+        try:
+            white_elo = game['white_elo']
+            black_elo = game['black_elo']
+            
+            if white_elo == '?' or black_elo == '?':
+                return 0
+            
+            return (int(white_elo) + int(black_elo)) / 2
+        except:
+            return 0
+    
+    return sorted(games_data, key=get_avg_elo, reverse=True)
+
+
+def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, sort_by_elo=True):
+    """
+    PHASE 1: Extract games from PGN file
+    Uses multi-processing for true CPU parallelism
     
     Args:
-        game_data: Extracted game data
-        min_elo: Minimum Elo threshold
-        max_moves: Maximum moves per game
-        use_mtl: If True, extract auxiliary labels
-        history_positions: Number of previous positions to include (0 = disabled)
+        pgn_path: Path to PGN file
+        max_games: Maximum games to extract
+        phase1_threads: Number of processes
+        sort_by_elo: If True, sort by Elo and take top max_games (default: True)
     """
-    try:
-        if game_data is None:
-            return []
+    # Extract MORE games than needed if sorting (to ensure we get enough after filtering)
+    # We'll extract 2x max_games, sort, then take top max_games
+    games_to_extract = max_games * 2 if sort_by_elo else max_games
+    
+    if sort_by_elo:
+        print(f"  📊 Extracting {games_to_extract:,} games (will sort and select top {max_games:,} by Elo)...")
+    
+    all_games = extract_games_from_pgn_multiprocess(pgn_path, games_to_extract, phase1_threads)
+    
+    if not all_games:
+        return []
+    
+    # Sort by Elo and take top games
+    if sort_by_elo:
+        print(f"  🔝 Sorting {len(all_games):,} games by average Elo...")
+        all_games = sort_games_by_elo(all_games)
         
+        # Take top max_games
+        all_games = all_games[:max_games]
+        
+        # Print Elo stats
+        if all_games:
+            elos = []
+            for game in all_games:
+                try:
+                    if game['white_elo'] != '?' and game['black_elo'] != '?':
+                        avg_elo = (int(game['white_elo']) + int(game['black_elo'])) / 2
+                        elos.append(avg_elo)
+                except:
+                    pass
+            
+            if elos:
+                print(f"  ✅ Selected top {len(all_games):,} games")
+                print(f"     Average Elo range: {min(elos):.0f} - {max(elos):.0f}")
+                print(f"     Mean Elo: {sum(elos)/len(elos):.0f}")
+    
+    return all_games
+
+
+# ==============================================================================
+# PHASE 2: POSITION EXTRACTION (Multi-processing for CPU parallelism)
+# ==============================================================================
+
+def extract_positions_from_game_worker(args):
+    """
+    PHASE 2 WORKER: Extract positions from a single game
+    Runs in separate process for TRUE parallelism
+    """
+    game_data, min_elo, max_moves_per_game, use_mtl, history_positions = args
+    
+    import chess
+    import struct
+    import numpy as np
+    
+    # Import helpers locally (each process needs its own)
+    from .utils.data_helpers import (
+        board_to_compact,
+        move_to_index,
+        compute_material_balance,
+        is_in_check,
+        will_win
+    )
+    
+    try:
+        # Check Elo
         white_elo = game_data['white_elo']
         black_elo = game_data['black_elo']
         
         if white_elo == '?' or black_elo == '?':
             return []
         
-        try:
-            white_elo_int = int(white_elo)
-            black_elo_int = int(black_elo)
-            
-            if white_elo_int < min_elo or black_elo_int < min_elo:
-                return []
-        except (ValueError, TypeError):
+        white_elo_int = int(white_elo)
+        black_elo_int = int(black_elo)
+        
+        if white_elo_int < min_elo or black_elo_int < min_elo:
             return []
         
-        result = game_data['result']
-        if result == '1-0':
-            outcome = 1.0
-        elif result == '0-1':
-            outcome = -1.0
-        elif result == '1/2-1/2':
-            outcome = 0.0
-        else:
+        # Check game length
+        if len(game_data['moves']) > max_moves_per_game:
             return []
         
-        data = []
+        # Replay game
         board = chess.Board()
-        move_count = 0
+        result = game_data['result']
         
-        # 🆕 History tracking
-        board_history = []  # List of compact boards
+        positions = []
+        board_history = []
         
         for move_uci in game_data['moves']:
-            if move_count >= max_moves:
-                break
-            
             try:
                 move = chess.Move.from_uci(move_uci)
                 
-                # Current board
-                compact_board = board_to_compact(board)
-                move_index = np.uint16(move_to_index(move))
-                current_outcome = outcome if board.turn == chess.WHITE else -outcome
+                if move not in board.legal_moves:
+                    break
                 
-                # 🆕 Prepare history (pad with empty boards if needed)
+                # Current board state (compact)
+                current_board_compact = board_to_compact(board)
+                
+                # History (compact)
+                history_compact_list = []
                 if history_positions > 0:
-                    # Get last N positions, pad with empty if not enough
-                    history_list = board_history[-history_positions:] if len(board_history) > 0 else []
+                    # Get last N boards
+                    hist_to_use = board_history[-history_positions:] if board_history else []
                     
                     # Pad with empty boards if needed
-                    empty_board = bytes(32)  # All zeros = empty board
-                    while len(history_list) < history_positions:
-                        history_list.insert(0, empty_board)
+                    while len(hist_to_use) < history_positions:
+                        empty = bytes(32)
+                        hist_to_use.insert(0, empty)
                     
-                    # Concatenate history (oldest to newest, then current)
-                    full_history = b''.join(history_list)
-                else:
-                    full_history = b''  # No history
+                    history_compact_list = hist_to_use
                 
-                # Extract auxiliary labels if MTL is enabled
+                # Move index
+                move_idx = move_to_index(move)
+                
+                # Outcome
+                if result == '1-0':
+                    outcome = 1.0 if board.turn == chess.WHITE else -1.0
+                elif result == '0-1':
+                    outcome = -1.0 if board.turn == chess.WHITE else 1.0
+                else:
+                    outcome = 0.0
+                
+                # MTL labels
                 if use_mtl:
-                    aux_labels = extract_auxiliary_labels(board, result)
-                    win_label = np.float32(aux_labels['win'])
-                    material_label = np.float32(aux_labels['material'])
-                    check_label = np.float32(aux_labels['check'])
-                    
-                    data.append((
-                        compact_board,
-                        full_history,  # 🆕 History bytes
-                        move_index, 
-                        np.float32(current_outcome),
-                        win_label,
-                        material_label,
-                        check_label
-                    ))
+                    win_label = will_win(board, result)
+                    material_label = compute_material_balance(board)
+                    check_label = is_in_check(board)
                 else:
-                    data.append((
-                        compact_board,
-                        full_history,  # 🆕 History bytes
-                        move_index,
-                        np.float32(current_outcome)
-                    ))
+                    win_label = material_label = check_label = 0.0
                 
-                # 🆕 Add current board to history
-                board_history.append(compact_board)
+                # Pack position
+                position_data = current_board_compact
                 
+                # Add history
+                for hist_board in history_compact_list:
+                    position_data += hist_board
+                
+                # Add move and outcome
+                position_data += struct.pack('H', move_idx)
+                position_data += struct.pack('f', outcome)
+                
+                # Add MTL if enabled
+                if use_mtl:
+                    position_data += struct.pack('f', win_label)
+                    position_data += struct.pack('f', material_label)
+                    position_data += struct.pack('f', check_label)
+                
+                positions.append(position_data)
+                
+                # Update history
+                board_history.append(current_board_compact)
+                
+                # Make move
                 board.push(move)
-                move_count += 1
-            except:
+                
+            except Exception as e:
                 break
         
-        return data
-    except:
+        return positions
+        
+    except Exception as e:
         return []
 
 
-def process_game_batch(args):
-    """Process a batch of extracted game data in parallel worker"""
-    games_data, min_elo, max_moves, use_mtl, history_positions = args
+def extract_positions_parallel(games_data, config, phase2_workers):
+    """
+    PHASE 2: Extract positions from games using multi-processing
+    
+    Args:
+        games_data: List of game dictionaries
+        config: Configuration dictionary
+        phase2_workers: Number of processes to use
+    
+    Returns:
+        List of binary position data
+    """
+    min_elo = config['data'].get('min_elo', 0)
+    max_moves = config['data'].get('max_moves_per_game', 200)
+    use_mtl = config['model'].get('use_multitask_learning', False)
+    history_pos = config['model'].get('history_positions', 0)
+    
+    if phase2_workers <= 1:
+        # Sequential fallback
+        return extract_positions_sequential(games_data, config)
+    
+    print(f"  Using {phase2_workers} processes for parallel position extraction...")
+    
+    # Prepare tasks
+    tasks = [(game, min_elo, max_moves, use_mtl, history_pos) for game in games_data]
+    
+    # Process in parallel
     all_positions = []
     
-    for game_data in games_data:
-        positions = process_extracted_game(game_data, min_elo, max_moves, use_mtl, history_positions)
+    with ProcessPoolExecutor(max_workers=phase2_workers) as executor:
+        futures = {executor.submit(extract_positions_from_game_worker, task): i 
+                   for i, task in enumerate(tasks)}
+        
+        with tqdm(total=len(futures), desc="  Phase 2 workers") as pbar:
+            for future in as_completed(futures):
+                positions = future.result()
+                all_positions.extend(positions)
+                pbar.update(1)
+                pbar.set_postfix({'positions': len(all_positions)})
+    
+    return all_positions
+
+
+def extract_positions_sequential(games_data, config):
+    """
+    PHASE 2: Sequential position extraction (fallback)
+    """
+    min_elo = config['data'].get('min_elo', 0)
+    max_moves = config['data'].get('max_moves_per_game', 200)
+    use_mtl = config['model'].get('use_multitask_learning', False)
+    history_pos = config['model'].get('history_positions', 0)
+    
+    all_positions = []
+    
+    for game in tqdm(games_data, desc="  Extracting positions"):
+        task = (game, min_elo, max_moves, use_mtl, history_pos)
+        positions = extract_positions_from_game_worker(task)
         all_positions.extend(positions)
     
     return all_positions
 
 
-class BinaryDataWriter:
+# ==============================================================================
+# PHASE 3 & 4: DISK WRITING & CLEANUP
+# ==============================================================================
+
+def write_positions_to_disk(positions, binary_file):
     """
-    🆕 Write positions to binary file with MTL and HISTORY support
+    PHASE 3: Write positions to binary file
     
-    Format without MTL, no history (38 bytes):
-    - Board: 32 bytes
-    - Move: 2 bytes
-    - Outcome: 4 bytes
+    Args:
+        positions: List of binary position data
+        binary_file: Path to output file
     
-    Format with MTL, no history (50 bytes):
-    - Board: 32 bytes
-    - Move: 2 bytes
-    - Outcome: 4 bytes
-    - Win: 4 bytes
-    - Material: 4 bytes
-    - Check: 4 bytes
-    
-    Format with history:
-    - Board: 32 bytes
-    - History: 32 * history_positions bytes
-    - Move: 2 bytes
-    - Outcome: 4 bytes
-    - [MTL labels if enabled: 12 bytes]
+    Returns:
+        Number of positions written
     """
+    print(f"\n  💾 Writing {len(positions):,} positions to disk...")
     
-    def __init__(self, filepath, use_mtl=True, history_positions=0):
-        self.filepath = filepath
-        self.use_mtl = use_mtl
-        self.history_positions = history_positions
-        
-        # Calculate position size
-        base_size = 32 + (32 * history_positions) + 2 + 4  # board + history + move + outcome
-        mtl_size = 12 if use_mtl else 0  # win + material + check
-        self.position_size = base_size + mtl_size
-        
-        self.file = open(filepath, 'wb')
-        self.count = 0
+    with open(binary_file, 'wb') as f:
+        for pos_data in tqdm(positions, desc="  Writing"):
+            f.write(pos_data)
     
-    def write_position(self, *args):
-        """
-        Write one position
-        
-        Args (without MTL):
-            compact_board, history_bytes, move_index, outcome
-        
-        Args (with MTL):
-            compact_board, history_bytes, move_index, outcome, win, material, check
-        """
-        if self.use_mtl:
-            if len(args) != 7:
-                raise ValueError(f"Expected 7 args for MTL, got {len(args)}")
-            compact_board, history_bytes, move_index, outcome, win, material, check = args
-            
-            self.file.write(compact_board)  # 32 bytes
-            self.file.write(history_bytes)  # 32 * history_positions bytes
-            self.file.write(struct.pack('H', move_index))  # 2 bytes
-            self.file.write(struct.pack('f', outcome))  # 4 bytes
-            self.file.write(struct.pack('f', win))  # 4 bytes
-            self.file.write(struct.pack('f', material))  # 4 bytes
-            self.file.write(struct.pack('f', check))  # 4 bytes
-        else:
-            if len(args) != 4:
-                raise ValueError(f"Expected 4 args for non-MTL, got {len(args)}")
-            compact_board, history_bytes, move_index, outcome = args
-            
-            self.file.write(compact_board)  # 32 bytes
-            self.file.write(history_bytes)  # 32 * history_positions bytes
-            self.file.write(struct.pack('H', move_index))  # 2 bytes
-            self.file.write(struct.pack('f', outcome))  # 4 bytes
-        
-        self.count += 1
+    size_mb = binary_file.stat().st_size / (1024**2)
+    print(f"  ✅ Written: {size_mb:.1f} MB")
     
-    def close(self):
-        self.file.close()
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        self.close()
+    return len(positions)
 
 
-def parse_single_pgn_file(args):
-    """🆕 Process single PGN with MTL and HISTORY"""
-    pgn_path, output_path, min_elo, max_games, max_moves, file_index, select_top, sort_by_elo, use_mtl, history_positions = args
-    
-    print(f"[Worker {file_index}] Processing: {pgn_path.name}")
-    
-    # Extract games
-    games_data = []
-    with open(pgn_path, 'r', encoding='utf-8', errors='ignore') as f:
-        while True:
-            game = chess.pgn.read_game(f)
-            if game is None:
-                break
-            
-            game_data = extract_game_data(game)
-            if game_data:
-                try:
-                    white_elo = int(game_data['white_elo']) if game_data['white_elo'] != '?' else 0
-                    black_elo = int(game_data['black_elo']) if game_data['black_elo'] != '?' else 0
-                    
-                    if white_elo >= min_elo and black_elo >= min_elo:
-                        avg_elo = (white_elo + black_elo) / 2
-                        games_data.append((game_data, avg_elo))
-                except (ValueError, TypeError):
-                    pass
-    
-    print(f"[Worker {file_index}] Extracted {len(games_data)} games (Elo >= {min_elo})")
-    
-    # Sort and select
-    if select_top and sort_by_elo and games_data:
-        games_data.sort(key=lambda x: x[1], reverse=True)
-        games_to_process = min(max_games, len(games_data))
-        games_data = games_data[:games_to_process]
-        
-        if games_data:
-            print(f"[Worker {file_index}] Selected top {len(games_data)} (Elo: {games_data[-1][1]:.0f}-{games_data[0][1]:.0f})")
-    
-    games_data = [g[0] for g in games_data]
-    
-    # Process in batches
-    batch_size = max(1, len(games_data) // (mp.cpu_count() * 2))
-    batches = [(games_data[i:i + batch_size], min_elo, max_moves, use_mtl, history_positions) 
-               for i in range(0, len(games_data), batch_size)]
-    
-    all_positions = []
-    with ProcessPoolExecutor(max_workers=mp.cpu_count()) as executor:
-        futures = [executor.submit(process_game_batch, batch) for batch in batches]
-        for future in as_completed(futures):
-            all_positions.extend(future.result())
-    
-    # Write to binary
-    with BinaryDataWriter(output_path, use_mtl=use_mtl, history_positions=history_positions) as writer:
-        for position_data in all_positions:
-            writer.write_position(*position_data)
-    
-    print(f"[Worker {file_index}] ✓ {pgn_path.name}: {len(all_positions)} positions")
-    
-    return pgn_path.name, len(all_positions), output_path
+# ==============================================================================
+# 🆕 MAIN PROCESSING FUNCTION WITH SMART MANAGEMENT
+# ==============================================================================
 
-
-def parse_pgn_files(data_dir, config, num_workers=None):
-    """🆕 Parse PGN files with MTL and HISTORY support"""
-    script_dir = Path(__file__).parent.parent
-    data_path = script_dir / data_dir
-    preprocessing_dir = script_dir / "data" / "preprocessing"
+def process_pgn_files_smart(pgn_files, config):
+    """
+    🆕 Smart PGN processing with:
+    - Dataset tracking (avoid reprocessing)
+    - Auto-cleanup (remove intermediate files)
+    - Smart merging (reuse compatible datasets)
+    
+    Args:
+        pgn_files: List of PGN file paths
+        config: Configuration dictionary
+    
+    Returns:
+        Combined metadata dictionary
+    """
+    # Get directory where data.py is located (chess/src/)
+    # Go up one level to project root (chess/)
+    project_root = Path(__file__).parent.parent
+    
+    # Create preprocessing directory relative to project root
+    # Result: chess/data/preprocessing/
+    preprocessing_dir = project_root / config['paths']['data_dir'] / 'preprocessing'
     preprocessing_dir.mkdir(parents=True, exist_ok=True)
     
-    pgn_files = sorted(list(data_path.glob("*.pgn")))
+    # Initialize tracker
+    tracker = DatasetTracker(preprocessing_dir)
     
-    if not pgn_files:
-        raise FileNotFoundError(f"No PGN files found in {data_path}")
+    # List existing datasets
+    tracker.list_processed_datasets()
+    
+    # Check which files need processing
+    to_process = []
+    existing_binaries = []
+    existing_metadatas = []
     
     print(f"\n{'='*70}")
-    print(f"Found {len(pgn_files)} PGN file(s):")
-    for pgn in pgn_files:
-        size_mb = pgn.stat().st_size / (1024**2)
-        print(f"  • {pgn.name} ({size_mb:.1f} MB)")
+    print(f"🔍 Checking {len(pgn_files)} PGN files...")
     print(f"{'='*70}\n")
     
-    min_elo = config['data']['min_elo']
-    max_games = config['data']['max_games']
-    max_moves = config['data']['max_moves_per_game']
-    select_top = config['data'].get('select_top_games', True)
-    sort_by_elo = config['data'].get('sort_by_avg_elo', True)
-    
-    use_mtl = config['model'].get('use_multitask_learning', False)
-    history_positions = config['model'].get('history_positions', 0)
-    
-    # Cache filename
-    cache_suffix = f"_top{max_games}" if select_top else f"_first{max_games}"
-    mtl_suffix = "_mtl" if use_mtl else ""
-    history_suffix = f"_hist{history_positions}" if history_positions > 0 else ""
-    
-    binary_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}{mtl_suffix}{history_suffix}.bin"
-    metadata_file = preprocessing_dir / f"positions_elo{min_elo}{cache_suffix}_moves{max_moves}{mtl_suffix}{history_suffix}_meta.pkl"
-    
-    # Check cache
-    if binary_file.exists() and metadata_file.exists():
-        print(f"📦 Loading from cache: {binary_file.name}")
-        try:
-            with open(metadata_file, 'rb') as f:
-                metadata = pickle.load(f)
-            
-            if metadata['total_positions'] > 0:
-                size_mb = binary_file.stat().st_size / (1024**2)
-                print(f"✓ Loaded {metadata['total_positions']:,} positions ({size_mb:.1f} MB)")
-                print(f"  • MTL: {metadata.get('use_mtl', False)}")
-                print(f"  • History: {metadata.get('history_positions', 0)}")
-                print(f"  • Input planes: {metadata.get('input_planes', 12)}")
-                return metadata
-        except Exception as e:
-            print(f"⚠️ Failed to load cache: {e}")
-    
-    # Processing config
-    use_parallel = config['data'].get('parallel_pgn_processing', True)
-    max_parallel_workers = config['data'].get('max_workers', None) or len(pgn_files)
-    games_per_file = max_games // len(pgn_files) if len(pgn_files) > 1 else max_games
-    
-    # Calculate dimensions
-    base_size = 32 + (32 * history_positions) + 2 + 4
-    mtl_size = 12 if use_mtl else 0
-    position_size = base_size + mtl_size
-    input_planes = 12 * (1 + history_positions)  # 🆕 AUTO-CALCULATE
-    
-    print(f"🚀 Processing Configuration:")
-    print(f"  • Parallel: {use_parallel} (workers: {max_parallel_workers if use_parallel else 1})")
-    print(f"  • Strategy: {'TOP games by Elo' if select_top else 'FIRST games'}")
-    print(f"  • Min Elo: {min_elo}, Games/file: {games_per_file:,}")
-    print(f"  • 🆕 MTL: {use_mtl}")
-    print(f"  • 🆕 History: {history_positions} positions")
-    print(f"  • 🆕 Input planes: {input_planes} (12 × {1 + history_positions})")
-    print(f"  • Position size: {position_size} bytes\n")
-    
-    # Prepare tasks
-    tasks = []
-    temp_files = []
-    
-    for idx, pgn_file in enumerate(pgn_files):
-        temp_output = preprocessing_dir / f"temp_{idx}_{pgn_file.stem}.bin"
-        temp_files.append(temp_output)
-        tasks.append((pgn_file, temp_output, min_elo, games_per_file, max_moves,
-                     idx, select_top, sort_by_elo, use_mtl, history_positions))
-    
-    # Process files
-    results = []
-    total_positions = 0
-    
-    if use_parallel and len(pgn_files) > 1:
-        print(f"🚀 Processing {len(pgn_files)} files in parallel...\n")
+    for pgn_file in pgn_files:
+        binary_path, metadata_path = tracker.get_processed_dataset(pgn_file, config)
         
-        with ProcessPoolExecutor(max_workers=max_parallel_workers) as executor:
-            futures = [executor.submit(parse_single_pgn_file, task) for task in tasks]
-            pbar = tqdm(total=len(futures), desc="Processing")
-            
-            for future in as_completed(futures):
-                filename, count, output = future.result()
-                results.append((filename, count, output))
-                total_positions += count
-                pbar.update(1)
-            
-            pbar.close()
-    else:
-        print("Processing sequentially...\n")
-        for task in tasks:
-            filename, count, output = parse_single_pgn_file(task)
-            results.append((filename, count, output))
-            total_positions += count
+        if binary_path and metadata_path:
+            # Already processed!
+            existing_binaries.append(binary_path)
+            existing_metadatas.append(metadata_path)
+            print(f"✅ SKIP: {Path(pgn_file).name} (already processed)")
+        else:
+            # Needs processing
+            to_process.append(pgn_file)
+            print(f"🆕 PROCESS: {Path(pgn_file).name}")
     
-    # Summary
     print(f"\n{'='*70}")
-    print("Processing Summary:")
-    for filename, count, _ in sorted(results, key=lambda x: x[1], reverse=True):
-        print(f"  • {filename}: {count:,} positions")
-    print(f"{'='*70}")
-    print(f"Total: {total_positions:,} positions\n")
+    print(f"  • Already processed: {len(existing_binaries)} files")
+    print(f"  • Need processing: {len(to_process)} files")
+    print(f"{'='*70}\n")
     
-    if total_positions == 0:
-        print("⚠️ WARNING: No positions extracted!")
-        return {
-            'binary_file': str(binary_file), 
-            'total_positions': 0, 
-            'position_size': position_size,
-            'use_mtl': use_mtl,
-            'history_positions': history_positions,
-            'input_planes': input_planes
-        }
+    # Process new files
+    new_binaries = []
+    new_metadatas = []
     
-    # Merge temp files
-    if len(temp_files) > 1:
-        print("📦 Merging binary files...")
-        with open(binary_file, 'wb') as outfile:
-            for temp_file in tqdm(temp_files, desc="Merging"):
-                if temp_file.exists():
-                    with open(temp_file, 'rb') as infile:
-                        outfile.write(infile.read())
-                    temp_file.unlink()
+    if to_process:
+        print(f"\n{'='*70}")
+        print(f"⚙️  Processing {len(to_process)} new files...")
+        print(f"{'='*70}\n")
+        
+        for i, pgn_file in enumerate(to_process, 1):
+            print(f"\n[{i}/{len(to_process)}] Processing: {Path(pgn_file).name}")
+            print("="*70)
+            
+            # Generate output names
+            pgn_name = Path(pgn_file).stem
+            binary_file = preprocessing_dir / f"{pgn_name}.bin"
+            metadata_file = preprocessing_dir / f"{pgn_name}_meta.pkl"
+            
+            # PHASE 1: Extract games
+            print("\n📖 PHASE 1: Extracting games from PGN...")
+            games_data = extract_games_from_pgn_parallel(
+                pgn_file,
+                config['data']['max_games'],
+                config['data']['phase1_threads'],
+                sort_by_elo=config['data'].get('sort_by_avg_elo', True)
+            )
+            
+            if not games_data:
+                print(f"⚠️  No games extracted from {Path(pgn_file).name}, skipping...")
+                continue
+            
+            # PHASE 2: Extract positions
+            print(f"\n♟️  PHASE 2: Extracting positions...")
+            positions = extract_positions_parallel(
+                games_data,
+                config,
+                config['data']['phase2_threads']
+            )
+            
+            if not positions:
+                print(f"⚠️  No positions extracted, skipping...")
+                continue
+            
+            # PHASE 3: Write to disk
+            print(f"\n💾 PHASE 3: Writing to disk...")
+            total_positions = write_positions_to_disk(positions, binary_file)
+            
+            # Calculate position size
+            use_mtl = config['model'].get('use_multitask_learning', False)
+            history_pos = config['model'].get('history_positions', 0)
+            input_planes = 12 * (1 + history_pos)
+            
+            base_size = 32 + (32 * history_pos) + 2 + 4
+            position_size = base_size + (12 if use_mtl else 0)
+            
+            # Create metadata
+            metadata = {
+                'binary_file': str(binary_file),
+                'total_positions': total_positions,
+                'position_size': position_size,
+                'use_mtl': use_mtl,
+                'history_positions': history_pos,
+                'input_planes': input_planes
+            }
+            
+            with open(metadata_file, 'wb') as f:
+                pickle.dump(metadata, f)
+            
+            # PHASE 4: Cleanup intermediate data
+            print(f"\n♻️  PHASE 4: Cleanup...")
+            del games_data
+            del positions
+            gc.collect()
+            
+            # Register in tracker
+            tracker.register_dataset(pgn_file, config, binary_file, metadata_file, total_positions)
+            
+            new_binaries.append(binary_file)
+            new_metadatas.append(metadata_file)
+            
+            print(f"\n✅ Completed: {Path(pgn_file).name}")
+            print(f"   Positions: {total_positions:,}")
+            print(f"   Size: {binary_file.stat().st_size / (1024**2):.1f} MB")
+    
+    # Merge all datasets (existing + new)
+    all_binaries = existing_binaries + new_binaries
+    all_metadatas = existing_metadatas + new_metadatas
+    
+    if not all_binaries:
+        raise ValueError("No datasets to process!")
+    
+    if len(all_binaries) == 1:
+        # Single dataset, no merge needed
+        print(f"\n{'='*70}")
+        print(f"✅ Using single dataset (no merge needed)")
+        print(f"{'='*70}\n")
+        
+        with open(all_metadatas[0], 'rb') as f:
+            return pickle.load(f)
     else:
-        if temp_files[0].exists():
-            temp_files[0].rename(binary_file)
-    
-    # Save metadata
-    metadata = {
-        'binary_file': str(binary_file),
-        'total_positions': total_positions,
-        'position_size': position_size,
-        'use_mtl': use_mtl,
-        'history_positions': history_positions,
-        'input_planes': input_planes  # 🆕
-    }
-    
-    with open(metadata_file, 'wb') as f:
-        pickle.dump(metadata, f)
-    
-    final_size_mb = binary_file.stat().st_size / (1024**2)
-    compression = 100 * (1 - final_size_mb / (total_positions * 3072 / 1024**2))
-    
-    print(f"✓ File: {binary_file.name}")
-    print(f"✓ Size: {final_size_mb:.1f} MB (compression: {compression:.1f}%)")
-    print(f"✓ MTL: {use_mtl}, History: {history_positions}, Input planes: {input_planes}")
-    
-    return metadata
+        # Merge multiple datasets
+        final_binary = preprocessing_dir / "combined_dataset.bin"
+        final_metadata = preprocessing_dir / "combined_dataset_meta.pkl"
+        
+        combined_meta = merge_binary_datasets(
+            all_binaries,
+            all_metadatas,
+            final_binary,
+            final_metadata
+        )
+        
+        return combined_meta
 
+
+# ==============================================================================
+# DATASET AND DATALOADER (unchanged)
+# ==============================================================================
 
 class BinaryChessDataset(Dataset):
-    """🆕 Memory-mapped dataset with MTL and HISTORY support"""
+    """Memory-mapped dataset with MTL and HISTORY support"""
     
     def __init__(self, binary_file, indices, position_size=38, use_mtl=None, history_positions=0):
         self.binary_file = binary_file
@@ -758,7 +984,7 @@ class BinaryChessDataset(Dataset):
         compact_board = data[:32]
         current_offset = 32
         
-        # 🆕 Unpack history
+        # Unpack history
         history_size = 32 * self.history_positions
         if history_size > 0:
             history_bytes = data[current_offset:current_offset + history_size]
@@ -781,7 +1007,7 @@ class BinaryChessDataset(Dataset):
         # Convert current board
         board_tensor = compact_to_tensor(compact_board)
         
-        # 🆕 Stack history with current board
+        # Stack history with current board
         if history_tensors:
             # Stack: [oldest_history, ..., newest_history, current]
             # Shape: (12 * (history_positions + 1), 8, 8)
@@ -821,7 +1047,7 @@ class BinaryChessDataset(Dataset):
 
 
 def create_dataloaders(metadata, config):
-    """🆕 Create dataloaders with MTL and HISTORY support"""
+    """Create dataloaders with MTL and HISTORY support"""
     
     if metadata['total_positions'] == 0:
         raise ValueError("Cannot create dataloaders with 0 positions.")
@@ -836,7 +1062,8 @@ def create_dataloaders(metadata, config):
     train_indices = all_indices[:split_idx]
     val_indices = all_indices[split_idx:]
     
-    print(f"📊 Dataset split:")
+    print(f"\n{'='*70}")
+    print("📊 Dataset split:")
     print(f"  • Train: {len(train_indices):,} positions")
     print(f"  • Val: {len(val_indices):,} positions")
     
@@ -850,6 +1077,7 @@ def create_dataloaders(metadata, config):
     print(f"  • MTL: {use_mtl}")
     print(f"  • History: {history_positions} positions")
     print(f"  • Input planes: {input_planes}")
+    print(f"{'='*70}\n")
     
     # Create datasets
     train_dataset = BinaryChessDataset(
