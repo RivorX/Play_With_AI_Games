@@ -117,37 +117,6 @@ class CoordConv2d(nn.Module):
         return self.conv(x)
 
 
-class FactorizedConv2d(nn.Module):
-    """
-    🆕 v3.1: Factorized Convolution (3x3 -> 1x3 + 3x1)
-    
-    BENEFITS:
-    - 33% fewer parameters (6 vs 9 weights per filter)
-    - Slightly faster inference
-    - Comparable quality to standard 3x3
-    
-    TRADEOFFS:
-    - Less expressive than full 3x3
-    - Best for deeper networks where stacking compensates
-    
-    RECOMMENDED:
-    - Use in first few blocks (early layers benefit less from 3x3)
-    - Avoid in final blocks (need full expressiveness)
-    """
-    def __init__(self, in_channels, out_channels, padding=1, bias=False):
-        super().__init__()
-        # Factorize: 3x3 = 1x3 followed by 3x1
-        self.conv_h = nn.Conv2d(in_channels, out_channels, kernel_size=(1, 3), 
-                                padding=(0, padding), bias=False)
-        self.conv_v = nn.Conv2d(out_channels, out_channels, kernel_size=(3, 1), 
-                                padding=(padding, 0), bias=bias)
-    
-    def forward(self, x):
-        x = self.conv_h(x)
-        x = self.conv_v(x)
-        return x
-
-
 class LayerScale(nn.Module):
     """
     🆕 v3.1: LayerScale for better training stability
@@ -193,22 +162,33 @@ def drop_path(x, drop_prob: float = 0., training: bool = False):
 
 
 class ResidualBlock(nn.Module):
-    """Residual block with advanced features"""
+    """
+    🆕 v4.0: Pre-activation Residual Block
+    
+    ARCHITECTURE:
+    - POST-ACTIVATION (standard):  x -> Conv -> BN -> ReLU -> Conv -> BN -> (+x) -> ReLU
+    - PRE-ACTIVATION (v4.0):       x -> BN -> ReLU -> Conv -> BN -> ReLU -> Conv -> (+x)
+    
+    BENEFITS OF PRE-ACTIVATION:
+    ✅ Better gradient flow (no ReLU after addition)
+    ✅ More stable training for deep networks
+    ✅ Easier to train 20+ layer networks
+    ✅ Identity mapping is cleaner
+    
+    PAPER: "Identity Mappings in Deep Residual Networks" (He et al. 2016)
+    """
     def __init__(self, filters, use_se=True, use_se2d=False, use_spatial=True, 
                  drop_path_rate=0.0, use_layer_scale=False, layer_scale_init=1e-5,
-                 use_factorized=False):
+                 use_preactivation=True):
         super().__init__()
         
-        # Choose convolution type
-        if use_factorized:
-            self.conv1 = FactorizedConv2d(filters, filters, padding=1, bias=False)
-            self.conv2 = FactorizedConv2d(filters, filters, padding=1, bias=False)
-        else:
-            self.conv1 = nn.Conv2d(filters, filters, kernel_size=3, padding=1, bias=False)
-            self.conv2 = nn.Conv2d(filters, filters, kernel_size=3, padding=1, bias=False)
+        self.use_preactivation = use_preactivation
         
+        # BN + Conv layers
         self.bn1 = nn.BatchNorm2d(filters)
+        self.conv1 = nn.Conv2d(filters, filters, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(filters)
+        self.conv2 = nn.Conv2d(filters, filters, kernel_size=3, padding=1, bias=False)
         
         # Choose SE variant
         self.use_se = use_se
@@ -228,35 +208,69 @@ class ResidualBlock(nn.Module):
         self.use_layer_scale = use_layer_scale
         if use_layer_scale:
             self.layer_scale = LayerScale(filters, init_value=layer_scale_init)
-        
+    
     def forward(self, x):
-        residual = x
+        if self.use_preactivation:
+            # 🆕 PRE-ACTIVATION PATH: BN -> ReLU -> Conv -> BN -> ReLU -> Conv
+            residual = x
+            
+            # First conv path: BN -> ReLU -> Conv
+            out = self.bn1(x)
+            out = F.relu(out, inplace=True)
+            out = self.conv1(out)
+            
+            # Second conv path: BN -> ReLU -> Conv
+            out = self.bn2(out)
+            out = F.relu(out, inplace=True)
+            out = self.conv2(out)
+            
+            # Attention blocks (after convs)
+            if self.use_se2d:
+                out = self.se(out)
+            elif self.use_se:
+                out = self.se(out)
+            
+            if self.use_spatial:
+                out = self.spatial(out)
+            
+            if self.use_layer_scale:
+                out = self.layer_scale(out)
+            
+            if self.drop_path_rate > 0:
+                out = drop_path(out, self.drop_path_rate, self.training)
+            
+            # ✅ Clean identity mapping (no activation after addition!)
+            return residual + out
         
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = F.relu(out, inplace=True)
-        
-        out = self.conv2(out)
-        out = self.bn2(out)
-        
-        if self.use_se2d:
-            out = self.se(out)
-        elif self.use_se:
-            out = self.se(out)
-        
-        if self.use_spatial:
-            out = self.spatial(out)
-        
-        if self.use_layer_scale:
-            out = self.layer_scale(out)
-        
-        if self.drop_path_rate > 0:
-            out = drop_path(out, self.drop_path_rate, self.training)
-        
-        out = out + residual
-        out = F.relu(out, inplace=True)
-        
-        return out
+        else:
+            # POST-ACTIVATION PATH (standard ResNet): Conv -> BN -> ReLU -> Conv -> BN
+            residual = x
+            
+            out = self.conv1(x)
+            out = self.bn1(out)
+            out = F.relu(out, inplace=True)
+            
+            out = self.conv2(out)
+            out = self.bn2(out)
+            
+            if self.use_se2d:
+                out = self.se(out)
+            elif self.use_se:
+                out = self.se(out)
+            
+            if self.use_spatial:
+                out = self.spatial(out)
+            
+            if self.use_layer_scale:
+                out = self.layer_scale(out)
+            
+            if self.drop_path_rate > 0:
+                out = drop_path(out, self.drop_path_rate, self.training)
+            
+            out = out + residual
+            out = F.relu(out, inplace=True)
+            
+            return out
 
 
 class AdaptivePolicyPool(nn.Module):
@@ -305,11 +319,13 @@ class AdaptivePolicyPool(nn.Module):
 
 class ChessNet(nn.Module):
     """
-    🆕 Chess Neural Network v3.1 with AUTO input_planes
+    🆕 Chess Neural Network v4.0 with Pre-activation ResNet
     
-    CHANGES:
+    CHANGES from v3.1:
+    - 🆕 Pre-activation ResNet blocks (BN->ReLU->Conv instead of Conv->BN->ReLU)
+    - ✅ Better gradient flow for deeper networks
+    - ✅ More stable training
     - ✅ Automatically calculates input_planes from history_positions
-    - ✅ No need to specify input_planes in config
     - ✅ Formula: input_planes = 12 * (1 + history_positions)
     """
     def __init__(self, config, input_planes=None):
@@ -332,8 +348,10 @@ class ChessNet(nn.Module):
         
         use_layer_scale = config['model'].get('use_layer_scale', True)
         layer_scale_init = config['model'].get('layer_scale_init', 1e-5)
-        use_factorized = config['model'].get('use_factorized_conv', False)
         use_adaptive_policy = config['model'].get('use_adaptive_policy_pool', True)
+        
+        # 🆕 v4.0: Pre-activation ResNet
+        use_preactivation = config['model'].get('use_preactivation', True)
         
         spatial_attention_mode = config['model'].get('spatial_attention_mode', 'last_2')
         
@@ -351,7 +369,7 @@ class ChessNet(nn.Module):
         self.input_planes = input_planes
         self.history_positions = history_positions
         
-        print(f"🧠 ULTRA-OPTIMIZED Model v3.1:")
+        print(f"🧠 ULTRA-OPTIMIZED Model v4.0 (Pre-activation ResNet):")
         print(f"  • 🆕 History positions: {history_positions}")
         print(f"  • 🆕 Input planes: {input_planes} (12 × {1 + history_positions})")
         print(f"  • ✅ SE-Block: Mixed pooling (avg+max)")
@@ -369,10 +387,13 @@ class ChessNet(nn.Module):
         if use_layer_scale:
             print(f"  • 🆕 LayerScale: ENABLED (init={layer_scale_init})")
         
-        if use_factorized:
-            print(f"  • 🆕 FactorizedConv: ENABLED (-33% params)")
+        # 🆕 v4.0: Pre-activation
+        if use_preactivation:
+            print(f"  • 🆕 Pre-activation ResNet: ENABLED (better gradients)")
         else:
-            print(f"  • ✅ FactorizedConv: DISABLED (using standard 3x3)")
+            print(f"  • ✅ Post-activation ResNet: Standard mode")
+        
+        print(f"  • ✅ Standard 3x3 Conv: ENABLED (preserves spatial info for chess)")
         
         if use_adaptive_policy:
             print(f"  • 🆕 AdaptivePolicyPool: ENABLED (+2-3% accuracy)")
@@ -418,7 +439,7 @@ class ChessNet(nn.Module):
                     drop_path_rate=dpr[i],
                     use_layer_scale=use_layer_scale,
                     layer_scale_init=layer_scale_init,
-                    use_factorized=use_factorized
+                    use_preactivation=use_preactivation
                 )
             )
         self.residual_tower = nn.Sequential(*blocks)

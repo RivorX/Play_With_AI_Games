@@ -1,9 +1,9 @@
 # ==============================================================================
-# CHESS AI CONFIGURATION - OPTIMIZED FOR RTX 5060Ti 16GB v3.1-Fast
+# CHESS AI CONFIGURATION - OPTIMIZED FOR RTX 5060Ti 16GB v4.1
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# FILE PATHS
+# FILE PATHS (relative to chess/ project root)
 # ------------------------------------------------------------------------------
 paths:
   data_dir: "data"
@@ -20,11 +20,11 @@ paths:
 
 
 # ------------------------------------------------------------------------------
-# DATA PROCESSING
+# DATA PROCESSING - 🆕 v4.1 SMART MANAGEMENT
 # ------------------------------------------------------------------------------
 data:
-  min_elo: 1800              # Minimum Elo rating for games (lowered for more data)
-  max_games: 100000          # Top N games to use (sorted by avg Elo, best first)
+  min_elo: 2000              # Minimum Elo rating for games
+  max_games: 100000          # Top N games to use per PGN file
   train_split: 0.9           # Train/validation split ratio
   max_moves_per_game: 200    # Skip longer games
   
@@ -32,9 +32,33 @@ data:
   select_top_games: true     # Sort by Elo and take top max_games (higher quality)
   sort_by_avg_elo: true      # Sort by average Elo of both players
   
-  # Parallel processing (one process per PGN file)
-  parallel_pgn_processing: true   # Process multiple PGN files in parallel
-  max_workers: null               # null = auto-detect CPU count, or set manually
+  # 4-PHASE PROCESSING (LOW RAM MODE)
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 1: PGN extraction (multi-processing, TRUE parallelism)
+  # PHASE 2: Position extraction (multi-processing, TRUE parallelism)
+  # PHASE 3: Disk writing (single-threaded I/O)
+  # PHASE 4: Cleanup (🆕 automatic cleanup + tracking)
+  # ═══════════════════════════════════════════════════════════════════════════
+  
+  files_at_once: 1           # How many PGN files to process simultaneously
+                             # 1 = SEQUENTIAL (minimal RAM, most stable)
+                             # 2-4 = BATCH (more RAM, faster)
+                             # ⚠️ Set to 1 if you have RAM issues!
+  
+  phase1_threads: 11          # 🆕 PROCESSES for PGN parsing (Phase 1)
+                             # PHASE 1: Multi-processing (bypasses GIL!)
+                             # ✅ TRUE parallelism - each process has own Python interpreter
+                             # ✅ Real CPU utilization - you'll see all cores working!
+                             # Recommended: 4-8 processes (2-4x speedup)
+                             # Set to 1 to disable multi-processing
+  
+  phase2_threads: 11          # 🆕 PROCESSES for position extraction (Phase 2)
+                             # PHASE 2: Multi-processing (bypasses GIL!)
+                             # ✅ TRUE parallelism for CPU-bound position processing
+                             # ✅ Real CPU utilization - all cores working!
+                             # Recommended: 8-16 processes (2-4x speedup)
+                             # More processes = faster, but more RAM per file
+                             # Set to 1 to disable multi-processing
 
 
 # ------------------------------------------------------------------------------
@@ -51,9 +75,9 @@ model:
 
   history_positions: 4       # Number of previous positions to include
   
-  # Advanced features (minimal params, significant quality gains)
-  use_se_blocks: true           # 🧠 Channel attention (with mixed pooling v3.1)
-  use_se2d_blocks: true         # 🆕 v3.1: SE-Net v2 with spatial info (+0.5-1%, +5% time)
+  # Advanced features
+  use_se_blocks: true           # 🧠 Channel attention (with mixed pooling)
+  use_se2d_blocks: true         # 🆕 SE-Net v2 with spatial info (+0.5-1%, +5% time)
   use_spatial_attention: true   # 👁️ Spatial attention
   spatial_attention_mode: 'last_2' # 'all', 'last_2', 'last_3', 'none'
   
@@ -65,8 +89,10 @@ model:
   use_layer_scale: true         # LayerScale for better training stability (+0% params)
   layer_scale_init: 1e-5        # Initial LayerScale value (1e-6 to 1e-4)
   
-  use_factorized_conv: true     # Factorized 3x3 convs (1x3 + 3x1, -30% params, ~same quality)
   use_adaptive_policy_pool: true # Adaptive pooling in policy head (+2-3% accuracy, 0% params)
+  
+  # 🆕 v4.0: Pre-activation ResNet
+  use_preactivation: true       # Pre-activation residual blocks (better gradients)
 
   # Multi-Task Learning
   use_multitask_learning: true        # Enable auxiliary tasks
@@ -92,7 +118,7 @@ imitation_learning:
   
   # Loss weights
   policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 0.5     # Value loss weight
+  value_loss_weight: 0.5     # Value loss weight (WDL or MSE)
   
   # Evaluation & checkpointing
   eval_every: 1              # Evaluate every N epochs
@@ -179,7 +205,7 @@ logging:
 # 🆕 DEBUG & PROFILING
 # ------------------------------------------------------------------------------
 debug:
-  enabled: false                    # Master switch for debug mode
+  enabled: true                    # Master switch for debug mode
   profile_training: true           # Time breakdown per epoch
   log_gpu_memory: false             # GPU memory usage
   profile_every_n_epochs: 1         # Profile frequency (if enabled)
