@@ -1,3 +1,11 @@
+"""
+MCTS (Monte Carlo Tree Search) - v4.2
+🆕 UPDATED: Compatible with POV + Dynamic Sliding Window
+- 🎯 POV: Automatic perspective handling
+- 🔄 History: Proper history tracking and assembly
+- 🚀 Batch evaluation with history support
+"""
+
 import chess
 import numpy as np
 import math
@@ -51,6 +59,7 @@ class BatchMCTS:
     - Tree reuse between moves
     - Virtual loss for parallel search
     - Efficient batch evaluation
+    - 🆕 v4.2: History support with POV
     """
     
     def __init__(self, model, config, device):
@@ -60,13 +69,68 @@ class BatchMCTS:
         self.c_puct = config['reinforcement_learning']['mcts_c_puct']
         self.eval_batch_size = config['reinforcement_learning'].get('mcts_batch_size', 32)
         
+        # 🆕 v4.2: History configuration
+        self.history_positions = config['model'].get('history_positions', 0)
+        
         # 🚀 Tree reuse
         self.root = None
         self.reuse_tree = config['reinforcement_learning'].get('mcts_reuse_tree', True)
+        
+        # 🆕 v4.2: Board history tracking
+        # Store list of boards leading to current position
+        self.board_history = []
+    
+    def _build_history_tensor(self, current_board):
+        """
+        🆕 v4.2: Build tensor with history using POV-aware board_to_tensor
+        
+        Similar to play.py, but uses self.board_history
+        
+        Args:
+            current_board: chess.Board for current position
+        
+        Returns:
+            numpy array: (input_planes, 8, 8) tensor
+        """
+        if self.history_positions == 0:
+            # No history - just current board
+            return board_to_tensor(current_board)
+        
+        # Build history list
+        history_boards = []
+        
+        # Get last N boards from history
+        if self.board_history:
+            history_boards = self.board_history[-self.history_positions:]
+        
+        # Pad with empty boards if not enough history
+        while len(history_boards) < self.history_positions:
+            history_boards.insert(0, chess.Board())  # Empty board at start
+        
+        # Convert all boards to tensors with POV
+        tensors = []
+        
+        # Add history boards (oldest to newest)
+        for hist_board in history_boards:
+            # All history from CURRENT player's perspective
+            hist_tensor = board_to_tensor(
+                hist_board,
+                flip_perspective=(current_board.turn == chess.BLACK)
+            )
+            tensors.append(hist_tensor)
+        
+        # Add current board
+        current_tensor = board_to_tensor(current_board)
+        tensors.append(current_tensor)
+        
+        # Stack: [oldest_history, ..., newest_history, current]
+        # Shape: (12 * (history_positions + 1), 8, 8)
+        return np.concatenate(tensors, axis=0)
     
     def search(self, board, num_simulations, temperature=1.0):
         """
         Run MCTS with tree reuse and batch evaluation
+        🆕 v4.2: Now with history support
         """
         # 🚀 Tree reuse: if root exists and matches board, reuse it
         if self.reuse_tree and self.root is not None:
@@ -146,7 +210,9 @@ class BatchMCTS:
         return q_value + u_value
     
     def _batch_expand_and_evaluate(self, nodes, add_noise=False):
-        """Batch expansion and evaluation"""
+        """
+        🆕 v4.2: Batch expansion and evaluation with history support
+        """
         terminal_values = []
         non_terminal_indices = []
         non_terminal_nodes = []
@@ -168,15 +234,15 @@ class BatchMCTS:
         all_values = [None] * len(nodes)
         
         if non_terminal_nodes:
-            # Stack tensors
+            # 🆕 v4.2: Stack tensors WITH HISTORY
             board_tensors = torch.stack([
-                torch.FloatTensor(board_to_tensor(node.board))
+                torch.FloatTensor(self._build_history_tensor(node.board))
                 for node in non_terminal_nodes
             ]).to(self.device)
             
             # Single GPU call
             with torch.no_grad():
-                policy_logits_batch, values_batch = self.model(board_tensors)
+                policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
             
             # Process results
             for idx, node in enumerate(non_terminal_nodes):
@@ -187,7 +253,7 @@ class BatchMCTS:
                 policy = np.zeros(4096)
                 
                 for move in legal_moves:
-                    move_idx = move_to_index(move)
+                    move_idx = move_to_index(move, node.board)  # 🆕 v4.2: Pass board for POV
                     policy[move_idx] = np.exp(policy_logits[move_idx])
                 
                 policy = policy / (policy.sum() + 1e-8)
@@ -199,12 +265,12 @@ class BatchMCTS:
                     noise = np.random.dirichlet([alpha] * len(legal_moves))
                     
                     for i, move in enumerate(legal_moves):
-                        move_idx = move_to_index(move)
+                        move_idx = move_to_index(move, node.board)  # 🆕 v4.2: Pass board for POV
                         policy[move_idx] = (1 - weight) * policy[move_idx] + weight * noise[i]
                 
                 # Create children
                 for move in legal_moves:
-                    move_idx = move_to_index(move)
+                    move_idx = move_to_index(move, node.board)  # 🆕 v4.2: Pass board for POV
                     child_board = node.board.copy()
                     child_board.push(move)
                     node.children[move] = MCTSNode(
@@ -229,9 +295,25 @@ class BatchMCTS:
             node.visit_count += 1
             value = -value
     
+    def update_history(self, board):
+        """
+        🆕 v4.2: Update board history after a move
+        Call this from play.py after each move
+        
+        Args:
+            board: chess.Board that was just played
+        """
+        self.board_history.append(board.copy())
+        
+        # Keep only last N positions needed for history
+        max_history = self.history_positions + 10  # Keep a few extra for safety
+        if len(self.board_history) > max_history:
+            self.board_history = self.board_history[-max_history:]
+    
     def reset_tree(self):
         """Reset tree (call after game ends)"""
         self.root = None
+        self.board_history = []  # 🆕 v4.2: Also reset history
 
 
 def select_move_by_visits(visit_counts, temperature=1.0):
