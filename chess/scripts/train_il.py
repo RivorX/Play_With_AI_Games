@@ -1,6 +1,9 @@
 """
-Imitation Learning Training Script with History Support and Profiling
-🆕 UPDATED: Compatible with multi-phase data processing
+Imitation Learning Training Script - v4.2
+🆕 UPDATED: Compatible with POV + Dynamic Sliding Window
+- 🎯 POV: All boards from current player's perspective
+- 🔄 Sliding Window: Dynamic history assembly at load time
+- 🎮 GameID tracking: Efficient history reconstruction
 """
 
 import torch
@@ -16,7 +19,7 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet, save_checkpoint
-from src.data import process_pgn_files_smart, create_dataloaders
+from src.data import process_pgn_files, create_dataloaders
 
 # Import from utils
 from utils import TrainingLogger, train_epoch_il, evaluate_il
@@ -73,9 +76,23 @@ def main():
     logs_dir.mkdir(parents=True, exist_ok=True)
     il_dir.mkdir(parents=True, exist_ok=True)
     
-    # Check if MTL and History are enabled
+    # Get configuration
     use_mtl = config['model'].get('use_multitask_learning', False)
     history_positions = config['model'].get('history_positions', 0)
+    stride = config['data'].get('sliding_window_stride', 1)
+    
+    # 🆕 Calculate expected input planes (dynamic)
+    expected_input_planes = 12 * (1 + history_positions)
+    
+    print("\n" + "="*70)
+    print("🆕 v4.2 POV + DYNAMIC SLIDING WINDOW")
+    print("="*70)
+    print(f"  • POV: Boards from current player's perspective")
+    print(f"  • History positions: {history_positions} (assembled dynamically)")
+    print(f"  • Sliding window stride: {stride}x")
+    print(f"  • Expected input planes: {expected_input_planes} (12 × {1 + history_positions})")
+    print(f"  • MTL enabled: {use_mtl}")
+    print("="*70 + "\n")
     
     # Setup debug logging
     debug_enabled = config.get('debug', {}).get('enabled', False)
@@ -100,33 +117,35 @@ def main():
         
         with open(debug_log_file, 'w', encoding='utf-8') as f:
             f.write("="*70 + "\n")
-            f.write("🐛 TRAINING DEBUG LOG\n")
+            f.write("🐛 TRAINING DEBUG LOG - v4.2 POV + Sliding Window\n")
             f.write("="*70 + "\n")
             f.write(f"Timestamp: {timestamp}\n")
             f.write(f"Model: {config['model']['filters']} filters, {config['model']['num_residual_blocks']} blocks\n")
             f.write(f"Batch size: {config['imitation_learning']['batch_size']}\n")
             f.write(f"Learning rate: {config['imitation_learning']['learning_rate']}\n")
-            f.write(f"History positions: {history_positions}\n")
+            f.write(f"History positions: {history_positions} (dynamic)\n")
+            f.write(f"Sliding window stride: {stride}x\n")
+            f.write(f"Input planes: {expected_input_planes}\n")
             f.write(f"MTL enabled: {use_mtl}\n")
+            f.write(f"POV enabled: True\n")
             f.write("="*70 + "\n\n")
     
     # Initialize logger
     logger = TrainingLogger(
         logs_dir, 
-        experiment_name="il_training", 
+        experiment_name="il_training_v4.2", 
         mode="il",
         use_mtl=use_mtl
     )
     
-    # Load data with multi-phase processing (v4.1 smart tracking)
-    print("\n=== Loading data (v4.1 smart processing with tracking) ===")
+    # Load data with multi-phase processing
+    print("\n=== Loading data (v4.2 POV + Sliding Window) ===")
     print(f"Mode: {'SEQUENTIAL' if config['data']['files_at_once'] == 1 else 'BATCH'}")
     print(f"Files at once: {config['data']['files_at_once']}")
     print(f"Phase 1 workers: {config['data'].get('phase1_threads', 1)}")
     print(f"Phase 2 workers: {config['data'].get('phase2_threads', 1)}")
     
-    # Find PGN files (relative to script location)
-    # script_dir.parent gives us chess/, then we add data_dir from config
+    # Find PGN files
     data_dir = script_dir.parent / config['paths']['data_dir']
     pgn_files = sorted(data_dir.glob('*.pgn'))
     
@@ -137,36 +156,67 @@ def main():
     for pgn in pgn_files:
         print(f"  • {pgn.name}")
     
-    # Process with smart tracking (v4.1)
-    metadata = process_pgn_files_smart(pgn_files, config)
+    # 🔧 FIX: Convert relative paths in config to absolute paths
+    # This ensures data/preprocessing is created in chess/data/ regardless of where script is called from
+    config_with_absolute_paths = config.copy()
+    config_with_absolute_paths['paths'] = config['paths'].copy()
+    config_with_absolute_paths['paths']['data_dir'] = str(data_dir.absolute())
+    
+    # Process with smart tracking
+    metadata = process_pgn_files(pgn_files, config_with_absolute_paths)
     
     print(f"\n✅ Data loaded successfully!")
-    print(f"Total positions: {metadata['total_positions']:,}")
-    print(f"Input planes (from data): {metadata.get('input_planes', 12)}")
+    print(f"Total positions (before stride): {metadata['total_positions']:,}")
     
-    # Verify input_planes matches model config
-    expected_input_planes = 12 * (1 + history_positions)
-    actual_input_planes = metadata.get('input_planes', 12)
+    # 🆕 v4.2: Verify binary format compatibility
+    # The binary file should have position_size without embedded history
+    actual_position_size = metadata.get('position_size')
+    expected_position_size = 40 if not use_mtl else 52  # Base size with GameID + MoveIdx
     
-    if expected_input_planes != actual_input_planes:
-        print(f"\n⚠️ WARNING: Input planes mismatch!")
-        print(f"  • Expected (from config): {expected_input_planes}")
-        print(f"  • Actual (from data): {actual_input_planes}")
-        print(f"  • This usually means data was preprocessed with different history_positions")
-        print(f"  • Please delete cache and reprocess data, or adjust history_positions in config")
-        raise ValueError("Input planes mismatch between model config and preprocessed data")
+    if actual_position_size != expected_position_size:
+        print(f"\n⚠️ WARNING: Position size mismatch!")
+        print(f"  • Expected: {expected_position_size} bytes")
+        print(f"  • Actual: {actual_position_size} bytes")
+        print(f"  • This may indicate the data was preprocessed with a different MTL setting")
+        
+        # Try to determine if it's just a MTL mismatch
+        if actual_position_size == 40 and use_mtl:
+            print(f"  ❌ Data was processed WITHOUT MTL, but config has use_multitask_learning=True")
+            print(f"     Please either:")
+            print(f"     1. Set use_multitask_learning=False in config.yaml, OR")
+            print(f"     2. Delete cache and reprocess data with MTL enabled")
+            raise ValueError("MTL mismatch between data and config")
+        elif actual_position_size == 52 and not use_mtl:
+            print(f"  ❌ Data was processed WITH MTL, but config has use_multitask_learning=False")
+            print(f"     Please either:")
+            print(f"     1. Set use_multitask_learning=True in config.yaml, OR")
+            print(f"     2. Delete cache and reprocess data without MTL")
+            raise ValueError("MTL mismatch between data and config")
+        else:
+            print(f"  ❌ Unknown format mismatch - please delete cache and reprocess")
+            raise ValueError("Position size mismatch")
     
-    # Create dataloaders
+    print(f"Position size: {actual_position_size} bytes ✓")
+    print(f"Format: {'WITH' if use_mtl else 'WITHOUT'} Multi-Task Learning ✓")
+    print(f"POV: Enabled (boards from current player's perspective) ✓")
+    print(f"Sliding Window: Dynamic (history assembled at load time) ✓")
+    
+    # Create dataloaders (they will apply sliding window and build history dynamically)
     train_loader, val_loader = create_dataloaders(metadata, config)
     
-    # Create model
+    # Create model with correct input planes
     print("\n=== Creating model ===")
+    print(f"Input planes: {expected_input_planes}")
+    print(f"Architecture: {config['model']['num_residual_blocks']} blocks, {config['model']['filters']} filters")
+    
     model = ChessNet(config).to(device)
     model = model.to(memory_format=torch.channels_last)
     print("✓ Model converted to channels_last memory format")
     
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {total_params:,}")
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
     
     # Optimizer
     optimizer = optim.AdamW(
@@ -205,11 +255,14 @@ def main():
     # Training loop
     print("\n=== Starting training ===")
     print("💾 Saving strategy: NO optimizer state (minimal file size)")
-    print("📊 NEW: Tracking Policy Accuracy (Top-1, Top-3) and Value MAE")
+    print("📊 Tracking: Policy Accuracy (Top-1, Top-3) and Value MAE")
     
     if history_positions > 0:
-        print(f"📜 History: {history_positions} previous positions included")
+        print(f"📜 History: {history_positions} positions (assembled dynamically with sliding window)")
         print(f"🔢 Input planes: {expected_input_planes}")
+    
+    if stride > 1:
+        print(f"⚡ Sliding window stride: {stride}x (sampling every {stride} positions)")
     
     if debug_enabled:
         print("🐛 Debug mode active - profiling enabled")
@@ -298,7 +351,10 @@ def main():
                         'use_bfloat16': use_bfloat16,
                         'use_mtl': use_mtl,
                         'history_positions': history_positions,
-                        'input_planes': expected_input_planes
+                        'input_planes': expected_input_planes,
+                        'sliding_window_stride': stride,
+                        'pov_enabled': True,  # 🆕 v4.2
+                        'version': 'v4.2'     # 🆕 Track version
                     },
                     save_optimizer=False
                 )
@@ -347,7 +403,10 @@ def main():
                     'val_value_mae': val_metrics['value_mae'],
                     'use_mtl': use_mtl,
                     'history_positions': history_positions,
-                    'input_planes': expected_input_planes
+                    'input_planes': expected_input_planes,
+                    'sliding_window_stride': stride,
+                    'pov_enabled': True,  # 🆕 v4.2
+                    'version': 'v4.2'     # 🆕 Track version
                 },
                 save_optimizer=False
             )
@@ -374,6 +433,17 @@ def main():
     print(f"Logs: {logs_dir}")
     if debug_log_file:
         print(f"Debug log: {debug_log_file}")
+    
+    print("\n" + "="*70)
+    print("🆕 v4.2 Features Used:")
+    print("="*70)
+    print(f"  ✓ POV (Point of View) - boards from current player's perspective")
+    print(f"  ✓ Dynamic Sliding Window - history assembled at load time")
+    print(f"  ✓ GameID tracking - efficient history reconstruction")
+    print(f"  ✓ Stride {stride}x - sampled every {stride} positions")
+    if use_mtl:
+        print(f"  ✓ Multi-Task Learning - win, material, check predictions")
+    print("="*70)
 
 
 if __name__ == "__main__":

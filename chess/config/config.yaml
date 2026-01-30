@@ -1,5 +1,6 @@
 # ==============================================================================
-# CHESS AI CONFIGURATION - OPTIMIZED FOR RTX 5060Ti 16GB v4.1
+# CHESS AI CONFIGURATION - OPTIMIZED FOR RTX 5060Ti 16GB v4.2
+# 🆕 POV (Point of View) + Dynamic Sliding Window Support
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -20,7 +21,7 @@ paths:
 
 
 # ------------------------------------------------------------------------------
-# DATA PROCESSING - 🆕 v4.1 SMART MANAGEMENT
+# DATA PROCESSING - 🆕 v4.2 POV + SLIDING WINDOW
 # ------------------------------------------------------------------------------
 data:
   min_elo: 2000              # Minimum Elo rating for games
@@ -31,6 +32,19 @@ data:
   # Quality filtering
   select_top_games: true     # Sort by Elo and take top max_games (higher quality)
   sort_by_avg_elo: true      # Sort by average Elo of both players
+  
+  # 🆕 SLIDING WINDOW CONFIGURATION
+  # ═══════════════════════════════════════════════════════════════════════════
+  # The sliding window system allows dynamic history assembly at load time
+  # instead of storing redundant history data in binary files.
+  # ═══════════════════════════════════════════════════════════════════════════
+  
+  sliding_window_stride: 2   # 🆕 Sample every Nth position (1 = all, 2 = every other, etc.)
+                             # - stride=1: All positions (~100% data, slower training)
+                             # - stride=2: Every other position (~50% data, 2x faster) ⭐ RECOMMENDED
+                             # - stride=3: Every 3rd position (~33% data, 3x faster)
+                             # Higher stride = less data but faster iterations
+                             # Note: History is still built dynamically from ALL positions
   
   # 4-PHASE PROCESSING (LOW RAM MODE)
   # ═══════════════════════════════════════════════════════════════════════════
@@ -73,7 +87,17 @@ model:
   value_hidden_dim: 256      # Value head hidden dimension
   dropout: 0.3               # Dropout rate
 
-  history_positions: 4       # Number of previous positions to include
+  # 🆕 DYNAMIC HISTORY CONFIGURATION
+  # ═══════════════════════════════════════════════════════════════════════════
+  # History is now assembled DYNAMICALLY at load time using mmap and GameID tracking
+  # This eliminates redundant storage and enables flexible history depths
+  # ═══════════════════════════════════════════════════════════════════════════
+  history_positions: 4       # Number of previous positions to include (dynamic)
+                             # - 0: Current position only (12 planes)
+                             # - 1: Current + 1 previous (24 planes)
+                             # - 4: Current + 4 previous (60 planes) ⭐ RECOMMENDED
+                             # - 8: Current + 8 previous (108 planes)
+                             # History is built by walking backwards through mmap using GameID
   
   # Advanced features
   use_se_blocks: true           # 🧠 Channel attention (with mixed pooling)

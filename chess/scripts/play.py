@@ -1,10 +1,10 @@
 """
-Chess GUI Game Interface (WITH MCTS TOGGLE)
-
-🆕 CHANGES:
-- Added --no-mcts flag to disable MCTS
-- Network-only mode for faster testing
-- Fixed history handling for both modes
+Chess GUI Game Interface - v4.2
+🆕 UPDATED: Compatible with POV + Dynamic Sliding Window
+- 🎯 POV: Automatic perspective handling
+- 🔄 Sliding Window: Correct history assembly
+- 🎮 MCTS toggle: --no-mcts flag for network-only mode
+- ✅ Fixed imports for v4.2
 """
 
 import torch
@@ -21,7 +21,9 @@ sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet
 from src.mcts import MCTS, select_move_by_visits
-from src.data import board_to_tensor
+
+# 🆕 v4.2: Import board_to_tensor from data_helpers
+from src.utils.data_helpers import board_to_tensor
 
 # Import from utils
 from utils.gui_helpers import create_piece_surfaces, load_model_from_checkpoint, select_models
@@ -49,7 +51,7 @@ TEXT_COLOR = (255, 255, 255)
 
 
 class ChessGUI:
-    """Chess game GUI with support for multiple game modes and MCTS toggle"""
+    """Chess game GUI with support for multiple game modes and MCTS toggle - v4.2"""
     
     def __init__(self, model1, model2, config, device, game_mode="human_vs_ai", enable_mcts=True):
         self.model1 = model1  # White AI or main AI
@@ -76,7 +78,7 @@ class ChessGUI:
             self.mcts2 = None
         
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-        pygame.display.set_caption("Chess AI")
+        pygame.display.set_caption("Chess AI v4.2")
         self.clock = pygame.time.Clock()
         
         # Load piece images
@@ -96,8 +98,9 @@ class ChessGUI:
         self.game_over = False
         self.move_history = []
         
-        # 🆕 Board history for neural network input
-        self.board_history = []  # List of chess.Board objects
+        # 🆕 v4.2: Board history for neural network input
+        # Store chess.Board objects (not tensors) for history
+        self.board_history = []
         
         # Flip board for black
         self.flipped = False
@@ -209,7 +212,7 @@ class ChessGUI:
         y = 20
         
         # Title
-        title = self.text_font.render("Chess AI", True, TEXT_COLOR)
+        title = self.text_font.render("Chess AI v4.2", True, TEXT_COLOR)
         self.screen.blit(title, (x_start + 20, y))
         y += 50
         
@@ -375,6 +378,12 @@ class ChessGUI:
                     # 🆕 Save current board to history before making move
                     self.board_history.append(self.board.copy())
                     
+                    # 🆕 v4.2: Update MCTS history too
+                    if self.mcts1:
+                        self.mcts1.update_history(self.board)
+                    if self.mcts2:
+                        self.mcts2.update_history(self.board)
+                    
                     self.board.push(move)
                     self.move_history.append(move)
                     self.selected_square = None
@@ -392,26 +401,64 @@ class ChessGUI:
             self.selected_square = None
             self.legal_moves = []
     
+    def _build_history_tensor(self, current_board):
+        """
+        🆕 v4.2: Build tensor with history using POV-aware board_to_tensor
+        
+        The board_to_tensor function from data_helpers automatically handles:
+        - POV (perspective from current player)
+        - Flipping for black to move
+        
+        Args:
+            current_board: chess.Board for current position
+        
+        Returns:
+            numpy array: (input_planes, 8, 8) tensor
+        """
+        if self.history_positions == 0:
+            # No history - just current board
+            # board_to_tensor automatically handles POV
+            return board_to_tensor(current_board)
+        
+        # Build history list
+        history_boards = []
+        
+        # Get last N boards from history
+        if self.board_history:
+            history_boards = self.board_history[-self.history_positions:]
+        
+        # Pad with empty boards if not enough history
+        while len(history_boards) < self.history_positions:
+            history_boards.insert(0, chess.Board())  # Empty board at start
+        
+        # Convert all boards to tensors with POV
+        # IMPORTANT: All boards should be from CURRENT player's perspective
+        tensors = []
+        
+        # Add history boards (oldest to newest)
+        for hist_board in history_boards:
+            # board_to_tensor handles POV automatically based on current_board.turn
+            hist_tensor = board_to_tensor(hist_board, flip_perspective=(current_board.turn == chess.BLACK))
+            tensors.append(hist_tensor)
+        
+        # Add current board
+        current_tensor = board_to_tensor(current_board)
+        tensors.append(current_tensor)
+        
+        # Stack: [oldest_history, ..., newest_history, current]
+        # Shape: (12 * (history_positions + 1), 8, 8)
+        import numpy as np
+        return np.concatenate(tensors, axis=0)
+    
     def _get_network_move(self, model):
         """
-        🆕 Get move directly from network (no MCTS)
+        🆕 v4.2: Get move directly from network (no MCTS)
         
-        Handles history positions correctly
+        Uses POV-aware board_to_tensor for correct history handling
         """
-        # Prepare board history
-        if self.history_positions > 0:
-            # Get last N boards, pad with empty if needed
-            history_list = self.board_history[-self.history_positions:] if self.board_history else []
-            
-            # Pad with empty boards if not enough history
-            while len(history_list) < self.history_positions:
-                history_list.insert(0, chess.Board())  # Empty board at start
-        else:
-            history_list = None
-        
-        # Convert to tensor with history
+        # Build tensor with history and POV
         board_tensor = torch.FloatTensor(
-            board_to_tensor(self.board, history_list, self.history_positions)
+            self._build_history_tensor(self.board)
         ).unsqueeze(0).to(self.device)
         
         # Get policy from model
@@ -464,12 +511,18 @@ class ChessGUI:
             )
             move, _ = select_move_by_visits(visit_counts, temperature=0)
         else:
-            # 🆕 Network-only mode (SAFE for history)
+            # 🆕 v4.2: Network-only mode with POV support
             move = self._get_network_move(current_model)
         
         if move:
             # 🆕 Save current board to history before making move
             self.board_history.append(self.board.copy())
+            
+            # 🆕 v4.2: Update MCTS history too
+            if self.mcts1:
+                self.mcts1.update_history(self.board)
+            if self.mcts2:
+                self.mcts2.update_history(self.board)
             
             self.board.push(move)
             self.move_history.append(move)
@@ -488,6 +541,12 @@ class ChessGUI:
         self.game_over = False
         self.move_history = []
         self.board_history = []  # 🆕 Clear board history
+        
+        # 🆕 v4.2: Reset MCTS trees and histories
+        if self.mcts1:
+            self.mcts1.reset_tree()
+        if self.mcts2:
+            self.mcts2.reset_tree()
     
     def run(self):
         """Main game loop"""
@@ -531,7 +590,7 @@ class ChessGUI:
 
 def main():
     # 🆕 Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Chess AI Game')
+    parser = argparse.ArgumentParser(description='Chess AI Game v4.2')
     parser.add_argument('--no-mcts', action='store_true', 
                        help='Disable MCTS (use network-only mode)')
     args = parser.parse_args()
@@ -551,6 +610,11 @@ def main():
     enable_mcts = not args.no_mcts
     if not enable_mcts:
         print("⚠️  MCTS DISABLED - Using network-only mode")
+    
+    # 🆕 Show config info
+    history_positions = config['model'].get('history_positions', 0)
+    print(f"📜 History positions: {history_positions}")
+    print(f"🔢 Input planes: {12 * (1 + history_positions)}")
     
     base_dir = script_dir.parent
     
@@ -578,8 +642,12 @@ def main():
     
     # Start GUI
     print("\n" + "="*50)
-    print("Chess AI - Pygame GUI")
+    print("Chess AI v4.2 - Pygame GUI")
     print("="*50)
+    print("\n🆕 v4.2 Features:")
+    print("  • POV (Point of View) - perspective handling")
+    print("  • Dynamic Sliding Window - history support")
+    print("  • MCTS toggle - network-only mode available")
     print("\nControls:")
     print("  • Click to select and move pieces")
     print("  • R - Restart game")
