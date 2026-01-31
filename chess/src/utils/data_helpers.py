@@ -201,14 +201,16 @@ def compact_to_tensor(compact_board, flip_perspective=False):
 
 
 # ==============================================================================
-# POV-AWARE MOVE ENCODING
+# POV-AWARE MOVE ENCODING - FIXED FOR 180° ROTATION
 # ==============================================================================
 
 def move_to_index(move, board):
     """
     Convert chess.Move to index (0-4095) with POV support
     
-    If black to move, flip the move coordinates to match flipped board
+    🔧 FIXED: Uses XOR 63 for 180° rotation (not square_mirror for vertical flip)
+    
+    If black to move, rotate both squares 180° to match flipped board
     
     Args:
         move: chess.Move object
@@ -220,10 +222,10 @@ def move_to_index(move, board):
     from_square = move.from_square
     to_square = move.to_square
     
-    # Flip move if black to move
+    # Rotate 180° if black to move (XOR with 63)
     if board.turn == chess.BLACK:
-        from_square = chess.square_mirror(from_square)
-        to_square = chess.square_mirror(to_square)
+        from_square = from_square ^ 63
+        to_square = to_square ^ 63
     
     return from_square * 64 + to_square
 
@@ -232,9 +234,11 @@ def index_to_move(index, is_black_turn=False):
     """
     Convert index back to move with POV support
     
+    🔧 FIXED: Uses XOR 63 for 180° rotation (not square_mirror for vertical flip)
+    
     Args:
         index: Move index (0-4095)
-        is_black_turn: If True, unflip the move
+        is_black_turn: If True, unrotate the move
     
     Returns:
         chess.Move
@@ -242,76 +246,66 @@ def index_to_move(index, is_black_turn=False):
     from_square = index // 64
     to_square = index % 64
     
-    # Unflip if black's turn
+    # Unrotate if black's turn (XOR with 63)
     if is_black_turn:
-        from_square = chess.square_mirror(from_square)
-        to_square = chess.square_mirror(to_square)
+        from_square = from_square ^ 63
+        to_square = to_square ^ 63
     
     return chess.Move(from_square, to_square)
 
 
-# ==============================================================================
-# DYNAMIC SLIDING WINDOW HELPERS
-# ==============================================================================
+from functools import lru_cache
 
-def should_include_position(move_idx, stride):
+
+@lru_cache(maxsize=512)
+def get_turn_from_move_idx(move_idx):
     """
-    Determine if position should be included based on sliding window stride
+    Determine whose turn it is from move index (CACHED for performance)
     
     Args:
         move_idx: Move index in game (0-based)
-        stride: Sliding window stride (1 = all positions, 2 = every other, etc.)
+    
+    Returns:
+        chess.WHITE or chess.BLACK
+    """
+    # Move 0 = White, Move 1 = Black, Move 2 = White, etc.
+    return chess.WHITE if move_idx % 2 == 0 else chess.BLACK
+
+
+def should_include_position(board, min_pieces=4):
+    """
+    Determine if position should be included in training
+    
+    Filters out:
+    - Endgame positions with very few pieces
+    - Positions with insufficient material
+    
+    Args:
+        board: chess.Board
+        min_pieces: Minimum number of pieces required
     
     Returns:
         bool: True if position should be included
     """
-    return (move_idx % stride) == 0
-
-
-def extract_game_id(data_bytes, position_size):
-    """
-    Extract game_id from binary position data
+    # Count total pieces
+    piece_count = len(board.piece_map())
     
-    Binary format:
-    [Board (32B)] + [GameID (2B, 'H')] + [MoveIdx (2B, 'H')] + [Outcome (4B, 'f')] + [MTL...]
+    if piece_count < min_pieces:
+        return False
     
-    Args:
-        data_bytes: Raw bytes from binary file
-        position_size: Total size of position record
-    
-    Returns:
-        tuple: (game_id, move_idx)
-    """
-    game_id = struct.unpack('H', data_bytes[32:34])[0]
-    move_idx = struct.unpack('H', data_bytes[34:36])[0]
-    return game_id, move_idx
-
-
-def get_turn_from_move_idx(move_idx):
-    """
-    Determine whose turn it is based on move index
-    
-    Args:
-        move_idx: Move index in game (0-based)
-    
-    Returns:
-        chess.Color: WHITE if even move, BLACK if odd move
-    """
-    return chess.WHITE if (move_idx % 2) == 0 else chess.BLACK
+    return True
 
 
 # ==============================================================================
-# MULTI-TASK LEARNING HELPER FUNCTIONS
+# AUXILIARY LABELS FOR MULTI-TASK LEARNING
 # ==============================================================================
 
 def compute_material_balance(board):
     """
-    Compute material balance for current player
+    Compute material balance from current player's perspective
     
     Returns:
-        float: Material advantage in pawns (-1.0 to +1.0)
-               Positive = current player ahead
-               Negative = current player behind
+        float: Material balance normalized to [-1, 1]
     """
     piece_values = {
         chess.PAWN: 1,
@@ -375,15 +369,15 @@ def will_win(board, game_result):
 
 
 # ==============================================================================
-# BINARY FORMAT HELPERS
+# BINARY FORMAT HELPERS - FIXED TO INCLUDE move_target
 # ==============================================================================
 
 def get_position_size(use_mtl=False, history_positions=0):
     """
     Calculate size of binary position record
     
-    NEW FORMAT (without embedded history):
-    [Board (32B)] + [GameID (2B)] + [MoveIdx (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    🔧 FIXED FORMAT v4.3 (GameID uint32):
+    [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
     
     Args:
         use_mtl: Whether Multi-Task Learning is enabled
@@ -393,8 +387,9 @@ def get_position_size(use_mtl=False, history_positions=0):
         int: Size in bytes
     """
     base_size = 32  # Board (compact)
-    base_size += 2  # GameID (uint16)
+    base_size += 4  # GameID (uint32) — supports up to ~4 billion unique games
     base_size += 2  # MoveIdx (uint16)
+    base_size += 2  # MoveTarget (uint16) - the move label (0-4095)
     base_size += 4  # Outcome (float32)
     
     if use_mtl:
@@ -405,17 +400,18 @@ def get_position_size(use_mtl=False, history_positions=0):
     return base_size
 
 
-def pack_position_data(board, game_id, move_idx, outcome, mtl_labels=None):
+def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_labels=None):
     """
     Pack position data into binary format
     
-    NEW FORMAT:
-    [Board (32B)] + [GameID (2B)] + [MoveIdx (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    🔧 FIXED FORMAT v4.3 (GameID uint32):
+    [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
     
     Args:
         board: chess.Board
-        game_id: Unique game identifier (0-65535)
+        game_id: Unique game identifier (0 – 4294967295, uint32)
         move_idx: Move index in game (0-based)
+        move_target: Target move index (0-4095) - THIS IS THE LABEL
         outcome: Game outcome value
         mtl_labels: Optional dict with 'win', 'material', 'check'
     
@@ -427,10 +423,11 @@ def pack_position_data(board, game_id, move_idx, outcome, mtl_labels=None):
     # Pack board (32 bytes)
     data.extend(board_to_compact(board))
     
-    # Pack metadata (8 bytes)
-    data.extend(struct.pack('H', game_id))      # GameID (2 bytes)
-    data.extend(struct.pack('H', move_idx))     # MoveIdx (2 bytes)
-    data.extend(struct.pack('f', outcome))      # Outcome (4 bytes)
+    # Pack metadata
+    data.extend(struct.pack('I', game_id))          # GameID (4 bytes, uint32)
+    data.extend(struct.pack('H', move_idx))         # MoveIdx (2 bytes)
+    data.extend(struct.pack('H', move_target))      # MoveTarget (2 bytes)
+    data.extend(struct.pack('f', outcome))          # Outcome (4 bytes)
     
     # Pack MTL labels if provided (12 bytes)
     if mtl_labels is not None:
@@ -445,6 +442,9 @@ def unpack_position_data(data_bytes, use_mtl=False):
     """
     Unpack position data from binary format
     
+    🔧 FIXED FORMAT v4.3 (GameID uint32):
+    [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    
     Args:
         data_bytes: Raw bytes from file
         use_mtl: Whether MTL labels are included
@@ -454,6 +454,7 @@ def unpack_position_data(data_bytes, use_mtl=False):
             'board_compact': bytes (32),
             'game_id': int,
             'move_idx': int,
+            'move_target': int,
             'outcome': float,
             'win': float (if MTL),
             'material': float (if MTL),
@@ -465,16 +466,17 @@ def unpack_position_data(data_bytes, use_mtl=False):
     # Unpack board (32 bytes)
     result['board_compact'] = data_bytes[:32]
     
-    # Unpack metadata
-    result['game_id'] = struct.unpack('H', data_bytes[32:34])[0]
-    result['move_idx'] = struct.unpack('H', data_bytes[34:36])[0]
-    result['outcome'] = struct.unpack('f', data_bytes[36:40])[0]
+    # Unpack metadata — GameID is now uint32 at [32:36], everything after shifts +2
+    result['game_id'] = struct.unpack('I', data_bytes[32:36])[0]     # uint32, 4 bytes
+    result['move_idx'] = struct.unpack('H', data_bytes[36:38])[0]    # was 34:36
+    result['move_target'] = struct.unpack('H', data_bytes[38:40])[0] # was 36:38
+    result['outcome'] = struct.unpack('f', data_bytes[40:44])[0]     # was 38:42
     
     # Unpack MTL labels if present
     if use_mtl:
-        result['win'] = struct.unpack('f', data_bytes[40:44])[0]
-        result['material'] = struct.unpack('f', data_bytes[44:48])[0]
-        result['check'] = struct.unpack('f', data_bytes[48:52])[0]
+        result['win'] = struct.unpack('f', data_bytes[44:48])[0]      # was 42:46
+        result['material'] = struct.unpack('f', data_bytes[48:52])[0] # was 46:50
+        result['check'] = struct.unpack('f', data_bytes[52:56])[0]    # was 50:54
     
     return result
 
@@ -519,9 +521,10 @@ def analyze_dataset_distribution(binary_file, position_size, sample_size=10000):
             offset = idx * position_size
             data = mm[offset:offset + position_size]
             
-            game_id = struct.unpack('H', data[32:34])[0]
-            move_idx = struct.unpack('H', data[34:36])[0]
-            outcome = struct.unpack('f', data[36:40])[0]
+            game_id = struct.unpack('I', data[32:36])[0]     # uint32
+            move_idx = struct.unpack('H', data[36:38])[0]    # was 34:36
+            # move_target at 38:40 (skipped for stats)
+            outcome = struct.unpack('f', data[40:44])[0]     # was 38:42
             
             stats['unique_games'].add(game_id)
             stats['max_move_idx'] = max(stats['max_move_idx'], move_idx)

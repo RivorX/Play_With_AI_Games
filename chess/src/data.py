@@ -36,7 +36,6 @@ from .utils.data_helpers import (
     is_in_check,
     will_win,
     get_position_size,
-    should_include_position,
     get_turn_from_move_idx
 )
 
@@ -283,20 +282,47 @@ def merge_binary_datasets(binary_files, metadata_files, output_binary, output_me
     print(f"\n  ✅ All datasets compatible")
     print(f"  📊 Total positions: {total_positions:,}")
     
-    # Merge binary files
-    print(f"\n  🔨 Writing merged binary file...")
+    # Merge binary files — rewriting GameIDs to be globally unique across all source files.
+    # Each source file's GameIDs start at 0, so after concatenation two different games in
+    # different files can share the same GameID.  We fix this by offsetting every GameID
+    # by the cumulative position count of all previous files.  Because positions within one
+    # source file are ordered by game (all moves of game 0, then game 1, …) and the history
+    # walk relies solely on GameID equality to detect game boundaries, the remapped IDs
+    # preserve that property while eliminating cross-file collisions.
+    print(f"\n  🔨 Writing merged binary file (with GameID remapping)...")
     chunk_size = 100 * 1024 * 1024  # 100 MB chunks
     
+    # We need per-position rewriting for GameID remapping, so we process record-by-record.
+    # GameID offset: we use the max GameID seen in previous files + 1 as the base for the
+    # next file.  This way IDs never collide regardless of how many games each file has.
+    game_id_offset = 0  # running offset applied to each file's GameIDs
+    
     with open(output_binary, 'wb') as outfile:
-        for i, binary_file in enumerate(binary_files, 1):
-            print(f"     Merging file {i}/{len(binary_files)}: {Path(binary_file).name}")
+        for i, (binary_file, meta) in enumerate(zip(binary_files, all_metadata), 1):
+            print(f"     Merging file {i}/{len(binary_files)}: {Path(binary_file).name} "
+                  f"(GameID offset: {game_id_offset})")
+            
+            file_positions = meta['total_positions']
+            max_game_id_in_file = 0
             
             with open(binary_file, 'rb') as infile:
-                while True:
-                    chunk = infile.read(chunk_size)
-                    if not chunk:
-                        break
-                    outfile.write(chunk)
+                for _ in range(file_positions):
+                    record = bytearray(infile.read(position_size))
+                    if len(record) < position_size:
+                        break  # truncated file, stop
+                    
+                    # Read original GameID (uint32 at offset 32)
+                    original_game_id = struct.unpack('I', record[32:36])[0]
+                    max_game_id_in_file = max(max_game_id_in_file, original_game_id)
+                    
+                    # Write remapped GameID
+                    new_game_id = original_game_id + game_id_offset
+                    record[32:36] = struct.pack('I', new_game_id)
+                    
+                    outfile.write(record)
+            
+            # Next file's IDs start after the highest ID we just wrote
+            game_id_offset += max_game_id_in_file + 1
     
     # Create combined metadata
     combined_metadata = {
@@ -514,13 +540,13 @@ def extract_positions_from_game_worker(args):
     """
     PHASE 2 WORKER: Extract positions from a single game
     
-    🆕 v4.2 CHANGES:
+    🔧 FIXED v4.2 CHANGES:
     - NO embedded history in binary format
-    - Stores GameID and MoveIdx for dynamic history assembly
-    - Reduced file size by ~4x (for history_positions=4)
+    - Stores GameID, MoveIdx, and MoveTarget for training
+    - MoveTarget is the LABEL for the network to predict
     
-    NEW BINARY FORMAT:
-    [Board (32B)] + [GameID (2B)] + [MoveIdx (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    🔧 FIXED BINARY FORMAT:
+    [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
     """
     game_data, game_id, min_elo, max_moves_per_game, use_mtl = args
     
@@ -533,7 +559,8 @@ def extract_positions_from_game_worker(args):
         move_to_index,
         compute_material_balance,
         is_in_check,
-        will_win
+        will_win,
+        pack_position_data  # 🔧 NEW: For proper binary packing
     )
     
     try:
@@ -568,11 +595,9 @@ def extract_positions_from_game_worker(args):
                 if move not in board.legal_moves:
                     break
                 
-                # 🆕 Current board state (compact) - POV handled at load time
-                current_board_compact = board_to_compact(board)
-                
-                # 🆕 Move index with POV
-                move_index = move_to_index(move, board)
+                # 🔧 CRITICAL FIX: Calculate move_target BEFORE making the move
+                # This is the LABEL the network should predict (0-4095)
+                move_target = move_to_index(move, board)
                 
                 # Outcome
                 if result == '1-0':
@@ -583,25 +608,24 @@ def extract_positions_from_game_worker(args):
                     outcome = 0.0
                 
                 # MTL labels
+                mtl_labels = None
                 if use_mtl:
-                    win_label = will_win(board, result)
-                    material_label = compute_material_balance(board)
-                    check_label = is_in_check(board)
-                else:
-                    win_label = material_label = check_label = 0.0
+                    mtl_labels = {
+                        'win': will_win(board, result),
+                        'material': compute_material_balance(board),
+                        'check': is_in_check(board)
+                    }
                 
-                # 🆕 Pack position WITHOUT history
-                # Format: [Board (32B)] + [GameID (2B)] + [MoveIdx (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
-                position_data = current_board_compact
-                position_data += struct.pack('H', game_id)      # GameID (0-65535)
-                position_data += struct.pack('H', move_idx)     # MoveIdx within game
-                position_data += struct.pack('f', outcome)
-                
-                # Add MTL if enabled
-                if use_mtl:
-                    position_data += struct.pack('f', win_label)
-                    position_data += struct.pack('f', material_label)
-                    position_data += struct.pack('f', check_label)
+                # 🔧 Pack position using helper function (includes move_target)
+                # Format: [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+                position_data = pack_position_data(
+                    board=board,
+                    game_id=game_id,
+                    move_idx=move_idx,
+                    move_target=move_target,  # 🔧 NEW: The label to predict
+                    outcome=outcome,
+                    mtl_labels=mtl_labels
+                )
                 
                 positions.append(position_data)
                 
@@ -632,7 +656,8 @@ def extract_positions_parallel(games_data, config, phase2_workers):
     print(f"  Using {phase2_workers} processes for parallel position extraction...")
     
     # Prepare tasks with unique game_id for each game
-    tasks = [(game, game_idx % 65536, min_elo, max_moves, use_mtl) 
+    # 🔧 v4.3: game_id is uint32 — no modulo needed, supports up to ~4 billion games
+    tasks = [(game, game_idx, min_elo, max_moves, use_mtl) 
              for game_idx, game in enumerate(games_data)]
     
     # Process in parallel
@@ -663,7 +688,8 @@ def extract_positions_sequential(games_data, config):
     all_positions = []
     
     for game_idx, game in enumerate(tqdm(games_data, desc="  Extracting positions")):
-        task = (game, game_idx % 65536, min_elo, max_moves, use_mtl)
+        # 🔧 v4.3: game_id is uint32 — no modulo needed
+        task = (game, game_idx, min_elo, max_moves, use_mtl)
         positions = extract_positions_from_game_worker(task)
         all_positions.extend(positions)
     
@@ -871,15 +897,25 @@ class BinaryChessDataset(Dataset):
             history_positions: Number of history positions to include (dynamic)
             stride: Sliding window stride (1 = all positions, 2 = every other, etc.)
         """
+        # ✅ ADDED v4.2.1: Input validation
+        if stride < 1:
+            raise ValueError(f"stride must be >= 1, got {stride}")
+        if history_positions < 0:
+            raise ValueError(f"history_positions must be >= 0, got {history_positions}")
+        if position_size < 32:  # Minimum size: just board
+            raise ValueError(f"position_size too small: {position_size} (minimum 32 bytes)")
+        
         self.binary_file = binary_file
         self.position_size = position_size
         self.history_positions = history_positions
         self.stride = stride
         
         # Auto-detect MTL
+        # 🔧 v4.3: base_size must match current binary layout:
+        #   Board(32) + GameID(4) + MoveIdx(2) + MoveTarget(2) + Outcome(4) = 44
         if use_mtl is None:
-            base_size = 32 + 2 + 2 + 4  # Board + GameID + MoveIdx + Outcome
-            self.use_mtl = (position_size == base_size + 12)
+            base_size = 32 + 4 + 2 + 2 + 4  # = 44
+            self.use_mtl = (position_size == base_size + 12)  # 44 + 12 = 56
         else:
             self.use_mtl = use_mtl
         
@@ -902,6 +938,8 @@ class BinaryChessDataset(Dataset):
         """
         Filter indices based on sliding window stride
         Only keep positions where (move_idx % stride) == 0
+        
+        🔧 FIXED: Correct offset for new binary format
         """
         filtered = []
         
@@ -909,11 +947,13 @@ class BinaryChessDataset(Dataset):
         with open(self.binary_file, 'rb') as f:
             for idx in indices:
                 offset = idx * self.position_size
-                f.seek(offset + 32 + 2)  # Skip Board + GameID
+                # 🔧 v4.3 Layout: [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + ...
+                f.seek(offset + 32 + 4)  # Skip Board (32) + GameID (4) = 36
                 move_idx_bytes = f.read(2)
                 move_idx = struct.unpack('H', move_idx_bytes)[0]
                 
-                if should_include_position(move_idx, self.stride):
+                # Simple stride logic: keep every Nth position
+                if move_idx % self.stride == 0:
                     filtered.append(idx)
         
         return filtered
@@ -931,12 +971,14 @@ class BinaryChessDataset(Dataset):
         """
         Get item with POV and dynamic sliding window history
         
-        🆕 v4.2 PROCESS:
-        1. Read current position (GameID, MoveIdx, Board, Move, Outcome, MTL)
-        2. Determine whose turn it is (from MoveIdx)
-        3. Walk backwards to find previous positions from SAME game
-        4. Convert all boards to POV (flip if black to move)
-        5. Stack history with current board
+        🔧 v4.3 FIXES:
+        - Binary offsets updated for GameID uint32 (4 bytes instead of 2)
+        - History walk iterates over raw file positions (position_idx-1, -2, …)
+          which is correct: the binary file stores positions in game order, so
+          adjacent positions in the file that share the same GameID belong to the
+          same game.  The stride filter only affects which positions are *returned*
+          as training samples — history is still assembled from every position in
+          the file, exactly as intended by the sliding-window design.
         """
         self._ensure_mmap()
         
@@ -944,90 +986,80 @@ class BinaryChessDataset(Dataset):
         offset = position_idx * self.position_size
         data = self._mmap[offset:offset + self.position_size]
         
-        # Unpack current position
+        # 🔧 v4.3 Layout:
+        # [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B)]
         compact_board = data[:32]
-        game_id = struct.unpack('H', data[32:34])[0]
-        move_idx = struct.unpack('H', data[34:36])[0]
-        outcome = struct.unpack('f', data[36:40])[0]
+        game_id    = struct.unpack('I', data[32:36])[0]   # uint32, 4 bytes
+        move_idx   = struct.unpack('H', data[36:38])[0]   # was 34:36
+        move_target = struct.unpack('H', data[38:40])[0]  # was 36:38  ← THIS IS THE LABEL
+        outcome    = struct.unpack('f', data[40:44])[0]   # was 38:42
         
-        # 🆕 Determine whose turn it is
+        # Determine whose turn it is
         is_black_turn = get_turn_from_move_idx(move_idx) == chess.BLACK
         
-        # 🆕 Convert current board to tensor with POV
+        # Convert current board to tensor with POV
         board_tensor = compact_to_tensor(compact_board, flip_perspective=is_black_turn)
         
-        # 🆕 DYNAMIC SLIDING WINDOW: Build history by walking backwards
+        # DYNAMIC SLIDING WINDOW: Build history by walking backwards through raw file.
+        # We walk position_idx-1, position_idx-2, … and stop as soon as the GameID
+        # changes (= different game) or we run out of file.  This correctly assembles
+        # history regardless of which positions the stride filter selected as samples.
         history_tensors = []
         
         if self.history_positions > 0:
-            # Walk backwards through file to find previous positions from same game
             current_offset = position_idx - 1
             collected_history = 0
             
             while collected_history < self.history_positions and current_offset >= 0:
                 hist_offset = current_offset * self.position_size
-                
-                # Check if we went past the beginning of file
-                if hist_offset < 0:
-                    break
-                
                 hist_data = self._mmap[hist_offset:hist_offset + self.position_size]
-                hist_game_id = struct.unpack('H', hist_data[32:34])[0]
-                hist_move_idx = struct.unpack('H', hist_data[34:36])[0]
+                
+                # 🔧 v4.3: GameID is uint32 at [32:36]
+                hist_game_id = struct.unpack('I', hist_data[32:36])[0]
                 
                 # Stop if different game
                 if hist_game_id != game_id:
                     break
                 
-                # Get history board
                 hist_compact_board = hist_data[:32]
                 
-                # 🆕 Determine turn for history position
-                hist_is_black_turn = get_turn_from_move_idx(hist_move_idx) == chess.BLACK
-                
-                # 🆕 Convert to tensor with POV
-                # IMPORTANT: History boards should use SAME perspective as current board
-                # If current board is from black's POV, all history should also be from black's POV
+                # All history boards use the CURRENT player's POV for consistency
                 hist_tensor = compact_to_tensor(hist_compact_board, flip_perspective=is_black_turn)
                 
-                history_tensors.insert(0, hist_tensor)  # Insert at beginning (oldest first)
+                history_tensors.insert(0, hist_tensor)  # oldest first
                 collected_history += 1
                 current_offset -= 1
             
-            # Pad with zeros if not enough history
+            # Pad with zeros if not enough history available
             while len(history_tensors) < self.history_positions:
                 empty_board = np.zeros((12, 8, 8), dtype=np.float32)
                 history_tensors.insert(0, empty_board)
         
-        # Stack history with current board
+        # Stack: [oldest_history, …, newest_history, current]  →  (12*(H+1), 8, 8)
         if history_tensors:
-            # Stack: [oldest_history, ..., newest_history, current]
-            # Shape: (12 * (history_positions + 1), 8, 8)
             all_tensors = history_tensors + [board_tensor]
             stacked_board = np.concatenate(all_tensors, axis=0)
         else:
             stacked_board = board_tensor
         
-        # Unpack move and MTL labels
-        move_index = struct.unpack('H', data[34:36])[0]  # Already unpacked above
-        
         if self.use_mtl:
-            win = struct.unpack('f', data[40:44])[0]
-            material = struct.unpack('f', data[44:48])[0]
-            check = struct.unpack('f', data[48:52])[0]
+            # 🔧 v4.3: MTL labels shifted +2 vs previous version
+            win      = struct.unpack('f', data[44:48])[0]  # was 42:46
+            material = struct.unpack('f', data[48:52])[0]  # was 46:50
+            check    = struct.unpack('f', data[52:56])[0]  # was 50:54
             
             return {
-                'board': torch.FloatTensor(stacked_board),
-                'move': torch.LongTensor([move_index])[0],
-                'value': torch.FloatTensor([outcome]),
-                'win': torch.FloatTensor([win]),
+                'board':    torch.FloatTensor(stacked_board),
+                'move':     torch.LongTensor([move_target])[0],
+                'value':    torch.FloatTensor([outcome]),
+                'win':      torch.FloatTensor([win]),
                 'material': torch.FloatTensor([material]),
-                'check': torch.FloatTensor([check])
+                'check':    torch.FloatTensor([check])
             }
         else:
             return (
                 torch.FloatTensor(stacked_board),
-                torch.LongTensor([move_index])[0],
+                torch.LongTensor([move_target])[0],
                 torch.FloatTensor([outcome])
             )
     
