@@ -168,10 +168,10 @@ def main():
     print(f"\n✅ Data loaded successfully!")
     print(f"Total positions (before stride): {metadata['total_positions']:,}")
     
-    # 🆕 v4.2: Verify binary format compatibility
-    # The binary file should have position_size without embedded history
+    # 🔧 v4.3: Verify binary format compatibility
+    # Layout: [Board 32B] + [GameID 4B] + [MoveIdx 2B] + [MoveTarget 2B] + [Outcome 4B] + [MTL 12B]
     actual_position_size = metadata.get('position_size')
-    expected_position_size = 40 if not use_mtl else 52  # Base size with GameID + MoveIdx
+    expected_position_size = 44 if not use_mtl else 56  # 🔧 v4.3: GameID is now uint32 (4B)
     
     if actual_position_size != expected_position_size:
         print(f"\n⚠️ WARNING: Position size mismatch!")
@@ -180,13 +180,13 @@ def main():
         print(f"  • This may indicate the data was preprocessed with a different MTL setting")
         
         # Try to determine if it's just a MTL mismatch
-        if actual_position_size == 40 and use_mtl:
+        if actual_position_size == 44 and use_mtl:
             print(f"  ❌ Data was processed WITHOUT MTL, but config has use_multitask_learning=True")
             print(f"     Please either:")
             print(f"     1. Set use_multitask_learning=False in config.yaml, OR")
             print(f"     2. Delete cache and reprocess data with MTL enabled")
             raise ValueError("MTL mismatch between data and config")
-        elif actual_position_size == 52 and not use_mtl:
+        elif actual_position_size == 56 and not use_mtl:
             print(f"  ❌ Data was processed WITH MTL, but config has use_multitask_learning=False")
             print(f"     Please either:")
             print(f"     1. Set use_multitask_learning=True in config.yaml, OR")
