@@ -348,11 +348,11 @@ class ChessNet(nn.Module):
         
         use_layer_scale = config['model'].get('use_layer_scale', True)
         layer_scale_init = config['model'].get('layer_scale_init', 1e-5)
-        use_adaptive_policy = config['model'].get('use_adaptive_policy_pool', True)
         
         # 🆕 v4.0: Pre-activation ResNet
         use_preactivation = config['model'].get('use_preactivation', True)
         
+        # Spatial attention mode
         spatial_attention_mode = config['model'].get('spatial_attention_mode', 'last_2')
         
         # Multi-Task Learning
@@ -361,17 +361,20 @@ class ChessNet(nn.Module):
         self.material_weight = config['model'].get('material_prediction_weight', 0.2)
         self.check_weight = config['model'].get('check_prediction_weight', 0.15)
         
-        # 🆕 AUTO-CALCULATE input_planes from history_positions
+        # 🆕 v4.4: AUTO-CALCULATE input_planes with chess metadata
+        # Base: 15 planes (12 pieces + 3 metadata: castling, en passant, halfmove)
+        # With history: 15 * (1 + history_positions)
         history_positions = config['model']['history_positions']
         if input_planes is None:
-            input_planes = 12 * (1 + history_positions)
+            input_planes = 15 * (1 + history_positions)  # 🆕 15 instead of 12!
         
         self.input_planes = input_planes
         self.history_positions = history_positions
         
-        print(f"🧠 ULTRA-OPTIMIZED Model v4.0 (Pre-activation ResNet):")
+        print(f"🧠 ULTRA-OPTIMIZED Model v4.4 (Chess Metadata + Pre-activation ResNet):")
         print(f"  • 🆕 History positions: {history_positions}")
-        print(f"  • 🆕 Input planes: {input_planes} (12 × {1 + history_positions})")
+        print(f"  • 🆕 Input planes: {input_planes} (15 × {1 + history_positions})")
+        print(f"  • 🆕 Chess metadata: Castling, En Passant, Halfmove Clock")
         print(f"  • ✅ SE-Block: Mixed pooling (avg+max)")
         
         if use_se2d:
@@ -394,11 +397,7 @@ class ChessNet(nn.Module):
             print(f"  • ✅ Post-activation ResNet: Standard mode")
         
         print(f"  • ✅ Standard 3x3 Conv: ENABLED (preserves spatial info for chess)")
-        
-        if use_adaptive_policy:
-            print(f"  • 🆕 AdaptivePolicyPool: ENABLED (+2-3% accuracy)")
-        else:
-            print(f"  • ✅ AdaptivePolicyPool: DISABLED (standard flatten+FC)")
+        print(f"  • 🔧 Policy Head: Standard flatten+FC (spatial preservation for chess)")
         
         if self.use_mtl:
             print(f"  • 🆕 MTL with GlobalAvgPool heads:")
@@ -449,23 +448,26 @@ class ChessNet(nn.Module):
         self.policy_conv = nn.Conv2d(filters, policy_filters, kernel_size=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(policy_filters)
         
-        if use_adaptive_policy:
-            self.policy_pool = AdaptivePolicyPool(policy_filters, 4096)
-            self.policy_fc = None
-        else:
-            self.policy_pool = None
-            self.policy_fc = nn.Linear(policy_filters * 8 * 8, 4096)
+        # 🔧 v4.4 CRITICAL FIX: Remove AdaptivePolicyPool
+        # Chess requires spatial information until the very end (position matters!)
+        # AdaptivePolicyPool aggregates spatial dimensions too early, losing "from where" information
+        # Use standard flatten + FC for full spatial preservation
+        self.policy_fc = nn.Linear(policy_filters * 8 * 8, 4096)
         
         self.policy_dropout = nn.Dropout(dropout)
         
-        # Value head
+        # 🆕 Value head - WDL (Win/Draw/Loss) classification
+        # Outputs 3 logits instead of 1 scalar for stronger signal
         value_filters = config['model']['value_head_filters']
         value_hidden = config['model']['value_hidden_dim']
         self.value_conv = nn.Conv2d(filters, value_filters, kernel_size=1, bias=False)
         self.value_bn = nn.BatchNorm2d(value_filters)
         self.value_fc1 = nn.Linear(value_filters * 8 * 8, value_hidden)
-        self.value_fc2 = nn.Linear(value_hidden, 1)
+        self.value_fc2 = nn.Linear(value_hidden, 3)  # 🆕 3 outputs: [Win, Draw, Loss]
         self.value_dropout = nn.Dropout(dropout)
+        
+        # Track if we use WDL
+        self.use_wdl = config['model'].get('use_wdl_value', True)
         
         # MTL heads
         if self.use_mtl:
@@ -508,25 +510,19 @@ class ChessNet(nn.Module):
         policy = self.policy_conv(x)
         policy = self.policy_bn(policy)
         policy = F.relu(policy, inplace=True)
-        
-        if self.policy_pool is not None:
-            policy = self.policy_dropout(policy)
-            policy = self.policy_pool(policy)
-        else:
-            policy = policy.flatten(1)
-            policy = self.policy_dropout(policy)
-            policy = self.policy_fc(policy)
-        
+        policy = policy.flatten(1)  # 🔧 v4.4: Always flatten (no adaptive pool)
+        policy = self.policy_dropout(policy)
+        policy = self.policy_fc(policy)
         policy = F.log_softmax(policy, dim=1)
         
-        # Value head
+        # 🆕 Value head - WDL classification
         value = self.value_conv(x)
         value = self.value_bn(value)
         value = F.relu(value, inplace=True)
         value = value.flatten(1)
         value = F.relu(self.value_fc1(value), inplace=True)
         value = self.value_dropout(value)
-        value = torch.tanh(self.value_fc2(value))
+        value = self.value_fc2(value)  # 🆕 Returns (B, 3) WDL logits (no tanh!)
         
         if not return_aux or not self.use_mtl:
             return policy, value
@@ -550,13 +546,28 @@ class ChessNet(nn.Module):
         return policy, value, win_pred, material_pred, check_pred
     
     def predict(self, board_tensor):
-        """Predict for a single position (used in MCTS)"""
+        """
+        Predict for a single position (used in MCTS)
+        🆕 Handles WDL output and converts to scalar
+        """
         self.eval()
         with torch.no_grad():
             if len(board_tensor.shape) == 3:
                 board_tensor = board_tensor.unsqueeze(0)
-            policy, value = self.forward(board_tensor, return_aux=False)
-            return torch.exp(policy).cpu().numpy()[0], value.cpu().item()
+            policy, value_logits = self.forward(board_tensor, return_aux=False)
+            
+            # Convert WDL logits to scalar value
+            if self.use_wdl:
+                # value_logits: (1, 3) -> [Win, Draw, Loss]
+                wdl_probs = F.softmax(value_logits, dim=1)
+                # Scalar: W*1.0 + D*0.0 + L*(-1.0)
+                value_scalar = (wdl_probs[0, 0] * 1.0 + 
+                               wdl_probs[0, 1] * 0.0 + 
+                               wdl_probs[0, 2] * (-1.0))
+                return torch.exp(policy).cpu().numpy()[0], value_scalar.item()
+            else:
+                # Legacy scalar output
+                return torch.exp(policy).cpu().numpy()[0], value_logits.cpu().item()
 
 
 def load_model(checkpoint_path, config, device):

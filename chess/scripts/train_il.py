@@ -1,9 +1,14 @@
 """
-Imitation Learning Training Script - v4.2
-🆕 UPDATED: Compatible with POV + Dynamic Sliding Window
-- 🎯 POV: All boards from current player's perspective
-- 🔄 Sliding Window: Dynamic history assembly at load time
-- 🎮 GameID tracking: Efficient history reconstruction
+Imitation Learning Training Script - v4.4
+🆕 v4.4: CHESS METADATA - Castling, En Passant, Halfmove Clock (15 planes)
+🆕 v4.3: WDL VALUE HEAD + TEMPORAL DISCOUNTING (conditional on use_wdl)
+🆕 v4.2: POV + Dynamic Sliding Window
+- 🎯 POV: All boards from current player's perspective (flip for black)
+- 🔄 Sliding Window: Dynamic history assembly at load time using mmap
+- 🎮 GameID tracking: Efficient history reconstruction across positions
+- 📊 Chess Metadata: 3 extra planes (castling, en passant, halfmove clock)
+- ⚡ WDL: Win/Draw/Loss classification (stronger signal than MSE)
+- ⚡ TEMPORAL DISCOUNTING: DISABLED for WDL (clean ±1.0), ENABLED for MSE
 """
 
 import torch
@@ -81,17 +86,19 @@ def main():
     history_positions = config['model'].get('history_positions', 0)
     stride = config['data'].get('sliding_window_stride', 1)
     
-    # 🆕 Calculate expected input planes (dynamic)
-    expected_input_planes = 12 * (1 + history_positions)
+    # 🆕 v4.4 FIXED: Calculate expected input planes with chess metadata
+    expected_input_planes = 15 * (1 + history_positions)  # 🔧 FIXED: 15 planes (12 pieces + 3 metadata)
     
     print("\n" + "="*70)
-    print("🆕 v4.2 POV + DYNAMIC SLIDING WINDOW")
+    print("🆕 v4.4 CHESS METADATA + v4.3 TEMPORAL DISCOUNTING + v4.2 POV")
     print("="*70)
     print(f"  • POV: Boards from current player's perspective")
     print(f"  • History positions: {history_positions} (assembled dynamically)")
     print(f"  • Sliding window stride: {stride}x")
-    print(f"  • Expected input planes: {expected_input_planes} (12 × {1 + history_positions})")
+    print(f"  • Expected input planes: {expected_input_planes} (15 × {1 + history_positions})")
+    print(f"  • 🆕 Chess metadata: Castling, En Passant, Halfmove Clock")
     print(f"  • MTL enabled: {use_mtl}")
+    print(f"  • 🆕 WDL Value: {config['model'].get('use_wdl_value', True)}")
     print("="*70 + "\n")
     
     # Setup debug logging
@@ -117,7 +124,7 @@ def main():
         
         with open(debug_log_file, 'w', encoding='utf-8') as f:
             f.write("="*70 + "\n")
-            f.write("🐛 TRAINING DEBUG LOG - v4.2 POV + Sliding Window\n")
+            f.write("🐛 TRAINING DEBUG LOG - v4.4 Chess Metadata + WDL\n")
             f.write("="*70 + "\n")
             f.write(f"Timestamp: {timestamp}\n")
             f.write(f"Model: {config['model']['filters']} filters, {config['model']['num_residual_blocks']} blocks\n")
@@ -125,21 +132,23 @@ def main():
             f.write(f"Learning rate: {config['imitation_learning']['learning_rate']}\n")
             f.write(f"History positions: {history_positions} (dynamic)\n")
             f.write(f"Sliding window stride: {stride}x\n")
-            f.write(f"Input planes: {expected_input_planes}\n")
+            f.write(f"Input planes: {expected_input_planes} (15 per position)\n")
+            f.write(f"Chess metadata: Castling, En Passant, Halfmove\n")
             f.write(f"MTL enabled: {use_mtl}\n")
+            f.write(f"WDL Value: {config['model'].get('use_wdl_value', True)}\n")
             f.write(f"POV enabled: True\n")
             f.write("="*70 + "\n\n")
     
     # Initialize logger
     logger = TrainingLogger(
         logs_dir, 
-        experiment_name="il_training_v4.2", 
+        experiment_name="il_training_v4.4", 
         mode="il",
         use_mtl=use_mtl
     )
     
     # Load data with multi-phase processing
-    print("\n=== Loading data (v4.2 POV + Sliding Window) ===")
+    print("\n=== Loading data (v4.4 Chess Metadata + POV + Sliding Window) ===")
     print(f"Mode: {'SEQUENTIAL' if config['data']['files_at_once'] == 1 else 'BATCH'}")
     print(f"Files at once: {config['data']['files_at_once']}")
     print(f"Phase 1 workers: {config['data'].get('phase1_threads', 1)}")
@@ -168,45 +177,61 @@ def main():
     print(f"\n✅ Data loaded successfully!")
     print(f"Total positions (before stride): {metadata['total_positions']:,}")
     
-    # 🔧 v4.3: Verify binary format compatibility
-    # Layout: [Board 32B] + [GameID 4B] + [MoveIdx 2B] + [MoveTarget 2B] + [Outcome 4B] + [MTL 12B]
+    # 🔧 v4.4: Check if WDL is enabled (affects temporal discounting)
+    use_wdl = config['model'].get('use_wdl_value', True)
+    if use_wdl:
+        print(f"  • WDL enabled: Temporal discounting DISABLED (clean ±1.0 targets) ✓")
+    else:
+        print(f"  • MSE regression: Temporal discounting ENABLED (sqrt scaling) ⚠️")
+    
+    # 🔧 v4.4: Verify binary format compatibility
+    # Layout: [Board 36B] + [GameID 4B] + [MoveIdx 2B] + [MoveTarget 2B] + [Outcome 4B] + [MTL 12B]
     actual_position_size = metadata.get('position_size')
-    expected_position_size = 44 if not use_mtl else 56  # 🔧 v4.3: GameID is now uint32 (4B)
+    expected_position_size = 48 if not use_mtl else 60  # 🆕 v4.4: Board is now 36B (was 32B)
     
     if actual_position_size != expected_position_size:
         print(f"\n⚠️ WARNING: Position size mismatch!")
         print(f"  • Expected: {expected_position_size} bytes")
         print(f"  • Actual: {actual_position_size} bytes")
-        print(f"  • This may indicate the data was preprocessed with a different MTL setting")
+        print(f"  • This may indicate the data was preprocessed with an old format or different MTL setting")
         
         # Try to determine if it's just a MTL mismatch
-        if actual_position_size == 44 and use_mtl:
+        if actual_position_size == 48 and use_mtl:
             print(f"  ❌ Data was processed WITHOUT MTL, but config has use_multitask_learning=True")
             print(f"     Please either:")
             print(f"     1. Set use_multitask_learning=False in config.yaml, OR")
             print(f"     2. Delete cache and reprocess data with MTL enabled")
             raise ValueError("MTL mismatch between data and config")
-        elif actual_position_size == 56 and not use_mtl:
+        elif actual_position_size == 60 and not use_mtl:
             print(f"  ❌ Data was processed WITH MTL, but config has use_multitask_learning=False")
             print(f"     Please either:")
             print(f"     1. Set use_multitask_learning=True in config.yaml, OR")
             print(f"     2. Delete cache and reprocess data without MTL")
             raise ValueError("MTL mismatch between data and config")
+        elif actual_position_size in [44, 56]:  # Old v4.3 format (32B board)
+            print(f"  ❌ Data was processed with OLD v4.3 format (32B board, no chess metadata)")
+            print(f"     🆕 v4.4 uses 36B board with castling, en passant, and halfmove clock")
+            print(f"     Please delete cache (data/preprocessing/) and reprocess with v4.4")
+            raise ValueError("Old data format - please reprocess")
         else:
             print(f"  ❌ Unknown format mismatch - please delete cache and reprocess")
             raise ValueError("Position size mismatch")
     
-    print(f"Position size: {actual_position_size} bytes ✓")
-    print(f"Format: {'WITH' if use_mtl else 'WITHOUT'} Multi-Task Learning ✓")
-    print(f"POV: Enabled (boards from current player's perspective) ✓")
-    print(f"Sliding Window: Dynamic (history assembled at load time) ✓")
+    print(f"\n✅ Binary Format Validation:")
+    print(f"  • Position size: {actual_position_size} bytes ✓")
+    print(f"  • Board size: 36 bytes (32B pieces + 4B metadata) ✓")
+    print(f"  • Chess metadata: Castling, En Passant, Halfmove ✓")
+    print(f"  • MTL: {'ENABLED' if use_mtl else 'DISABLED'} ✓")
+    print(f"  • POV: Boards from current player's perspective ✓")
+    print(f"  • Sliding Window: Dynamic history assembly ✓")
     
     # Create dataloaders (they will apply sliding window and build history dynamically)
     train_loader, val_loader = create_dataloaders(metadata, config)
     
     # Create model with correct input planes
     print("\n=== Creating model ===")
-    print(f"Input planes: {expected_input_planes}")
+    print(f"Input planes: {expected_input_planes} (15 × {1 + history_positions})")
+    print(f"  • Per position: 12 pieces + 3 metadata (castling, en passant, halfmove)")
     print(f"Architecture: {config['model']['num_residual_blocks']} blocks, {config['model']['filters']} filters")
     
     model = ChessNet(config).to(device)
@@ -218,10 +243,36 @@ def main():
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
+    # 🆕 Per-layer learning rates - value head with lower LR to prevent overfitting
+    value_head_lr_factor = config['imitation_learning'].get('value_head_lr_factor', 1.0)
+    base_lr = config['imitation_learning']['learning_rate']
+    
+    if value_head_lr_factor != 1.0:
+        # Separate value head parameters
+        value_head_params = []
+        other_params = []
+        
+        for name, param in model.named_parameters():
+            if 'value_' in name:  # value_conv1, value_conv2, value_bn, value_fc1, value_fc2
+                value_head_params.append(param)
+            else:
+                other_params.append(param)
+        
+        param_groups = [
+            {'params': other_params, 'lr': base_lr},
+            {'params': value_head_params, 'lr': base_lr * value_head_lr_factor}
+        ]
+        
+        print(f"\n🎯 Per-layer Learning Rates:")
+        print(f"  • Trunk + Policy head: {base_lr:.4f}")
+        print(f"  • Value head: {base_lr * value_head_lr_factor:.4f} ({value_head_lr_factor}x)")
+    else:
+        param_groups = model.parameters()
+    
     # Optimizer
     optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config['imitation_learning']['learning_rate'],
+        param_groups,
+        lr=base_lr,
         weight_decay=config['imitation_learning']['weight_decay'],
         fused=True if torch.cuda.is_available() else False
     )
@@ -230,10 +281,10 @@ def main():
         print("✓ Using fused AdamW optimizer")
     
     # Learning rate scheduler
-    use_onecycle = config['imitation_learning'].get('use_onecycle_lr', True)
+    scheduler_type = config['imitation_learning'].get('scheduler_type', 'cosine_warm_restarts')
     scheduler = None
     
-    if use_onecycle:
+    if scheduler_type == 'onecycle':
         total_steps = len(train_loader) * config['imitation_learning']['epochs']
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -241,13 +292,55 @@ def main():
             total_steps=total_steps,
             pct_start=0.3,
             anneal_strategy='cos',
-            div_factor=25.0,
+            div_factor=10.0,
             final_div_factor=10000.0
         )
         print("✓ OneCycleLR scheduler enabled")
     
+    elif scheduler_type == 'cosine_warm_restarts':
+        t0 = config['imitation_learning'].get('cosine_t0', 10)
+        t_mult = config['imitation_learning'].get('cosine_t_mult', 2)
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=t0,
+            T_mult=t_mult,
+            eta_min=config['imitation_learning']['learning_rate'] / 100
+        )
+        print(f"✓ CosineAnnealingWarmRestarts: T0={t0}, T_mult={t_mult}")
+    
+    elif scheduler_type == 'reduce_on_plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=5,
+            verbose=True
+        )
+        print("✓ ReduceLROnPlateau scheduler enabled")
+    
+    elif scheduler_type == 'none':
+        print("✓ No LR scheduler (constant learning rate)")
+    
+    else:
+        raise ValueError(f"Unknown scheduler_type: {scheduler_type}")
+    
     # AMP Gradient Scaler
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    
+    # 🆕 Stochastic Weight Averaging (SWA) for better generalization with large batches
+    use_swa = config['imitation_learning'].get('use_swa', False)
+    swa_model = None
+    swa_scheduler = None
+    swa_start = config['imitation_learning'].get('swa_start_epoch', 15)
+    
+    if use_swa:
+        swa_model = torch.optim.swa_utils.AveragedModel(model)
+        swa_lr = config['imitation_learning'].get('swa_lr', 0.0005)
+        swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=swa_lr)
+        print(f"\n🎯 Stochastic Weight Averaging (SWA):")
+        print(f"  • Start epoch: {swa_start}")
+        print(f"  • SWA LR: {swa_lr:.6f}")
+        print(f"  • Benefits: Better generalization, flatter minima")
     
     # Best model path
     best_model_path = base_dir / config['paths']['best_model_il']
@@ -288,6 +381,13 @@ def main():
         
         current_lr = optimizer.param_groups[0]['lr']
         
+        # 🆕 SWA: Update averaged model after swa_start epoch
+        if use_swa and epoch >= swa_start:
+            swa_model.update_parameters(model)
+            if swa_scheduler is not None:
+                swa_scheduler.step()
+            print(f"       🎯 SWA: Updated averaged weights (epoch {epoch + 1 - swa_start}/{config['imitation_learning']['epochs'] - swa_start})")
+        
         # Print train losses and metrics
         print(f"Train - Loss: {train_losses['total']:.4f}, "
               f"Policy: {train_losses['policy']:.4f}, "
@@ -306,6 +406,10 @@ def main():
         # Evaluate
         if (epoch + 1) % config['imitation_learning']['eval_every'] == 0:
             val_losses, val_metrics = evaluate_il(model, val_loader, config, device)
+            
+            # Step ReduceLROnPlateau scheduler (needs val_loss)
+            if scheduler_type == 'reduce_on_plateau' and scheduler is not None:
+                scheduler.step(val_losses['total'])
             
             print(f"Val - Loss: {val_losses['total']:.4f}, "
                   f"Policy: {val_losses['policy']:.4f}, "
@@ -426,6 +530,59 @@ def main():
     # Final plot
     logger.plot()
     
+    # 🆕 SWA: Finalize and save averaged model
+    if use_swa and swa_model is not None:
+        print("\n" + "="*70)
+        print("🎯 Finalizing SWA (Stochastic Weight Averaging)")
+        print("="*70)
+        
+        # Update BatchNorm statistics for SWA model
+        print("Updating BatchNorm statistics...")
+        torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
+        
+        # Evaluate SWA model
+        print("Evaluating SWA model...")
+        swa_val_losses, swa_val_metrics = evaluate_il(swa_model.module, val_loader, config, device)
+        
+        print(f"\nSWA Model Performance:")
+        print(f"  Val Loss: {swa_val_losses['total']:.4f}")
+        print(f"  Val MAE: {swa_val_metrics['value_mae']:.4f}")
+        print(f"  Val Top-1: {swa_val_metrics['policy_top1_acc']:.2%}")
+        
+        # Save SWA model
+        swa_model_path = best_model_path.parent / "best_model_il_swa.pt"
+        swa_model_to_save = swa_model.module.to(torch.bfloat16) if use_bfloat16 else swa_model.module
+        
+        save_checkpoint(
+            swa_model_to_save,
+            None,
+            epoch,
+            swa_val_losses['total'],
+            str(swa_model_path),
+            {
+                'val_loss': swa_val_losses['total'],
+                'val_policy_loss': swa_val_losses['policy'],
+                'val_value_loss': swa_val_losses['value'],
+                'val_policy_top1': swa_val_metrics['policy_top1_acc'],
+                'val_policy_top3': swa_val_metrics['policy_top3_acc'],
+                'val_value_mae': swa_val_metrics['value_mae'],
+                'swa_enabled': True,
+                'swa_start_epoch': swa_start,
+                'use_mtl': use_mtl,
+                'history_positions': history_positions,
+                'input_planes': expected_input_planes,
+                'sliding_window_stride': stride,
+                'pov_enabled': True,
+                'version': 'v4.4'
+            },
+            save_optimizer=False
+        )
+        
+        size_mb = swa_model_path.stat().st_size / (1024**2)
+        print(f"\n✅ SWA model saved: {swa_model_path.name} ({size_mb:.1f} MB)")
+        print(f"  Val loss improvement: {best_val_loss - swa_val_losses['total']:.4f}")
+        print("="*70)
+    
     print("\n=== Training complete ===")
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Best model: {best_model_path}")
@@ -435,14 +592,24 @@ def main():
         print(f"Debug log: {debug_log_file}")
     
     print("\n" + "="*70)
-    print("🆕 v4.2 Features Used:")
+    print("🆕 v4.4 Features Used:")
     print("="*70)
+    print(f"  ✓ Chess Metadata - castling, en passant, halfmove clock")
+    print(f"  ✓ WDL Value Head - Win/Draw/Loss classification")
     print(f"  ✓ POV (Point of View) - boards from current player's perspective")
     print(f"  ✓ Dynamic Sliding Window - history assembled at load time")
     print(f"  ✓ GameID tracking - efficient history reconstruction")
     print(f"  ✓ Stride {stride}x - sampled every {stride} positions")
+    if use_wdl:
+        print(f"  ✓ Temporal Discounting - DISABLED for WDL (clean targets)")
+    else:
+        print(f"  ✓ Temporal Discounting - ENABLED for MSE (sqrt scaling)")
     if use_mtl:
         print(f"  ✓ Multi-Task Learning - win, material, check predictions")
+    if use_swa:
+        print(f"  ✓ Stochastic Weight Averaging - better generalization with large batches")
+    if value_head_lr_factor != 1.0:
+        print(f"  ✓ Per-layer LR - value head at {value_head_lr_factor}x to prevent overfitting")
     print("="*70)
 
 

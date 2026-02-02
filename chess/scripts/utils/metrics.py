@@ -36,9 +36,9 @@ class MetricsCalculator:
         
         Args:
             policy_pred: Policy logits (B, 4096) - log probabilities
-            value_pred: Value predictions (B, 1)
+            value_pred: Value predictions (B, 3) - WDL logits OR (B, 1) - scalar
             target_move: Target move indices (B,)
-            target_value: Target values (B, 1)
+            target_value: Target values (B, 1) or (B,) - scalar values
             legal_moves_mask: Optional binary mask of legal moves (B, 4096)
         """
         batch_size = policy_pred.size(0)
@@ -67,9 +67,27 @@ class MetricsCalculator:
         
         # ============================================================
         # VALUE MAE (Mean Absolute Error)
+        # 🆕 Handle WDL predictions by converting to scalar
         # ============================================================
         
-        value_mae = torch.abs(value_pred.squeeze() - target_value.squeeze())
+        # Check if value_pred is WDL (3 logits) or scalar (1 value)
+        if value_pred.dim() == 2 and value_pred.size(1) == 3:
+            # WDL format: convert to scalar
+            # value_pred: (B, 3) logits
+            wdl_probs = torch.softmax(value_pred, dim=1)
+            # Scalar: W*1.0 + D*0.0 + L*(-1.0)
+            value_scalar = (wdl_probs[:, 0] * 1.0 + 
+                           wdl_probs[:, 1] * 0.0 + 
+                           wdl_probs[:, 2] * (-1.0))
+        else:
+            # Legacy scalar format
+            value_scalar = value_pred.squeeze()
+        
+        # Ensure target_value is 1D
+        if target_value.dim() > 1:
+            target_value = target_value.squeeze()
+        
+        value_mae = torch.abs(value_scalar - target_value)
         self.value_abs_errors.extend(value_mae.cpu().tolist())
         
         # ============================================================
@@ -144,8 +162,20 @@ def compute_batch_metrics(policy_pred, value_pred, target_move, target_value):
     target_expanded = target_move.unsqueeze(1).expand_as(top3_indices)
     top3_acc = (top3_indices == target_expanded).any(dim=1).float().mean().item()
     
-    # Value MAE
-    value_mae = torch.abs(value_pred.squeeze() - target_value.squeeze()).mean().item()
+    # Value MAE - handle WDL
+    if value_pred.dim() == 2 and value_pred.size(1) == 3:
+        # WDL format
+        wdl_probs = torch.softmax(value_pred, dim=1)
+        value_scalar = (wdl_probs[:, 0] * 1.0 + 
+                       wdl_probs[:, 1] * 0.0 + 
+                       wdl_probs[:, 2] * (-1.0))
+    else:
+        value_scalar = value_pred.squeeze()
+    
+    if target_value.dim() > 1:
+        target_value = target_value.squeeze()
+    
+    value_mae = torch.abs(value_scalar - target_value).mean().item()
     
     # Confidence
     policy_probs = torch.exp(policy_pred)

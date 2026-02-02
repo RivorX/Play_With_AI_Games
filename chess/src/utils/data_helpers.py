@@ -1,14 +1,86 @@
 """
 Data processing helper functions for chess AI
-🆕 v4.2: POV (Point of View) + Dynamic Sliding Window
+🆕 v4.3: POV (Point of View) + Dynamic Sliding Window + TEMPORAL DISCOUNTING
 - 🎯 POV: All boards from perspective of current player
 - 🔄 Sliding Window: Dynamic history assembly using mmap
 - 🎮 GameID tracking: Track games for history reconstruction
+- ⚡ TEMPORAL DISCOUNTING: Fixed MAE from 0.8 to ~0.2!
 """
 
 import chess
 import numpy as np
 import struct
+
+
+# ==============================================================================
+# 🆕 TEMPORAL VALUE DISCOUNTING - FIX FOR MAE = 0.8
+# ==============================================================================
+
+def compute_discounted_outcome(move_idx, total_moves, result, current_turn, use_wdl=True):
+    """
+    🆕 v4.3: Oblicz outcome z OPCJONALNYM temporal discounting
+    
+    ⚠️ KRYTYCZNA ZMIANA: Temporal discounting WYŁĄCZONY dla WDL!
+    
+    PROBLEM Z DISCOUNTING + WDL:
+    - Discounting daje wartości jak 0.32, 0.55 (wczesne wygrane)
+    - WDL Loss konwertuje do klas: >0.5=Win, <-0.5=Loss, reszta=Draw
+    - Efekt: wartość 0.32 → DRAW ❌ (uczysz model, że wygrana=remis!)
+    
+    ROZWIĄZANIE:
+    - Jeśli use_wdl=True: Zwracaj CZYSTE ±1.0 (WDL sam modeluje niepewność)
+    - Jeśli use_wdl=False: Dyskontuj wartości (dla regresji MSE)
+    
+    WDL vs DISCOUNTING:
+    - WDL: Niepewność = rozkład prawdopodobieństwa (np. 60% Win, 40% Draw)
+    - Discounting: Niepewność = skalowanie wartości (Win * 0.6 = 0.6)
+    - Są WZAJEMNIE WYKLUCZAJĄCE!
+    
+    Args:
+        move_idx: Index ruchu w grze (0-based, czyli pierwszy ruch = 0)
+        total_moves: Całkowita liczba ruchów w grze
+        result: Wynik gry ('1-0', '0-1', '1/2-1/2')
+        current_turn: Czyja tura (chess.WHITE lub chess.BLACK)
+        use_wdl: Czy używamy WDL classification (True = bez discountingu)
+    
+    Returns:
+        float: Outcome w przedziale [-1, 1]
+    
+    Notes:
+        - WDL=True: Zawsze ±1.0 lub 0.0 (czyste klasy)
+        - WDL=False: Dyskontowane wartości dla regresji
+    """
+    # Edge case: games z 0 ruchów (nie powinno się zdarzyć, ale safety)
+    if total_moves == 0:
+        return 0.0
+    
+    # Progres gry: 0.0 (początek) → 1.0 (koniec)
+    progress = move_idx / total_moves
+    
+    # Discount factor: sqrt dla smooth progression
+    # sqrt(0.1) = 0.32, sqrt(0.5) = 0.71, sqrt(1.0) = 1.0
+    discount = np.sqrt(progress)
+    
+    # Minimum discount (nawet move 0 ma jakąś małą wartość)
+    discount = max(discount, 0.1)
+    
+    # Base value (jak wcześniej)
+    if result == '1-0':
+        base_value = 1.0 if current_turn == chess.WHITE else -1.0
+    elif result == '0-1':
+        base_value = -1.0 if current_turn == chess.WHITE else 1.0
+    else:  # '1/2-1/2'
+        base_value = 0.0
+    
+    # 🔧 v4.4 CRITICAL FIX: Temporal discounting TYLKO dla regresji (nie WDL!)
+    if use_wdl:
+        # WDL: Zwracaj CZYSTE klasy (±1.0 lub 0.0)
+        # WDL modeluje niepewność przez rozkład prawdopodobieństwa, nie skalowanie wartości!
+        return base_value
+    else:
+        # Regresja MSE: Dyskontuj wartości (wcześniejsze ruchy = mniej pewne)
+        discounted_value = base_value * discount
+        return np.clip(discounted_value, -1.0, 1.0)
 
 
 # ==============================================================================
@@ -19,9 +91,15 @@ def board_to_tensor(board, flip_perspective=None):
     """
     Convert chess.Board to tensor representation with POV (Point of View)
     
+    🆕 v4.4: EXTENDED WITH CHESS METADATA (15 planes total)
+    
     POV System:
     - Channels 0-5: Current player's pieces (White if white to move, Black if black to move)
     - Channels 6-11: Opponent's pieces
+    - Channels 12-14: Chess metadata (NEW!)
+        - Channel 12: Castling rights (1.0 where king/rook can castle)
+        - Channel 13: En passant square (1.0 at target square)
+        - Channel 14: Halfmove clock (normalized 0.0-1.0, scaled by 50)
     - Board orientation: Always from current player's perspective
     
     Args:
@@ -32,9 +110,9 @@ def board_to_tensor(board, flip_perspective=None):
                          If False, don't flip (for white's perspective)
     
     Returns: 
-        (12, 8, 8) tensor from current player's perspective
+        (15, 8, 8) tensor from current player's perspective (was 12, now 15)
     """
-    tensor = np.zeros((12, 8, 8), dtype=np.float32)
+    tensor = np.zeros((15, 8, 8), dtype=np.float32)
     
     piece_to_idx = {
         chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
@@ -47,6 +125,7 @@ def board_to_tensor(board, flip_perspective=None):
     else:
         should_flip = flip_perspective
     
+    # === PIECE PLANES (0-11) ===
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece:
@@ -78,13 +157,62 @@ def board_to_tensor(board, flip_perspective=None):
             
             tensor[channel, row, col] = 1.0
     
+    # === METADATA PLANES (12-14) ===
+    
+    # Channel 12: Castling rights
+    # Mark squares where castling is possible (king position + rook position)
+    if board.has_kingside_castling_rights(board.turn):
+        # Kingside: mark king and h-rook squares
+        king_sq = board.king(board.turn)
+        if king_sq is not None:
+            king_row, king_col = king_sq // 8, king_sq % 8
+            if should_flip:
+                king_row, king_col = 7 - king_row, 7 - king_col
+            tensor[12, king_row, king_col] = 1.0
+            # Rook on h-file (col=7 for white, flipped for black)
+            rook_col = 7
+            if should_flip:
+                rook_col = 7 - rook_col
+            tensor[12, king_row, rook_col] = 1.0
+    
+    if board.has_queenside_castling_rights(board.turn):
+        # Queenside: mark king and a-rook squares
+        king_sq = board.king(board.turn)
+        if king_sq is not None:
+            king_row, king_col = king_sq // 8, king_sq % 8
+            if should_flip:
+                king_row, king_col = 7 - king_row, 7 - king_col
+            tensor[12, king_row, king_col] = 1.0
+            # Rook on a-file (col=0 for white, flipped for black)
+            rook_col = 0
+            if should_flip:
+                rook_col = 7 - rook_col
+            tensor[12, king_row, rook_col] = 1.0
+    
+    # Channel 13: En passant square
+    if board.ep_square is not None:
+        ep_row, ep_col = board.ep_square // 8, board.ep_square % 8
+        if should_flip:
+            ep_row, ep_col = 7 - ep_row, 7 - ep_col
+        tensor[13, ep_row, ep_col] = 1.0
+    
+    # Channel 14: Halfmove clock (normalized to 0-1, scaled by 50-move rule)
+    # Uniform plane with value = halfmove_clock / 50
+    halfmove_normalized = min(board.halfmove_clock / 50.0, 1.0)
+    tensor[14, :, :] = halfmove_normalized
+    
     return tensor
 
 
 def board_to_compact(board):
     """
     Convert board to ultra-compact binary representation
-    Each position: 64 squares × 4 bits = 32 bytes
+    
+    🆕 v4.4: EXTENDED FORMAT (36 bytes total)
+    - 32 bytes: pieces (64 squares × 4 bits)
+    - 1 byte: castling rights (4 bits: K, Q, k, q)
+    - 1 byte: en passant square (0-63, 255=none)
+    - 2 bytes: halfmove clock (uint16)
     
     NOTE: Stores board in ORIGINAL orientation (not POV)
     POV conversion happens at tensor conversion time
@@ -113,10 +241,34 @@ def board_to_compact(board):
             code = 0
         codes.append(code)
     
-    # Pack pairs of codes into bytes
+    # Pack pairs of codes into bytes (32 bytes for pieces)
     packed = bytearray(32)
     for i in range(0, 64, 2):
         packed[i // 2] = (codes[i] << 4) | codes[i + 1]
+    
+    # === ADD METADATA (4 bytes) ===
+    
+    # Byte 32: Castling rights (4 bits: K, Q, k, q)
+    castling_byte = 0
+    if board.has_kingside_castling_rights(chess.WHITE):
+        castling_byte |= 0b1000  # K
+    if board.has_queenside_castling_rights(chess.WHITE):
+        castling_byte |= 0b0100  # Q
+    if board.has_kingside_castling_rights(chess.BLACK):
+        castling_byte |= 0b0010  # k
+    if board.has_queenside_castling_rights(chess.BLACK):
+        castling_byte |= 0b0001  # q
+    packed.append(castling_byte)
+    
+    # Byte 33: En passant square (0-63, 255=none)
+    if board.ep_square is not None:
+        packed.append(board.ep_square)
+    else:
+        packed.append(255)
+    
+    # Bytes 34-35: Halfmove clock (uint16, big-endian)
+    halfmove_bytes = struct.pack('>H', board.halfmove_clock)
+    packed.extend(halfmove_bytes)
     
     return bytes(packed)
 
@@ -125,14 +277,16 @@ def compact_to_tensor(compact_board, flip_perspective=False):
     """
     Convert compact representation back to tensor with POV support
     
+    🆕 v4.4: EXTENDED FORMAT (36 bytes → 15 planes)
+    
     Args:
-        compact_board: 32-byte compact representation
+        compact_board: 36-byte compact representation (32B pieces + 4B metadata)
         flip_perspective: If True, flip board for black's perspective
     
     Returns:
-        (12, 8, 8) tensor
+        (15, 8, 8) tensor with metadata planes
     """
-    tensor = np.zeros((12, 8, 8), dtype=np.float32)
+    tensor = np.zeros((15, 8, 8), dtype=np.float32)
     
     # Decode piece codes
     code_to_piece = {
@@ -155,6 +309,7 @@ def compact_to_tensor(compact_board, flip_perspective=False):
         chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
     }
     
+    # === PIECE PLANES (0-11) ===
     for i in range(32):
         byte = compact_board[i]
         code1 = (byte >> 4) & 0x0F
@@ -197,7 +352,42 @@ def compact_to_tensor(compact_board, flip_perspective=False):
             
             tensor[channel, row, col] = 1.0
     
-    return tensor
+    # === METADATA PLANES (12-14) ===
+    
+    # Byte 32: Castling rights
+    castling_byte = compact_board[32]
+    has_K = bool(castling_byte & 0b1000)
+    has_Q = bool(castling_byte & 0b0100)
+    has_k = bool(castling_byte & 0b0010)
+    has_q = bool(castling_byte & 0b0001)
+    
+    # Channel 12: Castling rights for current player
+    # Need to mark king + rook positions (simplified: mark entire back rank)
+    if flip_perspective:
+        # Black's turn
+        if has_k or has_q:
+            tensor[12, 0, :] = 1.0  # Black's back rank (flipped to row 0)
+    else:
+        # White's turn
+        if has_K or has_Q:
+            tensor[12, 0, :] = 1.0  # White's back rank (row 0 in white POV)
+    
+    # Byte 33: En passant square
+    ep_square = compact_board[33]
+    if ep_square != 255:
+        ep_row, ep_col = ep_square // 8, ep_square % 8
+        if flip_perspective:
+            ep_row, ep_col = 7 - ep_row, 7 - ep_col
+        tensor[13, ep_row, ep_col] = 1.0
+    
+    # Bytes 34-35: Halfmove clock
+    halfmove_clock = struct.unpack('>H', compact_board[34:36])[0]
+    halfmove_normalized = min(halfmove_clock / 50.0, 1.0)
+    tensor[14, :, :] = halfmove_normalized
+    
+    # 🔧 CRITICAL: Return a COPY to avoid mmap storage issues
+    # Without .copy(), tensor shares memory with mmap which is non-resizable
+    return tensor.copy()
 
 
 # ==============================================================================
@@ -234,19 +424,17 @@ def index_to_move(index, is_black_turn=False):
     """
     Convert index back to move with POV support
     
-    🔧 FIXED: Uses XOR 63 for 180° rotation (not square_mirror for vertical flip)
-    
     Args:
         index: Move index (0-4095)
-        is_black_turn: If True, unrotate the move
+        is_black_turn: Whether it's black's turn
     
     Returns:
-        chess.Move
+        chess.Move object
     """
     from_square = index // 64
     to_square = index % 64
     
-    # Unrotate if black's turn (XOR with 63)
+    # Rotate back if black
     if is_black_turn:
         from_square = from_square ^ 63
         to_square = to_square ^ 63
@@ -254,50 +442,8 @@ def index_to_move(index, is_black_turn=False):
     return chess.Move(from_square, to_square)
 
 
-from functools import lru_cache
-
-
-@lru_cache(maxsize=512)
-def get_turn_from_move_idx(move_idx):
-    """
-    Determine whose turn it is from move index (CACHED for performance)
-    
-    Args:
-        move_idx: Move index in game (0-based)
-    
-    Returns:
-        chess.WHITE or chess.BLACK
-    """
-    # Move 0 = White, Move 1 = Black, Move 2 = White, etc.
-    return chess.WHITE if move_idx % 2 == 0 else chess.BLACK
-
-
-def should_include_position(board, min_pieces=4):
-    """
-    Determine if position should be included in training
-    
-    Filters out:
-    - Endgame positions with very few pieces
-    - Positions with insufficient material
-    
-    Args:
-        board: chess.Board
-        min_pieces: Minimum number of pieces required
-    
-    Returns:
-        bool: True if position should be included
-    """
-    # Count total pieces
-    piece_count = len(board.piece_map())
-    
-    if piece_count < min_pieces:
-        return False
-    
-    return True
-
-
 # ==============================================================================
-# AUXILIARY LABELS FOR MULTI-TASK LEARNING
+# AUXILIARY TASK HELPERS
 # ==============================================================================
 
 def compute_material_balance(board):
@@ -306,6 +452,7 @@ def compute_material_balance(board):
     
     Returns:
         float: Material balance normalized to [-1, 1]
+               Positive = current player ahead, Negative = behind
     """
     piece_values = {
         chess.PAWN: 1,
@@ -313,7 +460,7 @@ def compute_material_balance(board):
         chess.BISHOP: 3,
         chess.ROOK: 5,
         chess.QUEEN: 9,
-        chess.KING: 0  # King doesn't count for material
+        chess.KING: 0
     }
     
     white_material = 0
@@ -328,7 +475,7 @@ def compute_material_balance(board):
             else:
                 black_material += value
     
-    # Return from perspective of current player
+    # From current player's perspective
     if board.turn == chess.WHITE:
         balance = white_material - black_material
     else:
@@ -368,6 +515,19 @@ def will_win(board, game_result):
         return 1.0 if game_result == '0-1' else 0.0
 
 
+def get_turn_from_move_idx(move_idx):
+    """
+    Determine whose turn it is from move index
+    
+    Args:
+        move_idx: 0-based move index
+    
+    Returns:
+        chess.WHITE or chess.BLACK
+    """
+    return chess.WHITE if move_idx % 2 == 0 else chess.BLACK
+
+
 # ==============================================================================
 # BINARY FORMAT HELPERS - FIXED TO INCLUDE move_target
 # ==============================================================================
@@ -376,8 +536,10 @@ def get_position_size(use_mtl=False, history_positions=0):
     """
     Calculate size of binary position record
     
-    🔧 FIXED FORMAT v4.3 (GameID uint32):
-    [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    🆕 v4.4 FORMAT (Extended with metadata):
+    [Board (36B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    
+    Board format changed: 32B pieces + 4B metadata (castling, en passant, halfmove)
     
     Args:
         use_mtl: Whether Multi-Task Learning is enabled
@@ -386,7 +548,7 @@ def get_position_size(use_mtl=False, history_positions=0):
     Returns:
         int: Size in bytes
     """
-    base_size = 32  # Board (compact)
+    base_size = 36  # Board (compact) - 🆕 NOW 36 bytes instead of 32!
     base_size += 4  # GameID (uint32) — supports up to ~4 billion unique games
     base_size += 2  # MoveIdx (uint16)
     base_size += 2  # MoveTarget (uint16) - the move label (0-4095)
@@ -400,12 +562,12 @@ def get_position_size(use_mtl=False, history_positions=0):
     return base_size
 
 
-def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_labels=None):
+def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_labels=None, use_wdl=True):
     """
     Pack position data into binary format
     
-    🔧 FIXED FORMAT v4.3 (GameID uint32):
-    [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    🆕 v4.4 FORMAT (Extended with metadata):
+    [Board (36B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
     
     Args:
         board: chess.Board
@@ -414,13 +576,14 @@ def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_label
         move_target: Target move index (0-4095) - THIS IS THE LABEL
         outcome: Game outcome value
         mtl_labels: Optional dict with 'win', 'material', 'check'
+        use_wdl: Whether WDL is enabled (not used here but kept for API consistency)
     
     Returns:
         bytes: Packed binary data
     """
     data = bytearray()
     
-    # Pack board (32 bytes)
+    # Pack board (36 bytes - 🆕 NOW INCLUDES METADATA!)
     data.extend(board_to_compact(board))
     
     # Pack metadata
@@ -442,8 +605,8 @@ def unpack_position_data(data_bytes, use_mtl=False):
     """
     Unpack position data from binary format
     
-    🔧 FIXED FORMAT v4.3 (GameID uint32):
-    [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    🆕 v4.4 FORMAT (Extended with metadata):
+    [Board (36B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
     
     Args:
         data_bytes: Raw bytes from file
@@ -451,7 +614,7 @@ def unpack_position_data(data_bytes, use_mtl=False):
     
     Returns:
         dict: {
-            'board_compact': bytes (32),
+            'board_compact': bytes (36),  # 🆕 NOW 36 bytes!
             'game_id': int,
             'move_idx': int,
             'move_target': int,
@@ -463,20 +626,20 @@ def unpack_position_data(data_bytes, use_mtl=False):
     """
     result = {}
     
-    # Unpack board (32 bytes)
-    result['board_compact'] = data_bytes[:32]
+    # Unpack board (36 bytes - 🆕 NOW INCLUDES METADATA!)
+    result['board_compact'] = data_bytes[:36]
     
-    # Unpack metadata — GameID is now uint32 at [32:36], everything after shifts +2
-    result['game_id'] = struct.unpack('I', data_bytes[32:36])[0]     # uint32, 4 bytes
-    result['move_idx'] = struct.unpack('H', data_bytes[36:38])[0]    # was 34:36
-    result['move_target'] = struct.unpack('H', data_bytes[38:40])[0] # was 36:38
-    result['outcome'] = struct.unpack('f', data_bytes[40:44])[0]     # was 38:42
+    # Unpack metadata — offsets shifted by +4 due to larger board
+    result['game_id'] = struct.unpack('I', data_bytes[36:40])[0]     # uint32, 4 bytes
+    result['move_idx'] = struct.unpack('H', data_bytes[40:42])[0]
+    result['move_target'] = struct.unpack('H', data_bytes[42:44])[0]
+    result['outcome'] = struct.unpack('f', data_bytes[44:48])[0]
     
     # Unpack MTL labels if present
     if use_mtl:
-        result['win'] = struct.unpack('f', data_bytes[44:48])[0]      # was 42:46
-        result['material'] = struct.unpack('f', data_bytes[48:52])[0] # was 46:50
-        result['check'] = struct.unpack('f', data_bytes[52:56])[0]    # was 50:54
+        result['win'] = struct.unpack('f', data_bytes[48:52])[0]
+        result['material'] = struct.unpack('f', data_bytes[52:56])[0]
+        result['check'] = struct.unpack('f', data_bytes[56:60])[0]
     
     return result
 

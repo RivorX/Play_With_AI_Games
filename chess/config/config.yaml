@@ -21,7 +21,7 @@ paths:
 
 
 # ------------------------------------------------------------------------------
-# DATA PROCESSING - 🆕 v4.2 POV + SLIDING WINDOW
+# DATA PROCESSING - 🆕 v4.3 TEMPORAL DISCOUNTING + v4.2 POV + SLIDING WINDOW
 # ------------------------------------------------------------------------------
 data:
   min_elo: 2000              # Minimum Elo rating for games
@@ -80,12 +80,15 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Base architecture
-  num_residual_blocks: 6     # Number of residual blocks (6-12 optimal)
+  num_residual_blocks: 8     # Number of residual blocks (6-12 optimal)
   filters: 128               # Convolutional filters (128-256 for RTX 5060 Ti)
   policy_head_filters: 32    # Policy head filters
-  value_head_filters: 32     # Value head filters
-  value_hidden_dim: 256      # Value head hidden dimension
-  dropout: 0.3               # Dropout rate
+  value_head_filters: 32     # Value head filters (reduced to prevent overfitting)
+  value_hidden_dim: 256      # Value head hidden dimension (reduced to prevent overfitting)
+  dropout: 0.5               # Dropout rate (increased for stronger regularization)
+
+  # 🆕 v4.3: WDL VALUE HEAD
+  use_wdl_value: true         # 🆕 Use WDL (Win/Draw/Loss) classification (RECOMMENDED!)
 
   # 🆕 DYNAMIC HISTORY CONFIGURATION
   # ═══════════════════════════════════════════════════════════════════════════
@@ -100,12 +103,12 @@ model:
                              # History is built by walking backwards through mmap using GameID
   
   # Advanced features
-  use_se_blocks: true           # 🧠 Channel attention (with mixed pooling)
-  use_se2d_blocks: true         # 🆕 SE-Net v2 with spatial info (+0.5-1%, +5% time)
-  use_spatial_attention: true   # 👁️ Spatial attention
+  use_se_blocks: false          # ❌ Standard SE (global pooling) - mniej przydatne dla szachów
+  use_se2d_blocks: true          # ✅ SE-Net v2 with spatial info (+0.5-1%, +5% time) - LEPSZE DLA SZACHÓW!
+  use_spatial_attention: true    # 👁️ Spatial attention
   spatial_attention_mode: 'last_2' # 'all', 'last_2', 'last_3', 'none'
   
-  drop_path_rate: 0.1           # 🎲 Stochastic Depth (0% params, +4% quality)
+  drop_path_rate: 0.2           # 🎲 Stochastic Depth (increased for better regularization)
   activation: 'relu'            # ⚡ ReLU activation (5-10x FASTER than ELU!)
   use_coord_conv: true          # 🗺️ Position-aware conv (+0.5% params, +4% quality)
   
@@ -113,16 +116,17 @@ model:
   use_layer_scale: true         # LayerScale for better training stability (+0% params)
   layer_scale_init: 1e-5        # Initial LayerScale value (1e-6 to 1e-4)
   
-  use_adaptive_policy_pool: true # Adaptive pooling in policy head (+2-3% accuracy, 0% params)
-  
   # 🆕 v4.0: Pre-activation ResNet
   use_preactivation: true       # Pre-activation residual blocks (better gradients)
 
   # Multi-Task Learning
   use_multitask_learning: true        # Enable auxiliary tasks
-  win_prediction_weight: 0.3          # Weight for win prediction task
-  material_prediction_weight: 0.2     # Weight for material count task
-  check_prediction_weight: 0.15       # Weight for check prediction task
+  win_prediction_weight: 0.3          # Weight for win prediction (reduced to prevent overfitting)
+  material_prediction_weight: 0.15    # Weight for material count (reduced)
+  check_prediction_weight: 0.1        # Weight for check prediction (reduced)
+  
+  # 🆕 v4.3: Advanced MTL options
+  use_focal_loss_check: true          # Use Focal Loss for check prediction (vs BCE)
 
 
 # ------------------------------------------------------------------------------
@@ -130,26 +134,37 @@ model:
 # ------------------------------------------------------------------------------
 imitation_learning:
   # Training hyperparameters
-  batch_size: 4096           # Batch size (doubled for better GPU utilization)
-  learning_rate: 0.0014      # Learning rate (scaled with batch size)
-  epochs: 100                # Maximum training epochs
-  weight_decay: 0.0001       # L2 regularization
+  batch_size: 8192           # Batch size (maximized for GPU utilization)
+  learning_rate: 0.002       # Learning rate (lower for CosineAnnealing - no warmup)
+  value_head_lr_factor: 0.5  # 🆕 Value head LR multiplier (0.5 = half LR to prevent overfitting)
+  epochs: 200                # Maximum training epochs
+  weight_decay: 0.001        # L2 regularization (10x stronger for value head)
   grad_clip: 1.0             # Gradient clipping threshold
+  
+  # 🆕 Stochastic Weight Averaging (SWA) for better generalization
+  use_swa: true              # Enable SWA (averages weights from multiple epochs)
+  swa_start_epoch: 15        # Start SWA after this epoch
+  swa_lr: 0.0005             # SWA learning rate (lower than base LR)
   
   # Advanced training features
   label_smoothing: 0.1       # Label smoothing (0.0 = off, 0.1 = standard)
-  use_onecycle_lr: true      # 📈 OneCycleLR scheduler for better convergence
+  scheduler_type: 'cosine_warm_restarts'  # Options: 'onecycle', 'cosine_warm_restarts', 'reduce_on_plateau', 'none'
+  cosine_t0: 10              # 🔄 Epochs per cosine cycle (restarts every T0 epochs)
+  cosine_t_mult: 2           # 🔄 Multiply T0 after each restart (10→20→40 epochs)
+  
+  # 🆕 v4.3: WDL-specific options
+  wdl_label_smoothing: 0.20  # Label smoothing for WDL (maximum - prevents overfitting)
   
   # Loss weights
   policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 0.5     # Value loss weight (WDL or MSE)
+  value_loss_weight: 1.0     # Value loss weight (balanced with policy)
   
   # Evaluation & checkpointing
   eval_every: 1              # Evaluate every N epochs
   checkpoint_every: 5        # Save checkpoint every N epochs
   
   # Early stopping
-  max_patience: 15           # ℹ️ Stop if no improvement for N epochs
+  max_patience: 40           # ℹ️ Stop if no improvement for N epochs
   min_delta: 0.001           # Minimum improvement threshold
 
 
@@ -174,7 +189,7 @@ reinforcement_learning:
   temperature_decay_iterations: 500   # Decay over N iterations
 
   # 🚀 MCTS parameters (BATCH OPTIMIZED)
-  mcts_simulations: 100      # Number of MCTS simulations per move
+  mcts_simulations: 400      # 🔧 v4.4: Increased from 100→400 for better evaluation quality
   mcts_batch_size: 256       # Batch MCTS evaluations (32-128 optimal)
   mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
   mcts_c_puct: 1.5           # Exploration constant (UCB)

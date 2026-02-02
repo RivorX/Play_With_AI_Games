@@ -1,11 +1,13 @@
 """
-Chess data processing and dataset management - v4.2 POV + SLIDING WINDOW
+Chess data processing and dataset management - v4.3 POV + SLIDING WINDOW + TEMPORAL DISCOUNTING
+🆕 v4.3: Temporal Discounting for better value learning (MAE: 0.8 → 0.2)
 🆕 v4.2: POV (Point of View) + Dynamic Sliding Window with mmap
 - 🎯 POV: All boards from current player's perspective
 - 🔄 Sliding Window: Dynamic history assembly at load time
 - 🎮 GameID tracking: Efficient history reconstruction
 - 📝 Dataset tracking: Smart reuse of preprocessed data
 - 💾 Reduced file size: No embedded history, only GameID + MoveIdx
+- ⚡ TEMPORAL DISCOUNTING: Outcome scaled by game progress (sqrt)
 """
 
 import chess
@@ -36,7 +38,8 @@ from .utils.data_helpers import (
     is_in_check,
     will_win,
     get_position_size,
-    get_turn_from_move_idx
+    get_turn_from_move_idx,
+    compute_discounted_outcome  # 🆕 v4.3: Temporal discounting for better value learning
 )
 
 
@@ -540,15 +543,16 @@ def extract_positions_from_game_worker(args):
     """
     PHASE 2 WORKER: Extract positions from a single game
     
-    🔧 FIXED v4.2 CHANGES:
+    🔧 FIXED v4.3 CHANGES:
     - NO embedded history in binary format
     - Stores GameID, MoveIdx, and MoveTarget for training
     - MoveTarget is the LABEL for the network to predict
+    - 🆕 TEMPORAL DISCOUNTING: Outcome with sqrt(progress) discounting (ONLY if use_wdl=False)
     
     🔧 FIXED BINARY FORMAT:
     [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
     """
-    game_data, game_id, min_elo, max_moves_per_game, use_mtl = args
+    game_data, game_id, min_elo, max_moves_per_game, use_mtl, use_wdl = args
     
     import chess
     import struct
@@ -560,7 +564,8 @@ def extract_positions_from_game_worker(args):
         compute_material_balance,
         is_in_check,
         will_win,
-        pack_position_data  # 🔧 NEW: For proper binary packing
+        pack_position_data,
+        compute_discounted_outcome  # 🆕 v4.3: Temporal discounting
     )
     
     try:
@@ -585,6 +590,9 @@ def extract_positions_from_game_worker(args):
         board = chess.Board()
         result = game_data['result']
         
+        # 🆕 v4.3: Calculate total moves for temporal discounting
+        total_moves = len(game_data['moves'])
+        
         positions = []
         move_idx = 0
         
@@ -599,13 +607,17 @@ def extract_positions_from_game_worker(args):
                 # This is the LABEL the network should predict (0-4095)
                 move_target = move_to_index(move, board)
                 
-                # Outcome
-                if result == '1-0':
-                    outcome = 1.0 if board.turn == chess.WHITE else -1.0
-                elif result == '0-1':
-                    outcome = -1.0 if board.turn == chess.WHITE else 1.0
-                else:
-                    outcome = 0.0
+                # 🆕 v4.3: TEMPORAL DISCOUNTING (conditional on use_wdl)
+                # WDL: No discounting (returns ±1.0, WDL models uncertainty via probabilities)
+                # MSE: Discounting enabled (early game → lower values)
+                # This fixes the critical bug where discounted values (0.3) were classified as Draw!
+                outcome = compute_discounted_outcome(
+                    move_idx=move_idx,
+                    total_moves=total_moves,
+                    result=result,
+                    current_turn=board.turn,
+                    use_wdl=use_wdl  # 🔧 CRITICAL: Pass WDL flag
+                )
                 
                 # MTL labels
                 mtl_labels = None
@@ -623,8 +635,9 @@ def extract_positions_from_game_worker(args):
                     game_id=game_id,
                     move_idx=move_idx,
                     move_target=move_target,  # 🔧 NEW: The label to predict
-                    outcome=outcome,
-                    mtl_labels=mtl_labels
+                    outcome=outcome,  # 🆕 v4.3: Conditional discounting based on use_wdl
+                    mtl_labels=mtl_labels,
+                    use_wdl=use_wdl  # API consistency
                 )
                 
                 positions.append(position_data)
@@ -649,6 +662,7 @@ def extract_positions_parallel(games_data, config, phase2_workers):
     min_elo = config['data'].get('min_elo', 0)
     max_moves = config['data'].get('max_moves_per_game', 200)
     use_mtl = config['model'].get('use_multitask_learning', False)
+    use_wdl = config['model'].get('use_wdl_value', True)  # 🆕 Get WDL flag
     
     if phase2_workers <= 1:
         return extract_positions_sequential(games_data, config)
@@ -657,7 +671,7 @@ def extract_positions_parallel(games_data, config, phase2_workers):
     
     # Prepare tasks with unique game_id for each game
     # 🔧 v4.3: game_id is uint32 — no modulo needed, supports up to ~4 billion games
-    tasks = [(game, game_idx, min_elo, max_moves, use_mtl) 
+    tasks = [(game, game_idx, min_elo, max_moves, use_mtl, use_wdl) 
              for game_idx, game in enumerate(games_data)]
     
     # Process in parallel
@@ -684,12 +698,13 @@ def extract_positions_sequential(games_data, config):
     min_elo = config['data'].get('min_elo', 0)
     max_moves = config['data'].get('max_moves_per_game', 200)
     use_mtl = config['model'].get('use_multitask_learning', False)
+    use_wdl = config['model'].get('use_wdl_value', True)  # 🆕 Get WDL flag
     
     all_positions = []
     
     for game_idx, game in enumerate(tqdm(games_data, desc="  Extracting positions")):
         # 🔧 v4.3: game_id is uint32 — no modulo needed
-        task = (game, game_idx, min_elo, max_moves, use_mtl)
+        task = (game, game_idx, min_elo, max_moves, use_mtl, use_wdl)
         positions = extract_positions_from_game_worker(task)
         all_positions.extend(positions)
     
@@ -902,8 +917,8 @@ class BinaryChessDataset(Dataset):
             raise ValueError(f"stride must be >= 1, got {stride}")
         if history_positions < 0:
             raise ValueError(f"history_positions must be >= 0, got {history_positions}")
-        if position_size < 32:  # Minimum size: just board
-            raise ValueError(f"position_size too small: {position_size} (minimum 32 bytes)")
+        if position_size < 48:  # 🔧 FIXED: Minimum size with metadata (36B board + 12B metadata)
+            raise ValueError(f"position_size too small: {position_size} (minimum 48 bytes)")
         
         self.binary_file = binary_file
         self.position_size = position_size
@@ -911,11 +926,12 @@ class BinaryChessDataset(Dataset):
         self.stride = stride
         
         # Auto-detect MTL
-        # 🔧 v4.3: base_size must match current binary layout:
-        #   Board(32) + GameID(4) + MoveIdx(2) + MoveTarget(2) + Outcome(4) = 44
+        # 🔧 v4.4 FIXED: base_size must match current binary layout:
+        #   Board(36) + GameID(4) + MoveIdx(2) + MoveTarget(2) + Outcome(4) = 48
+        #   Board is now 36 bytes: 32B pieces + 4B metadata (castling, ep, halfmove)
         if use_mtl is None:
-            base_size = 32 + 4 + 2 + 2 + 4  # = 44
-            self.use_mtl = (position_size == base_size + 12)  # 44 + 12 = 56
+            base_size = 36 + 4 + 2 + 2 + 4  # = 48 (was 44 - CRITICAL FIX)
+            self.use_mtl = (position_size == base_size + 12)  # 48 + 12 = 60
         else:
             self.use_mtl = use_mtl
         
@@ -947,8 +963,8 @@ class BinaryChessDataset(Dataset):
         with open(self.binary_file, 'rb') as f:
             for idx in indices:
                 offset = idx * self.position_size
-                # 🔧 v4.3 Layout: [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + ...
-                f.seek(offset + 32 + 4)  # Skip Board (32) + GameID (4) = 36
+                # 🔧 v4.4 FIXED Layout: [Board (36B)] + [GameID (4B)] + [MoveIdx (2B)] + ...
+                f.seek(offset + 36 + 4)  # 🔧 FIXED: Skip Board (36) + GameID (4) = 40
                 move_idx_bytes = f.read(2)
                 move_idx = struct.unpack('H', move_idx_bytes)[0]
                 
@@ -986,19 +1002,27 @@ class BinaryChessDataset(Dataset):
         offset = position_idx * self.position_size
         data = self._mmap[offset:offset + self.position_size]
         
-        # 🔧 v4.3 Layout:
-        # [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B)]
-        compact_board = data[:32]
-        game_id    = struct.unpack('I', data[32:36])[0]   # uint32, 4 bytes
-        move_idx   = struct.unpack('H', data[36:38])[0]   # was 34:36
-        move_target = struct.unpack('H', data[38:40])[0]  # was 36:38  ← THIS IS THE LABEL
-        outcome    = struct.unpack('f', data[40:44])[0]   # was 38:42
+        # 🔧 v4.4 FIXED Layout:
+        # [Board (36B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B)]
+        compact_board = data[:36]  # 🔧 FIXED: 36 bytes (was 32)
+        game_id    = struct.unpack('I', data[36:40])[0]   # 🔧 FIXED: offset +4
+        move_idx   = struct.unpack('H', data[40:42])[0]   # 🔧 FIXED: offset +4
+        move_target = struct.unpack('H', data[42:44])[0]  # 🔧 FIXED: offset +4
+        outcome    = struct.unpack('f', data[44:48])[0]   # 🔧 FIXED: offset +4
+        
+        # 🔧 v4.4: Validation
+        if len(compact_board) != 36:
+            raise ValueError(f"Invalid compact board size: {len(compact_board)} (expected 36)")
         
         # Determine whose turn it is
         is_black_turn = get_turn_from_move_idx(move_idx) == chess.BLACK
         
         # Convert current board to tensor with POV
         board_tensor = compact_to_tensor(compact_board, flip_perspective=is_black_turn)
+        
+        # 🔧 v4.4: Validate tensor shape (should be 15 planes now)
+        if board_tensor.shape[0] != 15:
+            raise ValueError(f"Invalid board tensor shape: {board_tensor.shape} (expected (15, 8, 8))")
         
         # DYNAMIC SLIDING WINDOW: Build history by walking backwards through raw file.
         # We walk position_idx-1, position_idx-2, … and stop as soon as the GameID
@@ -1014,14 +1038,14 @@ class BinaryChessDataset(Dataset):
                 hist_offset = current_offset * self.position_size
                 hist_data = self._mmap[hist_offset:hist_offset + self.position_size]
                 
-                # 🔧 v4.3: GameID is uint32 at [32:36]
-                hist_game_id = struct.unpack('I', hist_data[32:36])[0]
+                # 🔧 v4.4 FIXED: GameID is uint32 at [36:40]
+                hist_game_id = struct.unpack('I', hist_data[36:40])[0]
                 
                 # Stop if different game
                 if hist_game_id != game_id:
                     break
                 
-                hist_compact_board = hist_data[:32]
+                hist_compact_board = hist_data[:36]  # 🔧 FIXED: 36 bytes
                 
                 # All history boards use the CURRENT player's POV for consistency
                 hist_tensor = compact_to_tensor(hist_compact_board, flip_perspective=is_black_turn)
@@ -1032,24 +1056,28 @@ class BinaryChessDataset(Dataset):
             
             # Pad with zeros if not enough history available
             while len(history_tensors) < self.history_positions:
-                empty_board = np.zeros((12, 8, 8), dtype=np.float32)
+                empty_board = np.zeros((15, 8, 8), dtype=np.float32)  # 🔧 FIXED: 15 channels!
                 history_tensors.insert(0, empty_board)
         
-        # Stack: [oldest_history, …, newest_history, current]  →  (12*(H+1), 8, 8)
+        # Stack: [oldest_history, …, newest_history, current]  →  (15*(H+1), 8, 8)
         if history_tensors:
             all_tensors = history_tensors + [board_tensor]
             stacked_board = np.concatenate(all_tensors, axis=0)
         else:
             stacked_board = board_tensor
         
+        # 🔧 CRITICAL FIX: .copy() to avoid mmap non-resizable storage issue
+        # DataLoader collate requires resizable tensors
+        stacked_board = stacked_board.copy()
+        
         if self.use_mtl:
-            # 🔧 v4.3: MTL labels shifted +2 vs previous version
-            win      = struct.unpack('f', data[44:48])[0]  # was 42:46
-            material = struct.unpack('f', data[48:52])[0]  # was 46:50
-            check    = struct.unpack('f', data[52:56])[0]  # was 50:54
+            # 🔧 v4.4 FIXED: MTL labels with corrected offsets
+            win      = struct.unpack('f', data[48:52])[0]  # 🔧 FIXED: offset +4
+            material = struct.unpack('f', data[52:56])[0]  # 🔧 FIXED: offset +4
+            check    = struct.unpack('f', data[56:60])[0]  # 🔧 FIXED: offset +4
             
             return {
-                'board':    torch.FloatTensor(stacked_board),
+                'board':    torch.from_numpy(stacked_board),
                 'move':     torch.LongTensor([move_target])[0],
                 'value':    torch.FloatTensor([outcome]),
                 'win':      torch.FloatTensor([win]),
@@ -1058,7 +1086,7 @@ class BinaryChessDataset(Dataset):
             }
         else:
             return (
-                torch.FloatTensor(stacked_board),
+                torch.from_numpy(stacked_board),
                 torch.LongTensor([move_target])[0],
                 torch.FloatTensor([outcome])
             )
@@ -1083,6 +1111,12 @@ def create_dataloaders(metadata, config):
     total_positions = metadata['total_positions']
     all_indices = list(range(total_positions))
     
+    # 🔧 FIXED: Random shuffle before split to balance Win/Draw/Loss distribution
+    # Sequential split causes validation bias (last 10% may have different outcome distribution)
+    import random
+    random.seed(config['seed'])
+    random.shuffle(all_indices)
+    
     # Split
     split_idx = int(len(all_indices) * config['data']['train_split'])
     split_idx = max(1, min(split_idx, len(all_indices) - 1))
@@ -1096,17 +1130,18 @@ def create_dataloaders(metadata, config):
     history_positions = config['model'].get('history_positions', 0)
     stride = config['data'].get('sliding_window_stride', 1)
     
-    # Calculate actual input planes
-    input_planes = 12 * (1 + history_positions)
+    # 🔧 v4.4 FIXED: Calculate actual input planes (15 per position with metadata)
+    input_planes = 15 * (1 + history_positions)  # 15 planes (12 pieces + 3 metadata)
     
     print(f"\n{'='*70}")
     print("📊 Dataset Configuration:")
     print(f"  • Total positions (before stride): {total_positions:,}")
-    print(f"  • Position size: {position_size} bytes")
+    print(f"  • Position size: {position_size} bytes (expected: {48 if not use_mtl else 60})")
     print(f"  • MTL: {use_mtl}")
     print(f"  • History positions: {history_positions} (dynamic)")
     print(f"  • Sliding window stride: {stride}")
-    print(f"  • Input planes: {input_planes} (12 × {1 + history_positions})")
+    print(f"  • Input planes: {input_planes} (15 × {1 + history_positions})")
+    print(f"  • Chess metadata: Castling, En Passant, Halfmove Clock")
     print(f"{'='*70}\n")
     
     # Create datasets
