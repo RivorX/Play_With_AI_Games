@@ -1,39 +1,17 @@
 """
-Training and evaluation functions with WDL and move-weighted losses
-🆕 v4.3 UPDATED: Integrated WDL classification and move-weighted training
-
-CRITICAL CHANGES:
-1. Value head now outputs (B, 3) WDL logits instead of (B, 1) scalar
-2. Win prediction uses move-weighted BCE loss
-3. CombinedLoss class simplifies loss computation
+Training and evaluation functions for IL with WDL and move-weighted losses
 """
 
+import time
 import torch
 import torch.nn as nn
-import chess
 from tqdm import tqdm
-import gc
-import time
 
-from .loss import LabelSmoothingNLLLoss, CombinedLoss, WDLLoss, MoveWeightedBCELoss
-from .replay import PrioritizedReplayBuffer
-from .metrics import MetricsCalculator, compute_batch_metrics
+from .loss import LabelSmoothingNLLLoss, CombinedLoss
+from ..shared.metrics import MetricsCalculator
 
-import sys
-from pathlib import Path
-
-# Add src to path for imports
-script_dir = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(script_dir))
-
-from src.mcts import BatchMCTS, select_move_by_visits
-
-
-# ==============================================================================
-# 🆕 v4.3 TRAINING WITH WDL + MOVE WEIGHTING
-# ==============================================================================
-
-def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, scaler, epoch=0, debug_log_file=None):
+def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, scaler,
+                   epoch=0, debug_log_file=None, profile=False):
     """
     🆕 v4.3: Train one epoch with WDL value head and move-weighted losses
     
@@ -54,7 +32,7 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
         debug_log_file: Path to debug log (optional)
     
     Returns:
-        Tuple of (losses_dict, metrics_dict)
+        Tuple of (losses_dict, metrics_dict, profile_stats or None)
     """
     model.train()
     
@@ -93,6 +71,24 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
     metrics_calc = MetricsCalculator()
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+
+    profile_stats = None
+    profile_enabled = bool(profile)
+    if profile_enabled:
+        timers = {
+            'data': 0.0,
+            'forward': 0.0,
+            'backward': 0.0,
+            'optim': 0.0,
+            'metrics': 0.0,
+        }
+        batch_count = 0
+
+        def _sync():
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+
+        data_timer_start = time.perf_counter()
     
     # 🔍 DIAGNOSTIC: Track target distributions (gated by config)
     first_batch_targets = True
@@ -103,6 +99,9 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
     )
     
     for batch_idx, batch_data in enumerate(pbar):
+        if profile_enabled:
+            _sync()
+            timers['data'] += time.perf_counter() - data_timer_start
         # Unpack batch
         if isinstance(batch_data, dict):
             boards = batch_data['board']
@@ -165,6 +164,10 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
         # Mixed precision
         use_amp = config['hardware'].get('use_amp', True)
         amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
+
+        if profile_enabled:
+            _sync()
+            t0 = time.perf_counter()
         
         with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
             # Forward pass
@@ -259,8 +262,18 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
                     material_loss = material_loss.item()
                     check_loss = check_loss.item()
         
+        if profile_enabled:
+            _sync()
+            timers['forward'] += time.perf_counter() - t0
+            t0 = time.perf_counter()
+
         # Backward pass
         scaler.scale(loss).backward()
+
+        if profile_enabled:
+            _sync()
+            timers['backward'] += time.perf_counter() - t0
+            t0 = time.perf_counter()
         
         # Gradient clipping
         grad_clip = config['imitation_learning'].get('grad_clip', 1.0)
@@ -270,6 +283,15 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
         
         scaler.step(optimizer)
         scaler.update()
+        
+        # OneCycleLR must step every batch (after optimizer update)
+        if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
+            scheduler.step()
+
+        if profile_enabled:
+            _sync()
+            timers['optim'] += time.perf_counter() - t0
+            t0 = time.perf_counter()
         
         # Update metrics
         # Note: metrics_calc.update() auto-handles WDL predictions
@@ -312,9 +334,16 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             'policy': f'{total_policy_loss / (batch_idx + 1):.4f}',
             'value': f'{total_value_loss / (batch_idx + 1):.4f}',
         })
+
+        if profile_enabled:
+            _sync()
+            timers['metrics'] += time.perf_counter() - t0
+            batch_count += 1
+            data_timer_start = time.perf_counter()
     
-    # Step scheduler (per-batch for OneCycleLR/CosineAnnealing, NOT for ReduceLROnPlateau)
-    if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+    # Step scheduler per-epoch for non-OneCycle schedulers
+    if scheduler is not None and not isinstance(scheduler, (torch.optim.lr_scheduler.ReduceLROnPlateau,
+                                                           torch.optim.lr_scheduler.OneCycleLR)):
         scheduler.step()
     
     # Compute final metrics
@@ -334,8 +363,20 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
         })
     
     metrics = metrics_calc.compute()
+
+    if profile_enabled:
+        total_profile_time = sum(timers.values())
+        profile_stats = {
+            'data': timers['data'],
+            'forward': timers['forward'],
+            'backward': timers['backward'],
+            'optim': timers['optim'],
+            'metrics': timers['metrics'],
+            'total': total_profile_time,
+            'batches': max(1, batch_count),
+        }
     
-    return losses, metrics
+    return losses, metrics, profile_stats
 
 
 def evaluate_il(model, val_loader, config, device):
@@ -540,110 +581,3 @@ def evaluate_il(model, val_loader, config, device):
     metrics = metrics_calc.compute()
     
     return losses, metrics
-
-
-# ==============================================================================
-# REINFORCEMENT LEARNING FUNCTIONS (unchanged)
-# ==============================================================================
-
-def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device, scaler, replay_buffer, metrics_calc=None):
-    """Train on batch with optional prioritized replay and metrics"""
-    boards, policy_targets, value_targets = batch
-    boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
-    policy_targets = policy_targets.to(device, non_blocking=True)
-    value_targets = value_targets.to(device, non_blocking=True)
-    
-    if weights is not None:
-        weights = torch.FloatTensor(weights).to(device, non_blocking=True)
-    
-    optimizer.zero_grad(set_to_none=True)
-    
-    use_amp = config['hardware'].get('use_amp', True)
-    amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
-    
-    with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-        policy_pred, value_pred = model(boards, return_aux=False)
-        
-        policy_loss = -(policy_targets * policy_pred).sum(dim=1)
-        value_loss = (value_pred.squeeze() - value_targets.squeeze()) ** 2
-        
-        if weights is not None:
-            policy_loss = (policy_loss * weights).mean()
-            value_loss = (value_loss * weights).mean()
-        else:
-            policy_loss = policy_loss.mean()
-            value_loss = value_loss.mean()
-        
-        policy_weight = config['reinforcement_learning']['policy_loss_weight']
-        value_weight = config['reinforcement_learning']['value_loss_weight']
-        loss = policy_weight * policy_loss + value_weight * value_loss
-    
-    scaler.scale(loss).backward()
-    
-    grad_clip = config['reinforcement_learning'].get('grad_clip', 1.0)
-    if grad_clip > 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    
-    scaler.step(optimizer)
-    scaler.update()
-    
-    if isinstance(replay_buffer, PrioritizedReplayBuffer):
-        with torch.no_grad():
-            td_errors = torch.abs(value_pred.squeeze() - value_targets.squeeze()).cpu().numpy()
-        replay_buffer.update_priorities(indices, td_errors)
-    
-    if metrics_calc is not None:
-        with torch.no_grad():
-            target_moves = policy_targets.argmax(dim=1)
-            metrics_calc.update(policy_pred, value_pred, target_moves, value_targets.unsqueeze(1))
-    
-    return loss.item(), policy_loss.item(), value_loss.item()
-
-
-def evaluate_models(model1, model2, config, device, num_games=100):
-    """
-    Evaluate model1 vs model2
-    
-    🔧 v4.4: Increased from 20→100 games for statistical significance
-    """
-    mcts1 = BatchMCTS(model1, config, device)
-    mcts2 = BatchMCTS(model2, config, device)
-    
-    wins = 0
-    draws = 0
-    
-    for game_idx in range(num_games):
-        board = chess.Board()
-        
-        if game_idx % 2 == 0:
-            current_mcts = mcts1
-            other_mcts = mcts2
-        else:
-            current_mcts = mcts2
-            other_mcts = mcts1
-        
-        move_count = 0
-        while not board.is_game_over() and move_count < 200:
-            mcts = current_mcts if board.turn == chess.WHITE else other_mcts
-            visit_counts = mcts.search(board, num_simulations=50)
-            move, _ = select_move_by_visits(visit_counts, temperature=0)
-            board.push(move)
-            move_count += 1
-        
-        mcts1.reset_tree()
-        mcts2.reset_tree()
-        
-        result = board.result()
-        if game_idx % 2 == 0:
-            if result == '1-0':
-                wins += 1
-            elif result == '1/2-1/2':
-                draws += 0.5
-        else:
-            if result == '0-1':
-                wins += 1
-            elif result == '1/2-1/2':
-                draws += 0.5
-    
-    return (wins + draws) / num_games

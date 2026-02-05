@@ -33,7 +33,8 @@ from src.data import process_pgn_files, create_dataloaders
 from src.utils.data_helpers import ACTION_SIZE
 
 # Import from utils
-from utils import TrainingLogger, train_epoch_il, evaluate_il
+from utils.shared.logger import TrainingLogger
+from utils.il.training_il import train_epoch_il, evaluate_il
 
 
 def main():
@@ -397,13 +398,15 @@ def main():
         if profile_this_epoch and device.type == 'cuda':
             torch.cuda.synchronize()
         train_start_time = time.perf_counter()
-        train_losses, train_metrics = train_epoch_il(
-            model, train_loader, optimizer, scheduler, config, device, scaler, 
-            epoch=epoch, debug_log_file=debug_log_file
+        train_losses, train_metrics, train_profile = train_epoch_il(
+            model, train_loader, optimizer, scheduler, config, device, scaler,
+            epoch=epoch, debug_log_file=debug_log_file, profile=profile_this_epoch
         )
         if profile_this_epoch and device.type == 'cuda':
             torch.cuda.synchronize()
         train_time = time.perf_counter() - train_start_time
+        if profile_this_epoch and train_profile is not None:
+            train_time = train_profile['total']
         
         current_lr = optimizer.param_groups[0]['lr']
         
@@ -520,13 +523,28 @@ def main():
                 torch.cuda.synchronize()
             epoch_total_time = time.perf_counter() - epoch_start_time
             other_time = max(0.0, epoch_total_time - train_time - eval_time)
-            profile_msg = (
-                f"[PROFILE] Epoch {epoch + 1}: "
-                f"train={train_time:.2f}s, "
-                f"eval={eval_time:.2f}s, "
-                f"other={other_time:.2f}s, "
-                f"total={epoch_total_time:.2f}s"
-            )
+            if train_profile is not None:
+                batches = max(1, train_profile['batches'])
+                profile_msg = (
+                    f"[PROFILE] Epoch {epoch + 1}: "
+                    f"data={train_profile['data']:.2f}s ({train_profile['data']*1000/batches:.1f}ms/b), "
+                    f"fwd={train_profile['forward']:.2f}s ({train_profile['forward']*1000/batches:.1f}ms/b), "
+                    f"bwd={train_profile['backward']:.2f}s ({train_profile['backward']*1000/batches:.1f}ms/b), "
+                    f"optim={train_profile['optim']:.2f}s ({train_profile['optim']*1000/batches:.1f}ms/b), "
+                    f"metrics={train_profile['metrics']:.2f}s ({train_profile['metrics']*1000/batches:.1f}ms/b), "
+                    f"train_total={train_profile['total']:.2f}s, "
+                    f"eval={eval_time:.2f}s, "
+                    f"other={other_time:.2f}s, "
+                    f"epoch_total={epoch_total_time:.2f}s"
+                )
+            else:
+                profile_msg = (
+                    f"[PROFILE] Epoch {epoch + 1}: "
+                    f"train={train_time:.2f}s, "
+                    f"eval={eval_time:.2f}s, "
+                    f"other={other_time:.2f}s, "
+                    f"total={epoch_total_time:.2f}s"
+                )
             print(profile_msg)
             if debug_log_file is not None:
                 with open(debug_log_file, 'a', encoding='utf-8') as f:

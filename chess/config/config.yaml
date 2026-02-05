@@ -30,7 +30,6 @@ data:
   max_moves_per_game: 200    # Skip longer games
   
   # Quality filtering
-  select_top_games: true     # Sort by Elo and take top max_games (higher quality)
   sort_by_avg_elo: true      # Sort by average Elo of both players
   
   # 🆕 SLIDING WINDOW CONFIGURATION
@@ -94,7 +93,7 @@ model:
   policy_head_filters: 32    # Policy head filters
   value_head_filters: 48     # Value head filters 
   value_hidden_dim: 256      # Value head hidden dimension 
-  dropout: 0.3               # Dropout rate 
+  dropout: 0.2               # Dropout rate 
   # 🆕 v4.3: WDL VALUE HEAD
   use_wdl_value: true         # 🆕 Use WDL (Win/Draw/Loss) classification (RECOMMENDED!)
 
@@ -111,7 +110,6 @@ model:
                              # History is built by walking backwards through mmap using GameID
   
   # Advanced features
-  use_se_blocks: false          # ❌ Standard SE (global pooling) - mniej przydatne dla szachów
   use_se2d_blocks: true          # ✅ SE-Net v2 with spatial info (+0.5-1%, +5% time) - LEPSZE DLA SZACHÓW!
   use_spatial_attention: true    # 👁️ Spatial attention
   spatial_attention_mode: 'last_2' # 'all', 'last_2', 'last_3', 'none'
@@ -123,9 +121,6 @@ model:
   # Advanced architectural features
   use_layer_scale: true         # LayerScale for better training stability
   layer_scale_init: 1e-5        # Initial LayerScale value (1e-6 to 1e-4)
-  
-  # 🆕 v4.0: Pre-activation ResNet
-  use_preactivation: true       # Pre-activation residual blocks (better gradients)
 
   # Multi-Task Learning
   use_multitask_learning: true        # Enable auxiliary tasks
@@ -142,8 +137,8 @@ model:
 # ------------------------------------------------------------------------------
 imitation_learning:
   # Training hyperparameters
-  batch_size: 8192           # Batch size (maximized for GPU utilization)
-  learning_rate: 0.0015       # Learning rate (slightly lower for large-batch stability)
+  batch_size: 6144           # Batch size (maximized for GPU utilization)
+  learning_rate: 0.0015      # Learning rate 
   value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
   epochs: 100                # Maximum training epochs
   weight_decay: 0.001        # L2 regularization (10x stronger for value head)
@@ -239,7 +234,7 @@ hardware:
   use_amp: true              # 🚀 Mixed Precision Training (~2x speedup)
   use_bfloat16: true         # 💾 bfloat16 instead of float16 (better range)
   num_workers: 4             # CPU workers for data loading
-  prefetch_factor: 4         # DataLoader prefetch factor
+  prefetch_factor: 2         # DataLoader prefetch factor
   pin_memory: true           # Faster GPU data transfer
 
 
@@ -256,7 +251,7 @@ logging:
 # 🆕 DEBUG & PROFILING
 # ------------------------------------------------------------------------------
 debug:
-  enabled: true                    # Master switch for debug mode
+  enabled: false                    # Master switch for debug mode
   profile_training: true           # Time breakdown per epoch
   log_gpu_memory: false             # GPU memory usage
   profile_every_n_epochs: 1         # Profile frequency (if enabled)

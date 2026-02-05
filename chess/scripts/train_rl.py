@@ -34,15 +34,11 @@ except ImportError:
     print("⚠️ MCTS self-play not available")
 
 # Import from utils
-from utils import (
-    TrainingLogger,
-    ReplayBuffer,
-    PrioritizedReplayBuffer,
-    TemperatureSchedule,
-    train_on_batch_rl,
-    evaluate_models
-)
-from utils.metrics import MetricsCalculator
+from utils.shared.logger import TrainingLogger
+from utils.rl.replay import ReplayBuffer, PrioritizedReplayBuffer
+from utils.rl.temperature import TemperatureSchedule
+from utils.rl.training_rl import train_on_batch_rl, evaluate_models
+from utils.shared.metrics import MetricsCalculator
 
 
 # ==============================================================================

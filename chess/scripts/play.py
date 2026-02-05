@@ -29,7 +29,7 @@ from src.mcts import MCTS, select_move_by_visits
 from src.utils.data_helpers import board_to_tensor, move_to_index
 
 # Import from utils
-from utils.gui_helpers import create_piece_surfaces, load_model_from_checkpoint, select_models
+from utils.ui.gui_helpers import create_piece_surfaces, load_model_from_checkpoint, select_models
 
 # Initialize Pygame
 pygame.init()

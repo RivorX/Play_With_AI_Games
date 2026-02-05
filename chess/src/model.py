@@ -5,41 +5,11 @@ import torch.nn.functional as F
 from src.utils.data_helpers import ACTION_SIZE
 
 
-class SEBlock(nn.Module):
-    """
-    🚀 ULTRA-OPTIMIZED Squeeze-and-Excitation block v3.1
-    
-    v3.1 CHANGES:
-    - ✅ Mixed pooling: max + avg for richer features (+0.5-1% quality)
-    - ✅ Still using native operations (fast)
-    """
-    def __init__(self, filters, reduction=16):
-        super().__init__()
-        self.fc1 = nn.Linear(filters, filters // reduction, bias=False)
-        self.fc2 = nn.Linear(filters // reduction, filters, bias=False)
-    
-    def forward(self, x):
-        # 🆕 v3.1: Mixed pooling (max + avg) for richer features
-        # (B, C, H, W) -> (B, C)
-        avg_pool = x.mean(dim=[2, 3])
-        max_pool = x.amax(dim=[2, 3])  # amax is faster than max()[0]
-        
-        # Combine pools (learned weighting via FC layers)
-        squeeze = avg_pool + max_pool
-        
-        # Excitation path
-        excite = F.relu(self.fc1(squeeze), inplace=True)
-        excite = torch.sigmoid(self.fc2(excite))
-        
-        # Broadcasting: (B, C) -> (B, C, 1, 1) -> (B, C, H, W)
-        return x * excite.unsqueeze(2).unsqueeze(3)
-
-
 class SE2DBlock(nn.Module):
     """
-    🆕 v3.1: SE-Net v2 with Spatial Information
+    đź†• v3.1: SE-Net v2 with Spatial Information
     
-    KEY DIFFERENCES FROM SEBlock:
+    KEY DIFFERENCES FROM standard SE:
     - Preserves spatial structure during squeeze
     - Uses 1x1 convs instead of FC layers
     - More expressive but ~5% slower
@@ -69,7 +39,7 @@ class SE2DBlock(nn.Module):
 
 class LightweightSpatialAttention(nn.Module):
     """
-    🚀 OPTIMIZED Lightweight Spatial Attention
+    đźš€ OPTIMIZED Lightweight Spatial Attention
     
     No changes - already optimal with kernel=3
     """
@@ -92,7 +62,7 @@ class LightweightSpatialAttention(nn.Module):
 
 class CoordConv2d(nn.Module):
     """
-    🚀 OPTIMIZED CoordConv - Position-aware convolution
+    đźš€ OPTIMIZED CoordConv - Position-aware convolution
     No changes - already optimal
     """
     def __init__(self, in_channels, out_channels, kernel_size, padding=0, bias=True):
@@ -121,7 +91,7 @@ class CoordConv2d(nn.Module):
 
 class LayerScale(nn.Module):
     """
-    🆕 v3.1: LayerScale for better training stability
+    đź†• v3.1: LayerScale for better training stability
     
     PAPER: "Going deeper with Image Transformers" (Touvron et al. 2021)
     
@@ -150,7 +120,7 @@ class LayerScale(nn.Module):
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     """
-    🚀 OPTIMIZED Stochastic Depth
+    đźš€ OPTIMIZED Stochastic Depth
     """
     if drop_prob == 0. or not training:
         return x
@@ -165,26 +135,23 @@ def drop_path(x, drop_prob: float = 0., training: bool = False):
 
 class ResidualBlock(nn.Module):
     """
-    🆕 v4.0: Pre-activation Residual Block
+    Pre-activation Residual Block
     
     ARCHITECTURE:
     - POST-ACTIVATION (standard):  x -> Conv -> BN -> ReLU -> Conv -> BN -> (+x) -> ReLU
     - PRE-ACTIVATION (v4.0):       x -> BN -> ReLU -> Conv -> BN -> ReLU -> Conv -> (+x)
     
     BENEFITS OF PRE-ACTIVATION:
-    ✅ Better gradient flow (no ReLU after addition)
-    ✅ More stable training for deep networks
-    ✅ Easier to train 20+ layer networks
-    ✅ Identity mapping is cleaner
+    ? Better gradient flow (no ReLU after addition)
+    ? More stable training for deep networks
+    ? Easier to train 20+ layer networks
+    ? Identity mapping is cleaner
     
     PAPER: "Identity Mappings in Deep Residual Networks" (He et al. 2016)
     """
-    def __init__(self, filters, use_se=True, use_se2d=False, use_spatial=True, 
-                 drop_path_rate=0.0, use_layer_scale=False, layer_scale_init=1e-5,
-                 use_preactivation=True):
+    def __init__(self, filters, use_se2d=False, use_spatial=True,
+                 drop_path_rate=0.0, use_layer_scale=False, layer_scale_init=1e-5):
         super().__init__()
-        
-        self.use_preactivation = use_preactivation
         
         # BN + Conv layers
         self.bn1 = nn.BatchNorm2d(filters)
@@ -192,14 +159,9 @@ class ResidualBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(filters)
         self.conv2 = nn.Conv2d(filters, filters, kernel_size=3, padding=1, bias=False)
         
-        # Choose SE variant
-        self.use_se = use_se
         self.use_se2d = use_se2d
-        
         if use_se2d:
             self.se = SE2DBlock(filters)
-        elif use_se:
-            self.se = SEBlock(filters)
         
         self.use_spatial = use_spatial
         if use_spatial:
@@ -212,123 +174,45 @@ class ResidualBlock(nn.Module):
             self.layer_scale = LayerScale(filters, init_value=layer_scale_init)
     
     def forward(self, x):
-        if self.use_preactivation:
-            # 🆕 PRE-ACTIVATION PATH: BN -> ReLU -> Conv -> BN -> ReLU -> Conv
-            residual = x
-            
-            # First conv path: BN -> ReLU -> Conv
-            out = self.bn1(x)
-            out = F.relu(out, inplace=True)
-            out = self.conv1(out)
-            
-            # Second conv path: BN -> ReLU -> Conv
-            out = self.bn2(out)
-            out = F.relu(out, inplace=True)
-            out = self.conv2(out)
-            
-            # Attention blocks (after convs)
-            if self.use_se2d:
-                out = self.se(out)
-            elif self.use_se:
-                out = self.se(out)
-            
-            if self.use_spatial:
-                out = self.spatial(out)
-            
-            if self.use_layer_scale:
-                out = self.layer_scale(out)
-            
-            if self.drop_path_rate > 0:
-                out = drop_path(out, self.drop_path_rate, self.training)
-            
-            # ✅ Clean identity mapping (no activation after addition!)
-            return residual + out
+        # ?? PRE-ACTIVATION PATH: BN -> ReLU -> Conv -> BN -> ReLU -> Conv
+        residual = x
         
-        else:
-            # POST-ACTIVATION PATH (standard ResNet): Conv -> BN -> ReLU -> Conv -> BN
-            residual = x
-            
-            out = self.conv1(x)
-            out = self.bn1(out)
-            out = F.relu(out, inplace=True)
-            
-            out = self.conv2(out)
-            out = self.bn2(out)
-            
-            if self.use_se2d:
-                out = self.se(out)
-            elif self.use_se:
-                out = self.se(out)
-            
-            if self.use_spatial:
-                out = self.spatial(out)
-            
-            if self.use_layer_scale:
-                out = self.layer_scale(out)
-            
-            if self.drop_path_rate > 0:
-                out = drop_path(out, self.drop_path_rate, self.training)
-            
-            out = out + residual
-            out = F.relu(out, inplace=True)
-            
-            return out
-
-
-class AdaptivePolicyPool(nn.Module):
-    """
-    🆕 v3.1: Adaptive Policy Pooling
-    
-    MOTIVATION:
-    - Standard policy head flattens 8x8 feature map -> 2048 features
-    - Not all spatial positions equally important for policy
-    - Adaptive pooling learns to focus on relevant regions
-    
-    ARCHITECTURE:
-    - Learnable attention weights per spatial location
-    - Weighted average pooling -> more compact representation
-    - Can reduce policy FC input size while maintaining quality
-    
-    BENEFITS:
-    - +2-3% policy accuracy (empirical)
-    - 0% parameter overhead (attention is cheap)
-    - Better generalization
-    """
-    def __init__(self, in_channels, out_features):
-        super().__init__()
-        # Spatial attention for policy-relevant regions
-        self.attention_conv = nn.Conv2d(in_channels, 1, kernel_size=1, bias=True)
+        # First conv path: BN -> ReLU -> Conv
+        out = self.bn1(x)
+        out = F.relu(out, inplace=True)
+        out = self.conv1(out)
         
-        # Compact FC (can be smaller due to adaptive pooling)
-        self.fc = nn.Linear(in_channels, out_features)
-    
-    def forward(self, x):
-        # x: (B, C, 8, 8)
+        # Second conv path: BN -> ReLU -> Conv
+        out = self.bn2(out)
+        out = F.relu(out, inplace=True)
+        out = self.conv2(out)
         
-        # Compute spatial attention weights
-        # (B, C, 8, 8) -> (B, 1, 8, 8) -> (B, 8, 8)
-        attention = self.attention_conv(x).squeeze(1)
-        attention = torch.softmax(attention.view(x.size(0), -1), dim=1)  # (B, 64)
-        attention = attention.view(x.size(0), 1, 8, 8)  # (B, 1, 8, 8)
+        # Attention blocks (after convs)
+        if self.use_se2d:
+            out = self.se(out)
         
-        # Weighted spatial pooling
-        # (B, C, 8, 8) * (B, 1, 8, 8) -> (B, C, 8, 8) -> (B, C)
-        pooled = (x * attention).sum(dim=[2, 3])
+        if self.use_spatial:
+            out = self.spatial(out)
         
-        # FC layer
-        return self.fc(pooled)
-
+        if self.use_layer_scale:
+            out = self.layer_scale(out)
+        
+        if self.drop_path_rate > 0:
+            out = drop_path(out, self.drop_path_rate, self.training)
+        
+        # ? Clean identity mapping (no activation after addition!)
+        return residual + out
 
 class ChessNet(nn.Module):
     """
-    🆕 Chess Neural Network v4.0 with Pre-activation ResNet
+    đź†• Chess Neural Network v4.0 with Pre-activation ResNet
     
     CHANGES from v3.1:
-    - 🆕 Pre-activation ResNet blocks (BN->ReLU->Conv instead of Conv->BN->ReLU)
-    - ✅ Better gradient flow for deeper networks
-    - ✅ More stable training
-    - ✅ Automatically calculates input_planes from history_positions
-    - ✅ Formula: input_planes = 16 * (1 + history_positions)
+    - đź†• Pre-activation ResNet blocks (BN->ReLU->Conv instead of Conv->BN->ReLU)
+    - âś… Better gradient flow for deeper networks
+    - âś… More stable training
+    - âś… Automatically calculates input_planes from history_positions
+    - âś… Formula: input_planes = 16 * (1 + history_positions)
     """
     def __init__(self, config, input_planes=None):
         """
@@ -342,7 +226,6 @@ class ChessNet(nn.Module):
         num_blocks = config['model']['num_residual_blocks']
         dropout = config['model']['dropout']
         
-        use_se = config['model'].get('use_se_blocks', True)
         use_se2d = config['model'].get('use_se2d_blocks', False)
         use_spatial = config['model'].get('use_spatial_attention', True)
         drop_path_rate = config['model'].get('drop_path_rate', 0.1)
@@ -351,8 +234,6 @@ class ChessNet(nn.Module):
         use_layer_scale = config['model'].get('use_layer_scale', True)
         layer_scale_init = config['model'].get('layer_scale_init', 1e-5)
         
-        # 🆕 v4.0: Pre-activation ResNet
-        use_preactivation = config['model'].get('use_preactivation', True)
         
         # Spatial attention mode
         spatial_attention_mode = config['model'].get('spatial_attention_mode', 'last_2')
@@ -363,51 +244,47 @@ class ChessNet(nn.Module):
         self.material_weight = config['model'].get('material_prediction_weight', 0.2)
         self.check_weight = config['model'].get('check_prediction_weight', 0.15)
         
-        # 🆕 v4.5: AUTO-CALCULATE input_planes with chess metadata
+        # đź†• v4.5: AUTO-CALCULATE input_planes with chess metadata
         # Base: 16 planes (12 pieces + 4 metadata: castling, en passant, halfmove, fullmove)
         # With history: 16 * (1 + history_positions)
         history_positions = config['model']['history_positions']
         if input_planes is None:
-            input_planes = 16 * (1 + history_positions)  # 🆕 16 instead of 12!
+            input_planes = 16 * (1 + history_positions)  # đź†• 16 instead of 12!
         
         self.input_planes = input_planes
         self.history_positions = history_positions
         
-        print(f"🧠 ULTRA-OPTIMIZED Model v4.4 (Chess Metadata + Pre-activation ResNet):")
-        print(f"  • 🆕 History positions: {history_positions}")
-        print(f"  • 🆕 Input planes: {input_planes} (16 × {1 + history_positions})")
-        print(f"  • 🆕 Chess metadata: Castling, En Passant, Halfmove, Fullmove")
-        print(f"  • ✅ SE-Block: Mixed pooling (avg+max)")
+        print(f"đź§  ULTRA-OPTIMIZED Model v4.4 (Chess Metadata + Pre-activation ResNet):")
+        print(f"  â€˘ đź†• History positions: {history_positions}")
+        print(f"  â€˘ đź†• Input planes: {input_planes} (16 Ă— {1 + history_positions})")
+        print(f"  â€˘ đź†• Chess metadata: Castling, En Passant, Halfmove, Fullmove")
         
         if use_se2d:
-            print(f"  • 🆕 SE2D-Block: ENABLED (spatial-aware, +5% time)")
+            print(f"  â€˘ đź†• SE2D-Block: ENABLED (spatial-aware, +5% time)")
         else:
-            print(f"  • ✅ SE2D-Block: DISABLED (using standard SE)")
+            print(f"  â€˘ âś… SE2D-Block: DISABLED")
         
-        print(f"  • ✅ Spatial Attention: {spatial_attention_mode} mode")
-        print(f"  • ✅ CoordConv: Only at input")
-        print(f"  • ⚡ Activation: ReLU (5-10x faster than ELU)")
-        print(f"  • 🎲 Stochastic Depth: {drop_path_rate}")
+        print(f"  â€˘ âś… Spatial Attention: {spatial_attention_mode} mode")
+        print(f"  â€˘ âś… CoordConv: Only at input")
+        print(f"  â€˘ âšˇ Activation: ReLU (5-10x faster than ELU)")
+        print(f"  â€˘ đźŽ˛ Stochastic Depth: {drop_path_rate}")
+        # Pre-activation ResNet is always enabled
+        print(f"  ? Pre-activation ResNet: ENABLED (better gradients)")
         
         if use_layer_scale:
-            print(f"  • 🆕 LayerScale: ENABLED (init={layer_scale_init})")
+            print(f"  â€˘ đź†• LayerScale: ENABLED (init={layer_scale_init})")
         
-        # 🆕 v4.0: Pre-activation
-        if use_preactivation:
-            print(f"  • 🆕 Pre-activation ResNet: ENABLED (better gradients)")
-        else:
-            print(f"  • ✅ Post-activation ResNet: Standard mode")
         
-        print(f"  • ✅ Standard 3x3 Conv: ENABLED (preserves spatial info for chess)")
-        print(f"  • 🔧 Policy Head: Standard flatten+FC (spatial preservation for chess)")
+        print(f"  â€˘ âś… Standard 3x3 Conv: ENABLED (preserves spatial info for chess)")
+        print(f"  â€˘ đź”§ Policy Head: Standard flatten+FC (spatial preservation for chess)")
         
         if self.use_mtl:
-            print(f"  • 🆕 MTL with GlobalAvgPool heads:")
+            print(f"  â€˘ đź†• MTL with GlobalAvgPool heads:")
             print(f"    - Win: {self.win_weight}")
             print(f"    - Material: {self.material_weight}")
             print(f"    - Check: {self.check_weight}")
         
-        # 🆕 Input conv with dynamic input_planes
+        # đź†• Input conv with dynamic input_planes
         if use_coord_conv:
             self.conv_block = nn.Sequential(
                 CoordConv2d(input_planes, filters, kernel_size=3, padding=1),
@@ -425,7 +302,7 @@ class ChessNet(nn.Module):
         # SELECTIVE ATTENTION: Determine which blocks get spatial attention
         spatial_blocks = self._get_spatial_blocks(num_blocks, spatial_attention_mode)
         
-        print(f"  • 🔍 Spatial attention in blocks: {spatial_blocks}")
+        print(f"  â€˘ đź”Ť Spatial attention in blocks: {spatial_blocks}")
         
         # Residual tower
         blocks = []
@@ -434,13 +311,11 @@ class ChessNet(nn.Module):
             blocks.append(
                 ResidualBlock(
                     filters,
-                    use_se=use_se,
                     use_se2d=use_se2d,
                     use_spatial=use_spatial_this_block,
                     drop_path_rate=dpr[i],
                     use_layer_scale=use_layer_scale,
                     layer_scale_init=layer_scale_init,
-                    use_preactivation=use_preactivation
                 )
             )
         self.residual_tower = nn.Sequential(*blocks)
@@ -449,23 +324,22 @@ class ChessNet(nn.Module):
         policy_filters = config['model']['policy_head_filters']
         self.policy_conv = nn.Conv2d(filters, policy_filters, kernel_size=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(policy_filters)
-        
-        # 🔧 v4.4 CRITICAL FIX: Remove AdaptivePolicyPool
+        # Policy head keeps full spatial information until the final FC layer.
         # Chess requires spatial information until the very end (position matters!)
-        # AdaptivePolicyPool aggregates spatial dimensions too early, losing "from where" information
         # Use standard flatten + FC for full spatial preservation
+        
         self.policy_fc = nn.Linear(policy_filters * 8 * 8, ACTION_SIZE)
         
         self.policy_dropout = nn.Dropout(dropout)
         
-        # 🆕 Value head - WDL (Win/Draw/Loss) classification
+        # đź†• Value head - WDL (Win/Draw/Loss) classification
         # Outputs 3 logits instead of 1 scalar for stronger signal
         value_filters = config['model']['value_head_filters']
         value_hidden = config['model']['value_hidden_dim']
         self.value_conv = nn.Conv2d(filters, value_filters, kernel_size=1, bias=False)
         self.value_bn = nn.BatchNorm2d(value_filters)
         self.value_fc1 = nn.Linear(value_filters * 8 * 8, value_hidden)
-        self.value_fc2 = nn.Linear(value_hidden, 3)  # 🆕 3 outputs: [Win, Draw, Loss]
+        self.value_fc2 = nn.Linear(value_hidden, 3)  # đź†• 3 outputs: [Win, Draw, Loss]
         self.value_dropout = nn.Dropout(dropout)
         
         # Track if we use WDL
@@ -496,7 +370,7 @@ class ChessNet(nn.Module):
         elif mode == 'none':
             return set()
         else:
-            print(f"⚠️ Unknown spatial_attention_mode '{mode}', using 'last_2'")
+            print(f"âš ď¸Ź Unknown spatial_attention_mode '{mode}', using 'last_2'")
             return set(range(max(0, num_blocks - 2), num_blocks))
     
     def forward(self, x, return_aux=False):
@@ -512,19 +386,19 @@ class ChessNet(nn.Module):
         policy = self.policy_conv(x)
         policy = self.policy_bn(policy)
         policy = F.relu(policy, inplace=True)
-        policy = policy.flatten(1)  # 🔧 v4.4: Always flatten (no adaptive pool)
+        policy = policy.flatten(1)  # đź”§ v4.4: Always flatten (no adaptive pool)
         policy = self.policy_dropout(policy)
         policy = self.policy_fc(policy)
         policy = F.log_softmax(policy, dim=1)
         
-        # 🆕 Value head - WDL classification
+        # đź†• Value head - WDL classification
         value = self.value_conv(x)
         value = self.value_bn(value)
         value = F.relu(value, inplace=True)
         value = value.flatten(1)
         value = F.relu(self.value_fc1(value), inplace=True)
         value = self.value_dropout(value)
-        value = self.value_fc2(value)  # 🆕 Returns (B, 3) WDL logits (no tanh!)
+        value = self.value_fc2(value)  # đź†• Returns (B, 3) WDL logits (no tanh!)
         
         if not return_aux or not self.use_mtl:
             return policy, value
@@ -550,7 +424,7 @@ class ChessNet(nn.Module):
     def predict(self, board_tensor):
         """
         Predict for a single position (used in MCTS)
-        🆕 Handles WDL output and converts to scalar
+        đź†• Handles WDL output and converts to scalar
         """
         self.eval()
         with torch.no_grad():

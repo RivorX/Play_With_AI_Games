@@ -13,7 +13,6 @@ from src.utils.data_helpers import board_to_tensor, move_to_index
 from src.utils.data_pipeline import (
     DatasetTracker,
     cleanup_intermediate_files,
-    extract_auxiliary_labels,
     extract_game_data,
     extract_games_from_pgn_multiprocess,
     extract_games_from_pgn_parallel,
@@ -38,7 +37,6 @@ __all__ = [
     'move_to_index',
     'DatasetTracker',
     'cleanup_intermediate_files',
-    'extract_auxiliary_labels',
     'extract_game_data',
     'extract_games_from_pgn_multiprocess',
     'extract_games_from_pgn_parallel',

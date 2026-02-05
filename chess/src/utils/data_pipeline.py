@@ -16,29 +16,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from src.utils.data_helpers import compute_material_balance, get_position_size, is_in_check, will_win
-
-def extract_auxiliary_labels(board, game_result):
-    """
-    Extract all auxiliary task labels for Multi-Task Learning
-    
-    Args:
-        board: chess.Board at current position
-        game_result: Game result string
-    
-    Returns:
-        dict: {
-            'win': float,        # Will current player win? (0.0 or 1.0)
-            'material': float,   # Material balance (-1.0 to 1.0)
-            'check': float       # Is in check? (0.0 or 1.0)
-        }
-    """
-    return {
-        'win': will_win(board, game_result),
-        'material': compute_material_balance(board),
-        'check': is_in_check(board)
-    }
-
+from src.utils.data_helpers import get_position_size
 
 # ==============================================================================
 # 🆕 DATASET TRACKING SYSTEM
