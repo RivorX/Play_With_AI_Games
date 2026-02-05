@@ -40,8 +40,12 @@ class TrainingLogger:
                     'epoch', 'train_loss', 'train_policy_loss', 'train_value_loss',
                     'val_loss', 'val_policy_loss', 'val_value_loss', 'learning_rate',
                     # 📊 NEW: Metrics
-                    'train_policy_top1', 'train_policy_top3', 'train_value_mae',
-                    'val_policy_top1', 'val_policy_top3', 'val_value_mae'
+                    'train_policy_top1', 'train_policy_top3',
+                    'train_value_mae', 'train_value_mae_weighted',
+                    'train_value_wdl_acc', 'train_value_wdl_ce',
+                    'val_policy_top1', 'val_policy_top3',
+                    'val_value_mae', 'val_value_mae_weighted',
+                    'val_value_wdl_acc', 'val_value_wdl_ce'
                 ]
                 
                 if use_mtl:
@@ -56,7 +60,9 @@ class TrainingLogger:
                     'win_rate', 'buffer_size', 'avg_game_length', 'positions_per_sec',
                     'selfplay_time', 'data_collection_time', 'temperature', 'beta',
                     # 📊 NEW: Metrics
-                    'policy_top1_acc', 'policy_top3_acc', 'value_mae'
+                    'policy_top1_acc', 'policy_top3_acc',
+                    'value_mae', 'value_mae_weighted',
+                    'value_wdl_acc', 'value_wdl_ce'
                 ]
             
             writer.writerow(header)
@@ -74,9 +80,15 @@ class TrainingLogger:
         self.train_policy_top1 = []
         self.train_policy_top3 = []
         self.train_value_mae = []
+        self.train_value_mae_weighted = []
+        self.train_value_wdl_acc = []
+        self.train_value_wdl_ce = []
         self.val_policy_top1 = []
         self.val_policy_top3 = []
         self.val_value_mae = []
+        self.val_value_mae_weighted = []
+        self.val_value_wdl_acc = []
+        self.val_value_wdl_ce = []
         
         if use_mtl:
             self.train_win_losses = []
@@ -123,9 +135,15 @@ class TrainingLogger:
                     train_metrics.get('policy_top1_acc', '') if train_metrics else '',
                     train_metrics.get('policy_top3_acc', '') if train_metrics else '',
                     train_metrics.get('value_mae', '') if train_metrics else '',
+                    train_metrics.get('value_mae_weighted', '') if train_metrics else '',
+                    train_metrics.get('value_wdl_acc', '') if train_metrics else '',
+                    train_metrics.get('value_wdl_ce', '') if train_metrics else '',
                     val_metrics.get('policy_top1_acc', '') if val_metrics else '',
                     val_metrics.get('policy_top3_acc', '') if val_metrics else '',
-                    val_metrics.get('value_mae', '') if val_metrics else ''
+                    val_metrics.get('value_mae', '') if val_metrics else '',
+                    val_metrics.get('value_mae_weighted', '') if val_metrics else '',
+                    val_metrics.get('value_wdl_acc', '') if val_metrics else '',
+                    val_metrics.get('value_wdl_ce', '') if val_metrics else ''
                 ]
                 
                 if self.use_mtl:
@@ -148,6 +166,9 @@ class TrainingLogger:
                     self.train_policy_top1.append(train_metrics.get('policy_top1_acc', 0))
                     self.train_policy_top3.append(train_metrics.get('policy_top3_acc', 0))
                     self.train_value_mae.append(train_metrics.get('value_mae', 0))
+                    self.train_value_mae_weighted.append(train_metrics.get('value_mae_weighted', 0))
+                    self.train_value_wdl_acc.append(train_metrics.get('value_wdl_acc', 0))
+                    self.train_value_wdl_ce.append(train_metrics.get('value_wdl_ce', 0))
                 
                 if val_losses is not None:
                     self.val_losses.append(val_losses['total'])
@@ -158,6 +179,9 @@ class TrainingLogger:
                     self.val_policy_top1.append(val_metrics.get('policy_top1_acc', 0))
                     self.val_policy_top3.append(val_metrics.get('policy_top3_acc', 0))
                     self.val_value_mae.append(val_metrics.get('value_mae', 0))
+                    self.val_value_mae_weighted.append(val_metrics.get('value_mae_weighted', 0))
+                    self.val_value_wdl_acc.append(val_metrics.get('value_wdl_acc', 0))
+                    self.val_value_wdl_ce.append(val_metrics.get('value_wdl_ce', 0))
                 
                 if self.use_mtl:
                     self.train_win_losses.append(train_losses.get('win', 0))
@@ -186,7 +210,10 @@ class TrainingLogger:
                     # 📊 NEW: Metrics
                     train_metrics.get('policy_top1_acc', '') if train_metrics else '',
                     train_metrics.get('policy_top3_acc', '') if train_metrics else '',
-                    train_metrics.get('value_mae', '') if train_metrics else ''
+                    train_metrics.get('value_mae', '') if train_metrics else '',
+                    train_metrics.get('value_mae_weighted', '') if train_metrics else '',
+                    train_metrics.get('value_wdl_acc', '') if train_metrics else '',
+                    train_metrics.get('value_wdl_ce', '') if train_metrics else ''
                 ]
                 
                 # Store for plotting
@@ -200,6 +227,9 @@ class TrainingLogger:
                     self.train_policy_top1.append(train_metrics.get('policy_top1_acc', 0))
                     self.train_policy_top3.append(train_metrics.get('policy_top3_acc', 0))
                     self.train_value_mae.append(train_metrics.get('value_mae', 0))
+                    self.train_value_mae_weighted.append(train_metrics.get('value_mae_weighted', 0))
+                    self.train_value_wdl_acc.append(train_metrics.get('value_wdl_acc', 0))
+                    self.train_value_wdl_ce.append(train_metrics.get('value_wdl_ce', 0))
                 
                 if 'win_rate' in kwargs and kwargs['win_rate'] is not None:
                     self.win_rates.append((iteration, kwargs['win_rate']))
@@ -222,9 +252,9 @@ class TrainingLogger:
     def _plot_il(self):
         """Plot IL training progress"""
         if self.use_mtl:
-            fig, axes = plt.subplots(4, 3, figsize=(18, 18))
+            fig, axes = plt.subplots(5, 3, figsize=(18, 22))
         else:
-            fig, axes = plt.subplots(3, 2, figsize=(15, 14))
+            fig, axes = plt.subplots(4, 2, figsize=(15, 18))
         
         fig.suptitle('IL Training Progress', fontsize=16, fontweight='bold')
         
@@ -280,8 +310,12 @@ class TrainingLogger:
             ax = axes[1, 1]
             if self.train_value_mae:
                 ax.plot(self.iterations, self.train_value_mae, 'b-', label='Train MAE', linewidth=2)
+            if self.train_value_mae_weighted:
+                ax.plot(self.iterations, self.train_value_mae_weighted, 'b--', label='Train MAE (weighted)', linewidth=2, alpha=0.8)
             if self.val_value_mae:
                 ax.plot(val_epochs, self.val_value_mae, 'r-', label='Val MAE', linewidth=2)
+            if self.val_value_mae_weighted:
+                ax.plot(val_epochs, self.val_value_mae_weighted, 'r--', label='Val MAE (weighted)', linewidth=2, alpha=0.8)
             ax.set_xlabel('Epoch')
             ax.set_ylabel('MAE')
             ax.set_title('Value MAE')
@@ -317,9 +351,40 @@ class TrainingLogger:
             ax.set_title('All Losses Comparison')
             ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
+            
+            # ============================================================
+            # ROW 4: WDL METRICS
+            # ============================================================
+            
+            # WDL Accuracy
+            ax = axes[3, 0]
+            if self.train_value_wdl_acc:
+                ax.plot(self.iterations, self.train_value_wdl_acc, 'b-', label='Train WDL Acc', linewidth=2)
+            if self.val_value_wdl_acc:
+                ax.plot(val_epochs, self.val_value_wdl_acc, 'r-', label='Val WDL Acc', linewidth=2)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Accuracy')
+            ax.set_title('Value WDL Accuracy')
+            ax.set_ylim([0, 1])
+            if self.train_value_wdl_acc or self.val_value_wdl_acc:
+                ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # WDL Cross-Entropy
+            ax = axes[3, 1]
+            if self.train_value_wdl_ce:
+                ax.plot(self.iterations, self.train_value_wdl_ce, 'b-', label='Train WDL CE', linewidth=2)
+            if self.val_value_wdl_ce:
+                ax.plot(val_epochs, self.val_value_wdl_ce, 'r-', label='Val WDL CE', linewidth=2)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('CE')
+            ax.set_title('Value WDL Cross-Entropy')
+            if self.train_value_wdl_ce or self.val_value_wdl_ce:
+                ax.legend()
+            ax.grid(True, alpha=0.3)
         
         else:
-            # MTL plots (4x3)
+            # MTL plots (5x3)
             
             # Row 1: Main tasks
             ax = axes[0, 0]
@@ -401,22 +466,33 @@ class TrainingLogger:
             ax = axes[2, 1]
             if self.train_value_mae:
                 ax.plot(self.iterations, self.train_value_mae, 'b-', label='Train', linewidth=2)
+            if self.train_value_mae_weighted:
+                ax.plot(self.iterations, self.train_value_mae_weighted, 'b--', label='Train (weighted)', linewidth=2, alpha=0.8)
             if self.val_value_mae:
                 ax.plot(val_epochs, self.val_value_mae, 'r-', label='Val', linewidth=2)
+            if self.val_value_mae_weighted:
+                ax.plot(val_epochs, self.val_value_mae_weighted, 'r--', label='Val (weighted)', linewidth=2, alpha=0.8)
             ax.set_xlabel('Epoch')
             ax.set_ylabel('MAE')
             ax.set_title('Value MAE')
             ax.legend()
             ax.grid(True, alpha=0.3)
             
+            # Value WDL metrics
             ax = axes[2, 2]
-            ax.plot(self.iterations, self.train_losses, 'b-', label='Total', linewidth=2, alpha=0.7)
-            ax.plot(self.iterations, self.train_policy_losses, 'g--', label='Policy', linewidth=1.5, alpha=0.7)
-            ax.plot(self.iterations, self.train_value_losses, 'r--', label='Value', linewidth=1.5, alpha=0.7)
+            if self.train_value_wdl_acc:
+                ax.plot(self.iterations, self.train_value_wdl_acc, 'b-', label='Train WDL Acc', linewidth=2)
+            if self.val_value_wdl_acc:
+                ax.plot(val_epochs, self.val_value_wdl_acc, 'r-', label='Val WDL Acc', linewidth=2)
+            if self.train_value_wdl_ce:
+                ax.plot(self.iterations, self.train_value_wdl_ce, 'b--', label='Train WDL CE', linewidth=2, alpha=0.8)
+            if self.val_value_wdl_ce:
+                ax.plot(val_epochs, self.val_value_wdl_ce, 'r--', label='Val WDL CE', linewidth=2, alpha=0.8)
             ax.set_xlabel('Epoch')
-            ax.set_ylabel('Loss')
-            ax.set_title('Main Tasks (Train)')
-            ax.legend()
+            ax.set_ylabel('Metric')
+            ax.set_title('Value WDL Metrics')
+            if self.train_value_wdl_acc or self.val_value_wdl_acc or self.train_value_wdl_ce or self.val_value_wdl_ce:
+                ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
             
             # Row 4: Comparisons
@@ -440,17 +516,38 @@ class TrainingLogger:
                 ax.legend()
                 ax.grid(True, alpha=0.3)
             
-            # Summary metrics
+            # Main tasks (Train)
             ax = axes[3, 2]
+            ax.plot(self.iterations, self.train_losses, 'b-', label='Total', linewidth=2, alpha=0.7)
+            ax.plot(self.iterations, self.train_policy_losses, 'g--', label='Policy', linewidth=1.5, alpha=0.7)
+            ax.plot(self.iterations, self.train_value_losses, 'r--', label='Value', linewidth=1.5, alpha=0.7)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Loss')
+            ax.set_title('Main Tasks (Train)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Summary metrics
+            axes[4, 0].axis('off')
+            axes[4, 1].axis('off')
+            ax = axes[4, 2]
             ax.axis('off')
             if self.val_policy_top1 and len(self.val_policy_top1) > 0:
-                summary_text = (
-                    f"Latest Validation Metrics:\n\n"
-                    f"Policy Top-1: {self.val_policy_top1[-1]:.2%}\n"
-                    f"Policy Top-3: {self.val_policy_top3[-1]:.2%}\n"
-                    f"Value MAE: {self.val_value_mae[-1]:.4f}\n"
-                    f"Total Loss: {self.val_losses[-1]:.4f}\n"
-                )
+                summary_lines = [
+                    "Latest Validation Metrics:",
+                    "",
+                    f"Policy Top-1: {self.val_policy_top1[-1]:.2%}",
+                    f"Policy Top-3: {self.val_policy_top3[-1]:.2%}",
+                    f"Value MAE: {self.val_value_mae[-1]:.4f}",
+                ]
+                if self.val_value_mae_weighted:
+                    summary_lines.append(f"Value MAE (w): {self.val_value_mae_weighted[-1]:.4f}")
+                if self.val_value_wdl_acc:
+                    summary_lines.append(f"WDL Acc: {self.val_value_wdl_acc[-1]:.2%}")
+                if self.val_value_wdl_ce:
+                    summary_lines.append(f"WDL CE: {self.val_value_wdl_ce[-1]:.4f}")
+                summary_lines.append(f"Total Loss: {self.val_losses[-1]:.4f}")
+                summary_text = "\n".join(summary_lines)
                 ax.text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
                        verticalalignment='center')
         
@@ -505,11 +602,13 @@ class TrainingLogger:
         ax = axes[1, 1]
         if self.train_value_mae:
             ax.plot(self.iterations, self.train_value_mae, 'r-', label='Value MAE', linewidth=2)
-            ax.set_xlabel('Iteration')
-            ax.set_ylabel('MAE')
-            ax.set_title('Value MAE')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
+        if self.train_value_mae_weighted:
+            ax.plot(self.iterations, self.train_value_mae_weighted, 'r--', label='Value MAE (weighted)', linewidth=2, alpha=0.8)
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('MAE')
+        ax.set_title('Value MAE')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
         
         ax = axes[1, 2]
         if self.win_rates:
@@ -549,13 +648,22 @@ class TrainingLogger:
         ax = axes[2, 2]
         ax.axis('off')
         if len(self.iterations) > 0:
-            summary_text = (
-                f"Latest Metrics:\n\n"
-                f"Policy Top-1: {self.train_policy_top1[-1]:.2%}\n" if self.train_policy_top1 else "" +
-                f"Policy Top-3: {self.train_policy_top3[-1]:.2%}\n" if self.train_policy_top3 else "" +
-                f"Value MAE: {self.train_value_mae[-1]:.4f}\n" if self.train_value_mae else "" +
-                f"Total Loss: {self.train_losses[-1]:.4f}\n" if self.train_losses else ""
-            )
+            summary_lines = ["Latest Metrics:", ""]
+            if self.train_policy_top1:
+                summary_lines.append(f"Policy Top-1: {self.train_policy_top1[-1]:.2%}")
+            if self.train_policy_top3:
+                summary_lines.append(f"Policy Top-3: {self.train_policy_top3[-1]:.2%}")
+            if self.train_value_mae:
+                summary_lines.append(f"Value MAE: {self.train_value_mae[-1]:.4f}")
+            if self.train_value_mae_weighted:
+                summary_lines.append(f"Value MAE (w): {self.train_value_mae_weighted[-1]:.4f}")
+            if self.train_value_wdl_acc:
+                summary_lines.append(f"WDL Acc: {self.train_value_wdl_acc[-1]:.2%}")
+            if self.train_value_wdl_ce:
+                summary_lines.append(f"WDL CE: {self.train_value_wdl_ce[-1]:.4f}")
+            if self.train_losses:
+                summary_lines.append(f"Total Loss: {self.train_losses[-1]:.4f}")
+            summary_text = "\n".join(summary_lines)
             ax.text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
                    verticalalignment='center')
         

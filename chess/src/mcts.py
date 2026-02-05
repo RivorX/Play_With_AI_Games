@@ -9,7 +9,7 @@ MCTS (Monte Carlo Tree Search) - v4.2
 import chess
 import numpy as np
 import math
-from src.utils.data_helpers import board_to_tensor, move_to_index
+from src.utils.data_helpers import board_to_tensor, move_to_index, ACTION_SIZE
 import torch
 from collections import defaultdict
 import threading
@@ -97,35 +97,33 @@ class BatchMCTS:
             return board_to_tensor(current_board)
         
         # Build history list
-        history_boards = []
+        history_tensors = []
         
         # Get last N boards from history
         if self.board_history:
             history_boards = self.board_history[-self.history_positions:]
+            # Convert history boards to tensors with POV
+            for hist_board in history_boards:
+                # All history from CURRENT player's perspective
+                hist_tensor = board_to_tensor(
+                    hist_board,
+                    flip_perspective=(current_board.turn == chess.BLACK)
+                )
+                history_tensors.append(hist_tensor)
         
-        # Pad with empty boards if not enough history
-        while len(history_boards) < self.history_positions:
-            history_boards.insert(0, chess.Board())  # Empty board at start
-        
-        # Convert all boards to tensors with POV
-        tensors = []
-        
-        # Add history boards (oldest to newest)
-        for hist_board in history_boards:
-            # All history from CURRENT player's perspective
-            hist_tensor = board_to_tensor(
-                hist_board,
-                flip_perspective=(current_board.turn == chess.BLACK)
-            )
-            tensors.append(hist_tensor)
+        # Pad with ZEROS if not enough history (matching training data!)
+        while len(history_tensors) < self.history_positions:
+            # 🔧 v4.5 FIX: Use zeros, not chess.Board() - matches BinaryChessDataset padding
+            empty_tensor = np.zeros((16, 8, 8), dtype=np.float32)
+            history_tensors.insert(0, empty_tensor)
         
         # Add current board
         current_tensor = board_to_tensor(current_board)
-        tensors.append(current_tensor)
+        history_tensors.append(current_tensor)
         
         # Stack: [oldest_history, ..., newest_history, current]
-        # Shape: (12 * (history_positions + 1), 8, 8)
-        return np.concatenate(tensors, axis=0)
+        # 🔧 v4.5 FIX: Shape is now (16 * (history_positions + 1), 8, 8) - 16 planes per position
+        return np.concatenate(history_tensors, axis=0)
     
     def search(self, board, num_simulations, temperature=1.0):
         """
@@ -247,10 +245,20 @@ class BatchMCTS:
             # Process results
             for idx, node in enumerate(non_terminal_nodes):
                 policy_logits = policy_logits_batch[idx].cpu().numpy()
-                value = values_batch[idx].cpu().item()
+                
+                # 🔧 FIX: Handle WDL output (3 values) vs scalar output
+                value_tensor = values_batch[idx]
+                if value_tensor.dim() == 1 and value_tensor.shape[0] == 3:
+                    # WDL output: [Win, Draw, Loss] → convert to scalar [-1, 1]
+                    # value = Win_prob * 1.0 + Draw_prob * 0.0 + Loss_prob * (-1.0)
+                    wdl_probs = torch.softmax(value_tensor, dim=0).cpu()
+                    value = (wdl_probs[0] - wdl_probs[2]).item()  # Win - Loss
+                else:
+                    # Scalar output
+                    value = value_tensor.cpu().item()
                 
                 legal_moves = list(node.board.legal_moves)
-                policy = np.zeros(4096)
+                policy = np.zeros(ACTION_SIZE)
                 
                 for move in legal_moves:
                     move_idx = move_to_index(move, node.board)  # 🆕 v4.2: Pass board for POV

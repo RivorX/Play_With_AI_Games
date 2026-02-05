@@ -1,10 +1,12 @@
 """
-Chess GUI Game Interface - v4.2
-🆕 UPDATED: Compatible with POV + Dynamic Sliding Window
+Chess GUI Game Interface - v4.5
+🆕 v4.5: CRITICAL FIXES - Promotions support
+🆕 v4.4: Compatible with POV + Dynamic Sliding Window
 - 🎯 POV: Automatic perspective handling
 - 🔄 Sliding Window: Correct history assembly
 - 🎮 MCTS toggle: --no-mcts flag for network-only mode
-- ✅ Fixed imports for v4.2
+- 👑 Promotions: Promotion-aware action space (see ACTION_SIZE)
+- ✅ Fixed imports for v4.5
 """
 
 import torch
@@ -23,7 +25,8 @@ from src.model import ChessNet
 from src.mcts import MCTS, select_move_by_visits
 
 # 🆕 v4.2: Import board_to_tensor from data_helpers
-from src.utils.data_helpers import board_to_tensor
+# 🔧 v4.4: Added move_to_index for POV-aware move encoding
+from src.utils.data_helpers import board_to_tensor, move_to_index
 
 # Import from utils
 from utils.gui_helpers import create_piece_surfaces, load_model_from_checkpoint, select_models
@@ -78,7 +81,7 @@ class ChessGUI:
             self.mcts2 = None
         
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-        pygame.display.set_caption("Chess AI v4.2")
+        pygame.display.set_caption("Chess AI v4.5")
         self.clock = pygame.time.Clock()
         
         # Load piece images
@@ -212,7 +215,7 @@ class ChessGUI:
         y = 20
         
         # Title
-        title = self.text_font.render("Chess AI v4.2", True, TEXT_COLOR)
+        title = self.text_font.render("Chess AI v4.5", True, TEXT_COLOR)
         self.screen.blit(title, (x_start + 20, y))
         y += 50
         
@@ -420,33 +423,30 @@ class ChessGUI:
             # board_to_tensor automatically handles POV
             return board_to_tensor(current_board)
         
-        # Build history list
-        history_boards = []
+        # Build history tensors
+        tensors = []
         
         # Get last N boards from history
         if self.board_history:
             history_boards = self.board_history[-self.history_positions:]
+            # Convert history boards to tensors with POV
+            for hist_board in history_boards:
+                hist_tensor = board_to_tensor(hist_board, flip_perspective=(current_board.turn == chess.BLACK))
+                tensors.append(hist_tensor)
         
-        # Pad with empty boards if not enough history
-        while len(history_boards) < self.history_positions:
-            history_boards.insert(0, chess.Board())  # Empty board at start
-        
-        # Convert all boards to tensors with POV
-        # IMPORTANT: All boards should be from CURRENT player's perspective
-        tensors = []
-        
-        # Add history boards (oldest to newest)
-        for hist_board in history_boards:
-            # board_to_tensor handles POV automatically based on current_board.turn
-            hist_tensor = board_to_tensor(hist_board, flip_perspective=(current_board.turn == chess.BLACK))
-            tensors.append(hist_tensor)
+        # Pad with ZEROS if not enough history (matching training data!)
+        while len(tensors) < self.history_positions:
+            # 🔧 v4.4 FIX: Use zeros, not chess.Board() - matches BinaryChessDataset padding
+            import numpy as np
+            empty_tensor = np.zeros((16, 8, 8), dtype=np.float32)
+            tensors.insert(0, empty_tensor)
         
         # Add current board
         current_tensor = board_to_tensor(current_board)
         tensors.append(current_tensor)
         
         # Stack: [oldest_history, ..., newest_history, current]
-        # Shape: (12 * (history_positions + 1), 8, 8)
+        # Shape: (16 * (history_positions + 1), 8, 8)
         import numpy as np
         return np.concatenate(tensors, axis=0)
     
@@ -470,7 +470,8 @@ class ChessGUI:
         best_score = -1
         best_move = None
         for move in self.board.legal_moves:
-            idx = move.from_square * 64 + move.to_square
+            # 🔧 v4.4 FIX: Use POV-aware move_to_index (handles black's perspective)
+            idx = move_to_index(move, self.board)
             if policy[idx] > best_score:
                 best_score = policy[idx]
                 best_move = move
@@ -590,7 +591,7 @@ class ChessGUI:
 
 def main():
     # 🆕 Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Chess AI Game v4.2')
+    parser = argparse.ArgumentParser(description='Chess AI Game v4.5')
     parser.add_argument('--no-mcts', action='store_true', 
                        help='Disable MCTS (use network-only mode)')
     args = parser.parse_args()
@@ -614,7 +615,7 @@ def main():
     # 🆕 Show config info
     history_positions = config['model'].get('history_positions', 0)
     print(f"📜 History positions: {history_positions}")
-    print(f"🔢 Input planes: {12 * (1 + history_positions)}")
+    print(f"🔢 Input planes: {16 * (1 + history_positions)}")
     
     base_dir = script_dir.parent
     
@@ -642,9 +643,11 @@ def main():
     
     # Start GUI
     print("\n" + "="*50)
-    print("Chess AI v4.2 - Pygame GUI")
+    print("Chess AI v4.5 - Pygame GUI")
     print("="*50)
-    print("\n🆕 v4.2 Features:")
+    print("\n🆕 v4.5 Features:")
+    from src.utils.data_helpers import ACTION_SIZE
+    print(f"  • Promotions - {ACTION_SIZE} actions (promotion-aware)")
     print("  • POV (Point of View) - perspective handling")
     print("  • Dynamic Sliding Window - history support")
     print("  • MCTS toggle - network-only mode available")

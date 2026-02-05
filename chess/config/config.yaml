@@ -26,7 +26,7 @@ paths:
 data:
   min_elo: 2000              # Minimum Elo rating for games
   max_games: 100000          # Top N games to use per PGN file
-  train_split: 0.9           # Train/validation split ratio
+  train_split: 0.85           # Train/validation split ratio
   max_moves_per_game: 200    # Skip longer games
   
   # Quality filtering
@@ -45,6 +45,15 @@ data:
                              # - stride=3: Every 3rd position (~33% data, 3x faster)
                              # Higher stride = less data but faster iterations
                              # Note: History is still built dynamically from ALL positions
+  
+  # Stride sampling mode (prevents color drop for even stride)
+  stride_mode: "fullmove_per_game_offset"  # "fullmove_per_game_offset" | "fullmove" | "ply"
+                                           # - fullmove_per_game_offset: per-game offset on fullmove index (keeps both colors)
+                                           # - fullmove: keep every Nth fullmove (keeps both colors, deterministic)
+                                           # - ply: legacy move_idx % stride (can drop one color for even stride)
+  
+  # Split strategy (prevents validation leakage via shared game history)
+  split_by_game: true        # Split per GameID instead of per-position (recommended)
   
   # 4-PHASE PROCESSING (LOW RAM MODE)
   # ═══════════════════════════════════════════════════════════════════════════
@@ -80,13 +89,12 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Base architecture
-  num_residual_blocks: 8     # Number of residual blocks (6-12 optimal)
-  filters: 128               # Convolutional filters (128-256 for RTX 5060 Ti)
+  num_residual_blocks: 6     # Number of residual blocks (6-12 optimal)
+  filters: 192               # Convolutional filters (128-256 for RTX 5060 Ti)
   policy_head_filters: 32    # Policy head filters
-  value_head_filters: 32     # Value head filters (reduced to prevent overfitting)
-  value_hidden_dim: 256      # Value head hidden dimension (reduced to prevent overfitting)
-  dropout: 0.5               # Dropout rate (increased for stronger regularization)
-
+  value_head_filters: 48     # Value head filters 
+  value_hidden_dim: 256      # Value head hidden dimension 
+  dropout: 0.3               # Dropout rate 
   # 🆕 v4.3: WDL VALUE HEAD
   use_wdl_value: true         # 🆕 Use WDL (Win/Draw/Loss) classification (RECOMMENDED!)
 
@@ -96,10 +104,10 @@ model:
   # This eliminates redundant storage and enables flexible history depths
   # ═══════════════════════════════════════════════════════════════════════════
   history_positions: 4       # Number of previous positions to include (dynamic)
-                             # - 0: Current position only (12 planes)
-                             # - 1: Current + 1 previous (24 planes)
-                             # - 4: Current + 4 previous (60 planes) ⭐ RECOMMENDED
-                             # - 8: Current + 8 previous (108 planes)
+                             # - 0: Current position only (16 planes)
+                             # - 1: Current + 1 previous (32 planes)
+                             # - 4: Current + 4 previous (80 planes) ⭐ RECOMMENDED
+                             # - 8: Current + 8 previous (144 planes)
                              # History is built by walking backwards through mmap using GameID
   
   # Advanced features
@@ -108,12 +116,12 @@ model:
   use_spatial_attention: true    # 👁️ Spatial attention
   spatial_attention_mode: 'last_2' # 'all', 'last_2', 'last_3', 'none'
   
-  drop_path_rate: 0.2           # 🎲 Stochastic Depth (increased for better regularization)
-  activation: 'relu'            # ⚡ ReLU activation (5-10x FASTER than ELU!)
-  use_coord_conv: true          # 🗺️ Position-aware conv (+0.5% params, +4% quality)
+  drop_path_rate: 0.15          # Stochastic Depth
+  activation: 'relu'            # ⚡ ReLU activation
+  use_coord_conv: true          # 🗺️ Position-aware conv
   
   # Advanced architectural features
-  use_layer_scale: true         # LayerScale for better training stability (+0% params)
+  use_layer_scale: true         # LayerScale for better training stability
   layer_scale_init: 1e-5        # Initial LayerScale value (1e-6 to 1e-4)
   
   # 🆕 v4.0: Pre-activation ResNet
@@ -121,9 +129,9 @@ model:
 
   # Multi-Task Learning
   use_multitask_learning: true        # Enable auxiliary tasks
-  win_prediction_weight: 0.3          # Weight for win prediction (reduced to prevent overfitting)
-  material_prediction_weight: 0.15    # Weight for material count (reduced)
-  check_prediction_weight: 0.1        # Weight for check prediction (reduced)
+  win_prediction_weight: 0.3          # Weight for win prediction
+  material_prediction_weight: 0.15    # Weight for material count
+  check_prediction_weight: 0.1        # Weight for check prediction
   
   # 🆕 v4.3: Advanced MTL options
   use_focal_loss_check: true          # Use Focal Loss for check prediction (vs BCE)
@@ -135,9 +143,9 @@ model:
 imitation_learning:
   # Training hyperparameters
   batch_size: 8192           # Batch size (maximized for GPU utilization)
-  learning_rate: 0.002       # Learning rate (lower for CosineAnnealing - no warmup)
-  value_head_lr_factor: 0.5  # 🆕 Value head LR multiplier (0.5 = half LR to prevent overfitting)
-  epochs: 200                # Maximum training epochs
+  learning_rate: 0.0015       # Learning rate (slightly lower for large-batch stability)
+  value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
+  epochs: 100                # Maximum training epochs
   weight_decay: 0.001        # L2 regularization (10x stronger for value head)
   grad_clip: 1.0             # Gradient clipping threshold
   
@@ -153,11 +161,15 @@ imitation_learning:
   cosine_t_mult: 2           # 🔄 Multiply T0 after each restart (10→20→40 epochs)
   
   # 🆕 v4.3: WDL-specific options
-  wdl_label_smoothing: 0.20  # Label smoothing for WDL (maximum - prevents overfitting)
-  
+  wdl_label_smoothing: 0.10  # Label smoothing for WDL (reduced for stronger signal)
   # Loss weights
   policy_loss_weight: 1.0    # Policy loss weight
   value_loss_weight: 1.0     # Value loss weight (balanced with policy)
+  # 🆕 WDL value weighting by move index (later positions = stronger signal)
+  value_move_weighting: true
+  value_move_weight_min: 0.1
+  value_move_weight_use_game_length: true
+  value_move_weight_min_total_moves: 40
   
   # Evaluation & checkpointing
   eval_every: 1              # Evaluate every N epochs
@@ -248,6 +260,7 @@ debug:
   profile_training: true           # Time breakdown per epoch
   log_gpu_memory: false             # GPU memory usage
   profile_every_n_epochs: 1         # Profile frequency (if enabled)
+  print_batch0_diagnostics: false   # Print batch-0 target stats + WDL samples
 
 
 # ------------------------------------------------------------------------------

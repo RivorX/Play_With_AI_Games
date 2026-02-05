@@ -1,20 +1,25 @@
 """
-Imitation Learning Training Script - v4.4
-🆕 v4.4: CHESS METADATA - Castling, En Passant, Halfmove Clock (15 planes)
+Imitation Learning Training Script - v4.5
+🆕 v4.5: CRITICAL FIXES - Per-Game Split + Promotions + Better Sampling
+🆕 v4.5: CHESS METADATA - Castling, En Passant, Halfmove, Fullmove (16 planes)
 🆕 v4.3: WDL VALUE HEAD + TEMPORAL DISCOUNTING (conditional on use_wdl)
 🆕 v4.2: POV + Dynamic Sliding Window
 - 🎯 POV: All boards from current player's perspective (flip for black)
 - 🔄 Sliding Window: Dynamic history assembly at load time using mmap
 - 🎮 GameID tracking: Efficient history reconstruction across positions
-- 📊 Chess Metadata: 3 extra planes (castling, en passant, halfmove clock)
+- 📊 Chess Metadata: 4 extra planes (castling, en passant, halfmove, fullmove)
 - ⚡ WDL: Win/Draw/Loss classification (stronger signal than MSE)
 - ⚡ TEMPORAL DISCOUNTING: DISABLED for WDL (clean ±1.0), ENABLED for MSE
+- 🔒 Per-Game Split: Train/Val separated by games (no history leakage)
+- 🎲 Per-Game Stride Offset: Per-game offset for unbiased sampling
+- 👑 Promotions: Promotion-aware action space (see ACTION_SIZE)
 """
 
 import torch
 import torch.optim as optim
 import yaml
 import sys
+import time
 from pathlib import Path
 import numpy as np
 import gc
@@ -25,6 +30,7 @@ sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet, save_checkpoint
 from src.data import process_pgn_files, create_dataloaders
+from src.utils.data_helpers import ACTION_SIZE
 
 # Import from utils
 from utils import TrainingLogger, train_epoch_il, evaluate_il
@@ -86,17 +92,19 @@ def main():
     history_positions = config['model'].get('history_positions', 0)
     stride = config['data'].get('sliding_window_stride', 1)
     
-    # 🆕 v4.4 FIXED: Calculate expected input planes with chess metadata
-    expected_input_planes = 15 * (1 + history_positions)  # 🔧 FIXED: 15 planes (12 pieces + 3 metadata)
+    # 🆕 v4.5 FIXED: Calculate expected input planes with chess metadata
+    expected_input_planes = 16 * (1 + history_positions)  # 🔧 FIXED: 16 planes (12 pieces + 4 metadata)
     
     print("\n" + "="*70)
-    print("🆕 v4.4 CHESS METADATA + v4.3 TEMPORAL DISCOUNTING + v4.2 POV")
+    print("🆕 v4.5 CRITICAL FIXES + v4.5 METADATA + v4.3 WDL + v4.2 POV")
     print("="*70)
     print(f"  • POV: Boards from current player's perspective")
     print(f"  • History positions: {history_positions} (assembled dynamically)")
-    print(f"  • Sliding window stride: {stride}x")
-    print(f"  • Expected input planes: {expected_input_planes} (15 × {1 + history_positions})")
-    print(f"  • 🆕 Chess metadata: Castling, En Passant, Halfmove Clock")
+    print(f"  • Sliding window stride: {stride}x (per-game offset)")
+    print(f"  • Expected input planes: {expected_input_planes} (16 × {1 + history_positions})")
+    print(f"  • 🆕 Chess metadata: Castling, En Passant, Halfmove, Fullmove")
+    print(f"  • 🆕 Promotions: {ACTION_SIZE} actions ({ACTION_SIZE - 4096} promotion actions)")
+    print(f"  • 🆕 Per-game split: No validation leakage")
     print(f"  • MTL enabled: {use_mtl}")
     print(f"  • 🆕 WDL Value: {config['model'].get('use_wdl_value', True)}")
     print("="*70 + "\n")
@@ -124,7 +132,7 @@ def main():
         
         with open(debug_log_file, 'w', encoding='utf-8') as f:
             f.write("="*70 + "\n")
-            f.write("🐛 TRAINING DEBUG LOG - v4.4 Chess Metadata + WDL\n")
+            f.write("🐛 TRAINING DEBUG LOG - v4.5 Chess Metadata + WDL\n")
             f.write("="*70 + "\n")
             f.write(f"Timestamp: {timestamp}\n")
             f.write(f"Model: {config['model']['filters']} filters, {config['model']['num_residual_blocks']} blocks\n")
@@ -132,8 +140,8 @@ def main():
             f.write(f"Learning rate: {config['imitation_learning']['learning_rate']}\n")
             f.write(f"History positions: {history_positions} (dynamic)\n")
             f.write(f"Sliding window stride: {stride}x\n")
-            f.write(f"Input planes: {expected_input_planes} (15 per position)\n")
-            f.write(f"Chess metadata: Castling, En Passant, Halfmove\n")
+            f.write(f"Input planes: {expected_input_planes} (16 per position)\n")
+            f.write(f"Chess metadata: Castling, En Passant, Halfmove, Fullmove\n")
             f.write(f"MTL enabled: {use_mtl}\n")
             f.write(f"WDL Value: {config['model'].get('use_wdl_value', True)}\n")
             f.write(f"POV enabled: True\n")
@@ -142,13 +150,13 @@ def main():
     # Initialize logger
     logger = TrainingLogger(
         logs_dir, 
-        experiment_name="il_training_v4.4", 
+        experiment_name="il_training_v4.5", 
         mode="il",
         use_mtl=use_mtl
     )
     
     # Load data with multi-phase processing
-    print("\n=== Loading data (v4.4 Chess Metadata + POV + Sliding Window) ===")
+    print("\n=== Loading data (v4.5 Chess Metadata + POV + Sliding Window) ===")
     print(f"Mode: {'SEQUENTIAL' if config['data']['files_at_once'] == 1 else 'BATCH'}")
     print(f"Files at once: {config['data']['files_at_once']}")
     print(f"Phase 1 workers: {config['data'].get('phase1_threads', 1)}")
@@ -177,17 +185,17 @@ def main():
     print(f"\n✅ Data loaded successfully!")
     print(f"Total positions (before stride): {metadata['total_positions']:,}")
     
-    # 🔧 v4.4: Check if WDL is enabled (affects temporal discounting)
+    # 🔧 v4.5: Check if WDL is enabled (affects temporal discounting)
     use_wdl = config['model'].get('use_wdl_value', True)
     if use_wdl:
         print(f"  • WDL enabled: Temporal discounting DISABLED (clean ±1.0 targets) ✓")
     else:
         print(f"  • MSE regression: Temporal discounting ENABLED (sqrt scaling) ⚠️")
     
-    # 🔧 v4.4: Verify binary format compatibility
-    # Layout: [Board 36B] + [GameID 4B] + [MoveIdx 2B] + [MoveTarget 2B] + [Outcome 4B] + [MTL 12B]
+    # 🔧 v4.5: Verify binary format compatibility
+    # Layout: [Board 38B] + [GameID 4B] + [MoveIdx 2B] + [MoveTarget 2B] + [Outcome 4B] + [MTL 12B]
     actual_position_size = metadata.get('position_size')
-    expected_position_size = 48 if not use_mtl else 60  # 🆕 v4.4: Board is now 36B (was 32B)
+    expected_position_size = 50 if not use_mtl else 62  # 🆕 v4.5: Board is now 38B (was 36B)
     
     if actual_position_size != expected_position_size:
         print(f"\n⚠️ WARNING: Position size mismatch!")
@@ -196,22 +204,27 @@ def main():
         print(f"  • This may indicate the data was preprocessed with an old format or different MTL setting")
         
         # Try to determine if it's just a MTL mismatch
-        if actual_position_size == 48 and use_mtl:
+        if actual_position_size == 50 and use_mtl:
             print(f"  ❌ Data was processed WITHOUT MTL, but config has use_multitask_learning=True")
             print(f"     Please either:")
             print(f"     1. Set use_multitask_learning=False in config.yaml, OR")
             print(f"     2. Delete cache and reprocess data with MTL enabled")
             raise ValueError("MTL mismatch between data and config")
-        elif actual_position_size == 60 and not use_mtl:
+        elif actual_position_size == 62 and not use_mtl:
             print(f"  ❌ Data was processed WITH MTL, but config has use_multitask_learning=False")
             print(f"     Please either:")
             print(f"     1. Set use_multitask_learning=True in config.yaml, OR")
             print(f"     2. Delete cache and reprocess data without MTL")
             raise ValueError("MTL mismatch between data and config")
+        elif actual_position_size in [48, 60]:  # Old v4.4 format (36B board)
+            print(f"  âťŚ Data was processed with OLD v4.4 format (36B board, no fullmove metadata)")
+            print(f"     đź†• v4.5 adds fullmove number (38B board)")
+            print(f"     Please delete cache (data/preprocessing/) and reprocess with v4.5")
+            raise ValueError("Old data format - please reprocess")
         elif actual_position_size in [44, 56]:  # Old v4.3 format (32B board)
             print(f"  ❌ Data was processed with OLD v4.3 format (32B board, no chess metadata)")
-            print(f"     🆕 v4.4 uses 36B board with castling, en passant, and halfmove clock")
-            print(f"     Please delete cache (data/preprocessing/) and reprocess with v4.4")
+            print(f"     🆕 v4.5 uses 38B board with castling, en passant, halfmove, fullmove")
+            print(f"     Please delete cache (data/preprocessing/) and reprocess with v4.5")
             raise ValueError("Old data format - please reprocess")
         else:
             print(f"  ❌ Unknown format mismatch - please delete cache and reprocess")
@@ -219,8 +232,8 @@ def main():
     
     print(f"\n✅ Binary Format Validation:")
     print(f"  • Position size: {actual_position_size} bytes ✓")
-    print(f"  • Board size: 36 bytes (32B pieces + 4B metadata) ✓")
-    print(f"  • Chess metadata: Castling, En Passant, Halfmove ✓")
+    print(f"  • Board size: 38 bytes (32B pieces + 6B metadata) ✓")
+    print(f"  • Chess metadata: Castling, En Passant, Halfmove, Fullmove ✓")
     print(f"  • MTL: {'ENABLED' if use_mtl else 'DISABLED'} ✓")
     print(f"  • POV: Boards from current player's perspective ✓")
     print(f"  • Sliding Window: Dynamic history assembly ✓")
@@ -230,8 +243,8 @@ def main():
     
     # Create model with correct input planes
     print("\n=== Creating model ===")
-    print(f"Input planes: {expected_input_planes} (15 × {1 + history_positions})")
-    print(f"  • Per position: 12 pieces + 3 metadata (castling, en passant, halfmove)")
+    print(f"Input planes: {expected_input_planes} (16 × {1 + history_positions})")
+    print(f"  • Per position: 12 pieces + 4 metadata (castling, en passant, halfmove, fullmove)")
     print(f"Architecture: {config['model']['num_residual_blocks']} blocks, {config['model']['filters']} filters")
     
     model = ChessNet(config).to(device)
@@ -359,6 +372,8 @@ def main():
     
     if debug_enabled:
         print("🐛 Debug mode active - profiling enabled")
+    profile_enabled = debug_enabled and config.get('debug', {}).get('profile_training', False)
+    profile_every = config.get('debug', {}).get('profile_every_n_epochs', 1)
     
     best_val_loss = float('inf')
     patience_counter = 0
@@ -373,11 +388,22 @@ def main():
     for epoch in range(config['imitation_learning']['epochs']):
         print(f"\nEpoch {epoch + 1}/{config['imitation_learning']['epochs']}")
         
+        profile_this_epoch = profile_enabled and ((epoch + 1) % profile_every == 0)
+        if profile_this_epoch and device.type == 'cuda':
+            torch.cuda.synchronize()
+        epoch_start_time = time.perf_counter()
+        
         # Train epoch
+        if profile_this_epoch and device.type == 'cuda':
+            torch.cuda.synchronize()
+        train_start_time = time.perf_counter()
         train_losses, train_metrics = train_epoch_il(
             model, train_loader, optimizer, scheduler, config, device, scaler, 
             epoch=epoch, debug_log_file=debug_log_file
         )
+        if profile_this_epoch and device.type == 'cuda':
+            torch.cuda.synchronize()
+        train_time = time.perf_counter() - train_start_time
         
         current_lr = optimizer.param_groups[0]['lr']
         
@@ -405,7 +431,13 @@ def main():
         
         # Evaluate
         if (epoch + 1) % config['imitation_learning']['eval_every'] == 0:
+            if profile_this_epoch and device.type == 'cuda':
+                torch.cuda.synchronize()
+            eval_start_time = time.perf_counter()
             val_losses, val_metrics = evaluate_il(model, val_loader, config, device)
+            if profile_this_epoch and device.type == 'cuda':
+                torch.cuda.synchronize()
+            eval_time = time.perf_counter() - eval_start_time
             
             # Step ReduceLROnPlateau scheduler (needs val_loss)
             if scheduler_type == 'reduce_on_plateau' and scheduler is not None:
@@ -458,7 +490,7 @@ def main():
                         'input_planes': expected_input_planes,
                         'sliding_window_stride': stride,
                         'pov_enabled': True,  # 🆕 v4.2
-                        'version': 'v4.2'     # 🆕 Track version
+                        'version': 'v4.5'     # 🆕 Track version
                     },
                     save_optimizer=False
                 )
@@ -481,7 +513,25 @@ def main():
         else:
             # Log only training metrics
             logger.log(epoch + 1, train_losses, None, train_metrics, None, current_lr)
+            eval_time = 0.0
         
+        if profile_this_epoch:
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            epoch_total_time = time.perf_counter() - epoch_start_time
+            other_time = max(0.0, epoch_total_time - train_time - eval_time)
+            profile_msg = (
+                f"[PROFILE] Epoch {epoch + 1}: "
+                f"train={train_time:.2f}s, "
+                f"eval={eval_time:.2f}s, "
+                f"other={other_time:.2f}s, "
+                f"total={epoch_total_time:.2f}s"
+            )
+            print(profile_msg)
+            if debug_log_file is not None:
+                with open(debug_log_file, 'a', encoding='utf-8') as f:
+                    f.write(profile_msg + "\n")
+
         # Save checkpoint every N epochs
         if (epoch + 1) % checkpoint_every == 0:
             # Get current val loss if not already computed
@@ -510,7 +560,7 @@ def main():
                     'input_planes': expected_input_planes,
                     'sliding_window_stride': stride,
                     'pov_enabled': True,  # 🆕 v4.2
-                    'version': 'v4.2'     # 🆕 Track version
+                    'version': 'v4.5'     # 🆕 Track version
                 },
                 save_optimizer=False
             )
@@ -573,7 +623,7 @@ def main():
                 'input_planes': expected_input_planes,
                 'sliding_window_stride': stride,
                 'pov_enabled': True,
-                'version': 'v4.4'
+                'version': 'v4.5'
             },
             save_optimizer=False
         )
@@ -592,9 +642,9 @@ def main():
         print(f"Debug log: {debug_log_file}")
     
     print("\n" + "="*70)
-    print("🆕 v4.4 Features Used:")
+    print("🆕 v4.5 Features Used:")
     print("="*70)
-    print(f"  ✓ Chess Metadata - castling, en passant, halfmove clock")
+    print(f"  ✓ Chess Metadata - castling, en passant, halfmove, fullmove")
     print(f"  ✓ WDL Value Head - Win/Draw/Loss classification")
     print(f"  ✓ POV (Point of View) - boards from current player's perspective")
     print(f"  ✓ Dynamic Sliding Window - history assembled at load time")

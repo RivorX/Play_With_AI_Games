@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.utils.data_helpers import ACTION_SIZE
+
 
 class SEBlock(nn.Module):
     """
@@ -326,7 +328,7 @@ class ChessNet(nn.Module):
     - ✅ Better gradient flow for deeper networks
     - ✅ More stable training
     - ✅ Automatically calculates input_planes from history_positions
-    - ✅ Formula: input_planes = 12 * (1 + history_positions)
+    - ✅ Formula: input_planes = 16 * (1 + history_positions)
     """
     def __init__(self, config, input_planes=None):
         """
@@ -361,20 +363,20 @@ class ChessNet(nn.Module):
         self.material_weight = config['model'].get('material_prediction_weight', 0.2)
         self.check_weight = config['model'].get('check_prediction_weight', 0.15)
         
-        # 🆕 v4.4: AUTO-CALCULATE input_planes with chess metadata
-        # Base: 15 planes (12 pieces + 3 metadata: castling, en passant, halfmove)
-        # With history: 15 * (1 + history_positions)
+        # 🆕 v4.5: AUTO-CALCULATE input_planes with chess metadata
+        # Base: 16 planes (12 pieces + 4 metadata: castling, en passant, halfmove, fullmove)
+        # With history: 16 * (1 + history_positions)
         history_positions = config['model']['history_positions']
         if input_planes is None:
-            input_planes = 15 * (1 + history_positions)  # 🆕 15 instead of 12!
+            input_planes = 16 * (1 + history_positions)  # 🆕 16 instead of 12!
         
         self.input_planes = input_planes
         self.history_positions = history_positions
         
         print(f"🧠 ULTRA-OPTIMIZED Model v4.4 (Chess Metadata + Pre-activation ResNet):")
         print(f"  • 🆕 History positions: {history_positions}")
-        print(f"  • 🆕 Input planes: {input_planes} (15 × {1 + history_positions})")
-        print(f"  • 🆕 Chess metadata: Castling, En Passant, Halfmove Clock")
+        print(f"  • 🆕 Input planes: {input_planes} (16 × {1 + history_positions})")
+        print(f"  • 🆕 Chess metadata: Castling, En Passant, Halfmove, Fullmove")
         print(f"  • ✅ SE-Block: Mixed pooling (avg+max)")
         
         if use_se2d:
@@ -452,7 +454,7 @@ class ChessNet(nn.Module):
         # Chess requires spatial information until the very end (position matters!)
         # AdaptivePolicyPool aggregates spatial dimensions too early, losing "from where" information
         # Use standard flatten + FC for full spatial preservation
-        self.policy_fc = nn.Linear(policy_filters * 8 * 8, 4096)
+        self.policy_fc = nn.Linear(policy_filters * 8 * 8, ACTION_SIZE)
         
         self.policy_dropout = nn.Dropout(dropout)
         

@@ -13,6 +13,7 @@ import chess
 import numpy as np
 import pickle
 from src.data import board_to_tensor, move_to_index
+from src.utils.data_helpers import ACTION_SIZE
 
 
 class BatchSelfPlayMCTS:
@@ -101,11 +102,11 @@ class BatchSelfPlayMCTS:
             move = self._select_move_from_visits(visit_counts, temperature)
             
             # 🎯 TRAINING TARGET = MCTS VISIT DISTRIBUTION (not raw network policy!)
-            policy_target = torch.zeros(4096, dtype=torch.float32)
+            policy_target = torch.zeros(ACTION_SIZE, dtype=torch.float32)
             total_visits = sum(visit_counts.values())
             
             for m, visits in visit_counts.items():
-                policy_target[move_to_index(m)] = visits / total_visits
+                policy_target[move_to_index(m, board)] = visits / total_visits
             
             # Store position for training
             board_tensor = torch.from_numpy(board_to_tensor(board))
@@ -275,6 +276,7 @@ class BatchSelfPlayFast:
         Fast but generates lower quality training data!
         """
         from src.data import board_to_tensor, move_to_index
+        from src.utils.data_helpers import ACTION_SIZE
         
         boards = [chess.Board() for _ in range(num_games)]
         game_histories = [[] for _ in range(num_games)]
@@ -326,7 +328,7 @@ class BatchSelfPlayFast:
                 if not legal_moves:
                     continue
                 
-                legal_probs = np.array([policy[move_to_index(m)] for m in legal_moves])
+                legal_probs = np.array([policy[move_to_index(m, boards[game_idx])] for m in legal_moves])
                 
                 if legal_probs.sum() > 1e-10:
                     legal_probs = legal_probs / legal_probs.sum()
@@ -347,8 +349,8 @@ class BatchSelfPlayFast:
                 move = legal_moves[move_idx]
                 
                 board_tensor = torch.from_numpy(board_to_tensor(boards[game_idx]))
-                policy_target = torch.zeros(4096, dtype=torch.float32)
-                policy_target[move_to_index(move)] = 1.0
+                policy_target = torch.zeros(ACTION_SIZE, dtype=torch.float32)
+                policy_target[move_to_index(move, boards[game_idx])] = 1.0
                 
                 game_histories[game_idx].append(
                     (board_tensor, policy_target, boards[game_idx].turn)

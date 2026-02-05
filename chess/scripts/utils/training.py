@@ -94,9 +94,13 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
     
-    # 🔍 DIAGNOSTIC: Track target distributions
+    # 🔍 DIAGNOSTIC: Track target distributions (gated by config)
     first_batch_targets = True
     first_batch_predictions = True
+    show_batch0_diagnostics = (
+        config.get('debug', {}).get('enabled', False) and
+        config.get('debug', {}).get('print_batch0_diagnostics', False)
+    )
     
     for batch_idx, batch_data in enumerate(pbar):
         # Unpack batch
@@ -105,16 +109,25 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             moves = batch_data['move']
             outcomes = batch_data['value']
             
-            # 🆕 Get move indices if available (for move weighting)
-            move_indices = batch_data.get('move_indices', None)
+            # 🔧 v4.4 FIX: Get move_idx (not move_indices) from dict
+            move_indices = batch_data.get('move_idx', None)
+            total_moves = batch_data.get('total_moves', None)
             
             if use_mtl:
                 win_targets = batch_data['win']
                 material_targets = batch_data['material']
                 check_targets = batch_data['check']
         else:
-            boards, moves, outcomes = batch_data
-            move_indices = None
+            # 🔧 v4.4 FIX: Unpack move_indices from tuple
+            if len(batch_data) == 5:
+                boards, moves, outcomes, move_indices, total_moves = batch_data
+            elif len(batch_data) == 4:
+                boards, moves, outcomes, move_indices = batch_data
+                total_moves = None
+            else:
+                boards, moves, outcomes = batch_data
+                move_indices = None
+                total_moves = None
             use_mtl = False
         
         # Move to device
@@ -124,6 +137,8 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
         
         if move_indices is not None:
             move_indices = move_indices.to(device, non_blocking=True)
+        if total_moves is not None:
+            total_moves = total_moves.to(device, non_blocking=True)
         
         if use_mtl:
             win_targets = win_targets.to(device, non_blocking=True)
@@ -131,7 +146,7 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             check_targets = check_targets.to(device, non_blocking=True)
         
         # 🔍 DIAGNOSTIC: Print distributions for first batch
-        if first_batch_targets:
+        if show_batch0_diagnostics and first_batch_targets:
             print(f"\n🔍 DIAGNOSTIC - Batch 0:")
             print(f"  Outcome targets (Value):")
             print(f"    Min: {outcomes.min().item():.3f}, Max: {outcomes.max().item():.3f}, Mean: {outcomes.mean().item():.3f}")
@@ -170,8 +185,12 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
                     'moves': moves,
                     'values': outcomes,  # Still scalar {-1, 0, +1}
                 }
+                if move_indices is not None:
+                    targets['move_indices'] = move_indices
+                if total_moves is not None:
+                    targets['total_moves'] = total_moves
                                 # 🔍 DIAGNOSTIC: Print WDL predictions for first batch
-                if first_batch_predictions and batch_idx == 0:
+                if show_batch0_diagnostics and first_batch_predictions and batch_idx == 0:
                     wdl_probs = torch.softmax(value_pred[:10], dim=1)
                     value_scalars = (wdl_probs[:, 0] * 1.0 + 
                                     wdl_probs[:, 1] * 0.0 + 
@@ -198,8 +217,11 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
                         'win': win_targets,
                         'material': material_targets,
                         'check': check_targets,
-                        'move_indices': move_indices,  # 🆕 For move weighting
                     })
+                    if move_indices is not None:
+                        targets['move_indices'] = move_indices  # 🆕 For move weighting
+                    if total_moves is not None:
+                        targets['total_moves'] = total_moves
                 
                 # Single loss computation
                 loss, loss_dict = criterion(predictions, targets)
@@ -251,7 +273,18 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
         
         # Update metrics
         # Note: metrics_calc.update() auto-handles WDL predictions
-        metrics_calc.update(policy_pred, value_pred, moves, outcomes)
+        metrics_calc.update(
+            policy_pred,
+            value_pred,
+            moves,
+            outcomes,
+            move_indices=move_indices,
+            total_moves=total_moves,
+            value_weight_min=config['imitation_learning'].get('value_move_weight_min', 0.1),
+            value_weight_min_total_moves=config['imitation_learning'].get('value_move_weight_min_total_moves', 40),
+            value_max_moves=config['data'].get('max_moves_per_game', 200),
+            value_use_game_length=config['imitation_learning'].get('value_move_weight_use_game_length', False),
+        )
         
         # Accumulate losses
         if use_wdl:
@@ -350,15 +383,24 @@ def evaluate_il(model, val_loader, config, device):
                 boards = batch_data['board']
                 moves = batch_data['move']
                 outcomes = batch_data['value']
-                move_indices = batch_data.get('move_indices', None)
+                move_indices = batch_data.get('move_idx', None)  # 🔧 v4.4 FIX: move_idx not move_indices
+                total_moves = batch_data.get('total_moves', None)
                 
                 if use_mtl:
                     win_targets = batch_data['win']
                     material_targets = batch_data['material']
                     check_targets = batch_data['check']
             else:
-                boards, moves, outcomes = batch_data
-                move_indices = None
+                # 🔧 v4.4 FIX: Unpack move_indices from tuple
+                if len(batch_data) == 5:
+                    boards, moves, outcomes, move_indices, total_moves = batch_data
+                elif len(batch_data) == 4:
+                    boards, moves, outcomes, move_indices = batch_data
+                    total_moves = None
+                else:
+                    boards, moves, outcomes = batch_data
+                    move_indices = None
+                    total_moves = None
                 use_mtl = False
             
             boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
@@ -367,6 +409,8 @@ def evaluate_il(model, val_loader, config, device):
             
             if move_indices is not None:
                 move_indices = move_indices.to(device, non_blocking=True)
+            if total_moves is not None:
+                total_moves = total_moves.to(device, non_blocking=True)
             
             if use_mtl:
                 win_targets = win_targets.to(device, non_blocking=True)
@@ -392,6 +436,10 @@ def evaluate_il(model, val_loader, config, device):
                         'moves': moves,
                         'values': outcomes,
                     }
+                    if move_indices is not None:
+                        targets['move_indices'] = move_indices
+                    if total_moves is not None:
+                        targets['total_moves'] = total_moves
                     
                     if use_mtl:
                         predictions.update({
@@ -404,8 +452,11 @@ def evaluate_il(model, val_loader, config, device):
                             'win': win_targets,
                             'material': material_targets,
                             'check': check_targets,
-                            'move_indices': move_indices,
                         })
+                        if move_indices is not None:
+                            targets['move_indices'] = move_indices
+                        if total_moves is not None:
+                            targets['total_moves'] = total_moves
                     
                     loss, loss_dict = criterion(predictions, targets)
                     
@@ -458,7 +509,18 @@ def evaluate_il(model, val_loader, config, device):
                     total_material_loss += material_loss
                     total_check_loss += check_loss
             
-            metrics_calc.update(policy_pred, value_pred, moves, outcomes)
+            metrics_calc.update(
+                policy_pred,
+                value_pred,
+                moves,
+                outcomes,
+                move_indices=move_indices,
+                total_moves=total_moves,
+                value_weight_min=config['imitation_learning'].get('value_move_weight_min', 0.1),
+                value_weight_min_total_moves=config['imitation_learning'].get('value_move_weight_min_total_moves', 40),
+                value_max_moves=config['data'].get('max_moves_per_game', 200),
+                value_use_game_length=config['imitation_learning'].get('value_move_weight_use_game_length', False),
+            )
     
     n = len(val_loader)
     

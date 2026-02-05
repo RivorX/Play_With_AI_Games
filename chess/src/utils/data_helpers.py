@@ -91,15 +91,16 @@ def board_to_tensor(board, flip_perspective=None):
     """
     Convert chess.Board to tensor representation with POV (Point of View)
     
-    🆕 v4.4: EXTENDED WITH CHESS METADATA (15 planes total)
+    🆕 v4.5: EXTENDED WITH CHESS METADATA (16 planes total)
     
     POV System:
     - Channels 0-5: Current player's pieces (White if white to move, Black if black to move)
     - Channels 6-11: Opponent's pieces
-    - Channels 12-14: Chess metadata (NEW!)
+    - Channels 12-15: Chess metadata (NEW!)
         - Channel 12: Castling rights (1.0 where king/rook can castle)
         - Channel 13: En passant square (1.0 at target square)
         - Channel 14: Halfmove clock (normalized 0.0-1.0, scaled by 50)
+        - Channel 15: Fullmove number (normalized 0.0-1.0, scaled by 100)
     - Board orientation: Always from current player's perspective
     
     Args:
@@ -110,9 +111,9 @@ def board_to_tensor(board, flip_perspective=None):
                          If False, don't flip (for white's perspective)
     
     Returns: 
-        (15, 8, 8) tensor from current player's perspective (was 12, now 15)
+        (16, 8, 8) tensor from current player's perspective (was 12, now 16)
     """
-    tensor = np.zeros((15, 8, 8), dtype=np.float32)
+    tensor = np.zeros((16, 8, 8), dtype=np.float32)
     
     piece_to_idx = {
         chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
@@ -157,7 +158,7 @@ def board_to_tensor(board, flip_perspective=None):
             
             tensor[channel, row, col] = 1.0
     
-    # === METADATA PLANES (12-14) ===
+    # === METADATA PLANES (12-15) ===
     
     # Channel 12: Castling rights
     # Mark squares where castling is possible (king position + rook position)
@@ -200,6 +201,11 @@ def board_to_tensor(board, flip_perspective=None):
     # Uniform plane with value = halfmove_clock / 50
     halfmove_normalized = min(board.halfmove_clock / 50.0, 1.0)
     tensor[14, :, :] = halfmove_normalized
+
+    # Channel 15: Fullmove number (normalized to 0-1)
+    # Fullmove starts at 1 and increments after Black's move
+    fullmove_normalized = min(board.fullmove_number / 100.0, 1.0)
+    tensor[15, :, :] = fullmove_normalized
     
     return tensor
 
@@ -208,11 +214,12 @@ def board_to_compact(board):
     """
     Convert board to ultra-compact binary representation
     
-    🆕 v4.4: EXTENDED FORMAT (36 bytes total)
+    🆕 v4.5: EXTENDED FORMAT (38 bytes total)
     - 32 bytes: pieces (64 squares × 4 bits)
     - 1 byte: castling rights (4 bits: K, Q, k, q)
     - 1 byte: en passant square (0-63, 255=none)
     - 2 bytes: halfmove clock (uint16)
+    - 2 bytes: fullmove number (uint16)
     
     NOTE: Stores board in ORIGINAL orientation (not POV)
     POV conversion happens at tensor conversion time
@@ -246,7 +253,7 @@ def board_to_compact(board):
     for i in range(0, 64, 2):
         packed[i // 2] = (codes[i] << 4) | codes[i + 1]
     
-    # === ADD METADATA (4 bytes) ===
+    # === ADD METADATA (6 bytes) ===
     
     # Byte 32: Castling rights (4 bits: K, Q, k, q)
     castling_byte = 0
@@ -269,6 +276,10 @@ def board_to_compact(board):
     # Bytes 34-35: Halfmove clock (uint16, big-endian)
     halfmove_bytes = struct.pack('>H', board.halfmove_clock)
     packed.extend(halfmove_bytes)
+
+    # Bytes 36-37: Fullmove number (uint16, big-endian)
+    fullmove_bytes = struct.pack('>H', board.fullmove_number)
+    packed.extend(fullmove_bytes)
     
     return bytes(packed)
 
@@ -277,16 +288,16 @@ def compact_to_tensor(compact_board, flip_perspective=False):
     """
     Convert compact representation back to tensor with POV support
     
-    🆕 v4.4: EXTENDED FORMAT (36 bytes → 15 planes)
+    🆕 v4.5: EXTENDED FORMAT (38 bytes → 16 planes)
     
     Args:
-        compact_board: 36-byte compact representation (32B pieces + 4B metadata)
+        compact_board: 38-byte compact representation (32B pieces + 6B metadata)
         flip_perspective: If True, flip board for black's perspective
     
     Returns:
-        (15, 8, 8) tensor with metadata planes
+        (16, 8, 8) tensor with metadata planes
     """
-    tensor = np.zeros((15, 8, 8), dtype=np.float32)
+    tensor = np.zeros((16, 8, 8), dtype=np.float32)
     
     # Decode piece codes
     code_to_piece = {
@@ -352,7 +363,7 @@ def compact_to_tensor(compact_board, flip_perspective=False):
             
             tensor[channel, row, col] = 1.0
     
-    # === METADATA PLANES (12-14) ===
+    # === METADATA PLANES (12-15) ===
     
     # Byte 32: Castling rights
     castling_byte = compact_board[32]
@@ -361,16 +372,32 @@ def compact_to_tensor(compact_board, flip_perspective=False):
     has_k = bool(castling_byte & 0b0010)
     has_q = bool(castling_byte & 0b0001)
     
-    # Channel 12: Castling rights for current player
-    # Need to mark king + rook positions (simplified: mark entire back rank)
+    # Channel 12: Castling rights - precise squares (matching board_to_tensor)
+    # 🔧 v4.4 FIX: Use exact king/rook squares, not entire back rank!
+    # Standard chess: King on e-file (col 4), Rooks on a/h-files (col 0/7)
+    # In POV, always row 0 (current player's back rank)
+    
     if flip_perspective:
-        # Black's turn
-        if has_k or has_q:
-            tensor[12, 0, :] = 1.0  # Black's back rank (flipped to row 0)
+        # Black's perspective
+        # After flip: e8 (4,7) -> (3,0), a8 (0,7) -> (7,0), h8 (7,7) -> (0,0)
+        # Kingside (black)
+        if has_k:
+            tensor[12, 0, 3] = 1.0  # King (e8 flipped)
+            tensor[12, 0, 0] = 1.0  # Rook (h8 flipped)
+        # Queenside (black)
+        if has_q:
+            tensor[12, 0, 3] = 1.0  # King (e8 flipped)
+            tensor[12, 0, 7] = 1.0  # Rook (a8 flipped)
     else:
-        # White's turn
-        if has_K or has_Q:
-            tensor[12, 0, :] = 1.0  # White's back rank (row 0 in white POV)
+        # White's perspective
+        # Kingside (white)
+        if has_K:
+            tensor[12, 0, 4] = 1.0  # King (e1)
+            tensor[12, 0, 7] = 1.0  # Rook (h1)
+        # Queenside (white)
+        if has_Q:
+            tensor[12, 0, 4] = 1.0  # King (e1)
+            tensor[12, 0, 0] = 1.0  # Rook (a1)
     
     # Byte 33: En passant square
     ep_square = compact_board[33]
@@ -384,6 +411,11 @@ def compact_to_tensor(compact_board, flip_perspective=False):
     halfmove_clock = struct.unpack('>H', compact_board[34:36])[0]
     halfmove_normalized = min(halfmove_clock / 50.0, 1.0)
     tensor[14, :, :] = halfmove_normalized
+
+    # Bytes 36-37: Fullmove number
+    fullmove_number = struct.unpack('>H', compact_board[36:38])[0]
+    fullmove_normalized = min(fullmove_number / 100.0, 1.0)
+    tensor[15, :, :] = fullmove_normalized
     
     # 🔧 CRITICAL: Return a COPY to avoid mmap storage issues
     # Without .copy(), tensor shares memory with mmap which is non-resizable
@@ -394,9 +426,56 @@ def compact_to_tensor(compact_board, flip_perspective=False):
 # POV-AWARE MOVE ENCODING - FIXED FOR 180° ROTATION
 # ==============================================================================
 
+NORMAL_ACTIONS = 4096
+PROMOTION_TYPE_TO_INDEX = {
+    chess.QUEEN: 0,
+    chess.ROOK: 1,
+    chess.BISHOP: 2,
+    chess.KNIGHT: 3
+}
+INDEX_TO_PROMOTION_TYPE = {v: k for k, v in PROMOTION_TYPE_TO_INDEX.items()}
+
+def _build_promotion_pairs():
+    """
+    Build ordered list of all promotion (from_square, to_square) pairs.
+    Includes forward and capture promotions for both colors.
+    """
+    pairs = []
+    
+    # White promotions: from rank 7 -> rank 8
+    for file in range(8):
+        from_sq = chess.square(file, 6)
+        # forward
+        pairs.append((from_sq, chess.square(file, 7)))
+        # capture left
+        if file > 0:
+            pairs.append((from_sq, chess.square(file - 1, 7)))
+        # capture right
+        if file < 7:
+            pairs.append((from_sq, chess.square(file + 1, 7)))
+    
+    # Black promotions: from rank 2 -> rank 1
+    for file in range(8):
+        from_sq = chess.square(file, 1)
+        # forward
+        pairs.append((from_sq, chess.square(file, 0)))
+        # capture left (from black perspective = file+1 in board coords)
+        if file < 7:
+            pairs.append((from_sq, chess.square(file + 1, 0)))
+        # capture right (from black perspective = file-1)
+        if file > 0:
+            pairs.append((from_sq, chess.square(file - 1, 0)))
+    
+    return pairs
+
+
+PROMOTION_PAIRS = _build_promotion_pairs()
+PROMOTION_PAIR_TO_INDEX = {pair: idx for idx, pair in enumerate(PROMOTION_PAIRS)}
+ACTION_SIZE = NORMAL_ACTIONS + len(PROMOTION_PAIRS) * 4
+
 def move_to_index(move, board):
     """
-    Convert chess.Move to index (0-4095) with POV support
+    Convert chess.Move to index with POV support
     
     🔧 FIXED: Uses XOR 63 for 180° rotation (not square_mirror for vertical flip)
     
@@ -407,7 +486,7 @@ def move_to_index(move, board):
         board: chess.Board (to determine whose turn it is)
     
     Returns:
-        int: Move index (0-4095)
+        int: Move index (ACTION_SIZE)
     """
     from_square = move.from_square
     to_square = move.to_square
@@ -417,6 +496,19 @@ def move_to_index(move, board):
         from_square = from_square ^ 63
         to_square = to_square ^ 63
     
+    # Promotions use extended action space to disambiguate promotion type
+    if move.promotion is not None:
+        promo_idx = PROMOTION_TYPE_TO_INDEX.get(move.promotion)
+        if promo_idx is None:
+            promo_idx = PROMOTION_TYPE_TO_INDEX[chess.QUEEN]
+        
+        pair_idx = PROMOTION_PAIR_TO_INDEX.get((from_square, to_square))
+        if pair_idx is None:
+            # Fallback to base encoding if mapping fails
+            return from_square * 64 + to_square
+        
+        return NORMAL_ACTIONS + (pair_idx * 4 + promo_idx)
+    
     return from_square * 64 + to_square
 
 
@@ -425,21 +517,37 @@ def index_to_move(index, is_black_turn=False):
     Convert index back to move with POV support
     
     Args:
-        index: Move index (0-4095)
+        index: Move index (ACTION_SIZE)
         is_black_turn: Whether it's black's turn
     
     Returns:
         chess.Move object
     """
-    from_square = index // 64
-    to_square = index % 64
+    if index < NORMAL_ACTIONS:
+        from_square = index // 64
+        to_square = index % 64
+        
+        # Rotate back if black
+        if is_black_turn:
+            from_square = from_square ^ 63
+            to_square = to_square ^ 63
+        
+        return chess.Move(from_square, to_square)
     
-    # Rotate back if black
+    promo_index = index - NORMAL_ACTIONS
+    pair_idx = promo_index // 4
+    promo_type_idx = promo_index % 4
+    
+    if pair_idx < 0 or pair_idx >= len(PROMOTION_PAIRS):
+        return chess.Move.null()
+    
+    from_square, to_square = PROMOTION_PAIRS[pair_idx]
     if is_black_turn:
         from_square = from_square ^ 63
         to_square = to_square ^ 63
     
-    return chess.Move(from_square, to_square)
+    promotion = INDEX_TO_PROMOTION_TYPE.get(promo_type_idx, chess.QUEEN)
+    return chess.Move(from_square, to_square, promotion=promotion)
 
 
 # ==============================================================================
@@ -537,9 +645,9 @@ def get_position_size(use_mtl=False, history_positions=0):
     Calculate size of binary position record
     
     🆕 v4.4 FORMAT (Extended with metadata):
-    [Board (36B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
     
-    Board format changed: 32B pieces + 4B metadata (castling, en passant, halfmove)
+    Board format changed: 32B pieces + 6B metadata (castling, en passant, halfmove, fullmove)
     
     Args:
         use_mtl: Whether Multi-Task Learning is enabled
@@ -548,7 +656,7 @@ def get_position_size(use_mtl=False, history_positions=0):
     Returns:
         int: Size in bytes
     """
-    base_size = 36  # Board (compact) - 🆕 NOW 36 bytes instead of 32!
+    base_size = 38  # Board (compact) - 🆕 NOW 38 bytes instead of 32!
     base_size += 4  # GameID (uint32) — supports up to ~4 billion unique games
     base_size += 2  # MoveIdx (uint16)
     base_size += 2  # MoveTarget (uint16) - the move label (0-4095)
@@ -567,7 +675,7 @@ def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_label
     Pack position data into binary format
     
     🆕 v4.4 FORMAT (Extended with metadata):
-    [Board (36B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
     
     Args:
         board: chess.Board
@@ -583,7 +691,7 @@ def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_label
     """
     data = bytearray()
     
-    # Pack board (36 bytes - 🆕 NOW INCLUDES METADATA!)
+    # Pack board (38 bytes - 🆕 NOW INCLUDES METADATA!)
     data.extend(board_to_compact(board))
     
     # Pack metadata
@@ -606,7 +714,7 @@ def unpack_position_data(data_bytes, use_mtl=False):
     Unpack position data from binary format
     
     🆕 v4.4 FORMAT (Extended with metadata):
-    [Board (36B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
     
     Args:
         data_bytes: Raw bytes from file
@@ -614,7 +722,7 @@ def unpack_position_data(data_bytes, use_mtl=False):
     
     Returns:
         dict: {
-            'board_compact': bytes (36),  # 🆕 NOW 36 bytes!
+            'board_compact': bytes (38),  # 🆕 NOW 38 bytes!
             'game_id': int,
             'move_idx': int,
             'move_target': int,
@@ -626,20 +734,20 @@ def unpack_position_data(data_bytes, use_mtl=False):
     """
     result = {}
     
-    # Unpack board (36 bytes - 🆕 NOW INCLUDES METADATA!)
-    result['board_compact'] = data_bytes[:36]
+    # Unpack board (38 bytes - 🆕 NOW INCLUDES METADATA!)
+    result['board_compact'] = data_bytes[:38]
     
     # Unpack metadata — offsets shifted by +4 due to larger board
-    result['game_id'] = struct.unpack('I', data_bytes[36:40])[0]     # uint32, 4 bytes
-    result['move_idx'] = struct.unpack('H', data_bytes[40:42])[0]
-    result['move_target'] = struct.unpack('H', data_bytes[42:44])[0]
-    result['outcome'] = struct.unpack('f', data_bytes[44:48])[0]
+    result['game_id'] = struct.unpack('I', data_bytes[38:42])[0]     # uint32, 4 bytes
+    result['move_idx'] = struct.unpack('H', data_bytes[42:44])[0]
+    result['move_target'] = struct.unpack('H', data_bytes[44:46])[0]
+    result['outcome'] = struct.unpack('f', data_bytes[46:50])[0]
     
     # Unpack MTL labels if present
     if use_mtl:
-        result['win'] = struct.unpack('f', data_bytes[48:52])[0]
-        result['material'] = struct.unpack('f', data_bytes[52:56])[0]
-        result['check'] = struct.unpack('f', data_bytes[56:60])[0]
+        result['win'] = struct.unpack('f', data_bytes[50:54])[0]
+        result['material'] = struct.unpack('f', data_bytes[54:58])[0]
+        result['check'] = struct.unpack('f', data_bytes[58:62])[0]
     
     return result
 
@@ -684,10 +792,12 @@ def analyze_dataset_distribution(binary_file, position_size, sample_size=10000):
             offset = idx * position_size
             data = mm[offset:offset + position_size]
             
-            game_id = struct.unpack('I', data[32:36])[0]     # uint32
-            move_idx = struct.unpack('H', data[36:38])[0]    # was 34:36
-            # move_target at 38:40 (skipped for stats)
-            outcome = struct.unpack('f', data[40:44])[0]     # was 38:42
+            # 🔧 v4.5 FIXED: Updated offsets for 38B board (was 36B in v4.4)
+            # Layout: [Board 38B] + [GameID 4B] + [MoveIdx 2B] + [MoveTarget 2B] + [Outcome 4B] + [MTL 12B]
+            game_id = struct.unpack('I', data[38:42])[0]     # uint32 at offset 38 (was 36)
+            move_idx = struct.unpack('H', data[42:44])[0]    # uint16 at offset 42 (was 40)
+            # move_target at 44:46 (skipped for stats)
+            outcome = struct.unpack('f', data[46:50])[0]     # float at offset 46 (was 44)
             
             stats['unique_games'].add(game_id)
             stats['max_move_idx'] = max(stats['max_move_idx'], move_idx)

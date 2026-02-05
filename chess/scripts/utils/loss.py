@@ -74,6 +74,34 @@ class WDLLoss(nn.Module):
         super().__init__()
         self.label_smoothing = label_smoothing
     
+    def targets_to_classes(self, target_values):
+        """
+        Convert scalar targets to class indices, with shape handling and diagnostics.
+        """
+        # Ensure 1D
+        if target_values.dim() > 1:
+            target_values = target_values.squeeze(-1)
+
+        target_classes = torch.zeros_like(target_values, dtype=torch.long)
+        target_classes[target_values > 0.9] = 0   # Win
+        target_classes[target_values < -0.9] = 2  # Loss
+        target_classes[(target_values >= -0.9) & (target_values <= 0.9)] = 1  # Draw
+
+        # Diagnostic print (once)
+        if not hasattr(self, '_diagnostic_printed'):
+            print(f"\nWDL Loss DIAGNOSTIC:")
+            print(f"  Input target_values shape: {target_values.shape}")
+            print(f"  Target values range: [{target_values.min().item():.3f}, {target_values.max().item():.3f}]")
+            print(f"  Class distribution:")
+            print(f"    Win (0):  {(target_classes == 0).sum().item()} ({(target_classes == 0).float().mean().item()*100:.1f}%)")
+            print(f"    Draw (1): {(target_classes == 1).sum().item()} ({(target_classes == 1).float().mean().item()*100:.1f}%)")
+            print(f"    Loss (2): {(target_classes == 2).sum().item()} ({(target_classes == 2).float().mean().item()*100:.1f}%)")
+            print(f"  Sample targets: {target_values[:10].cpu().numpy()}")
+            print(f"  Sample classes: {target_classes[:10].cpu().numpy()}\n")
+            self._diagnostic_printed = True
+
+        return target_classes
+
     def forward(self, wdl_logits, target_values):
         """
         Args:
@@ -85,38 +113,8 @@ class WDLLoss(nn.Module):
         Returns:
             Cross-entropy loss
         """
-        # 🐛 FIX: Ensure target_values is 1D
-        # Datasets often return (B, 1) but cross_entropy expects (B,)
-        if target_values.dim() > 1:
-            target_values = target_values.squeeze(-1)
-        
-        # Convert scalar targets to class indices
-        # Mapping: +1.0 -> 0 (Win), 0.0 -> 1 (Draw), -1.0 -> 2 (Loss)
-        # 
-        # ⚠️ KRYTYCZNA NAPRAWA: Progi ±0.5 → ±0.9
-        # Dlaczego: Jeśli temporal discounting byłby użyty (błędnie), wartości
-        # jak 0.3, 0.4 MUSZĄ być klasyfikowane jako Win (choć słaba), nie Draw!
-        # 
-        # Ale NAJLEPIEJ: Używaj CZYSTYCH ±1.0 targets (use_wdl=True w discounting)
-        target_classes = torch.zeros_like(target_values, dtype=torch.long)
-        target_classes[target_values > 0.9] = 0   # Win: >0.9 (prawie pewna wygrana)
-        target_classes[target_values < -0.9] = 2  # Loss: <-0.9 (prawie pewna przegrana)
-        # Everything else (including exactly 0.0) is Draw
-        target_classes[(target_values >= -0.9) & (target_values <= 0.9)] = 1  # Draw
-        
-        # 🔍 DIAGNOSTIC: Print class distribution for first call
-        if not hasattr(self, '_diagnostic_printed'):
-            print(f"\n🔍 WDL Loss DIAGNOSTIC:")
-            print(f"  Input target_values shape: {target_values.shape}")
-            print(f"  Target values range: [{target_values.min().item():.3f}, {target_values.max().item():.3f}]")
-            print(f"  Class distribution:")
-            print(f"    Win (0):  {(target_classes == 0).sum().item()} ({(target_classes == 0).float().mean().item()*100:.1f}%)")
-            print(f"    Draw (1): {(target_classes == 1).sum().item()} ({(target_classes == 1).float().mean().item()*100:.1f}%)")
-            print(f"    Loss (2): {(target_classes == 2).sum().item()} ({(target_classes == 2).float().mean().item()*100:.1f}%)")
-            print(f"  Sample targets: {target_values[:10].cpu().numpy()}")
-            print(f"  Sample classes: {target_classes[:10].cpu().numpy()}\n")
-            self._diagnostic_printed = True
-        
+        target_classes = self.targets_to_classes(target_values)
+
         # Compute cross-entropy loss
         if self.label_smoothing > 0:
             return F.cross_entropy(
@@ -300,6 +298,13 @@ class CombinedLoss(nn.Module):
         # 🆕 WDL loss for value head
         wdl_smoothing = config['imitation_learning'].get('wdl_label_smoothing', 0.0)
         self.value_loss_fn = WDLLoss(label_smoothing=wdl_smoothing)
+
+        # ?? Value loss weighting by move index (later positions = stronger signal)
+        self.value_move_weighting = config['imitation_learning'].get('value_move_weighting', True)
+        self.value_move_weight_min = config['imitation_learning'].get('value_move_weight_min', 0.1)
+        self.value_move_weight_use_game_length = config['imitation_learning'].get('value_move_weight_use_game_length', False)
+        self.value_move_weight_min_total_moves = config['imitation_learning'].get('value_move_weight_min_total_moves', 40)
+        self.value_max_moves = config['data'].get('max_moves_per_game', 200)
         
         if self.use_mtl:
             # 🆕 Move-weighted win prediction
@@ -334,6 +339,7 @@ class CombinedLoss(nn.Module):
                 - 'material': (B,) or (B, 1) material targets (if MTL)
                 - 'check': (B,) or (B, 1) check labels (if MTL)
                 - 'move_indices': (B,) or (B, 1) move numbers (optional, for weighting)
+                - 'total_moves': (B,) or (B, 1) total moves per game (optional, for value weighting)
         
         Returns:
             total_loss, loss_dict
@@ -344,12 +350,49 @@ class CombinedLoss(nn.Module):
             targets['moves']
         )
         
-        # 🆕 Value loss (WDL) - handles both (B,) and (B, 1) targets
-        value_loss = self.value_loss_fn(
-            predictions['value'],
-            targets['values']
-        )
-        
+        # ?? Value loss (WDL) - handles both (B,) and (B, 1) targets
+        move_indices = targets.get('move_indices', None)
+        total_moves = targets.get('total_moves', None)
+        if self.value_move_weighting and move_indices is not None:
+            if move_indices.dim() > 1:
+                move_indices = move_indices.squeeze(-1)
+            if self.value_move_weight_use_game_length and total_moves is not None:
+                if total_moves.dim() > 1:
+                    total_moves = total_moves.squeeze(-1)
+                effective_total = torch.clamp(
+                    total_moves.float(),
+                    min=self.value_move_weight_min_total_moves,
+                    max=self.value_max_moves
+                )
+                denom = effective_total
+            else:
+                denom = self.value_max_moves
+            weights = torch.clamp(
+                move_indices.float() / denom,
+                min=self.value_move_weight_min,
+                max=1.0
+            )
+            target_classes = self.value_loss_fn.targets_to_classes(targets['values'])
+            if self.value_loss_fn.label_smoothing > 0:
+                value_losses = F.cross_entropy(
+                    predictions['value'],
+                    target_classes,
+                    reduction='none',
+                    label_smoothing=self.value_loss_fn.label_smoothing
+                )
+            else:
+                value_losses = F.cross_entropy(
+                    predictions['value'],
+                    target_classes,
+                    reduction='none'
+                )
+            value_loss = (value_losses * weights).mean()
+        else:
+            value_loss = self.value_loss_fn(
+                predictions['value'],
+                targets['values']
+            )
+
         # Combine
         total_loss = (
             self.policy_weight * policy_loss + 

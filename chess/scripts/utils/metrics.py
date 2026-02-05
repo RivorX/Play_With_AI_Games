@@ -3,6 +3,7 @@ Training metrics for chess AI evaluation
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 
 
@@ -26,20 +27,28 @@ class MetricsCalculator:
         self.policy_top3_correct = 0
         self.policy_top5_correct = 0
         self.value_abs_errors = []
+        self.value_abs_error_weighted_sum = 0.0
+        self.value_abs_error_weighted_denom = 0.0
+        self.value_wdl_correct = 0
+        self.value_wdl_total = 0
+        self.value_wdl_ce_sum = 0.0
         self.confidences = []
         self.legal_coverages = []
         self.total_samples = 0
     
-    def update(self, policy_pred, value_pred, target_move, target_value, legal_moves_mask=None):
+    def update(self, policy_pred, value_pred, target_move, target_value, legal_moves_mask=None,
+               move_indices=None, total_moves=None, value_weight_min=0.1,
+               value_weight_min_total_moves=40, value_max_moves=200,
+               value_use_game_length=False):
         """
         Update metrics with batch predictions
         
         Args:
-            policy_pred: Policy logits (B, 4096) - log probabilities
+            policy_pred: Policy logits (B, action_size) - log probabilities
             value_pred: Value predictions (B, 3) - WDL logits OR (B, 1) - scalar
             target_move: Target move indices (B,)
             target_value: Target values (B, 1) or (B,) - scalar values
-            legal_moves_mask: Optional binary mask of legal moves (B, 4096)
+            legal_moves_mask: Optional binary mask of legal moves (B, action_size)
         """
         batch_size = policy_pred.size(0)
         self.total_samples += batch_size
@@ -70,6 +79,10 @@ class MetricsCalculator:
         # 🆕 Handle WDL predictions by converting to scalar
         # ============================================================
         
+        # Ensure target_value is 1D
+        if target_value.dim() > 1:
+            target_value = target_value.squeeze()
+
         # Check if value_pred is WDL (3 logits) or scalar (1 value)
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
             # WDL format: convert to scalar
@@ -79,16 +92,45 @@ class MetricsCalculator:
             value_scalar = (wdl_probs[:, 0] * 1.0 + 
                            wdl_probs[:, 1] * 0.0 + 
                            wdl_probs[:, 2] * (-1.0))
+
+            # WDL accuracy + CE (classification metrics)
+            target_classes = torch.zeros_like(target_value, dtype=torch.long)
+            target_classes[target_value > 0.9] = 0
+            target_classes[target_value < -0.9] = 2
+            target_classes[(target_value >= -0.9) & (target_value <= 0.9)] = 1
+            pred_classes = torch.argmax(value_pred, dim=1)
+            self.value_wdl_correct += (pred_classes == target_classes).sum().item()
+            self.value_wdl_total += target_value.numel()
+            self.value_wdl_ce_sum += F.cross_entropy(value_pred, target_classes, reduction='sum').item()
         else:
             # Legacy scalar format
             value_scalar = value_pred.squeeze()
         
-        # Ensure target_value is 1D
-        if target_value.dim() > 1:
-            target_value = target_value.squeeze()
-        
         value_mae = torch.abs(value_scalar - target_value)
         self.value_abs_errors.extend(value_mae.cpu().tolist())
+        
+        # Weighted MAE (optional)
+        if move_indices is not None:
+            if move_indices.dim() > 1:
+                move_indices = move_indices.squeeze(-1)
+            if value_use_game_length and total_moves is not None:
+                if total_moves.dim() > 1:
+                    total_moves = total_moves.squeeze(-1)
+                effective_total = torch.clamp(
+                    total_moves.float(),
+                    min=value_weight_min_total_moves,
+                    max=value_max_moves
+                )
+                denom = effective_total
+            else:
+                denom = value_max_moves
+            weights = torch.clamp(
+                move_indices.float() / denom,
+                min=value_weight_min,
+                max=1.0
+            )
+            self.value_abs_error_weighted_sum += (value_mae * weights).sum().item()
+            self.value_abs_error_weighted_denom += weights.sum().item()
         
         # ============================================================
         # PREDICTION CONFIDENCE
@@ -125,6 +167,10 @@ class MetricsCalculator:
             
             # Value metrics
             'value_mae': np.mean(self.value_abs_errors) if self.value_abs_errors else 0.0,
+            'value_mae_weighted': (self.value_abs_error_weighted_sum / self.value_abs_error_weighted_denom)
+            if self.value_abs_error_weighted_denom else 0.0,
+            'value_wdl_acc': (self.value_wdl_correct / self.value_wdl_total) if self.value_wdl_total else 0.0,
+            'value_wdl_ce': (self.value_wdl_ce_sum / self.value_wdl_total) if self.value_wdl_total else 0.0,
             
             # Confidence metrics
             'avg_confidence': np.mean(self.confidences) if self.confidences else 0.0,
@@ -143,7 +189,7 @@ def compute_batch_metrics(policy_pred, value_pred, target_move, target_value):
     Compute metrics for a single batch (lightweight version)
     
     Args:
-        policy_pred: Policy logits (B, 4096)
+        policy_pred: Policy logits (B, action_size)
         value_pred: Value predictions (B, 1)
         target_move: Target move indices (B,)
         target_value: Target values (B, 1)
@@ -169,8 +215,21 @@ def compute_batch_metrics(policy_pred, value_pred, target_move, target_value):
         value_scalar = (wdl_probs[:, 0] * 1.0 + 
                        wdl_probs[:, 1] * 0.0 + 
                        wdl_probs[:, 2] * (-1.0))
+        
+        # WDL accuracy + CE
+        if target_value.dim() > 1:
+            target_value = target_value.squeeze()
+        target_classes = torch.zeros_like(target_value, dtype=torch.long)
+        target_classes[target_value > 0.9] = 0
+        target_classes[target_value < -0.9] = 2
+        target_classes[(target_value >= -0.9) & (target_value <= 0.9)] = 1
+        pred_classes = torch.argmax(value_pred, dim=1)
+        wdl_acc = (pred_classes == target_classes).float().mean().item()
+        wdl_ce = F.cross_entropy(value_pred, target_classes).item()
     else:
         value_scalar = value_pred.squeeze()
+        wdl_acc = 0.0
+        wdl_ce = 0.0
     
     if target_value.dim() > 1:
         target_value = target_value.squeeze()
@@ -185,5 +244,7 @@ def compute_batch_metrics(policy_pred, value_pred, target_move, target_value):
         'policy_top1_acc': top1_acc,
         'policy_top3_acc': top3_acc,
         'value_mae': value_mae,
+        'value_wdl_acc': wdl_acc,
+        'value_wdl_ce': wdl_ce,
         'avg_confidence': avg_confidence
     }
