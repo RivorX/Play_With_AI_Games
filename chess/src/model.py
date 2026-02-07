@@ -244,47 +244,47 @@ class ChessNet(nn.Module):
         self.material_weight = config['model'].get('material_prediction_weight', 0.2)
         self.check_weight = config['model'].get('check_prediction_weight', 0.15)
         
-        # đź†• v4.5: AUTO-CALCULATE input_planes with chess metadata
+        # v4.5: AUTO-CALCULATE input_planes with chess metadata
         # Base: 16 planes (12 pieces + 4 metadata: castling, en passant, halfmove, fullmove)
         # With history: 16 * (1 + history_positions)
         history_positions = config['model']['history_positions']
         if input_planes is None:
-            input_planes = 16 * (1 + history_positions)  # đź†• 16 instead of 12!
+            input_planes = 16 * (1 + history_positions)  # 16 instead of 12!
         
         self.input_planes = input_planes
         self.history_positions = history_positions
         
-        print(f"đź§  ULTRA-OPTIMIZED Model v4.4 (Chess Metadata + Pre-activation ResNet):")
-        print(f"  â€˘ đź†• History positions: {history_positions}")
-        print(f"  â€˘ đź†• Input planes: {input_planes} (16 Ă— {1 + history_positions})")
-        print(f"  â€˘ đź†• Chess metadata: Castling, En Passant, Halfmove, Fullmove")
+        print(f"[MODEL v4.6] ULTRA-OPTIMIZED (Chess Metadata + Pre-activation ResNet):")
+        print(f"  > History positions: {history_positions}")
+        print(f"  > Input planes: {input_planes} (16 x {1 + history_positions})")
+        print(f"  > Chess metadata: Castling, En Passant, Halfmove, Fullmove")
         
         if use_se2d:
-            print(f"  â€˘ đź†• SE2D-Block: ENABLED (spatial-aware, +5% time)")
+            print(f"  > SE2D-Block: ENABLED (spatial-aware, +5% time)")
         else:
-            print(f"  â€˘ âś… SE2D-Block: DISABLED")
+            print(f"  > SE2D-Block: DISABLED")
         
-        print(f"  â€˘ âś… Spatial Attention: {spatial_attention_mode} mode")
-        print(f"  â€˘ âś… CoordConv: Only at input")
-        print(f"  â€˘ âšˇ Activation: ReLU (5-10x faster than ELU)")
-        print(f"  â€˘ đźŽ˛ Stochastic Depth: {drop_path_rate}")
+        print(f"  > Spatial Attention: {spatial_attention_mode} mode")
+        print(f"  > CoordConv: Only at input")
+        print(f"  > Activation: ReLU (5-10x faster than ELU)")
+        print(f"  > Stochastic Depth: {drop_path_rate}")
         # Pre-activation ResNet is always enabled
-        print(f"  ? Pre-activation ResNet: ENABLED (better gradients)")
+        print(f"  > Pre-activation ResNet: ENABLED (better gradients)")
         
         if use_layer_scale:
-            print(f"  â€˘ đź†• LayerScale: ENABLED (init={layer_scale_init})")
+            print(f"  > LayerScale: ENABLED (init={layer_scale_init})")
         
         
-        print(f"  â€˘ âś… Standard 3x3 Conv: ENABLED (preserves spatial info for chess)")
-        print(f"  â€˘ đź”§ Policy Head: Standard flatten+FC (spatial preservation for chess)")
+        print(f"  > Standard 3x3 Conv: ENABLED (preserves spatial info for chess)")
+        print(f"  > Policy Head: Standard flatten+FC (spatial preservation for chess)")
         
         if self.use_mtl:
-            print(f"  â€˘ đź†• MTL with GlobalAvgPool heads:")
+            print(f"  > MTL with GlobalAvgPool heads:")
             print(f"    - Win: {self.win_weight}")
             print(f"    - Material: {self.material_weight}")
             print(f"    - Check: {self.check_weight}")
         
-        # đź†• Input conv with dynamic input_planes
+        # Input conv with dynamic input_planes
         if use_coord_conv:
             self.conv_block = nn.Sequential(
                 CoordConv2d(input_planes, filters, kernel_size=3, padding=1),
@@ -302,7 +302,7 @@ class ChessNet(nn.Module):
         # SELECTIVE ATTENTION: Determine which blocks get spatial attention
         spatial_blocks = self._get_spatial_blocks(num_blocks, spatial_attention_mode)
         
-        print(f"  â€˘ đź”Ť Spatial attention in blocks: {spatial_blocks}")
+        print(f"  > Spatial attention in blocks: {spatial_blocks}")
         
         # Residual tower
         blocks = []

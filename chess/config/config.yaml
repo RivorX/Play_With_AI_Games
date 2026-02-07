@@ -88,9 +88,9 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Base architecture
-  num_residual_blocks: 6     # Number of residual blocks (6-12 optimal)
+  num_residual_blocks: 9     # Number of residual blocks (6-12 optimal)
   filters: 192               # Convolutional filters (128-256 for RTX 5060 Ti)
-  policy_head_filters: 32    # Policy head filters
+  policy_head_filters: 16    # Policy head filters - 🔧 v4.6: 32→16 
   value_head_filters: 48     # Value head filters 
   value_hidden_dim: 256      # Value head hidden dimension 
   dropout: 0.2               # Dropout rate 
@@ -137,8 +137,8 @@ model:
 # ------------------------------------------------------------------------------
 imitation_learning:
   # Training hyperparameters
-  batch_size: 6144           # Batch size (maximized for GPU utilization)
-  learning_rate: 0.0015      # Learning rate 
+  batch_size: 5120           # Batch size
+  learning_rate: 0.001       # Learning rate 
   value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
   epochs: 100                # Maximum training epochs
   weight_decay: 0.001        # L2 regularization (10x stronger for value head)
