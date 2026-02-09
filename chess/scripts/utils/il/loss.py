@@ -66,13 +66,15 @@ class WDLLoss(nn.Module):
     - +5-10% stronger value predictions empirically
     """
     
-    def __init__(self, label_smoothing=0.0):
+    def __init__(self, label_smoothing=0.0, debug=False):
         """
         Args:
             label_smoothing: Optional smoothing for WDL targets (0.0-0.1)
+            debug: If True, print one-time diagnostics about target distribution
         """
         super().__init__()
         self.label_smoothing = label_smoothing
+        self.debug = bool(debug)
     
     def targets_to_classes(self, target_values):
         """
@@ -88,7 +90,7 @@ class WDLLoss(nn.Module):
         target_classes[(target_values >= -0.9) & (target_values <= 0.9)] = 1  # Draw
 
         # Diagnostic print (once)
-        if not hasattr(self, '_diagnostic_printed'):
+        if self.debug and not hasattr(self, '_diagnostic_printed'):
             print(f"\nWDL Loss DIAGNOSTIC:")
             print(f"  Input target_values shape: {target_values.shape}")
             print(f"  Target values range: [{target_values.min().item():.3f}, {target_values.max().item():.3f}]")
@@ -297,7 +299,8 @@ class CombinedLoss(nn.Module):
         
         # 🆕 WDL loss for value head
         wdl_smoothing = config['imitation_learning'].get('wdl_label_smoothing', 0.0)
-        self.value_loss_fn = WDLLoss(label_smoothing=wdl_smoothing)
+        debug_enabled = config.get('debug', {}).get('enabled', False)
+        self.value_loss_fn = WDLLoss(label_smoothing=wdl_smoothing, debug=debug_enabled)
 
         # ?? Value loss weighting by move index (later positions = stronger signal)
         self.value_move_weighting = config['imitation_learning'].get('value_move_weighting', True)

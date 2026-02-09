@@ -1,4 +1,4 @@
-"""
+﻿"""
 Imitation Learning Training Script - v4.5
 🆕 v4.5: CRITICAL FIXES - Per-Game Split + Promotions + Better Sampling
 🆕 v4.5: CHESS METADATA - Castling, En Passant, Halfmove, Fullmove (16 planes)
@@ -22,6 +22,7 @@ import sys
 import time
 from pathlib import Path
 import numpy as np
+import math
 import gc
 
 # Add src to path
@@ -44,6 +45,8 @@ def main():
     print(f"Loading config from: {config_path}")
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+
+    model_version = config.get('model', {}).get('version', 'v?.?')
     
     # Set seed
     torch.manual_seed(config['seed'])
@@ -97,7 +100,7 @@ def main():
     expected_input_planes = 16 * (1 + history_positions)  # 🔧 FIXED: 16 planes (12 pieces + 4 metadata)
     
     print("\n" + "="*70)
-    print("🆕 v4.5 CRITICAL FIXES + v4.5 METADATA + v4.3 WDL + v4.2 POV")
+    print(f"🆕 {model_version} CRITICAL FIXES + {model_version} METADATA + v4.3 WDL + v4.2 POV")
     print("="*70)
     print(f"  • POV: Boards from current player's perspective")
     print(f"  • History positions: {history_positions} (assembled dynamically)")
@@ -133,7 +136,7 @@ def main():
         
         with open(debug_log_file, 'w', encoding='utf-8') as f:
             f.write("="*70 + "\n")
-            f.write("🐛 TRAINING DEBUG LOG - v4.5 Chess Metadata + WDL\n")
+            f.write(f"🐛 TRAINING DEBUG LOG - {model_version} Chess Metadata + WDL\n")
             f.write("="*70 + "\n")
             f.write(f"Timestamp: {timestamp}\n")
             f.write(f"Model: {config['model']['filters']} filters, {config['model']['num_residual_blocks']} blocks\n")
@@ -151,13 +154,13 @@ def main():
     # Initialize logger
     logger = TrainingLogger(
         logs_dir, 
-        experiment_name="il_training_v4.5", 
+        experiment_name=f"il_training_{model_version}", 
         mode="il",
         use_mtl=use_mtl
     )
     
     # Load data with multi-phase processing
-    print("\n=== Loading data (v4.5 Chess Metadata + POV + Sliding Window) ===")
+    print(f"\n=== Loading data ({model_version} Chess Metadata + POV + Sliding Window) ===")
     print(f"Mode: {'SEQUENTIAL' if config['data']['files_at_once'] == 1 else 'BATCH'}")
     print(f"Files at once: {config['data']['files_at_once']}")
     print(f"Phase 1 workers: {config['data'].get('phase1_threads', 1)}")
@@ -219,13 +222,13 @@ def main():
             raise ValueError("MTL mismatch between data and config")
         elif actual_position_size in [48, 60]:  # Old v4.4 format (36B board)
             print(f"  âťŚ Data was processed with OLD v4.4 format (36B board, no fullmove metadata)")
-            print(f"     đź†• v4.5 adds fullmove number (38B board)")
-            print(f"     Please delete cache (data/preprocessing/) and reprocess with v4.5")
+            print(f"     đź†• {model_version} adds fullmove number (38B board)")
+            print(f"     Please delete cache (data/preprocessing/) and reprocess with {model_version}")
             raise ValueError("Old data format - please reprocess")
         elif actual_position_size in [44, 56]:  # Old v4.3 format (32B board)
             print(f"  ❌ Data was processed with OLD v4.3 format (32B board, no chess metadata)")
-            print(f"     🆕 v4.5 uses 38B board with castling, en passant, halfmove, fullmove")
-            print(f"     Please delete cache (data/preprocessing/) and reprocess with v4.5")
+            print(f"     🆕 {model_version} uses 38B board with castling, en passant, halfmove, fullmove")
+            print(f"     Please delete cache (data/preprocessing/) and reprocess with {model_version}")
             raise ValueError("Old data format - please reprocess")
         else:
             print(f"  ❌ Unknown format mismatch - please delete cache and reprocess")
@@ -311,6 +314,50 @@ def main():
         )
         print("✓ OneCycleLR scheduler enabled")
     
+    elif scheduler_type == 'cosine_decay':
+        total_epochs = config['imitation_learning']['epochs']
+        warmup_pct = config['imitation_learning'].get('warmup_pct', 0.05)
+        min_lr_ratio = config['imitation_learning'].get('min_lr_ratio', 0.05)
+        
+        warmup_pct = max(0.0, min(1.0, float(warmup_pct)))
+        min_lr_ratio = max(0.0, min(1.0, float(min_lr_ratio)))
+        
+        warmup_epochs = int(round(total_epochs * warmup_pct))
+        warmup_epochs = max(0, min(warmup_epochs, total_epochs))
+        
+        if warmup_epochs > 0:
+            start_factor = 1.0 / warmup_epochs if warmup_epochs > 1 else 1.0
+            warmup_scheduler = optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=start_factor,
+                total_iters=warmup_epochs
+            )
+            
+            if warmup_epochs >= total_epochs:
+                scheduler = warmup_scheduler
+            else:
+                cosine_epochs = total_epochs - warmup_epochs
+                cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=max(1, cosine_epochs),
+                    eta_min=base_lr * min_lr_ratio
+                )
+                scheduler = optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[warmup_scheduler, cosine_scheduler],
+                    milestones=[warmup_epochs]
+                )
+        else:
+            start_factor = 1.0
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, total_epochs),
+                eta_min=base_lr * min_lr_ratio
+            )
+        
+        print(f"✓ Cosine decay + warmup: warmup={warmup_epochs} ep "
+              f"({warmup_pct:.0%}), start_factor={start_factor:.3f}, min_lr_ratio={min_lr_ratio}")
+    
     elif scheduler_type == 'cosine_warm_restarts':
         t0 = config['imitation_learning'].get('cosine_t0', 10)
         t_mult = config['imitation_learning'].get('cosine_t_mult', 2)
@@ -388,6 +435,7 @@ def main():
     
     for epoch in range(config['imitation_learning']['epochs']):
         print(f"\nEpoch {epoch + 1}/{config['imitation_learning']['epochs']}")
+        epoch_lr = optimizer.param_groups[0]['lr']
         
         profile_this_epoch = profile_enabled and ((epoch + 1) % profile_every == 0)
         if profile_this_epoch and device.type == 'cuda':
@@ -408,8 +456,6 @@ def main():
         if profile_this_epoch and train_profile is not None:
             train_time = train_profile['total']
         
-        current_lr = optimizer.param_groups[0]['lr']
-        
         # 🆕 SWA: Update averaged model after swa_start epoch
         if use_swa and epoch >= swa_start:
             swa_model.update_parameters(model)
@@ -421,7 +467,7 @@ def main():
         print(f"Train - Loss: {train_losses['total']:.4f}, "
               f"Policy: {train_losses['policy']:.4f}, "
               f"Value: {train_losses['value']:.4f}, "
-              f"LR: {current_lr:.2e}")
+              f"LR: {epoch_lr:.2e}")
         
         print(f"       📊 Top-1: {train_metrics['policy_top1_acc']:.2%}, "
               f"Top-3: {train_metrics['policy_top3_acc']:.2%}, "
@@ -460,7 +506,7 @@ def main():
                       f"Check: {val_losses['check']:.4f}")
             
             # Log metrics
-            logger.log(epoch + 1, train_losses, val_losses, train_metrics, val_metrics, current_lr)
+            logger.log(epoch + 1, train_losses, val_losses, train_metrics, val_metrics, epoch_lr)
             logger.plot()
             
             # Save best model
@@ -493,7 +539,7 @@ def main():
                         'input_planes': expected_input_planes,
                         'sliding_window_stride': stride,
                         'pov_enabled': True,  # 🆕 v4.2
-                        'version': 'v4.5'     # 🆕 Track version
+                        'version': model_version     # 🆕 Track version
                     },
                     save_optimizer=False
                 )
@@ -515,7 +561,7 @@ def main():
                 break
         else:
             # Log only training metrics
-            logger.log(epoch + 1, train_losses, None, train_metrics, None, current_lr)
+            logger.log(epoch + 1, train_losses, None, train_metrics, None, epoch_lr)
             eval_time = 0.0
         
         if profile_this_epoch:
@@ -578,7 +624,7 @@ def main():
                     'input_planes': expected_input_planes,
                     'sliding_window_stride': stride,
                     'pov_enabled': True,  # 🆕 v4.2
-                    'version': 'v4.5'     # 🆕 Track version
+                    'version': model_version     # 🆕 Track version
                 },
                 save_optimizer=False
             )
@@ -641,7 +687,7 @@ def main():
                 'input_planes': expected_input_planes,
                 'sliding_window_stride': stride,
                 'pov_enabled': True,
-                'version': 'v4.5'
+                'version': model_version
             },
             save_optimizer=False
         )
@@ -660,7 +706,7 @@ def main():
         print(f"Debug log: {debug_log_file}")
     
     print("\n" + "="*70)
-    print("🆕 v4.5 Features Used:")
+    print(f"🆕 {model_version} Features Used:")
     print("="*70)
     print(f"  ✓ Chess Metadata - castling, en passant, halfmove, fullmove")
     print(f"  ✓ WDL Value Head - Win/Draw/Loss classification")
@@ -683,3 +729,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

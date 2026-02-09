@@ -60,6 +60,7 @@ class ChessGUI:
         self.model1 = model1  # White AI or main AI
         self.model2 = model2  # Black AI (for AI vs AI mode)
         self.config = config
+        self.version = config.get('model', {}).get('version', 'v?.?')
         self.device = device
         self.game_mode = game_mode  # "human_vs_ai", "ai_vs_ai", "human_vs_human"
         
@@ -81,7 +82,7 @@ class ChessGUI:
             self.mcts2 = None
         
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-        pygame.display.set_caption("Chess AI v4.5")
+        pygame.display.set_caption(f"Chess AI {self.version}")
         self.clock = pygame.time.Clock()
         
         # Load piece images
@@ -215,7 +216,7 @@ class ChessGUI:
         y = 20
         
         # Title
-        title = self.text_font.render("Chess AI v4.5", True, TEXT_COLOR)
+        title = self.text_font.render(f"Chess AI {self.version}", True, TEXT_COLOR)
         self.screen.blit(title, (x_start + 20, y))
         y += 50
         
@@ -591,7 +592,7 @@ class ChessGUI:
 
 def main():
     # 🆕 Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Chess AI Game v4.5')
+    parser = argparse.ArgumentParser(description='Chess AI Game')
     parser.add_argument('--no-mcts', action='store_true', 
                        help='Disable MCTS (use network-only mode)')
     args = parser.parse_args()
@@ -602,6 +603,8 @@ def main():
     print(f"Loading config from: {config_path}")
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+
+    model_version = config.get('model', {}).get('version', 'v?.?')
     
     # Setup device
     device = torch.device(config['hardware']['device'])
@@ -643,9 +646,9 @@ def main():
     
     # Start GUI
     print("\n" + "="*50)
-    print("Chess AI v4.5 - Pygame GUI")
+    print(f"Chess AI {model_version} - Pygame GUI")
     print("="*50)
-    print("\n🆕 v4.5 Features:")
+    print(f"\n🆕 {model_version} Features:")
     from src.utils.data_helpers import ACTION_SIZE
     print(f"  • Promotions - {ACTION_SIZE} actions (promotion-aware)")
     print("  • POV (Point of View) - perspective handling")

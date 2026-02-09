@@ -26,8 +26,7 @@ class BinaryChessDataset(Dataset):
     """
     
     def __init__(self, binary_file, indices, position_size, use_mtl=None, 
-                 history_positions=0, stride=1, stride_mode="fullmove_per_game_offset",
-                 game_length_by_id=None):
+                 history_positions=0, stride=1, game_length_by_id=None, sampling_config=None):
         """
         Args:
             binary_file: Path to binary file
@@ -50,8 +49,8 @@ class BinaryChessDataset(Dataset):
         self.position_size = position_size
         self.history_positions = history_positions
         self.stride = stride
-        self.stride_mode = stride_mode
         self.game_length_by_id = game_length_by_id
+        self.sampling_config = sampling_config or {}
         
         # Auto-detect MTL
         # 🔧 v4.5 FIXED: base_size must match current binary layout:
@@ -65,7 +64,7 @@ class BinaryChessDataset(Dataset):
         
         # 🆕 Apply stride filter to indices
         if self.stride > 1:
-            print(f"  🔄 Applying stride={stride} (mode={self.stride_mode})")
+            print(f"  🔄 Applying stride={stride} (mode=fullmove_per_game_offset)")
             # Filter indices based on stride
             # We need to check MoveIdx for each position
             filtered_indices = self._filter_indices_by_stride(indices)
@@ -75,16 +74,24 @@ class BinaryChessDataset(Dataset):
         else:
             self.indices = indices
         
+        # Optional: position sampling by game progress (reduce opening duplicates)
+        if self.sampling_config.get('enabled', False):
+            if self.game_length_by_id is None:
+                print("  ⚠️ position_sampling enabled but game_length_by_id missing; skipping sampling.")
+            else:
+                print("  🎯 Applying position sampling by game progress")
+                filtered_indices = self._filter_indices_by_progress_sampling(self.indices)
+                print(f"     Before sampling: {len(self.indices):,}")
+                print(f"     After sampling:  {len(filtered_indices):,}")
+                self.indices = filtered_indices
+        
         self._mmap = None
         self._file = None
     
     def _filter_indices_by_stride(self, indices):
         """
-        Filter indices based on sliding window stride
-        Modes:
-        - ply: move_idx % stride == 0 (legacy, can drop one color for even stride)
-        - fullmove: (move_idx // 2) % stride == 0 (keeps both colors)
-        - fullmove_per_game_offset: per-game offset on fullmove index (keeps both colors)
+        Filter indices based on sliding window stride.
+        Fixed mode: fullmove_per_game_offset (keeps both colors, per-game offset).
         
         🔧 FIXED: Correct offset for new binary format
         """
@@ -105,18 +112,66 @@ class BinaryChessDataset(Dataset):
                 
                 fullmove_idx = move_idx // 2
                 
-                if self.stride_mode == "ply":
-                    keep = (move_idx % self.stride == 0)
-                elif self.stride_mode == "fullmove":
-                    keep = (fullmove_idx % self.stride == 0)
-                elif self.stride_mode == "fullmove_per_game_offset":
-                    offset = game_id % self.stride
-                    keep = (fullmove_idx % self.stride == offset)
-                else:
-                    # Fallback to safe default
-                    keep = (fullmove_idx % self.stride == 0)
+                offset = game_id % self.stride
+                keep = (fullmove_idx % self.stride == offset)
                 
                 if keep:
+                    filtered.append(idx)
+        
+        return filtered
+
+    def _filter_indices_by_progress_sampling(self, indices):
+        """
+        Sample positions with higher probability later in the game.
+        Uses game_length_by_id to compute progress = move_idx / (total_moves - 1).
+        """
+        cfg = self.sampling_config
+        keep_min = float(cfg.get('keep_min', 1.0))
+        keep_max = float(cfg.get('keep_max', 1.0))
+        power = float(cfg.get('power', 1.0))
+        min_fullmove = int(cfg.get('min_fullmove', 0))
+        seed = cfg.get('seed', None)
+        
+        # Clamp config
+        keep_min = max(0.0, min(1.0, keep_min))
+        keep_max = max(0.0, min(1.0, keep_max))
+        if keep_max < keep_min:
+            keep_max = keep_min
+        if power <= 0:
+            power = 1.0
+        
+        rng = random.Random(seed) if seed is not None else random
+        filtered = []
+        
+        with open(self.binary_file, 'rb') as f:
+            for idx in indices:
+                offset = idx * self.position_size
+                # Layout: [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + ...
+                f.seek(offset + 38)
+                header = f.read(6)
+                if len(header) < 6:
+                    continue
+                
+                game_id = struct.unpack('I', header[:4])[0]
+                move_idx = struct.unpack('H', header[4:6])[0]
+                
+                # Optional: hard skip very early moves
+                if min_fullmove > 0 and (move_idx // 2) < min_fullmove:
+                    continue
+                
+                total_moves = self.game_length_by_id.get(game_id, 0)
+                if total_moves <= 1:
+                    progress = 1.0
+                else:
+                    progress = move_idx / (total_moves - 1)
+                    if progress < 0.0:
+                        progress = 0.0
+                    elif progress > 1.0:
+                        progress = 1.0
+                
+                keep_prob = keep_min + (keep_max - keep_min) * (progress ** power)
+                
+                if rng.random() <= keep_prob:
                     filtered.append(idx)
         
         return filtered
@@ -266,6 +321,68 @@ class BinaryChessDataset(Dataset):
 # DATALOADER CREATION
 # ==============================================================================
 
+def _compute_progress_histogram(binary_file, position_size, indices, game_length_by_id,
+                                bins=10, sample_max=200000, seed=0):
+    """
+    Compute histogram of position progress (move_idx / total_moves) for given indices.
+    Uses sampling for speed if indices list is large.
+    """
+    if not indices:
+        return [0] * bins, 0, 0
+    
+    total_count = len(indices)
+    sampled = False
+    sample_indices = indices
+    if sample_max and total_count > sample_max:
+        rng = random.Random(seed)
+        sample_indices = rng.sample(indices, sample_max)
+        sampled = True
+    
+    counts = [0] * bins
+    with open(binary_file, 'rb') as f:
+        for idx in sample_indices:
+            offset = idx * position_size
+            f.seek(offset + 38)
+            header = f.read(6)
+            if len(header) < 6:
+                continue
+            
+            game_id = struct.unpack('I', header[:4])[0]
+            move_idx = struct.unpack('H', header[4:6])[0]
+            total_moves = game_length_by_id.get(game_id, 0)
+            
+            if total_moves <= 1:
+                progress = 1.0
+            else:
+                progress = move_idx / (total_moves - 1)
+                if progress < 0.0:
+                    progress = 0.0
+                elif progress > 1.0:
+                    progress = 1.0
+            
+            bin_idx = int(progress * bins)
+            if bin_idx >= bins:
+                bin_idx = bins - 1
+            counts[bin_idx] += 1
+    
+    sample_count = len(sample_indices)
+    return counts, sample_count, total_count if sampled else sample_count
+
+
+def _print_progress_histogram(label, counts, sample_count, total_count, bins=10):
+    if sample_count == 0:
+        print(f"  🔍 {label}: no samples")
+        return
+    sampled_note = ""
+    if total_count != sample_count:
+        sampled_note = f" (sampled from {total_count:,})"
+    print(f"  🔍 {label} progress histogram{sampled_note}:")
+    for i in range(bins):
+        lo = int(100 * i / bins)
+        hi = int(100 * (i + 1) / bins)
+        pct = (counts[i] * 100.0) / sample_count if sample_count else 0.0
+        print(f"     {lo:02d}-{hi:02d}%: {counts[i]:,} ({pct:.1f}%)")
+
 def _build_game_ranges(binary_file, position_size, total_positions):
     """
     Build contiguous (game_id, start_idx, end_idx) ranges by scanning the binary file.
@@ -332,15 +449,35 @@ def _split_indices_by_game(metadata, config, return_game_ranges=False):
     
     train_ranges = []
     val_ranges = []
-    train_positions = 0
+    remaining_train = target_train_positions
+    remaining_total = total_positions
     
+    # Probabilistic per-game assignment to avoid tail bias and keep length distribution similar.
+    # For each game, assign to train with probability proportional to remaining target positions.
     for _, start, end in game_ranges:
         count = end - start
-        if train_positions < target_train_positions:
+        if remaining_total <= 0:
+            val_ranges.append((start, end))
+            continue
+        
+        if remaining_train <= 0:
+            val_ranges.append((start, end))
+            remaining_total -= count
+            continue
+        
+        if remaining_train >= remaining_total:
             train_ranges.append((start, end))
-            train_positions += count
+            remaining_train -= count
+            remaining_total -= count
+            continue
+        
+        p_train = remaining_train / remaining_total
+        if rng.random() < p_train:
+            train_ranges.append((start, end))
+            remaining_train -= count
         else:
             val_ranges.append((start, end))
+        remaining_total -= count
     
     # Ensure both splits are non-empty
     if not val_ranges and train_ranges:
@@ -369,13 +506,20 @@ def create_dataloaders(metadata, config):
     
     total_positions = metadata['total_positions']
     
-    split_by_game = config['data'].get('split_by_game', False)
+    split_by_game = True
     game_count = train_game_count = val_game_count = None
     use_game_length = config['imitation_learning'].get('value_move_weight_use_game_length', False)
+    sampling_cfg = config['data'].get('position_sampling', {})
+    sampling_enabled = bool(sampling_cfg.get('enabled', False))
+    if sampling_enabled:
+        sampling_cfg = dict(sampling_cfg)  # avoid mutating config
+        if sampling_cfg.get('seed', None) is None:
+            sampling_cfg['seed'] = config.get('seed', 0)
     game_length_by_id = None
+    need_game_length = use_game_length or sampling_enabled
     
     if split_by_game:
-        if use_game_length:
+        if need_game_length:
             (train_indices, val_indices, game_count, train_game_count,
              val_game_count, game_ranges) = _split_indices_by_game(
                 metadata, config, return_game_ranges=True
@@ -398,7 +542,7 @@ def create_dataloaders(metadata, config):
         
         train_indices = all_indices[:split_idx]
         val_indices = all_indices[split_idx:]
-        if use_game_length:
+        if need_game_length:
             game_length_by_id = _build_game_length_map(
                 metadata['binary_file'],
                 metadata['position_size'],
@@ -410,7 +554,6 @@ def create_dataloaders(metadata, config):
     use_mtl = metadata.get('use_mtl', False)
     history_positions = config['model'].get('history_positions', 0)
     stride = config['data'].get('sliding_window_stride', 1)
-    stride_mode = config['data'].get('stride_mode', "fullmove_per_game_offset")
     
     # 🔧 v4.5 FIXED: Calculate actual input planes (16 per position with metadata)
     input_planes = 16 * (1 + history_positions)  # 16 planes (12 pieces + 4 metadata)
@@ -422,8 +565,14 @@ def create_dataloaders(metadata, config):
     print(f"  • MTL: {use_mtl}")
     print(f"  • History positions: {history_positions} (dynamic)")
     print(f"  • Sliding window stride: {stride}")
-    print(f"  • Stride mode: {stride_mode}")
-    print(f"  • Split by game: {split_by_game}")
+    print("  • Stride mode: fullmove_per_game_offset (fixed)")
+    if sampling_enabled:
+        print("  • Position sampling: enabled (progress-weighted)")
+        print(f"    - keep_min: {sampling_cfg.get('keep_min', 1.0)}")
+        print(f"    - keep_max: {sampling_cfg.get('keep_max', 1.0)}")
+        print(f"    - power: {sampling_cfg.get('power', 1.0)}")
+        print(f"    - min_fullmove: {sampling_cfg.get('min_fullmove', 0)}")
+    print("  • Split by game: True (fixed)")
     if split_by_game and game_count is not None:
         print(f"  • Games: {game_count:,} (train: {train_game_count:,}, val: {val_game_count:,})")
     print(f"  • Input planes: {input_planes} (16 × {1 + history_positions})")
@@ -438,8 +587,8 @@ def create_dataloaders(metadata, config):
         use_mtl=use_mtl,
         history_positions=history_positions,
         stride=stride,
-        stride_mode=stride_mode,
-        game_length_by_id=game_length_by_id
+        game_length_by_id=game_length_by_id,
+        sampling_config=sampling_cfg if sampling_enabled else None
     )
     val_dataset = BinaryChessDataset(
         metadata['binary_file'], 
@@ -448,9 +597,36 @@ def create_dataloaders(metadata, config):
         use_mtl=use_mtl,
         history_positions=history_positions,
         stride=stride,
-        stride_mode=stride_mode,
-        game_length_by_id=game_length_by_id
+        game_length_by_id=game_length_by_id,
+        sampling_config=sampling_cfg if sampling_enabled else None
     )
+
+    # Debug: show progress histogram after stride + sampling
+    debug_enabled = config.get('debug', {}).get('enabled', False)
+    if debug_enabled and sampling_enabled:
+        if game_length_by_id is None:
+            print("  ⚠️ Debug histogram skipped: game_length_by_id missing")
+        else:
+            counts, sample_count, total_count = _compute_progress_histogram(
+                metadata['binary_file'],
+                position_size,
+                train_dataset.indices,
+                game_length_by_id,
+                bins=10,
+                sample_max=200000,
+                seed=config.get('seed', 0)
+            )
+            _print_progress_histogram("Train", counts, sample_count, total_count, bins=10)
+            counts, sample_count, total_count = _compute_progress_histogram(
+                metadata['binary_file'],
+                position_size,
+                val_dataset.indices,
+                game_length_by_id,
+                bins=10,
+                sample_max=200000,
+                seed=(config.get('seed', 0) + 1)
+            )
+            _print_progress_histogram("Val", counts, sample_count, total_count, bins=10)
     
     print(f"  • Train positions (after stride): {len(train_dataset):,}")
     print(f"  • Val positions (after stride): {len(val_dataset):,}")

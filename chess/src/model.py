@@ -222,6 +222,9 @@ class ChessNet(nn.Module):
         """
         super().__init__()
         
+        model_version = config.get('model', {}).get('version', 'v?.?')
+        self.model_version = model_version
+
         filters = config['model']['filters']
         num_blocks = config['model']['num_residual_blocks']
         dropout = config['model']['dropout']
@@ -254,7 +257,7 @@ class ChessNet(nn.Module):
         self.input_planes = input_planes
         self.history_positions = history_positions
         
-        print(f"[MODEL v4.6] ULTRA-OPTIMIZED (Chess Metadata + Pre-activation ResNet):")
+        print(f"[MODEL {model_version}] ULTRA-OPTIMIZED (Chess Metadata + Pre-activation ResNet):")
         print(f"  > History positions: {history_positions}")
         print(f"  > Input planes: {input_planes} (16 x {1 + history_positions})")
         print(f"  > Chess metadata: Castling, En Passant, Halfmove, Fullmove")

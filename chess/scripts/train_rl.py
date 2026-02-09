@@ -162,6 +162,8 @@ def main():
     print(f"Loading config from: {config_path}")
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+
+    model_version = config.get('model', {}).get('version', 'v?.?')
     
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
@@ -199,7 +201,7 @@ def main():
     # Initialize logger
     logger = TrainingLogger(
         logs_dir, 
-        experiment_name="rl_training_mcts",
+        experiment_name=f"rl_training_{model_version}_mcts",
         mode="rl"
     )
     
@@ -402,7 +404,8 @@ def main():
                     {
                         'win_rate': win_rate,
                         'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
-                        'value_mae': train_metrics.get('value_mae', 0)
+                        'value_mae': train_metrics.get('value_mae', 0),
+                        'version': model_version
                     },
                     save_optimizer=False
                 )
@@ -444,7 +447,8 @@ def main():
                 {
                     'win_rate': win_rate,
                     'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
-                    'value_mae': train_metrics.get('value_mae', 0)
+                    'value_mae': train_metrics.get('value_mae', 0),
+                    'version': model_version
                 },
                 save_optimizer=False
             )

@@ -6,6 +6,7 @@ Split from src.data to keep preprocessing separate from dataset/dataloader code.
 import chess
 import chess.pgn
 import gc
+import os
 import hashlib
 import json
 import pickle
@@ -17,6 +18,31 @@ from pathlib import Path
 from tqdm import tqdm
 
 from src.utils.data_helpers import get_position_size
+
+# ==============================================================================
+# WORKER COUNT RESOLUTION
+# ==============================================================================
+
+def _resolve_workers(value, label):
+    """
+    Resolve worker count from config.
+    Accepts int or strings like "all" to use all CPU cores.
+    """
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("all", "auto", "max"):
+            return max(1, os.cpu_count() or 1)
+        try:
+            value = int(v)
+        except ValueError:
+            raise ValueError(f"{label} must be an int or 'all', got: {value}")
+    try:
+        value = int(value)
+    except Exception:
+        raise ValueError(f"{label} must be an int or 'all', got: {value}")
+    if value <= 0:
+        return max(1, os.cpu_count() or 1)
+    return value
 
 # ==============================================================================
 # 🆕 DATASET TRACKING SYSTEM
@@ -78,6 +104,10 @@ class DatasetTracker:
             'min_elo': config['data'].get('min_elo', 0),
             'max_games': config['data'].get('max_games', float('inf')),
             'max_moves_per_game': config['data'].get('max_moves_per_game', 200),
+            'sort_by_avg_elo': config['data'].get('sort_by_avg_elo', True),
+            'game_filters': config['data'].get('game_filters', {}),
+            'position_dedup': config['data'].get('position_dedup', {}),
+            'position_sampling': config['data'].get('position_sampling', {}),
             'use_multitask_learning': config['model'].get('use_multitask_learning', False),
             'use_wdl_value': config['model'].get('use_wdl_value', True),  # 🔧 CRITICAL FIX
         }
@@ -325,6 +355,7 @@ def extract_game_data(game):
         white_elo = game.headers.get('WhiteElo', '?')
         black_elo = game.headers.get('BlackElo', '?')
         result = game.headers.get('Result', '*')
+        termination = game.headers.get('Termination', '')
         
         moves = []
         for move in game.mainline_moves():
@@ -334,6 +365,7 @@ def extract_game_data(game):
             'white_elo': white_elo,
             'black_elo': black_elo,
             'result': result,
+            'termination': termination,
             'moves': moves
         }
     except:
@@ -453,7 +485,223 @@ def sort_games_by_elo(games_data):
     return sorted(games_data, key=get_avg_elo, reverse=True)
 
 
-def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, sort_by_elo=True):
+def _dedupe_games(games_data):
+    """Remove duplicate games based on moves+result signature."""
+    seen = set()
+    deduped = []
+    dupes = 0
+    
+    for game in games_data:
+        moves = game.get('moves') or []
+        result = game.get('result', '')
+        sig_src = result + "|" + " ".join(moves)
+        sig = hashlib.md5(sig_src.encode('utf-8')).hexdigest()
+        if sig in seen:
+            dupes += 1
+            continue
+        seen.add(sig)
+        deduped.append(game)
+    
+    if dupes:
+        print(f"  🔁 Deduplicated games: {dupes} removed")
+    return deduped
+
+
+def _dedupe_positions(positions, mode="fen_no_counters", include_turn=True, max_count=None, random_sample=True):
+    """
+    Remove or limit duplicate positions across all games.
+    
+    Args:
+        positions: List of position bytes
+        mode: Deduplication mode:
+            - "fen": pieces + castling + ep + halfmove + fullmove
+            - "fen_no_counters": pieces + castling + ep (no half/fullmove)
+            - "pieces": pieces only
+            - "position_plus_move": (position, move_target) pair - BEST for preserving move diversity!
+        include_turn: Include side-to-move (from move_idx parity)
+        max_count: Max occurrences per signature (None = remove all duplicates)
+        random_sample: If True, randomly sample max_count positions; else take first K
+    
+    Returns:
+        Deduplicated list of positions
+    """
+    if not positions:
+        return positions
+    
+    valid_modes = {"fen", "fen_no_counters", "pieces", "position_plus_move"}
+    if mode not in valid_modes:
+        raise ValueError(f"position_dedup.mode must be one of {sorted(valid_modes)}, got: {mode}")
+    
+    # Build signature → positions mapping
+    from collections import defaultdict
+    sig_to_positions = defaultdict(list)
+    
+    for pos in positions:
+        board = pos[:38]
+        
+        # Choose signature based on mode
+        if mode == "fen":
+            sig_bytes = board
+        elif mode == "fen_no_counters":
+            sig_bytes = board[:34]  # pieces + castling + ep
+        elif mode == "pieces":
+            sig_bytes = board[:32]
+        elif mode == "position_plus_move":
+            # Signature = (board, move_target) - preserves move diversity!
+            move_target = pos[44:46]  # 2 bytes: move_target
+            sig_bytes = board[:34] + move_target  # fen_no_counters + move
+        
+        # Add turn if requested
+        if include_turn and mode != "position_plus_move":  # position_plus_move already has context
+            move_idx = struct.unpack('H', pos[42:44])[0]
+            sig_bytes = sig_bytes + bytes([move_idx & 1])
+        
+        sig = hashlib.blake2b(sig_bytes, digest_size=16).digest()
+        sig_to_positions[sig].append(pos)
+    
+    # Sample positions based on max_count
+    deduped = []
+    total_kept = 0
+    total_removed = 0
+    
+    for sig, pos_list in sig_to_positions.items():
+        count = len(pos_list)
+        
+        if max_count is None:
+            # Old behavior: keep only first occurrence
+            kept = pos_list[:1]
+            removed = count - 1
+        elif count <= max_count:
+            # Keep all
+            kept = pos_list
+            removed = 0
+        else:
+            # Sample max_count positions
+            if random_sample:
+                import random
+                kept = random.sample(pos_list, max_count)
+            else:
+                kept = pos_list[:max_count]
+            removed = count - max_count
+        
+        deduped.extend(kept)
+        total_kept += len(kept)
+        total_removed += removed
+    
+    if total_removed > 0:
+        if max_count is None:
+            print(f"  🔁 Position dedup: removed {total_removed:,} duplicates (mode={mode})")
+        else:
+            print(f"  🔁 Position dedup: removed {total_removed:,} / kept {total_kept:,} (mode={mode}, max_count={max_count})")
+    
+    return deduped
+
+
+# ==============================================================================
+# GAME FILTERING (HEADERS + LENGTH)
+# ==============================================================================
+
+def _safe_int(value):
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _contains_any(text, keywords):
+    text = (text or "").lower()
+    for kw in keywords:
+        if kw.lower() in text:
+            return True
+    return False
+
+
+def _fullmoves_from_moves(moves):
+    plies = len(moves) if moves else 0
+    return (plies + 1) // 2
+
+
+def _filter_games(games_data, config):
+    cfg = config.get('data', {}).get('game_filters', {})
+    
+    filters_enabled = bool(cfg.get('enabled', False))
+    
+    if not filters_enabled:
+        return games_data
+    
+    exclude_term_keywords = [s.lower() for s in (cfg.get('exclude_terminations', []) or [])]
+    
+    min_fullmove = int(cfg.get('min_fullmove', 0))
+    min_fullmove_draw = int(cfg.get('min_fullmove_draw', min_fullmove))
+    min_fullmove_resign = int(cfg.get('min_fullmove_resign', min_fullmove))
+    max_elo_gap = int(cfg.get('max_elo_gap', 0) or 0)
+    
+    filtered = []
+    stats = {
+        'total': 0,
+        'kept': 0,
+        'termination': 0,
+        'length': 0,
+        'draw_short': 0,
+        'resign_short': 0,
+        'elo_gap': 0,
+    }
+    
+    for game in games_data:
+        stats['total'] += 1
+        moves = game.get('moves') or []
+        fullmoves = _fullmoves_from_moves(moves)
+        
+        result = game.get('result', '*')
+        termination = (game.get('termination', '') or '').lower()
+        
+        # Termination filter
+        if filters_enabled:
+            if termination and exclude_term_keywords and _contains_any(termination, exclude_term_keywords):
+                stats['termination'] += 1
+                continue
+        
+        # Elo gap filter
+        if filters_enabled and max_elo_gap > 0:
+            white_elo = _safe_int(game.get('white_elo'))
+            black_elo = _safe_int(game.get('black_elo'))
+            if white_elo is not None and black_elo is not None:
+                if abs(white_elo - black_elo) > max_elo_gap:
+                    stats['elo_gap'] += 1
+                    continue
+        
+        # Length filters
+        if filters_enabled:
+            if result == "1/2-1/2" and min_fullmove_draw > 0 and fullmoves < min_fullmove_draw:
+                stats['draw_short'] += 1
+                continue
+            if _contains_any(termination, ["resign", "resignation"]) and min_fullmove_resign > 0 and fullmoves < min_fullmove_resign:
+                stats['resign_short'] += 1
+                continue
+            if min_fullmove > 0 and fullmoves < min_fullmove:
+                stats['length'] += 1
+                continue
+        
+        filtered.append(game)
+        stats['kept'] += 1
+    
+    if filters_enabled:
+        print(f"  Filtered games: {stats['total']:,} -> {stats['kept']:,}")
+        if stats['termination']:
+            print(f"    - termination filter: {stats['termination']:,}")
+        if stats['elo_gap']:
+            print(f"    - elo gap filter: {stats['elo_gap']:,}")
+        if stats['draw_short']:
+            print(f"    - short draw filter: {stats['draw_short']:,}")
+        if stats['resign_short']:
+            print(f"    - short resign filter: {stats['resign_short']:,}")
+        if stats['length']:
+            print(f"    - min length filter: {stats['length']:,}")
+    
+    return filtered
+
+
+def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, sort_by_elo=True, config=None):
     """
     PHASE 1: Extract games from PGN file
     """
@@ -466,6 +714,13 @@ def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, sort_by
     
     if not all_games:
         return []
+    
+    # Remove duplicate games (same moves + result)
+    all_games = _dedupe_games(all_games)
+    
+    # Apply filters (if enabled)
+    if config:
+        all_games = _filter_games(all_games, config)
     
     # Sort by Elo and take top games
     if sort_by_elo:
@@ -539,8 +794,9 @@ def extract_positions_from_game_worker(args):
         if white_elo_int < min_elo or black_elo_int < min_elo:
             return []
         
-        # Check game length
-        if len(game_data['moves']) > max_moves_per_game:
+        # Check game length (drop if too long)
+        moves = game_data['moves']
+        if max_moves_per_game and max_moves_per_game > 0 and len(moves) > max_moves_per_game:
             return []
         
         # Replay game
@@ -548,12 +804,12 @@ def extract_positions_from_game_worker(args):
         result = game_data['result']
         
         # 🆕 v4.3: Calculate total moves for temporal discounting
-        total_moves = len(game_data['moves'])
+        total_moves = len(moves)
         
         positions = []
         move_idx = 0
         
-        for move_uci in game_data['moves']:
+        for move_uci in moves:
             try:
                 move = chess.Move.from_uci(move_uci)
                 
@@ -759,8 +1015,8 @@ def process_pgn_files(pgn_files, config):
         print(f"🔨 Processing {len(new_pgn_files)} new PGN files...")
         print(f"{'='*70}")
         
-        phase1_workers = config['data'].get('phase1_threads', 1)
-        phase2_workers = config['data'].get('phase2_threads', 1)
+        phase1_workers = _resolve_workers(config['data'].get('phase1_threads', 1), "phase1_threads")
+        phase2_workers = _resolve_workers(config['data'].get('phase2_threads', 1), "phase2_threads")
         max_games = config['data'].get('max_games', 100000)
         sort_by_elo = config['data'].get('sort_by_avg_elo', True)
         
@@ -771,7 +1027,7 @@ def process_pgn_files(pgn_files, config):
             # Phase 1: Extract games
             print("🔹 PHASE 1: PGN Parsing...")
             games_data = extract_games_from_pgn_parallel(
-                pgn_file, max_games, phase1_workers, sort_by_elo
+                pgn_file, max_games, phase1_workers, sort_by_elo, config=config
             )
             
             if not games_data:
@@ -789,6 +1045,22 @@ def process_pgn_files(pgn_files, config):
                 continue
             
             print(f"  ✅ Extracted {len(positions):,} positions")
+            
+            # Optional: position deduplication (FEN / pieces / position+move)
+            pos_dedup_cfg = config['data'].get('position_dedup', {})
+            if pos_dedup_cfg.get('enabled', False):
+                mode = pos_dedup_cfg.get('mode', 'fen_no_counters')
+                include_turn = pos_dedup_cfg.get('include_turn', True)
+                max_count = pos_dedup_cfg.get('max_count', None)  # None = remove all duplicates
+                random_sample = pos_dedup_cfg.get('random_sample', True)
+                positions = _dedupe_positions(
+                    positions, 
+                    mode=mode, 
+                    include_turn=include_turn,
+                    max_count=max_count,
+                    random_sample=random_sample
+                )
+                print(f"  ✅ After position dedup: {len(positions):,} positions")
             
             # Phase 3: Write to disk
             print(f"\n🔹 PHASE 3: Writing to disk...")

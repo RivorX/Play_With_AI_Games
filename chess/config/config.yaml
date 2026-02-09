@@ -25,71 +25,63 @@ paths:
 # ------------------------------------------------------------------------------
 data:
   min_elo: 2000              # Minimum Elo rating for games
-  max_games: 100000          # Top N games to use per PGN file
+  max_games: 200000          # Top N games to use per PGN file
   train_split: 0.85           # Train/validation split ratio
-  max_moves_per_game: 200    # Skip longer games
+  max_moves_per_game: 200    # Skip games longer than this
   
   # Quality filtering
   sort_by_avg_elo: true      # Sort by average Elo of both players
+
+  # Game-level quality filters (headers + length)
+  game_filters:
+    enabled: true
+    min_fullmove: 8               # Minimum fullmoves for any decisive game
+    min_fullmove_draw: 16         # Stronger filter for short draws
+    min_fullmove_resign: 10       # Early resignations
+    max_elo_gap: 350              # Detect "rozkladówki"
+    exclude_terminations:
+      - "Time forfeit"
+      - "Timeout"
+      - "Flag"
   
-  # 🆕 SLIDING WINDOW CONFIGURATION
-  # ═══════════════════════════════════════════════════════════════════════════
-  # The sliding window system allows dynamic history assembly at load time
-  # instead of storing redundant history data in binary files.
-  # ═══════════════════════════════════════════════════════════════════════════
+  # SLIDING WINDOW: dynamic history, no redundant storage
+  sliding_window_stride: 2   # Sample every Nth position (1=all, 2=half, 3=third)
   
-  sliding_window_stride: 2   # 🆕 Sample every Nth position (1 = all, 2 = every other, etc.)
-                             # - stride=1: All positions (~100% data, slower training)
-                             # - stride=2: Every other position (~50% data, 2x faster) ⭐ RECOMMENDED
-                             # - stride=3: Every 3rd position (~33% data, 3x faster)
-                             # Higher stride = less data but faster iterations
-                             # Note: History is still built dynamically from ALL positions
+  # Position sampling by game progress (reduce opening duplicates)
+  # keep_prob = keep_min + (keep_max - keep_min) * (progress ** power)
+  # progress = move_idx / (total_moves - 1)
+  position_sampling:
+    enabled: true
+    seed: 42
+    min_fullmove: 2      # hard-skip first N fullmoves (2 = skip moves 1-2)
+    keep_min: 0.2        # early-game keep probability
+    keep_max: 1.0        # late-game keep probability
+    power: 1.5           # >1 biases toward mid/late game
+
+  # Position deduplication (across games)
+  # 🆕 v4.7: SMART DEDUP with max_count + position_plus_move mode
+  position_dedup:
+    enabled: true
+    mode: "position_plus_move"   # position_plus_move | fen_no_counters | fen | pieces
+    include_turn: true           # Include side-to-move in signature
+    max_count: 5                 # Max occurrences per signature (None = remove all duplicates)
+    random_sample: true          # Random sample (vs first K) - prevents bias
   
-  # Stride sampling mode (prevents color drop for even stride)
-  stride_mode: "fullmove_per_game_offset"  # "fullmove_per_game_offset" | "fullmove" | "ply"
-                                           # - fullmove_per_game_offset: per-game offset on fullmove index (keeps both colors)
-                                           # - fullmove: keep every Nth fullmove (keeps both colors, deterministic)
-                                           # - ply: legacy move_idx % stride (can drop one color for even stride)
-  
-  # Split strategy (prevents validation leakage via shared game history)
-  split_by_game: true        # Split per GameID instead of per-position (recommended)
-  
-  # 4-PHASE PROCESSING (LOW RAM MODE)
-  # ═══════════════════════════════════════════════════════════════════════════
-  # PHASE 1: PGN extraction (multi-processing, TRUE parallelism)
-  # PHASE 2: Position extraction (multi-processing, TRUE parallelism)
-  # PHASE 3: Disk writing (single-threaded I/O)
-  # PHASE 4: Cleanup (🆕 automatic cleanup + tracking)
-  # ═══════════════════════════════════════════════════════════════════════════
-  
-  files_at_once: 1           # How many PGN files to process simultaneously
-                             # 1 = SEQUENTIAL (minimal RAM, most stable)
-                             # 2-4 = BATCH (more RAM, faster)
-                             # ⚠️ Set to 1 if you have RAM issues!
-  
-  phase1_threads: 11          # 🆕 PROCESSES for PGN parsing (Phase 1)
-                             # PHASE 1: Multi-processing (bypasses GIL!)
-                             # ✅ TRUE parallelism - each process has own Python interpreter
-                             # ✅ Real CPU utilization - you'll see all cores working!
-                             # Recommended: 4-8 processes (2-4x speedup)
-                             # Set to 1 to disable multi-processing
-  
-  phase2_threads: 11          # 🆕 PROCESSES for position extraction (Phase 2)
-                             # PHASE 2: Multi-processing (bypasses GIL!)
-                             # ✅ TRUE parallelism for CPU-bound position processing
-                             # ✅ Real CPU utilization - all cores working!
-                             # Recommended: 8-16 processes (2-4x speedup)
-                             # More processes = faster, but more RAM per file
-                             # Set to 1 to disable multi-processing
+  # 4-PHASE: parse -> positions -> write -> cleanup
+  files_at_once: 1           # PGN files per batch (1=seq, 2-4=batch)
+  phase1_threads: all         # PGN parse workers (1=off, all=cpu)
+  phase2_threads: all         # Position workers (1=off, all=cpu)
 
 
 # ------------------------------------------------------------------------------
 # MODEL ARCHITECTURE 
 # ------------------------------------------------------------------------------
 model:
+  # Model version identifier
+  version: "v4.6"
   # Base architecture
-  num_residual_blocks: 9     # Number of residual blocks (6-12 optimal)
-  filters: 192               # Convolutional filters (128-256 for RTX 5060 Ti)
+  num_residual_blocks: 6     # Number of residual blocks (6-12 optimal)
+  filters: 128               # Convolutional filters (128-256 for RTX 5060 Ti)
   policy_head_filters: 16    # Policy head filters - 🔧 v4.6: 32→16 
   value_head_filters: 48     # Value head filters 
   value_hidden_dim: 256      # Value head hidden dimension 
@@ -137,23 +129,23 @@ model:
 # ------------------------------------------------------------------------------
 imitation_learning:
   # Training hyperparameters
-  batch_size: 5120           # Batch size
-  learning_rate: 0.001       # Learning rate 
+  batch_size: 8192           # Batch size
+  learning_rate: 0.0005       # Learning rate 
   value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
-  epochs: 100                # Maximum training epochs
-  weight_decay: 0.001        # L2 regularization (10x stronger for value head)
+  epochs: 40                # Maximum training epochs
+  weight_decay: 0.002         # L2 regularization (10x stronger for value head)
   grad_clip: 1.0             # Gradient clipping threshold
   
   # 🆕 Stochastic Weight Averaging (SWA) for better generalization
   use_swa: true              # Enable SWA (averages weights from multiple epochs)
-  swa_start_epoch: 15        # Start SWA after this epoch
-  swa_lr: 0.0005             # SWA learning rate (lower than base LR)
+  swa_start_epoch: 10        # Start SWA after this epoch
+  swa_lr: 0.0001             # SWA learning rate (lower than base LR)
   
   # Advanced training features
-  label_smoothing: 0.1       # Label smoothing (0.0 = off, 0.1 = standard)
-  scheduler_type: 'cosine_warm_restarts'  # Options: 'onecycle', 'cosine_warm_restarts', 'reduce_on_plateau', 'none'
-  cosine_t0: 10              # 🔄 Epochs per cosine cycle (restarts every T0 epochs)
-  cosine_t_mult: 2           # 🔄 Multiply T0 after each restart (10→20→40 epochs)
+  label_smoothing: 0.12      # Label smoothing (0.0 = off, 0.1 = standard)
+  scheduler_type: 'cosine_decay'  # Options: 'onecycle', 'cosine_decay', 'reduce_on_plateau', 'none'
+  warmup_pct: 0.05           # Warmup fraction of epochs (e.g., 0.02-0.05)
+  min_lr_ratio: 0.05         # Min LR = base_lr * ratio
   
   # 🆕 v4.3: WDL-specific options
   wdl_label_smoothing: 0.10  # Label smoothing for WDL (reduced for stronger signal)
