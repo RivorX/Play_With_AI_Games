@@ -417,9 +417,7 @@ def compact_to_tensor(compact_board, flip_perspective=False):
     fullmove_normalized = min(fullmove_number / 100.0, 1.0)
     tensor[15, :, :] = fullmove_normalized
     
-    # 🔧 CRITICAL: Return a COPY to avoid mmap storage issues
-    # Without .copy(), tensor shares memory with mmap which is non-resizable
-    return tensor.copy()
+    return tensor
 
 
 # ==============================================================================

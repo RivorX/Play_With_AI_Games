@@ -2,6 +2,8 @@
 Training metrics for chess AI evaluation
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -26,13 +28,17 @@ class MetricsCalculator:
         self.policy_top1_correct = 0
         self.policy_top3_correct = 0
         self.policy_top5_correct = 0
-        self.value_abs_errors = []
+        # ⚡ Running sums instead of lists (avoids .cpu().tolist() GPU sync per batch)
+        self.value_abs_error_sum = 0.0
+        self.value_abs_error_count = 0
         self.value_abs_error_weighted_sum = 0.0
         self.value_abs_error_weighted_denom = 0.0
         self.value_wdl_correct = 0
         self.value_wdl_total = 0
         self.value_wdl_ce_sum = 0.0
-        self.confidences = []
+        self.confidence_sum = 0.0
+        self.confidence_sq_sum = 0.0
+        self.confidence_count = 0
         self.legal_coverages = []
         self.total_samples = 0
     
@@ -107,7 +113,9 @@ class MetricsCalculator:
             value_scalar = value_pred.squeeze()
         
         value_mae = torch.abs(value_scalar - target_value)
-        self.value_abs_errors.extend(value_mae.cpu().tolist())
+        # ⚡ Running sum instead of list (avoids GPU→CPU sync per batch)
+        self.value_abs_error_sum += value_mae.sum().item()
+        self.value_abs_error_count += value_mae.numel()
         
         # Weighted MAE (optional)
         if move_indices is not None:
@@ -138,7 +146,10 @@ class MetricsCalculator:
         
         # Max probability (confidence in best move)
         max_probs = policy_probs.max(dim=1)[0]
-        self.confidences.extend(max_probs.cpu().tolist())
+        # ⚡ Running sums for mean + std (avoids GPU→CPU sync per batch)
+        self.confidence_sum += max_probs.sum().item()
+        self.confidence_sq_sum += (max_probs * max_probs).sum().item()
+        self.confidence_count += max_probs.numel()
         
         # ============================================================
         # LEGAL MOVE COVERAGE (if legal moves provided)
@@ -166,15 +177,15 @@ class MetricsCalculator:
             'policy_top5_acc': self.policy_top5_correct / self.total_samples,
             
             # Value metrics
-            'value_mae': np.mean(self.value_abs_errors) if self.value_abs_errors else 0.0,
+            'value_mae': (self.value_abs_error_sum / self.value_abs_error_count) if self.value_abs_error_count else 0.0,
             'value_mae_weighted': (self.value_abs_error_weighted_sum / self.value_abs_error_weighted_denom)
             if self.value_abs_error_weighted_denom else 0.0,
             'value_wdl_acc': (self.value_wdl_correct / self.value_wdl_total) if self.value_wdl_total else 0.0,
             'value_wdl_ce': (self.value_wdl_ce_sum / self.value_wdl_total) if self.value_wdl_total else 0.0,
             
-            # Confidence metrics
-            'avg_confidence': np.mean(self.confidences) if self.confidences else 0.0,
-            'confidence_std': np.std(self.confidences) if self.confidences else 0.0,
+            # Confidence metrics (Welford: std = sqrt(E[x²] - E[x]²))
+            'avg_confidence': (self.confidence_sum / self.confidence_count) if self.confidence_count else 0.0,
+            'confidence_std': math.sqrt(max(0.0, self.confidence_sq_sum / self.confidence_count - (self.confidence_sum / self.confidence_count) ** 2)) if self.confidence_count else 0.0,
         }
         
         # Legal move coverage (if available)

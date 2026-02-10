@@ -78,13 +78,13 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v4.6"
+  version: "v4.7"
   # Base architecture
-  num_residual_blocks: 6     # Number of residual blocks (6-12 optimal)
+  num_residual_blocks: 10     # Number of residual blocks (6-12 optimal)
   filters: 128               # Convolutional filters (128-256 for RTX 5060 Ti)
   policy_head_filters: 16    # Policy head filters - 🔧 v4.6: 32→16 
-  value_head_filters: 48     # Value head filters 
-  value_hidden_dim: 256      # Value head hidden dimension 
+  value_head_filters: 64     # Value head filters 
+  value_hidden_dim: 384      # Value head hidden dimension 
   dropout: 0.2               # Dropout rate 
   # 🆕 v4.3: WDL VALUE HEAD
   use_wdl_value: true         # 🆕 Use WDL (Win/Draw/Loss) classification (RECOMMENDED!)
@@ -102,11 +102,8 @@ model:
                              # History is built by walking backwards through mmap using GameID
   
   # Advanced features
-  use_se2d_blocks: true          # ✅ SE-Net v2 with spatial info (+0.5-1%, +5% time) - LEPSZE DLA SZACHÓW!
-  use_spatial_attention: true    # 👁️ Spatial attention
-  spatial_attention_mode: 'last_2' # 'all', 'last_2', 'last_3', 'none'
-  
-  drop_path_rate: 0.15          # Stochastic Depth
+  use_se2d_blocks: true          # ✅ SE-Net v2 with channel attention
+  drop_path_rate: 0.2           # Stochastic Depth
   activation: 'relu'            # ⚡ ReLU activation
   use_coord_conv: true          # 🗺️ Position-aware conv
   
@@ -132,7 +129,7 @@ imitation_learning:
   batch_size: 8192           # Batch size
   learning_rate: 0.0005       # Learning rate 
   value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
-  epochs: 40                # Maximum training epochs
+  epochs: 30                # Maximum training epochs
   weight_decay: 0.002         # L2 regularization (10x stronger for value head)
   grad_clip: 1.0             # Gradient clipping threshold
   
@@ -142,13 +139,13 @@ imitation_learning:
   swa_lr: 0.0001             # SWA learning rate (lower than base LR)
   
   # Advanced training features
-  label_smoothing: 0.12      # Label smoothing (0.0 = off, 0.1 = standard)
+  label_smoothing: 0.08      # Label smoothing (0.0 = off, 0.1 = standard)
   scheduler_type: 'cosine_decay'  # Options: 'onecycle', 'cosine_decay', 'reduce_on_plateau', 'none'
   warmup_pct: 0.05           # Warmup fraction of epochs (e.g., 0.02-0.05)
   min_lr_ratio: 0.05         # Min LR = base_lr * ratio
   
   # 🆕 v4.3: WDL-specific options
-  wdl_label_smoothing: 0.10  # Label smoothing for WDL (reduced for stronger signal)
+  wdl_label_smoothing: 0.08  # Label smoothing for WDL
   # Loss weights
   policy_loss_weight: 1.0    # Policy loss weight
   value_loss_weight: 1.0     # Value loss weight (balanced with policy)
@@ -172,14 +169,18 @@ imitation_learning:
 # ------------------------------------------------------------------------------
 reinforcement_learning:
   # 🚀 Self-play configuration (PARALLEL)
-  use_prioritized_replay: true        # Enable prioritized experience replay (default: false)
-  games_per_iteration: 2048    # ⬇️ Reduced for faster iterations (adjust based on CPU)
+  use_prioritized_replay: true        # Enable prioritized experience replay
+  games_per_iteration: 100   # 🆕 More games per iteration (CPU self-play friendly)
   iterations: 1000           # Total RL iterations
-  self_play_workers: 4       # 🚀 Parallel game workers (Windows: CPU only, Linux: can use GPU)
+  self_play_device: "cpu"    # cpu | cuda | auto (auto uses GPU if available)
+  self_play_workers: auto    # 0/auto = cpu_count - 1, or set explicit number
+  self_play_torch_threads: 1 # Threads per worker (avoid oversubscription on Windows)
+
+  self_play_save_every_games: 1  # Multiplier of games_per_iteration (0=off, e.g. 0.8 or 2.0)
   
   # 🚀 Batch self-play mode
   use_batch_selfplay: true         # 🚀 NEW: Play multiple games simultaneously (5-10x faster)
-  batch_games_per_worker: 512       # 🚀 NEW: Games per worker in batch mode (adjust for VRAM)
+  max_batch_games_per_worker: 8   # 🚀 NEW: Max games per worker in batch mode (adjust for VRAM)
 
   # 🆕 TEMPERATURE SCHEDULE
   use_temperature_schedule: true      # Enable adaptive temperature
@@ -188,8 +189,8 @@ reinforcement_learning:
   temperature_decay_iterations: 500   # Decay over N iterations
 
   # 🚀 MCTS parameters (BATCH OPTIMIZED)
-  mcts_simulations: 400      # 🔧 v4.4: Increased from 100→400 for better evaluation quality
-  mcts_batch_size: 256       # Batch MCTS evaluations (32-128 optimal)
+  mcts_simulations: 200      # 🆕 Balanced for CPU self-play
+  mcts_batch_size: 64        # Batch MCTS evaluations (CPU-friendly)
   mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
   mcts_c_puct: 1.5           # Exploration constant (UCB)
   mcts_temperature: 1.0      # Temperature for move selection
@@ -199,16 +200,39 @@ reinforcement_learning:
   
   # Training parameters
   batch_size: 4096           # Training batch size (GPU)
-  learning_rate: 0.0002       # Learning rate
+  learning_rate: 0.0002       # Base learning rate
   weight_decay: 0.05         # L2 regularization (AdamW)
   grad_clip: 0.5             # Gradient clipping
-  train_epochs_per_iteration: 3  # ⬇️ Reduced from 5 (faster iteration)
-  replay_buffer_size: 500000  # Max positions in replay buffer
+  train_epochs_per_iteration: 8  # 🆕 More replays per iteration
+  # Replay buffer sizing:
+  # Actual size = games_per_iteration * avg_moves_per_game * replay_buffer_multiplier
+  avg_moves_per_game: 50        # Estimated average moves per game
+  replay_buffer_multiplier: 3   # Buffer size multiplier (iterations worth of data)
+  replay_fp16: true            # Store replay tensors in float16 to reduce RAM (~2x)
+  
+  # 🆕 Learning rate schedule
+  use_lr_schedule: true
+  lr_warmup_iterations: 20    # Warmup phase
+  lr_max: 0.0003              # Peak LR (higher than base)
+  lr_min: 0.00005             # Final LR
+  
+  # 🆕 Target network (DQN-style stability)
+  use_target_network: true
+  target_update_freq: 5       # Update target every N iterations
+  target_polyak: 0.995        # Soft update: θ_target = τ*θ + (1-τ)*θ_target
+  
+  # 🆕 Entropy regularization (prevent overconfident policy)
+  entropy_weight: 0.01        # Policy entropy bonus
+  
+  # 🆕 Data augmentation (8x more data for free!)
+  use_augmentation: true
+  augment_horizontal_flip: true   # Mirror board horizontally
+  augment_prob: 0.5               # 50% chance per position
   
   # Evaluation
-  eval_games: 30             # ⬇️ Reduced from 20 (faster eval)
-  eval_every: 2              # Evaluate every N iterations
-  win_rate_threshold: 0.53   # Win rate to update best model
+  eval_games: 50             # 🆕 Increased 30→50 for more reliable win rate
+  eval_every: 5              # 🆕 Changed 2→5 (less frequent but more data between evals)
+  win_rate_threshold: 0.55   # 🆕 More demanding (was 0.53)
   checkpoint_every: 10        # Save checkpoint every N iterations
   
   # Loss weights

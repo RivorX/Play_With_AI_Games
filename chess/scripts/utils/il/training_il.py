@@ -98,6 +98,10 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
         config.get('debug', {}).get('print_batch0_diagnostics', False)
     )
     
+    # ⚡ Pre-read AMP config outside loop (avoid dict lookups per batch)
+    use_amp = config['hardware'].get('use_amp', True)
+    amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
+    
     for batch_idx, batch_data in enumerate(pbar):
         if profile_enabled:
             _sync()
@@ -160,10 +164,6 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             first_batch_targets = False
         
         optimizer.zero_grad(set_to_none=True)
-        
-        # Mixed precision
-        use_amp = config['hardware'].get('use_amp', True)
-        amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
 
         if profile_enabled:
             _sync()
@@ -418,7 +418,11 @@ def evaluate_il(model, val_loader, config, device):
     
     metrics_calc = MetricsCalculator()
     
-    with torch.no_grad():
+    # ⚡ Pre-read AMP config outside loop
+    use_amp = config['hardware'].get('use_amp', True)
+    amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
+    
+    with torch.inference_mode():
         for batch_data in tqdm(val_loader, desc="Evaluating"):
             if isinstance(batch_data, dict):
                 boards = batch_data['board']
@@ -457,9 +461,6 @@ def evaluate_il(model, val_loader, config, device):
                 win_targets = win_targets.to(device, non_blocking=True)
                 material_targets = material_targets.to(device, non_blocking=True)
                 check_targets = check_targets.to(device, non_blocking=True)
-            
-            use_amp = config['hardware'].get('use_amp', True)
-            amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
             
             with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
                 if use_mtl:

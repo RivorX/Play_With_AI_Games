@@ -92,31 +92,29 @@ class BinaryChessDataset(Dataset):
         """
         Filter indices based on sliding window stride.
         Fixed mode: fullmove_per_game_offset (keeps both colors, per-game offset).
-        
-        🔧 FIXED: Correct offset for new binary format
+        Uses mmap for fast random access instead of individual seeks.
         """
         filtered = []
         
-        # Open file temporarily to read move indices
         with open(self.binary_file, 'rb') as f:
-            for idx in indices:
-                offset = idx * self.position_size
-                # 🔧 v4.5 FIXED Layout: [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + ...
-                f.seek(offset + 38)  # Board (38B)
-                header = f.read(6)   # GameID (4B) + MoveIdx (2B)
-                if len(header) < 6:
-                    continue
-                
-                game_id = struct.unpack('I', header[:4])[0]
-                move_idx = struct.unpack('H', header[4:6])[0]
-                
-                fullmove_idx = move_idx // 2
-                
-                offset = game_id % self.stride
-                keep = (fullmove_idx % self.stride == offset)
-                
-                if keep:
-                    filtered.append(idx)
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                for idx in indices:
+                    offset = idx * self.position_size + 38
+                    header = mm[offset:offset + 6]
+                    if len(header) < 6:
+                        continue
+                    
+                    game_id = struct.unpack('I', header[:4])[0]
+                    move_idx = struct.unpack('H', header[4:6])[0]
+                    
+                    fullmove_idx = move_idx // 2
+                    stride_offset = game_id % self.stride
+                    
+                    if fullmove_idx % self.stride == stride_offset:
+                        filtered.append(idx)
+            finally:
+                mm.close()
         
         return filtered
 
@@ -144,35 +142,37 @@ class BinaryChessDataset(Dataset):
         filtered = []
         
         with open(self.binary_file, 'rb') as f:
-            for idx in indices:
-                offset = idx * self.position_size
-                # Layout: [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + ...
-                f.seek(offset + 38)
-                header = f.read(6)
-                if len(header) < 6:
-                    continue
-                
-                game_id = struct.unpack('I', header[:4])[0]
-                move_idx = struct.unpack('H', header[4:6])[0]
-                
-                # Optional: hard skip very early moves
-                if min_fullmove > 0 and (move_idx // 2) < min_fullmove:
-                    continue
-                
-                total_moves = self.game_length_by_id.get(game_id, 0)
-                if total_moves <= 1:
-                    progress = 1.0
-                else:
-                    progress = move_idx / (total_moves - 1)
-                    if progress < 0.0:
-                        progress = 0.0
-                    elif progress > 1.0:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                for idx in indices:
+                    offset = idx * self.position_size + 38
+                    header = mm[offset:offset + 6]
+                    if len(header) < 6:
+                        continue
+                    
+                    game_id = struct.unpack('I', header[:4])[0]
+                    move_idx = struct.unpack('H', header[4:6])[0]
+                    
+                    # Optional: hard skip very early moves
+                    if min_fullmove > 0 and (move_idx // 2) < min_fullmove:
+                        continue
+                    
+                    total_moves = self.game_length_by_id.get(game_id, 0)
+                    if total_moves <= 1:
                         progress = 1.0
-                
-                keep_prob = keep_min + (keep_max - keep_min) * (progress ** power)
-                
-                if rng.random() <= keep_prob:
-                    filtered.append(idx)
+                    else:
+                        progress = move_idx / (total_moves - 1)
+                        if progress < 0.0:
+                            progress = 0.0
+                        elif progress > 1.0:
+                            progress = 1.0
+                    
+                    keep_prob = keep_min + (keep_max - keep_min) * (progress ** power)
+                    
+                    if rng.random() <= keep_prob:
+                        filtered.append(idx)
+            finally:
+                mm.close()
         
         return filtered
     
@@ -255,13 +255,16 @@ class BinaryChessDataset(Dataset):
                 # All history boards use the CURRENT player's POV for consistency
                 hist_tensor = compact_to_tensor(hist_compact_board, flip_perspective=is_black_turn)
                 
-                history_tensors.insert(0, hist_tensor)  # oldest first
+                history_tensors.append(hist_tensor)  # newest first, reversed below
                 collected_history += 1
                 current_offset -= 1
             
-            # Pad with zeros if not enough history available
+            # Reverse to get oldest-first order
+            history_tensors.reverse()
+            
+            # Pad with zeros at the front if not enough history available
             while len(history_tensors) < self.history_positions:
-                empty_board = np.zeros((16, 8, 8), dtype=np.float32)  # 🔧 FIXED: 16 channels!
+                empty_board = np.zeros((16, 8, 8), dtype=np.float32)
                 history_tensors.insert(0, empty_board)
         
         # Stack: [oldest_history, …, newest_history, current]  →  (16*(H+1), 8, 8)

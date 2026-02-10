@@ -9,10 +9,9 @@ MCTS (Monte Carlo Tree Search) - v4.2
 import chess
 import numpy as np
 import math
-from src.utils.data_helpers import board_to_tensor, move_to_index, ACTION_SIZE
+from src.utils.data_helpers import board_to_tensor, move_to_index
 import torch
 from collections import defaultdict
-import threading
 
 
 class MCTSNode:
@@ -29,9 +28,11 @@ class MCTSNode:
         self.value_sum = 0.0
         self.expanded = False
         
-        # 🚀 Virtual Loss for thread-safe parallel MCTS
+        # 🚀 Virtual Loss (no lock - single-threaded per worker)
         self.virtual_loss = 0
-        self.lock = threading.Lock()
+        
+        # 🔥 Cache FEN for tree reuse speedup
+        self._fen_cache = None
     
     def value(self):
         """Average value with virtual loss"""
@@ -43,14 +44,18 @@ class MCTSNode:
         return not self.expanded
     
     def add_virtual_loss(self, n=1):
-        """Add virtual loss for thread safety"""
-        with self.lock:
-            self.virtual_loss += n
+        """Add virtual loss (no lock needed - single-threaded)"""
+        self.virtual_loss += n
     
     def remove_virtual_loss(self, n=1):
         """Remove virtual loss after backup"""
-        with self.lock:
-            self.virtual_loss -= n
+        self.virtual_loss -= n
+    
+    def get_fen(self):
+        """Get cached FEN (lazy evaluation)"""
+        if self._fen_cache is None:
+            self._fen_cache = self.board.fen()
+        return self._fen_cache
 
 
 class BatchMCTS:
@@ -79,6 +84,10 @@ class BatchMCTS:
         # 🆕 v4.2: Board history tracking
         # Store list of boards leading to current position
         self.board_history = []
+        
+        # 🔥 Inference optimization (AMP on GPU)
+        self.use_amp = config.get('hardware', {}).get('use_amp', False) and self.device.type == 'cuda'
+        self.amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
     
     def _build_history_tensor(self, current_board):
         """
@@ -132,9 +141,11 @@ class BatchMCTS:
         """
         # 🚀 Tree reuse: if root exists and matches board, reuse it
         if self.reuse_tree and self.root is not None:
+            # 🔥 OPTIMIZATION: Use cached FEN instead of generating twice
+            target_fen = board.fen()
             # Try to find current position in existing tree
             for move, child in self.root.children.items():
-                if child.board.fen() == board.fen():
+                if child.get_fen() == target_fen:
                     # Found it! Reuse this subtree
                     self.root = child
                     self.root.parent = None  # Make it new root
@@ -200,10 +211,21 @@ class BatchMCTS:
         return best_child
     
     def _ucb_score(self, parent, child):
-        """Upper Confidence Bound with virtual loss"""
+        """
+        Upper Confidence Bound with virtual loss (AlphaZero PUCT)
+        
+        Formula: Q(s,a) + c_puct * P(s,a) * sqrt(N(s) + 1) / (1 + N(s,a))
+        Where:
+        - Q(s,a) = average value of child
+        - P(s,a) = prior probability (from policy network)
+        - N(s) = parent visit count
+        - N(s,a) = child visit count
+        
+        🔥 FIX: +1 in sqrt ensures exploration even when parent has 0 visits
+        """
         q_value = child.value()  # Already includes virtual loss
         u_value = (self.c_puct * child.prior * 
-                   math.sqrt(parent.visit_count + parent.virtual_loss) / 
+                   math.sqrt(parent.visit_count + parent.virtual_loss + 1) / 
                    (1 + child.visit_count + child.virtual_loss))
         return q_value + u_value
     
@@ -234,13 +256,17 @@ class BatchMCTS:
         if non_terminal_nodes:
             # 🆕 v4.2: Stack tensors WITH HISTORY
             board_tensors = torch.stack([
-                torch.FloatTensor(self._build_history_tensor(node.board))
+                torch.from_numpy(self._build_history_tensor(node.board))
                 for node in non_terminal_nodes
-            ]).to(self.device)
+            ]).to(self.device, memory_format=torch.channels_last, non_blocking=True)
             
-            # Single GPU call
-            with torch.no_grad():
-                policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
+            # Single GPU call (inference optimized)
+            with torch.inference_mode():
+                if self.use_amp:
+                    with torch.autocast(device_type='cuda', dtype=self.amp_dtype):
+                        policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
+                else:
+                    policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
             
             # Process results
             for idx, node in enumerate(non_terminal_nodes):
@@ -250,42 +276,37 @@ class BatchMCTS:
                 value_tensor = values_batch[idx]
                 if value_tensor.dim() == 1 and value_tensor.shape[0] == 3:
                     # WDL output: [Win, Draw, Loss] → convert to scalar [-1, 1]
-                    # value = Win_prob * 1.0 + Draw_prob * 0.0 + Loss_prob * (-1.0)
-                    wdl_probs = torch.softmax(value_tensor, dim=0).cpu()
+                    # 🔥 OPTIMIZATION: Compute softmax on GPU, only transfer final result
+                    wdl_probs = torch.softmax(value_tensor, dim=0)
                     value = (wdl_probs[0] - wdl_probs[2]).item()  # Win - Loss
                 else:
                     # Scalar output
-                    value = value_tensor.cpu().item()
+                    value = value_tensor.item()
                 
                 legal_moves = list(node.board.legal_moves)
-                policy = np.zeros(ACTION_SIZE)
+                legal_indices = [move_to_index(m, node.board) for m in legal_moves]
                 
-                for move in legal_moves:
-                    move_idx = move_to_index(move, node.board)  # 🆕 v4.2: Pass board for POV
-                    policy[move_idx] = np.exp(policy_logits[move_idx])
-                
-                policy = policy / (policy.sum() + 1e-8)
+                # Compute probabilities only for legal moves (faster than full ACTION_SIZE)
+                legal_logits = policy_logits[legal_indices]
+                legal_probs = np.exp(legal_logits - legal_logits.max())
+                legal_probs = legal_probs / (legal_probs.sum() + 1e-8)
                 
                 # Dirichlet noise
                 if add_noise and len(legal_moves) > 0:
                     alpha = self.config['reinforcement_learning']['mcts_dirichlet_alpha']
                     weight = self.config['reinforcement_learning']['mcts_dirichlet_weight']
                     noise = np.random.dirichlet([alpha] * len(legal_moves))
-                    
-                    for i, move in enumerate(legal_moves):
-                        move_idx = move_to_index(move, node.board)  # 🆕 v4.2: Pass board for POV
-                        policy[move_idx] = (1 - weight) * policy[move_idx] + weight * noise[i]
+                    legal_probs = (1 - weight) * legal_probs + weight * noise
                 
                 # Create children
-                for move in legal_moves:
-                    move_idx = move_to_index(move, node.board)  # 🆕 v4.2: Pass board for POV
+                for move, prior in zip(legal_moves, legal_probs):
                     child_board = node.board.copy()
                     child_board.push(move)
                     node.children[move] = MCTSNode(
                         child_board,
                         parent=node,
                         move=move,
-                        prior=policy[move_idx]
+                        prior=prior
                     )
                 
                 node.expanded = True
@@ -299,7 +320,7 @@ class BatchMCTS:
     def _backpropagate(self, search_path, value):
         """Backpropagate value"""
         for node in reversed(search_path):
-            node.value_sum += value if node.board.turn == chess.WHITE else -value
+            node.value_sum += value
             node.visit_count += 1
             value = -value
     

@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,57 +9,36 @@ from src.utils.data_helpers import ACTION_SIZE
 
 class SE2DBlock(nn.Module):
     """
-    đź†• v3.1: SE-Net v2 with Spatial Information
+    🆕 v4.7: TRUE Squeeze-and-Excitation with Channel Attention
     
-    KEY DIFFERENCES FROM standard SE:
-    - Preserves spatial structure during squeeze
-    - Uses 1x1 convs instead of FC layers
-    - More expressive but ~5% slower
+    FIXED from v3.1: Previous version was just a 1x1 conv bottleneck
+    (no global pooling = no actual squeeze = NOT a real SE block!)
     
-    WHEN TO USE:
-    - For tasks where spatial relationships matter (chess!)
-    - When you have extra compute budget
-    - Expected gain: +0.5-1% quality, +5% training time
+    Now properly:
+    1. SQUEEZE: Global Average Pool -> (B, C, 1, 1)
+    2. EXCITE:  FC(C/r) -> ReLU -> FC(C) -> Sigmoid
+    3. SCALE:   x * scale (channel-wise attention)
+    
+    This gives TRUE channel attention ("which channels matter?")
+    instead of spatial-dependent scaling.
+    
+    PAPER: "Squeeze-and-Excitation Networks" (Hu et al. 2018)
     """
     def __init__(self, filters, reduction=16):
         super().__init__()
-        # Spatial squeeze: preserve 2D structure
-        self.conv1 = nn.Conv2d(filters, filters // reduction, kernel_size=1, bias=False)
-        self.conv2 = nn.Conv2d(filters // reduction, filters, kernel_size=1, bias=False)
+        mid = max(filters // reduction, 8)  # Ensure at least 8 channels
+        self.squeeze = nn.AdaptiveAvgPool2d(1)  # Global Average Pool
+        self.fc1 = nn.Conv2d(filters, mid, kernel_size=1, bias=False)
+        self.fc2 = nn.Conv2d(mid, filters, kernel_size=1, bias=False)
     
     def forward(self, x):
-        # Spatial squeeze (no pooling - preserves HxW)
-        squeeze = self.conv1(x)  # (B, C, H, W) -> (B, C/r, H, W)
-        squeeze = F.relu(squeeze, inplace=True)
-        
-        # Excitation with spatial awareness
-        excite = self.conv2(squeeze)  # (B, C/r, H, W) -> (B, C, H, W)
-        excite = torch.sigmoid(excite)
-        
-        return x * excite
-
-
-class LightweightSpatialAttention(nn.Module):
-    """
-    đźš€ OPTIMIZED Lightweight Spatial Attention
-    
-    No changes - already optimal with kernel=3
-    """
-    def __init__(self, kernel_size=3):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
-    
-    def forward(self, x):
-        # Fused max+mean pooling
-        pooled = torch.cat([
-            x.max(dim=1, keepdim=True)[0],
-            x.mean(dim=1, keepdim=True)
-        ], dim=1)
-        
-        # Single conv + sigmoid
-        attention = torch.sigmoid(self.conv(pooled))
-        
-        return x * attention
+        # Squeeze: global average pooling (B, C, H, W) -> (B, C, 1, 1)
+        scale = self.squeeze(x)
+        # Excitation: bottleneck FC -> channel-wise weights
+        scale = F.relu(self.fc1(scale), inplace=True)  # (B, C/r, 1, 1)
+        scale = torch.sigmoid(self.fc2(scale))          # (B, C, 1, 1)
+        # Scale: channel-wise attention (broadcasts over H, W)
+        return x * scale
 
 
 class CoordConv2d(nn.Module):
@@ -128,7 +109,7 @@ def drop_path(x, drop_prob: float = 0., training: bool = False):
     keep_prob = 1 - drop_prob
     
     shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-    mask = torch.bernoulli(torch.full(shape, keep_prob, dtype=x.dtype, device=x.device))
+    mask = torch.empty(shape, dtype=x.dtype, device=x.device).bernoulli_(keep_prob)
     
     return x * mask / keep_prob
 
@@ -149,7 +130,7 @@ class ResidualBlock(nn.Module):
     
     PAPER: "Identity Mappings in Deep Residual Networks" (He et al. 2016)
     """
-    def __init__(self, filters, use_se2d=False, use_spatial=True,
+    def __init__(self, filters, use_se2d=False,
                  drop_path_rate=0.0, use_layer_scale=False, layer_scale_init=1e-5):
         super().__init__()
         
@@ -162,10 +143,6 @@ class ResidualBlock(nn.Module):
         self.use_se2d = use_se2d
         if use_se2d:
             self.se = SE2DBlock(filters)
-        
-        self.use_spatial = use_spatial
-        if use_spatial:
-            self.spatial = LightweightSpatialAttention(kernel_size=3)
         
         self.drop_path_rate = drop_path_rate
         
@@ -187,12 +164,9 @@ class ResidualBlock(nn.Module):
         out = F.relu(out, inplace=True)
         out = self.conv2(out)
         
-        # Attention blocks (after convs)
+        # Attention (after convs)
         if self.use_se2d:
             out = self.se(out)
-        
-        if self.use_spatial:
-            out = self.spatial(out)
         
         if self.use_layer_scale:
             out = self.layer_scale(out)
@@ -230,22 +204,14 @@ class ChessNet(nn.Module):
         dropout = config['model']['dropout']
         
         use_se2d = config['model'].get('use_se2d_blocks', False)
-        use_spatial = config['model'].get('use_spatial_attention', True)
         drop_path_rate = config['model'].get('drop_path_rate', 0.1)
         use_coord_conv = config['model'].get('use_coord_conv', True)
         
         use_layer_scale = config['model'].get('use_layer_scale', True)
         layer_scale_init = config['model'].get('layer_scale_init', 1e-5)
         
-        
-        # Spatial attention mode
-        spatial_attention_mode = config['model'].get('spatial_attention_mode', 'last_2')
-        
         # Multi-Task Learning
         self.use_mtl = config['model'].get('use_multitask_learning', False)
-        self.win_weight = config['model'].get('win_prediction_weight', 0.3)
-        self.material_weight = config['model'].get('material_prediction_weight', 0.2)
-        self.check_weight = config['model'].get('check_prediction_weight', 0.15)
         
         # v4.5: AUTO-CALCULATE input_planes with chess metadata
         # Base: 16 planes (12 pieces + 4 metadata: castling, en passant, halfmove, fullmove)
@@ -257,35 +223,33 @@ class ChessNet(nn.Module):
         self.input_planes = input_planes
         self.history_positions = history_positions
         
-        print(f"[MODEL {model_version}] ULTRA-OPTIMIZED (Chess Metadata + Pre-activation ResNet):")
-        print(f"  > History positions: {history_positions}")
-        print(f"  > Input planes: {input_planes} (16 x {1 + history_positions})")
-        print(f"  > Chess metadata: Castling, En Passant, Halfmove, Fullmove")
-        
-        if use_se2d:
-            print(f"  > SE2D-Block: ENABLED (spatial-aware, +5% time)")
-        else:
-            print(f"  > SE2D-Block: DISABLED")
-        
-        print(f"  > Spatial Attention: {spatial_attention_mode} mode")
-        print(f"  > CoordConv: Only at input")
-        print(f"  > Activation: ReLU (5-10x faster than ELU)")
-        print(f"  > Stochastic Depth: {drop_path_rate}")
-        # Pre-activation ResNet is always enabled
-        print(f"  > Pre-activation ResNet: ENABLED (better gradients)")
-        
-        if use_layer_scale:
-            print(f"  > LayerScale: ENABLED (init={layer_scale_init})")
-        
-        
-        print(f"  > Standard 3x3 Conv: ENABLED (preserves spatial info for chess)")
-        print(f"  > Policy Head: Standard flatten+FC (spatial preservation for chess)")
-        
-        if self.use_mtl:
-            print(f"  > MTL with GlobalAvgPool heads:")
-            print(f"    - Win: {self.win_weight}")
-            print(f"    - Material: {self.material_weight}")
-            print(f"    - Check: {self.check_weight}")
+        print_summary = config['model'].get('print_summary', True)
+        if print_summary:
+            print(f"[MODEL {model_version}] ULTRA-OPTIMIZED (Chess Metadata + Pre-activation ResNet):")
+            print(f"  > History positions: {history_positions}")
+            print(f"  > Input planes: {input_planes} (16 x {1 + history_positions})")
+            print(f"  > Chess metadata: Castling, En Passant, Halfmove, Fullmove")
+            
+            if use_se2d:
+                print(f"  > SE2D-Block: ENABLED (spatial-aware, +5% time)")
+            else:
+                print(f"  > SE2D-Block: DISABLED")
+            
+            print(f"  > CoordConv: Only at input")
+            print(f"  > Activation: ReLU (5-10x faster than ELU)")
+            print(f"  > Stochastic Depth: {drop_path_rate}")
+            # Pre-activation ResNet is always enabled
+            print(f"  > Pre-activation ResNet: ENABLED (better gradients)")
+            
+            if use_layer_scale:
+                print(f"  > LayerScale: ENABLED (init={layer_scale_init})")
+            
+            
+            print(f"  > Standard 3x3 Conv: ENABLED (preserves spatial info for chess)")
+            print(f"  > Policy Head: Standard flatten+FC (spatial preservation for chess)")
+            
+            if self.use_mtl:
+                print(f"  > MTL: ENABLED (Win, Material, Check auxiliary tasks)")
         
         # Input conv with dynamic input_planes
         if use_coord_conv:
@@ -302,20 +266,13 @@ class ChessNet(nn.Module):
         # Stochastic depth schedule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_blocks)]
         
-        # SELECTIVE ATTENTION: Determine which blocks get spatial attention
-        spatial_blocks = self._get_spatial_blocks(num_blocks, spatial_attention_mode)
-        
-        print(f"  > Spatial attention in blocks: {spatial_blocks}")
-        
         # Residual tower
         blocks = []
         for i in range(num_blocks):
-            use_spatial_this_block = i in spatial_blocks if use_spatial else False
             blocks.append(
                 ResidualBlock(
                     filters,
                     use_se2d=use_se2d,
-                    use_spatial=use_spatial_this_block,
                     drop_path_rate=dpr[i],
                     use_layer_scale=use_layer_scale,
                     layer_scale_init=layer_scale_init,
@@ -336,46 +293,33 @@ class ChessNet(nn.Module):
         self.policy_dropout = nn.Dropout(dropout)
         
         # đź†• Value head - WDL (Win/Draw/Loss) classification
-        # Outputs 3 logits instead of 1 scalar for stronger signal
+        # AlphaZero-style: Conv 1x1 → BN → ReLU → GlobalAvgPool → FC → WDL
         value_filters = config['model']['value_head_filters']
         value_hidden = config['model']['value_hidden_dim']
         self.value_conv = nn.Conv2d(filters, value_filters, kernel_size=1, bias=False)
         self.value_bn = nn.BatchNorm2d(value_filters)
-        self.value_fc1 = nn.Linear(value_filters * 8 * 8, value_hidden)
+        self.value_fc1 = nn.Linear(value_filters, value_hidden)
         self.value_fc2 = nn.Linear(value_hidden, 3)  # đź†• 3 outputs: [Win, Draw, Loss]
         self.value_dropout = nn.Dropout(dropout)
         
         # Track if we use WDL
         self.use_wdl = config['model'].get('use_wdl_value', True)
         
-        # MTL heads
+        # Shared GAP for value + MTL heads
+        self.shared_gap = nn.AdaptiveAvgPool2d(1)
+        
+        # MTL heads (reuse shared_gap)
         if self.use_mtl:
-            self.win_gap = nn.AdaptiveAvgPool2d(1)
             self.win_fc1 = nn.Linear(filters, 128)
             self.win_fc2 = nn.Linear(128, 1)
             self.win_dropout = nn.Dropout(dropout * 0.5)
             
-            self.material_gap = nn.AdaptiveAvgPool2d(1)
             self.material_fc1 = nn.Linear(filters, 64)
             self.material_fc2 = nn.Linear(64, 1)
             
-            self.check_gap = nn.AdaptiveAvgPool2d(1)
             self.check_fc = nn.Linear(filters, 1)
     
-    def _get_spatial_blocks(self, num_blocks, mode):
-        """Determine which blocks should have spatial attention"""
-        if mode == 'all':
-            return set(range(num_blocks))
-        elif mode == 'last_2':
-            return set(range(max(0, num_blocks - 2), num_blocks))
-        elif mode == 'last_3':
-            return set(range(max(0, num_blocks - 3), num_blocks))
-        elif mode == 'none':
-            return set()
-        else:
-            print(f"âš ď¸Ź Unknown spatial_attention_mode '{mode}', using 'last_2'")
-            return set(range(max(0, num_blocks - 2), num_blocks))
-    
+
     def forward(self, x, return_aux=False):
         """Forward pass"""
         x = x.contiguous(memory_format=torch.channels_last)
@@ -394,33 +338,30 @@ class ChessNet(nn.Module):
         policy = self.policy_fc(policy)
         policy = F.log_softmax(policy, dim=1)
         
-        # đź†• Value head - WDL classification
+        # 🆕 Value head - AlphaZero-style: Conv → BN → ReLU → GAP → FC → WDL
         value = self.value_conv(x)
         value = self.value_bn(value)
         value = F.relu(value, inplace=True)
-        value = value.flatten(1)
+        value = self.shared_gap(value)  # GAP: (B, C, 8, 8) → (B, C, 1, 1)
+        value = value.flatten(1)        # (B, C, 1, 1) → (B, C)
         value = F.relu(self.value_fc1(value), inplace=True)
         value = self.value_dropout(value)
-        value = self.value_fc2(value)  # đź†• Returns (B, 3) WDL logits (no tanh!)
+        value = self.value_fc2(value)  # 🆕 Returns (B, 3) WDL logits
         
         if not return_aux or not self.use_mtl:
             return policy, value
         
-        # MTL predictions
-        win_pred = self.win_gap(x)
-        win_pred = win_pred.flatten(1)
-        win_pred = F.relu(self.win_fc1(win_pred), inplace=True)
+        # MTL predictions (shared GAP on trunk features)
+        mtl_pooled = self.shared_gap(x).flatten(1)  # (B, filters)
+        
+        win_pred = F.relu(self.win_fc1(mtl_pooled), inplace=False)
         win_pred = self.win_dropout(win_pred)
         win_pred = self.win_fc2(win_pred)
         
-        material_pred = self.material_gap(x)
-        material_pred = material_pred.flatten(1)
-        material_pred = F.relu(self.material_fc1(material_pred), inplace=True)
+        material_pred = F.relu(self.material_fc1(mtl_pooled), inplace=False)
         material_pred = torch.tanh(self.material_fc2(material_pred))
         
-        check_pred = self.check_gap(x)
-        check_pred = check_pred.flatten(1)
-        check_pred = self.check_fc(check_pred)
+        check_pred = self.check_fc(mtl_pooled)
         
         return policy, value, win_pred, material_pred, check_pred
     
@@ -430,7 +371,7 @@ class ChessNet(nn.Module):
         đź†• Handles WDL output and converts to scalar
         """
         self.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             if len(board_tensor.shape) == 3:
                 board_tensor = board_tensor.unsqueeze(0)
             policy, value_logits = self.forward(board_tensor, return_aux=False)
@@ -439,10 +380,8 @@ class ChessNet(nn.Module):
             if self.use_wdl:
                 # value_logits: (1, 3) -> [Win, Draw, Loss]
                 wdl_probs = F.softmax(value_logits, dim=1)
-                # Scalar: W*1.0 + D*0.0 + L*(-1.0)
-                value_scalar = (wdl_probs[0, 0] * 1.0 + 
-                               wdl_probs[0, 1] * 0.0 + 
-                               wdl_probs[0, 2] * (-1.0))
+                # Scalar: W*1.0 + D*0.0 + L*(-1.0) = W - L
+                value_scalar = wdl_probs[0, 0] - wdl_probs[0, 2]
                 return torch.exp(policy).cpu().numpy()[0], value_scalar.item()
             else:
                 # Legacy scalar output
@@ -454,18 +393,27 @@ def load_model(checkpoint_path, config, device):
     model = ChessNet(config).to(device)
     model = model.to(memory_format=torch.channels_last)
     
-    if checkpoint_path and torch.cuda.is_available():
-        checkpoint = torch.load(checkpoint_path)
+    if checkpoint_path:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
     
     return model
 
 
-def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None, save_optimizer=False):
-    """Save model checkpoint"""
+def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None, save_optimizer=False, save_dtype=None):
+    """Save model checkpoint
+    
+    Args:
+        save_dtype: Optional dtype to convert state_dict (e.g. torch.bfloat16)
+                    Converts the saved copy WITHOUT modifying the live model.
+    """
+    state_dict = model.state_dict()
+    if save_dtype is not None:
+        state_dict = {k: v.to(save_dtype) for k, v in state_dict.items()}
+    
     checkpoint = {
         'epoch': epoch,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': state_dict,
         'loss': loss,
     }
     
@@ -477,7 +425,6 @@ def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None, save_opt
     
     torch.save(checkpoint, path)
     
-    import os
     if os.path.exists(path):
         size_mb = os.path.getsize(path) / (1024 ** 2)
         opt_status = "with optimizer" if save_optimizer else "without optimizer"

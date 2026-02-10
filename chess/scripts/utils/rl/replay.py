@@ -12,12 +12,26 @@ class ReplayBuffer:
     Standard replay buffer with uniform sampling
     """
     
-    def __init__(self, max_size):
+    def __init__(self, max_size, use_fp16=False):
         """
         Args:
             max_size: Maximum buffer size
+            use_fp16: Store tensors in float16 to reduce RAM
         """
         self.buffer = deque(maxlen=max_size)
+        self.use_fp16 = use_fp16
+
+    def _maybe_fp16(self, position):
+        if not self.use_fp16:
+            return position
+        board, policy, value = position
+        if torch.is_tensor(board):
+            board = board.half().contiguous()
+        if torch.is_tensor(policy):
+            policy = policy.half().contiguous()
+        if torch.is_tensor(value):
+            value = value.half().contiguous()
+        return (board, policy, value)
     
     def add(self, position):
         """
@@ -26,7 +40,7 @@ class ReplayBuffer:
         Args:
             position: Tuple of (board_tensor, policy_target, value_target)
         """
-        self.buffer.append(position)
+        self.buffer.append(self._maybe_fp16(position))
     
     def sample(self, batch_size):
         """
@@ -65,7 +79,7 @@ class PrioritizedReplayBuffer:
     - Improved convergence
     """
     
-    def __init__(self, max_size, alpha=0.6, beta_start=0.4, beta_end=1.0, epsilon=0.01):
+    def __init__(self, max_size, alpha=0.6, beta_start=0.4, beta_end=1.0, epsilon=0.01, use_fp16=False):
         """
         Args:
             max_size: Maximum buffer size
@@ -73,6 +87,7 @@ class PrioritizedReplayBuffer:
             beta_start: Initial importance sampling correction
             beta_end: Final beta value
             epsilon: Small constant to avoid zero priority
+            use_fp16: Store tensors in float16 to reduce RAM
         """
         self.max_size = max_size
         self.alpha = alpha
@@ -80,6 +95,7 @@ class PrioritizedReplayBuffer:
         self.beta_start = beta_start
         self.beta_end = beta_end
         self.epsilon = epsilon
+        self.use_fp16 = use_fp16
         
         self.buffer = []
         self.priorities = np.zeros(max_size, dtype=np.float32)
@@ -90,6 +106,18 @@ class PrioritizedReplayBuffer:
         print(f"   Alpha (priority): {alpha}")
         print(f"   Beta (IS correction): {beta_start} → {beta_end}")
         print(f"   Epsilon: {epsilon}")
+
+    def _maybe_fp16(self, position):
+        if not self.use_fp16:
+            return position
+        board, policy, value = position
+        if torch.is_tensor(board):
+            board = board.half().contiguous()
+        if torch.is_tensor(policy):
+            policy = policy.half().contiguous()
+        if torch.is_tensor(value):
+            value = value.half().contiguous()
+        return (board, policy, value)
     
     def add(self, position, priority=None):
         """
@@ -103,6 +131,8 @@ class PrioritizedReplayBuffer:
             # New positions get max priority (will be sampled quickly)
             priority = self.priorities.max() if self.size > 0 else 1.0
         
+        position = self._maybe_fp16(position)
+
         if len(self.buffer) < self.max_size:
             self.buffer.append(position)
         else:

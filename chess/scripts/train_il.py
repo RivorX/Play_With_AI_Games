@@ -519,7 +519,7 @@ def main():
                       f"(improved by {improvement:.4f})")
                 print(f"  📊 Val Top-1: {val_metrics['policy_top1_acc']:.2%}")
                 
-                model_to_save = model.to(torch.bfloat16) if use_bfloat16 else model
+                model_to_save = model
                 save_checkpoint(
                     model_to_save, 
                     None,
@@ -541,11 +541,9 @@ def main():
                         'pov_enabled': True,  # 🆕 v4.2
                         'version': model_version     # 🆕 Track version
                     },
-                    save_optimizer=False
+                    save_optimizer=False,
+                    save_dtype=torch.bfloat16 if use_bfloat16 else None
                 )
-                
-                if use_bfloat16:
-                    model = model.to(torch.float32)
                 
                 print(f"  💾 Saved to: {best_model_path}")
                 size_mb = best_model_path.stat().st_size / (1024**2)
@@ -605,7 +603,7 @@ def main():
             checkpoint_name = f"il_epoch_{epoch+1}_valloss_{val_losses['total']:.4f}_top1_{val_metrics['policy_top1_acc']:.3f}.pt"
             checkpoint_path = il_dir / checkpoint_name
             
-            model_to_save = model.to(torch.bfloat16) if use_bfloat16 else model
+            model_to_save = model
             save_checkpoint(
                 model_to_save, 
                 None,
@@ -626,11 +624,9 @@ def main():
                     'pov_enabled': True,  # 🆕 v4.2
                     'version': model_version     # 🆕 Track version
                 },
-                save_optimizer=False
+                save_optimizer=False,
+                save_dtype=torch.bfloat16 if use_bfloat16 else None
             )
-            
-            if use_bfloat16:
-                model = model.to(torch.float32)
             
             size_mb = checkpoint_path.stat().st_size / (1024**2)
             print(f"💾 Checkpoint saved: {checkpoint_path.name} ({size_mb:.1f} MB)")
@@ -665,10 +661,9 @@ def main():
         
         # Save SWA model
         swa_model_path = best_model_path.parent / "best_model_il_swa.pt"
-        swa_model_to_save = swa_model.module.to(torch.bfloat16) if use_bfloat16 else swa_model.module
         
         save_checkpoint(
-            swa_model_to_save,
+            swa_model.module,
             None,
             epoch,
             swa_val_losses['total'],
@@ -689,7 +684,8 @@ def main():
                 'pov_enabled': True,
                 'version': model_version
             },
-            save_optimizer=False
+            save_optimizer=False,
+            save_dtype=torch.bfloat16 if use_bfloat16 else None
         )
         
         size_mb = swa_model_path.stat().st_size / (1024**2)

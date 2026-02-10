@@ -7,6 +7,8 @@ from pathlib import Path
 
 import torch
 import chess
+import torch.nn.functional as F
+import numpy as np
 
 from .replay import PrioritizedReplayBuffer
 
@@ -15,10 +17,108 @@ project_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(project_root))
 
 from src.mcts import BatchMCTS, select_move_by_visits
+from src.utils.data_helpers import (
+    ACTION_SIZE,
+    NORMAL_ACTIONS,
+    PROMOTION_PAIRS,
+    PROMOTION_PAIR_TO_INDEX,
+)
+
+_HFLIP_INV_INDEX_MAP = None
+
+
+def _mirror_file(square):
+    """Mirror square across files (a<->h) in 0..63 indexing."""
+    rank = square // 8
+    file = square % 8
+    return rank * 8 + (7 - file)
+
+
+def _get_hflip_inverse_index_map():
+    """
+    Build inverse index map for horizontal flip (a<->h).
+
+    We return inverse_map so that:
+        flipped_policy = policy[:, inverse_map]
+    which ensures flipped_policy[mirror(move)] = policy[move].
+    """
+    global _HFLIP_INV_INDEX_MAP
+    if _HFLIP_INV_INDEX_MAP is not None:
+        return _HFLIP_INV_INDEX_MAP
+
+    forward_map = np.zeros(ACTION_SIZE, dtype=np.int64)
+
+    # Normal moves (from_square * 64 + to_square)
+    for idx in range(NORMAL_ACTIONS):
+        from_sq = idx // 64
+        to_sq = idx % 64
+        new_from = _mirror_file(from_sq)
+        new_to = _mirror_file(to_sq)
+        forward_map[idx] = new_from * 64 + new_to
+
+    # Promotion moves (PROMOTION_PAIRS)
+    promo_count = ACTION_SIZE - NORMAL_ACTIONS
+    for promo_offset in range(promo_count):
+        pair_idx = promo_offset // 4
+        promo_type_idx = promo_offset % 4
+        from_sq, to_sq = PROMOTION_PAIRS[pair_idx]
+        new_from = _mirror_file(from_sq)
+        new_to = _mirror_file(to_sq)
+        new_pair_idx = PROMOTION_PAIR_TO_INDEX.get((new_from, new_to))
+        if new_pair_idx is None:
+            # Fallback: keep original if mapping not found (shouldn't happen)
+            forward_map[NORMAL_ACTIONS + promo_offset] = NORMAL_ACTIONS + promo_offset
+        else:
+            forward_map[NORMAL_ACTIONS + promo_offset] = (
+                NORMAL_ACTIONS + new_pair_idx * 4 + promo_type_idx
+            )
+
+    inverse_map = np.zeros_like(forward_map)
+    inverse_map[forward_map] = np.arange(ACTION_SIZE, dtype=np.int64)
+
+    _HFLIP_INV_INDEX_MAP = torch.from_numpy(inverse_map).long()
+    return _HFLIP_INV_INDEX_MAP
+
+
+def _maybe_augment_batch(boards, policy_targets, config):
+    """
+    Apply simple symmetry augmentation (horizontal flip).
+    """
+    rl_cfg = config.get('reinforcement_learning', {})
+    if not rl_cfg.get('use_augmentation', False):
+        return boards, policy_targets
+    if not rl_cfg.get('augment_horizontal_flip', False):
+        return boards, policy_targets
+
+    prob = rl_cfg.get('augment_prob', 0.5)
+    if prob <= 0:
+        return boards, policy_targets
+
+    batch_size = boards.size(0)
+    if batch_size == 0:
+        return boards, policy_targets
+
+    flip_mask = torch.rand(batch_size) < prob
+    if not flip_mask.any():
+        return boards, policy_targets
+
+    # Flip board tensors across files (a<->h)
+    boards[flip_mask] = torch.flip(boards[flip_mask], dims=[3])
+
+    # Remap policy targets to match flipped board
+    inv_map = _get_hflip_inverse_index_map()
+    policy_targets[flip_mask] = policy_targets[flip_mask][:, inv_map]
+
+    return boards, policy_targets
 
 def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device, scaler, replay_buffer, metrics_calc=None):
     """Train on batch with optional prioritized replay and metrics"""
     boards, policy_targets, value_targets = batch
+    if config['reinforcement_learning'].get('replay_fp16', False):
+        boards = boards.float()
+        policy_targets = policy_targets.float()
+        value_targets = value_targets.float()
+    boards, policy_targets = _maybe_augment_batch(boards, policy_targets, config)
     boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
     policy_targets = policy_targets.to(device, non_blocking=True)
     value_targets = value_targets.to(device, non_blocking=True)
@@ -35,7 +135,19 @@ def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device,
         policy_pred, value_pred = model(boards, return_aux=False)
         
         policy_loss = -(policy_targets * policy_pred).sum(dim=1)
-        value_loss = (value_pred.squeeze() - value_targets.squeeze()) ** 2
+        
+        # Value loss: WDL CE when using WDL head, otherwise MSE
+        if value_pred.dim() == 2 and value_pred.size(1) == 3:
+            # Targets are scalar {-1, 0, 1} -> map to WDL classes [W, D, L]
+            target_scalar = value_targets.squeeze()
+            target_classes = torch.zeros_like(target_scalar, dtype=torch.long)
+            target_classes[target_scalar > 0.9] = 0
+            target_classes[target_scalar < -0.9] = 2
+            target_classes[(target_scalar >= -0.9) & (target_scalar <= 0.9)] = 1
+            
+            value_loss = F.cross_entropy(value_pred, target_classes, reduction='none')
+        else:
+            value_loss = (value_pred.squeeze() - value_targets.squeeze()) ** 2
         
         if weights is not None:
             policy_loss = (policy_loss * weights).mean()
@@ -47,6 +159,13 @@ def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device,
         policy_weight = config['reinforcement_learning']['policy_loss_weight']
         value_weight = config['reinforcement_learning']['value_loss_weight']
         loss = policy_weight * policy_loss + value_weight * value_loss
+
+        # Entropy regularization (optional)
+        entropy_weight = config['reinforcement_learning'].get('entropy_weight', 0.0)
+        if entropy_weight > 0:
+            policy_probs = torch.exp(policy_pred)
+            policy_entropy = -(policy_probs * policy_pred).sum(dim=1).mean()
+            loss = loss - entropy_weight * policy_entropy
     
     scaler.scale(loss).backward()
     
@@ -60,7 +179,14 @@ def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device,
     
     if isinstance(replay_buffer, PrioritizedReplayBuffer):
         with torch.no_grad():
-            td_errors = torch.abs(value_pred.squeeze() - value_targets.squeeze()).cpu().numpy()
+            if value_pred.dim() == 2 and value_pred.size(1) == 3:
+                # Convert WDL logits to scalar for priority
+                wdl_probs = torch.softmax(value_pred, dim=1)
+                value_scalar = (wdl_probs[:, 0] - wdl_probs[:, 2])
+                td_errors = torch.abs(value_scalar - value_targets.squeeze())
+            else:
+                td_errors = torch.abs(value_pred.squeeze() - value_targets.squeeze())
+            td_errors = td_errors.cpu().numpy()
         replay_buffer.update_priorities(indices, td_errors)
     
     if metrics_calc is not None:
@@ -98,6 +224,11 @@ def evaluate_models(model1, model2, config, device, num_games=100):
             mcts = current_mcts if board.turn == chess.WHITE else other_mcts
             visit_counts = mcts.search(board, num_simulations=50)
             move, _ = select_move_by_visits(visit_counts, temperature=0)
+            
+            # Update history BEFORE making the move (for POV history inputs)
+            mcts1.update_history(board)
+            mcts2.update_history(board)
+            
             board.push(move)
             move_count += 1
         
