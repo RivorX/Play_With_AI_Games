@@ -257,8 +257,10 @@ class FocalLoss(nn.Module):
             logits, targets, reduction='none'
         )
         
-        # Focal loss with alpha balancing
-        focal_loss = self.alpha * focal_weight * bce
+        # Focal loss with per-class alpha balancing
+        # 🔧 v4.8: alpha_t varies per sample (was flat alpha for all)
+        alpha_t = torch.where(targets == 1.0, self.alpha, 1 - self.alpha)
+        focal_loss = alpha_t * focal_weight * bce
         
         return focal_loss.mean()
 

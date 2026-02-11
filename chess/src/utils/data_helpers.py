@@ -16,71 +16,28 @@ import struct
 # 🆕 TEMPORAL VALUE DISCOUNTING - FIX FOR MAE = 0.8
 # ==============================================================================
 
-def compute_discounted_outcome(move_idx, total_moves, result, current_turn, use_wdl=True):
+def compute_discounted_outcome(move_idx, total_moves, result, current_turn):
     """
-    🆕 v4.3: Oblicz outcome z OPCJONALNYM temporal discounting
-    
-    ⚠️ KRYTYCZNA ZMIANA: Temporal discounting WYŁĄCZONY dla WDL!
-    
-    PROBLEM Z DISCOUNTING + WDL:
-    - Discounting daje wartości jak 0.32, 0.55 (wczesne wygrane)
-    - WDL Loss konwertuje do klas: >0.5=Win, <-0.5=Loss, reszta=Draw
-    - Efekt: wartość 0.32 → DRAW ❌ (uczysz model, że wygrana=remis!)
-    
-    ROZWIĄZANIE:
-    - Jeśli use_wdl=True: Zwracaj CZYSTE ±1.0 (WDL sam modeluje niepewność)
-    - Jeśli use_wdl=False: Dyskontuj wartości (dla regresji MSE)
-    
-    WDL vs DISCOUNTING:
-    - WDL: Niepewność = rozkład prawdopodobieństwa (np. 60% Win, 40% Draw)
-    - Discounting: Niepewność = skalowanie wartości (Win * 0.6 = 0.6)
-    - Są WZAJEMNIE WYKLUCZAJĄCE!
-    
+    Return outcome in WDL-only mode (no temporal discounting).
+
     Args:
-        move_idx: Index ruchu w grze (0-based, czyli pierwszy ruch = 0)
-        total_moves: Całkowita liczba ruchów w grze
-        result: Wynik gry ('1-0', '0-1', '1/2-1/2')
-        current_turn: Czyja tura (chess.WHITE lub chess.BLACK)
-        use_wdl: Czy używamy WDL classification (True = bez discountingu)
-    
+        move_idx: Unused; kept for API stability.
+        total_moves: Unused; kept for API stability.
+        result: Game result ('1-0', '0-1', '1/2-1/2').
+        current_turn: Side to move (chess.WHITE or chess.BLACK).
+
     Returns:
-        float: Outcome w przedziale [-1, 1]
-    
-    Notes:
-        - WDL=True: Zawsze ±1.0 lub 0.0 (czyste klasy)
-        - WDL=False: Dyskontowane wartości dla regresji
+        float: Outcome in {-1.0, 0.0, 1.0}.
     """
-    # Edge case: games z 0 ruchów (nie powinno się zdarzyć, ale safety)
-    if total_moves == 0:
-        return 0.0
-    
-    # Progres gry: 0.0 (początek) → 1.0 (koniec)
-    progress = move_idx / total_moves
-    
-    # Discount factor: sqrt dla smooth progression
-    # sqrt(0.1) = 0.32, sqrt(0.5) = 0.71, sqrt(1.0) = 1.0
-    discount = np.sqrt(progress)
-    
-    # Minimum discount (nawet move 0 ma jakąś małą wartość)
-    discount = max(discount, 0.1)
-    
-    # Base value (jak wcześniej)
+    # Keep the signature stable for existing call sites.
+    _ = move_idx
+    _ = total_moves
+
     if result == '1-0':
-        base_value = 1.0 if current_turn == chess.WHITE else -1.0
-    elif result == '0-1':
-        base_value = -1.0 if current_turn == chess.WHITE else 1.0
-    else:  # '1/2-1/2'
-        base_value = 0.0
-    
-    # 🔧 v4.4 CRITICAL FIX: Temporal discounting TYLKO dla regresji (nie WDL!)
-    if use_wdl:
-        # WDL: Zwracaj CZYSTE klasy (±1.0 lub 0.0)
-        # WDL modeluje niepewność przez rozkład prawdopodobieństwa, nie skalowanie wartości!
-        return base_value
-    else:
-        # Regresja MSE: Dyskontuj wartości (wcześniejsze ruchy = mniej pewne)
-        discounted_value = base_value * discount
-        return np.clip(discounted_value, -1.0, 1.0)
+        return 1.0 if current_turn == chess.WHITE else -1.0
+    if result == '0-1':
+        return -1.0 if current_turn == chess.WHITE else 1.0
+    return 0.0
 
 
 # ==============================================================================
@@ -668,7 +625,7 @@ def get_position_size(use_mtl=False, history_positions=0):
     return base_size
 
 
-def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_labels=None, use_wdl=True):
+def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_labels=None):
     """
     Pack position data into binary format
     
@@ -682,7 +639,6 @@ def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_label
         move_target: Target move index (0-4095) - THIS IS THE LABEL
         outcome: Game outcome value
         mtl_labels: Optional dict with 'win', 'material', 'check'
-        use_wdl: Whether WDL is enabled (not used here but kept for API consistency)
     
     Returns:
         bytes: Packed binary data

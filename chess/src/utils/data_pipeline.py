@@ -98,7 +98,6 @@ class DatasetTracker:
         """
         Compute hash of processing configuration
         Only includes parameters that affect binary output
-        🔧 v4.4 FIX: Added use_wdl_value (affects temporal discounting)
         """
         relevant_config = {
             'min_elo': config['data'].get('min_elo', 0),
@@ -109,7 +108,7 @@ class DatasetTracker:
             'position_dedup': config['data'].get('position_dedup', {}),
             'position_sampling': config['data'].get('position_sampling', {}),
             'use_multitask_learning': config['model'].get('use_multitask_learning', False),
-            'use_wdl_value': config['model'].get('use_wdl_value', True),  # 🔧 CRITICAL FIX
+            'wdl_mode': 'always',
         }
         
         config_str = json.dumps(relevant_config, sort_keys=True)
@@ -759,12 +758,12 @@ def extract_positions_from_game_worker(args):
     - NO embedded history in binary format
     - Stores GameID, MoveIdx, and MoveTarget for training
     - MoveTarget is the LABEL for the network to predict
-    - 🆕 TEMPORAL DISCOUNTING: Outcome with sqrt(progress) discounting (ONLY if use_wdl=False)
+    - WDL-only mode: temporal discounting disabled (clean ±1.0 targets)
     
     🔧 FIXED BINARY FORMAT:
     [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
     """
-    game_data, game_id, min_elo, max_moves_per_game, use_mtl, use_wdl = args
+    game_data, game_id, min_elo, max_moves_per_game, use_mtl = args
     
     import chess
     import struct
@@ -820,16 +819,12 @@ def extract_positions_from_game_worker(args):
                 # This is the LABEL the network should predict (0-4095)
                 move_target = move_to_index(move, board)
                 
-                # 🆕 v4.3: TEMPORAL DISCOUNTING (conditional on use_wdl)
-                # WDL: No discounting (returns ±1.0, WDL models uncertainty via probabilities)
-                # MSE: Discounting enabled (early game → lower values)
-                # This fixes the critical bug where discounted values (0.3) were classified as Draw!
+                # WDL-only mode: no temporal discounting.
                 outcome = compute_discounted_outcome(
                     move_idx=move_idx,
                     total_moves=total_moves,
                     result=result,
                     current_turn=board.turn,
-                    use_wdl=use_wdl  # 🔧 CRITICAL: Pass WDL flag
                 )
                 
                 # MTL labels
@@ -848,9 +843,8 @@ def extract_positions_from_game_worker(args):
                     game_id=game_id,
                     move_idx=move_idx,
                     move_target=move_target,  # 🔧 NEW: The label to predict
-                    outcome=outcome,  # 🆕 v4.3: Conditional discounting based on use_wdl
+                    outcome=outcome,
                     mtl_labels=mtl_labels,
-                    use_wdl=use_wdl  # API consistency
                 )
                 
                 positions.append(position_data)
@@ -875,7 +869,6 @@ def extract_positions_parallel(games_data, config, phase2_workers):
     min_elo = config['data'].get('min_elo', 0)
     max_moves = config['data'].get('max_moves_per_game', 200)
     use_mtl = config['model'].get('use_multitask_learning', False)
-    use_wdl = config['model'].get('use_wdl_value', True)  # 🆕 Get WDL flag
     
     if phase2_workers <= 1:
         return extract_positions_sequential(games_data, config)
@@ -884,7 +877,7 @@ def extract_positions_parallel(games_data, config, phase2_workers):
     
     # Prepare tasks with unique game_id for each game
     # 🔧 v4.3: game_id is uint32 — no modulo needed, supports up to ~4 billion games
-    tasks = [(game, game_idx, min_elo, max_moves, use_mtl, use_wdl) 
+    tasks = [(game, game_idx, min_elo, max_moves, use_mtl)
              for game_idx, game in enumerate(games_data)]
     
     # Process in parallel
@@ -911,13 +904,12 @@ def extract_positions_sequential(games_data, config):
     min_elo = config['data'].get('min_elo', 0)
     max_moves = config['data'].get('max_moves_per_game', 200)
     use_mtl = config['model'].get('use_multitask_learning', False)
-    use_wdl = config['model'].get('use_wdl_value', True)  # 🆕 Get WDL flag
     
     all_positions = []
     
     for game_idx, game in enumerate(tqdm(games_data, desc="  Extracting positions")):
         # 🔧 v4.3: game_id is uint32 — no modulo needed
-        task = (game, game_idx, min_elo, max_moves, use_mtl, use_wdl)
+        task = (game, game_idx, min_elo, max_moves, use_mtl)
         positions = extract_positions_from_game_worker(task)
         all_positions.extend(positions)
     

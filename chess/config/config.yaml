@@ -78,16 +78,18 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v4.7"
+  version: "v4.8"
   # Base architecture
   num_residual_blocks: 10     # Number of residual blocks (6-12 optimal)
   filters: 128               # Convolutional filters (128-256 for RTX 5060 Ti)
-  policy_head_filters: 16    # Policy head filters - 🔧 v4.6: 32→16 
+  # 🆕 v4.8: Dual-stream policy head
+  policy_head_conv_filters: 32  # Spatial stream: 3x3 conv filters (wider = more info preserved)
+  policy_head_conv_groups: 4    # Grouped 3x3 conv in policy head (must divide filters and conv_filters)
+  policy_head_global_dim: 64    # Global stream: GAP → FC dimension (board-wide context)
+  policy_head_hidden_dim: 512   # Intermediate FC dimension (decomposed projection)
   value_head_filters: 64     # Value head filters 
   value_hidden_dim: 384      # Value head hidden dimension 
   dropout: 0.2               # Dropout rate 
-  # 🆕 v4.3: WDL VALUE HEAD
-  use_wdl_value: true         # 🆕 Use WDL (Win/Draw/Loss) classification (RECOMMENDED!)
 
   # 🆕 DYNAMIC HISTORY CONFIGURATION
   # ═══════════════════════════════════════════════════════════════════════════
@@ -104,7 +106,6 @@ model:
   # Advanced features
   use_se2d_blocks: true          # ✅ SE-Net v2 with channel attention
   drop_path_rate: 0.2           # Stochastic Depth
-  activation: 'relu'            # ⚡ ReLU activation
   use_coord_conv: true          # 🗺️ Position-aware conv
   
   # Advanced architectural features
@@ -127,15 +128,15 @@ model:
 imitation_learning:
   # Training hyperparameters
   batch_size: 8192           # Batch size
-  learning_rate: 0.0005       # Learning rate 
+  learning_rate: 0.0005      # Learning rate 
   value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
-  epochs: 30                # Maximum training epochs
-  weight_decay: 0.002         # L2 regularization (10x stronger for value head)
+  epochs: 30                 # Maximum training epochs
+  weight_decay: 0.002        # L2 regularization (10x stronger for value head)
   grad_clip: 1.0             # Gradient clipping threshold
   
   # 🆕 Stochastic Weight Averaging (SWA) for better generalization
   use_swa: true              # Enable SWA (averages weights from multiple epochs)
-  swa_start_epoch: 10        # Start SWA after this epoch
+  swa_start_epoch: 8         # Start SWA after this epoch
   swa_lr: 0.0001             # SWA learning rate (lower than base LR)
   
   # Advanced training features
@@ -145,7 +146,7 @@ imitation_learning:
   min_lr_ratio: 0.05         # Min LR = base_lr * ratio
   
   # 🆕 v4.3: WDL-specific options
-  wdl_label_smoothing: 0.08  # Label smoothing for WDL
+  wdl_label_smoothing: 0.03  # 🔧 v4.8: 0.08->0.03 (0.08 too strong for 3-class WDL)
   # Loss weights
   policy_loss_weight: 1.0    # Policy loss weight
   value_loss_weight: 1.0     # Value loss weight (balanced with policy)
@@ -160,7 +161,7 @@ imitation_learning:
   checkpoint_every: 5        # Save checkpoint every N epochs
   
   # Early stopping
-  max_patience: 40           # ℹ️ Stop if no improvement for N epochs
+  max_patience: 5           # ℹ️ Stop if no improvement for N epochs
   min_delta: 0.001           # Minimum improvement threshold
 
 
@@ -278,3 +279,4 @@ debug:
 # REPRODUCIBILITY
 # ------------------------------------------------------------------------------
 seed: 42                     # Random seed
+

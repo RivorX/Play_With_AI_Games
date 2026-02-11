@@ -29,7 +29,7 @@ class SE2DBlock(nn.Module):
         mid = max(filters // reduction, 8)  # Ensure at least 8 channels
         self.squeeze = nn.AdaptiveAvgPool2d(1)  # Global Average Pool
         self.fc1 = nn.Conv2d(filters, mid, kernel_size=1, bias=False)
-        self.fc2 = nn.Conv2d(mid, filters, kernel_size=1, bias=False)
+        self.fc2 = nn.Conv2d(mid, filters, kernel_size=1, bias=True)  # 🔧 v4.8: bias=True for better calibration
     
     def forward(self, x):
         # Squeeze: global average pooling (B, C, H, W) -> (B, C, 1, 1)
@@ -212,6 +212,22 @@ class ChessNet(nn.Module):
         
         # Multi-Task Learning
         self.use_mtl = config['model'].get('use_multitask_learning', False)
+
+        # Policy head (explicit config, no legacy fallback)
+        policy_conv_filters = config['model']['policy_head_conv_filters']
+        policy_conv_groups = int(config['model']['policy_head_conv_groups'])
+        if policy_conv_groups < 1:
+            raise ValueError(f"policy_head_conv_groups must be >= 1, got {policy_conv_groups}")
+        if filters % policy_conv_groups != 0:
+            raise ValueError(
+                f"model.filters={filters} must be divisible by "
+                f"policy_head_conv_groups={policy_conv_groups}"
+            )
+        if policy_conv_filters % policy_conv_groups != 0:
+            raise ValueError(
+                f"policy_head_conv_filters={policy_conv_filters} must be divisible by "
+                f"policy_head_conv_groups={policy_conv_groups}"
+            )
         
         # v4.5: AUTO-CALCULATE input_planes with chess metadata
         # Base: 16 planes (12 pieces + 4 metadata: castling, en passant, halfmove, fullmove)
@@ -245,8 +261,11 @@ class ChessNet(nn.Module):
                 print(f"  > LayerScale: ENABLED (init={layer_scale_init})")
             
             
-            print(f"  > Standard 3x3 Conv: ENABLED (preserves spatial info for chess)")
-            print(f"  > Policy Head: Standard flatten+FC (spatial preservation for chess)")
+            if policy_conv_groups == 1:
+                print(f"  > Policy Conv: 3x3 full (groups=1)")
+            else:
+                print(f"  > Policy Conv: 3x3 grouped (groups={policy_conv_groups})")
+            print(f"  > Policy Head: Dual-stream (3x3 spatial + GAP global + 2-stage FC)")
             
             if self.use_mtl:
                 print(f"  > MTL: ENABLED (Win, Material, Check auxiliary tasks)")
@@ -280,15 +299,42 @@ class ChessNet(nn.Module):
             )
         self.residual_tower = nn.Sequential(*blocks)
         
-        # Policy head
-        policy_filters = config['model']['policy_head_filters']
-        self.policy_conv = nn.Conv2d(filters, policy_filters, kernel_size=1, bias=False)
-        self.policy_bn = nn.BatchNorm2d(policy_filters)
-        # Policy head keeps full spatial information until the final FC layer.
-        # Chess requires spatial information until the very end (position matters!)
-        # Use standard flatten + FC for full spatial preservation
+        # 🔧 v4.8: Final BN+ReLU after pre-activation residual tower
+        # CRITICAL: In pre-act ResNet, BN is at the START of each block,
+        # so the last block outputs un-normalized features. Without this,
+        # all heads receive unstable activations. (He et al. 2016)
+        self.final_bn = nn.BatchNorm2d(filters)
         
-        self.policy_fc = nn.Linear(policy_filters * 8 * 8, ACTION_SIZE)
+        # 🆕 v4.8: "TOP-MODEL" DUAL-STREAM POLICY HEAD
+        # ═══════════════════════════════════════════════════════════════
+        # Stream 1 (Spatial): Conv 3×3 preserves neighbor relationships
+        #   → "which pieces can reach which squares?"
+        # Stream 2 (Global):  GAP captures board-wide context
+        #   → "is it endgame? is king in danger? material balance?"
+        # Two-stage FC: decomposed projection with intermediate non-linearity
+        #   → more expressive than single giant FC, with FEWER parameters
+        # ═══════════════════════════════════════════════════════════════
+        policy_global_dim = config['model'].get('policy_head_global_dim', 64)
+        policy_hidden_dim = config['model'].get('policy_head_hidden_dim', 512)
+        
+        # Spatial stream: 3×3 conv sees neighboring squares (critical for move legality)
+        self.policy_conv = nn.Conv2d(
+            filters,
+            policy_conv_filters,
+            kernel_size=3,
+            padding=1,
+            groups=policy_conv_groups,
+            bias=False,
+        )
+        self.policy_bn = nn.BatchNorm2d(policy_conv_filters)
+        
+        # Global stream: GAP captures board-wide features
+        self.policy_global_fc = nn.Linear(filters, policy_global_dim)
+        
+        # Two-stage FC: spatial(2048) + global(64) → hidden(512) → actions(4272)
+        spatial_features = policy_conv_filters * 8 * 8
+        self.policy_fc1 = nn.Linear(spatial_features + policy_global_dim, policy_hidden_dim)
+        self.policy_fc2 = nn.Linear(policy_hidden_dim, ACTION_SIZE)
         
         self.policy_dropout = nn.Dropout(dropout)
         
@@ -301,9 +347,6 @@ class ChessNet(nn.Module):
         self.value_fc1 = nn.Linear(value_filters, value_hidden)
         self.value_fc2 = nn.Linear(value_hidden, 3)  # đź†• 3 outputs: [Win, Draw, Loss]
         self.value_dropout = nn.Dropout(dropout)
-        
-        # Track if we use WDL
-        self.use_wdl = config['model'].get('use_wdl_value', True)
         
         # Shared GAP for value + MTL heads
         self.shared_gap = nn.AdaptiveAvgPool2d(1)
@@ -318,7 +361,37 @@ class ChessNet(nn.Module):
             self.material_fc2 = nn.Linear(64, 1)
             
             self.check_fc = nn.Linear(filters, 1)
+        
+        # 🔧 v4.8: Proper weight initialization
+        self._initialize_weights()
     
+    def _initialize_weights(self):
+        """Initialize weights for better training stability and convergence.
+        
+        - Conv2d: Kaiming normal (fan_out, relu) — standard for ResNets
+        - Linear: Kaiming normal — matches ReLU activations
+        - BatchNorm: weight=1, bias=0 — standard
+        - Final FC layers (policy_fc2, value_fc2): small init (std=0.01)
+          to prevent heads from dominating early training
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Small init for final output layers (prevent overconfident early predictions)
+        nn.init.normal_(self.policy_fc2.weight, std=0.01)
+        nn.init.zeros_(self.policy_fc2.bias)
+        nn.init.normal_(self.value_fc2.weight, std=0.01)
+        nn.init.zeros_(self.value_fc2.bias)
 
     def forward(self, x, return_aux=False):
         """Forward pass"""
@@ -329,13 +402,28 @@ class ChessNet(nn.Module):
         
         x = self.residual_tower(x)
         
-        # Policy head
-        policy = self.policy_conv(x)
-        policy = self.policy_bn(policy)
-        policy = F.relu(policy, inplace=True)
-        policy = policy.flatten(1)  # đź”§ v4.4: Always flatten (no adaptive pool)
+        # 🔧 v4.8: Final BN+ReLU (critical for pre-activation ResNet)
+        x = self.final_bn(x)
+        x = F.relu(x, inplace=True)
+        
+        # 🔧 v4.8: Compute shared GAP once and reuse (was 3 separate calls)
+        trunk_pooled = self.shared_gap(x).flatten(1)  # (B, filters)
+        
+        # 🆕 v4.8: Dual-stream policy head (spatial + global)
+        # Stream 1: Spatial features via 3×3 conv
+        p_spatial = self.policy_conv(x)               # (B, 32, 8, 8)
+        p_spatial = self.policy_bn(p_spatial)
+        p_spatial = F.relu(p_spatial, inplace=True)
+        p_spatial = p_spatial.flatten(1)               # (B, 2048)
+        
+        # Stream 2: Global context via GAP (reuse trunk_pooled)
+        p_global = F.relu(self.policy_global_fc(trunk_pooled), inplace=True)  # (B, 64)
+        
+        # Fuse streams + two-stage projection
+        policy = torch.cat([p_spatial, p_global], dim=1)  # (B, 2112)
+        policy = F.relu(self.policy_fc1(policy), inplace=True)
         policy = self.policy_dropout(policy)
-        policy = self.policy_fc(policy)
+        policy = self.policy_fc2(policy)               # (B, 4272)
         policy = F.log_softmax(policy, dim=1)
         
         # 🆕 Value head - AlphaZero-style: Conv → BN → ReLU → GAP → FC → WDL
@@ -351,17 +439,16 @@ class ChessNet(nn.Module):
         if not return_aux or not self.use_mtl:
             return policy, value
         
-        # MTL predictions (shared GAP on trunk features)
-        mtl_pooled = self.shared_gap(x).flatten(1)  # (B, filters)
+        # MTL predictions (reuse trunk_pooled — no extra GAP call)
         
-        win_pred = F.relu(self.win_fc1(mtl_pooled), inplace=False)
+        win_pred = F.relu(self.win_fc1(trunk_pooled), inplace=False)
         win_pred = self.win_dropout(win_pred)
         win_pred = self.win_fc2(win_pred)
         
-        material_pred = F.relu(self.material_fc1(mtl_pooled), inplace=False)
+        material_pred = F.relu(self.material_fc1(trunk_pooled), inplace=False)
         material_pred = torch.tanh(self.material_fc2(material_pred))
         
-        check_pred = self.check_fc(mtl_pooled)
+        check_pred = self.check_fc(trunk_pooled)
         
         return policy, value, win_pred, material_pred, check_pred
     
@@ -370,22 +457,22 @@ class ChessNet(nn.Module):
         Predict for a single position (used in MCTS)
         đź†• Handles WDL output and converts to scalar
         """
+        was_training = self.training
         self.eval()
-        with torch.inference_mode():
-            if len(board_tensor.shape) == 3:
-                board_tensor = board_tensor.unsqueeze(0)
-            policy, value_logits = self.forward(board_tensor, return_aux=False)
-            
-            # Convert WDL logits to scalar value
-            if self.use_wdl:
+        try:
+            with torch.inference_mode():
+                if len(board_tensor.shape) == 3:
+                    board_tensor = board_tensor.unsqueeze(0)
+                policy, value_logits = self.forward(board_tensor, return_aux=False)
+                
                 # value_logits: (1, 3) -> [Win, Draw, Loss]
                 wdl_probs = F.softmax(value_logits, dim=1)
                 # Scalar: W*1.0 + D*0.0 + L*(-1.0) = W - L
                 value_scalar = wdl_probs[0, 0] - wdl_probs[0, 2]
                 return torch.exp(policy).cpu().numpy()[0], value_scalar.item()
-            else:
-                # Legacy scalar output
-                return torch.exp(policy).cpu().numpy()[0], value_logits.cpu().item()
+        finally:
+            if was_training:
+                self.train()
 
 
 def load_model(checkpoint_path, config, device):

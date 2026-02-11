@@ -2,14 +2,14 @@
 Imitation Learning Training Script - v4.5
 🆕 v4.5: CRITICAL FIXES - Per-Game Split + Promotions + Better Sampling
 🆕 v4.5: CHESS METADATA - Castling, En Passant, Halfmove, Fullmove (16 planes)
-🆕 v4.3: WDL VALUE HEAD + TEMPORAL DISCOUNTING (conditional on use_wdl)
+🆕 v4.3: WDL VALUE HEAD + TEMPORAL DISCOUNTING
 🆕 v4.2: POV + Dynamic Sliding Window
 - 🎯 POV: All boards from current player's perspective (flip for black)
 - 🔄 Sliding Window: Dynamic history assembly at load time using mmap
 - 🎮 GameID tracking: Efficient history reconstruction across positions
 - 📊 Chess Metadata: 4 extra planes (castling, en passant, halfmove, fullmove)
 - ⚡ WDL: Win/Draw/Loss classification (stronger signal than MSE)
-- ⚡ TEMPORAL DISCOUNTING: DISABLED for WDL (clean ±1.0), ENABLED for MSE
+- ⚡ TEMPORAL DISCOUNTING: DISABLED (WDL-only mode, clean ±1.0 targets)
 - 🔒 Per-Game Split: Train/Val separated by games (no history leakage)
 - 🎲 Per-Game Stride Offset: Per-game offset for unbiased sampling
 - 👑 Promotions: Promotion-aware action space (see ACTION_SIZE)
@@ -110,7 +110,7 @@ def main():
     print(f"  • 🆕 Promotions: {ACTION_SIZE} actions ({ACTION_SIZE - 4096} promotion actions)")
     print(f"  • 🆕 Per-game split: No validation leakage")
     print(f"  • MTL enabled: {use_mtl}")
-    print(f"  • 🆕 WDL Value: {config['model'].get('use_wdl_value', True)}")
+    print("  • 🆕 WDL Value: True (forced)")
     print("="*70 + "\n")
     
     # Setup debug logging
@@ -147,7 +147,7 @@ def main():
             f.write(f"Input planes: {expected_input_planes} (16 per position)\n")
             f.write(f"Chess metadata: Castling, En Passant, Halfmove, Fullmove\n")
             f.write(f"MTL enabled: {use_mtl}\n")
-            f.write(f"WDL Value: {config['model'].get('use_wdl_value', True)}\n")
+            f.write("WDL Value: True (forced)\n")
             f.write(f"POV enabled: True\n")
             f.write("="*70 + "\n\n")
     
@@ -189,12 +189,8 @@ def main():
     print(f"\n✅ Data loaded successfully!")
     print(f"Total positions (before stride): {metadata['total_positions']:,}")
     
-    # 🔧 v4.5: Check if WDL is enabled (affects temporal discounting)
-    use_wdl = config['model'].get('use_wdl_value', True)
-    if use_wdl:
-        print(f"  • WDL enabled: Temporal discounting DISABLED (clean ±1.0 targets) ✓")
-    else:
-        print(f"  • MSE regression: Temporal discounting ENABLED (sqrt scaling) ⚠️")
+    # WDL is always enabled.
+    print("  • WDL enabled: Temporal discounting DISABLED (clean ±1.0 targets) ✓")
     
     # 🔧 v4.5: Verify binary format compatibility
     # Layout: [Board 38B] + [GameID 4B] + [MoveIdx 2B] + [MoveTarget 2B] + [Outcome 4B] + [MTL 12B]
@@ -386,7 +382,8 @@ def main():
         raise ValueError(f"Unknown scheduler_type: {scheduler_type}")
     
     # AMP Gradient Scaler
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    # 🔧 v4.8: GradScaler only for float16, NOT for bfloat16 (same dynamic range as float32)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp and not use_bfloat16)
     
     # 🆕 Stochastic Weight Averaging (SWA) for better generalization with large batches
     use_swa = config['imitation_learning'].get('use_swa', False)
@@ -647,8 +644,11 @@ def main():
         print("="*70)
         
         # Update BatchNorm statistics for SWA model
+        # 🔧 v4.8: Must use same AMP context as training, otherwise BN stats mismatch
         print("Updating BatchNorm statistics...")
-        torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
+        amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+        with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+            torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
         
         # Evaluate SWA model
         print("Evaluating SWA model...")
@@ -710,10 +710,7 @@ def main():
     print(f"  ✓ Dynamic Sliding Window - history assembled at load time")
     print(f"  ✓ GameID tracking - efficient history reconstruction")
     print(f"  ✓ Stride {stride}x - sampled every {stride} positions")
-    if use_wdl:
-        print(f"  ✓ Temporal Discounting - DISABLED for WDL (clean targets)")
-    else:
-        print(f"  ✓ Temporal Discounting - ENABLED for MSE (sqrt scaling)")
+    print(f"  ✓ Temporal Discounting - DISABLED for WDL (clean targets)")
     if use_mtl:
         print(f"  ✓ Multi-Task Learning - win, material, check predictions")
     if use_swa:
