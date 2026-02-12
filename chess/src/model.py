@@ -364,6 +364,9 @@ class ChessNet(nn.Module):
         
         # 🔧 v4.8: Proper weight initialization
         self._initialize_weights()
+
+        if print_summary:
+            self._print_parameter_summary(num_blocks)
     
     def _initialize_weights(self):
         """Initialize weights for better training stability and convergence.
@@ -392,6 +395,62 @@ class ChessNet(nn.Module):
         nn.init.zeros_(self.policy_fc2.bias)
         nn.init.normal_(self.value_fc2.weight, std=0.01)
         nn.init.zeros_(self.value_fc2.bias)
+
+    @staticmethod
+    def _count_parameters(module, trainable_only=False):
+        """Count parameters for a module."""
+        if trainable_only:
+            return sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return sum(p.numel() for p in module.parameters())
+
+    def _print_parameter_summary(self, num_blocks):
+        """Print a compact parameter breakdown for key model parts."""
+        stem_params = self._count_parameters(self.conv_block)
+        tower_params = self._count_parameters(self.residual_tower)
+        final_bn_params = self._count_parameters(self.final_bn)
+
+        policy_params = (
+            self._count_parameters(self.policy_conv) +
+            self._count_parameters(self.policy_bn) +
+            self._count_parameters(self.policy_global_fc) +
+            self._count_parameters(self.policy_fc1) +
+            self._count_parameters(self.policy_fc2)
+        )
+
+        value_params = (
+            self._count_parameters(self.value_conv) +
+            self._count_parameters(self.value_bn) +
+            self._count_parameters(self.value_fc1) +
+            self._count_parameters(self.value_fc2)
+        )
+
+        mtl_params = 0
+        if self.use_mtl:
+            mtl_params = (
+                self._count_parameters(self.win_fc1) +
+                self._count_parameters(self.win_fc2) +
+                self._count_parameters(self.material_fc1) +
+                self._count_parameters(self.material_fc2) +
+                self._count_parameters(self.check_fc)
+            )
+
+        total_params = self._count_parameters(self)
+        trainable_params = self._count_parameters(self, trainable_only=True)
+        frozen_params = total_params - trainable_params
+        per_block = tower_params // max(1, num_blocks)
+
+        print("  > Parameter breakdown:")
+        print(f"    - Stem (input conv_block): {stem_params:,}")
+        print(f"    - Residual tower ({num_blocks} blocks): {tower_params:,} (~{per_block:,}/block)")
+        print(f"    - Final BN: {final_bn_params:,}")
+        print(f"    - Policy head: {policy_params:,}")
+        print(f"    - Value head: {value_params:,}")
+        if self.use_mtl:
+            print(f"    - MTL heads: {mtl_params:,}")
+        print(f"    - Trainable params: {trainable_params:,}")
+        if frozen_params > 0:
+            print(f"    - Frozen params: {frozen_params:,}")
+        print(f"    - Total params: {total_params:,}")
 
     def forward(self, x, return_aux=False):
         """Forward pass"""

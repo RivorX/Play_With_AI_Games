@@ -24,7 +24,7 @@ paths:
 # DATA PROCESSING - 🆕 v4.3 TEMPORAL DISCOUNTING + v4.2 POV + SLIDING WINDOW
 # ------------------------------------------------------------------------------
 data:
-  min_elo: 2000              # Minimum Elo rating for games
+  min_elo: 2300              # Minimum Elo rating for games
   max_games: 200000          # Top N games to use per PGN file
   train_split: 0.85           # Train/validation split ratio
   max_moves_per_game: 200    # Skip games longer than this
@@ -35,14 +35,16 @@ data:
   # Game-level quality filters (headers + length)
   game_filters:
     enabled: true
-    min_fullmove: 8               # Minimum fullmoves for any decisive game
-    min_fullmove_draw: 16         # Stronger filter for short draws
-    min_fullmove_resign: 10       # Early resignations
-    max_elo_gap: 350              # Detect "rozkladówki"
+    min_fullmove: 10              # Minimum fullmoves for any decisive game
+    min_fullmove_draw: 20         # Stronger filter for short draws
+    min_fullmove_resign: 12       # Early resignations
+    max_elo_gap: 300              # Detect "rozkladówki"
     exclude_terminations:
       - "Time forfeit"
       - "Timeout"
       - "Flag"
+      - "Abandoned"
+      - "Rules infraction"
   
   # SLIDING WINDOW: dynamic history, no redundant storage
   sliding_window_stride: 2   # Sample every Nth position (1=all, 2=half, 3=third)
@@ -53,10 +55,10 @@ data:
   position_sampling:
     enabled: true
     seed: 42
-    min_fullmove: 2      # hard-skip first N fullmoves (2 = skip moves 1-2)
-    keep_min: 0.2        # early-game keep probability
+    min_fullmove: 3      # hard-skip first N fullmoves
+    keep_min: 0.12       # early-game keep probability
     keep_max: 1.0        # late-game keep probability
-    power: 1.5           # >1 biases toward mid/late game
+    power: 1.8           # >1 biases toward mid/late game
 
   # Position deduplication (across games)
   # 🆕 v4.7: SMART DEDUP with max_count + position_plus_move mode
@@ -64,7 +66,7 @@ data:
     enabled: true
     mode: "position_plus_move"   # position_plus_move | fen_no_counters | fen | pieces
     include_turn: true           # Include side-to-move in signature
-    max_count: 5                 # Max occurrences per signature (None = remove all duplicates)
+    max_count: 3                 # Max occurrences per signature (None = remove all duplicates)
     random_sample: true          # Random sample (vs first K) - prevents bias
   
   # 4-PHASE: parse -> positions -> write -> cleanup
@@ -78,15 +80,15 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v4.8"
+  version: "v4.9"
   # Base architecture
-  num_residual_blocks: 10     # Number of residual blocks (6-12 optimal)
+  num_residual_blocks: 6     # Number of residual blocks (6-12 optimal)
   filters: 128               # Convolutional filters (128-256 for RTX 5060 Ti)
   # 🆕 v4.8: Dual-stream policy head
   policy_head_conv_filters: 32  # Spatial stream: 3x3 conv filters (wider = more info preserved)
   policy_head_conv_groups: 4    # Grouped 3x3 conv in policy head (must divide filters and conv_filters)
   policy_head_global_dim: 64    # Global stream: GAP → FC dimension (board-wide context)
-  policy_head_hidden_dim: 512   # Intermediate FC dimension (decomposed projection)
+  policy_head_hidden_dim: 384   # Intermediate FC dimension (decomposed projection)
   value_head_filters: 64     # Value head filters 
   value_hidden_dim: 384      # Value head hidden dimension 
   dropout: 0.2               # Dropout rate 
@@ -96,16 +98,11 @@ model:
   # History is now assembled DYNAMICALLY at load time using mmap and GameID tracking
   # This eliminates redundant storage and enables flexible history depths
   # ═══════════════════════════════════════════════════════════════════════════
-  history_positions: 4       # Number of previous positions to include (dynamic)
-                             # - 0: Current position only (16 planes)
-                             # - 1: Current + 1 previous (32 planes)
-                             # - 4: Current + 4 previous (80 planes) ⭐ RECOMMENDED
-                             # - 8: Current + 8 previous (144 planes)
-                             # History is built by walking backwards through mmap using GameID
+  history_positions: 4       # Number of past positions to include (0 = current only, 4 = current + 3 history)
   
   # Advanced features
   use_se2d_blocks: true          # ✅ SE-Net v2 with channel attention
-  drop_path_rate: 0.2           # Stochastic Depth
+  drop_path_rate: 0.1           # Stochastic Depth
   use_coord_conv: true          # 🗺️ Position-aware conv
   
   # Advanced architectural features
@@ -127,7 +124,7 @@ model:
 # ------------------------------------------------------------------------------
 imitation_learning:
   # Training hyperparameters
-  batch_size: 8192           # Batch size
+  batch_size: 10240           # Batch size
   learning_rate: 0.0005      # Learning rate 
   value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
   epochs: 30                 # Maximum training epochs
