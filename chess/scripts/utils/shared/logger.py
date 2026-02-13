@@ -45,7 +45,9 @@ class TrainingLogger:
                     'train_value_wdl_acc', 'train_value_wdl_ce',
                     'val_policy_top1', 'val_policy_top3',
                     'val_value_mae', 'val_value_mae_weighted',
-                    'val_value_wdl_acc', 'val_value_wdl_ce'
+                    'val_value_wdl_acc', 'val_value_wdl_ce',
+                    # 🆕 Elo estimation
+                    'estimated_elo'
                 ]
                 
                 if use_mtl:
@@ -90,6 +92,9 @@ class TrainingLogger:
         self.val_value_wdl_acc = []
         self.val_value_wdl_ce = []
         
+        # 🆕 Elo estimation storage
+        self.estimated_elos = []  # (epoch, elo) tuples
+        
         if use_mtl:
             self.train_win_losses = []
             self.val_win_losses = []
@@ -105,7 +110,7 @@ class TrainingLogger:
         print(f"📊 Logging to: {self.csv_path}")
     
     def log(self, iteration, train_losses=None, val_losses=None, 
-            train_metrics=None, val_metrics=None, lr=None, **kwargs):
+            train_metrics=None, val_metrics=None, lr=None, estimated_elo=None, **kwargs):
         """
         Log metrics to CSV
         
@@ -146,6 +151,9 @@ class TrainingLogger:
                     val_metrics.get('value_wdl_ce', '') if val_metrics else ''
                 ]
                 
+                # 🆕 Elo estimation
+                row.append(estimated_elo if estimated_elo is not None else '')
+                
                 if self.use_mtl:
                     row.extend([
                         train_losses.get('win', ''),
@@ -182,6 +190,10 @@ class TrainingLogger:
                     self.val_value_mae_weighted.append(val_metrics.get('value_mae_weighted', 0))
                     self.val_value_wdl_acc.append(val_metrics.get('value_wdl_acc', 0))
                     self.val_value_wdl_ce.append(val_metrics.get('value_wdl_ce', 0))
+                
+                # 🆕 Elo estimation storage
+                if estimated_elo is not None:
+                    self.estimated_elos.append((iteration, estimated_elo))
                 
                 if self.use_mtl:
                     self.train_win_losses.append(train_losses.get('win', 0))
@@ -384,9 +396,25 @@ class TrainingLogger:
             ax.grid(True, alpha=0.3)
 
             # ============================================================
-            # ROW 5: SUMMARY
+            # ROW 5: ELO ESTIMATION + SUMMARY
             # ============================================================
-            axes[4, 0].axis('off')
+            ax = axes[4, 0]
+            if self.estimated_elos:
+                elo_epochs, elo_vals = zip(*self.estimated_elos)
+                ax.plot(elo_epochs, elo_vals, 'go-', label='Estimated Elo', linewidth=2, markersize=8)
+                ax.set_xlabel('Epoch')
+                ax.set_ylabel('Elo')
+                ax.set_title('Estimated Elo (vs Stockfish)')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                # Add horizontal reference lines
+                for ref_elo, ref_label in [(1200, 'Beginner'), (1500, 'Club'), (1800, 'Expert'), (2000, 'Candidate Master')]:
+                    if min(elo_vals) - 200 <= ref_elo <= max(elo_vals) + 200:
+                        ax.axhline(y=ref_elo, color='gray', linestyle=':', alpha=0.4)
+                        ax.text(elo_epochs[0], ref_elo + 15, ref_label, fontsize=8, color='gray', alpha=0.6)
+            else:
+                ax.axis('off')
+            
             ax = axes[4, 1]
             ax.axis('off')
             if self.val_policy_top1 and self.val_losses:
@@ -404,6 +432,8 @@ class TrainingLogger:
                 if self.val_value_wdl_ce:
                     summary_lines.append(f"WDL CE: {self.val_value_wdl_ce[-1]:.4f}")
                 summary_lines.append(f"Total Loss: {self.val_losses[-1]:.4f}")
+                if self.estimated_elos:
+                    summary_lines.append(f"Est. Elo: {self.estimated_elos[-1][1]}")
                 summary_text = "\n".join(summary_lines)
                 ax.text(
                     0.1,
@@ -559,7 +589,18 @@ class TrainingLogger:
             ax.grid(True, alpha=0.3)
             
             # Summary metrics
-            axes[4, 0].axis('off')
+            # Elo plot (MTL mode)
+            ax = axes[4, 0]
+            if self.estimated_elos:
+                elo_epochs, elo_vals = zip(*self.estimated_elos)
+                ax.plot(elo_epochs, elo_vals, 'go-', label='Estimated Elo', linewidth=2, markersize=8)
+                ax.set_xlabel('Epoch')
+                ax.set_ylabel('Elo')
+                ax.set_title('Estimated Elo (vs Stockfish)')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.axis('off')
             axes[4, 1].axis('off')
             ax = axes[4, 2]
             ax.axis('off')
@@ -578,6 +619,8 @@ class TrainingLogger:
                 if self.val_value_wdl_ce:
                     summary_lines.append(f"WDL CE: {self.val_value_wdl_ce[-1]:.4f}")
                 summary_lines.append(f"Total Loss: {self.val_losses[-1]:.4f}")
+                if self.estimated_elos:
+                    summary_lines.append(f"Est. Elo: {self.estimated_elos[-1][1]}")
                 summary_text = "\n".join(summary_lines)
                 ax.text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
                        verticalalignment='center')

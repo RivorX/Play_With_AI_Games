@@ -257,6 +257,23 @@ logging:
 
 
 # ------------------------------------------------------------------------------
+# 🆕 ELO ESTIMATION (via Stockfish matches during evaluation)
+# ------------------------------------------------------------------------------
+elo_estimation:
+  enabled: true                # Enable Elo estimation during training
+  eval_every: 5                # Estimate Elo every N epochs (expensive, don't run every epoch)
+  stockfish_path: "stockfish"  # Path to Stockfish binary (or just "stockfish" if on PATH)
+  games_per_level: 4           # Games per Elo level (half as white, half as black)
+  levels: [1320, 1500, 1700, 1900, 2200]  # Stockfish UCI_Elo levels (min 1320 for SF 17+)
+  stockfish_time_limit: 0.05   # Seconds per Stockfish move (lower = faster but weaker play)
+  max_moves: 150               # Max full moves per game before declaring draw
+  
+  # MCTS options (for stronger but slower play)
+  use_mcts: false              # Enable MCTS for model moves (false = raw network, much faster)
+  mcts_simulations: 100        # MCTS sims per move (50-100 = fast, 200-400 = strong, 800+ = very strong)
+
+
+# ------------------------------------------------------------------------------
 # 🆕 DEBUG & PROFILING
 # ------------------------------------------------------------------------------
 debug:

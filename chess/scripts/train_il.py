@@ -36,6 +36,7 @@ from src.utils.data_helpers import ACTION_SIZE
 # Import from utils
 from utils.shared.logger import TrainingLogger
 from utils.il.training_il import train_epoch_il, evaluate_il
+from utils.shared.elo_estimator import estimate_model_elo
 
 
 def main():
@@ -430,6 +431,17 @@ def main():
     print(f"Checkpoints saved every {checkpoint_every} epochs to: {il_dir}")
     print(f"Best model saved to: {best_model_path}")
     
+    # 🆕 Elo estimation config
+    elo_config = config.get('elo_estimation', {})
+    elo_enabled = elo_config.get('enabled', False)
+    elo_eval_every = elo_config.get('eval_every', 5)
+    if elo_enabled:
+        print(f"\n\u265a Elo Estimation (vs Stockfish):")
+        print(f"  \u2022 Evaluate every {elo_eval_every} epochs")
+        print(f"  \u2022 Levels: {elo_config.get('levels', [1000, 1300, 1600, 1900, 2200])}")
+        print(f"  \u2022 Games per level: {elo_config.get('games_per_level', 4)}")
+        print(f"  \u2022 Stockfish path: {elo_config.get('stockfish_path', 'stockfish')}")
+    
     for epoch in range(config['imitation_learning']['epochs']):
         print(f"\nEpoch {epoch + 1}/{config['imitation_learning']['epochs']}")
         epoch_lr = optimizer.param_groups[0]['lr']
@@ -503,7 +515,24 @@ def main():
                       f"Check: {val_losses['check']:.4f}")
             
             # Log metrics
-            logger.log(epoch + 1, train_losses, val_losses, train_metrics, val_metrics, epoch_lr)
+            # 🆕 Elo estimation (run every N epochs)
+            estimated_elo = None
+            if elo_enabled and (epoch + 1) % elo_eval_every == 0:
+                print(f"\n     \u265a Estimating Elo (vs Stockfish)...")
+                elo_result = estimate_model_elo(model, config, device, elo_config)
+                estimated_elo = elo_result.get('estimated_elo')
+                if estimated_elo is not None:
+                    print(f"     \u265a Estimated Elo: {estimated_elo}")
+                    # Print per-level breakdown
+                    for lvl, res in sorted(elo_result.get('results', {}).items()):
+                        score_str = f"W{res['wins']}/D{res['draws']}/L{res['losses']}" 
+                        print(f"       vs SF {lvl}: {score_str} (score: {res['score']:.0%})")
+                    print(f"       \u23f1 {elo_result['total_time']:.1f}s ({elo_result['total_games']} games)")
+                elif 'error' not in elo_result and not elo_result.get('skipped'):
+                    print(f"     \u265a Elo estimation: inconclusive")
+            
+            logger.log(epoch + 1, train_losses, val_losses, train_metrics, val_metrics, epoch_lr,
+                       estimated_elo=estimated_elo)
             logger.plot()
             
             # Save best model
