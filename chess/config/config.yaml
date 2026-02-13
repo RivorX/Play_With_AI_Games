@@ -80,9 +80,9 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v4.9"
+  version: "v5.0"
   # Base architecture
-  num_residual_blocks: 6     # Number of residual blocks (6-12 optimal)
+  num_residual_blocks: 8     # Number of residual blocks (6-12 optimal)
   filters: 128               # Convolutional filters (128-256 for RTX 5060 Ti)
   # 🆕 v4.8: Dual-stream policy head
   policy_head_conv_filters: 32  # Spatial stream: 3x3 conv filters (wider = more info preserved)
@@ -93,11 +93,6 @@ model:
   value_hidden_dim: 384      # Value head hidden dimension 
   dropout: 0.2               # Dropout rate 
 
-  # 🆕 DYNAMIC HISTORY CONFIGURATION
-  # ═══════════════════════════════════════════════════════════════════════════
-  # History is now assembled DYNAMICALLY at load time using mmap and GameID tracking
-  # This eliminates redundant storage and enables flexible history depths
-  # ═══════════════════════════════════════════════════════════════════════════
   history_positions: 4       # Number of past positions to include (0 = current only, 4 = current + 3 history)
   
   # Advanced features
@@ -110,7 +105,7 @@ model:
   layer_scale_init: 1e-5        # Initial LayerScale value (1e-6 to 1e-4)
 
   # Multi-Task Learning
-  use_multitask_learning: true        # Enable auxiliary tasks
+  use_multitask_learning: false        # Enable auxiliary tasks
   win_prediction_weight: 0.3          # Weight for win prediction
   material_prediction_weight: 0.15    # Weight for material count
   check_prediction_weight: 0.1        # Weight for check prediction
@@ -124,7 +119,7 @@ model:
 # ------------------------------------------------------------------------------
 imitation_learning:
   # Training hyperparameters
-  batch_size: 10240           # Batch size
+  batch_size: 9216           # Batch size
   learning_rate: 0.0005      # Learning rate 
   value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
   epochs: 30                 # Maximum training epochs

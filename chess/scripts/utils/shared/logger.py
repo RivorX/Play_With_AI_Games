@@ -254,7 +254,7 @@ class TrainingLogger:
         if self.use_mtl:
             fig, axes = plt.subplots(5, 3, figsize=(18, 22))
         else:
-            fig, axes = plt.subplots(4, 2, figsize=(15, 18))
+            fig, axes = plt.subplots(5, 2, figsize=(15, 22))
         
         fig.suptitle('IL Training Progress', fontsize=16, fontweight='bold')
         
@@ -382,6 +382,37 @@ class TrainingLogger:
             if self.train_value_wdl_ce or self.val_value_wdl_ce:
                 ax.legend()
             ax.grid(True, alpha=0.3)
+
+            # ============================================================
+            # ROW 5: SUMMARY
+            # ============================================================
+            axes[4, 0].axis('off')
+            ax = axes[4, 1]
+            ax.axis('off')
+            if self.val_policy_top1 and self.val_losses:
+                summary_lines = [
+                    "Latest Validation Metrics:",
+                    "",
+                    f"Policy Top-1: {self.val_policy_top1[-1]:.2%}",
+                    f"Policy Top-3: {self.val_policy_top3[-1]:.2%}",
+                    f"Value MAE: {self.val_value_mae[-1]:.4f}",
+                ]
+                if self.val_value_mae_weighted:
+                    summary_lines.append(f"Value MAE (w): {self.val_value_mae_weighted[-1]:.4f}")
+                if self.val_value_wdl_acc:
+                    summary_lines.append(f"WDL Acc: {self.val_value_wdl_acc[-1]:.2%}")
+                if self.val_value_wdl_ce:
+                    summary_lines.append(f"WDL CE: {self.val_value_wdl_ce[-1]:.4f}")
+                summary_lines.append(f"Total Loss: {self.val_losses[-1]:.4f}")
+                summary_text = "\n".join(summary_lines)
+                ax.text(
+                    0.1,
+                    0.5,
+                    summary_text,
+                    fontsize=12,
+                    family='monospace',
+                    verticalalignment='center',
+                )
         
         else:
             # MTL plots (5x3)

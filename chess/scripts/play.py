@@ -29,7 +29,17 @@ from src.mcts import MCTS, select_move_by_visits
 from src.utils.data_helpers import board_to_tensor, move_to_index
 
 # Import from utils
-from utils.ui.gui_helpers import create_piece_surfaces, load_model_from_checkpoint, select_models
+from utils.ui.game_setup import load_model_from_checkpoint, select_models, write_setup_log
+from utils.ui.gui_helpers import (
+    build_pgn_game,
+    create_piece_surfaces,
+    format_recent_moves,
+    get_game_mode_labels,
+    get_result_message,
+    get_turn_color,
+    resolve_games_dir,
+    save_game_to_pgn,
+)
 
 # Initialize Pygame
 pygame.init()
@@ -56,13 +66,25 @@ TEXT_COLOR = (255, 255, 255)
 class ChessGUI:
     """Chess game GUI with support for multiple game modes and MCTS toggle - v4.2"""
     
-    def __init__(self, model1, model2, config, device, game_mode="human_vs_ai", enable_mcts=True):
+    def __init__(
+        self,
+        model1,
+        model2,
+        config,
+        device,
+        game_mode="human_vs_ai",
+        enable_mcts=True,
+        model1_name=None,
+        model2_name=None,
+    ):
         self.model1 = model1  # White AI or main AI
         self.model2 = model2  # Black AI (for AI vs AI mode)
         self.config = config
         self.version = config.get('model', {}).get('version', 'v?.?')
         self.device = device
         self.game_mode = game_mode  # "human_vs_ai", "ai_vs_ai", "human_vs_human"
+        self.model1_name = model1_name or f"ChessAI-{self.version}-A"
+        self.model2_name = model2_name or f"ChessAI-{self.version}-B"
         
         # 🆕 MCTS toggle
         self.mcts_enabled = enable_mcts
@@ -101,6 +123,7 @@ class ChessGUI:
         self.ai_thinking = False
         self.game_over = False
         self.move_history = []
+        self.move_san_history = []
         
         # 🆕 v4.2: Board history for neural network input
         # Store chess.Board objects (not tensors) for history
@@ -108,6 +131,13 @@ class ChessGUI:
         
         # Flip board for black
         self.flipped = False
+
+        # PGN autosave state
+        base_dir = script_dir.parent
+        self.games_dir = resolve_games_dir(config, base_dir)
+        self.initial_fen = self.board.fen()
+        self.current_game_saved = False
+        self.game_index = 1
     
     def square_to_coords(self, square):
         """Convert chess square to screen coordinates"""
@@ -205,6 +235,12 @@ class ChessGUI:
                 x, y = self.square_to_coords(square)
                 piece_surface = self.pieces[piece.symbol()]
                 self.screen.blit(piece_surface, (x, y))
+
+    def _ai_thinking_icon(self):
+        """Animated text icon for AI thinking state."""
+        frames = ["[   ]", "[=  ]", "[== ]", "[===]"]
+        idx = (pygame.time.get_ticks() // 180) % len(frames)
+        return frames[idx]
     
     def draw_sidebar(self):
         """Draw sidebar with game info"""
@@ -226,15 +262,7 @@ class ChessGUI:
         y += 20
         
         # Game mode info
-        if self.game_mode == "human_vs_ai":
-            mode_text = "Human vs AI"
-            you_text = f"You: {'White' if self.human_color == chess.WHITE else 'Black'}"
-        elif self.game_mode == "ai_vs_ai":
-            mode_text = "AI vs AI"
-            you_text = "Spectator Mode"
-        else:  # human_vs_human
-            mode_text = "Human vs Human"
-            you_text = "2 Player Mode"
+        mode_text, you_text = get_game_mode_labels(self.game_mode, self.human_color)
         
         mode = self.small_font.render(mode_text, True, (150, 200, 255))
         self.screen.blit(mode, (x_start + 20, y))
@@ -247,10 +275,7 @@ class ChessGUI:
         # Game info
         turn_text = "White's turn" if self.board.turn == chess.WHITE else "Black's turn"
         
-        if self.game_mode == "human_vs_ai":
-            turn_color = (255, 255, 200) if self.board.turn == self.human_color else (200, 200, 255)
-        else:
-            turn_color = (255, 255, 200) if self.board.turn == chess.WHITE else (200, 200, 255)
+        turn_color = get_turn_color(self.game_mode, self.board.turn, self.human_color)
         
         turn = self.text_font.render(turn_text, True, turn_color)
         self.screen.blit(turn, (x_start + 20, y))
@@ -271,16 +296,17 @@ class ChessGUI:
         
         # AI status
         if self.ai_thinking:
-            status = self.text_font.render("🤔 AI thinking...", True, (255, 200, 0))
-            self.screen.blit(status, (x_start + 20, y))
-            
-            # Animated dots
-            dots = "." * (pygame.time.get_ticks() // 500 % 4)
-            dots_text = self.text_font.render(dots, True, (255, 200, 0))
-            self.screen.blit(dots_text, (x_start + 200, y))
-        
+            status_box = pygame.Rect(x_start + 20, y - 8, SIDEBAR_WIDTH - 40, 44)
+            pygame.draw.rect(self.screen, (54, 51, 34), status_box, border_radius=8)
+            pygame.draw.rect(self.screen, (142, 126, 66), status_box, 1, border_radius=8)
+            icon = self._ai_thinking_icon()
+            icon_text = self.text_font.render(icon, True, (255, 215, 100))
+            status = self.text_font.render("AI thinking", True, (255, 215, 100))
+            self.screen.blit(icon_text, (x_start + 28, y - 2))
+            self.screen.blit(status, (x_start + 108, y - 2))
+
         y += 50
-        
+
         # Separator line
         pygame.draw.line(self.screen, (80, 80, 80), 
                         (x_start + 20, y), (x_start + SIDEBAR_WIDTH - 20, y), 2)
@@ -291,14 +317,12 @@ class ChessGUI:
         self.screen.blit(history_title, (x_start + 20, y))
         y += 30
         
-        for i, move in enumerate(self.move_history[-12:]):
-            move_num = len(self.move_history) - 12 + i + 1
-            if move_num > 0:
-                move_text = f"{move_num}. {move.uci()}"
-                color = (200, 200, 200) if i == len(self.move_history[-12:]) - 1 else (150, 150, 150)
-                text = self.small_font.render(move_text, True, color)
-                self.screen.blit(text, (x_start + 30, y))
-                y += 22
+        recent_moves = format_recent_moves(self.move_san_history, limit=12)
+        for i, move_text in enumerate(recent_moves):
+            color = (200, 200, 200) if i == len(recent_moves) - 1 else (150, 150, 150)
+            text = self.small_font.render(move_text, True, color)
+            self.screen.blit(text, (x_start + 30, y))
+            y += 22
         
         # Game over message
         if self.game_over:
@@ -312,15 +336,7 @@ class ChessGUI:
             y += 15
             result = self.board.result()
             
-            if result == '1-0':
-                msg = "White Wins!"
-                color = (100, 255, 100)
-            elif result == '0-1':
-                msg = "Black Wins!"
-                color = (100, 255, 100)
-            else:
-                msg = "Draw!"
-                color = (200, 200, 200)
+            msg, color = get_result_message(result)
             
             game_over_text = self.text_font.render(msg, True, color)
             rect = game_over_text.get_rect(center=(x_start + SIDEBAR_WIDTH//2, y + 30))
@@ -336,7 +352,7 @@ class ChessGUI:
         self.screen.blit(controls_title, (x_start + 20, y))
         y += 25
         
-        controls = ["R - Restart game", "F - Flip board"]
+        controls = ["R - Restart game", "U - Undo move", "F - Flip board", "ESC - Back to menu"]
         
         # 🆕 Show MCTS toggle only if enabled
         if self.game_mode == "human_vs_ai" and self.mcts_enabled:
@@ -346,6 +362,95 @@ class ChessGUI:
             text = self.small_font.render(control, True, (120, 120, 120))
             self.screen.blit(text, (x_start + 20, y))
             y += 20
+
+    def _record_pre_move_state(self):
+        """Store pre-move state for history-aware inference."""
+        self.board_history.append(self.board.copy())
+        if self.mcts1:
+            self.mcts1.update_history(self.board)
+        if self.mcts2:
+            self.mcts2.update_history(self.board)
+
+    def _sync_mcts_histories(self):
+        """Rebuild MCTS histories after undoing moves."""
+        for mcts in (self.mcts1, self.mcts2):
+            if mcts:
+                mcts.reset_tree()
+                for hist_board in self.board_history:
+                    mcts.update_history(hist_board)
+
+    def undo_moves(self, plies=None):
+        """Undo last moves. In human-vs-AI defaults to 2 plies."""
+        if plies is None:
+            plies = 2 if self.game_mode == "human_vs_ai" else 1
+
+        undone = 0
+        while undone < plies and self.move_history and self.board.move_stack:
+            self.board.pop()
+            self.move_history.pop()
+            if self.move_san_history:
+                self.move_san_history.pop()
+            if self.board_history:
+                self.board_history.pop()
+            undone += 1
+
+        if undone > 0:
+            self.selected_square = None
+            self.legal_moves = []
+            self.ai_thinking = False
+            self.game_over = False
+            self.current_game_saved = False
+            self._sync_mcts_histories()
+
+        return undone
+
+    def _save_current_game(self, force_incomplete=False, termination=None):
+        """Save current game to PGN once."""
+        if self.current_game_saved:
+            return None
+        if not self.move_history:
+            return None
+        if not self.board.is_game_over() and not force_incomplete:
+            return None
+
+        result_override = None if self.board.is_game_over() else "*"
+        game = build_pgn_game(
+            board=self.board,
+            move_history=self.move_history,
+            initial_fen=self.initial_fen,
+            version=self.version,
+            game_mode=self.game_mode,
+            mcts_enabled=self.mcts_enabled,
+            game_index=self.game_index,
+            human_color=self.human_color,
+            model1_name=self.model1_name,
+            model2_name=self.model2_name,
+            result_override=result_override,
+            termination=termination,
+        )
+        output_path = save_game_to_pgn(
+            games_dir=self.games_dir,
+            version=self.version,
+            game_index=self.game_index,
+            game=game,
+        )
+
+        self.current_game_saved = True
+        self.game_index += 1
+        print(f"Saved game PGN: {output_path}")
+        return output_path
+
+    def _apply_move(self, move):
+        """Apply move, update histories, and persist finished game."""
+        san_move = self.board.san(move)
+        self._record_pre_move_state()
+        self.board.push(move)
+        self.move_history.append(move)
+        self.move_san_history.append(san_move)
+
+        if self.board.is_game_over():
+            self.game_over = True
+            self._save_current_game()
     
     def handle_click(self, pos):
         """Handle mouse click"""
@@ -379,22 +484,9 @@ class ChessGUI:
                         move = chess.Move(self.selected_square, square, promotion=chess.QUEEN)
                 
                 if move in self.board.legal_moves:
-                    # 🆕 Save current board to history before making move
-                    self.board_history.append(self.board.copy())
-                    
-                    # 🆕 v4.2: Update MCTS history too
-                    if self.mcts1:
-                        self.mcts1.update_history(self.board)
-                    if self.mcts2:
-                        self.mcts2.update_history(self.board)
-                    
-                    self.board.push(move)
-                    self.move_history.append(move)
+                    self._apply_move(move)
                     self.selected_square = None
                     self.legal_moves = []
-                    
-                    if self.board.is_game_over():
-                        self.game_over = True
                     return
         
         # Select piece
@@ -517,32 +609,31 @@ class ChessGUI:
             move = self._get_network_move(current_model)
         
         if move:
-            # 🆕 Save current board to history before making move
-            self.board_history.append(self.board.copy())
-            
-            # 🆕 v4.2: Update MCTS history too
-            if self.mcts1:
-                self.mcts1.update_history(self.board)
-            if self.mcts2:
-                self.mcts2.update_history(self.board)
-            
-            self.board.push(move)
-            self.move_history.append(move)
+            self._apply_move(move)
         
         self.ai_thinking = False
-        
-        if self.board.is_game_over():
-            self.game_over = True
     
     def restart_game(self):
         """Restart the game"""
+        if self.move_history and not self.current_game_saved:
+            if self.board.is_game_over():
+                self._save_current_game()
+            else:
+                self._save_current_game(
+                    force_incomplete=True,
+                    termination="abandoned by restart",
+                )
+
         self.board = chess.Board()
+        self.initial_fen = self.board.fen()
         self.selected_square = None
         self.legal_moves = []
         self.ai_thinking = False
         self.game_over = False
         self.move_history = []
+        self.move_san_history = []
         self.board_history = []  # 🆕 Clear board history
+        self.current_game_saved = False
         
         # 🆕 v4.2: Reset MCTS trees and histories
         if self.mcts1:
@@ -551,8 +642,13 @@ class ChessGUI:
             self.mcts2.reset_tree()
     
     def run(self):
-        """Main game loop"""
+        """Main game loop.
+
+        Returns:
+            str: 'menu' to return to setup, 'quit' to exit application.
+        """
         running = True
+        exit_action = "quit"
         
         while running:
             self.clock.tick(FPS)
@@ -560,6 +656,14 @@ class ChessGUI:
             # Handle events
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
+                    if self.board.is_game_over():
+                        self._save_current_game()
+                    else:
+                        self._save_current_game(
+                            force_incomplete=True,
+                            termination="abandoned by quit",
+                        )
+                    exit_action = "quit"
                     running = False
                 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -569,6 +673,18 @@ class ChessGUI:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_r:
                         self.restart_game()
+                    elif event.key == pygame.K_u:
+                        self.undo_moves()
+                    elif event.key == pygame.K_ESCAPE:
+                        if self.board.is_game_over():
+                            self._save_current_game()
+                        else:
+                            self._save_current_game(
+                                force_incomplete=True,
+                                termination="abandoned by return-to-menu",
+                            )
+                        exit_action = "menu"
+                        running = False
                     elif event.key == pygame.K_f:
                         self.flipped = not self.flipped
                     elif event.key == pygame.K_m and self.game_mode == "human_vs_ai" and self.mcts_enabled:
@@ -587,113 +703,140 @@ class ChessGUI:
             
             pygame.display.flip()
         
-        pygame.quit()
+        return exit_action
 
 
 def main():
-    # 🆕 Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Chess AI Game')
-    parser.add_argument('--no-mcts', action='store_true', 
-                       help='Disable MCTS (use network-only mode)')
+    parser = argparse.ArgumentParser(description="Chess AI Game")
+    parser.add_argument(
+        "--no-mcts",
+        action="store_true",
+        help="Disable MCTS (use network-only mode)",
+    )
     args = parser.parse_args()
-    
-    # Load config
-    config_path = script_dir.parent / 'config' / 'config.yaml'
-    
-    print(f"Loading config from: {config_path}")
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
 
-    model_version = config.get('model', {}).get('version', 'v?.?')
-    
-    # Setup device
-    device = torch.device(config['hardware']['device'])
+    config_path = script_dir.parent / "config" / "config.yaml"
+    print(f"Loading config from: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as file_obj:
+        config = yaml.safe_load(file_obj)
+
+    model_version = config.get("model", {}).get("version", "v?.?")
+
+    device = torch.device(config["hardware"]["device"])
     print(f"Using device: {device}")
-    
-    # 🆕 MCTS toggle
-    enable_mcts = not args.no_mcts
-    if not enable_mcts:
-        print("⚠️  MCTS DISABLED - Using network-only mode")
-    
-    # 🆕 Show config info
-    history_positions = config['model'].get('history_positions', 0)
-    print(f"📜 History positions: {history_positions}")
-    print(f"🔢 Input planes: {16 * (1 + history_positions)}")
-    
+
+    default_use_mcts = not args.no_mcts
+
+    history_positions = config["model"].get("history_positions", 0)
+    print(f"History positions: {history_positions}")
+    print(f"Input planes: {16 * (1 + history_positions)}")
+
     base_dir = script_dir.parent
-    
-    # Select models and game mode
-    model1_path, model2_path, game_mode = select_models(base_dir, config)
-    
-    if game_mode in ["human_vs_ai", "ai_vs_ai"]:
-        if model1_path is None:
-            print("⚠️  No model selected. Exiting.")
-            return
-        
-        # Load models
-        print("\nLoading models...")
-        model1 = load_model_from_checkpoint(model1_path, config, device, ChessNet)
-        
-        model2 = None
-        if game_mode == "ai_vs_ai":
-            if model2_path is None:
-                print("⚠️  No second model selected. Exiting.")
-                return
-            model2 = load_model_from_checkpoint(model2_path, config, device, ChessNet)
-    else:  # human_vs_human
-        model1 = None
-        model2 = None
-    
-    # Start GUI
-    print("\n" + "="*50)
-    print(f"Chess AI {model_version} - Pygame GUI")
-    print("="*50)
-    print(f"\n🆕 {model_version} Features:")
-    from src.utils.data_helpers import ACTION_SIZE
-    print(f"  • Promotions - {ACTION_SIZE} actions (promotion-aware)")
-    print("  • POV (Point of View) - perspective handling")
-    print("  • Dynamic Sliding Window - history support")
-    print("  • MCTS toggle - network-only mode available")
-    print("\nControls:")
-    print("  • Click to select and move pieces")
-    print("  • R - Restart game")
-    print("  • F - Flip board")
-    if game_mode == "human_vs_ai" and enable_mcts:
-        print("  • M - Toggle MCTS on/off")
-    print()
-    
-    # 🆕 Pass enable_mcts to GUI
-    gui = ChessGUI(model1, model2, config, device, game_mode, enable_mcts=enable_mcts)
-    
-    # Choose color (only for human vs AI)
-    if game_mode == "human_vs_ai":
-        print("Choose your color:")
-        print("  1. White (you start)")
-        print("  2. Black (AI starts)")
-        choice = input("Enter choice (1/2): ").strip()
-        
-        if choice == '2':
-            gui.human_color = chess.BLACK
-            gui.flipped = True
-            print("\nYou are playing as Black!")
+
+    while True:
+        setup = select_models(base_dir, config, default_use_mcts=default_use_mcts)
+        if setup is None:
+            print("Setup cancelled. Exiting.")
+            break
+
+        model1_path = setup["model1_path"]
+        model2_path = setup["model2_path"]
+        game_mode = setup["game_mode"]
+        human_color = setup["human_color"]
+        enable_mcts = bool(setup["use_mcts"])
+        if not enable_mcts:
+            print("MCTS disabled from setup window")
+
+        setup_log_path = write_setup_log(base_dir, config, setup)
+        print(f"Setup log saved: {setup_log_path}")
+
+        if game_mode in ["human_vs_ai", "ai_vs_ai"]:
+            if model1_path is None:
+                print("No model selected. Exiting.")
+                break
+
+            print()
+            print("Loading models...")
+            model1 = load_model_from_checkpoint(model1_path, config, device, ChessNet)
+
+            model2 = None
+            if game_mode == "ai_vs_ai":
+                if model2_path is None:
+                    print("No second model selected. Exiting.")
+                    break
+                model2 = load_model_from_checkpoint(model2_path, config, device, ChessNet)
         else:
-            print("\nYou are playing as White!")
-    elif game_mode == "ai_vs_ai":
-        print("\nWatching AI vs AI match...")
-        print(f"White: {model1_path.name}")
-        print(f"Black: {model2_path.name}")
-    else:
-        print("\n2-Player mode activated!")
-    
-    # 🆕 Display mode
-    if enable_mcts:
-        print(f"\n🎮 AI Mode: MCTS (press M to toggle)")
-    else:
-        print(f"\n🎮 AI Mode: Network-only (faster)")
-    
-    print("\nStarting game... Good luck! 🎮\n")
-    
-    gui.run()
+            model1 = None
+            model2 = None
+
+        print()
+        print("=" * 50)
+        print(f"Chess AI {model_version} - Pygame GUI")
+        print("=" * 50)
+        print()
+        print(f"{model_version} Features:")
+        from src.utils.data_helpers import ACTION_SIZE
+
+        print(f"  - Promotions ({ACTION_SIZE} actions)")
+        print("  - POV perspective handling")
+        print("  - Dynamic Sliding Window history")
+        print("  - MCTS toggle support")
+        print()
+        print("Controls:")
+        print("  - Click to select and move pieces")
+        print("  - R: restart game")
+        print("  - U: undo move")
+        print("  - F: flip board")
+        print("  - ESC: back to setup menu")
+        if game_mode == "human_vs_ai" and enable_mcts:
+            print("  - M: toggle MCTS")
+        print()
+
+        gui = ChessGUI(
+            model1,
+            model2,
+            config,
+            device,
+            game_mode,
+            enable_mcts=enable_mcts,
+            model1_name=model1_path.name if model1_path else None,
+            model2_name=model2_path.name if model2_path else None,
+        )
+
+        if game_mode == "human_vs_ai":
+            gui.human_color = human_color
+            gui.flipped = human_color == chess.BLACK
+            if human_color == chess.BLACK:
+                print()
+                print("You are playing as Black!")
+            else:
+                print()
+                print("You are playing as White!")
+        elif game_mode == "ai_vs_ai":
+            print()
+            print("Watching AI vs AI match...")
+            print(f"White: {model1_path.name}")
+            print(f"Black: {model2_path.name}")
+        else:
+            print()
+            print("2-Player mode activated!")
+
+        print()
+        if enable_mcts:
+            print("AI Mode: MCTS")
+        else:
+            print("AI Mode: Network-only")
+        print()
+        print("Starting game...")
+        print()
+
+        exit_action = gui.run()
+        if exit_action == "menu":
+            print("Returned to setup menu.")
+            continue
+        break
+
+    pygame.quit()
 
 
 if __name__ == "__main__":
