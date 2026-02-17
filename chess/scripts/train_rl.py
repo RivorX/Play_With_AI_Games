@@ -39,12 +39,42 @@ from utils.shared.logger import TrainingLogger
 from utils.rl.replay import ReplayBuffer, PrioritizedReplayBuffer
 from utils.rl.temperature import TemperatureSchedule
 from utils.rl.training_rl import train_on_batch_rl, evaluate_models
+from utils.rl.startup import plan_rl_startup, apply_rl_startup_plan
 from utils.shared.metrics import MetricsCalculator
+from utils.shared.runtime_helpers import (
+    build_model_file_tag,
+    build_model_architecture_metadata,
+    cleanup_interrupted_log_csv,
+)
+
+
+_LAST_RUN_LOG_CSV = None
+_LAST_RUN_LOG_PNG = None
 
 
 # ==============================================================================
 # SELF-PLAY WITH PROPER MCTS
 # ==============================================================================
+
+def _terminate_workers(processes, timeout_s=5):
+    """Terminate spawned self-play workers cleanly."""
+    for proc in processes:
+        if proc.is_alive():
+            proc.terminate()
+
+    deadline = time.time() + timeout_s
+    for proc in processes:
+        remaining = max(0.0, deadline - time.time())
+        proc.join(timeout=remaining)
+
+    for proc in processes:
+        if proc.is_alive():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            proc.join(timeout=1.0)
+
 
 def play_games_parallel_mcts(model, config, device, num_games):
     """
@@ -151,8 +181,13 @@ def play_games_parallel_mcts(model, config, device, num_games):
         processes.append(p)
     
     # Wait for all workers
-    for p in tqdm(processes, desc="MCTS Self-play workers"):
-        p.join()
+    try:
+        for p in tqdm(processes, desc="MCTS Self-play workers"):
+            p.join()
+    except KeyboardInterrupt:
+        print("\nInterrupt received. Stopping self-play workers...")
+        _terminate_workers(processes)
+        raise
     
     selfplay_time = time.time() - start_time
     
@@ -210,6 +245,12 @@ def main():
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
+    if not MCTS_SELFPLAY_AVAILABLE:
+        raise RuntimeError(
+            "RL requires MCTS self-play backend, but it is not available "
+            "(failed to import src.batch_selfplay.play_games_mcts_worker)."
+        )
+
     rl_cfg = config.get('reinforcement_learning', {})
     replay_multiplier = rl_cfg.get('replay_buffer_multiplier', 0)
     try:
@@ -259,6 +300,8 @@ def main():
         print("Self-play save every: disabled")
 
     model_version = config.get('model', {}).get('version', 'v?.?')
+    model_file_tag = build_model_file_tag(config)
+    model_architecture = build_model_architecture_metadata(config)
     
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
@@ -293,69 +336,87 @@ def main():
             print("⚠️ bfloat16 not supported")
             use_bfloat16 = False
     
-    # Initialize logger
-    logger = TrainingLogger(
-        logs_dir, 
-        experiment_name=f"rl_training_{model_version}_mcts",
-        mode="rl"
-    )
-    
-    print("\n=== Loading IL model ===")
-    # Print model summary only once in the main process
+    best_model_il_path = base_dir / config['paths']['best_model_il']
+    best_model_rl_path = base_dir / config['paths']['best_model_rl']
+    checkpoint_every = config['reinforcement_learning'].get('checkpoint_every', 10)
+    total_iterations = int(config['reinforcement_learning']['iterations'])
+
+    print("\nPreparing model for startup menu...")
     config['model'] = {**config.get('model', {}), 'print_summary': True}
     model = ChessNet(config).to(device)
     model = model.to(memory_format=torch.channels_last)
-    
-    def _load_checkpoint_compat(path, device):
-        """
-        PyTorch 2.6 sets weights_only=True by default.
-        Older checkpoints may include numpy scalars in metadata.
-        We allowlist numpy scalar to keep weights_only=True without warnings.
-        """
-        try:
-            try:
-                from torch.serialization import safe_globals
-                # Use numpy._core (numpy.core is deprecated since NumPy 2.0)
-                try:
-                    import numpy._core.multiarray
-                    scalar_class = numpy._core.multiarray.scalar
-                except (ImportError, AttributeError):
-                    # Fallback for older NumPy versions
-                    import numpy.core.multiarray
-                    scalar_class = numpy.core.multiarray.scalar
-                
-                with safe_globals([scalar_class]):
-                    return torch.load(path, map_location=device, weights_only=True)
-            except Exception:
-                # Fallback: try weights_only=True without allowlist
-                return torch.load(path, map_location=device, weights_only=True)
-        except Exception as e:
-            # Silent fallback to weights_only=False for trusted local files
-            return torch.load(path, map_location=device, weights_only=False)
+    print("Model ready (channels_last enabled)")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Parameters: {trainable_params:,} trainable / {total_params:,} total")
+    model._print_parameter_summary(config['model']['num_residual_blocks'])
 
-    best_model_il_path = base_dir / config['paths']['best_model_il']
-    if best_model_il_path.exists():
-        checkpoint = _load_checkpoint_compat(best_model_il_path, device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"✅ Loaded IL model from {best_model_il_path}")
-    else:
-        print("⚠️ No IL model found")
-    
-    # Disable repeated model summary prints
-    config['model'] = {**config.get('model', {}), 'print_summary': False}
-    best_model = ChessNet(config).to(device)
-    best_model = best_model.to(memory_format=torch.channels_last)
-    best_model.load_state_dict(model.state_dict())
-    
+    startup_plan = plan_rl_startup(
+        model=model,
+        device=device,
+        models_dir=models_dir,
+        best_model_rl_path=best_model_rl_path,
+        rl_dir=rl_dir,
+    )
+
+    # Initialize logger after startup selection.
+    logger = TrainingLogger(
+        logs_dir,
+        experiment_name=f"rl_training_{model_version}_mcts",
+        mode="rl"
+    )
+    global _LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG
+    _LAST_RUN_LOG_CSV = logger.csv_path
+    _LAST_RUN_LOG_PNG = logger.plot_path
+
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config['reinforcement_learning']['learning_rate'],
         weight_decay=config['reinforcement_learning'].get('weight_decay', 0.01),
         fused=True if torch.cuda.is_available() else False
     )
-    
+
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-    
+
+    startup_state = apply_rl_startup_plan(
+        startup_plan=startup_plan,
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        device=device,
+        default_new_checkpoint=best_model_il_path,
+    )
+    start_mode = startup_state.get("start_mode", "new")
+    selected_checkpoint_label = startup_state.get("selected_checkpoint_label")
+    start_iteration = int(startup_state.get("start_iteration", 0) or 0)
+    resumed_best_win_rate = float(startup_state.get("best_win_rate", 0.0) or 0.0)
+    selected_compatibility_ratio = startup_state.get("selected_compatibility_ratio")
+    transfer_match_ratio = startup_state.get("transfer_match_ratio")
+
+    if start_mode == "new":
+        run_context = "startup: new RL training"
+    elif start_mode == "resume":
+        run_context = (
+            f"startup: resumed full state, next iteration {start_iteration + 1}, "
+            f"best win_rate={resumed_best_win_rate:.2%}"
+        )
+    else:
+        ratio = transfer_match_ratio
+        if ratio is None:
+            ratio = selected_compatibility_ratio
+        if ratio is None:
+            run_context = "startup: transferred matching weights, compatibility n/a"
+        else:
+            run_context = f"startup: transferred matching weights, compatibility {ratio * 100:.2f}%"
+    if selected_checkpoint_label and start_mode in {"resume", "transfer"}:
+        run_context = f"{run_context} | source={selected_checkpoint_label}"
+    logger.set_run_context(run_context)
+
+    # Disable repeated model summary prints.
+    config['model'] = {**config.get('model', {}), 'print_summary': False}
+    best_model = ChessNet(config).to(device)
+    best_model = best_model.to(memory_format=torch.channels_last)
+    best_model.load_state_dict(model.state_dict())
     # Initialize replay buffer (prioritized or standard)
     use_prioritized = config['reinforcement_learning'].get('use_prioritized_replay', False)
     
@@ -385,9 +446,6 @@ def main():
             end_temp=config['reinforcement_learning'].get('temperature_end', 0.5),
             decay_iterations=config['reinforcement_learning'].get('temperature_decay_iterations', 500)
         )
-    
-    best_model_rl_path = base_dir / config['paths']['best_model_rl']
-    checkpoint_every = config['reinforcement_learning'].get('checkpoint_every', 10)
     
     # LR schedule (cosine decay + warmup, RL)
     use_lr_schedule = config['reinforcement_learning'].get('use_lr_schedule', False)
@@ -423,9 +481,15 @@ def main():
     print(f"   • 🆕 Temperature Schedule: {use_temp_schedule}")
     print(f"   • 📊 Policy Accuracy & Value MAE tracking")
     
-    total_iterations = config['reinforcement_learning']['iterations']
-    
-    for iteration in range(total_iterations):
+    if start_iteration >= total_iterations:
+        print(
+            f"Resume start iteration ({start_iteration + 1}) exceeds configured total "
+            f"({total_iterations}). Nothing to train."
+        )
+        logger.plot()
+        return
+
+    for iteration in range(start_iteration, total_iterations):
         print(f"\n{'='*70}")
         print(f"Iteration {iteration + 1}/{total_iterations}")
         print('='*70)
@@ -567,9 +631,12 @@ def main():
                     str(best_model_rl_path),
                     {
                         'win_rate': win_rate,
+                        'policy_loss': avg_policy,
                         'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                         'value_mae': train_metrics.get('value_mae', 0),
-                        'version': model_version
+                        'version': model_version,
+                        'startup_mode': start_mode,
+                        'model_architecture': model_architecture,
                     },
                     save_optimizer=False,
                     save_dtype=torch.bfloat16 if use_bfloat16 else None
@@ -599,7 +666,7 @@ def main():
                 win_rate = evaluate_models(model, best_model, config, device,
                                         config['reinforcement_learning']['eval_games'])
             
-            checkpoint_name = f"rl_iter_{iteration+1}_wr_{win_rate:.3f}_top1_{train_metrics.get('policy_top1_acc', 0):.3f}.pt"
+            checkpoint_name = f"rl_iter_{iteration + 1:02d}_{model_file_tag}.pt"
             checkpoint_path = rl_dir / checkpoint_name
             
             model_to_save = model
@@ -608,9 +675,12 @@ def main():
                 str(checkpoint_path),
                 {
                     'win_rate': win_rate,
+                    'policy_loss': avg_policy,
                     'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                     'value_mae': train_metrics.get('value_mae', 0),
-                    'version': model_version
+                    'version': model_version,
+                    'startup_mode': start_mode,
+                    'model_architecture': model_architecture,
                 },
                 save_optimizer=False,
                 save_dtype=torch.bfloat16 if use_bfloat16 else None
@@ -628,4 +698,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        cleanup_interrupted_log_csv(_LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG, "RL")
+        print("\nCtrl+C detected. RL training stopped gracefully.")

@@ -1,217 +1,407 @@
-# ♚ Chess AI
+﻿# Chess AI
 
-Silnik szachowy oparty na deep learning, inspirowany podejściem AlphaZero. Model uczy się grać w szachy poprzez **Imitation Learning** (nauka z partii mistrzów) a następnie **Reinforcement Learning** (samogra z MCTS).
+Silnik szachowy oparty na deep learning (CNN) i MCTS, inspirowany AlphaZero.
 
-## Architektura
+## Etapy treningu
 
-**ChessNet** — sieć konwolucyjna typu pre-activation ResNet:
+1. **IL** (Imitation Learning) - nauka z partii mistrzowskich (PGN)
+2. **RL** (Reinforcement Learning) - samogra z MCTS i self-play
+3. **Evaluation** - pomiar siły gry (Elo vs Stockfish)
 
-- **Input**: `16 × (1 + history)` płaszczyzn na planszę 8×8
-  - 12 płaszczyzn: figury (6 × gracz bieżący + 6 × przeciwnik) w POV (Point of View)
-  - 4 płaszczyzny metadata: roszada, en passant, halfmove clock, fullmove number
-  - × `(1 + history_positions)` — historia pozycji dla kontekstu temporalnego
-- **Trunk**: 8 bloków rezydualnych z SE2D (Squeeze-and-Excitation), CoordConv, Stochastic Depth, LayerScale
-- **Policy head**: Dual-stream (3×3 spatial conv + Global Average Pool → 2-stage FC → 4272 akcji z promocjami)
-- **Value head**: WDL (Win/Draw/Loss) — 3 logity zamiast skalarnej wartości
+## Funkcjonalności
 
+### Model
+- **Policy head**: dual-stream (spatial + global context)
+- **Value head**: WDL classification (Win/Draw/Loss)
+- **POV**: wszystkie pozycje z perspektywy gracza na ruchu
+- **Historia**: `history_positions` pozycji wstecz (sliding window)
+- **Metadane szachowe**: castling, en passant, halfmove, fullmove
+- **Promocje**: pełna przestrzeń akcji (`ACTION_SIZE = 4272`)
 
-## Struktura projektu
+### Trening
+- **SWA** (Stochastic Weight Averaging): uśrednianie wag od epoch 15
+- **Elo tracking**: asynchroniczna ewaluacja podczas IL
+- **Mixed precision**: AMP (float16/bfloat16)
+- **Resume/Transfer**: menu startowe z kompatybilnością checkpointów
 
-```
+### Gra
+- **GUI**: pygame interface (Human vs AI, AI vs AI, Human vs Human)
+- **MCTS**: opcjonalny (toggle klawiszem `M` w GUI)
+- **UCI**: adapter do silników szachowych
+
+## Architektura modelu
+
+`ChessNet` (`chess/src/model.py`) to pre-activation ResNet z:
+- wejscie: `16 * (1 + history_positions)` kanalow
+- trunk: bloki residualne
+- policy head: dual-stream (spatial + global)
+- value head: 3 klasy WDL
+
+Opcjonalne elementy (zaleznie od `config.yaml`):
+- `SE2DBlock`
+- `CoordConv2d`
+- `LayerScale`
+- `Stochastic Depth`
+
+## Struktura katalogow
+
+```text
 chess/
-├── config/
-│   └── config.yaml           # Cała konfiguracja (model, trening, dane, hardware)
-├── data/
-│   ├── *.pgn                 # Pliki PGN z partiami (Lichess Elite)
-│   └── preprocessing/        # Cache przetworzonych danych (auto-generowany)
-├── engines/                  # Stockfish (auto-pobierany przy Elo estimation)
-├── logs/                     # Logi treningowe (CSV + PNG wykresy)
-│   └── games/                # Zapisane partie (PGN + YAML setup)
-├── models/
-│   ├── best_model_il.pt      # Najlepszy model IL
-│   ├── best_model_rl.pt      # Najlepszy model RL
-│   ├── IL/                   # Checkpointy IL (co N epok)
-│   └── RL/                   # Checkpointy RL (co N iteracji)
-├── scripts/
-│   ├── train_il.py           # Trening Imitation Learning
-│   ├── train_rl.py           # Trening Reinforcement Learning
-│   ├── play.py               # GUI do gry (Pygame)
-│   ├── eval_elo.py           # Ewaluacja Elo vs Stockfish
-│   └── utils/
-│       ├── il/               # Funkcje treningowe IL, loss
-│       ├── rl/               # Replay buffer, temperature, trening RL
-│       ├── shared/           # Logger, metrics, elo_estimator
-│       └── ui/               # GUI helpers, game setup, UCI engine
-└── src/
-    ├── model.py              # ChessNet (architektura sieci)
-    ├── mcts.py               # Monte Carlo Tree Search (batch MCTS)
-    ├── data.py               # Pipeline danych (PGN → tensory)
-    ├── batch_selfplay.py     # Równoległa samogra MCTS
-    └── utils/
-        ├── data_helpers.py   # board_to_tensor, move_to_index, ACTION_SIZE
-        ├── data_pipeline.py  # Przetwarzanie PGN (4-fazowe)
-        └── data_dataset.py   # Dataset + DataLoader
+|- config/config.yaml
+|- data/                     # PGN + preprocessing cache
+|- engines/                  # Stockfish cache (auto-download)
+|- logs/                     # CSV i PNG z treningu
+|- models/
+|  |- best_model_il.pt
+|  |- best_model_rl.pt
+|  |- IL/                    # checkpointy IL
+|  |- RL/                    # checkpointy RL
+|- scripts/
+|  |- train_il.py
+|  |- train_rl.py
+|  |- eval_elo.py
+|  |- play.py
+|  |- utils/
+|     |- il/
+|     |- rl/
+|     |- shared/
+|     |- ui/
+|- src/
+   |- model.py
+   |- mcts.py
+   |- data.py
+   |- batch_selfplay.py
+   |- utils/
 ```
 
-## Pipeline treningu
+## Szybki start
 
-### 1. Imitation Learning (IL)
+Uruchamiaj z root repo (`Play_With_AI_Games`):
 
-Nauka z partii silnych graczy (Lichess Elite, Elo ≥ 2300):
+```bash
+pip install -r requirements.txt
+python chess/scripts/train_il.py
+python chess/scripts/train_rl.py
+python chess/scripts/eval_elo.py
+python chess/scripts/play.py
+```
+
+## IL (Imitation Learning)
+
+### Start
 
 ```bash
 python chess/scripts/train_il.py
 ```
 
-**Co robi:**
-- Parsuje pliki PGN → kompaktowy format binarny (4-fazowy pipeline)
-- POV: plansza zawsze z perspektywy grającego
-- Sliding window: dynamiczne budowanie historii pozycji
-- Filtrowanie: min Elo, deduplikacja pozycji, sampling po progresie gry
-- Trening: policy (cross-entropy) + value (WDL cross-entropy)
-- SWA (Stochastic Weight Averaging) dla lepszej generalizacji
-- Early stopping z patience
+### Workflow
 
-**Metryki:** Policy Top-1/3/5 accuracy, Value MAE, WDL accuracy/CE, **estymowane Elo**
+1. **Menu startowe** (jeśli istnieją checkpointy):
+   ```
+   ━━━ IL STARTUP MENU ━━━
+   
+   [1] New training from scratch
+   [2] Resume full state (optimizer + scheduler + scaler)
+   [3] Transfer matching weights only
+   
+   Select option [1-3]:
+   ```
 
-**Hiperparametry** (w `config.yaml`):
-- `batch_size: 9216`, `learning_rate: 0.0005`, `epochs: 30`
-- `label_smoothing: 0.08`, `scheduler: cosine_decay`
-- `sliding_window_stride: 2` (co 2. pozycja)
+2. **Lista checkpointów** (dla resume/transfer):
+   ```
+   ID  Epoch  Top1     Val Loss  Compat  Size    Path
+   ─────────────────────────────────────────────────────
+   1   ep 20  67.84%   0.8234   100.0%   45.2MB  v5.1_epoch_20.pt
+   2   ep 15  65.12%   0.8891    98.7%   45.1MB  v5.0_epoch_15.pt
+   3   ep 10  62.45%   0.9123    85.3%   38.4MB  v4.9_epoch_10.pt
+   ```
+   - **Compat**: % kompatybilności architektury (matching tensors)
+   - Resume wymaga 100% (strict load), transfer działa z <100%
 
-### 2. Reinforcement Learning (RL)
-
-Samogra z MCTS (styl AlphaZero):
+3. **Resume mode**:
+### Start
 
 ```bash
 python chess/scripts/train_rl.py
 ```
 
-**Co robi:**
-- Równoległa samogra MCTS (wielu workerów CPU, batch mode)
-- Prioritized Experience Replay
-- Temperature schedule (wysoka eksploracja → niska)
-- Target network (stabilność treningu)
-- Augmentacja danych (lustrzane odbicie planszy)
-- Ewaluacja: nowy model vs najlepszy, win rate > 55% → zastąpienie
+### Workflow
 
-**Hiperparametry:**
-- `games_per_iteration: 100`, `mcts_simulations: 200`
-- `batch_size: 4096`, `learning_rate: 0.0002`
-- `eval_games: 50`, `win_rate_threshold: 0.55`
+1. **Inicjalizacja**:
+   - Ładuje `best_model_il.pt` (jeśli istnieje)
+   - Menu startowe: new/resume/transfer (jak w IL)
 
-### 3. Ewaluacja Elo
+2. **Self-play** (parallel MCTS):
+   ```
+   🎯 Parallel MCTS Self-Play:
+      Self-play device: cuda
+      Workers: 4
+      Games per worker: 25, 25, 25, 25 (balanced)
+      Total games: 100
+      MCTS simulations: 200
+   
+   ✅ MCTS Self-play completed:
+      Positions: 4,832
+      Games: 100
+      Self-play time: 45.3s
+      Speed: 106.7 positions/s
+      Avg game length: 48.3 moves
+   ```
 
-Porównanie modeli przez grę ze Stockfishem na różnych poziomach:
+3. **Training loop**:
+   - Batch sampling z **replay buffer**
+   - Policy target: MCTS visit distribution (nie legal moves!)
+   - Value target: game outcome (WDL)
+   - Prioritized replay (opcjonalnie)
+
+4. **Evaluation**:
+   - Co `eval_every` iteracji: AI vs Best Model
+   - Win rate > threshold → promote current to best
+   - Zapis: `best_model_rl.pt`
+
+5. **Temperature schedule**:
+   - Early game: high temp (exploration)
+   - Late game: low temp (exploitation)
+   - Per iteration decay
+
+### Replay Buffer
+
+- **Capacity**: `games_per_iteration * replay_buffer_multiplier`
+- **FIFO**: stare pozycje wypierane przez nowe
+- **Prioritized** (opcjonalnie): sample trudniejsze pozycje
+
+### Checkpointy
+
+- Co `checkpoint_every` iteracji
+- Folder: `models/RL/`
+- Format: `rl_iter_XXXX.pt (tylko zbiera średnią)
+
+### Start
 
 ```bash
-# Ewaluacja najlepszego modelu
 python chess/scripts/eval_elo.py
-
-# Porównanie wielu checkpointów
-python chess/scripts/eval_elo.py --model models/best_model_il.pt models/IL/*.pt
-
-# Szybki test
-python chess/scripts/eval_elo.py --model models/IL/*.pt --quick
-
-# Z MCTS (dokładniejsze Elo, ale wolniejsze)
-python chess/scripts/eval_elo.py --mcts --simulations 200
 ```
 
-**Co robi:**
-- Gra szybkie partie vs Stockfish na poziomach `[1320, 1500, 1700, 1900, 2200]`
-- Oblicza Performance Rating (MLE) z wyników W/D/L
-- Stockfish jest auto-pobierany jeśli nie jest zainstalowany
-- Przy wielu modelach — tabela porównawcza + zapis do CSV
+**Brak argumentów CLI** - wszystko przez interaktywne menu.
 
-**Flagi:**
-| Flaga | Opis |
-|-------|------|
-| `--model` | Ścieżki do modeli (wildcards obsługiwane) |
-| `--levels` | Poziomy Elo Stockfisha |
-| `--games N` | Gier na poziom |
-| `--mcts` | Użyj MCTS (silniejsza gra) |
-| `--simulations N` | Symulacje MCTS na ruch |
-| `--quick` | Tryb szybki (2 gry/lvl, 3 poziomy) |
-| `--output plik.csv` | Zapis wyników do CSV |
+### Workflow
 
-### 4. Gra (GUI)
+1. **Wybór modeli**:
+   ```
+   ━━━ Model Selection ━━━
+   
+   Select model scope:
+   [1] Best model only (best_model_il.pt + SWA)
+   [2] Choose model IDs (custom selection)
+   [3] All listed models
+   
+   Narzędzia
 
-Interfejs graficzny Pygame do gry z modelem:
+### List Models
 
 ```bash
-# Gra
-python chess/scripts/play.py
-
+python chess/scripts/list_models.py
 ```
 
-**Tryby gry:** Human vs AI, AI vs AI, Human vs Human
+Wyświetla wszystkie checkpointy z metadanymi:
 
-**Funkcje:**
-- Podświetlanie legalnych ruchów i bić
-- Historia ruchów w sidebarze
-- MCTS toggle w trakcie gry
-- Obsługa promocji
-- Auto-zapis partii do PGN
+```
+═══════════════════════════════════════════════════════════════════════════
+Model Checkpoints
+═══════════════════════════════════════════════════════════════════════════
+ ID  Folder  Version  Epoch   Top1      ValLoss    PolLoss      Elo   SWA  Opt   SizeMB  Updated           Checkpoint
+---- ------- -------- ------ -------- ---------- ---------- -------- ---- ---- ------- ----------------- ---------
+-- root --
+  1  root    v5.1        20   67.84%     0.8234     0.6123     1847   no   yes   45.2  2026-02-17 14:23  best_model_il.pt
+  2  root    v5.1        20   68.12%     0.8156     0.6089     1923   yes  yes   45.3  2026-02-17 14:30  best_model_il_swa.pt
+-- IL --
+  3  IL      v5.1        20   67.84%     0.8234     0.6123     1847   no   yes   45.2  2026-02-17 14:23  v5.1_epoch_20.pt
+  4  IL      v5.1        15   65.12%     0.8891     0.6445     1756   no   yes   45.1  2026-02-17 12:45  v5.1_epoch_15.pt
+  5  IL      v5.0        15   62.89%     0.9234     0.6789     1689   no   yes   45.0  2026-02-12 18:34  v5.0_epoch_15.pt
+-- RL --
+  6  RL      v5.1       143   69.34%     0.7845     0.5923     2034   no   yes   45.4  2026-02-16 22:11  rl_iter_0143.pt
+───────────────────────────────────────────────────────────────────────────
+Total: 6 | Valid: 6 | With Elo: 6 | With optimizer: 6 | SWA-tagged: 1
+═══════════════════════════════════════════════════════════════════════════
+```
 
-### 5. UCI Engine
+**Kolumny**:
+- **Compat**: % kompatybilności z obecną architekturą
+- **SWA**: czy checkpoint powstał z SWA finalization
+- **Opt**: czy zawiera optimizer state (resume vs transfer)
+- **Elo**: estimated Elo (jeśli był mierzony)
 
-Adapter UCI do użycia w GUI szachowych (Arena, CuteChess, itp.):
+### GUI
+
+```bash
+python chess/scripts/play.py
+```
+
+**Tryby gry**:
+- Human vs AI
+- AI vs AI
+- Human vs Human
+
+**Klawisze**:
+- `M` - toggle MCTS (network-only ↔ MCTS)
+- `R` - restart game
+- `U` - cofnij ruch
+
+**Flagi**:
+- `--no-mcts` - uruchom bez MCTS (tylko raw network)
+
+**Autosave**:
+- Zapisuje gry do `chess/games/*.pgn`
+- PGN z metadanymi (model, Elo, MCTS settings)
+
+### UCI Adapter
+
+### Struktura
+
+```
+chess/logs/
+├── il_training_v5.1_20260217_143025.csv    # Metryki IL
+├── il_training_v5.1_20260217_143025.png    # Wykresy IL
+├── elo_comparison_20260217_153045.csv      # Wyniki Elo
+└── debug/
+    └── training_profile_*.txt              # Profile (jeśli debug=True)
+
+chess/models/
+├── best_model_il.pt                        # Najlepszy IL
+├── best_model_il_swa.pt                    # Najlepszy IL SWA
+├── best_model_rl.pt                        # Najlepszy RL
+├── IL/
+│   ├── v5.1_epoch_05.pt
+│   ├── v5.1_epoch_10.pt
+│   ├── v5.1_epoch_10_swa.pt                # SWA snapshot
+│   └── v5.1_epoch_15.pt
+└── RL/
+    ├── rl_iter_0100.pt
+    └── rl_iter_0200.pt
+```
+
+### CSV Format (IL)
+
+```csv
+epoch,train_loss,val_loss,train_policy,val_policy,train_top1,val_top1,val_mae,lr,estimated_elo
+1,2.3456,2.4567,1.8234,1.8923,0.4523,0.4312,0.3456,0.001,
+5,1.2345,1.3456,0.9123,0.9456,0.6234,0.6123,0.2345,0.0009,1623
+10,0.9876,1.0234,0.7234,0.7456,0.6789,0.6623,0.1987,0.0007,1745
+```
+
+### Przerwanie (`Ctrl+C`)
+
+- **Graceful shutdown**: finalizacja SWA, zapis ostatniego checkpointu
+- **Cleanup**: usuwa incomplete CSV (jeśli PNG nie powstał)
+- **Resume**: możliwe od ostatniego zapisanego epocha
+   ```
+
+### Format wyniku
+
+```
+Model                    Elo  ±Conf  vs1320  vs1500  vs1700  vs1900  vs2200
+─────────────────────────────────────────────────────────────────────────────
+v5.1_epoch_20.pt        1847   ±45   6/6     6/6     5/6     3/6     1/6
+v5.1_epoch_20_swa.pt    1923   ±38   6/6     6/6     6/6     4/6     2/6
+best_model_il.pt        1805   ±52   6/6     6/6     4/6     2/6     1/6
+```
+
+### Automatyczna aktualizacja checkpointu
+
+- Zapisuje `estimated_elo` do pliku `.pt`
+- Widoczne w `list_models.py` i IL resume menuhutdown
+- Finalizacja SWA (jeśli zebrane dane)
+- Cleanup incomplete logs
+
+## RL (Reinforcement Learning)
+
+Start:
+
+```bash
+python chess/scripts/train_rl.py
+```
+
+Najwazniejsze zachowania:
+- RL startuje od `best_model_il.pt` (jesli plik istnieje)
+- Samogra przez `batch_selfplay` + MCTS worker
+- Replay buffer (w tym prioritized replay)
+- Temperature schedule i LR schedule (wg config)
+- Eval vs best model co `eval_every`
+- Zapisy:
+  - `best_model_rl.pt`
+  - checkpointy co `checkpoint_every`
+
+## Ewaluacja Elo
+
+Start:
+
+```bash
+python chess/scripts/eval_elo.py
+```
+
+Przy recznym uruchomieniu skrypt pyta, czy test ma byc:
+- raw network
+- MCTS
+
+Przydatne flagi:
+- `--model` (wspiera wildcard)
+- `--quick`
+- `--mcts` / `--no-mcts`
+- `--simulations`
+- `--levels`
+- `--games`
+- `--output`
+
+## GUI i UCI
+
+GUI:
+
+```bash
+python chess/scripts/play.py
+```
+
+- obsluga Human vs AI / AI vs AI / Human vs Human
+- mozliwosc gry z lub bez MCTS (`--no-mcts`)
+- podczas Human vs AI mozna przelaczyc tryb klawiszem `M`
+
+UCI adapter:
 
 ```bash
 python chess/scripts/utils/ui/uci_engine.py
 ```
 
-**Opcje UCI:** `UseMCTS`, `Simulations`, `MoveOverhead`, `Temperature`
+## Logi i checkpointy
 
-## Dane treningowe
+`chess/logs/`:
+- `*.csv` metryki treningu
+- `*.png` wykresy treningu
 
-Projekt używa **Lichess Elite Database** — partii z Lichess gdzie obaj gracze mają Elo ≥ 2300:
-- Format: PGN
-- Ściągnij z: https://database.nikonoel.fr/
-- Umieść w: `chess/data/`
+`chess/models/`:
+- best modele (`best_model_il.pt`, `best_model_rl.pt`)
+- checkpointy etapowe (`models/IL`, `models/RL`)
 
-## Wymagania
+Przerwanie treningu (`Ctrl+C`):
+- IL i RL koncza sie graceful
+- jesli dla danego runu nie powstal jeszcze PNG, tymczasowy CSV moze zostac usuniety
 
-```
-torch (CUDA)
-python-chess>=1.999
-pygame
-numpy
-pyyaml
-tqdm
-```
+## Dane
 
-**GPU:** Testowane na RTX 5060 Ti 16GB. Domyślna konfiguracja wymaga ~12-15 GB VRAM (batch 9216, 128 filtrów).
+PGN wrzuc do:
+- `chess/data/`
 
-## Szybki start
+Projekt byl przygotowywany pod zbiory typu Lichess Elite (wysokie Elo).
+Filtry jak `min_elo`, sampling i deduplikacje ustawiasz w `chess/config/config.yaml`.
 
-```bash
-# 1. Zainstaluj zależności
-pip install -r requirements.txt
+## Konfiguracja
 
-# 2. Ściągnij dane PGN do chess/data/
+Glowne sekcje:
+- `data`
+- `model`
+- `imitation_learning`
+- `reinforcement_learning`
+- `elo_estimation`
+- `hardware`
+- `debug`
 
-# 3. Trenuj IL
-python chess/scripts/train_il.py
-
-# 4. Sprawdź Elo
-python chess/scripts/eval_elo.py
-
-# 5. Zagraj
-python chess/scripts/play.py
-```
-
-## Logi i monitorowanie
-
-Każdy trening generuje:
-- **CSV** z metrykami per-epoka (loss, accuracy, MAE, WDL, Elo)
-- **PNG** z wykresami postępu (5 wierszy × 2 kolumny)
-- Checkpointy modelu co N epok
-
-Pliki w `chess/logs/`:
-```
-il_training_v5.0_20260212_173156.csv   # Metryki
-il_training_v5.0_20260212_173156.png   # Wykresy
-elo_comparison_20260214_*.csv          # Porównanie Elo
-```
+Punkt startowy konfiguracji:
+- `chess/config/config.yaml`

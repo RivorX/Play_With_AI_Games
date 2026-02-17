@@ -770,7 +770,6 @@ def extract_positions_from_game_worker(args):
     
     # Import helpers locally
     from src.utils.data_helpers import (
-        board_to_compact,
         move_to_index,
         compute_material_balance,
         is_in_check,

@@ -73,6 +73,7 @@ class TrainingLogger:
         self.iterations = []
         self.train_losses = []
         self.val_losses = []
+        self.val_iterations = []
         self.train_policy_losses = []
         self.val_policy_losses = []
         self.train_value_losses = []
@@ -106,8 +107,103 @@ class TrainingLogger:
         if mode == "rl":
             self.win_rates = []
             self.temperatures = []
+
+        # Optional run context shown in plot header (e.g. startup mode/resume/transfer info).
+        self.run_context_text = None
+        # Optional notes shown in summary panel (e.g. final SWA metrics).
+        self.final_notes = []
         
         print(f"📊 Logging to: {self.csv_path}")
+
+    def set_run_context(self, text):
+        """Set optional short context displayed on generated PNG plots."""
+        if text is None:
+            self.run_context_text = None
+            return
+        text = str(text).strip()
+        self.run_context_text = text if text else None
+
+    def append_final_note(self, text):
+        """Append short note shown in IL summary panel."""
+        if text is None:
+            return
+        text = str(text).strip()
+        if not text:
+            return
+        self.final_notes.append(text)
+
+    def record_estimated_elo(self, iteration, estimated_elo, update_csv=True):
+        """Record estimated Elo for a specific epoch/iteration (supports async updates)."""
+        if self.mode != "il" or estimated_elo is None:
+            return
+
+        try:
+            iteration = int(iteration)
+            estimated_elo = float(estimated_elo)
+        except (TypeError, ValueError):
+            return
+
+        # Upsert in-memory storage.
+        replaced = False
+        for idx, (it, _) in enumerate(self.estimated_elos):
+            if int(it) == iteration:
+                self.estimated_elos[idx] = (iteration, estimated_elo)
+                replaced = True
+                break
+        if not replaced:
+            self.estimated_elos.append((iteration, estimated_elo))
+            self.estimated_elos.sort(key=lambda x: x[0])
+
+        if not update_csv:
+            return
+
+        # Backfill CSV row for this epoch if it already exists.
+        try:
+            with open(self.csv_path, 'r', newline='') as f:
+                rows = list(csv.reader(f))
+            if not rows:
+                return
+
+            header = rows[0]
+            if 'estimated_elo' not in header:
+                return
+            elo_col = header.index('estimated_elo')
+            target_epoch = str(iteration)
+
+            updated = False
+            for row in rows[1:]:
+                if not row:
+                    continue
+                if row[0] == target_epoch:
+                    while len(row) <= elo_col:
+                        row.append('')
+                    row[elo_col] = str(int(round(estimated_elo)))
+                    updated = True
+                    break
+
+            if updated:
+                with open(self.csv_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerows(rows)
+        except Exception:
+            # CSV backfill is best-effort only.
+            pass
+
+    def get_latest_estimated_elo(self):
+        """Return latest known Elo value or None."""
+        if self.mode != "il" or not self.estimated_elos:
+            return None
+        return float(self.estimated_elos[-1][1])
+
+    def get_latest_estimated_elo_with_epoch(self):
+        """Return (epoch, elo) for latest known Elo, or (None, None)."""
+        if self.mode != "il" or not self.estimated_elos:
+            return None, None
+        epoch, elo = self.estimated_elos[-1]
+        try:
+            return int(epoch), float(elo)
+        except (TypeError, ValueError):
+            return None, None
     
     def log(self, iteration, train_losses=None, val_losses=None, 
             train_metrics=None, val_metrics=None, lr=None, estimated_elo=None, **kwargs):
@@ -127,6 +223,8 @@ class TrainingLogger:
             writer = csv.writer(f)
             
             if self.mode == "il":
+                if estimated_elo is None:
+                    estimated_elo = self.get_latest_estimated_elo()
                 row = [
                     iteration,
                     train_losses['total'],
@@ -152,7 +250,14 @@ class TrainingLogger:
                 ]
                 
                 # 🆕 Elo estimation
-                row.append(estimated_elo if estimated_elo is not None else '')
+                if estimated_elo is not None:
+                    try:
+                        row.append(int(round(float(estimated_elo))))
+                    except (TypeError, ValueError):
+                        row.append('')
+                        estimated_elo = None
+                else:
+                    row.append('')
                 
                 if self.use_mtl:
                     row.extend([
@@ -179,6 +284,7 @@ class TrainingLogger:
                     self.train_value_wdl_ce.append(train_metrics.get('value_wdl_ce', 0))
                 
                 if val_losses is not None:
+                    self.val_iterations.append(iteration)
                     self.val_losses.append(val_losses['total'])
                     self.val_policy_losses.append(val_losses['policy'])
                     self.val_value_losses.append(val_losses['value'])
@@ -193,7 +299,8 @@ class TrainingLogger:
                 
                 # 🆕 Elo estimation storage
                 if estimated_elo is not None:
-                    self.estimated_elos.append((iteration, estimated_elo))
+                    # CSV already contains this value in the current row.
+                    self.record_estimated_elo(iteration, estimated_elo, update_csv=False)
                 
                 if self.use_mtl:
                     self.train_win_losses.append(train_losses.get('win', 0))
@@ -268,9 +375,16 @@ class TrainingLogger:
         else:
             fig, axes = plt.subplots(5, 2, figsize=(15, 22))
         
-        fig.suptitle('IL Training Progress', fontsize=16, fontweight='bold')
+        if self.run_context_text:
+            fig.suptitle(
+                f"IL Training Progress\n{self.run_context_text}",
+                fontsize=14,
+                fontweight='bold',
+            )
+        else:
+            fig.suptitle('IL Training Progress', fontsize=16, fontweight='bold')
         
-        val_epochs = [e for e in self.iterations if e <= len(self.val_losses)] if self.val_losses else []
+        val_epochs = self.val_iterations if self.val_iterations else []
         
         if not self.use_mtl:
             # ============================================================
@@ -434,6 +548,10 @@ class TrainingLogger:
                 summary_lines.append(f"Total Loss: {self.val_losses[-1]:.4f}")
                 if self.estimated_elos:
                     summary_lines.append(f"Est. Elo: {self.estimated_elos[-1][1]}")
+                if self.final_notes:
+                    summary_lines.append("")
+                    summary_lines.append("Notes:")
+                    summary_lines.extend(self.final_notes[-3:])
                 summary_text = "\n".join(summary_lines)
                 ax.text(
                     0.1,
@@ -621,11 +739,15 @@ class TrainingLogger:
                 summary_lines.append(f"Total Loss: {self.val_losses[-1]:.4f}")
                 if self.estimated_elos:
                     summary_lines.append(f"Est. Elo: {self.estimated_elos[-1][1]}")
+                if self.final_notes:
+                    summary_lines.append("")
+                    summary_lines.append("Notes:")
+                    summary_lines.extend(self.final_notes[-3:])
                 summary_text = "\n".join(summary_lines)
                 ax.text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
                        verticalalignment='center')
         
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.savefig(self.plot_path, dpi=150, bbox_inches='tight')
         plt.close()
         
@@ -634,7 +756,14 @@ class TrainingLogger:
     def _plot_rl(self):
         """Plot RL training progress"""
         fig, axes = plt.subplots(3, 3, figsize=(18, 14))
-        fig.suptitle('RL Training Progress', fontsize=16, fontweight='bold')
+        if self.run_context_text:
+            fig.suptitle(
+                f"RL Training Progress\n{self.run_context_text}",
+                fontsize=14,
+                fontweight='bold',
+            )
+        else:
+            fig.suptitle('RL Training Progress', fontsize=16, fontweight='bold')
         
         # Row 1: Losses
         ax = axes[0, 0]
@@ -741,7 +870,7 @@ class TrainingLogger:
             ax.text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
                    verticalalignment='center')
         
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.savefig(self.plot_path, dpi=150, bbox_inches='tight')
         plt.close()
         

@@ -2,11 +2,18 @@
 
 from datetime import datetime
 from pathlib import Path
+import sys
 
 import chess
 import pygame
 import torch
 import yaml
+
+# Add utils to path for model_catalog import
+script_dir = Path(__file__).parent
+sys.path.insert(0, str(script_dir.parent.parent))
+
+from utils.shared.model_catalog import load_checkpoint_metadata
 
 
 _SETUP_BG = (18, 22, 28)
@@ -121,12 +128,46 @@ def write_setup_log(base_dir, config, setup):
 
 
 def _format_model_entry(path, models_dir, max_len=66):
+    """Format model entry with metadata (version, top1, elo).
+    
+    Returns:
+        tuple: (line1_text, line2_text) for two-line display
+    """
     rel = str(path.relative_to(models_dir)).replace("\\", "/")
     if len(rel) > max_len:
         rel = "..." + rel[-(max_len - 3) :]
-    size_mb = path.stat().st_size / (1024**2)
-    stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-    return rel, f"{size_mb:.1f} MB | {stamp}"
+    
+    # Load checkpoint metadata
+    metadata = load_checkpoint_metadata(path, models_dir)
+    
+    # Build second line with key metrics
+    parts = []
+    
+    version = metadata.get("version")
+    if version:
+        parts.append(f"v{version}" if not str(version).startswith("v") else str(version))
+    
+    epoch = metadata.get("epoch")
+    if epoch is not None:
+        parts.append(f"ep{epoch + 1}")
+    
+    top1 = metadata.get("top1")
+    if top1 is not None:
+        parts.append(f"Top1:{top1 * 100:.1f}%")
+    
+    elo = metadata.get("elo")
+    if elo is not None:
+        parts.append(f"Elo:{int(round(float(elo)))}")
+    
+    size_mb = metadata.get("size_mb", 0.0)
+    parts.append(f"{size_mb:.1f}MB")
+    
+    if metadata.get("swa"):
+        parts.append("[SWA]")
+    
+    line2 = " | ".join(parts) if parts else "No metadata"
+    
+    return rel, line2
 
 
 def _draw_button(

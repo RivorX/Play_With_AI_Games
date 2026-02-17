@@ -9,14 +9,13 @@ Auto-downloads Stockfish if not found on the system.
 """
 
 import io
-import math
 import os
 import platform
 import shutil
 import stat
-import sys
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import chess
@@ -357,6 +356,7 @@ class EloEstimator:
         max_moves: int = 150,
         use_mcts: bool = False,
         simulations: int = 100,
+        workers: int = 0,
     ) -> dict:
         """
         Play games against Stockfish at several Elo levels and return
@@ -369,6 +369,7 @@ class EloEstimator:
             max_moves: Maximum full moves before declaring a draw.
             use_mcts: Enable MCTS for model moves (slower but stronger).
             simulations: MCTS simulations per move (if use_mcts=True).
+            workers: Number of parallel game workers (0=auto, 1=sequential).
 
         Returns:
             dict with keys:
@@ -380,84 +381,121 @@ class EloEstimator:
         if levels is None:
             levels = [1000, 1300, 1600, 1900, 2200]
 
-        self.model.eval()
-        player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
+        # Auto-detect workers
+        if workers == 0 or workers is None:
+            workers = max(1, os.cpu_count() - 2)
+        workers = max(1, int(workers))
 
-        # Try to open Stockfish (auto-download if needed)
+        self.model.eval()
+
+        # Try to open Stockfish (auto-download if needed) - just for validation
         resolved_path = ensure_stockfish(self.stockfish_path)
         try:
-            engine = chess.engine.SimpleEngine.popen_uci(resolved_path)
+            test_engine = chess.engine.SimpleEngine.popen_uci(resolved_path)
+            # Auto-detect engine Elo limits from UCI options
+            sf_min_elo = 1320
+            sf_max_elo = 3190
+            if "UCI_Elo" in test_engine.options:
+                opt = test_engine.options["UCI_Elo"]
+                if hasattr(opt, "min") and opt.min is not None:
+                    sf_min_elo = int(opt.min)
+                if hasattr(opt, "max") and opt.max is not None:
+                    sf_max_elo = int(opt.max)
+            test_engine.quit()
         except FileNotFoundError:
-            print(f"  \u26a0\ufe0f  Stockfish not found at '{resolved_path}' — Elo estimation skipped.")
+            print(f"  ⚠️  Stockfish not found at '{resolved_path}' — Elo estimation skipped.")
             return {"estimated_elo": None, "results": {}, "total_games": 0, "total_time": 0.0,
                     "error": "stockfish_not_found"}
         except Exception as e:
-            print(f"  \u26a0\ufe0f  Stockfish error: {e} — Elo estimation skipped.")
+            print(f"  ⚠️  Stockfish error: {e} — Elo estimation skipped.")
             return {"estimated_elo": None, "results": {}, "total_games": 0, "total_time": 0.0,
                     "error": str(e)}
+
+        # Filter/clamp levels to engine's supported range
+        valid_levels = []
+        for lvl in levels:
+            clamped = max(sf_min_elo, min(sf_max_elo, lvl))
+            if clamped != lvl:
+                print(f"  ⚠️  Clamped level {lvl} → {clamped} (SF range: {sf_min_elo}-{sf_max_elo})")
+            if clamped not in valid_levels:
+                valid_levels.append(clamped)
+        levels = valid_levels
+
+        if not levels:
+            print("  ⚠️  No valid Elo levels after clamping.")
+            return {"estimated_elo": None, "results": {}, "total_games": 0,
+                    "total_time": 0.0, "error": "no_valid_levels"}
 
         t0 = time.perf_counter()
         all_opponent_elos: list[float] = []
         all_scores: list[float] = []
         results_per_level: dict[int, dict] = {}
 
-        try:
-            # Auto-detect engine Elo limits from UCI options
-            sf_min_elo = 1320
-            sf_max_elo = 3190
-            if "UCI_Elo" in engine.options:
-                opt = engine.options["UCI_Elo"]
-                if hasattr(opt, "min") and opt.min is not None:
-                    sf_min_elo = int(opt.min)
-                if hasattr(opt, "max") and opt.max is not None:
-                    sf_max_elo = int(opt.max)
+        # Build task list: (level, game_idx, model_is_white)
+        tasks = []
+        for level in levels:
+            for game_idx in range(games_per_level):
+                model_is_white = (game_idx % 2 == 0)
+                tasks.append((level, game_idx, model_is_white))
 
-            # Filter/clamp levels to engine's supported range
-            valid_levels = []
-            for lvl in levels:
-                clamped = max(sf_min_elo, min(sf_max_elo, lvl))
-                if clamped != lvl:
-                    print(f"  \u26a0\ufe0f  Clamped level {lvl} → {clamped} (SF range: {sf_min_elo}-{sf_max_elo})")
-                if clamped not in valid_levels:
-                    valid_levels.append(clamped)
-            levels = valid_levels
-
-            if not levels:
-                print("  \u26a0\ufe0f  No valid Elo levels after clamping.")
-                engine.quit()
-                return {"estimated_elo": None, "results": {}, "total_games": 0,
-                        "total_time": 0.0, "error": "no_valid_levels"}
-
-            for level in levels:
-                # Configure Stockfish Elo
-                engine.configure({"UCI_LimitStrength": True, "UCI_Elo": level})
-
-                wins = draws = losses = 0
-
-                for game_idx in range(games_per_level):
-                    model_is_white = (game_idx % 2 == 0)
-                    result = self._play_game(
-                        engine, player, model_is_white,
-                        stockfish_time_limit, max_moves,
-                    )
-                    if result == 1.0:
-                        wins += 1
-                    elif result == 0.5:
-                        draws += 1
-                    else:
-                        losses += 1
-
-                    all_opponent_elos.append(float(level))
-                    all_scores.append(result)
-
-                total = wins + draws + losses
-                score_pct = (wins + 0.5 * draws) / total if total else 0.0
-                results_per_level[level] = {
-                    "wins": wins, "draws": draws, "losses": losses,
-                    "score": score_pct,
+        # Execute games in parallel
+        if workers > 1:
+            # Parallel execution
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._play_single_game_worker,
+                        level, model_is_white, use_mcts, simulations,
+                        stockfish_time_limit, max_moves, resolved_path
+                    ): (level, game_idx)
+                    for level, game_idx, model_is_white in tasks
                 }
-        finally:
-            engine.quit()
+
+                for future in as_completed(futures):
+                    level, _ = futures[future]
+                    try:
+                        result = future.result()
+                        all_opponent_elos.append(float(level))
+                        all_scores.append(result)
+                    except Exception as exc:
+                        print(f"  ⚠️  Game at level {level} failed: {exc}")
+                        # Count as loss
+                        all_opponent_elos.append(float(level))
+                        all_scores.append(0.0)
+        else:
+            # Sequential execution (original behavior)
+            player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
+            engine = chess.engine.SimpleEngine.popen_uci(resolved_path)
+            
+            try:
+                for level in levels:
+                    engine.configure({"UCI_LimitStrength": True, "UCI_Elo": level})
+                    
+                    for game_idx in range(games_per_level):
+                        model_is_white = (game_idx % 2 == 0)
+                        result = self._play_game(
+                            engine, player, model_is_white,
+                            stockfish_time_limit, max_moves,
+                        )
+                        all_opponent_elos.append(float(level))
+                        all_scores.append(result)
+            finally:
+                engine.quit()
+
+        # Aggregate results per level
+        for level in levels:
+            level_scores = [
+                score for elo, score in zip(all_opponent_elos, all_scores) if elo == level
+            ]
+            wins = sum(1 for s in level_scores if s == 1.0)
+            draws = sum(1 for s in level_scores if s == 0.5)
+            losses = sum(1 for s in level_scores if s == 0.0)
+            total = wins + draws + losses
+            score_pct = (wins + 0.5 * draws) / total if total else 0.0
+            results_per_level[level] = {
+                "wins": wins, "draws": draws, "losses": losses,
+                "score": score_pct,
+            }
 
         elapsed = time.perf_counter() - t0
 
@@ -473,6 +511,42 @@ class EloEstimator:
     # -----------------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------------
+
+    def _play_single_game_worker(
+        self,
+        level: int,
+        model_is_white: bool,
+        use_mcts: bool,
+        simulations: int,
+        sf_time_limit: float,
+        max_moves: int,
+        stockfish_path: str,
+    ) -> float:
+        """
+        Worker function for parallel game execution.
+        Creates own Stockfish engine and plays one game.
+        
+        Returns: score (1.0=win, 0.5=draw, 0.0=loss) from model's perspective.
+        """
+        # Each worker needs its own engine and player
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            engine.configure({"UCI_LimitStrength": True, "UCI_Elo": level})
+        except Exception as e:
+            print(f"  ⚠️  Worker failed to open Stockfish: {e}")
+            return 0.0  # Count as loss
+        
+        player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
+        
+        try:
+            result = self._play_game(engine, player, model_is_white, sf_time_limit, max_moves)
+        except Exception as e:
+            print(f"  ⚠️  Game failed: {e}")
+            result = 0.0
+        finally:
+            engine.quit()
+        
+        return result
 
     def _play_game(
         self,
@@ -560,6 +634,7 @@ def estimate_model_elo(
     max_moves = elo_config.get("max_moves", 150)
     use_mcts = elo_config.get("use_mcts", False)
     simulations = elo_config.get("mcts_simulations", 100)
+    workers = elo_config.get("workers", 0)
 
     estimator = EloEstimator(model, config, device, stockfish_path)
     return estimator.estimate(
@@ -569,4 +644,5 @@ def estimate_model_elo(
         max_moves=max_moves,
         use_mcts=use_mcts,
         simulations=simulations,
+        workers=workers,
     )

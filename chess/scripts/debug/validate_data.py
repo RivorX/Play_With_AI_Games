@@ -21,7 +21,6 @@ import pickle
 import struct
 import mmap
 import numpy as np
-import torch
 import chess
 from collections import defaultdict, Counter
 from tqdm import tqdm

@@ -80,18 +80,18 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v5.0"
+  version: "v5.1"
   # Base architecture
-  num_residual_blocks: 8     # Number of residual blocks (6-12 optimal)
-  filters: 128               # Convolutional filters (128-256 for RTX 5060 Ti)
+  num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
+  filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
   # 🆕 v4.8: Dual-stream policy head
   policy_head_conv_filters: 32  # Spatial stream: 3x3 conv filters (wider = more info preserved)
   policy_head_conv_groups: 4    # Grouped 3x3 conv in policy head (must divide filters and conv_filters)
   policy_head_global_dim: 64    # Global stream: GAP → FC dimension (board-wide context)
   policy_head_hidden_dim: 384   # Intermediate FC dimension (decomposed projection)
-  value_head_filters: 64     # Value head filters 
-  value_hidden_dim: 384      # Value head hidden dimension 
-  dropout: 0.2               # Dropout rate 
+  value_head_filters: 96        # Value head filters 
+  value_hidden_dim: 384         # Value head hidden dimension 
+  dropout: 0.2                  # Dropout rate 
 
   history_positions: 4       # Number of past positions to include (0 = current only, 4 = current + 3 history)
   
@@ -118,10 +118,13 @@ model:
 # IMITATION LEARNING (IL)
 # ------------------------------------------------------------------------------
 imitation_learning:
+  # Checkpoint content
+  save_optimizer_state: true  # Save optimizer state in IL checkpoints for true resume
+
   # Training hyperparameters
   batch_size: 9216           # Batch size
   learning_rate: 0.0005      # Learning rate 
-  value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
+  value_head_lr_factor: 1.2  # Value head LR multiplier (1.0 = full LR)
   epochs: 30                 # Maximum training epochs
   weight_decay: 0.002        # L2 regularization (10x stronger for value head)
   grad_clip: 1.0             # Gradient clipping threshold
@@ -133,15 +136,14 @@ imitation_learning:
   
   # Advanced training features
   label_smoothing: 0.08      # Label smoothing (0.0 = off, 0.1 = standard)
-  scheduler_type: 'cosine_decay'  # Options: 'onecycle', 'cosine_decay', 'reduce_on_plateau', 'none'
   warmup_pct: 0.05           # Warmup fraction of epochs (e.g., 0.02-0.05)
   min_lr_ratio: 0.05         # Min LR = base_lr * ratio
   
   # 🆕 v4.3: WDL-specific options
-  wdl_label_smoothing: 0.03  # 🔧 v4.8: 0.08->0.03 (0.08 too strong for 3-class WDL)
+  wdl_label_smoothing: 0.01  # Smoothing for value head (WDL is more sensitive to overconfidence)
   # Loss weights
   policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 1.0     # Value loss weight (balanced with policy)
+  value_loss_weight: 1.5     # Value loss weight (balanced with policy)
   # 🆕 WDL value weighting by move index (later positions = stronger signal)
   value_move_weighting: true
   value_move_weight_min: 0.1
@@ -261,16 +263,24 @@ logging:
 # ------------------------------------------------------------------------------
 elo_estimation:
   enabled: true                # Enable Elo estimation during training
-  eval_every: 5                # Estimate Elo every N epochs (expensive, don't run every epoch)
+  eval_every: 2                # Estimate Elo every N epochs (expensive, don't run every epoch)
   stockfish_path: "stockfish"  # Path to Stockfish binary (or just "stockfish" if on PATH)
-  games_per_level: 4           # Games per Elo level (half as white, half as black)
-  levels: [1320, 1500, 1700, 1900, 2200]  # Stockfish UCI_Elo levels (min 1320 for SF 17+)
-  stockfish_time_limit: 0.05   # Seconds per Stockfish move (lower = faster but weaker play)
-  max_moves: 150               # Max full moves per game before declaring draw
+  workers: 0                   # 🚀 Parallel game workers (0/auto = cpu_count-2, set explicit 4-8 for best speed)
+  
+  games_per_level: 40          # Games per Elo level (half as white, half as black)
+  levels: [1320, 1400, 1500, 1600, 1700, 1850, 2000, 2200]  # Stockfish UCI_Elo levels (min 1320 for SF 17+)
+  stockfish_time_limit: 0.1    # Seconds per Stockfish move (lower = faster but weaker play)
+  max_moves: 120               # Max full moves per game before declaring draw
   
   # MCTS options (for stronger but slower play)
-  use_mcts: false              # Enable MCTS for model moves (false = raw network, much faster)
+  # NOTE: IL training forces this to false (raw net only for speed).
+  use_mcts: false              # Enable MCTS for model moves (default false)
   mcts_simulations: 100        # MCTS sims per move (50-100 = fast, 200-400 = strong, 800+ = very strong)
+
+  # IL async mode: run Elo in background while next epoch is training.
+  async_in_il: true            # true = do not block IL training loop on Elo
+  async_device: "cpu"          # cpu | cuda | same (same = training device)
+  async_wait_on_shutdown_sec: 0.0  # Optional wait for pending async Elo at normal end
 
 
 # ------------------------------------------------------------------------------

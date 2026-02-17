@@ -231,10 +231,6 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
         scaler.step(optimizer)
         scaler.update()
         
-        # OneCycleLR must step every batch (after optimizer update)
-        if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
-            scheduler.step()
-
         if profile_enabled:
             _sync()
             timers['optim'] += time.perf_counter() - t0
@@ -278,9 +274,8 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             batch_count += 1
             data_timer_start = time.perf_counter()
     
-    # Step scheduler per-epoch for non-OneCycle schedulers
-    if scheduler is not None and not isinstance(scheduler, (torch.optim.lr_scheduler.ReduceLROnPlateau,
-                                                           torch.optim.lr_scheduler.OneCycleLR)):
+    # Step scheduler once per epoch.
+    if scheduler is not None:
         scheduler.step()
     
     # Compute final metrics

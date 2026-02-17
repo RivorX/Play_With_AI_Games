@@ -46,7 +46,7 @@ class CoordConv2d(nn.Module):
     đźš€ OPTIMIZED CoordConv - Position-aware convolution
     No changes - already optimal
     """
-    def __init__(self, in_channels, out_channels, kernel_size, padding=0, bias=True):
+    def __init__(self, in_channels, out_channels, kernel_size, padding=0, bias=False):
         super().__init__()
         self.conv = nn.Conv2d(in_channels + 2, out_channels, kernel_size, padding=padding, bias=bias)
         
@@ -534,24 +534,113 @@ class ChessNet(nn.Module):
                 self.train()
 
 
-def load_model(checkpoint_path, config, device):
-    """Load model from checkpoint"""
+def load_checkpoint_file(checkpoint_path, device):
+    """Load checkpoint with PyTorch 2.6+ compatibility."""
+    try:
+        try:
+            from torch.serialization import safe_globals
+            try:
+                import numpy._core.multiarray
+                scalar_class = numpy._core.multiarray.scalar
+            except (ImportError, AttributeError):
+                import numpy.core.multiarray
+                scalar_class = numpy.core.multiarray.scalar
+
+            with safe_globals([scalar_class]):
+                return torch.load(checkpoint_path, map_location=device, weights_only=True)
+        except Exception:
+            return torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except Exception:
+        # Trusted local file fallback for legacy checkpoints.
+        return torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+
+def transfer_matching_weights(model, checkpoint_or_state):
+    """Transfer only matching tensors from checkpoint to model.
+
+    Matches by tensor name and exact shape.
+    Useful when architecture changed (e.g. different depth), so strict load fails.
+    """
+    if isinstance(checkpoint_or_state, dict) and 'model_state_dict' in checkpoint_or_state:
+        source_state = checkpoint_or_state['model_state_dict']
+    else:
+        source_state = checkpoint_or_state
+
+    target_state = model.state_dict()
+    target_keys = set(target_state.keys())
+
+    normalized_source = {}
+    for key, tensor in source_state.items():
+        if key in target_keys:
+            normalized_source[key] = tensor
+        elif key.startswith('module.') and key[7:] in target_keys:
+            normalized_source[key[7:]] = tensor
+        else:
+            normalized_source[key] = tensor
+
+    matched_keys = []
+    missing_keys = []
+    unexpected_keys = []
+    shape_mismatch = []
+
+    for key, tensor in normalized_source.items():
+        if key not in target_state:
+            unexpected_keys.append(key)
+            continue
+        if target_state[key].shape != tensor.shape:
+            shape_mismatch.append((key, tuple(tensor.shape), tuple(target_state[key].shape)))
+            continue
+
+        target_state[key] = tensor.to(dtype=target_state[key].dtype, device=target_state[key].device)
+        matched_keys.append(key)
+
+    matched_set = set(matched_keys)
+    for key in target_state.keys():
+        if key not in matched_set:
+            missing_keys.append(key)
+
+    model.load_state_dict(target_state, strict=False)
+
+    matched_elements = sum(target_state[k].numel() for k in matched_keys)
+    total_elements = sum(v.numel() for v in target_state.values())
+
+    return {
+        'matched_keys': matched_keys,
+        'missing_keys': missing_keys,
+        'unexpected_keys': unexpected_keys,
+        'shape_mismatch': shape_mismatch,
+        'matched_tensors': len(matched_keys),
+        'total_tensors': len(target_state),
+        'matched_elements': matched_elements,
+        'total_elements': total_elements,
+        'match_ratio': (matched_elements / total_elements) if total_elements else 0.0,
+    }
+
+
+def load_model(checkpoint_path, config, device, strict=True):
+    """Load model from checkpoint."""
     model = ChessNet(config).to(device)
     model = model.to(memory_format=torch.channels_last)
-    
+
     if checkpoint_path:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-    
+        checkpoint = load_checkpoint_file(checkpoint_path, device)
+        if strict:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            transfer_matching_weights(model, checkpoint)
+
     return model
 
 
-def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None, save_optimizer=False, save_dtype=None):
+def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None,
+                    save_optimizer=False, save_dtype=None, extra_state=None):
     """Save model checkpoint
     
     Args:
         save_dtype: Optional dtype to convert state_dict (e.g. torch.bfloat16)
                     Converts the saved copy WITHOUT modifying the live model.
+        extra_state: Optional dict with additional runtime state
+                    (e.g. scheduler/scaler/best metrics).
     """
     state_dict = model.state_dict()
     if save_dtype is not None:
@@ -568,6 +657,9 @@ def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None, save_opt
     
     if metadata:
         checkpoint.update(metadata)
+
+    if extra_state:
+        checkpoint.update(extra_state)
     
     torch.save(checkpoint, path)
     
