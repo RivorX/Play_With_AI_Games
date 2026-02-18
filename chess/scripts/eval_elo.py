@@ -23,7 +23,9 @@ from utils.shared.elo_estimator import EloEstimator, ensure_stockfish
 from utils.shared.model_catalog import (
     load_checkpoint_metadata,
     print_model_table,
+    sort_entries_by_folder_and_elo,
 )
+from utils.shared.model_view import print_selected_models_table
 
 
 def _safe_int(value):
@@ -299,12 +301,13 @@ def collect_model_candidates(chess_dir, config, max_candidates=200):
     best_rel = config.get("paths", {}).get("best_model_il", "models/best_model_il.pt")
     best_path = (chess_dir / best_rel).resolve()
     best_swa_path = (best_path.parent / "best_model_il_swa.pt").resolve()
+    models_rel = config.get("paths", {}).get("models_dir", "models")
+    models_dir = (chess_dir / models_rel).resolve()
 
     for path in (best_path, best_swa_path):
         if path.exists() and path not in candidates:
             candidates.append(path)
 
-    models_dir = chess_dir / "models"
     all_pts = []
     if models_dir.exists():
         all_pts = sorted(models_dir.rglob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -314,23 +317,24 @@ def collect_model_candidates(chess_dir, config, max_candidates=200):
         if resolved not in candidates:
             candidates.append(resolved)
 
-    return candidates, best_path
+    return candidates, best_path, models_dir
 
 
 def build_model_catalog(model_paths, base_dir):
-    return [load_checkpoint_metadata(path, base_dir) for path in model_paths]
+    entries = [load_checkpoint_metadata(path, base_dir) for path in model_paths]
+    return sort_entries_by_folder_and_elo(entries)
 
 
 def print_model_catalog(catalog):
     print_model_table(
         catalog,
         title="Available Checkpoints",
-        show_folder=False,
-        show_version=False,
-        show_modified=False,
-        show_swa=False,
-        show_opt=False,
-        group_by_folder=False,
+        show_folder=True,
+        show_version=True,
+        show_modified=True,
+        show_swa=True,
+        show_opt=True,
+        group_by_folder=True,
     )
 
 
@@ -772,18 +776,19 @@ def main():
     max_moves = settings["max_moves"]
     sf_path = settings["sf_path"]
 
-    model_paths, best_path = collect_model_candidates(chess_dir, config)
+    model_paths, best_path, models_dir = collect_model_candidates(chess_dir, config)
     if not model_paths:
-        print("No model checkpoints found in chess/models.")
+        print(f"No model checkpoints found in: {models_dir}")
         sys.exit(1)
 
-    catalog = build_model_catalog(model_paths, chess_dir)
+    catalog = build_model_catalog(model_paths, models_dir)
     print_model_catalog(catalog)
 
     selected_entries = choose_model_entries(catalog, best_path)
     if not selected_entries:
         print("No valid models selected.")
         sys.exit(1)
+    print_selected_models_table(selected_entries, title="Selected Models For Elo Evaluation")
 
     selected_paths = [entry["path"] for entry in selected_entries]
 

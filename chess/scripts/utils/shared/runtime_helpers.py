@@ -1,5 +1,6 @@
 """Shared runtime helpers for training scripts."""
 
+import csv
 import io
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -59,13 +60,37 @@ def build_model_architecture_metadata(config):
 
 
 def cleanup_interrupted_log_csv(csv_path, plot_path, mode_label):
-    """Delete run CSV on interrupt if plot PNG was not generated yet."""
+    """Delete interrupted run CSV when it has no data rows or when no plot exists yet."""
     if csv_path is None:
         return
 
     csv_file = Path(csv_path)
     plot_file = Path(plot_path) if plot_path is not None else None
     if not csv_file.exists():
+        return
+
+    # Remove header-only / effectively empty CSV files.
+    has_data_rows = False
+    try:
+        with open(csv_file, "r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            for row_idx, row in enumerate(reader):
+                # Skip header row and blank rows.
+                if row_idx == 0:
+                    continue
+                if any(str(cell).strip() for cell in row):
+                    has_data_rows = True
+                    break
+    except Exception:
+        # If CSV cannot be parsed, keep previous behavior below.
+        has_data_rows = True
+
+    if not has_data_rows:
+        try:
+            csv_file.unlink()
+            print(f"Removed interrupted {mode_label} log CSV (empty/header-only): {csv_file.name}")
+        except Exception as exc:
+            print(f"Warning: failed to remove interrupted {mode_label} log CSV ({exc})")
         return
 
     if plot_file is not None and plot_file.exists():
@@ -84,4 +109,3 @@ def run_with_optional_stdout_suppression(enabled, fn, *args, **kwargs):
         return fn(*args, **kwargs)
     with redirect_stdout(io.StringIO()):
         return fn(*args, **kwargs)
-

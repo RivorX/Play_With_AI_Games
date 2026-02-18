@@ -7,11 +7,42 @@ NEW Features:
 - 📊 Enhanced self-play statistics
 """
 
+import os
+import sys
+import signal
+import multiprocessing as _stdlib_mp
+
+# Windows multiprocessing ("spawn") starts worker processes by re-running this script as __mp_main__.
+# Ignore Ctrl+C inside spawned children to avoid noisy KeyboardInterrupt tracebacks during heavy imports.
+def _is_spawned_worker_process():
+    if __name__ != "__mp_main__":
+        return False
+    try:
+        return _stdlib_mp.parent_process() is not None
+    except Exception:
+        return True
+
+
+if _is_spawned_worker_process():
+    # Native runtimes (MKL/Fortran/OpenMP) used by numpy/torch may print noisy
+    # "forrtl: error (200)" on Ctrl+C in spawned workers. Keep children out of
+    # console Ctrl+C handling; parent process performs graceful shutdown.
+    os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "TRUE")
+    os.environ.setdefault("KMP_HANDLE_SIGNALS", "0")
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, True)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
+
 import torch
 import torch.optim as optim
 import torch.multiprocessing as mp
 import yaml
-import sys
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
@@ -46,10 +77,29 @@ from utils.shared.runtime_helpers import (
     build_model_architecture_metadata,
     cleanup_interrupted_log_csv,
 )
+from utils.shared.model_view import print_active_model_summary
 
 
 _LAST_RUN_LOG_CSV = None
 _LAST_RUN_LOG_PNG = None
+_WORKER_INTERRUPT_EXIT_CODE = 130
+
+
+class RLTrainingInterrupted(Exception):
+    """Raised when user interrupts RL run (Ctrl+C)."""
+
+
+def _handle_graceful_interrupt(logger=None, stage=None):
+    """Best-effort graceful shutdown on Ctrl+C."""
+    stage_suffix = f" during {stage}" if stage else ""
+    print(f"\nRL training interrupted by user (Ctrl+C){stage_suffix}.")
+    if logger is not None:
+        try:
+            logger.plot()
+        except Exception:
+            pass
+    cleanup_interrupted_log_csv(_LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG, "RL")
+    print("RL training stopped gracefully.")
 
 
 # ==============================================================================
@@ -58,22 +108,42 @@ _LAST_RUN_LOG_PNG = None
 
 def _terminate_workers(processes, timeout_s=5):
     """Terminate spawned self-play workers cleanly."""
-    for proc in processes:
+    all_processes = []
+    seen = set()
+    for proc in list(processes) + list(mp.active_children()):
+        if proc is None:
+            continue
+        key = proc.pid if proc.pid is not None else id(proc)
+        if key in seen:
+            continue
+        seen.add(key)
+        all_processes.append(proc)
+
+    for proc in all_processes:
         if proc.is_alive():
             proc.terminate()
 
     deadline = time.time() + timeout_s
-    for proc in processes:
+    for proc in all_processes:
         remaining = max(0.0, deadline - time.time())
         proc.join(timeout=remaining)
 
-    for proc in processes:
+    for proc in all_processes:
         if proc.is_alive():
             try:
                 proc.kill()
             except Exception:
                 pass
             proc.join(timeout=1.0)
+
+
+def _is_interrupt_exit_code(exit_code):
+    if exit_code is None:
+        return False
+    if exit_code == _WORKER_INTERRUPT_EXIT_CODE:
+        return True
+    sigint = getattr(signal, "SIGINT", None)
+    return sigint is not None and exit_code == -int(sigint)
 
 
 def play_games_parallel_mcts(model, config, device, num_games):
@@ -94,6 +164,7 @@ def play_games_parallel_mcts(model, config, device, num_games):
     model_state = model.state_dict()
     
     rl_cfg = config.get('reinforcement_learning', {})
+    show_worker_wait_bar = bool(rl_cfg.get('self_play_wait_progress', False))
     
     # Parallel configuration
     num_workers = rl_cfg.get('self_play_workers', 4)
@@ -164,30 +235,61 @@ def play_games_parallel_mcts(model, config, device, num_games):
     processes = []
     result_files = []
     
-    for rank, games_for_worker in worker_specs:
-        if device_type == 'cuda':
-            device_id = rank % torch.cuda.device_count()
-        else:
-            device_id = 'cpu'
-        
-        result_file = temp_dir / f"worker_{rank}_mcts_results.pkl"
-        result_files.append(result_file)
-        
-        p = mp_ctx.Process(
-            target=play_games_mcts_worker,
-            args=(rank, model_state, config, device_id, games_for_worker, str(result_file))
-        )
-        p.start()
-        processes.append(p)
-    
-    # Wait for all workers
+    interrupted = False
     try:
-        for p in tqdm(processes, desc="MCTS Self-play workers"):
-            p.join()
+        for rank, games_for_worker in worker_specs:
+            if device_type == 'cuda':
+                device_id = rank % torch.cuda.device_count()
+            else:
+                device_id = 'cpu'
+
+            result_file = temp_dir / f"worker_{rank}_mcts_results.pkl"
+            result_files.append(result_file)
+
+            p = mp_ctx.Process(
+                target=play_games_mcts_worker,
+                args=(rank, model_state, config, device_id, games_for_worker, str(result_file))
+            )
+            # If parent exits unexpectedly, daemonic workers are cleaned up automatically.
+            p.daemon = True
+            p.start()
+            processes.append(p)
+
+        # Wait for workers with short polling intervals so Ctrl+C is responsive on Windows.
+        wait_bar = tqdm(
+            total=len(processes),
+            desc="MCTS Self-play workers",
+            disable=not show_worker_wait_bar,
+            leave=False,
+        )
+        try:
+            pending = set(range(len(processes)))
+            while pending:
+                for idx in list(pending):
+                    p = processes[idx]
+                    p.join(timeout=0.2)
+                    if p.is_alive():
+                        continue
+                    pending.remove(idx)
+                    wait_bar.update(1)
+                    if _is_interrupt_exit_code(p.exitcode):
+                        interrupted = True
+                        print("\nCtrl+C detected in self-play worker. Stopping workers...")
+                        raise RLTrainingInterrupted("self-play")
+                if pending:
+                    time.sleep(0.05)
+        finally:
+            wait_bar.close()
     except KeyboardInterrupt:
-        print("\nInterrupt received. Stopping self-play workers...")
-        _terminate_workers(processes)
+        interrupted = True
+        print("\nCtrl+C detected during self-play. Stopping workers...")
+        raise RLTrainingInterrupted("self-play")
+    except Exception:
+        interrupted = True
         raise
+    finally:
+        if interrupted:
+            _terminate_workers(processes)
     
     selfplay_time = time.time() - start_time
     
@@ -299,6 +401,10 @@ def main():
         rl_cfg['self_play_save_every_games_resolved'] = 0
         print("Self-play save every: disabled")
 
+    worker_log_mode = "verbose" if bool(rl_cfg.get('self_play_worker_verbose', False)) else "minimal"
+    wait_bar_mode = "on" if bool(rl_cfg.get('self_play_wait_progress', False)) else "off"
+    print(f"Self-play worker logs: {worker_log_mode} (wait-progress: {wait_bar_mode})")
+
     model_version = config.get('model', {}).get('version', 'v?.?')
     model_file_tag = build_model_file_tag(config)
     model_architecture = build_model_architecture_metadata(config)
@@ -342,14 +448,10 @@ def main():
     total_iterations = int(config['reinforcement_learning']['iterations'])
 
     print("\nPreparing model for startup menu...")
-    config['model'] = {**config.get('model', {}), 'print_summary': True}
+    config['model'] = {**config.get('model', {}), 'print_summary': False}
     model = ChessNet(config).to(device)
     model = model.to(memory_format=torch.channels_last)
-    print("Model ready (channels_last enabled)")
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parameters: {trainable_params:,} trainable / {total_params:,} total")
-    model._print_parameter_summary(config['model']['num_residual_blocks'])
+    print("Model ready")
 
     startup_plan = plan_rl_startup(
         model=model,
@@ -392,6 +494,29 @@ def main():
     resumed_best_win_rate = float(startup_state.get("best_win_rate", 0.0) or 0.0)
     selected_compatibility_ratio = startup_state.get("selected_compatibility_ratio")
     transfer_match_ratio = startup_state.get("transfer_match_ratio")
+    selected_entry = startup_plan.get("selected_entry") or {}
+
+    if start_mode == "new":
+        source_label = (
+            f"{best_model_il_path.name} (init)"
+            if best_model_il_path.exists()
+            else "new (scratch)"
+        )
+    else:
+        source_label = "selected checkpoint"
+        if selected_checkpoint_label:
+            source_label = Path(selected_checkpoint_label).name
+
+    print_active_model_summary(
+        model,
+        config,
+        title="Active Model (RL)",
+        source_label=source_label,
+        startup_mode=start_mode,
+        checkpoint_label=selected_checkpoint_label,
+        device=device,
+        selected_entry=selected_entry,
+    )
 
     if start_mode == "new":
         run_context = "startup: new RL training"
@@ -489,146 +614,196 @@ def main():
         logger.plot()
         return
 
-    for iteration in range(start_iteration, total_iterations):
-        print(f"\n{'='*70}")
-        print(f"Iteration {iteration + 1}/{total_iterations}")
-        print('='*70)
-        
-        # Update learning rate (cosine decay + warmup)
-        current_lr = _compute_lr(iteration)
-        for group in optimizer.param_groups:
-            group['lr'] = current_lr
-        
-        # Get current temperature
-        if use_temp_schedule:
-            current_temp = temp_schedule.get_temperature(iteration)
-            print(f"🌡️ Temperature: {current_temp:.2f}")
-            config['reinforcement_learning']['mcts_temperature'] = current_temp
-        else:
-            current_temp = config['reinforcement_learning']['mcts_temperature']
-        
-        if use_lr_schedule:
-            print(f"📉 LR: {current_lr:.2e}")
-        
-        # Update beta for importance sampling
-        if use_prioritized:
-            progress = iteration / total_iterations
-            replay_buffer.update_beta(progress)
-            print(f"🎯 Beta (IS): {replay_buffer.beta:.3f}")
-        
-        # Self-play with MCTS
-        model.eval()
-        
-        positions, avg_game_length, positions_per_sec, selfplay_time, collection_time = \
-            play_games_parallel_mcts(
-                model,
-                config,
-                device,
-                config['reinforcement_learning']['games_per_iteration']
-            )
-        
-        # Add to replay buffer
-        for position in positions:
-            replay_buffer.add(position)
-        
-        print(f"Replay buffer: {len(replay_buffer)} positions")
-        
-        # Training with metrics
-        if len(replay_buffer) >= config['reinforcement_learning']['batch_size']:
-            print("Training...")
-            model.train()
-            total_loss = 0
-            total_policy = 0
-            total_value = 0
+    training_interrupted = False
+    interrupted_stage = None
+
+    try:
+        for iteration in range(start_iteration, total_iterations):
+            print(f"\n{'='*70}")
+            print(f"Iteration {iteration + 1}/{total_iterations}")
+            print('='*70)
             
-            # 📊 Initialize metrics calculator
-            metrics_calc = MetricsCalculator()
+            # Update learning rate (cosine decay + warmup)
+            current_lr = _compute_lr(iteration)
+            for group in optimizer.param_groups:
+                group['lr'] = current_lr
             
-            num_batches = len(replay_buffer) // config['reinforcement_learning']['batch_size']
+            # Get current temperature
+            if use_temp_schedule:
+                current_temp = temp_schedule.get_temperature(iteration)
+                print(f"🌡️ Temperature: {current_temp:.2f}")
+                config['reinforcement_learning']['mcts_temperature'] = current_temp
+            else:
+                current_temp = config['reinforcement_learning']['mcts_temperature']
             
-            for batch_idx in tqdm(range(config['reinforcement_learning']['train_epochs_per_iteration'] * num_batches), desc="Training"):
-                # Prioritized or standard sampling
-                if use_prioritized:
-                    batch_data, indices, weights = replay_buffer.sample(
-                        config['reinforcement_learning']['batch_size']
-                    )
-                    
-                    # Convert to tensors
-                    boards = torch.stack([b for b, _, _ in batch_data])
-                    policies = torch.stack([p for _, p, _ in batch_data])
-                    values = torch.stack([v for _, _, v in batch_data])
-                    batch = (boards, policies, values)
-                    
-                    loss, policy_loss, value_loss = train_on_batch_rl(
-                        model, optimizer, batch, indices, weights, config, device, scaler, replay_buffer, metrics_calc
-                    )
-                else:
-                    batch = replay_buffer.sample(config['reinforcement_learning']['batch_size'])
-                    loss, policy_loss, value_loss = train_on_batch_rl(
-                        model, optimizer, batch, None, None, config, device, scaler, replay_buffer, metrics_calc
-                    )
-                
-                total_loss += loss
-                total_policy += policy_loss
-                total_value += value_loss
-                
-                if batch_idx % 50 == 0:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+            if use_lr_schedule:
+                print(f"📉 LR: {current_lr:.2e}")
             
-            avg_loss = total_loss / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
-            avg_policy = total_policy / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
-            avg_value = total_value / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
+            # Update beta for importance sampling
+            if use_prioritized:
+                progress = iteration / total_iterations
+                replay_buffer.update_beta(progress)
+                print(f"🎯 Beta (IS): {replay_buffer.beta:.3f}")
             
-            # 📊 Compute metrics
-            train_metrics = metrics_calc.compute()
-            
-            print(f"Loss: {avg_loss:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}")
-            print(f"📊 Top-1: {train_metrics['policy_top1_acc']:.2%}, "
-                  f"Top-3: {train_metrics['policy_top3_acc']:.2%}, "
-                  f"MAE: {train_metrics['value_mae']:.4f}")
-        else:
-            avg_loss = avg_policy = avg_value = 0
-            train_metrics = {}
-        
-        # Evaluation
-        win_rate = None
-        if (iteration + 1) % config['reinforcement_learning']['eval_every'] == 0:
-            print("Evaluating vs best...")
+            # Self-play with MCTS
             model.eval()
-            win_rate = evaluate_models(
-                model, best_model, config, device,
-                config['reinforcement_learning']['eval_games']
-            )
-            print(f"Win rate: {win_rate:.2%}")
+            positions, avg_game_length, positions_per_sec, selfplay_time, collection_time = \
+                play_games_parallel_mcts(
+                    model,
+                    config,
+                    device,
+                    config['reinforcement_learning']['games_per_iteration']
+                )
             
-            # Log with all metrics
-            logger.log(
-                iteration + 1,
-                train_metrics=train_metrics,
-                avg_loss=avg_loss,
-                policy_loss=avg_policy,
-                value_loss=avg_value,
-                win_rate=win_rate,
-                buffer_size=len(replay_buffer),
-                avg_game_length=avg_game_length,
-                positions_per_sec=positions_per_sec,
-                selfplay_time=selfplay_time,
-                data_collection_time=collection_time,
-                temperature=current_temp,
-                beta=replay_buffer.beta if use_prioritized else None
-            )
-            logger.plot()
+            # Add to replay buffer
+            for position in positions:
+                replay_buffer.add(position)
             
-            if win_rate >= config['reinforcement_learning']['win_rate_threshold']:
-                print("✅ New best model!")
-                best_model.load_state_dict(model.state_dict())
+            print(f"Replay buffer: {len(replay_buffer)} positions")
+            
+            # Training with metrics
+            if len(replay_buffer) >= config['reinforcement_learning']['batch_size']:
+                print("Training...")
+                model.train()
+                total_loss = 0
+                total_policy = 0
+                total_value = 0
+                
+                # 📊 Initialize metrics calculator
+                metrics_calc = MetricsCalculator()
+                
+                num_batches = len(replay_buffer) // config['reinforcement_learning']['batch_size']
+                
+                for batch_idx in tqdm(
+                    range(config['reinforcement_learning']['train_epochs_per_iteration'] * num_batches),
+                    desc="Training",
+                ):
+                    # Prioritized or standard sampling
+                    if use_prioritized:
+                        batch_data, indices, weights = replay_buffer.sample(
+                            config['reinforcement_learning']['batch_size']
+                        )
+                        
+                        # Convert to tensors
+                        boards = torch.stack([b for b, _, _ in batch_data])
+                        policies = torch.stack([p for _, p, _ in batch_data])
+                        values = torch.stack([v for _, _, v in batch_data])
+                        batch = (boards, policies, values)
+                        
+                        loss, policy_loss, value_loss = train_on_batch_rl(
+                            model, optimizer, batch, indices, weights, config, device, scaler, replay_buffer, metrics_calc
+                        )
+                    else:
+                        batch = replay_buffer.sample(config['reinforcement_learning']['batch_size'])
+                        loss, policy_loss, value_loss = train_on_batch_rl(
+                            model, optimizer, batch, None, None, config, device, scaler, replay_buffer, metrics_calc
+                        )
+                    
+                    total_loss += loss
+                    total_policy += policy_loss
+                    total_value += value_loss
+                    
+                    if batch_idx % 50 == 0:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                
+                avg_loss = total_loss / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
+                avg_policy = total_policy / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
+                avg_value = total_value / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
+                
+                # 📊 Compute metrics
+                train_metrics = metrics_calc.compute()
+                
+                print(f"Loss: {avg_loss:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}")
+                print(f"📊 Top-1: {train_metrics['policy_top1_acc']:.2%}, "
+                      f"Top-3: {train_metrics['policy_top3_acc']:.2%}, "
+                      f"MAE: {train_metrics['value_mae']:.4f}")
+            else:
+                avg_loss = avg_policy = avg_value = 0
+                train_metrics = {}
+            
+            # Evaluation
+            win_rate = None
+            if (iteration + 1) % config['reinforcement_learning']['eval_every'] == 0:
+                print("Evaluating vs best...")
+                model.eval()
+                win_rate = evaluate_models(
+                    model, best_model, config, device,
+                    config['reinforcement_learning']['eval_games']
+                )
+                print(f"Win rate: {win_rate:.2%}")
+                
+                # Log with all metrics
+                logger.log(
+                    iteration + 1,
+                    train_metrics=train_metrics,
+                    avg_loss=avg_loss,
+                    policy_loss=avg_policy,
+                    value_loss=avg_value,
+                    win_rate=win_rate,
+                    buffer_size=len(replay_buffer),
+                    avg_game_length=avg_game_length,
+                    positions_per_sec=positions_per_sec,
+                    selfplay_time=selfplay_time,
+                    data_collection_time=collection_time,
+                    temperature=current_temp,
+                    beta=replay_buffer.beta if use_prioritized else None
+                )
+                logger.plot()
+                
+                if win_rate >= config['reinforcement_learning']['win_rate_threshold']:
+                    print("✅ New best model!")
+                    best_model.load_state_dict(model.state_dict())
+                    
+                    model_to_save = model
+                    save_checkpoint(
+                        model_to_save, None, iteration, avg_loss,
+                        str(best_model_rl_path),
+                        {
+                            'win_rate': win_rate,
+                            'policy_loss': avg_policy,
+                            'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
+                            'value_mae': train_metrics.get('value_mae', 0),
+                            'version': model_version,
+                            'startup_mode': start_mode,
+                            'model_architecture': model_architecture,
+                        },
+                        save_optimizer=False,
+                        save_dtype=torch.bfloat16 if use_bfloat16 else None
+                    )
+                    
+                    size_mb = best_model_rl_path.stat().st_size / (1024**2)
+                    print(f"💾 Saved: {best_model_rl_path} ({size_mb:.1f} MB)")
+            else:
+                logger.log(
+                    iteration + 1,
+                    train_metrics=train_metrics,
+                    avg_loss=avg_loss,
+                    policy_loss=avg_policy,
+                    value_loss=avg_value,
+                    buffer_size=len(replay_buffer),
+                    avg_game_length=avg_game_length,
+                    positions_per_sec=positions_per_sec,
+                    selfplay_time=selfplay_time,
+                    data_collection_time=collection_time,
+                    temperature=current_temp,
+                    beta=replay_buffer.beta if use_prioritized else None
+                )
+            
+            # Checkpoints
+            if (iteration + 1) % checkpoint_every == 0:
+                if (iteration + 1) % config['reinforcement_learning']['eval_every'] != 0:
+                    win_rate = evaluate_models(model, best_model, config, device,
+                                            config['reinforcement_learning']['eval_games'])
+                
+                checkpoint_name = f"rl_iter_{iteration + 1:02d}_{model_file_tag}.pt"
+                checkpoint_path = rl_dir / checkpoint_name
                 
                 model_to_save = model
                 save_checkpoint(
                     model_to_save, None, iteration, avg_loss,
-                    str(best_model_rl_path),
+                    str(checkpoint_path),
                     {
                         'win_rate': win_rate,
                         'policy_loss': avg_policy,
@@ -642,58 +817,24 @@ def main():
                     save_dtype=torch.bfloat16 if use_bfloat16 else None
                 )
                 
-                size_mb = best_model_rl_path.stat().st_size / (1024**2)
-                print(f"💾 Saved: {best_model_rl_path} ({size_mb:.1f} MB)")
-        else:
-            logger.log(
-                iteration + 1,
-                train_metrics=train_metrics,
-                avg_loss=avg_loss,
-                policy_loss=avg_policy,
-                value_loss=avg_value,
-                buffer_size=len(replay_buffer),
-                avg_game_length=avg_game_length,
-                positions_per_sec=positions_per_sec,
-                selfplay_time=selfplay_time,
-                data_collection_time=collection_time,
-                temperature=current_temp,
-                beta=replay_buffer.beta if use_prioritized else None
-            )
-        
-        # Checkpoints
-        if (iteration + 1) % checkpoint_every == 0:
-            if (iteration + 1) % config['reinforcement_learning']['eval_every'] != 0:
-                win_rate = evaluate_models(model, best_model, config, device,
-                                        config['reinforcement_learning']['eval_games'])
+                size_mb = checkpoint_path.stat().st_size / (1024**2)
+                print(f"💾 Checkpoint: {checkpoint_path.name} ({size_mb:.1f} MB)")
             
-            checkpoint_name = f"rl_iter_{iteration + 1:02d}_{model_file_tag}.pt"
-            checkpoint_path = rl_dir / checkpoint_name
-            
-            model_to_save = model
-            save_checkpoint(
-                model_to_save, None, iteration, avg_loss,
-                str(checkpoint_path),
-                {
-                    'win_rate': win_rate,
-                    'policy_loss': avg_policy,
-                    'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
-                    'value_mae': train_metrics.get('value_mae', 0),
-                    'version': model_version,
-                    'startup_mode': start_mode,
-                    'model_architecture': model_architecture,
-                },
-                save_optimizer=False,
-                save_dtype=torch.bfloat16 if use_bfloat16 else None
-            )
-            
-            size_mb = checkpoint_path.stat().st_size / (1024**2)
-            print(f"💾 Checkpoint: {checkpoint_path.name} ({size_mb:.1f} MB)")
-        
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    except RLTrainingInterrupted as exc:
+        training_interrupted = True
+        interrupted_stage = str(exc) or "self-play"
+    except KeyboardInterrupt:
+        training_interrupted = True
+        interrupted_stage = "runtime"
 
     logger.plot()
+    if training_interrupted:
+        _handle_graceful_interrupt(logger=None, stage=interrupted_stage)
+        return
+
     print("\n=== Training complete ===")
 
 
@@ -701,5 +842,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        cleanup_interrupted_log_csv(_LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG, "RL")
-        print("\nCtrl+C detected. RL training stopped gracefully.")
+        _handle_graceful_interrupt(logger=None, stage="runtime")

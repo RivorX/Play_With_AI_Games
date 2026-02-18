@@ -107,8 +107,17 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
     return entry
 
 
-def format_model_table_row(idx, entry, show_folder=False, show_version=False, show_modified=False, 
-                           show_swa=False, show_opt=False):
+def format_model_table_row(
+    idx,
+    entry,
+    show_folder=False,
+    show_version=False,
+    show_modified=False,
+    show_swa=False,
+    show_opt=False,
+    show_compat=False,
+    show_strict=False,
+):
     """Format a single model entry as a table row.
     
     Args:
@@ -119,6 +128,8 @@ def format_model_table_row(idx, entry, show_folder=False, show_version=False, sh
         show_modified: Include modified timestamp
         show_swa: Include SWA column
         show_opt: Include optimizer column
+        show_compat: Include compatibility ratio column
+        show_strict: Include strict-resume compatibility flag
     
     Returns:
         str: Formatted table row
@@ -150,14 +161,19 @@ def format_model_table_row(idx, entry, show_folder=False, show_version=False, sh
     pol_loss_str = f"{policy_loss:8.4f}" if policy_loss is not None else "   n/a  "
     
     # Elo
-    elo = entry.get("elo")
+    elo = entry.get("elo", entry.get("estimated_elo"))
     elo_str = f"{int(round(float(elo))):>6}" if elo is not None else "  n/a "
     
     # SWA
     swa_str = "yes" if entry.get("swa") else "no"
     
     # Optimizer
-    opt_str = "yes" if entry.get("optimizer") else "no"
+    opt_str = "yes" if entry.get("optimizer", entry.get("optimizer_present")) else "no"
+
+    # Compatibility / strict resume
+    compat_ratio = _safe_float(entry.get("compatibility_ratio"))
+    compat_str = f"{compat_ratio * 100:6.2f}%" if compat_ratio is not None else "  n/a "
+    strict_str = "yes" if bool(entry.get("strict_resume_ok", False)) else "no"
     
     # Size
     size_str = f"{entry['size_mb']:>6.1f}"
@@ -187,6 +203,12 @@ def format_model_table_row(idx, entry, show_folder=False, show_version=False, sh
     
     if show_opt:
         parts.append(f"{opt_str:>3}")
+
+    if show_compat:
+        parts.append(f"{compat_str:>7}")
+
+    if show_strict:
+        parts.append(f"{strict_str:>6}")
     
     parts.append(f"{size_str}")
     
@@ -198,8 +220,15 @@ def format_model_table_row(idx, entry, show_folder=False, show_version=False, sh
     return "  ".join(parts)
 
 
-def format_model_table_header(show_folder=False, show_version=False, show_modified=False,
-                              show_swa=False, show_opt=False):
+def format_model_table_header(
+    show_folder=False,
+    show_version=False,
+    show_modified=False,
+    show_swa=False,
+    show_opt=False,
+    show_compat=False,
+    show_strict=False,
+):
     """Format table header.
     
     Args:
@@ -208,6 +237,8 @@ def format_model_table_header(show_folder=False, show_version=False, show_modifi
         show_modified: Include modified timestamp
         show_swa: Include SWA column
         show_opt: Include optimizer column
+        show_compat: Include compatibility ratio column
+        show_strict: Include strict-resume compatibility flag
     
     Returns:
         tuple: (header_line, separator_line)
@@ -233,6 +264,14 @@ def format_model_table_header(show_folder=False, show_version=False, show_modifi
     if show_opt:
         parts.append("Opt")
         sep_parts.append("----")
+
+    if show_compat:
+        parts.append(" Compat ")
+        sep_parts.append("--------")
+
+    if show_strict:
+        parts.append("Strict")
+        sep_parts.append("------")
     
     parts.append(" SizeMB")
     sep_parts.append("-------")
@@ -250,8 +289,18 @@ def format_model_table_header(show_folder=False, show_version=False, show_modifi
     return header, separator
 
 
-def print_model_table(entries, title="Model Checkpoints", show_folder=False, show_version=False,
-                     show_modified=False, show_swa=False, show_opt=False, group_by_folder=False):
+def print_model_table(
+    entries,
+    title="Model Checkpoints",
+    show_folder=False,
+    show_version=False,
+    show_modified=False,
+    show_swa=False,
+    show_opt=False,
+    show_compat=False,
+    show_strict=False,
+    group_by_folder=False,
+):
     """Print formatted model table.
     
     Args:
@@ -262,10 +311,20 @@ def print_model_table(entries, title="Model Checkpoints", show_folder=False, sho
         show_modified: Include modified timestamp
         show_swa: Include SWA column
         show_opt: Include optimizer column
+        show_compat: Include compatibility ratio column
+        show_strict: Include strict-resume compatibility flag
         group_by_folder: Add separator lines between folders
     """
     # Calculate separator width
-    header, sep = format_model_table_header(show_folder, show_version, show_modified, show_swa, show_opt)
+    header, sep = format_model_table_header(
+        show_folder,
+        show_version,
+        show_modified,
+        show_swa,
+        show_opt,
+        show_compat,
+        show_strict,
+    )
     width = len(header)
     
     print("\n" + "=" * width)
@@ -285,14 +344,32 @@ def print_model_table(entries, title="Model Checkpoints", show_folder=False, sho
                 print(f"-- {folder} --")
             last_folder = folder
         
-        row = format_model_table_row(idx, entry, show_folder, show_version, show_modified, show_swa, show_opt)
+        row = format_model_table_row(
+            idx,
+            entry,
+            show_folder,
+            show_version,
+            show_modified,
+            show_swa,
+            show_opt,
+            show_compat,
+            show_strict,
+        )
         print(row)
     
     # Summary
     total = len(entries)
     valid = sum(1 for e in entries if not e.get("error"))
-    with_elo = sum(1 for e in entries if e.get("elo") is not None and not e.get("error"))
-    with_opt = sum(1 for e in entries if e.get("optimizer") and not e.get("error"))
+    with_elo = sum(
+        1
+        for e in entries
+        if e.get("elo", e.get("estimated_elo")) is not None and not e.get("error")
+    )
+    with_opt = sum(
+        1
+        for e in entries
+        if e.get("optimizer", e.get("optimizer_present")) and not e.get("error")
+    )
     with_swa = sum(1 for e in entries if e.get("swa") and not e.get("error"))
     
     print("-" * width)
@@ -328,8 +405,8 @@ def sort_entries_by_folder_and_elo(entries):
             1 if e.get("error") else 0,
             folder_rank(e.get("folder", "")),
             str(e.get("folder", "")).lower(),
-            1 if e.get("elo") is None else 0,
-            -float(e.get("elo") or 0.0),
+            1 if e.get("elo", e.get("estimated_elo")) is None else 0,
+            -float(e.get("elo", e.get("estimated_elo")) or 0.0),
             -float(e.get("mtime_ts") or 0.0),
             str(e.get("path_rel", "")).lower(),
         ),

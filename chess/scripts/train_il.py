@@ -56,6 +56,11 @@ from utils.shared.runtime_helpers import (
     cleanup_interrupted_log_csv,
     run_with_optional_stdout_suppression,
 )
+from utils.shared.model_view import (
+    print_active_model_summary,
+    print_status_table,
+    print_multi_column_table,
+)
 
 
 _LAST_RUN_LOG_CSV = None
@@ -77,8 +82,8 @@ def main():
 
     # Default to compact model logging in IL unless debug mode is enabled.
     config.setdefault('model', {})
-    if 'print_summary' not in config['model']:
-        config['model']['print_summary'] = bool(debug_enabled)
+    # Keep ChessNet constructor quiet; startup summary is printed via shared table view.
+    config['model']['print_summary'] = False
     
     # Set seed
     torch.manual_seed(config['seed'])
@@ -182,13 +187,7 @@ def main():
 
     model = ChessNet(config).to(device)
     model = model.to(memory_format=torch.channels_last)
-    print("Model ready (channels_last enabled)")
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parameters: {trainable_params:,} trainable / {total_params:,} total")
-    # Always show per-layer/group parameter breakdown before startup menu.
-    model._print_parameter_summary(config['model']['num_residual_blocks'])
+    print("Model ready")
 
     startup_plan = plan_il_startup(
         model=model,
@@ -223,102 +222,6 @@ def main():
     global _LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG
     _LAST_RUN_LOG_CSV = logger.csv_path
     _LAST_RUN_LOG_PNG = logger.plot_path
-    
-    # Load data with multi-phase processing
-    print("\nLoading data...")
-    
-    # Find PGN files
-    data_dir = script_dir.parent / config['paths']['data_dir']
-    pgn_files = sorted(data_dir.glob('*.pgn'))
-    
-    if not pgn_files:
-        raise FileNotFoundError(f"No PGN files found in {data_dir}")
-    
-    print(f"PGN files found: {len(pgn_files)}")
-    if debug_enabled:
-        for pgn in pgn_files:
-            print(f"  - {pgn.name}")
-    
-    # 🔧 FIX: Convert relative paths in config to absolute paths
-    # This ensures data/preprocessing is created in chess/data/ regardless of where script is called from
-    config_with_absolute_paths = config.copy()
-    config_with_absolute_paths['paths'] = config['paths'].copy()
-    config_with_absolute_paths['paths']['data_dir'] = str(data_dir.absolute())
-    
-    # Process with smart tracking (compact console by default).
-    metadata = run_with_optional_stdout_suppression(
-        debug_enabled,
-        process_pgn_files,
-        pgn_files,
-        config_with_absolute_paths,
-    )
-
-    print(f"Data ready: {metadata['total_positions']:,} positions (before stride/sampling)")
-    
-    # 🔧 v4.5: Verify binary format compatibility
-    # Layout: [Board 38B] + [GameID 4B] + [MoveIdx 2B] + [MoveTarget 2B] + [Outcome 4B] + [MTL 12B]
-    actual_position_size = metadata.get('position_size')
-    expected_position_size = 50 if not use_mtl else 62  # 🆕 v4.5: Board is now 38B (was 36B)
-    
-    if actual_position_size != expected_position_size:
-        print(f"\n⚠️ WARNING: Position size mismatch!")
-        print(f"  • Expected: {expected_position_size} bytes")
-        print(f"  • Actual: {actual_position_size} bytes")
-        print(f"  • This may indicate the data was preprocessed with an old format or different MTL setting")
-        
-        # Try to determine if it's just a MTL mismatch
-        if actual_position_size == 50 and use_mtl:
-            print(f"  ❌ Data was processed WITHOUT MTL, but config has use_multitask_learning=True")
-            print(f"     Please either:")
-            print(f"     1. Set use_multitask_learning=False in config.yaml, OR")
-            print(f"     2. Delete cache and reprocess data with MTL enabled")
-            raise ValueError("MTL mismatch between data and config")
-        elif actual_position_size == 62 and not use_mtl:
-            print(f"  ❌ Data was processed WITH MTL, but config has use_multitask_learning=False")
-            print(f"     Please either:")
-            print(f"     1. Set use_multitask_learning=True in config.yaml, OR")
-            print(f"     2. Delete cache and reprocess data without MTL")
-            raise ValueError("MTL mismatch between data and config")
-        elif actual_position_size in [48, 60]:  # Old v4.4 format (36B board)
-            print(f"  Data was processed with OLD v4.4 format (36B board, no fullmove metadata)")
-            print(f"  {model_version} adds fullmove number (38B board)")
-            print(f"     Please delete cache (data/preprocessing/) and reprocess with {model_version}")
-            raise ValueError("Old data format - please reprocess")
-        elif actual_position_size in [44, 56]:  # Old v4.3 format (32B board)
-            print(f"  ❌ Data was processed with OLD v4.3 format (32B board, no chess metadata)")
-            print(f"     🆕 {model_version} uses 38B board with castling, en passant, halfmove, fullmove")
-            print(f"     Please delete cache (data/preprocessing/) and reprocess with {model_version}")
-            raise ValueError("Old data format - please reprocess")
-        else:
-            print(f"  ❌ Unknown format mismatch - please delete cache and reprocess")
-            raise ValueError("Position size mismatch")
-    
-    if debug_enabled:
-        print(f"\nBinary format validation:")
-        print(f"  • Position size: {actual_position_size} bytes")
-        print(f"  • Board size: 38 bytes (32B pieces + 6B metadata)")
-        print(f"  • Chess metadata: Castling, En Passant, Halfmove, Fullmove")
-        print(f"  • MTL: {'ENABLED' if use_mtl else 'DISABLED'}")
-        print(f"  • POV: Boards from current player's perspective")
-        print(f"  • Sliding Window: Dynamic history assembly")
-    else:
-        print(
-            "Binary format OK: "
-            f"position_size={actual_position_size}, mtl={'on' if use_mtl else 'off'}, "
-            "metadata=on, pov=on"
-        )
-    
-    # Create dataloaders (they will apply sliding window and build history dynamically)
-    train_loader, val_loader = run_with_optional_stdout_suppression(
-        debug_enabled,
-        create_dataloaders,
-        metadata,
-        config,
-    )
-    print(
-        f"Dataloaders ready: train={len(train_loader.dataset):,}, "
-        f"val={len(val_loader.dataset):,}, batch={config['imitation_learning']['batch_size']}"
-    )
     
     # 🆕 Per-layer learning rates - value head with lower LR to prevent overfitting
     value_head_lr_factor = config['imitation_learning'].get('value_head_lr_factor', 1.0)
@@ -408,6 +311,24 @@ def main():
     transfer_match_ratio = startup_state.get('transfer_match_ratio')
     transfer_freeze_epochs = int(startup_state.get('transfer_freeze_epochs', 0) or 0)
     transfer_trainable_param_names = startup_state.get('transfer_trainable_param_names') or []
+    selected_entry = startup_plan.get("selected_entry") or {}
+
+    source_label = "new (scratch)"
+    if start_mode in {"resume", "transfer"}:
+        source_label = "selected checkpoint"
+        if selected_checkpoint_label:
+            source_label = Path(selected_checkpoint_label).name
+
+    print_active_model_summary(
+        model,
+        config,
+        title="Active Model (IL)",
+        source_label=source_label,
+        startup_mode=start_mode,
+        checkpoint_label=selected_checkpoint_label,
+        device=device,
+        selected_entry=selected_entry,
+    )
 
     if resumed_estimated_elo is not None:
         seed_epoch = resumed_estimated_elo_epoch
@@ -443,6 +364,170 @@ def main():
         plot_run_context = f"{plot_run_context} | source: {Path(selected_checkpoint_label).name}"
     logger.set_run_context(plot_run_context)
 
+    if start_mode == "resume" and start_epoch >= config['imitation_learning']['epochs']:
+        print(f"ℹ️ Checkpoint already at epoch {start_epoch}, no epochs left to run.")
+        return
+
+    # Load data with multi-phase processing
+    data_dir = script_dir.parent / config['paths']['data_dir']
+    pgn_files = sorted(data_dir.glob('*.pgn'))
+
+    if not pgn_files:
+        raise FileNotFoundError(f"No PGN files found in {data_dir}")
+
+    print_status_table(
+        "Loading Data (IL)",
+        [
+            ("Data dir", str(data_dir)),
+            ("PGN files", f"{len(pgn_files):,}"),
+            ("History positions", history_positions),
+            ("Sliding stride", stride),
+            ("MTL", "on" if use_mtl else "off"),
+            ("Debug mode", "on" if debug_enabled else "off"),
+        ],
+    )
+    if debug_enabled:
+        for pgn in pgn_files:
+            print(f"  - {pgn.name}")
+
+    # Convert relative paths in config to absolute paths to keep preprocessing under chess/data.
+    config_with_absolute_paths = config.copy()
+    config_with_absolute_paths['paths'] = config['paths'].copy()
+    config_with_absolute_paths['paths']['data_dir'] = str(data_dir.absolute())
+
+    metadata = run_with_optional_stdout_suppression(
+        debug_enabled,
+        process_pgn_files,
+        pgn_files,
+        config_with_absolute_paths,
+    )
+
+    # Verify binary format compatibility.
+    actual_position_size = metadata.get('position_size')
+    expected_position_size = 50 if not use_mtl else 62
+
+    if actual_position_size != expected_position_size:
+        print(f"\n⚠️ WARNING: Position size mismatch!")
+        print(f"  • Expected: {expected_position_size} bytes")
+        print(f"  • Actual: {actual_position_size} bytes")
+        print(f"  • This may indicate the data was preprocessed with an old format or different MTL setting")
+        
+        if actual_position_size == 50 and use_mtl:
+            print(f"  ❌ Data was processed WITHOUT MTL, but config has use_multitask_learning=True")
+            print(f"     Please either:")
+            print(f"     1. Set use_multitask_learning=False in config.yaml, OR")
+            print(f"     2. Delete cache and reprocess data with MTL enabled")
+            raise ValueError("MTL mismatch between data and config")
+        elif actual_position_size == 62 and not use_mtl:
+            print(f"  ❌ Data was processed WITH MTL, but config has use_multitask_learning=False")
+            print(f"     Please either:")
+            print(f"     1. Set use_multitask_learning=True in config.yaml, OR")
+            print(f"     2. Delete cache and reprocess data without MTL")
+            raise ValueError("MTL mismatch between data and config")
+        elif actual_position_size in [48, 60]:
+            print(f"  Data was processed with OLD v4.4 format (36B board, no fullmove metadata)")
+            print(f"  {model_version} adds fullmove number (38B board)")
+            print(f"     Please delete cache (data/preprocessing/) and reprocess with {model_version}")
+            raise ValueError("Old data format - please reprocess")
+        elif actual_position_size in [44, 56]:
+            print(f"  ❌ Data was processed with OLD v4.3 format (32B board, no chess metadata)")
+            print(f"     🆕 {model_version} uses 38B board with castling, en passant, halfmove, fullmove")
+            print(f"     Please delete cache (data/preprocessing/) and reprocess with {model_version}")
+            raise ValueError("Old data format - please reprocess")
+        else:
+            print(f"  ❌ Unknown format mismatch - please delete cache and reprocess")
+            raise ValueError("Position size mismatch")
+
+    train_loader, val_loader = run_with_optional_stdout_suppression(
+        debug_enabled,
+        create_dataloaders,
+        metadata,
+        config,
+    )
+
+    train_stats = getattr(train_loader.dataset, 'filter_stats', {}) or {}
+    val_stats = getattr(val_loader.dataset, 'filter_stats', {}) or {}
+    sampling_cfg = config.get('data', {}).get('position_sampling', {})
+    sampling_enabled = bool(sampling_cfg.get('enabled', False))
+
+    def _as_int(value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _stat(stats, key, default=0):
+        return _as_int(stats.get(key, default), default=default)
+
+    def _fmt_count(value):
+        return f"{_as_int(value):,}"
+
+    def _fmt_cut(removed, base):
+        removed = max(0, _as_int(removed))
+        base = max(0, _as_int(base))
+        pct = (removed * 100.0 / base) if base > 0 else 0.0
+        return f"{removed:,} ({pct:.2f}%)"
+
+    train_before = _stat(train_stats, 'input_count', len(train_loader.dataset))
+    val_before = _stat(val_stats, 'input_count', len(val_loader.dataset))
+
+    train_after_stride = _stat(train_stats, 'after_stride_count', train_before)
+    val_after_stride = _stat(val_stats, 'after_stride_count', val_before)
+
+    train_final = _stat(train_stats, 'final_count', len(train_loader.dataset))
+    val_final = _stat(val_stats, 'final_count', len(val_loader.dataset))
+
+    train_stride_cut = max(0, train_before - train_after_stride)
+    val_stride_cut = max(0, val_before - val_after_stride)
+    total_before = train_before + val_before
+    total_after_stride = train_after_stride + val_after_stride
+    total_stride_cut = train_stride_cut + val_stride_cut
+
+    train_second_cut = max(0, train_after_stride - train_final)
+    val_second_cut = max(0, val_after_stride - val_final)
+    total_final = train_final + val_final
+    total_second_cut = train_second_cut + val_second_cut
+
+    print_status_table(
+        "Data Ready (IL) - Overview",
+        [
+            ("Positions total", f"{metadata.get('total_positions', 0):,}"),
+            ("Position size", f"{actual_position_size} bytes"),
+            ("Board encoding", "38B board (32B pieces + 6B metadata)"),
+            ("POV", "on"),
+            ("Sliding stride", stride),
+            ("2nd filter", "position_sampling (on)" if sampling_enabled else "position_sampling (off)"),
+            ("Batch size", config['imitation_learning']['batch_size']),
+        ],
+    )
+
+    print_multi_column_table(
+        "Data Ready (IL) - Filtering Pipeline",
+        headers=["Stage", "Train", "Val", "Total"],
+        rows=[
+            ("Split (before filters)", _fmt_count(train_before), _fmt_count(val_before), _fmt_count(total_before)),
+            (
+                "Sliding window removed",
+                _fmt_cut(train_stride_cut, train_before),
+                _fmt_cut(val_stride_cut, val_before),
+                _fmt_cut(total_stride_cut, total_before),
+            ),
+            (
+                "After sliding window",
+                _fmt_count(train_after_stride),
+                _fmt_count(val_after_stride),
+                _fmt_count(total_after_stride),
+            ),
+            (
+                "2nd filter removed",
+                _fmt_cut(train_second_cut, train_after_stride),
+                _fmt_cut(val_second_cut, val_after_stride),
+                _fmt_cut(total_second_cut, total_after_stride),
+            ),
+            ("Final samples", _fmt_count(train_final), _fmt_count(val_final), _fmt_count(total_final)),
+        ],
+    )
+
     # Stochastic Weight Averaging (SWA) for better generalization with large batches
     use_swa = config['imitation_learning'].get('use_swa', False)
     swa_model = None
@@ -454,10 +539,6 @@ def main():
         swa_lr = config['imitation_learning'].get('swa_lr', 0.0005)
         swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=swa_lr)
         print(f"SWA enabled: start_epoch={swa_start} (inclusive), swa_lr={swa_lr:.6f}")
-
-    if start_mode == "resume" and start_epoch >= config['imitation_learning']['epochs']:
-        print(f"ℹ️ Checkpoint already at epoch {start_epoch}, no epochs left to run.")
-        return
 
     # Training loop
     print("\nStarting training...")
@@ -887,4 +968,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         cleanup_interrupted_log_csv(_LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG, "IL")
         print("\nCtrl+C detected. IL training stopped gracefully.")
-

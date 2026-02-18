@@ -1,10 +1,14 @@
 """RL startup flow (menu, checkpoint catalog, resume/transfer loading)."""
 
-from datetime import datetime
 from pathlib import Path
 import sys
 
 from src.model import load_checkpoint_file, transfer_matching_weights
+from utils.shared.model_catalog import (
+    load_checkpoint_metadata,
+    print_model_table,
+    sort_entries_by_folder_and_elo,
+)
 
 
 def _print_block_title(title):
@@ -33,39 +37,6 @@ def _path_relative_to_base(path, base_dir):
         return str(path.resolve().relative_to(base_dir.resolve()))
     except ValueError:
         return str(path)
-
-
-def _top_folder_from_rel(path_rel):
-    parts = path_rel.replace("/", "\\").split("\\")
-    if len(parts) <= 1:
-        return "root"
-    return parts[0]
-
-
-def _folder_rank(folder):
-    key = str(folder).strip().lower()
-    if key == "root":
-        return 0
-    if key == "il":
-        return 1
-    if key == "rl":
-        return 2
-    return 3
-
-
-def _sort_checkpoint_catalog(catalog):
-    return sorted(
-        catalog,
-        key=lambda entry: (
-            1 if entry.get("error") else 0,
-            _folder_rank(entry.get("folder", "")),
-            str(entry.get("folder", "")).lower(),
-            1 if entry.get("estimated_elo") is None else 0,
-            -float(entry.get("estimated_elo") or 0.0),
-            -float(entry.get("mtime_ts") or 0.0),
-            str(entry.get("model_name", "")).lower(),
-        ),
-    )
 
 
 def _normalize_source_state(source_state, target_keys):
@@ -193,27 +164,15 @@ def _build_checkpoint_catalog(candidates, model, device, base_dir):
     catalog = []
 
     for checkpoint_path in candidates:
-        path_rel = _path_relative_to_base(checkpoint_path, base_dir)
-        stat = checkpoint_path.stat()
-        entry = {
-            "path": checkpoint_path,
-            "path_rel": path_rel,
-            "folder": _top_folder_from_rel(path_rel),
-            "model_name": checkpoint_path.name,
-            "size_mb": stat.st_size / (1024 ** 2),
-            "mtime_ts": stat.st_mtime,
-            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
-            "epoch": None,
-            "version": None,
-            "top1": None,
-            "val_loss": None,
-            "policy_loss": None,
-            "estimated_elo": None,
-            "optimizer_present": False,
-            "compatibility_ratio": 0.0,
-            "strict_resume_ok": False,
-            "error": None,
-        }
+        entry = load_checkpoint_metadata(checkpoint_path, base_dir)
+        entry["estimated_elo"] = entry.get("elo")
+        entry["optimizer_present"] = bool(entry.get("optimizer", False))
+        entry["compatibility_ratio"] = None
+        entry["strict_resume_ok"] = False
+
+        if entry.get("error"):
+            catalog.append(entry)
+            continue
 
         try:
             checkpoint = load_checkpoint_file(str(checkpoint_path), device)
@@ -228,21 +187,11 @@ def _build_checkpoint_catalog(candidates, model, device, base_dir):
             catalog.append(entry)
             continue
 
-        entry["epoch"] = _safe_int(checkpoint.get("epoch"))
-        entry["version"] = checkpoint.get("version")
-        entry["top1"] = _safe_float(checkpoint.get("val_policy_top1", checkpoint.get("policy_top1_acc")))
-        entry["val_loss"] = _safe_float(checkpoint.get("val_loss", checkpoint.get("loss")))
-        entry["policy_loss"] = _safe_float(checkpoint.get("val_policy_loss", checkpoint.get("policy_loss")))
-        entry["estimated_elo"] = _safe_float(
-            checkpoint.get("estimated_elo", checkpoint.get("last_estimated_elo"))
-        )
-        entry["optimizer_present"] = "optimizer_state_dict" in checkpoint
-
         compat = _compute_compatibility(target_state, model_state)
         entry.update(compat)
         catalog.append(entry)
 
-    return _sort_checkpoint_catalog(catalog)
+    return sort_entries_by_folder_and_elo(catalog)
 
 
 def _print_checkpoint_catalog(catalog, start_mode):
@@ -251,44 +200,18 @@ def _print_checkpoint_catalog(catalog, start_mode):
         return
 
     mode_label = "Resume" if start_mode == "resume" else "Transfer"
-    _print_block_title(f"Available Checkpoints ({mode_label})")
-    print(" ID  Folder  Version  Epoch   Top1      ValLoss    PolLoss      Elo   Compat   Strict  Opt   SizeMB  Updated           Checkpoint")
-    print("---- ------- -------- ------ -------- ---------- ---------- -------- -------- ------- ---- ------- ----------------- -----------------------------------------")
-
-    last_folder = None
-    for idx, entry in enumerate(catalog, start=1):
-        folder = entry.get("folder", "root")
-        if folder != last_folder:
-            print(f"-- {folder} --")
-            last_folder = folder
-
-        if entry.get("error"):
-            print(
-                f"{idx:>3}  {folder:<7} {'n/a':<8}   n/a      n/a        n/a        n/a      n/a      n/a     n/a   "
-                f" n/a  {entry['size_mb']:>6.1f}  {entry['modified']:<17} "
-                f"{entry['model_name']} [ERROR: {entry['error']}]"
-            )
-            continue
-
-        epoch_value = entry.get("epoch")
-        epoch_str = f"{epoch_value + 1}" if epoch_value is not None else "n/a"
-        version_str = str(entry.get("version") or "n/a")[:8]
-        top1 = entry.get("top1")
-        top1_str = f"{top1 * 100:6.2f}%" if top1 is not None else "  n/a  "
-        val_loss = entry.get("val_loss")
-        loss_str = f"{val_loss:8.4f}" if val_loss is not None else "   n/a  "
-        pol_loss = entry.get("policy_loss")
-        pol_loss_str = f"{pol_loss:8.4f}" if pol_loss is not None else "   n/a  "
-        estimated_elo = entry.get("estimated_elo")
-        elo_str = f"{int(round(float(estimated_elo))):>6}" if estimated_elo is not None else "  n/a "
-        compat_str = f"{entry.get('compatibility_ratio', 0.0) * 100:6.2f}%"
-        strict_str = "yes" if entry.get("strict_resume_ok", False) else "no"
-        optimizer_str = "yes" if entry.get("optimizer_present", False) else "no"
-        print(
-            f"{idx:>3}  {folder:<7} {version_str:<8} {epoch_str:>6}  {top1_str:>8}  {loss_str:>10}  {pol_loss_str:>10}  {elo_str:>8}  "
-            f"{compat_str:>6}   {strict_str:>5}  {optimizer_str:>3}  "
-            f"{entry['size_mb']:>6.1f}  {entry['modified']:<17} {entry['model_name']}"
-        )
+    print_model_table(
+        catalog,
+        title=f"Available Checkpoints ({mode_label})",
+        show_folder=True,
+        show_version=True,
+        show_modified=True,
+        show_swa=True,
+        show_opt=True,
+        show_compat=True,
+        show_strict=True,
+        group_by_folder=True,
+    )
 
 
 def _choose_checkpoint_path(catalog):

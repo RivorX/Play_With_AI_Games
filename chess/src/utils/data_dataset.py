@@ -64,27 +64,55 @@ class BinaryChessDataset(Dataset):
         
         # 🆕 Apply stride filter to indices
         if self.stride > 1:
+            input_count = len(indices)
+            after_stride_count = input_count
+            stride_removed_count = 0
+
             print(f"  🔄 Applying stride={stride} (mode=fullmove_per_game_offset)")
-            # Filter indices based on stride
-            # We need to check MoveIdx for each position
             filtered_indices = self._filter_indices_by_stride(indices)
             self.indices = filtered_indices
-            print(f"     Original positions: {len(indices):,}")
-            print(f"     After stride filter: {len(self.indices):,}")
+            after_stride_count = len(self.indices)
+            stride_removed_count = max(0, input_count - after_stride_count)
+            print(f"     Original positions: {input_count:,}")
+            print(f"     After stride filter: {after_stride_count:,}")
         else:
+            input_count = len(indices)
+            after_stride_count = input_count
+            stride_removed_count = 0
             self.indices = indices
-        
-        # Optional: position sampling by game progress (reduce opening duplicates)
-        if self.sampling_config.get('enabled', False):
+
+        sampling_requested = bool(self.sampling_config.get('enabled', False))
+        sampling_applied = False
+        after_sampling_count = len(self.indices)
+        sampling_removed_count = 0
+
+        # Optional second filtering stage: position sampling by game progress.
+        if sampling_requested:
             if self.game_length_by_id is None:
                 print("  ⚠️ position_sampling enabled but game_length_by_id missing; skipping sampling.")
             else:
+                sampling_applied = True
+                before_sampling_count = len(self.indices)
                 print("  🎯 Applying position sampling by game progress")
                 filtered_indices = self._filter_indices_by_progress_sampling(self.indices)
-                print(f"     Before sampling: {len(self.indices):,}")
-                print(f"     After sampling:  {len(filtered_indices):,}")
                 self.indices = filtered_indices
-        
+                after_sampling_count = len(self.indices)
+                sampling_removed_count = max(0, before_sampling_count - after_sampling_count)
+                print(f"     Before sampling: {before_sampling_count:,}")
+                print(f"     After sampling:  {after_sampling_count:,}")
+
+        final_count = len(self.indices)
+        self.filter_stats = {
+            'input_count': input_count,
+            'after_stride_count': after_stride_count,
+            'stride_removed_count': stride_removed_count,
+            'sampling_requested': sampling_requested,
+            'sampling_applied': sampling_applied,
+            'after_sampling_count': after_sampling_count,
+            'sampling_removed_count': sampling_removed_count,
+            'final_count': final_count,
+        }
+
         self._mmap = None
         self._file = None
     
@@ -661,3 +689,4 @@ def create_dataloaders(metadata, config):
     print(f"✓ DataLoaders created (prefetch_factor={prefetch_factor})")
     
     return train_loader, val_loader
+

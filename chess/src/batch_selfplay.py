@@ -31,6 +31,7 @@ class BatchSelfPlayMCTS:
         self.config = config
         self.device = device
         self.model.eval()
+        self.verbose = bool(config.get('reinforcement_learning', {}).get('self_play_worker_verbose', False))
         
         # Import here to avoid circular dependency
         from src.mcts import BatchMCTS
@@ -72,7 +73,7 @@ class BatchSelfPlayMCTS:
             all_positions.extend(positions)
             game_lengths.append(game_length)
             
-            if (game_idx + 1) % 10 == 0:
+            if self.verbose and (game_idx + 1) % 10 == 0:
                 print(f"  Completed {game_idx + 1}/{num_games} games (avg length: {np.mean(game_lengths[-10:]):.1f} moves)")
         
         return all_positions, game_lengths
@@ -619,6 +620,11 @@ def play_games_mcts_worker(rank, model_state, config, device_id, num_games, resu
     try:
         from src.model import ChessNet
         rl_cfg = config.get('reinforcement_learning', {})
+        worker_verbose = bool(rl_cfg.get('self_play_worker_verbose', False))
+
+        def _wlog(message):
+            if worker_verbose:
+                print(f"Worker {rank}: {message}")
         # Silence model summary in workers
         config['model'] = {**config.get('model', {}), 'print_summary': False}
         
@@ -643,7 +649,7 @@ def play_games_mcts_worker(rank, model_state, config, device_id, num_games, resu
                 except Exception:
                     pass
         
-        print(f"Worker {rank}: Starting on {device}")
+        _wlog(f"Starting on {device}")
         
         # Load model
         model = ChessNet(config).to(device)
@@ -670,11 +676,14 @@ def play_games_mcts_worker(rank, model_state, config, device_id, num_games, resu
         if use_batch:
             engine = BatchSelfPlayMCTSBatch(model, config, device, max_batch_games)
             actual_max = min(max_batch_games, num_games)
-            print(f"Worker {rank}: Batch self-play enabled (max {max_batch_games}, actual {actual_max})")
+            _wlog(f"Batch self-play enabled (max {max_batch_games}, actual {actual_max})")
         else:
             engine = BatchSelfPlayMCTS(model, config, device)
         
-        print(f"Worker {rank}: Playing {num_games} games with MCTS ({config['reinforcement_learning']['mcts_simulations']} sims/move)")
+        _wlog(
+            f"Playing {num_games} games with MCTS "
+            f"({config['reinforcement_learning']['mcts_simulations']} sims/move)"
+        )
 
         save_every = rl_cfg.get('self_play_save_every_games_resolved', None)
         if save_every is None:
@@ -722,9 +731,17 @@ def play_games_mcts_worker(rank, model_state, config, device_id, num_games, resu
             with open(result_file_path, 'wb') as f:
                 pickle.dump((positions, game_lengths), f)
 
-        print(f"Worker {rank}: ✅ Generated {total_positions} positions from {total_games} games")
-        print(f"Worker {rank}: Saved to {result_file_path}")
+        _wlog(f"Generated {total_positions} positions from {total_games} games")
+        _wlog(f"Saved to {result_file_path}")
     
+    except KeyboardInterrupt:
+        # Avoid noisy tracebacks when user interrupts training.
+        try:
+            with open(result_file_path, 'wb') as f:
+                pickle.dump(([], []), f)
+        finally:
+            raise SystemExit(130)
+
     except Exception as e:
         print(f"❌ Worker {rank} failed: {e}")
         import traceback
