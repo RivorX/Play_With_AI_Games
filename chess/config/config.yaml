@@ -121,9 +121,11 @@ imitation_learning:
   # Checkpoint content
   save_optimizer_state: true  # Save optimizer state in IL checkpoints for true resume
 
-  # Training hyperparameters
+  # Training hyperparameters automatic tuning (see auto_tune section below)
   batch_size: 9216           # Batch size
-  learning_rate: 0.0005      # Learning rate 
+  learning_rate: 0.001       # Base/fallback LR (used for config mode and LR-test fallback)
+
+  # Advanced training hyperparameters
   value_head_lr_factor: 1.2  # Value head LR multiplier (1.0 = full LR)
   epochs: 30                 # Maximum training epochs
   weight_decay: 0.002        # L2 regularization (10x stronger for value head)
@@ -157,6 +159,21 @@ imitation_learning:
   # Early stopping
   max_patience: 5           # ℹ️ Stop if no improvement for N epochs
   min_delta: 0.001           # Minimum improvement threshold
+
+  # Auto-tuning (batch size + LR range test)
+  auto_tune:
+    cache_path: "logs/il_auto_tune_cache.yaml"
+    free_vram_utilization: 0.97
+    safety_margin_gib: 0.2
+    min_batch_size: 64
+    max_batch_size: 32768
+    batch_round_to: 64
+    lr_test_min: 0.00008
+    lr_test_max: 0.002
+    lr_test_points: 10
+    lr_test_steps: 3
+    lr_min: 0.00008
+    lr_max: 0.002
 
 
 # ------------------------------------------------------------------------------

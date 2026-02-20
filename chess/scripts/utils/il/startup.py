@@ -64,6 +64,40 @@ def ask_transfer_freeze_epochs(default_epochs=0):
         print("Invalid value. Enter an integer >= 0.")
 
 
+def ask_il_hyperparam_source(default_mode="config"):
+    """Ask whether to use auto-tuned IL batch/LR or config values."""
+    if default_mode not in {"auto", "config"}:
+        default_mode = "config"
+    if not sys.stdin.isatty():
+        return default_mode
+
+    _print_block_title("IL Hyperparameter Source")
+    print("1) Auto tune batch size + learning rate (cached per model hash)")
+    print("2) Use values from config.yaml")
+
+    default_choice = "1" if default_mode == "auto" else "2"
+    mapping = {
+        "1": "auto",
+        "2": "config",
+        "auto": "auto",
+        "config": "config",
+    }
+    while True:
+        try:
+            choice = input(f"Choose [1/2] (default {default_choice}): ").strip().lower()
+        except EOFError:
+            choice = default_choice
+
+        if not choice:
+            choice = default_choice
+
+        selected = mapping.get(choice)
+        if selected is not None:
+            return selected
+
+        print("Invalid choice. Enter 1, 2, or press Enter for default.")
+
+
 def _print_block_title(title):
     line = "=" * 92
     print(f"\n{line}")
@@ -94,7 +128,7 @@ def _collect_il_checkpoints(best_model_path, il_dir):
     return candidates
 
 
-def _choose_start_mode(has_checkpoints):
+def ask_il_start_mode(has_checkpoints):
     if not has_checkpoints:
         _print_block_title("IL Startup")
         print("No checkpoints found. Starting new training.")
@@ -127,6 +161,10 @@ def _choose_start_mode(has_checkpoints):
         if selected is not None:
             return selected
         print("Invalid choice. Enter 1, 2, 3, or press Enter for default.")
+
+
+def has_il_checkpoints(best_model_path, il_dir):
+    return len(_collect_il_checkpoints(best_model_path, il_dir)) > 0
 
 
 def _normalize_source_state(source_state, target_keys):
@@ -380,14 +418,20 @@ def _infer_changed_parameter_names(model, transfer_report):
     return sorted(changed_params)
 
 
-def plan_il_startup(model, device, base_dir, best_model_path, il_dir):
+def plan_il_startup(model, device, base_dir, best_model_path, il_dir, start_mode=None):
     """Interactive startup menu + checkpoint selection (no state loading yet)."""
     available_checkpoints = _collect_il_checkpoints(best_model_path, il_dir)
     catalog_base_dir = best_model_path.parent
     selected_checkpoint = None
     checkpoint_catalog = []
 
-    start_mode = _choose_start_mode(has_checkpoints=(len(available_checkpoints) > 0))
+    has_checkpoints = len(available_checkpoints) > 0
+    if start_mode not in {"new", "resume", "transfer"}:
+        start_mode = ask_il_start_mode(has_checkpoints=has_checkpoints)
+    elif not has_checkpoints and start_mode in {"resume", "transfer"}:
+        _print_block_title("IL Startup")
+        print("No checkpoints found. Starting new training.")
+        start_mode = "new"
 
     if start_mode in {"resume", "transfer"}:
         print("\nScanning checkpoints (metrics + compatibility)...")

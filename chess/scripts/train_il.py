@@ -43,7 +43,11 @@ from utils.il.startup import (
     plan_il_startup,
     apply_il_startup_plan,
     ask_resume_additional_epochs,
+    ask_il_hyperparam_source,
+    ask_il_start_mode,
+    has_il_checkpoints,
 )
+from utils.il.auto_tune import resolve_il_hyperparameters
 from utils.il.elo_async import ILEloCoordinator
 from utils.il.checkpointing import (
     build_runtime_state,
@@ -150,38 +154,6 @@ def main():
     # Setup debug logging
     debug_log_file = None
     
-    if debug_enabled:
-        debug_dir = logs_dir / "debug"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        debug_log_file = debug_dir / f"training_profile_{timestamp}.txt"
-        
-        print(
-            f"Debug mode: profile={config['debug'].get('profile_training', False)}, "
-            f"gpu_mem_log={config['debug'].get('log_gpu_memory', False)}, "
-            f"every={config['debug'].get('profile_every_n_epochs', 1)} ep, "
-            f"log={debug_log_file}"
-        )
-        
-        with open(debug_log_file, 'w', encoding='utf-8') as f:
-            f.write("="*70 + "\n")
-            f.write(f"🐛 TRAINING DEBUG LOG - {model_version} Chess Metadata + WDL\n")
-            f.write("="*70 + "\n")
-            f.write(f"Timestamp: {timestamp}\n")
-            f.write(f"Model: {config['model']['filters']} filters, {config['model']['num_residual_blocks']} blocks\n")
-            f.write(f"Batch size: {config['imitation_learning']['batch_size']}\n")
-            f.write(f"Learning rate: {config['imitation_learning']['learning_rate']}\n")
-            f.write(f"History positions: {history_positions} (dynamic)\n")
-            f.write(f"Sliding window stride: {stride}x\n")
-            f.write(f"Input planes: {expected_input_planes} (16 per position)\n")
-            f.write(f"Chess metadata: Castling, En Passant, Halfmove, Fullmove\n")
-            f.write(f"MTL enabled: {use_mtl}\n")
-            f.write("WDL Value: True (forced)\n")
-            f.write(f"POV enabled: True\n")
-            f.write("="*70 + "\n\n")
-    
     # Create model early so startup menu appears before any data processing.
     print("\nPreparing model for startup menu...")
 
@@ -189,12 +161,88 @@ def main():
     model = model.to(memory_format=torch.channels_last)
     print("Model ready")
 
+    hparam_mode = ask_il_hyperparam_source(default_mode="config")
+    selected_start_mode = ask_il_start_mode(
+        has_checkpoints=has_il_checkpoints(best_model_path, il_dir)
+    )
+
+    hparam_resolution = resolve_il_hyperparameters(
+        config=config,
+        model=model,
+        device=device,
+        base_dir=base_dir,
+        mode=hparam_mode,
+    )
+
+    model_hash_short = str(hparam_resolution.get("model_hash") or "n/a")[:16]
+    print_status_table(
+        "IL Hyperparameters",
+        [
+            ("Source", hparam_resolution.get("source", "config")),
+            ("Batch size", config['imitation_learning']['batch_size']),
+            ("Learning rate", f"{float(config['imitation_learning']['learning_rate']):.6g}"),
+            ("Model hash", model_hash_short),
+        ],
+    )
+
+    if debug_enabled:
+        debug_dir = logs_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_log_file = debug_dir / f"training_profile_{timestamp}.txt"
+
+        print(
+            f"Debug mode: profile={config['debug'].get('profile_training', False)}, "
+            f"gpu_mem_log={config['debug'].get('log_gpu_memory', False)}, "
+            f"every={config['debug'].get('profile_every_n_epochs', 1)} ep, "
+            f"log={debug_log_file}"
+        )
+
+        with open(debug_log_file, 'w', encoding='utf-8') as f:
+            f.write("=" * 70 + "\n")
+            f.write(f"🐛 TRAINING DEBUG LOG - {model_version} Chess Metadata + WDL\n")
+            f.write("=" * 70 + "\n")
+            f.write(f"Timestamp: {timestamp}\n")
+            f.write(
+                f"Model: {config['model']['filters']} filters, "
+                f"{config['model']['num_residual_blocks']} blocks\n"
+            )
+            f.write(f"Model hash: {hparam_resolution.get('model_hash', 'n/a')}\n")
+            f.write(f"Hyperparameter source: {hparam_resolution.get('source', 'config')}\n")
+            f.write(f"Batch size: {config['imitation_learning']['batch_size']}\n")
+            f.write(f"Learning rate: {config['imitation_learning']['learning_rate']}\n")
+            f.write(f"History positions: {history_positions} (dynamic)\n")
+            f.write(f"Sliding window stride: {stride}x\n")
+            f.write(f"Input planes: {expected_input_planes} (16 per position)\n")
+            f.write("Chess metadata: Castling, En Passant, Halfmove, Fullmove\n")
+            f.write(f"MTL enabled: {use_mtl}\n")
+            f.write("WDL Value: True (forced)\n")
+            f.write("POV enabled: True\n")
+            if hparam_resolution.get("mode") == "auto":
+                f.write(
+                    f"Auto-tune cache: {hparam_resolution.get('cache_path', 'n/a')} "
+                    f"(hit={hparam_resolution.get('cache_hit', False)})\n"
+                )
+                dedicated_vram = hparam_resolution.get("dedicated_vram_bytes")
+                if dedicated_vram:
+                    f.write(f"Dedicated VRAM: {dedicated_vram}\n")
+                budget_bytes = hparam_resolution.get("budget_bytes")
+                if budget_bytes:
+                    f.write(f"Target VRAM budget: {budget_bytes}\n")
+                estimated_peak = hparam_resolution.get("estimated_peak_bytes")
+                if estimated_peak:
+                    f.write(f"Estimated train peak: {estimated_peak}\n")
+            f.write("=" * 70 + "\n\n")
+
     startup_plan = plan_il_startup(
         model=model,
         device=device,
         base_dir=base_dir,
         best_model_path=best_model_path,
         il_dir=il_dir,
+        start_mode=selected_start_mode,
     )
 
     # For resume mode, allow extending training by additional epochs.
