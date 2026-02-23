@@ -218,7 +218,9 @@ class MultiGameBatchMCTS:
         history_tensors = []
         if board_history:
             history_boards = board_history[-self.history_positions:]
-            for hist_board in history_boards:
+            for hist_fen in history_boards:
+                # 🔥 OPTIMIZATION: Reconstruct board from FEN string (saves RAM)
+                hist_board = chess.Board(hist_fen) if isinstance(hist_fen, str) else hist_fen
                 hist_tensor = board_to_tensor(
                     hist_board,
                     flip_perspective=(current_board.turn == chess.BLACK)
@@ -235,26 +237,30 @@ class MultiGameBatchMCTS:
         return np.concatenate(history_tensors, axis=0)
 
     def _select_child(self, node):
-        """Select child with highest UCB score"""
+        """Select child with highest UCB score (optimized)"""
         best_score = -float('inf')
         best_child = None
 
+        # Precalculate parent term to avoid doing it for every child
+        parent_sqrt = math.sqrt(node.visit_count + node.virtual_loss + 1)
+        c_puct = self.c_puct
+
         for _, child in node.children.items():
-            score = self._ucb_score(node, child)
+            # Inline value() and ucb_score() for speed
+            cv = child.visit_count + child.virtual_loss
+            if cv == 0:
+                q_value = 0.0
+            else:
+                q_value = (child.value_sum - child.virtual_loss) / cv
+                
+            u_value = c_puct * child.prior * parent_sqrt / (1 + cv)
+            score = q_value + u_value
+
             if score > best_score:
                 best_score = score
                 best_child = child
 
         return best_child
-
-    def _ucb_score(self, parent, child):
-        """Upper Confidence Bound with virtual loss (AlphaZero PUCT)"""
-        q_value = child.value()
-        # 🔥 FIX: math.sqrt (not np.sqrt) + 1 ensures exploration with 0 visits
-        u_value = (self.c_puct * child.prior *
-                   math.sqrt(parent.visit_count + parent.virtual_loss + 1) /
-                   (1 + child.visit_count + child.virtual_loss))
-        return q_value + u_value
 
     def _backpropagate(self, search_path, value):
         """Backpropagate value"""
@@ -286,6 +292,7 @@ class MultiGameBatchMCTS:
                 target_fen = board.fen()
                 for _, child in root.children.items():
                     if child.get_fen() == target_fen:
+                        _ = child.board  # Ensure board is instantiated
                         root = child
                         root.parent = None
                         break
@@ -302,7 +309,17 @@ class MultiGameBatchMCTS:
         game_ptr = 0
 
         while total_remaining > 0:
-            batch_size = min(self.eval_batch_size, total_remaining)
+            # Cap per-game quota per round so that backprop happens before all
+            # simulations of a single game are consumed  (fixes: when
+            # eval_batch_size >= num_simulations, all sims land in one batch,
+            # root is never traversed after expansion, children stay at 0 visits).
+            max_remaining_any_game = max(remaining) if remaining else 1
+            slots_per_game = max(1, min(
+                self.eval_batch_size // max(1, len(game_states)),
+                max_remaining_any_game // 4,
+            ))
+            batch_size = min(self.eval_batch_size, total_remaining,
+                             slots_per_game * len(game_states))
             leaf_nodes = []
             search_paths = []
             leaf_game_indices = []
@@ -326,7 +343,7 @@ class MultiGameBatchMCTS:
                 search_path = [node]
                 node.add_virtual_loss()
 
-                while not node.is_leaf() and not node.board.is_game_over():
+                while not node.is_leaf() and not node.is_game_over:
                     node = self._select_child(node)
                     node.add_virtual_loss()
                     search_path.append(node)
@@ -358,13 +375,24 @@ class MultiGameBatchMCTS:
         """
         Batch expansion + evaluation for leaf nodes across games.
         """
-        terminal_values = []
-        non_terminal_indices = []
+        # The same leaf can appear multiple times in one batch.
+        # Evaluate each unique node once and fan-out value to duplicates.
+        node_occurrences = {}
+        unique_entries = []
+        for idx, node in enumerate(nodes):
+            node_id = id(node)
+            if node_id not in node_occurrences:
+                node_occurrences[node_id] = [idx]
+                unique_entries.append((node, game_indices[idx]))
+            else:
+                node_occurrences[node_id].append(idx)
+
+        terminal_values = {}
         non_terminal_nodes = []
         non_terminal_game_indices = []
 
-        for i, node in enumerate(nodes):
-            if node.board.is_game_over():
+        for node, gi in unique_entries:
+            if node.is_game_over:
                 result = node.board.result()
                 if result == '1-0':
                     value = 1.0 if node.board.turn == chess.WHITE else -1.0
@@ -372,13 +400,12 @@ class MultiGameBatchMCTS:
                     value = -1.0 if node.board.turn == chess.WHITE else 1.0
                 else:
                     value = 0.0
-                terminal_values.append((i, value))
+                terminal_values[id(node)] = value
             else:
-                non_terminal_indices.append(i)
                 non_terminal_nodes.append(node)
-                non_terminal_game_indices.append(game_indices[i])
+                non_terminal_game_indices.append(gi)
 
-        all_values = [None] * len(nodes)
+        values_by_node_id = {}
 
         if non_terminal_nodes:
             board_tensors = torch.stack([
@@ -397,17 +424,20 @@ class MultiGameBatchMCTS:
                         policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
                 else:
                     policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
+                
+                # 🔥 OPTIMIZATION: Transfer entire batch to CPU at once, not row by row
+                if values_batch.dim() == 2 and values_batch.shape[1] == 3:
+                    # WDL output: compute softmax on GPU before transfer
+                    wdl_probs = torch.softmax(values_batch, dim=1)
+                    values_batch = (wdl_probs[:, 0] - wdl_probs[:, 2])
+                
+                # Convert to float32 before numpy() because numpy doesn't support bfloat16
+                policy_logits_batch = policy_logits_batch.float().cpu().numpy()
+                values_batch = values_batch.float().cpu().numpy()
 
             for idx, node in enumerate(non_terminal_nodes):
-                policy_logits = policy_logits_batch[idx].cpu().numpy()
-
-                value_tensor = values_batch[idx]
-                if value_tensor.dim() == 1 and value_tensor.shape[0] == 3:
-                    # 🔥 OPTIMIZATION: Compute softmax on GPU, only transfer final result
-                    wdl_probs = torch.softmax(value_tensor, dim=0)
-                    value = (wdl_probs[0] - wdl_probs[2]).item()
-                else:
-                    value = value_tensor.item()
+                policy_logits = policy_logits_batch[idx]
+                value = float(values_batch[idx])
 
                 legal_moves = list(node.board.legal_moves)
                 legal_indices = [move_to_index(m, node.board) for m in legal_moves]
@@ -434,20 +464,22 @@ class MultiGameBatchMCTS:
                 # Expand only if not already expanded (avoid overwriting priors in same batch)
                 if not node.expanded:
                     for move, prior in zip(legal_moves, legal_probs):
-                        child_board = node.board.copy()
-                        child_board.push(move)
                         node.children[move] = MCTSNode(
-                            child_board,
+                            board=None,
                             parent=node,
                             move=move,
-                            prior=prior
+                            prior=prior,
+                            copy_board=False,
                         )
                     node.expanded = True
 
-                all_values[non_terminal_indices[idx]] = value
+                values_by_node_id[id(node)] = value
 
-        for idx, value in terminal_values:
-            all_values[idx] = value
+        all_values = [0.0] * len(nodes)
+        for node_id, indices in node_occurrences.items():
+            value = values_by_node_id.get(node_id, terminal_values.get(node_id, 0.0))
+            for idx in indices:
+                all_values[idx] = value
 
         return all_values
 
@@ -474,10 +506,13 @@ class BatchSelfPlayMCTSBatch:
         self.temperature = config['reinforcement_learning'].get('mcts_temperature', 1.0)
 
         self.max_batch_games_per_worker = max(1, int(max_batch_games_per_worker))
+        self._progress_file = None  # Set externally to enable progress reporting
+        self._games_completed = 0
 
     def play_games(self, num_games):
         all_positions = []
         game_lengths = []
+        self._games_completed = 0
 
         games_left = num_games
         batch_idx = 0
@@ -489,6 +524,15 @@ class BatchSelfPlayMCTSBatch:
             positions, lengths = self._play_batch(batch_size)
             all_positions.extend(positions)
             game_lengths.extend(lengths)
+            self._games_completed += len(lengths)
+
+            # Report progress to file if requested
+            if self._progress_file is not None:
+                try:
+                    with open(self._progress_file, 'w') as _pf:
+                        _pf.write(str(self._games_completed))
+                except Exception:
+                    pass
 
             games_left -= batch_size
 
@@ -534,8 +578,14 @@ class BatchSelfPlayMCTSBatch:
                 policy_target = torch.zeros(ACTION_SIZE, dtype=torch.float32)
                 total_visits = sum(visit_counts.values())
 
-                for m, visits in visit_counts.items():
-                    policy_target[move_to_index(m, board)] = visits / total_visits
+                if total_visits > 0:
+                    for m, visits in visit_counts.items():
+                        policy_target[move_to_index(m, board)] = visits / total_visits
+                else:
+                    # Fallback: uniform over legal moves
+                    n = len(visit_counts)
+                    for m in visit_counts:
+                        policy_target[move_to_index(m, board)] = 1.0 / n
 
                 board_tensor = torch.from_numpy(
                     self.mcts._build_history_tensor(board, gs['board_history'])
@@ -543,7 +593,8 @@ class BatchSelfPlayMCTSBatch:
                 gs['game_history'].append((board_tensor, policy_target, board.turn))
 
                 # Update history BEFORE making the move
-                gs['board_history'].append(board.copy())
+                # 🔥 OPTIMIZATION: Store FEN instead of full board copy to save RAM
+                gs['board_history'].append(board.fen())
                 max_history = self.mcts.history_positions + 10
                 if len(gs['board_history']) > max_history:
                     gs['board_history'] = gs['board_history'][-max_history:]
@@ -553,6 +604,8 @@ class BatchSelfPlayMCTSBatch:
 
                 if board.is_game_over() or gs['move_count'] >= max_moves:
                     gs['done'] = True
+                    # Free up memory immediately
+                    gs['root'] = None
 
         positions = []
         game_lengths = []
@@ -583,14 +636,21 @@ class BatchSelfPlayMCTSBatch:
 
     def _select_move_from_visits(self, visit_counts, temperature):
         moves = list(visit_counts.keys())
-        visits = np.array([visit_counts[m] for m in moves])
+        visits = np.array([visit_counts[m] for m in moves], dtype=np.float64)
 
         if temperature == 0 or len(moves) == 1:
             best_idx = np.argmax(visits)
             return moves[best_idx]
         else:
             visits_temp = visits ** (1.0 / temperature)
-            probs = visits_temp / visits_temp.sum()
+            total = visits_temp.sum()
+            if total <= 0 or not np.isfinite(total):
+                # Fallback: all visits are zero or overflow — pick uniformly
+                return moves[np.random.randint(len(moves))]
+            probs = visits_temp / total
+            # Renormalize to fix any floating-point drift
+            probs = np.clip(probs, 0.0, 1.0)
+            probs /= probs.sum()
             idx = np.random.choice(len(moves), p=probs)
             return moves[idx]
 
@@ -633,6 +693,8 @@ def play_games_mcts_worker(rank, model_state, config, device_id, num_games, resu
             device = torch.device('cpu')
         else:
             device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
+            if device.type == 'cuda':
+                torch.backends.cudnn.benchmark = True
         
         # Limit CPU threads per worker to avoid oversubscription
         if device.type == 'cpu':
@@ -679,7 +741,21 @@ def play_games_mcts_worker(rank, model_state, config, device_id, num_games, resu
             _wlog(f"Batch self-play enabled (max {max_batch_games}, actual {actual_max})")
         else:
             engine = BatchSelfPlayMCTS(model, config, device)
-        
+
+        # Progress reporting: worker writes number of completed games to a .progress file
+        # so the main process can track live progress via tqdm.
+        progress_file_path = result_file_path.replace('.pkl', '.progress')
+
+        def _write_progress(n):
+            try:
+                with open(progress_file_path, 'w') as _pf:
+                    _pf.write(str(n))
+            except Exception:
+                pass
+
+        if hasattr(engine, '_progress_file'):
+            engine._progress_file = progress_file_path
+
         _wlog(
             f"Playing {num_games} games with MCTS "
             f"({config['reinforcement_learning']['mcts_simulations']} sims/move)"
@@ -713,6 +789,10 @@ def play_games_mcts_worker(rank, model_state, config, device_id, num_games, resu
             games_left = num_games
             while games_left > 0:
                 chunk_games = min(save_every, games_left)
+                # Temporarily disable engine's own progress file to avoid double-counting;
+                # we'll update progress manually after each chunk instead.
+                if hasattr(engine, '_progress_file'):
+                    engine._progress_file = None
                 positions, game_lengths = engine.play_games(chunk_games)
 
                 with open(result_file_path, 'ab') as f:
@@ -720,12 +800,16 @@ def play_games_mcts_worker(rank, model_state, config, device_id, num_games, resu
 
                 total_positions += len(positions)
                 total_games += len(game_lengths)
+                _write_progress(total_games)
                 games_left -= chunk_games
         else:
-            # Play games in one shot
+            # Play games in one shot — engine writes progress itself
+            if hasattr(engine, '_progress_file'):
+                engine._progress_file = progress_file_path
             positions, game_lengths = engine.play_games(num_games)
             total_positions = len(positions)
             total_games = len(game_lengths)
+            _write_progress(total_games)
 
             # Save to file (avoids shared memory issues on Windows)
             with open(result_file_path, 'wb') as f:

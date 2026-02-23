@@ -16,8 +16,12 @@ import torch
 class MCTSNode:
     """Node in the MCTS tree"""
     
-    def __init__(self, board, parent=None, move=None, prior=0):
-        self.board = board.copy()
+    def __init__(self, board=None, parent=None, move=None, prior=0, copy_board=True):
+        # In expansion we already pass a copied board, so allow skipping extra copy.
+        if board is not None:
+            self._board = board.copy() if copy_board else board
+        else:
+            self._board = None
         self.parent = parent
         self.move = move
         self.prior = prior
@@ -32,6 +36,24 @@ class MCTSNode:
         
         # 🔥 Cache FEN for tree reuse speedup
         self._fen_cache = None
+        
+        # 🔥 Cache game over status
+        self._is_game_over = None
+    
+    @property
+    def board(self):
+        """Lazy evaluation of board state to save CPU and RAM"""
+        if self._board is None:
+            self._board = self.parent.board.copy()
+            self._board.push(self.move)
+        return self._board
+        
+    @property
+    def is_game_over(self):
+        """Cached game over check"""
+        if self._is_game_over is None:
+            self._is_game_over = self.board.is_game_over()
+        return self._is_game_over
     
     def value(self):
         """Average value with virtual loss"""
@@ -111,7 +133,9 @@ class BatchMCTS:
         if self.board_history:
             history_boards = self.board_history[-self.history_positions:]
             # Convert history boards to tensors with POV
-            for hist_board in history_boards:
+            for hist_fen in history_boards:
+                # 🔥 OPTIMIZATION: Reconstruct board from FEN string (saves RAM)
+                hist_board = chess.Board(hist_fen) if isinstance(hist_fen, str) else hist_fen
                 # All history from CURRENT player's perspective
                 hist_tensor = board_to_tensor(
                     hist_board,
@@ -146,6 +170,8 @@ class BatchMCTS:
             for move, child in self.root.children.items():
                 if child.get_fen() == target_fen:
                     # Found it! Reuse this subtree
+                    # Ensure board is instantiated before detaching parent
+                    _ = child.board
                     self.root = child
                     self.root.parent = None  # Make it new root
                     break
@@ -173,7 +199,7 @@ class BatchMCTS:
                 node.add_virtual_loss()
                 
                 # Selection
-                while not node.is_leaf() and not node.board.is_game_over():
+                while not node.is_leaf() and not node.is_game_over:
                     node = self._select_child(node)
                     node.add_virtual_loss()
                     search_path.append(node)
@@ -197,47 +223,52 @@ class BatchMCTS:
         return {move: child.visit_count for move, child in self.root.children.items()}
     
     def _select_child(self, node):
-        """Select child with highest UCB score"""
+        """Select child with highest UCB score (optimized)"""
         best_score = -float('inf')
         best_child = None
         
+        # Precalculate parent term to avoid doing it for every child
+        parent_sqrt = math.sqrt(node.visit_count + node.virtual_loss + 1)
+        c_puct = self.c_puct
+        
         for move, child in node.children.items():
-            score = self._ucb_score(node, child)
+            # Inline value() and ucb_score() for speed
+            cv = child.visit_count + child.virtual_loss
+            if cv == 0:
+                q_value = 0.0
+            else:
+                q_value = (child.value_sum - child.virtual_loss) / cv
+                
+            u_value = c_puct * child.prior * parent_sqrt / (1 + cv)
+            score = q_value + u_value
+            
             if score > best_score:
                 best_score = score
                 best_child = child
         
         return best_child
     
-    def _ucb_score(self, parent, child):
-        """
-        Upper Confidence Bound with virtual loss (AlphaZero PUCT)
-        
-        Formula: Q(s,a) + c_puct * P(s,a) * sqrt(N(s) + 1) / (1 + N(s,a))
-        Where:
-        - Q(s,a) = average value of child
-        - P(s,a) = prior probability (from policy network)
-        - N(s) = parent visit count
-        - N(s,a) = child visit count
-        
-        🔥 FIX: +1 in sqrt ensures exploration even when parent has 0 visits
-        """
-        q_value = child.value()  # Already includes virtual loss
-        u_value = (self.c_puct * child.prior * 
-                   math.sqrt(parent.visit_count + parent.virtual_loss + 1) / 
-                   (1 + child.visit_count + child.virtual_loss))
-        return q_value + u_value
-    
     def _batch_expand_and_evaluate(self, nodes, add_noise=False):
         """
         🆕 v4.2: Batch expansion and evaluation with history support
         """
-        terminal_values = []
-        non_terminal_indices = []
+        # The same leaf can be selected multiple times in one search batch.
+        # Evaluate each unique node once and reuse its value for duplicates.
+        node_occurrences = {}
+        unique_nodes = []
+        for idx, node in enumerate(nodes):
+            node_id = id(node)
+            if node_id not in node_occurrences:
+                node_occurrences[node_id] = [idx]
+                unique_nodes.append(node)
+            else:
+                node_occurrences[node_id].append(idx)
+
+        terminal_values = {}
         non_terminal_nodes = []
-        
-        for i, node in enumerate(nodes):
-            if node.board.is_game_over():
+
+        for node in unique_nodes:
+            if node.is_game_over:
                 result = node.board.result()
                 if result == '1-0':
                     value = 1.0 if node.board.turn == chess.WHITE else -1.0
@@ -245,20 +276,19 @@ class BatchMCTS:
                     value = -1.0 if node.board.turn == chess.WHITE else 1.0
                 else:
                     value = 0.0
-                terminal_values.append((i, value))
+                terminal_values[id(node)] = value
             else:
-                non_terminal_indices.append(i)
                 non_terminal_nodes.append(node)
-        
-        all_values = [None] * len(nodes)
-        
+
+        values_by_node_id = {}
+
         if non_terminal_nodes:
             # 🆕 v4.2: Stack tensors WITH HISTORY
             board_tensors = torch.stack([
                 torch.from_numpy(self._build_history_tensor(node.board))
                 for node in non_terminal_nodes
             ]).to(self.device, memory_format=torch.channels_last, non_blocking=True)
-            
+
             # Single GPU call (inference optimized)
             with torch.inference_mode():
                 if self.use_amp:
@@ -266,54 +296,59 @@ class BatchMCTS:
                         policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
                 else:
                     policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
-            
+                
+                # 🔥 OPTIMIZATION: Transfer entire batch to CPU at once, not row by row
+                if values_batch.dim() == 2 and values_batch.shape[1] == 3:
+                    # WDL output: compute softmax on GPU before transfer
+                    wdl_probs = torch.softmax(values_batch, dim=1)
+                    values_batch = (wdl_probs[:, 0] - wdl_probs[:, 2])
+                
+                # Convert to float32 before numpy() because numpy doesn't support bfloat16
+                policy_logits_batch = policy_logits_batch.float().cpu().numpy()
+                values_batch = values_batch.float().cpu().numpy()
+
             # Process results
             for idx, node in enumerate(non_terminal_nodes):
-                policy_logits = policy_logits_batch[idx].cpu().numpy()
+                policy_logits = policy_logits_batch[idx]
                 
-                # 🔧 FIX: Handle WDL output (3 values) vs scalar output
-                value_tensor = values_batch[idx]
-                if value_tensor.dim() == 1 and value_tensor.shape[0] == 3:
-                    # WDL output: [Win, Draw, Loss] → convert to scalar [-1, 1]
-                    # 🔥 OPTIMIZATION: Compute softmax on GPU, only transfer final result
-                    wdl_probs = torch.softmax(value_tensor, dim=0)
-                    value = (wdl_probs[0] - wdl_probs[2]).item()  # Win - Loss
-                else:
-                    # Scalar output
-                    value = value_tensor.item()
-                
+                # Scalar output (already processed if WDL)
+                value = float(values_batch[idx])
+
                 legal_moves = list(node.board.legal_moves)
                 legal_indices = [move_to_index(m, node.board) for m in legal_moves]
-                
+
                 # Compute probabilities only for legal moves (faster than full ACTION_SIZE)
                 legal_logits = policy_logits[legal_indices]
                 legal_probs = np.exp(legal_logits - legal_logits.max())
                 legal_probs = legal_probs / (legal_probs.sum() + 1e-8)
-                
+
                 # Dirichlet noise
-                if add_noise and len(legal_moves) > 0:
+                if add_noise and node is self.root and len(legal_moves) > 0:
                     alpha = self.config['reinforcement_learning']['mcts_dirichlet_alpha']
                     weight = self.config['reinforcement_learning']['mcts_dirichlet_weight']
                     noise = np.random.dirichlet([alpha] * len(legal_moves))
                     legal_probs = (1 - weight) * legal_probs + weight * noise
-                
-                # Create children
-                for move, prior in zip(legal_moves, legal_probs):
-                    child_board = node.board.copy()
-                    child_board.push(move)
-                    node.children[move] = MCTSNode(
-                        child_board,
-                        parent=node,
-                        move=move,
-                        prior=prior
-                    )
-                
-                node.expanded = True
-                all_values[non_terminal_indices[idx]] = value
-        
-        for idx, value in terminal_values:
-            all_values[idx] = value
-        
+
+                if not node.expanded:
+                    # Create children lazily (saves massive CPU and RAM)
+                    for move, prior in zip(legal_moves, legal_probs):
+                        node.children[move] = MCTSNode(
+                            board=None,
+                            parent=node,
+                            move=move,
+                            prior=prior,
+                            copy_board=False,
+                        )
+                    node.expanded = True
+
+                values_by_node_id[id(node)] = value
+
+        all_values = [0.0] * len(nodes)
+        for node_id, indices in node_occurrences.items():
+            value = values_by_node_id.get(node_id, terminal_values.get(node_id, 0.0))
+            for idx in indices:
+                all_values[idx] = value
+
         return all_values
     
     def _backpropagate(self, search_path, value):
@@ -331,7 +366,8 @@ class BatchMCTS:
         Args:
             board: chess.Board that was just played
         """
-        self.board_history.append(board.copy())
+        # 🔥 OPTIMIZATION: Store FEN instead of full board copy to save RAM
+        self.board_history.append(board.fen())
         
         # Keep only last N positions needed for history
         max_history = self.history_positions + 10  # Keep a few extra for safety

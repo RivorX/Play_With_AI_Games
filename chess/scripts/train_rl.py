@@ -83,6 +83,7 @@ from utils.shared.model_view import print_active_model_summary
 _LAST_RUN_LOG_CSV = None
 _LAST_RUN_LOG_PNG = None
 _WORKER_INTERRUPT_EXIT_CODE = 130
+_SELFPLAY_CONFIG_PRINTED = False
 
 
 class RLTrainingInterrupted(Exception):
@@ -201,12 +202,29 @@ def play_games_parallel_mcts(model, config, device, num_games):
         num_workers = min(int(num_workers), mp.cpu_count())
     else:
         num_workers = int(num_workers)
-        # On GPU, cap workers by available GPUs (1 GPU -> 1 worker).
+        # On GPU, cap workers by available GPUs and configurable workers-per-GPU.
+        # MCTS has heavy CPU-side tree logic, so >1 worker per GPU can improve
+        # utilization by overlapping tree expansion with batched inference.
         num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         if num_gpus > 0:
-            num_workers = min(num_workers, num_gpus)
+            workers_per_gpu_raw = rl_cfg.get('self_play_workers_per_gpu', 1)
+            try:
+                workers_per_gpu = max(1, int(workers_per_gpu_raw))
+            except Exception:
+                workers_per_gpu = 1
+            num_workers = min(num_workers, num_gpus * workers_per_gpu)
     
     num_workers = max(1, num_workers)
+
+    # Cap workers to number of games (no point spawning more workers than games)
+    num_workers = min(num_workers, num_games)
+
+    use_batch_selfplay = bool(rl_cfg.get('use_batch_selfplay', False))
+    max_batch_games_raw = rl_cfg.get('max_batch_games_per_worker', 1)
+    try:
+        max_batch_games = max(1, int(max_batch_games_raw))
+    except Exception:
+        max_batch_games = 1
     
     # Distribute games across workers (handle remainder)
     base_games = num_games // num_workers
@@ -214,17 +232,29 @@ def play_games_parallel_mcts(model, config, device, num_games):
     games_per_worker = [base_games + (1 if i < remainder else 0) for i in range(num_workers)]
     worker_specs = [(rank, games_per_worker[rank]) for rank in range(num_workers) if games_per_worker[rank] > 0]
     
-    print(f"🎯 Parallel MCTS Self-Play:")
-    if torch.cuda.is_available():
-        print(f"   GPUs available: {torch.cuda.device_count()}")
-    print(f"   Self-play device: {device_type}")
-    print(f"   Workers: {len(worker_specs)}")
-    if remainder > 0:
-        print(f"   Games per worker: {base_games} (+1 for {remainder} workers)")
-    else:
-        print(f"   Games per worker: {base_games}")
-    print(f"   Total games: {num_games}")
-    print(f"   MCTS simulations: {rl_cfg['mcts_simulations']}")
+    global _SELFPLAY_CONFIG_PRINTED
+    if not _SELFPLAY_CONFIG_PRINTED:
+        _SELFPLAY_CONFIG_PRINTED = True
+        gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        wpg = rl_cfg.get('self_play_workers_per_gpu', 1) if device_type == 'cuda' else '-'
+        batch_info = f"on  (max {max_batch_games} gier/worker)" if use_batch_selfplay else "off"
+        w_games = f"{base_games}" + (f"  (+1 dla {remainder} workerów)" if remainder else "")
+        print()
+        print("╔══════════════════════════════════════════════════════╗")
+        print("║           KONFIGURACJA SELF-PLAY (stała)             ║")
+        print("╠══════════════════════════╦═══════════════════════════╣")
+        print(f"║  Urządzenie              ║  {device_type:<25} ║")
+        print(f"║  GPU dostępne            ║  {gpus:<25} ║")
+        print(f"║  Workerów per GPU        ║  {str(wpg):<25} ║")
+        print(f"║  Workerów łącznie        ║  {len(worker_specs):<25} ║")
+        print(f"║  Gier per iterację       ║  {num_games:<25} ║")
+        print(f"║  Gier per worker         ║  {w_games:<25} ║")
+        print(f"║  Batch self-play         ║  {batch_info:<25} ║")
+        print(f"║  Symulacje MCTS          ║  {rl_cfg['mcts_simulations']:<25} ║")
+        print(f"║  Rozmiar batcha MCTS     ║  {rl_cfg.get('mcts_batch_size', 32):<25} ║")
+        print(f"║  Reuse drzewa            ║  {str(rl_cfg.get('mcts_reuse_tree', True)):<25} ║")
+        print("╚══════════════════════════╩═══════════════════════════╝")
+        print()
     
     # Create temp directory for results
     temp_dir = Path(tempfile.gettempdir()) / "chess_selfplay_mcts"
@@ -255,31 +285,65 @@ def play_games_parallel_mcts(model, config, device, num_games):
             p.start()
             processes.append(p)
 
-        # Wait for workers with short polling intervals so Ctrl+C is responsive on Windows.
-        wait_bar = tqdm(
-            total=len(processes),
-            desc="MCTS Self-play workers",
-            disable=not show_worker_wait_bar,
-            leave=False,
+        # Build progress file paths (workers write completed-game counts here)
+        progress_files = [
+            temp_dir / f"worker_{rank}_mcts_results.progress"
+            for rank, _ in worker_specs
+        ]
+
+        # Wait for workers with a live games-completed progress bar.
+        games_bar = tqdm(
+            total=num_games,
+            desc="🎮 Self-play gry",
+            unit="gra",
+            dynamic_ncols=True,
+            leave=True,
         )
         try:
             pending = set(range(len(processes)))
+            games_reported = [0] * len(processes)
+            games_bar_last = 0
             while pending:
+                # Update games progress from .progress files
+                total_done = 0
+                for idx in range(len(processes)):
+                    pf = progress_files[idx]
+                    try:
+                        raw = pf.read_text().strip()
+                        games_reported[idx] = int(raw) if raw else 0
+                    except Exception:
+                        pass
+                    total_done += games_reported[idx]
+                # Add games from already-finished workers (they may have removed progress files)
+                inc = total_done - games_bar_last
+                if inc > 0:
+                    games_bar.update(inc)
+                    games_bar_last = total_done
+
                 for idx in list(pending):
                     p = processes[idx]
                     p.join(timeout=0.2)
                     if p.is_alive():
                         continue
                     pending.remove(idx)
-                    wait_bar.update(1)
                     if _is_interrupt_exit_code(p.exitcode):
                         interrupted = True
                         print("\nCtrl+C detected in self-play worker. Stopping workers...")
                         raise RLTrainingInterrupted("self-play")
                 if pending:
                     time.sleep(0.05)
+
+            # Final sync: make sure bar reaches 100 %
+            games_bar.n = num_games
+            games_bar.refresh()
         finally:
-            wait_bar.close()
+            games_bar.close()
+            # Clean up progress files
+            for pf in progress_files:
+                try:
+                    pf.unlink(missing_ok=True)
+                except Exception:
+                    pass
     except KeyboardInterrupt:
         interrupted = True
         print("\nCtrl+C detected during self-play. Stopping workers...")

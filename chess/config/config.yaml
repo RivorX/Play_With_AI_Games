@@ -1,6 +1,5 @@
 # ==============================================================================
-# CHESS AI CONFIGURATION - OPTIMIZED FOR RTX 5060Ti 16GB v4.2
-# 🆕 POV (Point of View) + Dynamic Sliding Window Support
+# CHESS AI CONFIGURATION - OPTIMIZED FOR RTX 5060Ti 16GB
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -80,7 +79,7 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v5.1"
+  version: "v5.2"
   # Base architecture
   num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
   filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
@@ -127,7 +126,7 @@ imitation_learning:
 
   # Advanced training hyperparameters
   value_head_lr_factor: 1.2  # Value head LR multiplier (1.0 = full LR)
-  epochs: 30                 # Maximum training epochs
+  epochs: 20                 # Maximum training epochs
   weight_decay: 0.002        # L2 regularization (10x stronger for value head)
   grad_clip: 1.0             # Gradient clipping threshold
   
@@ -145,7 +144,7 @@ imitation_learning:
   wdl_label_smoothing: 0.01  # Smoothing for value head (WDL is more sensitive to overconfidence)
   # Loss weights
   policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 1.5     # Value loss weight (balanced with policy)
+  value_loss_weight: 0.5     # Value loss weight (balanced with policy)
   # 🆕 WDL value weighting by move index (later positions = stronger signal)
   value_move_weighting: true
   value_move_weight_min: 0.1
@@ -181,18 +180,19 @@ imitation_learning:
 # ------------------------------------------------------------------------------
 reinforcement_learning:
   # 🚀 Self-play configuration (PARALLEL)
-  use_prioritized_replay: true        # Enable prioritized experience replay
-  games_per_iteration: 100   # 🆕 More games per iteration (CPU self-play friendly)
-  iterations: 1000           # Total RL iterations
-  self_play_device: "cpu"    # cpu | cuda | auto (auto uses GPU if available)
-  self_play_workers: auto    # 0/auto = cpu_count - 1, or set explicit number
-  self_play_torch_threads: 1 # Threads per worker (avoid oversubscription on Windows)
+  use_prioritized_replay: true  # Enable prioritized experience replay
+  games_per_iteration: 200   # Gier per iteracja
+  iterations: 50                # Total RL iterations
+  self_play_device: "cuda"      # cpu | cuda | auto (auto uses GPU if available)
+  self_play_workers: auto       # 0/auto = cpu_count - 1, or set explicit number
+  self_play_workers_per_gpu: 16 # CUDA: allow multiple workers on one GPU (improves utilization)
+  self_play_torch_threads: 1    # Threads per worker (avoid oversubscription on Windows)
 
   self_play_save_every_games: 1  # Multiplier of games_per_iteration (0=off, e.g. 0.8 or 2.0)
   
   # 🚀 Batch self-play mode
-  use_batch_selfplay: true         # 🚀 NEW: Play multiple games simultaneously (5-10x faster)
-  max_batch_games_per_worker: 8   # 🚀 NEW: Max games per worker in batch mode (adjust for VRAM)
+  use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
+  max_batch_games_per_worker: 4    # 4 gier/worker = 72% GPU przy 11 workerach, max RAM-safe
 
   # 🆕 TEMPERATURE SCHEDULE
   use_temperature_schedule: true      # Enable adaptive temperature
@@ -201,8 +201,8 @@ reinforcement_learning:
   temperature_decay_iterations: 500   # Decay over N iterations
 
   # 🚀 MCTS parameters (BATCH OPTIMIZED)
-  mcts_simulations: 200      # 🆕 Balanced for CPU self-play
-  mcts_batch_size: 64        # Batch MCTS evaluations (CPU-friendly)
+  mcts_simulations: 100     # 100 = dobry balans jakość/szybkość (200 = lepiej ale 2x wolniej)
+  mcts_batch_size: 8          # musi być < mcts_simulations/4 żeby backprop działał między batchami
   mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
   mcts_c_puct: 1.5           # Exploration constant (UCB)
   mcts_temperature: 1.0      # Temperature for move selection
@@ -215,11 +215,11 @@ reinforcement_learning:
   learning_rate: 0.0002       # Base learning rate
   weight_decay: 0.05         # L2 regularization (AdamW)
   grad_clip: 0.5             # Gradient clipping
-  train_epochs_per_iteration: 8  # 🆕 More replays per iteration
+  train_epochs_per_iteration: 4  # Epok na bufor (każda epoka = inne losowe augmentacje)
   # Replay buffer sizing:
   # Actual size = games_per_iteration * avg_moves_per_game * replay_buffer_multiplier
-  avg_moves_per_game: 50        # Estimated average moves per game
-  replay_buffer_multiplier: 3   # Buffer size multiplier (iterations worth of data)
+  avg_moves_per_game: 160      # Rzeczywista długość gry (z logów: ~160-175 ruchów)
+  replay_buffer_multiplier: 8   # Buffer size multiplier (iterations worth of data)
   replay_fp16: true            # Store replay tensors in float16 to reduce RAM (~2x)
   
   # 🆕 Learning rate schedule

@@ -34,7 +34,7 @@ def _fmt_gib(num_bytes):
     return f"{(float(num_bytes) / (1024.0 ** 3)):.2f} GiB"
 
 
-def build_model_hash(config):
+def build_model_hash(config, include_version=False):
     """Build model hash used to cache auto-tuned IL hyperparameters."""
     model_cfg = dict(config.get("model", {}) or {})
 
@@ -45,6 +45,9 @@ def build_model_hash(config):
 
     # Exclude runtime-only fields from hash.
     model_cfg.pop("print_summary", None)
+    if not include_version:
+        # Keep cache stable across cosmetic version label changes.
+        model_cfg.pop("version", None)
     payload = json.dumps(model_cfg, sort_keys=True, ensure_ascii=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -799,7 +802,10 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
     if selected_mode not in {"auto", "config"}:
         selected_mode = "config"
 
-    model_hash = build_model_hash(config)
+    model_hash = build_model_hash(config, include_version=False)
+    legacy_model_hash = build_model_hash(config, include_version=True)
+    if legacy_model_hash == model_hash:
+        legacy_model_hash = None
 
     result = {
         "algo_version": AUTO_TUNE_ALGO_VERSION,
@@ -863,6 +869,16 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
 
     device_key = _build_device_key(config, device)
     hash_entries = entries.get(model_hash)
+    hash_key_used = model_hash
+    if not isinstance(hash_entries, dict) and legacy_model_hash:
+        legacy_entries = entries.get(legacy_model_hash)
+        if isinstance(legacy_entries, dict):
+            hash_entries = legacy_entries
+            hash_key_used = legacy_model_hash
+            print(
+                "IL auto-tune: found legacy cache key "
+                "(included model.version); migrating to version-agnostic hash."
+            )
     if isinstance(hash_entries, dict):
         cached_entry = hash_entries.get(device_key)
         if isinstance(cached_entry, dict):
@@ -909,6 +925,13 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
                     "IL auto-tune: loaded cached values "
                     f"(hash={model_hash[:12]}, batch_size={int(cached_batch)}, lr={float(cached_lr):.6g})."
                 )
+                if hash_key_used != model_hash:
+                    entries[model_hash] = hash_entries
+                    cache["entries"] = entries
+                    try:
+                        _save_cache(cache_path, cache)
+                    except Exception:
+                        pass
                 return result
 
     print(f"  Dedicated VRAM total: {_fmt_gib(dedicated_vram_bytes)}")

@@ -72,11 +72,6 @@ def board_to_tensor(board, flip_perspective=None):
     """
     tensor = np.zeros((16, 8, 8), dtype=np.float32)
     
-    piece_to_idx = {
-        chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
-        chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
-    }
-    
     # Determine if we need to flip
     if flip_perspective is None:
         should_flip = (board.turn == chess.BLACK)
@@ -84,36 +79,35 @@ def board_to_tensor(board, flip_perspective=None):
         should_flip = flip_perspective
     
     # === PIECE PLANES (0-11) ===
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            # Get original coordinates
-            row = square // 8
-            col = square % 8
-            
-            # Flip if needed (black's perspective)
-            if should_flip:
-                row = 7 - row
-                col = 7 - col
-            
-            # Get piece index
-            piece_idx = piece_to_idx[piece.piece_type]
-            
-            # Determine if this piece belongs to current player or opponent
-            if should_flip:
-                # Black to move
-                if piece.color == chess.BLACK:
-                    channel = piece_idx  # Current player (0-5)
-                else:
-                    channel = piece_idx + 6  # Opponent (6-11)
+    # Use piece_map() for much faster iteration than 64 piece_at() calls
+    for square, piece in board.piece_map().items():
+        # Get original coordinates
+        row = square // 8
+        col = square % 8
+        
+        # Flip if needed (black's perspective)
+        if should_flip:
+            row = 7 - row
+            col = 7 - col
+        
+        # Get piece index (PAWN=1 -> 0, KNIGHT=2 -> 1, etc.)
+        piece_idx = piece.piece_type - 1
+        
+        # Determine if this piece belongs to current player or opponent
+        if should_flip:
+            # Black to move
+            if piece.color == chess.BLACK:
+                channel = piece_idx  # Current player (0-5)
             else:
-                # White to move
-                if piece.color == chess.WHITE:
-                    channel = piece_idx  # Current player (0-5)
-                else:
-                    channel = piece_idx + 6  # Opponent (6-11)
-            
-            tensor[channel, row, col] = 1.0
+                channel = piece_idx + 6  # Opponent (6-11)
+        else:
+            # White to move
+            if piece.color == chess.WHITE:
+                channel = piece_idx  # Current player (0-5)
+            else:
+                channel = piece_idx + 6  # Opponent (6-11)
+        
+        tensor[channel, row, col] = 1.0
     
     # === METADATA PLANES (12-15) ===
     
@@ -196,14 +190,9 @@ def board_to_compact(board):
         (chess.KING, chess.BLACK): 12,
     }
     
-    codes = []
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            code = piece_to_code[(piece.piece_type, piece.color)]
-        else:
-            code = 0
-        codes.append(code)
+    codes = [0] * 64
+    for square, piece in board.piece_map().items():
+        codes[square] = piece_to_code[(piece.piece_type, piece.color)]
     
     # Pack pairs of codes into bytes (32 bytes for pieces)
     packed = bytearray(32)
