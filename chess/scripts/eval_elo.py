@@ -187,7 +187,9 @@ def _model_arch_keys():
         "num_residual_blocks",
         "dropout",
         "history_positions",
-        "use_se2d_blocks",
+        "use_se_blocks",
+        "use_se_bottleneck",
+        "se_reduction",
         "drop_path_rate",
         "use_coord_conv",
         "use_layer_scale",
@@ -273,7 +275,19 @@ def _infer_model_overrides_from_state_dict(state_dict):
     if isinstance(value_fc1_w, torch.Tensor):
         overrides["value_hidden_dim"] = int(value_fc1_w.shape[0])
 
-    overrides["use_se2d_blocks"] = any(".se.fc1.weight" in key for key in state_dict.keys())
+    se_fc1_keys = [key for key in state_dict.keys() if ".se.fc1.weight" in key]
+    se_fc_keys = [key for key in state_dict.keys() if ".se.fc.weight" in key]
+    use_se_blocks = bool(se_fc1_keys or se_fc_keys)
+    overrides["use_se_blocks"] = use_se_blocks
+    if use_se_blocks:
+        overrides["use_se_bottleneck"] = bool(se_fc1_keys)
+        if se_fc1_keys:
+            fc1_weight = state_dict.get(se_fc1_keys[0])
+            if isinstance(fc1_weight, torch.Tensor) and fc1_weight.ndim == 4:
+                in_ch = int(fc1_weight.shape[1])
+                mid = int(fc1_weight.shape[0])
+                if mid > 0 and in_ch > 0:
+                    overrides["se_reduction"] = max(1, in_ch // mid)
     overrides["use_layer_scale"] = any(".layer_scale.gamma" in key for key in state_dict.keys())
     overrides["use_multitask_learning"] = "win_fc1.weight" in state_dict
 
@@ -286,12 +300,17 @@ def _extract_arch_overrides(checkpoint):
 
     direct = checkpoint.get("model_architecture")
     if isinstance(direct, dict):
-        return {k: direct.get(k) for k in _model_arch_keys() if k in direct}
+        overrides = {k: direct.get(k) for k in _model_arch_keys() if k in direct}
+        if "use_se_blocks" not in overrides and "use_se2d_blocks" in direct:
+            overrides["use_se_blocks"] = direct.get("use_se2d_blocks")
+        return overrides
 
     legacy = {}
     for key in _model_arch_keys():
         if key in checkpoint and checkpoint[key] is not None:
             legacy[key] = checkpoint[key]
+    if "use_se_blocks" not in legacy and checkpoint.get("use_se2d_blocks") is not None:
+        legacy["use_se_blocks"] = checkpoint.get("use_se2d_blocks")
     return legacy
 
 

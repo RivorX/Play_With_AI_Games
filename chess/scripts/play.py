@@ -1128,6 +1128,10 @@ class ChessGUI:
         """Apply move, update histories, and persist finished game."""
         san_move = self.board.san(move)
         self._record_pre_move_state()
+        # Move is known here, so we can advance cached MCTS roots directly.
+        for mcts in (self.mcts1, self.mcts2):
+            if mcts:
+                mcts.advance_root(move)
         self.board.push(move)
         self.move_history.append(move)
         self.move_san_history.append(san_move)
@@ -1255,8 +1259,12 @@ class ChessGUI:
         
         # Get policy from model
         with torch.no_grad():
-            policy_log_probs, _ = model(board_tensor, return_aux=False)
-            policy = torch.exp(policy_log_probs).cpu().numpy()[0]
+            policy_logits, _ = model(
+                board_tensor,
+                return_aux=False,
+                apply_log_softmax=False,
+            )
+            policy = policy_logits.float().cpu().numpy()[0]
         
         # Find best legal move
         best_score = -1

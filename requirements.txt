@@ -9,6 +9,7 @@ pyyaml
 imageio
 Pillow
 sb3-contrib
+triton-windows
 
 # Dodatkowe dla Chess
 python-chess>=1.999

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from src.utils.data_helpers import ACTION_SIZE
 
 
-class SE2DBlock(nn.Module):
+class SEBlock(nn.Module):
     """
     🆕 v4.7: TRUE Squeeze-and-Excitation with Channel Attention
     
@@ -24,19 +24,36 @@ class SE2DBlock(nn.Module):
     
     PAPER: "Squeeze-and-Excitation Networks" (Hu et al. 2018)
     """
-    def __init__(self, filters, reduction=16):
+    def __init__(self, filters, reduction=16, use_bottleneck=True):
         super().__init__()
-        mid = max(filters // reduction, 8)  # Ensure at least 8 channels
+        filters = int(filters)
+        if filters < 1:
+            raise ValueError(f"filters must be >= 1, got {filters}")
+
+        self.use_bottleneck = bool(use_bottleneck)
+        self.reduction = int(reduction)
+        if self.use_bottleneck and self.reduction < 1:
+            raise ValueError(f"se_reduction must be >= 1 when use_se_bottleneck=true, got {self.reduction}")
+
         self.squeeze = nn.AdaptiveAvgPool2d(1)  # Global Average Pool
-        self.fc1 = nn.Conv2d(filters, mid, kernel_size=1, bias=False)
-        self.fc2 = nn.Conv2d(mid, filters, kernel_size=1, bias=True)  # 🔧 v4.8: bias=True for better calibration
+        if self.use_bottleneck:
+            mid = max(filters // self.reduction, 8)  # Ensure at least 8 channels
+            self.mid = mid
+            self.fc1 = nn.Conv2d(filters, mid, kernel_size=1, bias=False)
+            self.fc2 = nn.Conv2d(mid, filters, kernel_size=1, bias=True)  # 🔧 v4.8: bias=True for better calibration
+        else:
+            self.mid = filters
+            self.fc = nn.Conv2d(filters, filters, kernel_size=1, bias=True)
     
     def forward(self, x):
         # Squeeze: global average pooling (B, C, H, W) -> (B, C, 1, 1)
         scale = self.squeeze(x)
-        # Excitation: bottleneck FC -> channel-wise weights
-        scale = F.relu(self.fc1(scale), inplace=True)  # (B, C/r, 1, 1)
-        scale = torch.sigmoid(self.fc2(scale))          # (B, C, 1, 1)
+        # Excitation: optional bottleneck FC -> channel-wise weights
+        if self.use_bottleneck:
+            scale = F.relu(self.fc1(scale), inplace=True)  # (B, C/r, 1, 1)
+            scale = torch.sigmoid(self.fc2(scale))          # (B, C, 1, 1)
+        else:
+            scale = torch.sigmoid(self.fc(scale))           # (B, C, 1, 1)
         # Scale: channel-wise attention (broadcasts over H, W)
         return x * scale
 
@@ -60,10 +77,20 @@ class CoordConv2d(nn.Module):
         self.register_buffer('coord_y', yy.unsqueeze(0).unsqueeze(0))
         
     def forward(self, x):
+        if x.ndim != 4:
+            raise ValueError(f"CoordConv2d expected 4D input (B,C,H,W), got shape {tuple(x.shape)}")
+        if x.shape[-2:] != (8, 8):
+            raise ValueError(
+                f"CoordConv2d expects board spatial size 8x8, got {x.shape[-2]}x{x.shape[-1]}"
+            )
+
         batch = x.size(0)
         
         coords_x = self.coord_x.expand(batch, 1, 8, 8)
         coords_y = self.coord_y.expand(batch, 1, 8, 8)
+        if coords_x.dtype != x.dtype:
+            coords_x = coords_x.to(dtype=x.dtype)
+            coords_y = coords_y.to(dtype=x.dtype)
         
         x = torch.cat([x, coords_x, coords_y], dim=1)
         
@@ -130,8 +157,9 @@ class ResidualBlock(nn.Module):
     
     PAPER: "Identity Mappings in Deep Residual Networks" (He et al. 2016)
     """
-    def __init__(self, filters, use_se2d=False,
-                 drop_path_rate=0.0, use_layer_scale=False, layer_scale_init=1e-5):
+    def __init__(self, filters, use_se=False, use_se_bottleneck=True,
+                 drop_path_rate=0.0, use_layer_scale=False, layer_scale_init=1e-5,
+                 se_reduction=16):
         super().__init__()
         
         # BN + Conv layers
@@ -140,9 +168,9 @@ class ResidualBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(filters)
         self.conv2 = nn.Conv2d(filters, filters, kernel_size=3, padding=1, bias=False)
         
-        self.use_se2d = use_se2d
-        if use_se2d:
-            self.se = SE2DBlock(filters)
+        self.use_se = use_se
+        if use_se:
+            self.se = SEBlock(filters, reduction=se_reduction, use_bottleneck=use_se_bottleneck)
         
         self.drop_path_rate = drop_path_rate
         
@@ -165,7 +193,7 @@ class ResidualBlock(nn.Module):
         out = self.conv2(out)
         
         # Attention (after convs)
-        if self.use_se2d:
+        if self.use_se:
             out = self.se(out)
         
         if self.use_layer_scale:
@@ -203,7 +231,9 @@ class ChessNet(nn.Module):
         num_blocks = config['model']['num_residual_blocks']
         dropout = config['model']['dropout']
         
-        use_se2d = config['model'].get('use_se2d_blocks', False)
+        use_se = config['model'].get('use_se_blocks', False)
+        use_se_bottleneck = config['model'].get('use_se_bottleneck', True)
+        se_reduction = int(config['model'].get('se_reduction', 16))
         drop_path_rate = config['model'].get('drop_path_rate', 0.1)
         use_coord_conv = config['model'].get('use_coord_conv', True)
         
@@ -246,10 +276,14 @@ class ChessNet(nn.Module):
             print(f"  > Input planes: {input_planes} (16 x {1 + history_positions})")
             print(f"  > Chess metadata: Castling, En Passant, Halfmove, Fullmove")
             
-            if use_se2d:
-                print(f"  > SE2D-Block: ENABLED (spatial-aware, +5% time)")
+            if use_se:
+                if use_se_bottleneck:
+                    mid = max(filters // se_reduction, 8)
+                    print(f"  > SE blocks: ENABLED (bottleneck=yes, reduction={se_reduction}, mid={mid})")
+                else:
+                    print(f"  > SE blocks: ENABLED (bottleneck=no, direct channel gate)")
             else:
-                print(f"  > SE2D-Block: DISABLED")
+                print(f"  > SE blocks: DISABLED")
             
             print(f"  > CoordConv: Only at input")
             print(f"  > Activation: ReLU (5-10x faster than ELU)")
@@ -291,10 +325,12 @@ class ChessNet(nn.Module):
             blocks.append(
                 ResidualBlock(
                     filters,
-                    use_se2d=use_se2d,
+                    use_se=use_se,
+                    use_se_bottleneck=use_se_bottleneck,
                     drop_path_rate=dpr[i],
                     use_layer_scale=use_layer_scale,
                     layer_scale_init=layer_scale_init,
+                    se_reduction=se_reduction,
                 )
             )
         self.residual_tower = nn.Sequential(*blocks)
@@ -452,9 +488,10 @@ class ChessNet(nn.Module):
             print(f"    - Frozen params: {frozen_params:,}")
         print(f"    - Total params: {total_params:,}")
 
-    def forward(self, x, return_aux=False):
-        """Forward pass"""
-        x = x.contiguous(memory_format=torch.channels_last)
+    def forward(self, x, return_aux=False, apply_log_softmax=True):
+        """Forward pass (policy as log-probs by default, raw logits when apply_log_softmax=False)."""
+        if not x.is_contiguous(memory_format=torch.channels_last):
+            x = x.contiguous(memory_format=torch.channels_last)
         
         x = self.conv_block(x)
         x = F.relu(x, inplace=True)
@@ -482,8 +519,11 @@ class ChessNet(nn.Module):
         policy = torch.cat([p_spatial, p_global], dim=1)  # (B, 2112)
         policy = F.relu(self.policy_fc1(policy), inplace=True)
         policy = self.policy_dropout(policy)
-        policy = self.policy_fc2(policy)               # (B, 4272)
-        policy = F.log_softmax(policy, dim=1)
+        policy_logits = self.policy_fc2(policy)        # (B, 4272)
+        if apply_log_softmax:
+            policy = F.log_softmax(policy_logits, dim=1)
+        else:
+            policy = policy_logits
         
         # 🆕 Value head - AlphaZero-style: Conv → BN → ReLU → GAP → FC → WDL
         value = self.value_conv(x)
@@ -517,18 +557,24 @@ class ChessNet(nn.Module):
         đź†• Handles WDL output and converts to scalar
         """
         was_training = self.training
-        self.eval()
+        if was_training:
+            self.eval()
         try:
             with torch.inference_mode():
                 if len(board_tensor.shape) == 3:
                     board_tensor = board_tensor.unsqueeze(0)
-                policy, value_logits = self.forward(board_tensor, return_aux=False)
+                policy_logits, value_logits = self.forward(
+                    board_tensor,
+                    return_aux=False,
+                    apply_log_softmax=False,
+                )
                 
                 # value_logits: (1, 3) -> [Win, Draw, Loss]
                 wdl_probs = F.softmax(value_logits, dim=1)
                 # Scalar: W*1.0 + D*0.0 + L*(-1.0) = W - L
                 value_scalar = wdl_probs[0, 0] - wdl_probs[0, 2]
-                return torch.exp(policy).cpu().numpy()[0], value_scalar.item()
+                policy_probs = F.softmax(policy_logits, dim=1)
+                return policy_probs.float().cpu().numpy()[0], value_scalar.item()
         finally:
             if was_training:
                 self.train()
@@ -644,7 +690,10 @@ def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None,
     """
     state_dict = model.state_dict()
     if save_dtype is not None:
-        state_dict = {k: v.to(save_dtype) for k, v in state_dict.items()}
+        state_dict = {
+            k: (v.to(save_dtype) if v.is_floating_point() else v.clone())
+            for k, v in state_dict.items()
+        }
     
     checkpoint = {
         'epoch': epoch,

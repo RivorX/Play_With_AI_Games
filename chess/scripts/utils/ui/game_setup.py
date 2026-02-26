@@ -41,7 +41,9 @@ _MODEL_ARCH_KEYS = [
     "num_residual_blocks",
     "dropout",
     "history_positions",
-    "use_se2d_blocks",
+    "use_se_blocks",
+    "use_se_bottleneck",
+    "se_reduction",
     "drop_path_rate",
     "use_coord_conv",
     "use_layer_scale",
@@ -122,7 +124,19 @@ def _infer_architecture_from_state_dict(state_dict):
     if value_fc1 is not None and getattr(value_fc1, "ndim", 0) == 2:
         inferred["value_hidden_dim"] = int(value_fc1.shape[0])
 
-    inferred["use_se2d_blocks"] = any(".se.fc1.weight" in key for key in state_dict.keys())
+    se_fc1_keys = [key for key in state_dict.keys() if ".se.fc1.weight" in key]
+    se_fc_keys = [key for key in state_dict.keys() if ".se.fc.weight" in key]
+    use_se_blocks = bool(se_fc1_keys or se_fc_keys)
+    inferred["use_se_blocks"] = use_se_blocks
+    if use_se_blocks:
+        inferred["use_se_bottleneck"] = bool(se_fc1_keys)
+        if se_fc1_keys:
+            fc1_weight = state_dict.get(se_fc1_keys[0])
+            if fc1_weight is not None and getattr(fc1_weight, "ndim", 0) == 4:
+                in_ch = int(fc1_weight.shape[1])
+                mid = int(fc1_weight.shape[0])
+                if in_ch > 0 and mid > 0:
+                    inferred["se_reduction"] = max(1, in_ch // mid)
     inferred["use_layer_scale"] = any(".layer_scale.gamma" in key for key in state_dict.keys())
     inferred["use_multitask_learning"] = any(
         key.startswith("win_fc1.") or key.startswith("material_fc1.") or key.startswith("check_fc.")
@@ -139,10 +153,14 @@ def _build_checkpoint_model_config(config, checkpoint):
         for key in _MODEL_ARCH_KEYS:
             if key in checkpoint_arch:
                 model_cfg[key] = checkpoint_arch[key]
+        if "use_se_blocks" not in model_cfg and "use_se2d_blocks" in checkpoint_arch:
+            model_cfg["use_se_blocks"] = checkpoint_arch["use_se2d_blocks"]
 
     for key in _MODEL_ARCH_KEYS:
         if key in checkpoint:
             model_cfg[key] = checkpoint[key]
+    if "use_se_blocks" not in model_cfg and "use_se2d_blocks" in checkpoint:
+        model_cfg["use_se_blocks"] = checkpoint["use_se2d_blocks"]
 
     inferred = _infer_architecture_from_state_dict(checkpoint.get("model_state_dict"))
     for key, value in inferred.items():

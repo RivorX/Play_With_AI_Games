@@ -125,8 +125,12 @@ class UCIChessEngine:
         )
         with torch.inference_mode():
             with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                policy_log_probs, _ = self.model(board_tensor, return_aux=False)
-            policy = torch.exp(policy_log_probs).cpu().numpy()[0]
+                policy_logits, _ = self.model(
+                    board_tensor,
+                    return_aux=False,
+                    apply_log_softmax=False,
+                )
+            policy = policy_logits.float().cpu().numpy()[0]
 
         best_move = None
         best_score = -1.0

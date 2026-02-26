@@ -1,4 +1,4 @@
-"""IL auto-tuning for batch size and learning rate."""
+"""Shared auto-tuning helpers for IL and RL hyperparameters."""
 
 import gc
 import hashlib
@@ -28,6 +28,21 @@ def _safe_float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _safe_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
 
 
 def _fmt_gib(num_bytes):
@@ -97,9 +112,37 @@ def _build_device_key(config, device):
     )
 
 
+def _normalize_runtime_profile(runtime_profile):
+    text = str(runtime_profile or "eager").strip().lower()
+    if text in {"compiled", "compile", "torch.compile", "torch_compile"}:
+        return "compiled"
+    return "eager"
+
+
+def _get_auto_tune_cfg(config):
+    """Return shared auto-tune config (top-level) with legacy IL fallback."""
+    shared_cfg = config.get("auto_tune", {}) or {}
+    legacy_cfg = config.get("imitation_learning", {}).get("auto_tune", {}) or {}
+
+    if not isinstance(shared_cfg, dict):
+        shared_cfg = {}
+    if not isinstance(legacy_cfg, dict):
+        legacy_cfg = {}
+
+    merged = dict(legacy_cfg)
+    merged.update(shared_cfg)
+    return merged
+
+
+def _auto_tune_enabled_for(config, target):
+    auto_cfg = _get_auto_tune_cfg(config)
+    target_key = "use_for_rl" if str(target).strip().lower() == "rl" else "use_for_il"
+    return _safe_bool(auto_cfg.get(target_key), True)
+
+
 def _resolve_cache_path(base_dir, config):
     paths_cfg = config.get("paths", {}) or {}
-    auto_cfg = config.get("imitation_learning", {}).get("auto_tune", {}) or {}
+    auto_cfg = _get_auto_tune_cfg(config)
     rel_path = auto_cfg.get("cache_path")
     if rel_path is None or str(rel_path).strip() == "":
         rel_path = paths_cfg.get("il_auto_tune_cache", "logs/il_auto_tune_cache.yaml")
@@ -136,14 +179,187 @@ def _save_cache(cache_path, data):
         yaml.safe_dump(data, f, sort_keys=True)
 
 
+def _ensure_cache_entries(cache):
+    entries = cache.get("entries")
+    if not isinstance(entries, dict):
+        entries = {}
+        cache["entries"] = entries
+    return entries
+
+
+def _get_cached_entry_for_device(entries, model_hash, legacy_model_hash, device_key, context_label):
+    hash_entries = entries.get(model_hash)
+    hash_key_used = model_hash
+    if not isinstance(hash_entries, dict) and legacy_model_hash:
+        legacy_entries = entries.get(legacy_model_hash)
+        if isinstance(legacy_entries, dict):
+            hash_entries = legacy_entries
+            hash_key_used = legacy_model_hash
+            print(
+                f"{context_label}: found legacy cache key "
+                "(included model.version); migrating to version-agnostic hash."
+            )
+
+    cached_entry = None
+    if isinstance(hash_entries, dict):
+        maybe_entry = hash_entries.get(device_key)
+        if isinstance(maybe_entry, dict):
+            cached_entry = maybe_entry
+    return cached_entry, hash_entries, hash_key_used
+
+
+def _read_cache_profile(entry, runtime_profile, fallback_to_eager=True):
+    if not isinstance(entry, dict):
+        return None, None
+
+    requested = _normalize_runtime_profile(runtime_profile)
+
+    def _as_profile_payload(raw, fallback_algo):
+        if not isinstance(raw, dict):
+            return None
+        batch_size = _safe_int(raw.get("batch_size"), 0)
+        learning_rate = _safe_float(raw.get("learning_rate"), 0.0)
+        if batch_size <= 0 or learning_rate <= 0:
+            return None
+
+        payload = {
+            "batch_size": int(batch_size),
+            "learning_rate": float(learning_rate),
+            "estimated_peak_bytes": _safe_int(raw.get("estimated_peak_bytes"), 0) or None,
+            "probe_count": _safe_int(raw.get("probe_count"), 0),
+            "lr_factor": _safe_float(raw.get("lr_factor", raw.get("lr_scale_factor")), 1.0),
+            "lr_mode": raw.get("lr_mode", raw.get("lr_scale_mode")),
+            "algo_version": _safe_int(raw.get("algo_version"), fallback_algo),
+        }
+        return payload
+
+    fallback_algo = _safe_int(entry.get("algo_version"), 0)
+    profiles = entry.get("profiles")
+    if isinstance(profiles, dict):
+        requested_profile = _as_profile_payload(profiles.get(requested), fallback_algo)
+        if requested_profile is not None:
+            return requested_profile, requested
+        if fallback_to_eager and requested != "eager":
+            eager_profile = _as_profile_payload(profiles.get("eager"), fallback_algo)
+            if eager_profile is not None:
+                return eager_profile, "eager"
+
+    def _flat_profile(profile_key):
+        suffix = f"_{profile_key}"
+        batch_value = entry.get(f"batch_size{suffix}")
+        lr_value = entry.get(f"learning_rate{suffix}")
+        if batch_value is None and lr_value is None:
+            return None
+        raw = {
+            "batch_size": batch_value,
+            "learning_rate": lr_value,
+            "estimated_peak_bytes": entry.get(f"estimated_peak_bytes{suffix}"),
+            "probe_count": entry.get(f"probe_count{suffix}"),
+            "lr_factor": entry.get(f"lr_factor{suffix}", entry.get(f"lr_scale_factor{suffix}")),
+            "lr_mode": entry.get(f"lr_mode{suffix}", entry.get(f"lr_scale_mode{suffix}")),
+            "algo_version": entry.get(f"algo_version{suffix}", fallback_algo),
+        }
+        return _as_profile_payload(raw, fallback_algo)
+
+    requested_flat = _flat_profile(requested)
+    if requested_flat is not None:
+        return requested_flat, requested
+
+    eager_flat = _flat_profile("eager")
+    if fallback_to_eager and requested != "eager" and eager_flat is not None:
+        return eager_flat, "eager"
+
+    root_profile = _as_profile_payload(entry, fallback_algo)
+    if root_profile is not None and (requested == "eager" or fallback_to_eager):
+        return root_profile, "eager"
+
+    return None, None
+
+
+def _cached_profile_is_usable(cached_profile, context_label, current_budget_bytes=None):
+    if not isinstance(cached_profile, dict):
+        return False
+
+    cached_batch = _safe_int(cached_profile.get("batch_size"), 0)
+    cached_lr = _safe_float(cached_profile.get("learning_rate"), 0.0)
+    if cached_batch <= 0 or cached_lr <= 0:
+        return False
+
+    cached_algo = _safe_int(cached_profile.get("algo_version"), 0)
+    if cached_algo != AUTO_TUNE_ALGO_VERSION:
+        print(
+            f"{context_label}: cached params skipped "
+            f"(algo_version={cached_algo}, expected={AUTO_TUNE_ALGO_VERSION})."
+        )
+        return False
+
+    cached_peak = _safe_int(cached_profile.get("estimated_peak_bytes"), 0)
+    if (
+        current_budget_bytes is not None
+        and current_budget_bytes > 0
+        and cached_peak > 0
+        and cached_peak > current_budget_bytes
+    ):
+        print(
+            f"{context_label}: cached params skipped "
+            f"(cached_peak={_fmt_gib(cached_peak)} > current_budget={_fmt_gib(current_budget_bytes)})."
+        )
+        return False
+
+    return True
+
+
+def _write_cache_profile(entry, runtime_profile, profile_payload):
+    if not isinstance(entry, dict):
+        entry = {}
+    if not isinstance(profile_payload, dict):
+        return entry
+
+    profile_key = _normalize_runtime_profile(runtime_profile)
+    profiles = entry.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+    profiles[profile_key] = dict(profile_payload)
+    entry["profiles"] = profiles
+
+    suffix = f"_{profile_key}"
+    entry[f"batch_size{suffix}"] = int(profile_payload.get("batch_size", 0) or 0)
+    entry[f"learning_rate{suffix}"] = float(profile_payload.get("learning_rate", 0.0) or 0.0)
+    peak_bytes = profile_payload.get("estimated_peak_bytes")
+    entry[f"estimated_peak_bytes{suffix}"] = (
+        None if peak_bytes is None else int(peak_bytes)
+    )
+    entry[f"probe_count{suffix}"] = int(profile_payload.get("probe_count", 0) or 0)
+    entry[f"lr_mode{suffix}"] = profile_payload.get("lr_mode")
+    entry[f"lr_factor{suffix}"] = float(profile_payload.get("lr_factor", 1.0) or 1.0)
+    entry[f"algo_version{suffix}"] = int(
+        profile_payload.get("algo_version", AUTO_TUNE_ALGO_VERSION)
+    )
+
+    if profile_key == "eager":
+        entry["batch_size"] = int(profile_payload.get("batch_size", 0) or 0)
+        entry["learning_rate"] = float(profile_payload.get("learning_rate", 0.0) or 0.0)
+        entry["estimated_peak_bytes"] = (
+            None if peak_bytes is None else int(peak_bytes)
+        )
+        entry["probe_count"] = int(profile_payload.get("probe_count", 0) or 0)
+        entry["lr_mode"] = profile_payload.get("lr_mode")
+        entry["lr_factor"] = float(profile_payload.get("lr_factor", 1.0) or 1.0)
+        entry["lr_scale_mode"] = profile_payload.get("lr_mode")
+        entry["lr_scale_factor"] = float(profile_payload.get("lr_factor", 1.0) or 1.0)
+        entry["algo_version"] = int(profile_payload.get("algo_version", AUTO_TUNE_ALGO_VERSION))
+
+    entry["last_runtime_profile"] = profile_key
+    return entry
+
+
 def _is_oom_error(exc):
     text = str(exc).lower()
     return "out of memory" in text or "cuda error: out of memory" in text
 
 
 def _compute_vram_budget(total_vram_bytes, free_vram_bytes, config):
-    il_cfg = config.get("imitation_learning", {}) or {}
-    auto_cfg = il_cfg.get("auto_tune", {}) or {}
+    auto_cfg = _get_auto_tune_cfg(config)
 
     free_util = _safe_float(auto_cfg.get("free_vram_utilization"), 0.92)
     free_util = max(0.20, min(0.99, free_util))
@@ -436,7 +652,7 @@ def _round_batch(batch_size, round_to):
 
 def _find_max_batch_size(model, config, device, budget_info):
     il_cfg = config.get("imitation_learning", {}) or {}
-    auto_cfg = il_cfg.get("auto_tune", {}) or {}
+    auto_cfg = _get_auto_tune_cfg(config)
 
     use_amp = bool(config.get("hardware", {}).get("use_amp", True))
     use_bfloat16 = bool(config.get("hardware", {}).get("use_bfloat16", False))
@@ -446,6 +662,9 @@ def _find_max_batch_size(model, config, device, budget_info):
     max_batch_default = max(32768, configured_batch * 4)
     max_batch = max(min_batch, _safe_int(auto_cfg.get("max_batch_size"), max_batch_default))
     batch_round_to = max(1, _safe_int(auto_cfg.get("batch_round_to"), 64))
+    search_step = max(1, int(batch_round_to))
+    if search_step > 1:
+        max_batch = max(search_step, _round_batch(max_batch, search_step))
 
     budget_bytes = int(budget_info.get("budget_bytes") or 0)
     probe_peak_metric = str(auto_cfg.get("probe_peak_metric", "reserved")).strip().lower()
@@ -500,22 +719,67 @@ def _find_max_batch_size(model, config, device, budget_info):
             "max_batch": max_batch,
             "batch_round_to": batch_round_to,
             "raw_best_batch": 1,
+            "batch_search_mode": "fast_units",
             "free_limit_bytes": budget_info.get("free_limit_bytes"),
             "safety_margin_bytes": budget_info.get("safety_margin_bytes"),
             "budget_mode": budget_info.get("budget_mode"),
         }
 
-    low = 1
-    high = max_batch
+    raw_best_batch = 1
 
-    while low < high:
-        mid = (low + high + 1) // 2
-        if fits(mid):
-            low = mid
-        else:
-            high = mid - 1
+    # Fast search: probe rounded units (batch_round_to) + warm start near configured batch.
+    # This cuts probe count versus full integer binary search while keeping robust fit checks.
+    if search_step > 1 and not fits(search_step):
+        # If even first rounded step does not fit, binary-search the tiny range [1, step-1].
+        low = 1
+        high = search_step - 1
+        while low < high:
+            mid = (low + high + 1) // 2
+            if fits(mid):
+                low = mid
+            else:
+                high = mid - 1
+        raw_best_batch = int(low)
+    else:
+        max_units = max(1, int(max_batch // search_step))
+        low_units = 1
+        high_units = max_units
 
-    raw_best_batch = low
+        warm_units = max(1, min(max_units, int(configured_batch // search_step)))
+        if warm_units > 1:
+            warm_batch = int(warm_units * search_step)
+            if fits(warm_batch):
+                low_units = warm_units
+
+                # Find upper region quickly (galloping) starting from configured batch.
+                probe_units = min(max_units, max(warm_units + 1, warm_units * 2))
+                if probe_units > low_units:
+                    if fits(int(probe_units * search_step)):
+                        low_units = probe_units
+                        while low_units < max_units:
+                            next_units = min(max_units, low_units * 2)
+                            if next_units <= low_units:
+                                break
+                            if fits(int(next_units * search_step)):
+                                low_units = next_units
+                            else:
+                                high_units = max(low_units, next_units - 1)
+                                break
+                    else:
+                        high_units = max(low_units, probe_units - 1)
+            else:
+                high_units = max(1, min(high_units, warm_units - 1))
+
+        if low_units < high_units:
+            while low_units < high_units:
+                mid_units = (low_units + high_units + 1) // 2
+                mid_batch = int(mid_units * search_step)
+                if fits(mid_batch):
+                    low_units = mid_units
+                else:
+                    high_units = mid_units - 1
+
+        raw_best_batch = int(low_units * search_step)
 
     rounded_batch = _round_batch(raw_best_batch, batch_round_to)
     if raw_best_batch >= min_batch:
@@ -544,6 +808,7 @@ def _find_max_batch_size(model, config, device, budget_info):
         "max_batch": max_batch,
         "batch_round_to": batch_round_to,
         "raw_best_batch": raw_best_batch,
+        "batch_search_mode": "fast_units",
         "free_limit_bytes": budget_info.get("free_limit_bytes"),
         "safety_margin_bytes": budget_info.get("safety_margin_bytes"),
         "budget_mode": budget_info.get("budget_mode"),
@@ -563,7 +828,7 @@ def _count_trainable_params(model):
 
 
 def _build_lr_test_candidates(config):
-    auto_cfg = config.get("imitation_learning", {}).get("auto_tune", {}) or {}
+    auto_cfg = _get_auto_tune_cfg(config)
 
     manual = auto_cfg.get("lr_test_candidates")
     if isinstance(manual, (list, tuple)):
@@ -605,7 +870,7 @@ def _snapshot_model_state_cpu(model):
 
 def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use_amp, use_bfloat16):
     """Find LR by short range test (multiple short train steps on synthetic batches)."""
-    auto_cfg = config.get("imitation_learning", {}).get("auto_tune", {}) or {}
+    auto_cfg = _get_auto_tune_cfg(config)
     lr_candidates = _build_lr_test_candidates(config)
     test_steps = _safe_int(auto_cfg.get("lr_test_steps"), 2)
     test_steps = max(1, min(5, test_steps))
@@ -763,7 +1028,7 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
         if not was_training:
             model.eval()
 
-    auto_cfg = config.get("imitation_learning", {}).get("auto_tune", {}) or {}
+    auto_cfg = _get_auto_tune_cfg(config)
     if best_entry is not None:
         selected_lr_raw = float(best_entry["lr"])
     else:
@@ -786,7 +1051,69 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
     return float(selected_lr), lr_factor, "lr_range_test", lr_meta
 
 
-def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
+def _compile_model_for_auto_tune(model, config, device):
+    """
+    Try compiling model for probe-only runtime profiling.
+
+    Returns:
+    - compiled model wrapper on success, backend label, None
+    - None, None, error_message on failure
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None, None, "CUDA not available"
+
+    use_amp = bool(config.get("hardware", {}).get("use_amp", True))
+    use_bfloat16 = bool(config.get("hardware", {}).get("use_bfloat16", False))
+    amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+    amp_enabled = bool(use_amp)
+    input_planes = int(getattr(model, "input_planes", 16))
+    dummy = torch.zeros(
+        1,
+        input_planes,
+        8,
+        8,
+        device=device,
+        dtype=torch.float32,
+    ).to(memory_format=torch.channels_last)
+    backends = (("default", True), ("cudagraphs", False))
+    last_error = None
+
+    for backend_or_mode, is_mode in backends:
+        compiled = None
+        try:
+            if is_mode:
+                try:
+                    compiled = torch.compile(model, mode=backend_or_mode, dynamic=True)
+                except TypeError:
+                    compiled = torch.compile(model, mode=backend_or_mode)
+            else:
+                try:
+                    compiled = torch.compile(model, backend=backend_or_mode, dynamic=True)
+                except TypeError:
+                    compiled = torch.compile(model, backend=backend_or_mode)
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
+                    compiled(dummy)
+            return compiled, backend_or_mode, None
+        except Exception as exc:
+            last_error = exc
+            compiled = None
+
+    if last_error is None:
+        return None, None, "unknown compile error"
+    return None, None, f"{type(last_error).__name__}: {last_error}"
+
+
+def resolve_il_hyperparameters(
+    config,
+    model,
+    device,
+    base_dir,
+    mode="config",
+    runtime_profile="eager",
+    fixed_learning_rate=None,
+    fallback_to_eager_profile=True,
+):
     """
     Resolve IL hyperparameters from config or from auto-tune cache/probe.
 
@@ -801,6 +1128,8 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
     selected_mode = str(mode or "config").strip().lower()
     if selected_mode not in {"auto", "config"}:
         selected_mode = "config"
+
+    requested_profile = _normalize_runtime_profile(runtime_profile)
 
     model_hash = build_model_hash(config, include_version=False)
     legacy_model_hash = build_model_hash(config, include_version=True)
@@ -822,6 +1151,8 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
         "probe_count": 0,
         "lr_scale_factor": 1.0,
         "lr_scale_mode": None,
+        "runtime_profile_requested": requested_profile,
+        "runtime_profile_used": requested_profile,
     }
 
     if selected_mode != "auto":
@@ -831,6 +1162,14 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
             "IL hyperparameters: using config values "
             f"(batch_size={configured_batch}, learning_rate={configured_lr:.6g})."
         )
+        return result
+
+    if not _auto_tune_enabled_for(config, target="il"):
+        il_cfg["batch_size"] = configured_batch
+        il_cfg["learning_rate"] = configured_lr
+        result["mode"] = "config"
+        result["source"] = "config (auto disabled for IL)"
+        print("IL auto-tune disabled by config (auto_tune.use_for_il=false); using config values.")
         return result
 
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -862,77 +1201,93 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
 
     cache_path = _resolve_cache_path(base_dir, config)
     cache = _load_cache(cache_path)
-    entries = cache.setdefault("entries", {})
-    if not isinstance(entries, dict):
-        entries = {}
-        cache["entries"] = entries
+    entries = _ensure_cache_entries(cache)
 
     device_key = _build_device_key(config, device)
-    hash_entries = entries.get(model_hash)
-    hash_key_used = model_hash
-    if not isinstance(hash_entries, dict) and legacy_model_hash:
-        legacy_entries = entries.get(legacy_model_hash)
-        if isinstance(legacy_entries, dict):
-            hash_entries = legacy_entries
-            hash_key_used = legacy_model_hash
-            print(
-                "IL auto-tune: found legacy cache key "
-                "(included model.version); migrating to version-agnostic hash."
-            )
-    if isinstance(hash_entries, dict):
-        cached_entry = hash_entries.get(device_key)
-        if isinstance(cached_entry, dict):
-            cached_batch = _safe_int(cached_entry.get("batch_size"), 0)
-            cached_lr = _safe_float(cached_entry.get("learning_rate"), 0.0)
-            cached_peak = _safe_int(cached_entry.get("estimated_peak_bytes"), 0)
-            cached_algo = _safe_int(cached_entry.get("algo_version"), 0)
-            cache_usable = True
-            if cached_algo != AUTO_TUNE_ALGO_VERSION:
-                cache_usable = False
-                print(
-                    "IL auto-tune: cached params skipped "
-                    f"(algo_version={cached_algo}, expected={AUTO_TUNE_ALGO_VERSION})."
-                )
-            if cached_peak > 0 and current_budget_bytes > 0 and cached_peak > current_budget_bytes:
-                cache_usable = False
-                print(
-                    "IL auto-tune: cached params skipped "
-                    f"(cached_peak={_fmt_gib(cached_peak)} > current_budget={_fmt_gib(current_budget_bytes)})."
-                )
+    cached_entry, hash_entries, hash_key_used = _get_cached_entry_for_device(
+        entries=entries,
+        model_hash=model_hash,
+        legacy_model_hash=legacy_model_hash,
+        device_key=device_key,
+        context_label="IL auto-tune",
+    )
 
-            if cache_usable and cached_batch > 0 and cached_lr > 0:
-                cached_peak = _safe_int(cached_entry.get("estimated_peak_bytes"), 0) or None
-                cached_probe_count = _safe_int(cached_entry.get("probe_count"), 0)
-                il_cfg["batch_size"] = int(cached_batch)
-                il_cfg["learning_rate"] = float(cached_lr)
-                result.update(
-                    {
-                        "source": "auto-cache",
-                        "batch_size": int(cached_batch),
-                        "learning_rate": float(cached_lr),
-                        "cache_hit": True,
-                        "budget_bytes": current_budget_bytes or None,
-                        "estimated_peak_bytes": cached_peak,
-                        "probe_count": cached_probe_count,
-                        "lr_scale_factor": _safe_float(
-                            cached_entry.get("lr_factor", cached_entry.get("lr_scale_factor")),
-                            1.0,
-                        ),
-                        "lr_scale_mode": cached_entry.get("lr_mode", cached_entry.get("lr_scale_mode")),
-                    }
-                )
+    cached_profile, cached_profile_key = _read_cache_profile(
+        cached_entry,
+        runtime_profile=requested_profile,
+        fallback_to_eager=fallback_to_eager_profile,
+    )
+    if _cached_profile_is_usable(
+        cached_profile,
+        context_label="IL auto-tune",
+        current_budget_bytes=current_budget_bytes,
+    ):
+        cached_batch = _safe_int(cached_profile.get("batch_size"), 0)
+        cached_lr = _safe_float(cached_profile.get("learning_rate"), 0.0)
+        cached_peak = _safe_int(cached_profile.get("estimated_peak_bytes"), 0) or None
+        cached_probe_count = _safe_int(cached_profile.get("probe_count"), 0)
+        il_cfg["batch_size"] = int(cached_batch)
+        il_cfg["learning_rate"] = float(cached_lr)
+        result.update(
+            {
+                "source": "auto-cache",
+                "batch_size": int(cached_batch),
+                "learning_rate": float(cached_lr),
+                "cache_hit": True,
+                "budget_bytes": current_budget_bytes or None,
+                "estimated_peak_bytes": cached_peak,
+                "probe_count": cached_probe_count,
+                "lr_scale_factor": _safe_float(cached_profile.get("lr_factor"), 1.0),
+                "lr_scale_mode": cached_profile.get("lr_mode"),
+                "runtime_profile_used": cached_profile_key or requested_profile,
+            }
+        )
+        profile_note = ""
+        if cached_profile_key and cached_profile_key != requested_profile:
+            profile_note = f", profile={cached_profile_key} (fallback from {requested_profile})"
+        else:
+            profile_note = f", profile={cached_profile_key or requested_profile}"
+        print(
+            "IL auto-tune: loaded cached values "
+            f"(hash={model_hash[:12]}, batch_size={int(cached_batch)}, "
+            f"lr={float(cached_lr):.6g}{profile_note})."
+        )
+        if hash_key_used != model_hash and isinstance(hash_entries, dict):
+            entries[model_hash] = hash_entries
+            cache["entries"] = entries
+            try:
+                _save_cache(cache_path, cache)
+            except Exception:
+                pass
+        return result
+
+    probe_profile = requested_profile
+    probe_model = model
+    compile_backend = None
+    if requested_profile == "compiled":
+        probe_model, compile_backend, compile_error = _compile_model_for_auto_tune(model, config, device)
+        if probe_model is None:
+            if fallback_to_eager_profile:
+                probe_profile = "eager"
+                probe_model = model
                 print(
-                    "IL auto-tune: loaded cached values "
-                    f"(hash={model_hash[:12]}, batch_size={int(cached_batch)}, lr={float(cached_lr):.6g})."
+                    "IL auto-tune: torch.compile probe unavailable for profile=compiled; "
+                    f"falling back to eager ({compile_error})."
                 )
-                if hash_key_used != model_hash:
-                    entries[model_hash] = hash_entries
-                    cache["entries"] = entries
-                    try:
-                        _save_cache(cache_path, cache)
-                    except Exception:
-                        pass
+            else:
+                il_cfg["batch_size"] = configured_batch
+                il_cfg["learning_rate"] = configured_lr
+                result["mode"] = "config"
+                result["source"] = "config (auto unavailable: compile probe failed)"
+                result["runtime_profile_used"] = "eager"
+                result["compile_probe_error"] = compile_error
+                print(
+                    "IL auto-tune: compile-specific probe failed; "
+                    "keeping current hyperparameters."
+                )
                 return result
+        else:
+            result["compile_backend"] = compile_backend
 
     print(f"  Dedicated VRAM total: {_fmt_gib(dedicated_vram_bytes)}")
     print(f"  Dedicated VRAM free:  {_fmt_gib(free_vram_bytes)}")
@@ -941,23 +1296,50 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
         f"(free_limit={_fmt_gib(budget_info['free_limit_bytes'])}, "
         f"safety_margin={_fmt_gib(budget_info['safety_margin_bytes'])})"
     )
-    print("IL auto-tune: estimating batch size from dedicated GPU VRAM...")
-    tuned_batch, tune_info = _find_max_batch_size(
-        model=model,
-        config=config,
-        device=device,
-        budget_info=budget_info,
+    print(
+        f"IL auto-tune [{probe_profile}]: estimating batch size from dedicated GPU VRAM..."
     )
 
-    tuned_lr, lr_factor, lr_mode, lr_meta = _select_learning_rate(
-        model=model,
-        config=config,
-        configured_lr=configured_lr,
-        tuned_batch=tuned_batch,
-        device=device,
-        use_amp=bool(config.get("hardware", {}).get("use_amp", True)),
-        use_bfloat16=bool(config.get("hardware", {}).get("use_bfloat16", False)),
-    )
+    baseline_state = _snapshot_model_state_cpu(model)
+    tuned_batch = 0
+    tune_info = {}
+    tuned_lr = configured_lr
+    lr_factor = 1.0
+    lr_mode = "config"
+    lr_meta = None
+    try:
+        tuned_batch, tune_info = _find_max_batch_size(
+            model=probe_model,
+            config=config,
+            device=device,
+            budget_info=budget_info,
+        )
+
+        if fixed_learning_rate is not None and _safe_float(fixed_learning_rate, 0.0) > 0:
+            auto_cfg = _get_auto_tune_cfg(config)
+            tuned_lr_raw = _safe_float(fixed_learning_rate, configured_lr)
+            tuned_lr, _, _ = _clamp_learning_rate(tuned_lr_raw, auto_cfg)
+            lr_factor = float(tuned_lr / max(1e-12, float(configured_lr)))
+            lr_mode = "fixed"
+            lr_meta = {
+                "method": "fixed",
+                "value": float(tuned_lr),
+                "requested_value": float(tuned_lr_raw),
+            }
+        else:
+            tuned_lr, lr_factor, lr_mode, lr_meta = _select_learning_rate(
+                model=probe_model,
+                config=config,
+                configured_lr=configured_lr,
+                tuned_batch=tuned_batch,
+                device=device,
+                use_amp=bool(config.get("hardware", {}).get("use_amp", True)),
+                use_bfloat16=bool(config.get("hardware", {}).get("use_bfloat16", False)),
+            )
+    finally:
+        model.load_state_dict(baseline_state, strict=True)
+        _clear_probe_state(model, device)
+        del baseline_state
 
     il_cfg["batch_size"] = int(tuned_batch)
     il_cfg["learning_rate"] = float(tuned_lr)
@@ -968,7 +1350,7 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
     print(
         "IL auto-tune: selected "
         f"batch_size={int(tuned_batch)}, learning_rate={float(tuned_lr):.6g} "
-        f"({lr_mode}, factor x{lr_factor:.3f})."
+        f"({lr_mode}, factor x{lr_factor:.3f}, profile={probe_profile})."
     )
     if budget_bytes:
         print(f"  Target VRAM budget: {_fmt_gib(budget_bytes)}")
@@ -984,31 +1366,53 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
 
     if not isinstance(hash_entries, dict):
         hash_entries = {}
-    hash_entries[device_key] = {
+    device_entry = hash_entries.get(device_key)
+    if not isinstance(device_entry, dict):
+        device_entry = {}
+
+    device_entry.update(
+        {
+            "model_hash": model_hash,
+            "device_key": device_key,
+            "device_name": torch.cuda.get_device_name(device),
+            "dedicated_vram_bytes": int(dedicated_vram_bytes),
+            "free_vram_bytes_at_tune": int(free_vram_bytes),
+            "budget_bytes": int(budget_bytes) if budget_bytes is not None else None,
+            "free_vram_utilization": float(tune_info.get("free_utilization", 0.0)),
+            "budget_mode": tune_info.get("budget_mode", "free_dedicated_vram"),
+            "free_limit_bytes": int(tune_info.get("free_limit_bytes", 0) or 0),
+            "safety_margin_bytes": int(tune_info.get("safety_margin_bytes", 0) or 0),
+            "probe_peak_metric": tune_info.get("probe_peak_metric"),
+            "probe_to_train_multiplier": float(tune_info.get("probe_to_train_multiplier", 1.0)),
+            "algo_version": AUTO_TUNE_ALGO_VERSION,
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+    profile_payload = {
+        "runtime_profile": probe_profile,
         "batch_size": int(tuned_batch),
         "learning_rate": float(tuned_lr),
-        "model_hash": model_hash,
         "algo_version": AUTO_TUNE_ALGO_VERSION,
-        "device_key": device_key,
-        "device_name": torch.cuda.get_device_name(device),
-        "dedicated_vram_bytes": int(dedicated_vram_bytes),
-        "free_vram_bytes_at_tune": int(free_vram_bytes),
-        "budget_bytes": int(budget_bytes) if budget_bytes is not None else None,
         "estimated_peak_bytes": int(estimated_peak) if estimated_peak is not None else None,
         "probe_count": int(tune_info.get("probe_count", 0)),
-        "free_vram_utilization": float(tune_info.get("free_utilization", 0.0)),
-        "budget_mode": tune_info.get("budget_mode", "free_dedicated_vram"),
-        "free_limit_bytes": int(tune_info.get("free_limit_bytes", 0) or 0),
-        "safety_margin_bytes": int(tune_info.get("safety_margin_bytes", 0) or 0),
-        "probe_peak_metric": tune_info.get("probe_peak_metric"),
-        "probe_to_train_multiplier": float(tune_info.get("probe_to_train_multiplier", 1.0)),
         "lr_mode": lr_mode,
         "lr_factor": float(lr_factor),
         "lr_scale_mode": lr_mode,
         "lr_scale_factor": float(lr_factor),
         "lr_meta": lr_meta,
+        "budget_bytes": int(budget_bytes) if budget_bytes is not None else None,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+    if probe_profile == "compiled" and compile_backend:
+        profile_payload["compile_backend"] = compile_backend
+
+    device_entry = _write_cache_profile(
+        entry=device_entry,
+        runtime_profile=probe_profile,
+        profile_payload=profile_payload,
+    )
+    hash_entries[device_key] = device_entry
     entries[model_hash] = hash_entries
     cache["entries"] = entries
 
@@ -1031,6 +1435,120 @@ def resolve_il_hyperparameters(config, model, device, base_dir, mode="config"):
             "lr_scale_mode": lr_mode,
             "lr_meta": lr_meta,
             "cache_path": str(cache_path),
+            "runtime_profile_used": probe_profile,
         }
     )
+    if compile_backend:
+        result["compile_backend"] = compile_backend
+    return result
+
+
+def resolve_rl_hyperparameters(config, model, device, base_dir, runtime_profile=None):
+    """
+    Resolve RL hyperparameters from shared auto-tune cache (produced by IL).
+
+    RL does not run probing; it only reuses cached values when available.
+    """
+    rl_cfg = config.setdefault("reinforcement_learning", {})
+    configured_batch = max(1, _safe_int(rl_cfg.get("batch_size"), 1024))
+    configured_lr = _safe_float(rl_cfg.get("learning_rate"), 2e-4)
+    if configured_lr <= 0:
+        configured_lr = 2e-4
+
+    if runtime_profile is None:
+        runtime_profile = "eager"
+    requested_profile = _normalize_runtime_profile(runtime_profile)
+
+    model_hash = build_model_hash(config, include_version=False)
+    legacy_model_hash = build_model_hash(config, include_version=True)
+    if legacy_model_hash == model_hash:
+        legacy_model_hash = None
+
+    result = {
+        "algo_version": AUTO_TUNE_ALGO_VERSION,
+        "source": "config",
+        "batch_size": configured_batch,
+        "learning_rate": configured_lr,
+        "model_hash": model_hash,
+        "cache_path": str(_resolve_cache_path(base_dir, config)),
+        "cache_hit": False,
+        "lr_scale_factor": 1.0,
+        "lr_scale_mode": None,
+        "runtime_profile_requested": requested_profile,
+        "runtime_profile_used": requested_profile,
+    }
+
+    if not _auto_tune_enabled_for(config, target="rl"):
+        rl_cfg["batch_size"] = configured_batch
+        rl_cfg["learning_rate"] = configured_lr
+        result["source"] = "config (auto disabled for RL)"
+        print("RL auto-tune disabled by config (auto_tune.use_for_rl=false); using config values.")
+        return result
+
+    if device.type != "cuda" or not torch.cuda.is_available():
+        rl_cfg["batch_size"] = configured_batch
+        rl_cfg["learning_rate"] = configured_lr
+        result["source"] = "config (auto unavailable: non-CUDA)"
+        print("RL auto-tune unavailable on non-CUDA device; using config values.")
+        return result
+
+    cache_path = _resolve_cache_path(base_dir, config)
+    cache = _load_cache(cache_path)
+    entries = _ensure_cache_entries(cache)
+    device_key = _build_device_key(config, device)
+    cached_entry, hash_entries, hash_key_used = _get_cached_entry_for_device(
+        entries=entries,
+        model_hash=model_hash,
+        legacy_model_hash=legacy_model_hash,
+        device_key=device_key,
+        context_label="RL auto-tune",
+    )
+
+    cached_profile, cached_profile_key = _read_cache_profile(
+        cached_entry,
+        runtime_profile=requested_profile,
+        fallback_to_eager=True,
+    )
+    if _cached_profile_is_usable(cached_profile, context_label="RL auto-tune"):
+        cached_batch = _safe_int(cached_profile.get("batch_size"), 0)
+        cached_lr = _safe_float(cached_profile.get("learning_rate"), 0.0)
+        rl_cfg["batch_size"] = int(cached_batch)
+        rl_cfg["learning_rate"] = float(cached_lr)
+        result.update(
+            {
+                "source": "auto-cache",
+                "batch_size": int(cached_batch),
+                "learning_rate": float(cached_lr),
+                "cache_hit": True,
+                "lr_scale_factor": _safe_float(
+                    cached_profile.get("lr_factor"),
+                    1.0,
+                ),
+                "lr_scale_mode": cached_profile.get("lr_mode"),
+                "runtime_profile_used": cached_profile_key or requested_profile,
+            }
+        )
+        profile_note = ""
+        if cached_profile_key and cached_profile_key != requested_profile:
+            profile_note = f", profile={cached_profile_key} (fallback from {requested_profile})"
+        else:
+            profile_note = f", profile={cached_profile_key or requested_profile}"
+        print(
+            "RL auto-tune: loaded cached values "
+            f"(hash={model_hash[:12]}, batch_size={int(cached_batch)}, "
+            f"lr={float(cached_lr):.6g}{profile_note})."
+        )
+        if hash_key_used != model_hash and isinstance(hash_entries, dict):
+            entries[model_hash] = hash_entries
+            cache["entries"] = entries
+            try:
+                _save_cache(cache_path, cache)
+            except Exception:
+                pass
+        return result
+
+    rl_cfg["batch_size"] = configured_batch
+    rl_cfg["learning_rate"] = configured_lr
+    result["source"] = "config (auto-cache miss)"
+    print("RL auto-tune: cache miss or unusable entry; using config values.")
     return result

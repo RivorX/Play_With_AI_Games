@@ -38,7 +38,7 @@ Silnik szachowy oparty na deep learning (CNN) i MCTS, inspirowany AlphaZero.
 - value head: 3 klasy WDL
 
 Opcjonalne elementy (zaleznie od `config.yaml`):
-- `SE2DBlock`
+- `SEBlock` (Squeeze-and-Excitation)
 - `CoordConv2d`
 - `LayerScale`
 - `Stochastic Depth`

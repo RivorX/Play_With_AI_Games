@@ -39,6 +39,8 @@ class MCTSNode:
         
         # 🔥 Cache game over status
         self._is_game_over = None
+        # Cache current board tensor (side-to-move POV) reused across evaluations.
+        self._board_tensor = None
     
     @property
     def board(self):
@@ -109,8 +111,41 @@ class BatchMCTS:
         # 🔥 Inference optimization (AMP on GPU)
         self.use_amp = config.get('hardware', {}).get('use_amp', False) and self.device.type == 'cuda'
         self.amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
+        self.dirichlet_alpha = config['reinforcement_learning'].get('mcts_dirichlet_alpha', 0.3)
+        self.dirichlet_weight = config['reinforcement_learning'].get('mcts_dirichlet_weight', 0.0)
+
+        # Reused immutable zero-history plane to reduce per-call allocations.
+        self._empty_history_tensor = np.zeros((16, 8, 8), dtype=np.float32)
+
+    @staticmethod
+    def _is_encoded_history_entry(entry):
+        return (
+            isinstance(entry, tuple)
+            and len(entry) == 2
+            and isinstance(entry[0], np.ndarray)
+            and isinstance(entry[1], np.ndarray)
+        )
+
+    def _encode_history_entry(self, board_or_fen):
+        """
+        Convert history item to cached tensors for both POVs:
+        (white_pov_tensor, black_pov_tensor).
+        """
+        if self._is_encoded_history_entry(board_or_fen):
+            return board_or_fen
+        if isinstance(board_or_fen, str):
+            board_obj = chess.Board(board_or_fen)
+        else:
+            board_obj = board_or_fen
+        if not isinstance(board_obj, chess.Board):
+            raise TypeError(f"Unsupported history entry type: {type(board_or_fen)}")
+
+        return (
+            board_to_tensor(board_obj, flip_perspective=False),
+            board_to_tensor(board_obj, flip_perspective=True),
+        )
     
-    def _build_history_tensor(self, current_board):
+    def _build_history_tensor(self, current_board, current_tensor=None):
         """
         🆕 v4.2: Build tensor with history using POV-aware board_to_tensor
         
@@ -128,34 +163,56 @@ class BatchMCTS:
         
         # Build history list
         history_tensors = []
+        use_black_pov = current_board.turn == chess.BLACK
         
         # Get last N boards from history
         if self.board_history:
             history_boards = self.board_history[-self.history_positions:]
             # Convert history boards to tensors with POV
-            for hist_fen in history_boards:
-                # 🔥 OPTIMIZATION: Reconstruct board from FEN string (saves RAM)
-                hist_board = chess.Board(hist_fen) if isinstance(hist_fen, str) else hist_fen
-                # All history from CURRENT player's perspective
-                hist_tensor = board_to_tensor(
-                    hist_board,
-                    flip_perspective=(current_board.turn == chess.BLACK)
-                )
-                history_tensors.append(hist_tensor)
+            for hist_entry in history_boards:
+                encoded = self._encode_history_entry(hist_entry)
+                hist_tensors = encoded[1] if use_black_pov else encoded[0]
+                history_tensors.append(hist_tensors)
         
         # Pad with ZEROS if not enough history (matching training data!)
-        while len(history_tensors) < self.history_positions:
+        pad_count = max(0, self.history_positions - len(history_tensors))
+        if pad_count:
             # 🔧 v4.5 FIX: Use zeros, not chess.Board() - matches BinaryChessDataset padding
-            empty_tensor = np.zeros((16, 8, 8), dtype=np.float32)
-            history_tensors.insert(0, empty_tensor)
+            history_tensors = [self._empty_history_tensor] * pad_count + history_tensors
         
         # Add current board
-        current_tensor = board_to_tensor(current_board)
+        if current_tensor is None:
+            current_tensor = board_to_tensor(current_board)
         history_tensors.append(current_tensor)
         
         # Stack: [oldest_history, ..., newest_history, current]
         # 🔧 v4.5 FIX: Shape is now (16 * (history_positions + 1), 8, 8) - 16 planes per position
         return np.concatenate(history_tensors, axis=0)
+
+    @staticmethod
+    def _current_tensor_for_node(node):
+        cached = getattr(node, "_board_tensor", None)
+        if cached is None:
+            cached = board_to_tensor(node.board)
+            node._board_tensor = cached
+        return cached
+
+    def advance_root(self, move):
+        """
+        Advance tree root to a known played move.
+
+        This avoids expensive FEN matching on the next search call when the move
+        is known by the caller (e.g. self-play/game loop).
+        """
+        if self.root is None:
+            return
+        child = self.root.children.get(move)
+        if child is None:
+            self.root = None
+            return
+        _ = child.board  # Materialize board once, then detach subtree.
+        child.parent = None
+        self.root = child
     
     def search(self, board, num_simulations, temperature=1.0):
         """
@@ -166,23 +223,27 @@ class BatchMCTS:
         if self.reuse_tree and self.root is not None:
             # 🔥 OPTIMIZATION: Use cached FEN instead of generating twice
             target_fen = board.fen()
-            # Try to find current position in existing tree
-            for move, child in self.root.children.items():
-                if child.get_fen() == target_fen:
-                    # Found it! Reuse this subtree
-                    # Ensure board is instantiated before detaching parent
-                    _ = child.board
-                    self.root = child
-                    self.root.parent = None  # Make it new root
-                    break
+            if self.root.get_fen() == target_fen:
+                # Root already at requested position.
+                pass
             else:
-                # Position not found, create new tree
-                self.root = MCTSNode(board)
+                # Try to find current position in existing tree
+                for _, child in self.root.children.items():
+                    if child.get_fen() == target_fen:
+                        # Found it! Reuse this subtree
+                        # Ensure board is instantiated before detaching parent
+                        _ = child.board
+                        self.root = child
+                        self.root.parent = None  # Make it new root
+                        break
+                else:
+                    # Position not found, create new tree
+                    self.root = MCTSNode(board)
         else:
             self.root = MCTSNode(board)
         
         # Add Dirichlet noise to root
-        add_noise = self.config['reinforcement_learning'].get('mcts_dirichlet_weight', 0) > 0
+        add_noise = self.dirichlet_weight > 0
         
         # Batch simulations
         for batch_start in range(0, num_simulations, self.eval_batch_size):
@@ -199,7 +260,7 @@ class BatchMCTS:
                 node.add_virtual_loss()
                 
                 # Selection
-                while not node.is_leaf() and not node.is_game_over:
+                while not node.is_leaf():
                     node = self._select_child(node)
                     node.add_virtual_loss()
                     search_path.append(node)
@@ -284,18 +345,37 @@ class BatchMCTS:
 
         if non_terminal_nodes:
             # 🆕 v4.2: Stack tensors WITH HISTORY
-            board_tensors = torch.stack([
-                torch.from_numpy(self._build_history_tensor(node.board))
-                for node in non_terminal_nodes
-            ]).to(self.device, memory_format=torch.channels_last, non_blocking=True)
+            boards_np = np.stack(
+                [
+                    self._build_history_tensor(
+                        node.board,
+                        current_tensor=self._current_tensor_for_node(node),
+                    )
+                    for node in non_terminal_nodes
+                ],
+                axis=0,
+            )
+            board_tensors = torch.from_numpy(boards_np).to(
+                self.device,
+                memory_format=torch.channels_last,
+                non_blocking=True,
+            )
 
             # Single GPU call (inference optimized)
             with torch.inference_mode():
                 if self.use_amp:
                     with torch.autocast(device_type='cuda', dtype=self.amp_dtype):
-                        policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
+                        policy_logits_batch, values_batch = self.model(
+                            board_tensors,
+                            return_aux=False,
+                            apply_log_softmax=False,
+                        )
                 else:
-                    policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
+                    policy_logits_batch, values_batch = self.model(
+                        board_tensors,
+                        return_aux=False,
+                        apply_log_softmax=False,
+                    )
                 
                 # 🔥 OPTIMIZATION: Transfer entire batch to CPU at once, not row by row
                 if values_batch.dim() == 2 and values_batch.shape[1] == 3:
@@ -324,10 +404,8 @@ class BatchMCTS:
 
                 # Dirichlet noise
                 if add_noise and node is self.root and len(legal_moves) > 0:
-                    alpha = self.config['reinforcement_learning']['mcts_dirichlet_alpha']
-                    weight = self.config['reinforcement_learning']['mcts_dirichlet_weight']
-                    noise = np.random.dirichlet([alpha] * len(legal_moves))
-                    legal_probs = (1 - weight) * legal_probs + weight * noise
+                    noise = np.random.dirichlet([self.dirichlet_alpha] * len(legal_moves))
+                    legal_probs = (1 - self.dirichlet_weight) * legal_probs + self.dirichlet_weight * noise
 
                 if not node.expanded:
                     # Create children lazily (saves massive CPU and RAM)
@@ -366,8 +444,8 @@ class BatchMCTS:
         Args:
             board: chess.Board that was just played
         """
-        # 🔥 OPTIMIZATION: Store FEN instead of full board copy to save RAM
-        self.board_history.append(board.fen())
+        # Store cached tensors for both POVs to avoid repeated FEN parse + tensor rebuild.
+        self.board_history.append(self._encode_history_entry(board))
         
         # Keep only last N positions needed for history
         max_history = self.history_positions + 10  # Keep a few extra for safety

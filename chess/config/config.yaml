@@ -79,7 +79,7 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v5.2"
+  version: "v6.0"
   # Base architecture
   num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
   filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
@@ -95,7 +95,9 @@ model:
   history_positions: 4       # Number of past positions to include (0 = current only, 4 = current + 3 history)
   
   # Advanced features
-  use_se2d_blocks: true          # ✅ SE-Net v2 with channel attention
+  use_se_blocks: true           # ✅ Squeeze-and-Excitation channel attention
+  use_se_bottleneck: true       # Use FC bottleneck in SE block (recommended)
+  se_reduction: 4               # Used when bottleneck=true (4=mid=32, 8=mid=16, 16=mid=8)
   drop_path_rate: 0.1           # Stochastic Depth
   use_coord_conv: true          # 🗺️ Position-aware conv
   
@@ -114,31 +116,51 @@ model:
 
 
 # ------------------------------------------------------------------------------
+# SHARED AUTO-TUNE (IL + RL)
+# ------------------------------------------------------------------------------
+auto_tune:
+  use_for_il: true                   # IL may run probing + cache writes (when IL mode=auto)
+  use_for_rl: true                   # RL may reuse cached batch/LR from IL
+  cache_path: "logs/il_auto_tune_cache.yaml"
+  free_vram_utilization: 0.98
+  safety_margin_gib: 0.1
+  min_batch_size: 64
+  max_batch_size: 32768
+  batch_round_to: 64
+  lr_test_min: 0.00008
+  lr_test_max: 0.002
+  lr_test_points: 10
+  lr_test_steps: 3
+  lr_min: 0.00008
+  lr_max: 0.002
+
+
+# ------------------------------------------------------------------------------
 # IMITATION LEARNING (IL)
 # ------------------------------------------------------------------------------
 imitation_learning:
   # Checkpoint content
   save_optimizer_state: true  # Save optimizer state in IL checkpoints for true resume
 
-  # Training hyperparameters automatic tuning (see auto_tune section below)
+  # Training hyperparameters (used directly in config mode, and as fallback defaults)
   batch_size: 9216           # Batch size
   learning_rate: 0.001       # Base/fallback LR (used for config mode and LR-test fallback)
 
   # Advanced training hyperparameters
-  value_head_lr_factor: 1.2  # Value head LR multiplier (1.0 = full LR)
-  epochs: 20                 # Maximum training epochs
+  value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
+  epochs: 30                 # Maximum training epochs
   weight_decay: 0.002        # L2 regularization (10x stronger for value head)
   grad_clip: 1.0             # Gradient clipping threshold
   
   # 🆕 Stochastic Weight Averaging (SWA) for better generalization
   use_swa: true              # Enable SWA (averages weights from multiple epochs)
-  swa_start_epoch: 8         # Start SWA after this epoch
-  swa_lr: 0.0001             # SWA learning rate (lower than base LR)
+  swa_start_epoch: 14        # Start SWA after this epoch
+  swa_lr: 0.00005            # SWA learning rate (lower than base LR)
   
   # Advanced training features
   label_smoothing: 0.08      # Label smoothing (0.0 = off, 0.1 = standard)
   warmup_pct: 0.05           # Warmup fraction of epochs (e.g., 0.02-0.05)
-  min_lr_ratio: 0.05         # Min LR = base_lr * ratio
+  min_lr_ratio: 0.005        # Min LR = base_lr * ratio
   
   # 🆕 v4.3: WDL-specific options
   wdl_label_smoothing: 0.01  # Smoothing for value head (WDL is more sensitive to overconfidence)
@@ -156,24 +178,8 @@ imitation_learning:
   checkpoint_every: 5        # Save checkpoint every N epochs
   
   # Early stopping
-  max_patience: 5           # ℹ️ Stop if no improvement for N epochs
+  max_patience: 7           # ℹ️ Stop if no improvement for N epochs
   min_delta: 0.001           # Minimum improvement threshold
-
-  # Auto-tuning (batch size + LR range test)
-  auto_tune:
-    cache_path: "logs/il_auto_tune_cache.yaml"
-    free_vram_utilization: 0.97
-    safety_margin_gib: 0.2
-    min_batch_size: 64
-    max_batch_size: 32768
-    batch_round_to: 64
-    lr_test_min: 0.00008
-    lr_test_max: 0.002
-    lr_test_points: 10
-    lr_test_steps: 3
-    lr_min: 0.00008
-    lr_max: 0.002
-
 
 # ------------------------------------------------------------------------------
 # REINFORCEMENT LEARNING (RL)
@@ -264,6 +270,7 @@ hardware:
   num_workers: 4             # CPU workers for data loading
   prefetch_factor: 2         # DataLoader prefetch factor
   pin_memory: true           # Faster GPU data transfer
+  use_compile: true          # 🚀 torch.compile: fuse Conv+BN+ReLU kernels
 
 
 # ------------------------------------------------------------------------------
@@ -283,10 +290,16 @@ elo_estimation:
   eval_every: 2                # Estimate Elo every N epochs (expensive, don't run every epoch)
   stockfish_path: "stockfish"  # Path to Stockfish binary (or just "stockfish" if on PATH)
   workers: 0                   # 🚀 Parallel game workers (0/auto = cpu_count-2, set explicit 4-8 for best speed)
+  prioritize_training: true    # Keep IL training/data-loading responsive while Elo runs
+  reserve_dataloader_workers: true  # Reserve hardware.num_workers CPU slots for DataLoader
+  free_threads_utilization: 1.0  # Use this fraction of free CPU threads after DataLoader reservation
+  stockfish_priority: "below_normal"  # Windows process priority for Stockfish: idle|below_normal|normal
+  stockfish_hide_window: true  # Windows: spawn Stockfish without console windows
+  max_error_logs_per_type: 8   # Suppress repeated Stockfish error spam after N logs
   
-  games_per_level: 40          # Games per Elo level (half as white, half as black)
+  games_per_level: 50          # Games per Elo level (half as white, half as black)
   levels: [1320, 1400, 1500, 1600, 1700, 1850, 2000, 2200]  # Stockfish UCI_Elo levels (min 1320 for SF 17+)
-  stockfish_time_limit: 0.1    # Seconds per Stockfish move (lower = faster but weaker play)
+  stockfish_time_limit: 0.2    # Seconds per Stockfish move (lower = faster but weaker play)
   max_moves: 120               # Max full moves per game before declaring draw
   
   # MCTS options (for stronger but slower play)

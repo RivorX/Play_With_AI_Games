@@ -301,7 +301,7 @@ def finalize_swa_model(
     epoch_to_store = max(int(final_epoch_idx), 0)
     result["model_path"] = str(swa_model_path)
 
-    if eval_error is None and isinstance(elo_config, dict) and elo_config.get("enabled", False):
+    if isinstance(elo_config, dict) and elo_config.get("enabled", False):
         print("Estimating SWA Elo (separate final check)...")
         elo_result = estimate_model_elo(
             swa_model.module,

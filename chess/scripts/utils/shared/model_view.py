@@ -146,7 +146,9 @@ def _build_model_rows(
     drop_path_rate = _safe_float(model_cfg.get("drop_path_rate"))
     policy_groups = _safe_int(model_cfg.get("policy_head_conv_groups"))
     use_coord_conv = bool(model_cfg.get("use_coord_conv", False))
-    use_se2d = bool(model_cfg.get("use_se2d_blocks", False))
+    use_se = bool(model_cfg.get("use_se_blocks", False))
+    use_se_bottleneck = bool(model_cfg.get("use_se_bottleneck", True))
+    se_reduction = _safe_int(model_cfg.get("se_reduction"))
     use_layer_scale = bool(model_cfg.get("use_layer_scale", False))
     layer_scale_init = model_cfg.get("layer_scale_init")
     use_mtl = bool(model_cfg.get("use_multitask_learning", False))
@@ -177,8 +179,13 @@ def _build_model_rows(
 
     if use_coord_conv:
         rows.append(("CoordConv", "enabled"))
-    if use_se2d:
-        rows.append(("SE2D blocks", "enabled"))
+    if use_se:
+        if use_se_bottleneck and se_reduction is not None:
+            rows.append(("SE blocks", f"enabled (bottleneck, r={se_reduction})"))
+        elif use_se_bottleneck:
+            rows.append(("SE blocks", "enabled (bottleneck)"))
+        else:
+            rows.append(("SE blocks", "enabled (no bottleneck)"))
     if use_layer_scale:
         if layer_scale_init is None:
             rows.append(("LayerScale", "enabled"))

@@ -33,9 +33,26 @@ def _snapshot_model_state_cpu(model):
     }
 
 
-def _async_elo_worker(epoch_num, model_state_cpu, config_snapshot, elo_config_snapshot, worker_device_str, result_queue):
+def _async_elo_worker(
+    epoch_num,
+    model_state_cpu,
+    config_snapshot,
+    elo_config_snapshot,
+    worker_device_str,
+    result_queue,
+    cancel_event,
+):
     """Background Elo estimation worker for IL (thread target)."""
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            result_queue.put(
+                {
+                    "epoch": int(epoch_num),
+                    "cancelled": True,
+                }
+            )
+            return
+
         worker_config = copy.deepcopy(config_snapshot)
         worker_config.setdefault("model", {})
         worker_config["model"]["print_summary"] = False
@@ -54,12 +71,20 @@ def _async_elo_worker(epoch_num, model_state_cpu, config_snapshot, elo_config_sn
             worker_config,
             worker_device,
             elo_config_snapshot,
+            stop_event=cancel_event,
         )
         result_queue.put(
             {
                 "epoch": int(epoch_num),
                 "result": elo_result,
                 "device": worker_device.type,
+            }
+        )
+    except KeyboardInterrupt:
+        result_queue.put(
+            {
+                "epoch": int(epoch_num),
+                "cancelled": True,
             }
         )
     except Exception as exc:
@@ -90,6 +115,7 @@ class ILEloCoordinator:
         self.result_queue = queue.Queue()
         self.worker_thread = None
         self.worker_epoch = None
+        self.worker_cancel_event = None
 
     def print_startup_summary(self):
         """Print runtime Elo configuration."""
@@ -123,7 +149,9 @@ class ILEloCoordinator:
 
             result_epoch = int(payload.get("epoch", -1))
             worker_error = payload.get("error")
-            if worker_error:
+            if payload.get("cancelled"):
+                pass
+            elif worker_error:
                 print(f"     [async] Elo failed for epoch {result_epoch}: {worker_error}")
             else:
                 elo_result = payload.get("result", {}) or {}
@@ -142,12 +170,14 @@ class ILEloCoordinator:
             if self.worker_epoch == result_epoch:
                 self.worker_epoch = None
                 self.worker_thread = None
+                self.worker_cancel_event = None
 
         # Defensive cleanup in case worker ended without queue payload.
         if self.worker_thread is not None and not self.worker_thread.is_alive() and self.worker_epoch is not None:
             print(f"     [async] Elo worker for epoch {self.worker_epoch} finished without payload.")
             self.worker_epoch = None
             self.worker_thread = None
+            self.worker_cancel_event = None
 
         if any_new_elo:
             self.logger.plot()
@@ -167,6 +197,13 @@ class ILEloCoordinator:
         model_state_cpu = _snapshot_model_state_cpu(self.model)
         worker_config = copy.deepcopy(self.config)
         worker_elo_cfg = dict(self.elo_config)
+        worker_elo_cfg.setdefault("prioritize_training", True)
+        worker_elo_cfg.setdefault("reserve_dataloader_workers", True)
+        worker_elo_cfg.setdefault("free_threads_utilization", 0.8)
+        worker_elo_cfg.setdefault("stockfish_priority", "below_normal")
+        worker_elo_cfg.setdefault("stockfish_hide_window", True)
+        worker_elo_cfg.setdefault("max_error_logs_per_type", 8)
+        cancel_event = threading.Event()
 
         worker = threading.Thread(
             target=_async_elo_worker,
@@ -177,12 +214,14 @@ class ILEloCoordinator:
                 worker_elo_cfg,
                 self.async_device.type,
                 self.result_queue,
+                cancel_event,
             ),
             daemon=True,
         )
         worker.start()
         self.worker_thread = worker
         self.worker_epoch = int(epoch_num)
+        self.worker_cancel_event = cancel_event
         print(
             f"     [async] Started Elo for epoch {epoch_num} on {self.async_device.type}. "
             "Training continues."
@@ -218,6 +257,10 @@ class ILEloCoordinator:
         if not self.async_enabled or self.worker_thread is None or not self.worker_thread.is_alive():
             return
 
+        if interrupted and self.worker_cancel_event is not None:
+            self.worker_cancel_event.set()
+            print(f"Cancelling async Elo worker for epoch {self.worker_epoch}...")
+
         if (not interrupted) and self.shutdown_wait_sec > 0:
             print(
                 f"Waiting up to {self.shutdown_wait_sec:.1f}s for async Elo "
@@ -225,10 +268,13 @@ class ILEloCoordinator:
             )
             self.worker_thread.join(timeout=self.shutdown_wait_sec)
             self.poll_results()
+        elif interrupted:
+            # On Ctrl+C wait briefly so worker can stop and flush result queue.
+            self.worker_thread.join(timeout=2.0)
+            self.poll_results()
 
         if self.worker_thread is not None and self.worker_thread.is_alive():
             print(
                 f"Async Elo for epoch {self.worker_epoch} still running; "
                 "continuing shutdown without waiting."
             )
-

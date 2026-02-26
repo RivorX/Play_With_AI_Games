@@ -166,23 +166,62 @@ def main():
         has_checkpoints=has_il_checkpoints(best_model_path, il_dir)
     )
 
-    hparam_resolution = resolve_il_hyperparameters(
+    compile_requested = bool(
+        config.get("hardware", {}).get("use_compile", False)
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+    )
+
+    hparam_resolution_eager = resolve_il_hyperparameters(
         config=config,
         model=model,
         device=device,
         base_dir=base_dir,
         mode=hparam_mode,
+        runtime_profile="eager",
     )
+    hparam_resolution_compiled = None
+    hparam_resolution = hparam_resolution_eager
+
+    if str(hparam_mode).strip().lower() == "auto" and compile_requested:
+        eager_lr = hparam_resolution_eager.get("learning_rate")
+        try:
+            eager_lr = float(eager_lr)
+        except (TypeError, ValueError):
+            eager_lr = None
+
+        hparam_resolution_compiled = resolve_il_hyperparameters(
+            config=config,
+            model=model,
+            device=device,
+            base_dir=base_dir,
+            mode=hparam_mode,
+            runtime_profile="compiled",
+            fixed_learning_rate=eager_lr,
+            fallback_to_eager_profile=False,
+        )
+
+        if hparam_resolution_compiled.get("runtime_profile_used") == "compiled":
+            hparam_resolution = hparam_resolution_compiled
+        else:
+            hparam_resolution = hparam_resolution_eager
+            print("IL auto-tune: keeping eager profile for active training values.")
 
     model_hash_short = str(hparam_resolution.get("model_hash") or "n/a")[:16]
+    hparam_rows = [
+        ("Source", hparam_resolution.get("source", "config")),
+        ("Runtime profile", hparam_resolution.get("runtime_profile_used", "eager")),
+        ("Batch size", config['imitation_learning']['batch_size']),
+        ("Learning rate", f"{float(config['imitation_learning']['learning_rate']):.6g}"),
+        ("Model hash", model_hash_short),
+    ]
+    if hparam_resolution_compiled is not None:
+        hparam_rows.insert(3, ("Batch size (eager)", hparam_resolution_eager.get("batch_size", "n/a")))
+        hparam_rows.insert(4, ("Batch size (compiled)", hparam_resolution_compiled.get("batch_size", "n/a")))
+
     print_status_table(
         "IL Hyperparameters",
-        [
-            ("Source", hparam_resolution.get("source", "config")),
-            ("Batch size", config['imitation_learning']['batch_size']),
-            ("Learning rate", f"{float(config['imitation_learning']['learning_rate']):.6g}"),
-            ("Model hash", model_hash_short),
-        ],
+        hparam_rows,
     )
 
     if debug_enabled:
@@ -211,8 +250,18 @@ def main():
             )
             f.write(f"Model hash: {hparam_resolution.get('model_hash', 'n/a')}\n")
             f.write(f"Hyperparameter source: {hparam_resolution.get('source', 'config')}\n")
+            f.write(
+                f"Runtime profile: {hparam_resolution.get('runtime_profile_used', 'eager')} "
+                f"(requested={hparam_resolution.get('runtime_profile_requested', 'eager')})\n"
+            )
             f.write(f"Batch size: {config['imitation_learning']['batch_size']}\n")
             f.write(f"Learning rate: {config['imitation_learning']['learning_rate']}\n")
+            if hparam_resolution_compiled is not None:
+                f.write(f"Batch size (eager): {hparam_resolution_eager.get('batch_size', 'n/a')}\n")
+                f.write(
+                    "Batch size (compiled): "
+                    f"{hparam_resolution_compiled.get('batch_size', 'n/a')}\n"
+                )
             f.write(f"History positions: {history_positions} (dynamic)\n")
             f.write(f"Sliding window stride: {stride}x\n")
             f.write(f"Input planes: {expected_input_planes} (16 per position)\n")
@@ -652,6 +701,60 @@ def main():
     )
     elo_coordinator.print_startup_summary()
 
+    # torch.compile: fuses Conv+BN+ReLU kernels → fewer GPU kernel launches.
+    # Run it after checkpoint/startup initialization so all runtime components
+    # operate on the same model instance.
+    _use_compile = config['hardware'].get('use_compile', False)
+    if _use_compile and torch.cuda.is_available():
+        amp_enabled_for_compile = bool(use_amp and device.type == 'cuda')
+        amp_dtype_for_compile = torch.bfloat16 if use_bfloat16 else torch.float16
+
+        # torch.compile jest leniwy — kompilacja i ewentualny błąd dopiero przy pierwszym forward.
+        # Robimy próbny forward pass zaraz po compile, żeby złapać błąd TERAZ (nie w środku epoki).
+        def _try_compile(backend_or_mode, is_mode=True):
+            """Zwraca skompilowany model lub None jeśli się nie uda."""
+            try:
+                if is_mode:
+                    _compiled = torch.compile(model, mode=backend_or_mode)
+                else:
+                    _compiled = torch.compile(model, backend=backend_or_mode)
+                # Próbny forward — wymusza kompilację i łapie TritonMissing / inne błędy
+                _dummy = torch.zeros(
+                    1, expected_input_planes, 8, 8,
+                    device=device,
+                    dtype=torch.float32,
+                ).to(memory_format=torch.channels_last)
+                with torch.no_grad():
+                    with torch.amp.autocast(
+                        "cuda",
+                        enabled=amp_enabled_for_compile,
+                        dtype=amp_dtype_for_compile,
+                    ):
+                        _compiled(_dummy)
+                return _compiled
+            except Exception as _e:
+                print(f"  ✗ {'mode=' + backend_or_mode if is_mode else 'backend=' + backend_or_mode}: {type(_e).__name__}: {_e}")
+                return None
+
+        print("torch.compile: testowanie dostępnych backendów...")
+        _compiled_model = None
+
+        # 1. Inductor default (wymaga Triton — najlepszy wynik)
+        _compiled_model = _try_compile('default', is_mode=True)
+        if _compiled_model is not None:
+            model = _compiled_model
+            print("✓ torch.compile enabled (mode=default, inductor+Triton, warmup ~30-60s)")
+        else:
+            # 2. cudagraphs (nie wymaga Triton, ~10-15% gain, stabilny na Windows)
+            _compiled_model = _try_compile('cudagraphs', is_mode=False)
+            if _compiled_model is not None:
+                model = _compiled_model
+                print("✓ torch.compile enabled (backend=cudagraphs, ~10-15% gain, bez Triton)")
+            else:
+                print("⚠️ torch.compile niedostępny dla bieżącej konfiguracji — trening bez kompilacji")
+    elif _use_compile:
+        print("⚠️ torch.compile pominięty: CUDA niedostępna")
+
     def _get_elo_state_for_checkpoint():
         elo_epoch, elo_value = logger.get_latest_estimated_elo_with_epoch()
         elo_metadata = {}
@@ -660,8 +763,6 @@ def main():
         if elo_epoch is not None:
             elo_metadata['estimated_elo_epoch'] = int(elo_epoch)
         return elo_metadata, elo_epoch, elo_value
-
-    current_estimated_elo = logger.get_latest_estimated_elo()
 
     training_interrupted = False
     last_epoch_idx = start_epoch - 1
@@ -679,7 +780,6 @@ def main():
                     f"Full model unfrozen ({total_trainable_now:,} trainable params)."
                 )
             elo_coordinator.poll_results()
-            current_estimated_elo = logger.get_latest_estimated_elo()
             print(f"\nEpoch {epoch + 1}/{total_epochs}")
             epoch_lr = optimizer.param_groups[0]['lr']
 
@@ -753,16 +853,10 @@ def main():
 
                 # Log metrics + periodic Elo estimation.
                 estimated_elo = elo_coordinator.evaluate_if_due(epoch + 1)
-                if estimated_elo is not None:
-                    current_estimated_elo = float(estimated_elo)
-                else:
-                    current_estimated_elo = logger.get_latest_estimated_elo()
-
                 logger.log(epoch + 1, train_losses, val_losses, train_metrics, val_metrics, epoch_lr,
-                           estimated_elo=current_estimated_elo)
+                           estimated_elo=estimated_elo)
                 logger.plot()
                 elo_coordinator.poll_results()
-                current_estimated_elo = logger.get_latest_estimated_elo()
 
                 # Save best model
                 improvement = best_val_loss - val_losses['total']
@@ -835,10 +929,9 @@ def main():
                     train_metrics,
                     None,
                     epoch_lr,
-                    estimated_elo=current_estimated_elo,
+                    estimated_elo=None,
                 )
                 elo_coordinator.poll_results()
-                current_estimated_elo = logger.get_latest_estimated_elo()
                 eval_time = 0.0
 
             if profile_this_epoch:
@@ -984,16 +1077,44 @@ def main():
         model_architecture=model_architecture,
     )
 
+    final_epoch_num = max(1, last_epoch_idx + 1)
+    swa_was_active = bool(use_swa and final_epoch_num >= int(swa_start))
+    if swa_was_active:
+        swa_marker_epoch = swa_final_result.get("estimated_elo_epoch")
+        if swa_marker_epoch is None:
+            swa_marker_epoch = final_epoch_num
+        try:
+            marker_epoch_int = int(swa_marker_epoch)
+        except (TypeError, ValueError):
+            marker_epoch_int = final_epoch_num
+        marker_label = "SWA final" if swa_final_result.get("finalized") else "SWA skipped"
+        logger.add_elo_epoch_marker(marker_epoch_int, marker_label)
+
     if swa_final_result.get("finalized"):
+        swa_elo = swa_final_result.get("estimated_elo")
+        if swa_elo is not None:
+            swa_epoch = swa_final_result.get("estimated_elo_epoch")
+            if swa_epoch is None:
+                swa_epoch = max(1, last_epoch_idx + 1)
+            try:
+                logger.record_estimated_elo(int(swa_epoch), float(swa_elo), update_csv=True)
+            except (TypeError, ValueError):
+                pass
+
         swa_note = (
             "SWA final: "
             f"val_loss={swa_final_result['val_loss']:.4f}, "
             f"top1={swa_final_result['val_top1']:.2%}, "
             f"mae={swa_final_result['val_mae']:.4f}"
         )
-        if swa_final_result.get("estimated_elo") is not None:
-            swa_note += f", elo={int(round(float(swa_final_result['estimated_elo'])))}"
+        if swa_elo is not None:
+            swa_note += f", elo={int(round(float(swa_elo)))}"
+        else:
+            swa_note += ", elo=n/a"
         logger.append_final_note(swa_note)
+        logger.plot()
+    elif swa_was_active:
+        logger.append_final_note(f"SWA final: not saved (epoch {final_epoch_num})")
         logger.plot()
 
     if training_interrupted:

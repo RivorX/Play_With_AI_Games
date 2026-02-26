@@ -112,6 +112,8 @@ class TrainingLogger:
         self.run_context_text = None
         # Optional notes shown in summary panel (e.g. final SWA metrics).
         self.final_notes = []
+        # Optional epoch markers drawn on IL Elo chart (e.g. SWA final epoch).
+        self.elo_epoch_markers = []  # (epoch, label)
         
         print(f"📊 Logging to: {self.csv_path}")
 
@@ -131,6 +133,29 @@ class TrainingLogger:
         if not text:
             return
         self.final_notes.append(text)
+
+    def add_elo_epoch_marker(self, iteration, label):
+        """Add or update an IL Elo-chart marker at a specific epoch."""
+        if self.mode != "il":
+            return
+        try:
+            iteration = int(iteration)
+        except (TypeError, ValueError):
+            return
+
+        text = str(label).strip() if label is not None else ""
+        if not text:
+            text = f"Epoch {iteration}"
+
+        replaced = False
+        for idx, (it, _) in enumerate(self.elo_epoch_markers):
+            if int(it) == iteration:
+                self.elo_epoch_markers[idx] = (iteration, text)
+                replaced = True
+                break
+        if not replaced:
+            self.elo_epoch_markers.append((iteration, text))
+            self.elo_epoch_markers.sort(key=lambda x: x[0])
 
     def record_estimated_elo(self, iteration, estimated_elo, update_csv=True):
         """Record estimated Elo for a specific epoch/iteration (supports async updates)."""
@@ -204,6 +229,73 @@ class TrainingLogger:
             return int(epoch), float(elo)
         except (TypeError, ValueError):
             return None, None
+
+    def _plot_il_elo_panel(self, ax):
+        """Render IL Elo panel, including optional epoch markers (e.g. SWA final)."""
+        has_elos = bool(self.estimated_elos)
+        has_markers = bool(self.elo_epoch_markers)
+        if not has_elos and not has_markers:
+            ax.axis('off')
+            return
+
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Elo')
+        ax.set_title('Estimated Elo (vs Stockfish)')
+        ax.grid(True, alpha=0.3)
+
+        if has_elos:
+            elo_epochs, elo_vals = zip(*self.estimated_elos)
+            ax.plot(elo_epochs, elo_vals, 'go-', label='Estimated Elo', linewidth=2, markersize=8)
+            for ref_elo, ref_label in [(1200, 'Beginner'), (1500, 'Club'), (1800, 'Expert'), (2000, 'Candidate Master')]:
+                if min(elo_vals) - 200 <= ref_elo <= max(elo_vals) + 200:
+                    ax.axhline(y=ref_elo, color='gray', linestyle=':', alpha=0.4)
+                    ax.text(elo_epochs[0], ref_elo + 15, ref_label, fontsize=8, color='gray', alpha=0.6)
+
+        if has_markers:
+            for marker_epoch, marker_label in self.elo_epoch_markers:
+                ax.axvline(
+                    x=marker_epoch,
+                    color='black',
+                    linestyle='--',
+                    alpha=0.55,
+                    linewidth=1.4,
+                    label=marker_label,
+                )
+                if has_elos:
+                    _, nearest_elo = min(
+                        self.estimated_elos,
+                        key=lambda pair: abs(int(pair[0]) - int(marker_epoch)),
+                    )
+                    ax.annotate(
+                        marker_label,
+                        xy=(marker_epoch, nearest_elo),
+                        xytext=(4, 8),
+                        textcoords='offset points',
+                        fontsize=8,
+                        color='black',
+                    )
+                else:
+                    ax.text(
+                        marker_epoch,
+                        0.95,
+                        marker_label,
+                        transform=ax.get_xaxis_transform(),
+                        rotation=90,
+                        va='top',
+                        ha='left',
+                        fontsize=8,
+                        color='black',
+                    )
+
+        if self.iterations:
+            x_min = min(self.iterations)
+            x_max = max(self.iterations)
+            if x_min == x_max:
+                x_min -= 1
+                x_max += 1
+            ax.set_xlim(x_min, x_max)
+
+        ax.legend(fontsize=8)
     
     def log(self, iteration, train_losses=None, val_losses=None, 
             train_metrics=None, val_metrics=None, lr=None, estimated_elo=None, **kwargs):
@@ -223,8 +315,6 @@ class TrainingLogger:
             writer = csv.writer(f)
             
             if self.mode == "il":
-                if estimated_elo is None:
-                    estimated_elo = self.get_latest_estimated_elo()
                 row = [
                     iteration,
                     train_losses['total'],
@@ -513,21 +603,7 @@ class TrainingLogger:
             # ROW 5: ELO ESTIMATION + SUMMARY
             # ============================================================
             ax = axes[4, 0]
-            if self.estimated_elos:
-                elo_epochs, elo_vals = zip(*self.estimated_elos)
-                ax.plot(elo_epochs, elo_vals, 'go-', label='Estimated Elo', linewidth=2, markersize=8)
-                ax.set_xlabel('Epoch')
-                ax.set_ylabel('Elo')
-                ax.set_title('Estimated Elo (vs Stockfish)')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-                # Add horizontal reference lines
-                for ref_elo, ref_label in [(1200, 'Beginner'), (1500, 'Club'), (1800, 'Expert'), (2000, 'Candidate Master')]:
-                    if min(elo_vals) - 200 <= ref_elo <= max(elo_vals) + 200:
-                        ax.axhline(y=ref_elo, color='gray', linestyle=':', alpha=0.4)
-                        ax.text(elo_epochs[0], ref_elo + 15, ref_label, fontsize=8, color='gray', alpha=0.6)
-            else:
-                ax.axis('off')
+            self._plot_il_elo_panel(ax)
             
             ax = axes[4, 1]
             ax.axis('off')
@@ -709,16 +785,7 @@ class TrainingLogger:
             # Summary metrics
             # Elo plot (MTL mode)
             ax = axes[4, 0]
-            if self.estimated_elos:
-                elo_epochs, elo_vals = zip(*self.estimated_elos)
-                ax.plot(elo_epochs, elo_vals, 'go-', label='Estimated Elo', linewidth=2, markersize=8)
-                ax.set_xlabel('Epoch')
-                ax.set_ylabel('Elo')
-                ax.set_title('Estimated Elo (vs Stockfish)')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-            else:
-                ax.axis('off')
+            self._plot_il_elo_panel(ax)
             axes[4, 1].axis('off')
             ax = axes[4, 2]
             ax.axis('off')

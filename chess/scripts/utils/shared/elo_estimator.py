@@ -8,9 +8,11 @@ Uses python-chess's chess.engine module for Stockfish communication.
 Auto-downloads Stockfish if not found on the system.
 """
 
+import contextlib
 import io
 import os
 import platform
+import subprocess
 import shutil
 import stat
 import time
@@ -297,9 +299,13 @@ class _ModelPlayer:
             .to(self.device, memory_format=torch.channels_last)
         )
         with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
-            policy_logits, _ = self.model(t)
+            policy_logits, _ = self.model(
+                t,
+                return_aux=False,
+                apply_log_softmax=False,
+            )
 
-        policy = policy_logits.squeeze(0).cpu().numpy()
+        policy = policy_logits.squeeze(0).float().cpu().numpy()
 
         best_move = None
         best_score = -float('inf')
@@ -338,11 +344,96 @@ class EloEstimator:
         config: dict,
         device: torch.device,
         stockfish_path: str = "stockfish",
+        stop_event=None,
+        elo_config: dict | None = None,
     ):
         self.model = model
         self.config = config
         self.device = device
         self.stockfish_path = stockfish_path
+        self.stop_event = stop_event
+        self.elo_config = dict(elo_config or {})
+        self._error_counters: dict[str, int] = {}
+
+    def _is_cancelled(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    def _log_limited(self, key: str, message: str):
+        """Log noisy worker errors with suppression after N repeats."""
+        limit = int(self.elo_config.get("max_error_logs_per_type", 8) or 8)
+        limit = max(1, min(100, limit))
+
+        count = int(self._error_counters.get(key, 0)) + 1
+        self._error_counters[key] = count
+        if count <= limit:
+            print(message)
+            return
+        if count == (limit + 1):
+            print(f"  Warning: {key}: too many repeats, suppressing further logs.")
+
+    def _stockfish_popen_kwargs(self):
+        """Build process kwargs for Stockfish engine launches."""
+        kwargs = {}
+        if platform.system().lower() != "windows":
+            return kwargs
+
+        flags = 0
+        if bool(self.elo_config.get("stockfish_hide_window", True)):
+            flags |= int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+
+        priority = str(self.elo_config.get("stockfish_priority", "below_normal")).strip().lower()
+        if priority in {"idle", "low"}:
+            flags |= int(getattr(subprocess, "IDLE_PRIORITY_CLASS", 0x00000040))
+        elif priority in {"below", "below_normal", "background"}:
+            flags |= int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000))
+        elif priority in {"normal", "default", ""}:
+            pass
+        else:
+            # Unknown value -> keep safe default (below-normal background engine).
+            flags |= int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000))
+
+        if flags:
+            kwargs["creationflags"] = flags
+        return kwargs
+
+    def _resolve_workers(self, requested_workers: int, total_games: int) -> int:
+        """
+        Resolve worker count with optional training-friendly CPU reservation.
+        """
+        cpu_total = int(os.cpu_count() or 1)
+        try:
+            requested = int(requested_workers or 0)
+        except (TypeError, ValueError):
+            requested = 0
+        if requested <= 0:
+            requested = max(1, cpu_total - 2)
+
+        effective = max(1, requested)
+        prioritize_training = bool(self.elo_config.get("prioritize_training", False))
+
+        if prioritize_training:
+            reserve_loader = 0
+            if bool(self.elo_config.get("reserve_dataloader_workers", True)):
+                reserve_loader = int(self.config.get("hardware", {}).get("num_workers", 0) or 0)
+                reserve_loader = max(0, reserve_loader)
+
+            free_threads = max(1, cpu_total - reserve_loader)
+            free_util = float(self.elo_config.get("free_threads_utilization", 1.0) or 1.0)
+            free_util = max(0.10, min(1.00, free_util))
+            cap = max(1, int(free_threads * free_util))
+
+            effective = min(effective, cap)
+
+            if effective < requested:
+                print(
+                    "  Info: Elo workers capped for training priority: "
+                    f"{requested} -> {effective} "
+                    f"(cpu={cpu_total}, free={free_threads}, util={free_util:.2f}, "
+                    f"reserved_loader={reserve_loader})."
+                )
+
+        effective = min(effective, max(1, int(total_games)))
+        return max(1, effective)
 
     # -----------------------------------------------------------------------
     # Public API
@@ -361,38 +452,27 @@ class EloEstimator:
         """
         Play games against Stockfish at several Elo levels and return
         a performance-rating-based estimate of the model's Elo.
-
-        Args:
-            levels: Stockfish UCI_Elo levels to test against.
-            games_per_level: Number of games per level (half as white, half as black).
-            stockfish_time_limit: Seconds per Stockfish move.
-            max_moves: Maximum full moves before declaring a draw.
-            use_mcts: Enable MCTS for model moves (slower but stronger).
-            simulations: MCTS simulations per move (if use_mcts=True).
-            workers: Number of parallel game workers (0=auto, 1=sequential).
-
-        Returns:
-            dict with keys:
-                estimated_elo (float | None)
-                results (dict[int, dict])   – per-level {wins, draws, losses, score}
-                total_games (int)
-                total_time (float)          – wall-clock seconds
         """
         if levels is None:
             levels = [1000, 1300, 1600, 1900, 2200]
 
-        # Auto-detect workers
-        if workers == 0 or workers is None:
-            workers = max(1, os.cpu_count() - 2)
-        workers = max(1, int(workers))
-
         self.model.eval()
+        if self._is_cancelled():
+            return {
+                "estimated_elo": None,
+                "results": {},
+                "total_games": 0,
+                "total_time": 0.0,
+                "cancelled": True,
+            }
 
-        # Try to open Stockfish (auto-download if needed) - just for validation
+        # Try to open Stockfish (auto-download if needed) - just for validation.
         resolved_path = ensure_stockfish(self.stockfish_path)
         try:
-            test_engine = chess.engine.SimpleEngine.popen_uci(resolved_path)
-            # Auto-detect engine Elo limits from UCI options
+            test_engine = chess.engine.SimpleEngine.popen_uci(
+                resolved_path,
+                **self._stockfish_popen_kwargs(),
+            )
             sf_min_elo = 1320
             sf_max_elo = 3190
             if "UCI_Elo" in test_engine.options:
@@ -401,104 +481,161 @@ class EloEstimator:
                     sf_min_elo = int(opt.min)
                 if hasattr(opt, "max") and opt.max is not None:
                     sf_max_elo = int(opt.max)
-            test_engine.quit()
+            with contextlib.suppress(Exception):
+                test_engine.quit()
         except FileNotFoundError:
-            print(f"  ⚠️  Stockfish not found at '{resolved_path}' — Elo estimation skipped.")
-            return {"estimated_elo": None, "results": {}, "total_games": 0, "total_time": 0.0,
-                    "error": "stockfish_not_found"}
-        except Exception as e:
-            print(f"  ⚠️  Stockfish error: {e} — Elo estimation skipped.")
-            return {"estimated_elo": None, "results": {}, "total_games": 0, "total_time": 0.0,
-                    "error": str(e)}
+            print(f"  Warning: Stockfish not found at '{resolved_path}' - Elo estimation skipped.")
+            return {
+                "estimated_elo": None,
+                "results": {},
+                "total_games": 0,
+                "total_time": 0.0,
+                "error": "stockfish_not_found",
+            }
+        except Exception as exc:
+            print(f"  Warning: Stockfish error: {exc} - Elo estimation skipped.")
+            return {
+                "estimated_elo": None,
+                "results": {},
+                "total_games": 0,
+                "total_time": 0.0,
+                "error": str(exc),
+            }
 
-        # Filter/clamp levels to engine's supported range
+        # Filter/clamp levels to engine's supported range.
         valid_levels = []
         for lvl in levels:
             clamped = max(sf_min_elo, min(sf_max_elo, lvl))
             if clamped != lvl:
-                print(f"  ⚠️  Clamped level {lvl} → {clamped} (SF range: {sf_min_elo}-{sf_max_elo})")
+                print(f"  Warning: Clamped level {lvl} -> {clamped} (SF range: {sf_min_elo}-{sf_max_elo})")
             if clamped not in valid_levels:
                 valid_levels.append(clamped)
         levels = valid_levels
 
         if not levels:
-            print("  ⚠️  No valid Elo levels after clamping.")
-            return {"estimated_elo": None, "results": {}, "total_games": 0,
-                    "total_time": 0.0, "error": "no_valid_levels"}
+            print("  Warning: No valid Elo levels after clamping.")
+            return {
+                "estimated_elo": None,
+                "results": {},
+                "total_games": 0,
+                "total_time": 0.0,
+                "error": "no_valid_levels",
+            }
 
         t0 = time.perf_counter()
         all_opponent_elos: list[float] = []
         all_scores: list[float] = []
         results_per_level: dict[int, dict] = {}
 
-        # Build task list: (level, game_idx, model_is_white)
         tasks = []
         for level in levels:
             for game_idx in range(games_per_level):
                 model_is_white = (game_idx % 2 == 0)
                 tasks.append((level, game_idx, model_is_white))
 
-        # Execute games in parallel
+        workers = self._resolve_workers(workers, total_games=len(tasks))
+        if self._is_cancelled():
+            return {
+                "estimated_elo": None,
+                "results": {},
+                "total_games": 0,
+                "total_time": 0.0,
+                "cancelled": True,
+            }
+
         if workers > 1:
-            # Parallel execution
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(
+            executor = ThreadPoolExecutor(max_workers=workers)
+            futures = {}
+            try:
+                for level, game_idx, model_is_white in tasks:
+                    if self._is_cancelled():
+                        break
+                    future = executor.submit(
                         self._play_single_game_worker,
-                        level, model_is_white, use_mcts, simulations,
-                        stockfish_time_limit, max_moves, resolved_path
-                    ): (level, game_idx)
-                    for level, game_idx, model_is_white in tasks
-                }
+                        level,
+                        model_is_white,
+                        use_mcts,
+                        simulations,
+                        stockfish_time_limit,
+                        max_moves,
+                        resolved_path,
+                    )
+                    futures[future] = (level, game_idx)
 
                 for future in as_completed(futures):
+                    if self._is_cancelled():
+                        break
                     level, _ = futures[future]
                     try:
                         result = future.result()
+                        if result is None:
+                            continue
                         all_opponent_elos.append(float(level))
-                        all_scores.append(result)
+                        all_scores.append(float(result))
                     except Exception as exc:
-                        print(f"  ⚠️  Game at level {level} failed: {exc}")
-                        # Count as loss
+                        self._log_limited("parallel_game_fail", f"  Warning: game at level {level} failed: {exc}")
                         all_opponent_elos.append(float(level))
                         all_scores.append(0.0)
+            finally:
+                cancelled = self._is_cancelled()
+                if cancelled:
+                    for future in futures:
+                        future.cancel()
+                executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
         else:
-            # Sequential execution (original behavior)
             player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
-            engine = chess.engine.SimpleEngine.popen_uci(resolved_path)
-            
+            engine = chess.engine.SimpleEngine.popen_uci(
+                resolved_path,
+                **self._stockfish_popen_kwargs(),
+            )
             try:
                 for level in levels:
+                    if self._is_cancelled():
+                        break
                     engine.configure({"UCI_LimitStrength": True, "UCI_Elo": level})
-                    
                     for game_idx in range(games_per_level):
+                        if self._is_cancelled():
+                            break
                         model_is_white = (game_idx % 2 == 0)
                         result = self._play_game(
-                            engine, player, model_is_white,
-                            stockfish_time_limit, max_moves,
+                            engine,
+                            player,
+                            model_is_white,
+                            stockfish_time_limit,
+                            max_moves,
                         )
+                        if result is None:
+                            continue
                         all_opponent_elos.append(float(level))
-                        all_scores.append(result)
+                        all_scores.append(float(result))
             finally:
-                engine.quit()
+                with contextlib.suppress(Exception):
+                    engine.quit()
 
-        # Aggregate results per level
+        if self._is_cancelled():
+            return {
+                "estimated_elo": None,
+                "results": {},
+                "total_games": len(all_scores),
+                "total_time": time.perf_counter() - t0,
+                "cancelled": True,
+            }
+
         for level in levels:
-            level_scores = [
-                score for elo, score in zip(all_opponent_elos, all_scores) if elo == level
-            ]
+            level_scores = [score for elo, score in zip(all_opponent_elos, all_scores) if elo == level]
             wins = sum(1 for s in level_scores if s == 1.0)
             draws = sum(1 for s in level_scores if s == 0.5)
             losses = sum(1 for s in level_scores if s == 0.0)
             total = wins + draws + losses
             score_pct = (wins + 0.5 * draws) / total if total else 0.0
             results_per_level[level] = {
-                "wins": wins, "draws": draws, "losses": losses,
+                "wins": wins,
+                "draws": draws,
+                "losses": losses,
                 "score": score_pct,
             }
 
         elapsed = time.perf_counter() - t0
-
         estimated_elo = _performance_rating(all_opponent_elos, all_scores)
 
         return {
@@ -507,7 +644,6 @@ class EloEstimator:
             "total_games": len(all_scores),
             "total_time": elapsed,
         }
-
     # -----------------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------------
@@ -521,31 +657,43 @@ class EloEstimator:
         sf_time_limit: float,
         max_moves: int,
         stockfish_path: str,
-    ) -> float:
+    ) -> float | None:
         """
         Worker function for parallel game execution.
         Creates own Stockfish engine and plays one game.
         
         Returns: score (1.0=win, 0.5=draw, 0.0=loss) from model's perspective.
         """
+        if self._is_cancelled():
+            return None
+
         # Each worker needs its own engine and player
         try:
-            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            engine = chess.engine.SimpleEngine.popen_uci(
+                stockfish_path,
+                **self._stockfish_popen_kwargs(),
+            )
             engine.configure({"UCI_LimitStrength": True, "UCI_Elo": level})
-        except Exception as e:
-            print(f"  ⚠️  Worker failed to open Stockfish: {e}")
+        except Exception as exc:
+            if self._is_cancelled():
+                return None
+            self._log_limited("stockfish_open_fail", f"  Warning: worker failed to open Stockfish: {exc}")
             return 0.0  # Count as loss
         
         player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
         
         try:
             result = self._play_game(engine, player, model_is_white, sf_time_limit, max_moves)
-        except Exception as e:
-            print(f"  ⚠️  Game failed: {e}")
-            result = 0.0
+        except Exception as exc:
+            if self._is_cancelled():
+                result = None
+            else:
+                self._log_limited("stockfish_game_fail", f"  Warning: game failed: {exc}")
+                result = 0.0
         finally:
-            engine.quit()
-        
+            with contextlib.suppress(Exception):
+                engine.quit()
+
         return result
 
     def _play_game(
@@ -555,15 +703,20 @@ class EloEstimator:
         model_is_white: bool,
         sf_time_limit: float,
         max_moves: int,
-    ) -> float:
+    ) -> float | None:
         """
-        Play a single game.  Returns score from the model's perspective:
-        1.0 = win, 0.5 = draw, 0.0 = loss.
+        Play a single game. Returns score from the model perspective:
+        1.0 = win, 0.5 = draw, 0.0 = loss. Returns None when cancelled.
         """
+        if self._is_cancelled():
+            return None
+
         board = chess.Board()
         player.reset()
 
         for _ in range(max_moves * 2):  # max half-moves
+            if self._is_cancelled():
+                return None
             if board.is_game_over(claim_draw=True):
                 break
 
@@ -574,7 +727,7 @@ class EloEstimator:
                 player.record_state(board)
                 move = player.best_move(board)
                 if move is None or move not in board.legal_moves:
-                    # Fallback: random legal move
+                    # Fallback: first legal move
                     moves = list(board.legal_moves)
                     if not moves:
                         break
@@ -607,6 +760,7 @@ def estimate_model_elo(
     config: dict,
     device: torch.device,
     elo_config: dict | None = None,
+    stop_event=None,
 ) -> dict:
     """
     High-level function called from the training loop.
@@ -636,7 +790,14 @@ def estimate_model_elo(
     simulations = elo_config.get("mcts_simulations", 100)
     workers = elo_config.get("workers", 0)
 
-    estimator = EloEstimator(model, config, device, stockfish_path)
+    estimator = EloEstimator(
+        model,
+        config,
+        device,
+        stockfish_path,
+        stop_event=stop_event,
+        elo_config=elo_config,
+    )
     return estimator.estimate(
         levels=levels,
         games_per_level=games_per_level,
@@ -646,3 +807,4 @@ def estimate_model_elo(
         simulations=simulations,
         workers=workers,
     )
+

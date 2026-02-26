@@ -117,6 +117,8 @@ class BatchSelfPlayMCTS:
             
             # Update history BEFORE making the move (matches play.py)
             self.mcts.update_history(board)
+            # Reuse selected subtree directly instead of FEN-searching next turn.
+            self.mcts.advance_root(move)
             
             # Make the move
             board.push(move)
@@ -203,8 +205,37 @@ class MultiGameBatchMCTS:
         # Inference optimization (AMP on GPU)
         self.use_amp = config.get('hardware', {}).get('use_amp', False) and self.device.type == 'cuda'
         self.amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
+        self._empty_history_tensor = np.zeros((16, 8, 8), dtype=np.float32)
 
-    def _build_history_tensor(self, current_board, board_history):
+    @staticmethod
+    def _is_encoded_history_entry(entry):
+        return (
+            isinstance(entry, tuple)
+            and len(entry) == 2
+            and isinstance(entry[0], np.ndarray)
+            and isinstance(entry[1], np.ndarray)
+        )
+
+    def _encode_history_entry(self, board_or_fen):
+        """
+        Convert history item to cached tensors for both POVs:
+        (white_pov_tensor, black_pov_tensor).
+        """
+        if self._is_encoded_history_entry(board_or_fen):
+            return board_or_fen
+        if isinstance(board_or_fen, str):
+            board_obj = chess.Board(board_or_fen)
+        else:
+            board_obj = board_or_fen
+        if not isinstance(board_obj, chess.Board):
+            raise TypeError(f"Unsupported history entry type: {type(board_or_fen)}")
+
+        return (
+            board_to_tensor(board_obj, flip_perspective=False),
+            board_to_tensor(board_obj, flip_perspective=True),
+        )
+
+    def _build_history_tensor(self, current_board, board_history, current_tensor=None):
         """
         Build tensor with history using POV-aware board_to_tensor.
 
@@ -216,25 +247,31 @@ class MultiGameBatchMCTS:
             return board_to_tensor(current_board)
 
         history_tensors = []
+        use_black_pov = current_board.turn == chess.BLACK
         if board_history:
             history_boards = board_history[-self.history_positions:]
-            for hist_fen in history_boards:
-                # 🔥 OPTIMIZATION: Reconstruct board from FEN string (saves RAM)
-                hist_board = chess.Board(hist_fen) if isinstance(hist_fen, str) else hist_fen
-                hist_tensor = board_to_tensor(
-                    hist_board,
-                    flip_perspective=(current_board.turn == chess.BLACK)
-                )
+            for hist_entry in history_boards:
+                encoded = self._encode_history_entry(hist_entry)
+                hist_tensor = encoded[1] if use_black_pov else encoded[0]
                 history_tensors.append(hist_tensor)
 
-        while len(history_tensors) < self.history_positions:
-            empty_tensor = np.zeros((16, 8, 8), dtype=np.float32)
-            history_tensors.insert(0, empty_tensor)
+        pad_count = max(0, self.history_positions - len(history_tensors))
+        if pad_count:
+            history_tensors = [self._empty_history_tensor] * pad_count + history_tensors
 
-        current_tensor = board_to_tensor(current_board)
+        if current_tensor is None:
+            current_tensor = board_to_tensor(current_board)
         history_tensors.append(current_tensor)
 
         return np.concatenate(history_tensors, axis=0)
+
+    @staticmethod
+    def _current_tensor_for_node(node):
+        cached = getattr(node, "_board_tensor", None)
+        if cached is None:
+            cached = board_to_tensor(node.board)
+            node._board_tensor = cached
+        return cached
 
     def _select_child(self, node):
         """Select child with highest UCB score (optimized)"""
@@ -290,14 +327,17 @@ class MultiGameBatchMCTS:
             if self.reuse_tree and root is not None:
                 # 🔥 OPTIMIZATION: Use cached FEN
                 target_fen = board.fen()
-                for _, child in root.children.items():
-                    if child.get_fen() == target_fen:
-                        _ = child.board  # Ensure board is instantiated
-                        root = child
-                        root.parent = None
-                        break
+                if root.get_fen() == target_fen:
+                    pass
                 else:
-                    root = MCTSNode(board)
+                    for _, child in root.children.items():
+                        if child.get_fen() == target_fen:
+                            _ = child.board  # Ensure board is instantiated
+                            root = child
+                            root.parent = None
+                            break
+                    else:
+                        root = MCTSNode(board)
             else:
                 root = MCTSNode(board)
 
@@ -343,7 +383,7 @@ class MultiGameBatchMCTS:
                 search_path = [node]
                 node.add_virtual_loss()
 
-                while not node.is_leaf() and not node.is_game_over:
+                while not node.is_leaf():
                     node = self._select_child(node)
                     node.add_virtual_loss()
                     search_path.append(node)
@@ -408,22 +448,37 @@ class MultiGameBatchMCTS:
         values_by_node_id = {}
 
         if non_terminal_nodes:
-            board_tensors = torch.stack([
-                torch.from_numpy(
+            boards_np = np.stack(
+                [
                     self._build_history_tensor(
                         node.board,
-                        game_states[gi]['board_history']
+                        game_states[gi]['board_history'],
+                        current_tensor=self._current_tensor_for_node(node),
                     )
-                )
-                for node, gi in zip(non_terminal_nodes, non_terminal_game_indices)
-            ]).to(self.device, memory_format=torch.channels_last, non_blocking=True)
+                    for node, gi in zip(non_terminal_nodes, non_terminal_game_indices)
+                ],
+                axis=0,
+            )
+            board_tensors = torch.from_numpy(boards_np).to(
+                self.device,
+                memory_format=torch.channels_last,
+                non_blocking=True,
+            )
 
             with torch.inference_mode():
                 if self.use_amp:
                     with torch.autocast(device_type='cuda', dtype=self.amp_dtype):
-                        policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
+                        policy_logits_batch, values_batch = self.model(
+                            board_tensors,
+                            return_aux=False,
+                            apply_log_softmax=False,
+                        )
                 else:
-                    policy_logits_batch, values_batch = self.model(board_tensors, return_aux=False)
+                    policy_logits_batch, values_batch = self.model(
+                        board_tensors,
+                        return_aux=False,
+                        apply_log_softmax=False,
+                    )
                 
                 # 🔥 OPTIMIZATION: Transfer entire batch to CPU at once, not row by row
                 if values_batch.dim() == 2 and values_batch.shape[1] == 3:
@@ -593,11 +648,21 @@ class BatchSelfPlayMCTSBatch:
                 gs['game_history'].append((board_tensor, policy_target, board.turn))
 
                 # Update history BEFORE making the move
-                # 🔥 OPTIMIZATION: Store FEN instead of full board copy to save RAM
-                gs['board_history'].append(board.fen())
+                # Store cached tensors for both POVs to avoid repeated FEN parse + tensor rebuild.
+                gs['board_history'].append(self.mcts._encode_history_entry(board))
                 max_history = self.mcts.history_positions + 10
                 if len(gs['board_history']) > max_history:
                     gs['board_history'] = gs['board_history'][-max_history:]
+
+                # Reuse selected subtree directly to skip FEN-matching next turn.
+                root = gs.get('root')
+                if root is not None and move in root.children:
+                    next_root = root.children[move]
+                    _ = next_root.board
+                    next_root.parent = None
+                    gs['root'] = next_root
+                else:
+                    gs['root'] = None
 
                 board.push(move)
                 gs['move_count'] += 1
@@ -921,17 +986,23 @@ class BatchSelfPlayFast:
             )
             
             with torch.no_grad():
-                policy_logits, values = self.model(batch_tensors)
-                policies = torch.exp(policy_logits).cpu().numpy()
+                policy_logits_batch, values = self.model(
+                    batch_tensors,
+                    return_aux=False,
+                    apply_log_softmax=False,
+                )
+                policy_logits_batch = policy_logits_batch.float().cpu().numpy()
             
             for idx, game_idx in enumerate(active):
-                policy = policies[idx]
+                policy_logits = policy_logits_batch[idx]
                 legal_moves = legal_moves_list[idx]
                 
                 if not legal_moves:
                     continue
                 
-                legal_probs = np.array([policy[move_to_index(m, boards[game_idx])] for m in legal_moves])
+                legal_indices = [move_to_index(m, boards[game_idx]) for m in legal_moves]
+                legal_logits = policy_logits[legal_indices]
+                legal_probs = np.exp(legal_logits - legal_logits.max())
                 
                 if legal_probs.sum() > 1e-10:
                     legal_probs = legal_probs / legal_probs.sum()

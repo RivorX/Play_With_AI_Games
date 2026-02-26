@@ -71,6 +71,7 @@ from utils.rl.replay import ReplayBuffer, PrioritizedReplayBuffer
 from utils.rl.temperature import TemperatureSchedule
 from utils.rl.training_rl import train_on_batch_rl, evaluate_models
 from utils.rl.startup import plan_rl_startup, apply_rl_startup_plan
+from utils.il.auto_tune import resolve_rl_hyperparameters
 from utils.shared.metrics import MetricsCalculator
 from utils.shared.runtime_helpers import (
     build_model_file_tag,
@@ -516,6 +517,19 @@ def main():
     model = ChessNet(config).to(device)
     model = model.to(memory_format=torch.channels_last)
     print("Model ready")
+
+    rl_hparam_resolution = resolve_rl_hyperparameters(
+        config=config,
+        model=model,
+        device=device,
+        base_dir=base_dir,
+    )
+    print(
+        "RL hyperparameters source: "
+        f"{rl_hparam_resolution.get('source', 'config')} | "
+        f"batch_size={config['reinforcement_learning']['batch_size']} | "
+        f"lr={float(config['reinforcement_learning']['learning_rate']):.6g}"
+    )
 
     startup_plan = plan_rl_startup(
         model=model,
