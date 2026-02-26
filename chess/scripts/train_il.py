@@ -895,22 +895,13 @@ def main():
                         val_losses['total'],
                         str(best_model_path),
                         best_metadata,
-                        save_optimizer=save_optimizer_state,
+                        save_optimizer=False,
                         save_dtype=torch.bfloat16 if use_bfloat16 else None,
-                        extra_state=build_runtime_state(
-                            scheduler=scheduler,
-                            scaler=scaler,
-                            best_val_loss=best_val_loss,
-                            patience_counter=patience_counter,
-                            estimated_elo=elo_for_state,
-                            estimated_elo_epoch=elo_epoch_for_state,
-                        ),
                     )
 
                     print(f"  💾 Saved to: {best_model_path}")
                     size_mb = best_model_path.stat().st_size / (1024**2)
-                    optimizer_label = "with optimizer" if save_optimizer_state else "without optimizer"
-                    print(f"  📦 Model size: {size_mb:.1f} MB ({optimizer_label})")
+                    print(f"  📦 Model size: {size_mb:.1f} MB (without optimizer)")
                 else:
                     patience_counter += 1
                     print(f"No improvement. Patience: {patience_counter}/{max_patience}")
