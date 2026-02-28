@@ -73,8 +73,9 @@ class CoordConv2d(nn.Module):
         yy = torch.linspace(-1, 1, h)
         yy, xx = torch.meshgrid(yy, xx, indexing='ij')
         
-        self.register_buffer('coord_x', xx.unsqueeze(0).unsqueeze(0))
-        self.register_buffer('coord_y', yy.unsqueeze(0).unsqueeze(0))
+        # Ensure non-overlapping contiguous storage so load_state_dict can copy safely.
+        self.register_buffer('coord_x', xx.unsqueeze(0).unsqueeze(0).contiguous())
+        self.register_buffer('coord_y', yy.unsqueeze(0).unsqueeze(0).contiguous())
         
     def forward(self, x):
         if x.ndim != 4:
@@ -601,6 +602,42 @@ def load_checkpoint_file(checkpoint_path, device):
         return torch.load(checkpoint_path, map_location=device, weights_only=False)
 
 
+def normalize_state_dict_keys(source_state, target_keys=None):
+    """Normalize common wrapper prefixes in state_dict keys.
+
+    Handles keys created by DataParallel/DistributedDataParallel (`module.`)
+    and torch.compile (`_orig_mod.`). If `target_keys` is provided, only
+    strips wrappers when it helps match target names.
+    """
+    if source_state is None:
+        return {}
+
+    wrapper_prefixes = ("module", "_orig_mod")
+    normalized = {}
+
+    for key, tensor in source_state.items():
+        norm_key = key
+        parts = key.split(".")
+
+        if target_keys is not None and norm_key in target_keys:
+            pass
+        else:
+            while len(parts) > 1 and parts[0] in wrapper_prefixes:
+                parts = parts[1:]
+                candidate = ".".join(parts)
+                if target_keys is None:
+                    norm_key = candidate
+                    continue
+                if candidate in target_keys:
+                    norm_key = candidate
+                    break
+
+        if norm_key not in normalized:
+            normalized[norm_key] = tensor
+
+    return normalized
+
+
 def transfer_matching_weights(model, checkpoint_or_state):
     """Transfer only matching tensors from checkpoint to model.
 
@@ -614,15 +651,7 @@ def transfer_matching_weights(model, checkpoint_or_state):
 
     target_state = model.state_dict()
     target_keys = set(target_state.keys())
-
-    normalized_source = {}
-    for key, tensor in source_state.items():
-        if key in target_keys:
-            normalized_source[key] = tensor
-        elif key.startswith('module.') and key[7:] in target_keys:
-            normalized_source[key[7:]] = tensor
-        else:
-            normalized_source[key] = tensor
+    normalized_source = normalize_state_dict_keys(source_state, target_keys=target_keys)
 
     matched_keys = []
     missing_keys = []
@@ -670,10 +699,13 @@ def load_model(checkpoint_path, config, device, strict=True):
 
     if checkpoint_path:
         checkpoint = load_checkpoint_file(checkpoint_path, device)
+        source_state = checkpoint['model_state_dict']
+        target_keys = set(model.state_dict().keys())
+        normalized_state = normalize_state_dict_keys(source_state, target_keys=target_keys)
         if strict:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model.load_state_dict(normalized_state)
         else:
-            transfer_matching_weights(model, checkpoint)
+            transfer_matching_weights(model, normalized_state)
 
     return model
 
@@ -688,7 +720,8 @@ def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None,
         extra_state: Optional dict with additional runtime state
                     (e.g. scheduler/scaler/best metrics).
     """
-    state_dict = model.state_dict()
+    # Save canonical keys (without wrapper prefixes like `_orig_mod.`/`module.`)
+    state_dict = normalize_state_dict_keys(model.state_dict())
     if save_dtype is not None:
         state_dict = {
             k: (v.to(save_dtype) if v.is_floating_point() else v.clone())

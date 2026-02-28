@@ -168,14 +168,26 @@ def has_il_checkpoints(best_model_path, il_dir):
 
 
 def _normalize_source_state(source_state, target_keys):
+    wrapper_prefixes = ("module", "_orig_mod")
+
+    def _normalize_key(key):
+        if key in target_keys:
+            return key
+
+        parts = key.split(".")
+        while len(parts) > 1 and parts[0] in wrapper_prefixes:
+            parts = parts[1:]
+            candidate = ".".join(parts)
+            if candidate in target_keys:
+                return candidate
+
+        if key.startswith("module.") and key[7:] in target_keys:
+            return key[7:]
+        return key
+
     normalized = {}
     for key, tensor in source_state.items():
-        if key in target_keys:
-            norm_key = key
-        elif key.startswith("module.") and key[7:] in target_keys:
-            norm_key = key[7:]
-        else:
-            norm_key = key
+        norm_key = _normalize_key(key)
         if norm_key not in normalized:
             normalized[norm_key] = tensor
     return normalized
@@ -458,7 +470,9 @@ def plan_il_startup(model, device, base_dir, best_model_path, il_dir, start_mode
             checkpoint = load_checkpoint_file(str(selected_checkpoint), device)
             model_state = checkpoint.get("model_state_dict")
             if isinstance(model_state, dict):
-                preview_report = _build_transfer_report_preview(model.state_dict(), model_state)
+                target_keys = set(model.state_dict().keys())
+                normalized_state = _normalize_source_state(model_state, target_keys)
+                preview_report = _build_transfer_report_preview(model.state_dict(), normalized_state)
                 transfer_trainable_param_names = _infer_changed_parameter_names(model, preview_report)
                 if transfer_trainable_param_names:
                     print(
@@ -535,6 +549,8 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
         checkpoint = load_checkpoint_file(str(selected_checkpoint), device)
         if "model_state_dict" not in checkpoint:
             raise KeyError(f"Checkpoint missing 'model_state_dict': {selected_checkpoint}")
+        target_keys = set(model.state_dict().keys())
+        normalized_model_state = _normalize_source_state(checkpoint["model_state_dict"], target_keys)
 
         estimated_elo = _safe_float(
             checkpoint.get("estimated_elo", checkpoint.get("last_estimated_elo"))
@@ -549,7 +565,7 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
 
         if start_mode == "resume":
             try:
-                model.load_state_dict(checkpoint["model_state_dict"])
+                model.load_state_dict(normalized_model_state)
                 print("Resume: model state loaded")
                 start_epoch = int(checkpoint.get("epoch", -1)) + 1
 
@@ -589,7 +605,7 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
             except RuntimeError as exc:
                 print(f"WARNING: Full resume failed ({exc})")
                 print("Falling back to transfer mode (matching tensors only).")
-                transfer_report = transfer_matching_weights(model, checkpoint)
+                transfer_report = transfer_matching_weights(model, normalized_model_state)
                 transfer_match_ratio = transfer_report.get("match_ratio")
                 _print_transfer_report(transfer_report)
                 transfer_trainable_param_names = _infer_changed_parameter_names(model, transfer_report)
@@ -606,7 +622,7 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
                 best_val_loss = float("inf")
                 patience_counter = 0
         else:
-            transfer_report = transfer_matching_weights(model, checkpoint)
+            transfer_report = transfer_matching_weights(model, normalized_model_state)
             transfer_match_ratio = transfer_report.get("match_ratio")
             _print_transfer_report(transfer_report)
             if not transfer_trainable_param_names:
