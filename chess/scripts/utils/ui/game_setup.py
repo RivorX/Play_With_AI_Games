@@ -49,6 +49,7 @@ _MODEL_ARCH_KEYS = [
     "use_layer_scale",
     "layer_scale_init",
     "use_multitask_learning",
+    "policy_head_channels",
     "policy_head_conv_filters",
     "policy_head_conv_groups",
     "policy_head_global_dim",
@@ -103,6 +104,7 @@ def _infer_architecture_from_state_dict(state_dict):
 
     policy_conv_weight = state_dict.get("policy_conv.weight")
     if policy_conv_weight is not None and getattr(policy_conv_weight, "ndim", 0) == 4:
+        inferred["policy_head_channels"] = int(policy_conv_weight.shape[0])
         inferred["policy_head_conv_filters"] = int(policy_conv_weight.shape[0])
         in_per_group = int(policy_conv_weight.shape[1])
         if filters and in_per_group > 0 and filters % in_per_group == 0:

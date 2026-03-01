@@ -147,15 +147,99 @@ def _build_single_worker_loader(base_loader, shuffle=False):
         return None
 
 
-def _refresh_swa_bn_stats(train_loader, swa_model, device, use_amp, use_bfloat16):
-    """Refresh BN stats with fallback to a single-worker loader if needed."""
+def _build_fresh_multi_worker_loader(base_loader, shuffle=False):
+    """Build a fresh multi-worker DataLoader for one-off BN refresh after interrupts."""
+    dataset = getattr(base_loader, "dataset", None)
+    if dataset is None:
+        return None
+
+    workers = int(getattr(base_loader, "num_workers", 0) or 0)
+    if workers <= 0:
+        return None
+
+    batch_size = getattr(base_loader, "batch_size", None)
+    if batch_size is None:
+        batch_sampler = getattr(base_loader, "batch_sampler", None)
+        batch_size = getattr(batch_sampler, "batch_size", None)
+    if batch_size is None:
+        batch_size = 1
+
+    collate_fn = getattr(base_loader, "collate_fn", None)
+    drop_last = bool(getattr(base_loader, "drop_last", False))
+    pin_memory = bool(getattr(base_loader, "pin_memory", False))
+    prefetch_factor = getattr(base_loader, "prefetch_factor", None)
+
+    kwargs = {
+        "dataset": dataset,
+        "batch_size": int(batch_size),
+        "shuffle": bool(shuffle),
+        "num_workers": workers,
+        "pin_memory": pin_memory,
+        "drop_last": drop_last,
+        "collate_fn": collate_fn,
+        # Force fresh worker lifecycle for shutdown-time BN refresh.
+        "persistent_workers": False,
+    }
+    if isinstance(prefetch_factor, int) and prefetch_factor > 0:
+        kwargs["prefetch_factor"] = prefetch_factor
+
+    try:
+        return torch.utils.data.DataLoader(**kwargs)
+    except Exception:
+        return None
+
+
+def _refresh_swa_bn_stats(
+    train_loader,
+    swa_model,
+    device,
+    use_amp,
+    use_bfloat16,
+    prefer_fresh_multi_worker=False,
+):
+    """Refresh BN stats with fallback to a single-worker loader if needed.
+
+    When ``prefer_fresh_multi_worker`` is enabled (e.g. after Ctrl+C),
+    we first try a freshly spawned multi-worker loader (same worker count),
+    then fallback to single-worker only if needed.
+    """
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+    refreshed_multi_loader = None
+    tried_refreshed_multi = False
+    if prefer_fresh_multi_worker:
+        refreshed_multi_loader = _build_fresh_multi_worker_loader(train_loader, shuffle=False)
+        tried_refreshed_multi = True
+        if refreshed_multi_loader is None:
+            print(
+                "WARNING: Could not build fresh multi-worker loader for BN refresh; "
+                "falling back."
+            )
+        else:
+            try:
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                    torch.optim.swa_utils.update_bn(refreshed_multi_loader, swa_model, device=device)
+                print("BatchNorm statistics updated via fresh multi-worker loader.")
+                return True, "fresh_multi_worker", None
+            except Exception as refresh_exc:
+                print(f"WARNING: BN refresh failed on fresh multi-worker loader ({refresh_exc})")
+
     try:
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
             torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
         return True, "train_loader", None
     except Exception as primary_exc:
         print(f"WARNING: BN refresh failed on training loader ({primary_exc})")
+
+    if not tried_refreshed_multi:
+        refreshed_multi_loader = _build_fresh_multi_worker_loader(train_loader, shuffle=False)
+        if refreshed_multi_loader is not None:
+            try:
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                    torch.optim.swa_utils.update_bn(refreshed_multi_loader, swa_model, device=device)
+                print("BatchNorm statistics updated via fresh multi-worker loader.")
+                return True, "fresh_multi_worker", None
+            except Exception as refresh_exc:
+                print(f"WARNING: BN refresh failed on fresh multi-worker loader ({refresh_exc})")
 
     safe_loader = _build_single_worker_loader(train_loader, shuffle=False)
     if safe_loader is None:
@@ -225,8 +309,13 @@ def finalize_swa_model(
     result = {
         "finalized": False,
         "val_loss": None,
+        "val_policy_loss": None,
+        "val_value_loss": None,
         "val_top1": None,
+        "val_top3": None,
         "val_mae": None,
+        "val_wdl_acc": None,
+        "val_wdl_ce": None,
         "estimated_elo": None,
         "estimated_elo_epoch": None,
         "model_path": None,
@@ -250,6 +339,7 @@ def finalize_swa_model(
         device=device,
         use_amp=use_amp,
         use_bfloat16=use_bfloat16,
+        prefer_fresh_multi_worker=bool(interrupted),
     )
     if not bn_updated:
         print(
@@ -270,11 +360,18 @@ def finalize_swa_model(
         print(
             f"SWA metrics: val_loss={swa_val_losses['total']:.4f}, "
             f"val_mae={swa_val_metrics['value_mae']:.4f}, "
-            f"top1={swa_val_metrics['policy_top1_acc']:.2%}"
+            f"top1={swa_val_metrics['policy_top1_acc']:.2%}, "
+            f"top3={swa_val_metrics.get('policy_top3_acc', float('nan')):.2%}, "
+            f"wdl_acc={swa_val_metrics.get('value_wdl_acc', float('nan')):.2%}"
         )
-        result["val_loss"] = float(swa_val_losses["total"])
-        result["val_top1"] = float(swa_val_metrics["policy_top1_acc"])
-        result["val_mae"] = float(swa_val_metrics["value_mae"])
+        result["val_loss"]        = float(swa_val_losses["total"])
+        result["val_policy_loss"] = float(swa_val_losses["policy"]) if swa_val_losses.get("policy") is not None else None
+        result["val_value_loss"]  = float(swa_val_losses["value"])  if swa_val_losses.get("value")  is not None else None
+        result["val_top1"]    = float(swa_val_metrics["policy_top1_acc"])
+        result["val_top3"]    = float(swa_val_metrics.get("policy_top3_acc", float("nan")))
+        result["val_mae"]     = float(swa_val_metrics["value_mae"])
+        result["val_wdl_acc"] = float(swa_val_metrics.get("value_wdl_acc",  float("nan"))) if swa_val_metrics.get("value_wdl_acc")  is not None else None
+        result["val_wdl_ce"]  = float(swa_val_metrics.get("value_wdl_ce",   float("nan"))) if swa_val_metrics.get("value_wdl_ce")   is not None else None
     except Exception as exc:
         eval_error = str(exc)
         eval_mode = "none"

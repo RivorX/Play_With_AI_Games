@@ -166,6 +166,30 @@ def main():
         has_checkpoints=has_il_checkpoints(best_model_path, il_dir)
     )
 
+    startup_plan = plan_il_startup(
+        model=model,
+        device=device,
+        base_dir=base_dir,
+        best_model_path=best_model_path,
+        il_dir=il_dir,
+        start_mode=selected_start_mode,
+    )
+
+    # For resume mode, allow extending training by additional epochs.
+    il_epochs_cfg = int(config['imitation_learning']['epochs'])
+    if startup_plan.get("start_mode") == "resume":
+        selected_entry = startup_plan.get("selected_entry") or {}
+        checkpoint_epoch = selected_entry.get("epoch")
+        if checkpoint_epoch is not None:
+            completed_epochs = int(checkpoint_epoch) + 1
+            default_additional = max(0, il_epochs_cfg - completed_epochs)
+            additional_epochs = ask_resume_additional_epochs(completed_epochs, default_additional)
+            config['imitation_learning']['epochs'] = completed_epochs + additional_epochs
+            print(
+                f"Resume target: completed={completed_epochs}, "
+                f"additional={additional_epochs}, total_target={config['imitation_learning']['epochs']}"
+            )
+
     compile_requested = bool(
         config.get("hardware", {}).get("use_compile", False)
         and device.type == "cuda"
@@ -284,30 +308,6 @@ def main():
                 if estimated_peak:
                     f.write(f"Estimated train peak: {estimated_peak}\n")
             f.write("=" * 70 + "\n\n")
-
-    startup_plan = plan_il_startup(
-        model=model,
-        device=device,
-        base_dir=base_dir,
-        best_model_path=best_model_path,
-        il_dir=il_dir,
-        start_mode=selected_start_mode,
-    )
-
-    # For resume mode, allow extending training by additional epochs.
-    il_epochs_cfg = int(config['imitation_learning']['epochs'])
-    if startup_plan.get("start_mode") == "resume":
-        selected_entry = startup_plan.get("selected_entry") or {}
-        checkpoint_epoch = selected_entry.get("epoch")
-        if checkpoint_epoch is not None:
-            completed_epochs = int(checkpoint_epoch) + 1
-            default_additional = max(0, il_epochs_cfg - completed_epochs)
-            additional_epochs = ask_resume_additional_epochs(completed_epochs, default_additional)
-            config['imitation_learning']['epochs'] = completed_epochs + additional_epochs
-            print(
-                f"Resume target: completed={completed_epochs}, "
-                f"additional={additional_epochs}, total_target={config['imitation_learning']['epochs']}"
-            )
 
     # Initialize logger after startup menu selection.
     logger = TrainingLogger(
@@ -459,6 +459,14 @@ def main():
 
     if selected_checkpoint_label and start_mode in {"resume", "transfer"}:
         plot_run_context = f"{plot_run_context} | source: {Path(selected_checkpoint_label).name}"
+
+    # Prepend model architecture info: version | xM params | N blocks Xf
+    _total_params = sum(p.numel() for p in model.parameters())
+    _blocks  = config['model'].get('num_residual_blocks', '?')
+    _filters = config['model'].get('filters', '?')
+    _params_str = f"{_total_params / 1e6:.2f}M"
+    model_info = f"{model_version} | {_params_str} params | {_blocks} blocks {_filters}f"
+    plot_run_context = f"{model_info} | {plot_run_context}"
     logger.set_run_context(plot_run_context)
 
     if start_mode == "resume" and start_epoch >= config['imitation_learning']['epochs']:
@@ -630,12 +638,17 @@ def main():
     swa_model = None
     swa_scheduler = None
     swa_start = config['imitation_learning'].get('swa_start_epoch', 15)
+    non_blocking_transfers = bool(
+        config.get('hardware', {}).get('non_blocking_transfers', True)
+        and device.type == 'cuda'
+    )
 
     if use_swa:
         swa_model = torch.optim.swa_utils.AveragedModel(model)
         swa_lr = config['imitation_learning'].get('swa_lr', 0.0005)
         swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=swa_lr)
         print(f"SWA enabled: start_epoch={swa_start} (inclusive), swa_lr={swa_lr:.6f}")
+    print(f"Non-blocking transfers: {'enabled' if non_blocking_transfers else 'disabled'}")
 
     # Training loop
     print("\nStarting training...")
@@ -792,9 +805,22 @@ def main():
             if profile_this_epoch and device.type == 'cuda':
                 torch.cuda.synchronize()
             train_start_time = time.perf_counter()
+            use_swa_scheduler_this_epoch = bool(
+                use_swa and swa_scheduler is not None and (epoch + 1) >= int(swa_start)
+            )
             train_losses, train_metrics, train_profile = train_epoch_il(
-                model, train_loader, optimizer, scheduler, config, device, scaler,
-                epoch=epoch, debug_log_file=debug_log_file, profile=profile_this_epoch
+                model,
+                train_loader,
+                optimizer,
+                scheduler,
+                config,
+                device,
+                scaler,
+                epoch=epoch,
+                debug_log_file=debug_log_file,
+                profile=profile_this_epoch,
+                step_scheduler=not use_swa_scheduler_this_epoch,
+                non_blocking_transfer=non_blocking_transfers
             )
             if profile_this_epoch and device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -803,7 +829,7 @@ def main():
                 train_time = train_profile['total']
 
             # 🆕 SWA: Update averaged model starting from swa_start epoch (inclusive)
-            if use_swa and (epoch + 1) >= swa_start:
+            if use_swa_scheduler_this_epoch:
                 swa_model.update_parameters(model)
                 if swa_scheduler is not None:
                     swa_scheduler.step()
@@ -833,7 +859,13 @@ def main():
                 if profile_this_epoch and device.type == 'cuda':
                     torch.cuda.synchronize()
                 eval_start_time = time.perf_counter()
-                val_losses, val_metrics = evaluate_il(model, val_loader, config, device)
+                val_losses, val_metrics = evaluate_il(
+                    model,
+                    val_loader,
+                    config,
+                    device,
+                    non_blocking_transfer=non_blocking_transfers,
+                )
                 if profile_this_epoch and device.type == 'cuda':
                     torch.cuda.synchronize()
                 eval_time = time.perf_counter() - eval_start_time
@@ -961,7 +993,13 @@ def main():
             if (epoch + 1) % checkpoint_every == 0:
                 # Get current val loss if not already computed
                 if (epoch + 1) % config['imitation_learning']['eval_every'] != 0:
-                    val_losses, val_metrics = evaluate_il(model, val_loader, config, device)
+                    val_losses, val_metrics = evaluate_il(
+                        model,
+                        val_loader,
+                        config,
+                        device,
+                        non_blocking_transfer=non_blocking_transfers,
+                    )
 
                 checkpoint_name = f"{model_file_tag}_epoch_{epoch + 1:02d}.pt"
                 checkpoint_path = il_dir / checkpoint_name
@@ -1083,14 +1121,23 @@ def main():
 
     if swa_final_result.get("finalized"):
         swa_elo = swa_final_result.get("estimated_elo")
-        if swa_elo is not None:
-            swa_epoch = swa_final_result.get("estimated_elo_epoch")
-            if swa_epoch is None:
-                swa_epoch = max(1, last_epoch_idx + 1)
-            try:
-                logger.record_estimated_elo(int(swa_epoch), float(swa_elo), update_csv=True)
-            except (TypeError, ValueError):
-                pass
+        swa_epoch = swa_final_result.get("estimated_elo_epoch")
+        if swa_epoch is None:
+            swa_epoch = max(1, last_epoch_idx + 1)
+
+        # Record full SWA metrics for the summary table + gold-star Elo point
+        logger.record_swa_metrics(
+            val_loss=swa_final_result.get("val_loss"),
+            val_policy_loss=swa_final_result.get("val_policy_loss"),
+            val_value_loss=swa_final_result.get("val_value_loss"),
+            top1=swa_final_result.get("val_top1"),
+            top3=swa_final_result.get("val_top3"),
+            mae=swa_final_result.get("val_mae"),
+            wdl_acc=swa_final_result.get("val_wdl_acc"),
+            wdl_ce=swa_final_result.get("val_wdl_ce"),
+            elo=swa_elo,
+            epoch=swa_epoch,
+        )
 
         swa_note = (
             "SWA final: "

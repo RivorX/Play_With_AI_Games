@@ -79,15 +79,14 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v6.0"
+  version: "v7.5"
   # Base architecture
   num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
   filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
-  # 🆕 v4.8: Dual-stream policy head
-  policy_head_conv_filters: 32  # Spatial stream: 3x3 conv filters (wider = more info preserved)
-  policy_head_conv_groups: 4    # Grouped 3x3 conv in policy head (must divide filters and conv_filters)
-  policy_head_global_dim: 64    # Global stream: GAP → FC dimension (board-wide context)
-  policy_head_hidden_dim: 384   # Intermediate FC dimension (decomposed projection)
+  # Policy head (AZ-style classic chess planes, 8x8x73):
+  # 1x1 conv (C -> policy_head_channels) + BN + ReLU + 1x1 conv (policy_head_channels -> 73 planes)
+  # logits are reshaped to ACTION_SIZE (4672) in from_square-major order
+  policy_head_channels: 32
   value_head_filters: 96        # Value head filters 
   value_hidden_dim: 384         # Value head hidden dimension 
   dropout: 0.2                  # Dropout rate 
@@ -127,11 +126,11 @@ auto_tune:
   min_batch_size: 64
   max_batch_size: 32768
   batch_round_to: 64
-  lr_test_min: 0.00008
+  lr_test_min: 0.0002
   lr_test_max: 0.002
   lr_test_points: 10
-  lr_test_steps: 3
-  lr_min: 0.00008
+  lr_test_steps: 20
+  lr_min: 0.0002
   lr_max: 0.002
 
 

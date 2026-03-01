@@ -331,7 +331,7 @@ class CombinedLoss(nn.Module):
         
         Args:
             predictions: dict with model outputs:
-                - 'policy': (B, 4096) log probabilities
+                - 'policy': (B, ACTION_SIZE) log probabilities
                 - 'value': (B, 3) WDL logits
                 - 'win': (B,) or (B, 1) win logits (if MTL)
                 - 'material': (B,) or (B, 1) material predictions (if MTL)

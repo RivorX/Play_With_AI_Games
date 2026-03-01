@@ -47,6 +47,7 @@ def build_model_architecture_metadata(config):
         'use_layer_scale',
         'layer_scale_init',
         'use_multitask_learning',
+        'policy_head_channels',
         'policy_head_conv_filters',
         'policy_head_conv_groups',
         'policy_head_global_dim',

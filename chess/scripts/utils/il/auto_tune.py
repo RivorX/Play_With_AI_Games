@@ -10,6 +10,11 @@ from pathlib import Path
 import torch
 import yaml
 
+try:
+    from src.utils.data_helpers import ACTION_SIZE as DEFAULT_ACTION_SIZE
+except Exception:
+    DEFAULT_ACTION_SIZE = 4672
+
 from .loss import CombinedLoss
 
 
@@ -423,7 +428,7 @@ def _build_synthetic_batch(config, device, batch_size, input_planes, use_mtl, ge
     boards = torch.randn(batch_size, input_planes, 8, 8, device=device, generator=generator)
     boards = boards.to(memory_format=torch.channels_last)
 
-    move_space = int(config.get("imitation_learning", {}).get("probe_action_size", 4272))
+    move_space = int(config.get("imitation_learning", {}).get("probe_action_size", DEFAULT_ACTION_SIZE))
     max_moves = int(config.get("data", {}).get("max_moves_per_game", 200))
     min_total_moves = int(
         config.get("imitation_learning", {}).get("value_move_weight_min_total_moves", 40)
@@ -872,8 +877,10 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
     """Find LR by short range test (multiple short train steps on synthetic batches)."""
     auto_cfg = _get_auto_tune_cfg(config)
     lr_candidates = _build_lr_test_candidates(config)
-    test_steps = _safe_int(auto_cfg.get("lr_test_steps"), 2)
-    test_steps = max(1, min(5, test_steps))
+    test_steps = _safe_int(auto_cfg.get("lr_test_steps"), 5)
+    test_steps_cap = _safe_int(auto_cfg.get("lr_test_steps_cap"), 20)
+    test_steps_cap = max(3, min(50, test_steps_cap))
+    test_steps = max(3, min(test_steps_cap, test_steps))
     test_seed = _safe_int(auto_cfg.get("lr_test_seed"), 12345)
 
     il_cfg = config.get("imitation_learning", {}) or {}
@@ -1029,10 +1036,51 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
             model.eval()
 
     auto_cfg = _get_auto_tune_cfg(config)
-    if best_entry is not None:
-        selected_lr_raw = float(best_entry["lr"])
+    stable_entries = [entry for entry in lr_test_results if bool(entry.get("stable"))]
+    score_tolerance = max(0.0, _safe_float(auto_cfg.get("lr_score_tolerance"), 2e-4))
+    flat_score_threshold = _safe_float(auto_cfg.get("lr_flat_score_threshold"), 0.0)
+    max_non_improving_drift = max(
+        0.0, _safe_float(auto_cfg.get("lr_non_improving_drift_max"), 1.5e-3)
+    )
+    flat_max_factor = max(1.0, _safe_float(auto_cfg.get("lr_flat_max_factor"), 3.0))
+    prefer_high_lr = bool(auto_cfg.get("lr_prefer_high_lr_within_tolerance", True))
+
+    selected_entry = best_entry
+    selection_reason = "best_score"
+    near_best_entries = []
+
+    if best_entry is not None and stable_entries:
+        best_score = float(best_entry["score"])
+        near_best_entries = [
+            entry
+            for entry in stable_entries
+            if float(entry["score"]) >= (best_score - score_tolerance)
+        ]
+
+        if best_score <= float(flat_score_threshold):
+            near_best_guarded = [
+                entry
+                for entry in near_best_entries
+                if float(entry.get("improvement", float("-inf"))) >= -max_non_improving_drift
+                and float(entry["lr"]) <= float(configured_lr) * flat_max_factor
+            ]
+            if near_best_guarded:
+                selected_entry = max(near_best_guarded, key=lambda entry: float(entry["lr"]))
+                selection_reason = "flat_near_best_guarded_high_lr"
+            elif near_best_entries:
+                selected_entry = max(near_best_entries, key=lambda entry: float(entry["lr"]))
+                selection_reason = "flat_near_best_high_lr"
+        elif prefer_high_lr and near_best_entries:
+            selected_entry = max(near_best_entries, key=lambda entry: float(entry["lr"]))
+            if selected_entry is not best_entry:
+                selection_reason = "near_best_high_lr"
+
+    if selected_entry is not None:
+        selected_lr_raw = float(selected_entry["lr"])
     else:
         selected_lr_raw = float(configured_lr)
+        selection_reason = "fallback_config"
+
     selected_lr, lr_min, lr_max = _clamp_learning_rate(selected_lr_raw, auto_cfg)
 
     lr_factor = float(selected_lr / max(1e-12, float(configured_lr)))
@@ -1046,6 +1094,15 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
         "candidates": [float(v) for v in lr_candidates],
         "results": lr_test_results,
         "best_entry": best_entry,
+        "selected_entry": selected_entry,
+        "selection_reason": selection_reason,
+        "stable_count": int(len(stable_entries)),
+        "near_best_count": int(len(near_best_entries)),
+        "score_tolerance": float(score_tolerance),
+        "flat_score_threshold": float(flat_score_threshold),
+        "non_improving_drift_max": float(max_non_improving_drift),
+        "flat_max_factor": float(flat_max_factor),
+        "prefer_high_lr_within_tolerance": bool(prefer_high_lr),
         "model_params_millions": float(_count_trainable_params(model) / 1e6),
     }
     return float(selected_lr), lr_factor, "lr_range_test", lr_meta
@@ -1357,12 +1414,19 @@ def resolve_il_hyperparameters(
     if estimated_peak:
         print(f"  Estimated training peak: {_fmt_gib(estimated_peak)}")
     best_entry = lr_meta.get("best_entry") if isinstance(lr_meta, dict) else None
+    selected_entry = lr_meta.get("selected_entry") if isinstance(lr_meta, dict) else None
     if best_entry:
-        print(
+        message = (
             "  LR test: "
             f"candidates={len(lr_meta.get('candidates', []))}, "
             f"best_improvement={best_entry.get('improvement', 0.0):+.3f}"
         )
+        if selected_entry and float(selected_entry.get("lr", 0.0)) != float(best_entry.get("lr", 0.0)):
+            message += (
+                f", selected_lr={float(selected_entry.get('lr')):.6g}"
+                f" ({lr_meta.get('selection_reason', 'n/a')})"
+            )
+        print(message)
 
     if not isinstance(hash_entries, dict):
         hash_entries = {}

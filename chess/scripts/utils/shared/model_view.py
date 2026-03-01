@@ -236,7 +236,15 @@ def _build_parameter_rows(model, num_blocks):
 
     policy_params = sum(
         _count_params(getattr(model, name, None))
-        for name in ("policy_conv", "policy_bn", "policy_global_fc", "policy_fc1", "policy_fc2")
+        for name in (
+            "policy_conv",
+            "policy_bn",
+            "policy_logits_conv",
+            "policy_fc",
+            "policy_global_fc",
+            "policy_fc1",
+            "policy_fc2",
+        )
     )
     value_params = sum(
         _count_params(getattr(model, name, None))

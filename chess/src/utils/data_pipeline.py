@@ -17,7 +17,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from src.utils.data_helpers import get_position_size
+from src.utils.data_helpers import ACTION_SIZE, get_position_size
 
 # ==============================================================================
 # WORKER COUNT RESOLUTION
@@ -108,6 +108,8 @@ class DatasetTracker:
             'position_dedup': config['data'].get('position_dedup', {}),
             'position_sampling': config['data'].get('position_sampling', {}),
             'use_multitask_learning': config['model'].get('use_multitask_learning', False),
+            'action_encoding': 'az_classic_8x8x73_v1',
+            'action_size': ACTION_SIZE,
             'wdl_mode': 'always',
         }
         
@@ -815,7 +817,7 @@ def extract_positions_from_game_worker(args):
                     break
                 
                 # 🔧 CRITICAL FIX: Calculate move_target BEFORE making the move
-                # This is the LABEL the network should predict (0-4095)
+                # This is the LABEL the network should predict (0-4671)
                 move_target = move_to_index(move, board)
                 
                 # WDL-only mode: no temporal discounting.

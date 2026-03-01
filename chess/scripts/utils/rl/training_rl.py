@@ -8,7 +8,6 @@ from pathlib import Path
 import torch
 import chess
 import torch.nn.functional as F
-import numpy as np
 
 from .replay import PrioritizedReplayBuffer
 
@@ -19,19 +18,10 @@ sys.path.insert(0, str(project_root))
 from src.mcts import BatchMCTS, select_move_by_visits
 from src.utils.data_helpers import (
     ACTION_SIZE,
-    NORMAL_ACTIONS,
-    PROMOTION_PAIRS,
-    PROMOTION_PAIR_TO_INDEX,
+    build_hflip_inverse_index_map,
 )
 
 _HFLIP_INV_INDEX_MAP = None
-
-
-def _mirror_file(square):
-    """Mirror square across files (a<->h) in 0..63 indexing."""
-    rank = square // 8
-    file = square % 8
-    return rank * 8 + (7 - file)
 
 
 def _get_hflip_inverse_index_map():
@@ -46,36 +36,11 @@ def _get_hflip_inverse_index_map():
     if _HFLIP_INV_INDEX_MAP is not None:
         return _HFLIP_INV_INDEX_MAP
 
-    forward_map = np.zeros(ACTION_SIZE, dtype=np.int64)
-
-    # Normal moves (from_square * 64 + to_square)
-    for idx in range(NORMAL_ACTIONS):
-        from_sq = idx // 64
-        to_sq = idx % 64
-        new_from = _mirror_file(from_sq)
-        new_to = _mirror_file(to_sq)
-        forward_map[idx] = new_from * 64 + new_to
-
-    # Promotion moves (PROMOTION_PAIRS)
-    promo_count = ACTION_SIZE - NORMAL_ACTIONS
-    for promo_offset in range(promo_count):
-        pair_idx = promo_offset // 4
-        promo_type_idx = promo_offset % 4
-        from_sq, to_sq = PROMOTION_PAIRS[pair_idx]
-        new_from = _mirror_file(from_sq)
-        new_to = _mirror_file(to_sq)
-        new_pair_idx = PROMOTION_PAIR_TO_INDEX.get((new_from, new_to))
-        if new_pair_idx is None:
-            # Fallback: keep original if mapping not found (shouldn't happen)
-            forward_map[NORMAL_ACTIONS + promo_offset] = NORMAL_ACTIONS + promo_offset
-        else:
-            forward_map[NORMAL_ACTIONS + promo_offset] = (
-                NORMAL_ACTIONS + new_pair_idx * 4 + promo_type_idx
-            )
-
-    inverse_map = np.zeros_like(forward_map)
-    inverse_map[forward_map] = np.arange(ACTION_SIZE, dtype=np.int64)
-
+    inverse_map = build_hflip_inverse_index_map()
+    if len(inverse_map) != ACTION_SIZE:
+        raise ValueError(
+            f"Horizontal flip map length mismatch: got {len(inverse_map)}, expected {ACTION_SIZE}"
+        )
     _HFLIP_INV_INDEX_MAP = torch.from_numpy(inverse_map).long()
     return _HFLIP_INV_INDEX_MAP
 

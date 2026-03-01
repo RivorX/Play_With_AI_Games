@@ -195,6 +195,7 @@ def _model_arch_keys():
         "use_layer_scale",
         "layer_scale_init",
         "use_multitask_learning",
+        "policy_head_channels",
         "policy_head_conv_filters",
         "policy_head_conv_groups",
         "policy_head_global_dim",
@@ -254,6 +255,7 @@ def _infer_model_overrides_from_state_dict(state_dict):
     if isinstance(policy_conv_w, torch.Tensor):
         policy_out = int(policy_conv_w.shape[0])
         policy_in_per_group = int(policy_conv_w.shape[1])
+        overrides["policy_head_channels"] = policy_out
         overrides["policy_head_conv_filters"] = policy_out
         filters = overrides.get("filters")
         if isinstance(filters, int) and policy_in_per_group > 0 and filters % policy_in_per_group == 0:

@@ -11,12 +11,12 @@ Silnik szachowy oparty na deep learning (CNN) i MCTS, inspirowany AlphaZero.
 ## Funkcjonalności
 
 ### Model
-- **Policy head**: dual-stream (spatial + global context)
+- **Policy head**: AZ-like classic chess (`8x8x73`)
 - **Value head**: WDL classification (Win/Draw/Loss)
 - **POV**: wszystkie pozycje z perspektywy gracza na ruchu
 - **Historia**: `history_positions` pozycji wstecz (sliding window)
 - **Metadane szachowe**: castling, en passant, halfmove, fullmove
-- **Promocje**: pełna przestrzeń akcji (`ACTION_SIZE = 4272`)
+- **Promocje**: przestrzeń akcji AlphaZero (`ACTION_SIZE = 4672`)
 
 ### Trening
 - **SWA** (Stochastic Weight Averaging): uśrednianie wag od epoch 15
@@ -34,7 +34,7 @@ Silnik szachowy oparty na deep learning (CNN) i MCTS, inspirowany AlphaZero.
 `ChessNet` (`chess/src/model.py`) to pre-activation ResNet z:
 - wejscie: `16 * (1 + history_positions)` kanalow
 - trunk: bloki residualne
-- policy head: dual-stream (spatial + global)
+- policy head: `1x1 conv + BN + FC` (AZ-like, `8x8x73`)
 - value head: 3 klasy WDL
 
 Opcjonalne elementy (zaleznie od `config.yaml`):

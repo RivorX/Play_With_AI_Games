@@ -9,8 +9,20 @@ from tqdm import tqdm
 from .loss import CombinedLoss
 from ..shared.metrics import MetricsCalculator
 
-def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, scaler,
-                   epoch=0, debug_log_file=None, profile=False):
+def train_epoch_il(
+    model,
+    train_loader,
+    optimizer,
+    scheduler,
+    config,
+    device,
+    scaler,
+    epoch=0,
+    debug_log_file=None,
+    profile=False,
+    step_scheduler=True,
+    non_blocking_transfer=True
+):
     """
     đź†• v4.3: Train one epoch with WDL value head and move-weighted losses
     
@@ -29,6 +41,8 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
         scaler: GradScaler for mixed precision
         epoch: Current epoch number
         debug_log_file: Path to debug log (optional)
+        step_scheduler: Whether to step the provided scheduler at epoch end
+        non_blocking_transfer: Use async host->device copies when possible
     
     Returns:
         Tuple of (losses_dict, metrics_dict, profile_stats or None)
@@ -81,6 +95,7 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
     # âšˇ Pre-read AMP config outside loop (avoid dict lookups per batch)
     use_amp = config['hardware'].get('use_amp', True)
     amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
+    non_blocking = bool(non_blocking_transfer and device.type == 'cuda')
     
     for batch_idx, batch_data in enumerate(pbar):
         if profile_enabled:
@@ -114,19 +129,19 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             use_mtl = False
         
         # Move to device
-        boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
-        moves = moves.to(device, non_blocking=True)
-        outcomes = outcomes.to(device, non_blocking=True)
+        boards = boards.to(device, memory_format=torch.channels_last, non_blocking=non_blocking)
+        moves = moves.to(device, non_blocking=non_blocking)
+        outcomes = outcomes.to(device, non_blocking=non_blocking)
         
         if move_indices is not None:
-            move_indices = move_indices.to(device, non_blocking=True)
+            move_indices = move_indices.to(device, non_blocking=non_blocking)
         if total_moves is not None:
-            total_moves = total_moves.to(device, non_blocking=True)
+            total_moves = total_moves.to(device, non_blocking=non_blocking)
         
         if use_mtl:
-            win_targets = win_targets.to(device, non_blocking=True)
-            material_targets = material_targets.to(device, non_blocking=True)
-            check_targets = check_targets.to(device, non_blocking=True)
+            win_targets = win_targets.to(device, non_blocking=non_blocking)
+            material_targets = material_targets.to(device, non_blocking=non_blocking)
+            check_targets = check_targets.to(device, non_blocking=non_blocking)
         
         # đź”Ť DIAGNOSTIC: Print distributions for first batch
         if show_batch0_diagnostics and first_batch_targets:
@@ -274,8 +289,8 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
             batch_count += 1
             data_timer_start = time.perf_counter()
     
-    # Step scheduler once per epoch.
-    if scheduler is not None:
+    # Step scheduler once per epoch (if enabled by caller).
+    if scheduler is not None and step_scheduler:
         scheduler.step()
     
     # Compute final metrics
@@ -311,7 +326,7 @@ def train_epoch_il(model, train_loader, optimizer, scheduler, config, device, sc
     return losses, metrics, profile_stats
 
 
-def evaluate_il(model, val_loader, config, device):
+def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
     """
     đź†• v4.3: Evaluate model with WDL value head
     
@@ -336,6 +351,7 @@ def evaluate_il(model, val_loader, config, device):
     # âšˇ Pre-read AMP config outside loop
     use_amp = config['hardware'].get('use_amp', True)
     amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
+    non_blocking = bool(non_blocking_transfer and device.type == 'cuda')
     
     with torch.inference_mode():
         for batch_data in tqdm(val_loader, desc="Evaluating"):
@@ -363,19 +379,19 @@ def evaluate_il(model, val_loader, config, device):
                     total_moves = None
                 use_mtl = False
             
-            boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
-            moves = moves.to(device, non_blocking=True)
-            outcomes = outcomes.to(device, non_blocking=True)
+            boards = boards.to(device, memory_format=torch.channels_last, non_blocking=non_blocking)
+            moves = moves.to(device, non_blocking=non_blocking)
+            outcomes = outcomes.to(device, non_blocking=non_blocking)
             
             if move_indices is not None:
-                move_indices = move_indices.to(device, non_blocking=True)
+                move_indices = move_indices.to(device, non_blocking=non_blocking)
             if total_moves is not None:
-                total_moves = total_moves.to(device, non_blocking=True)
+                total_moves = total_moves.to(device, non_blocking=non_blocking)
             
             if use_mtl:
-                win_targets = win_targets.to(device, non_blocking=True)
-                material_targets = material_targets.to(device, non_blocking=True)
-                check_targets = check_targets.to(device, non_blocking=True)
+                win_targets = win_targets.to(device, non_blocking=non_blocking)
+                material_targets = material_targets.to(device, non_blocking=non_blocking)
+                check_targets = check_targets.to(device, non_blocking=non_blocking)
             
             with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
                 if use_mtl:

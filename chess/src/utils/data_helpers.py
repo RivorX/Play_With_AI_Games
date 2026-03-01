@@ -367,132 +367,243 @@ def compact_to_tensor(compact_board, flip_perspective=False):
 
 
 # ==============================================================================
-# POV-AWARE MOVE ENCODING - FIXED FOR 180° ROTATION
+# POV-AWARE MOVE ENCODING - ALPHAZERO-STYLE (8x8x73)
 # ==============================================================================
 
-NORMAL_ACTIONS = 4096
-PROMOTION_TYPE_TO_INDEX = {
-    chess.QUEEN: 0,
-    chess.ROOK: 1,
-    chess.BISHOP: 2,
-    chess.KNIGHT: 3
+ACTION_PLANES = 73
+ACTION_SIZE = 64 * ACTION_PLANES  # 4672
+
+# Queen-like directions: N, NE, E, SE, S, SW, W, NW
+_QUEENLIKE_DIRECTIONS = (
+    (1, 0),
+    (1, 1),
+    (0, 1),
+    (-1, 1),
+    (-1, 0),
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+)
+_QUEENLIKE_DIRECTION_TO_INDEX = {
+    direction: idx for idx, direction in enumerate(_QUEENLIKE_DIRECTIONS)
 }
-INDEX_TO_PROMOTION_TYPE = {v: k for k, v in PROMOTION_TYPE_TO_INDEX.items()}
 
-def _build_promotion_pairs():
-    """
-    Build ordered list of all promotion (from_square, to_square) pairs.
-    Includes forward and capture promotions for both colors.
-    """
-    pairs = []
-    
-    # White promotions: from rank 7 -> rank 8
-    for file in range(8):
-        from_sq = chess.square(file, 6)
-        # forward
-        pairs.append((from_sq, chess.square(file, 7)))
-        # capture left
-        if file > 0:
-            pairs.append((from_sq, chess.square(file - 1, 7)))
-        # capture right
-        if file < 7:
-            pairs.append((from_sq, chess.square(file + 1, 7)))
-    
-    # Black promotions: from rank 2 -> rank 1
-    for file in range(8):
-        from_sq = chess.square(file, 1)
-        # forward
-        pairs.append((from_sq, chess.square(file, 0)))
-        # capture left (from black perspective = file+1 in board coords)
-        if file < 7:
-            pairs.append((from_sq, chess.square(file + 1, 0)))
-        # capture right (from black perspective = file-1)
-        if file > 0:
-            pairs.append((from_sq, chess.square(file - 1, 0)))
-    
-    return pairs
+# Knight offsets in POV coordinates
+_KNIGHT_DELTAS = (
+    (2, 1),
+    (1, 2),
+    (-1, 2),
+    (-2, 1),
+    (-2, -1),
+    (-1, -2),
+    (1, -2),
+    (2, -1),
+)
+_KNIGHT_DELTA_TO_INDEX = {delta: idx for idx, delta in enumerate(_KNIGHT_DELTAS)}
+
+# Underpromotions: piece-major order, each with [capture-left, forward, capture-right]
+_UNDERPROMOTION_PIECES = (chess.KNIGHT, chess.BISHOP, chess.ROOK)
+_UNDERPROMOTION_PIECE_TO_INDEX = {
+    piece: idx for idx, piece in enumerate(_UNDERPROMOTION_PIECES)
+}
+_UNDERPROMOTION_DELTAS = (
+    (1, -1),
+    (1, 0),
+    (1, 1),
+)
+_UNDERPROMOTION_DELTA_TO_INDEX = {
+    delta: idx for idx, delta in enumerate(_UNDERPROMOTION_DELTAS)
+}
+
+_HFLIP_INV_INDEX_MAP = None
 
 
-PROMOTION_PAIRS = _build_promotion_pairs()
-PROMOTION_PAIR_TO_INDEX = {pair: idx for idx, pair in enumerate(PROMOTION_PAIRS)}
-ACTION_SIZE = NORMAL_ACTIONS + len(PROMOTION_PAIRS) * 4
+def _to_pov_square(square, is_black_turn):
+    return square ^ 63 if is_black_turn else square
+
+
+def _from_pov_square(square, is_black_turn):
+    return square ^ 63 if is_black_turn else square
+
+
+def _square_to_coords(square):
+    return square // 8, square % 8
+
+
+def _coords_to_square(row, col):
+    if row < 0 or row > 7 or col < 0 or col > 7:
+        return None
+    return row * 8 + col
+
+
+def _encode_queenlike_plane(dr, dc):
+    if dr == 0 and dc == 0:
+        return None
+
+    abs_dr = abs(dr)
+    abs_dc = abs(dc)
+    if not (dr == 0 or dc == 0 or abs_dr == abs_dc):
+        return None
+
+    distance = max(abs_dr, abs_dc)
+    if distance < 1 or distance > 7:
+        return None
+
+    step = (
+        0 if dr == 0 else (1 if dr > 0 else -1),
+        0 if dc == 0 else (1 if dc > 0 else -1),
+    )
+    direction_idx = _QUEENLIKE_DIRECTION_TO_INDEX.get(step)
+    if direction_idx is None:
+        return None
+    return direction_idx * 7 + (distance - 1)
+
+
+def _decode_queenlike_plane(plane):
+    direction_idx = plane // 7
+    distance = (plane % 7) + 1
+    dr, dc = _QUEENLIKE_DIRECTIONS[direction_idx]
+    return dr * distance, dc * distance
+
 
 def move_to_index(move, board):
     """
-    Convert chess.Move to index with POV support
-    
-    🔧 FIXED: Uses XOR 63 for 180° rotation (not square_mirror for vertical flip)
-    
-    If black to move, rotate both squares 180° to match flipped board
-    
-    Args:
-        move: chess.Move object
-        board: chess.Board (to determine whose turn it is)
-    
-    Returns:
-        int: Move index (ACTION_SIZE)
+    Convert chess.Move to AlphaZero-style index (8x8x73) with POV rotation.
     """
-    from_square = move.from_square
-    to_square = move.to_square
-    
-    # Rotate 180° if black to move (XOR with 63)
-    if board.turn == chess.BLACK:
-        from_square = from_square ^ 63
-        to_square = to_square ^ 63
-    
-    # Promotions use extended action space to disambiguate promotion type
-    if move.promotion is not None:
-        promo_idx = PROMOTION_TYPE_TO_INDEX.get(move.promotion)
-        if promo_idx is None:
-            promo_idx = PROMOTION_TYPE_TO_INDEX[chess.QUEEN]
-        
-        pair_idx = PROMOTION_PAIR_TO_INDEX.get((from_square, to_square))
-        if pair_idx is None:
-            # Fallback to base encoding if mapping fails
-            return from_square * 64 + to_square
-        
-        return NORMAL_ACTIONS + (pair_idx * 4 + promo_idx)
-    
-    return from_square * 64 + to_square
+    is_black_turn = (board.turn == chess.BLACK)
+    from_square = _to_pov_square(move.from_square, is_black_turn)
+    to_square = _to_pov_square(move.to_square, is_black_turn)
+
+    from_row, from_col = _square_to_coords(from_square)
+    to_row, to_col = _square_to_coords(to_square)
+    dr = to_row - from_row
+    dc = to_col - from_col
+
+    # Underpromotions use dedicated planes.
+    if move.promotion in _UNDERPROMOTION_PIECE_TO_INDEX:
+        piece_idx = _UNDERPROMOTION_PIECE_TO_INDEX[move.promotion]
+        dir_idx = _UNDERPROMOTION_DELTA_TO_INDEX.get((dr, dc))
+        if dir_idx is None:
+            raise ValueError(f"Unsupported underpromotion delta: {(dr, dc)} for move {move}")
+        plane = 64 + piece_idx * 3 + dir_idx
+        return from_square * ACTION_PLANES + plane
+
+    # Queen-like moves (includes queen promotions by design).
+    plane = _encode_queenlike_plane(dr, dc)
+    if plane is not None:
+        return from_square * ACTION_PLANES + plane
+
+    # Knight moves.
+    knight_idx = _KNIGHT_DELTA_TO_INDEX.get((dr, dc))
+    if knight_idx is not None:
+        return from_square * ACTION_PLANES + (56 + knight_idx)
+
+    raise ValueError(f"Unsupported move for AZ action encoding: {move} (delta={(dr, dc)})")
 
 
-def index_to_move(index, is_black_turn=False):
+def index_to_move(index, is_black_turn=False, board=None):
     """
-    Convert index back to move with POV support
-    
+    Convert AlphaZero-style index (8x8x73) back to chess.Move.
+
     Args:
-        index: Move index (ACTION_SIZE)
-        is_black_turn: Whether it's black's turn
-    
-    Returns:
-        chess.Move object
+        index: Move index in [0, ACTION_SIZE).
+        is_black_turn: Whether current player to move is black.
+        board: Optional board; if provided, queen promotions are reconstructed when applicable.
     """
-    if index < NORMAL_ACTIONS:
-        from_square = index // 64
-        to_square = index % 64
-        
-        # Rotate back if black
-        if is_black_turn:
-            from_square = from_square ^ 63
-            to_square = to_square ^ 63
-        
-        return chess.Move(from_square, to_square)
-    
-    promo_index = index - NORMAL_ACTIONS
-    pair_idx = promo_index // 4
-    promo_type_idx = promo_index % 4
-    
-    if pair_idx < 0 or pair_idx >= len(PROMOTION_PAIRS):
+    if index < 0 or index >= ACTION_SIZE:
         return chess.Move.null()
-    
-    from_square, to_square = PROMOTION_PAIRS[pair_idx]
-    if is_black_turn:
-        from_square = from_square ^ 63
-        to_square = to_square ^ 63
-    
-    promotion = INDEX_TO_PROMOTION_TYPE.get(promo_type_idx, chess.QUEEN)
+
+    from_square_pov = index // ACTION_PLANES
+    plane = index % ACTION_PLANES
+    from_row, from_col = _square_to_coords(from_square_pov)
+
+    if plane < 56:
+        dr, dc = _decode_queenlike_plane(plane)
+        to_row = from_row + dr
+        to_col = from_col + dc
+        promotion = None
+    elif plane < 64:
+        dr, dc = _KNIGHT_DELTAS[plane - 56]
+        to_row = from_row + dr
+        to_col = from_col + dc
+        promotion = None
+    else:
+        promo_plane = plane - 64
+        piece_idx = promo_plane // 3
+        dir_idx = promo_plane % 3
+        if piece_idx < 0 or piece_idx >= len(_UNDERPROMOTION_PIECES):
+            return chess.Move.null()
+        dr, dc = _UNDERPROMOTION_DELTAS[dir_idx]
+        to_row = from_row + dr
+        to_col = from_col + dc
+        promotion = _UNDERPROMOTION_PIECES[piece_idx]
+
+    to_square_pov = _coords_to_square(to_row, to_col)
+    if to_square_pov is None:
+        return chess.Move.null()
+
+    from_square = _from_pov_square(from_square_pov, is_black_turn)
+    to_square = _from_pov_square(to_square_pov, is_black_turn)
+
+    # Queen promotions are encoded in queen-like planes; reconstruct when board is available.
+    if promotion is None and board is not None:
+        piece = board.piece_at(from_square)
+        if piece is not None and piece.piece_type == chess.PAWN:
+            to_rank = chess.square_rank(to_square)
+            if to_rank == 0 or to_rank == 7:
+                promotion = chess.QUEEN
+
     return chess.Move(from_square, to_square, promotion=promotion)
 
+
+def _mirror_file_pov_square(square):
+    rank, file = _square_to_coords(square)
+    return rank * 8 + (7 - file)
+
+
+def build_hflip_inverse_index_map():
+    """
+    Build inverse action index map for horizontal file flip (a<->h) in POV space.
+
+    Returns:
+        np.ndarray[int64]: inverse map with shape (ACTION_SIZE,).
+    """
+    global _HFLIP_INV_INDEX_MAP
+    if _HFLIP_INV_INDEX_MAP is not None:
+        return _HFLIP_INV_INDEX_MAP
+
+    forward_map = np.empty(ACTION_SIZE, dtype=np.int64)
+
+    for idx in range(ACTION_SIZE):
+        from_square = idx // ACTION_PLANES
+        plane = idx % ACTION_PLANES
+        mirrored_from = _mirror_file_pov_square(from_square)
+
+        if plane < 56:
+            direction_idx = plane // 7
+            distance = (plane % 7) + 1
+            dr, dc = _QUEENLIKE_DIRECTIONS[direction_idx]
+            mirrored_direction_idx = _QUEENLIKE_DIRECTION_TO_INDEX[(dr, -dc)]
+            mirrored_plane = mirrored_direction_idx * 7 + (distance - 1)
+        elif plane < 64:
+            knight_idx = plane - 56
+            dr, dc = _KNIGHT_DELTAS[knight_idx]
+            mirrored_knight_idx = _KNIGHT_DELTA_TO_INDEX[(dr, -dc)]
+            mirrored_plane = 56 + mirrored_knight_idx
+        else:
+            promo_plane = plane - 64
+            piece_idx = promo_plane // 3
+            dir_idx = promo_plane % 3
+            dr, dc = _UNDERPROMOTION_DELTAS[dir_idx]
+            mirrored_dir_idx = _UNDERPROMOTION_DELTA_TO_INDEX[(dr, -dc)]
+            mirrored_plane = 64 + piece_idx * 3 + mirrored_dir_idx
+
+        forward_map[idx] = mirrored_from * ACTION_PLANES + mirrored_plane
+
+    inverse_map = np.empty_like(forward_map)
+    inverse_map[forward_map] = np.arange(ACTION_SIZE, dtype=np.int64)
+    _HFLIP_INV_INDEX_MAP = inverse_map
+    return _HFLIP_INV_INDEX_MAP
 
 # ==============================================================================
 # AUXILIARY TASK HELPERS
@@ -603,7 +714,7 @@ def get_position_size(use_mtl=False, history_positions=0):
     base_size = 38  # Board (compact) - 🆕 NOW 38 bytes instead of 32!
     base_size += 4  # GameID (uint32) — supports up to ~4 billion unique games
     base_size += 2  # MoveIdx (uint16)
-    base_size += 2  # MoveTarget (uint16) - the move label (0-4095)
+    base_size += 2  # MoveTarget (uint16) - the move label (0-4671)
     base_size += 4  # Outcome (float32)
     
     if use_mtl:
@@ -625,7 +736,7 @@ def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_label
         board: chess.Board
         game_id: Unique game identifier (0 – 4294967295, uint32)
         move_idx: Move index in game (0-based)
-        move_target: Target move index (0-4095) - THIS IS THE LABEL
+        move_target: Target move index (0-4671) - THIS IS THE LABEL
         outcome: Game outcome value
         mtl_labels: Optional dict with 'win', 'material', 'check'
     
