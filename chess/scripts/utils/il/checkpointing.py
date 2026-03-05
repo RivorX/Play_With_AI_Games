@@ -47,7 +47,6 @@ def save_swa_snapshot_checkpoint(
     swa_model,
     swa_start,
     il_dir,
-    use_mtl,
     history_positions,
     expected_input_planes,
     stride,
@@ -80,7 +79,6 @@ def save_swa_snapshot_checkpoint(
         "swa_snapshot": True,
         "swa_bn_updated": False,
         "swa_start_epoch": swa_start,
-        "use_mtl": use_mtl,
         "history_positions": history_positions,
         "input_planes": expected_input_planes,
         "sliding_window_stride": stride,
@@ -189,6 +187,42 @@ def _build_fresh_multi_worker_loader(base_loader, shuffle=False):
         return None
 
 
+def _extract_model_inputs(batch):
+    """Extract model input tensor from common batch formats."""
+    if isinstance(batch, dict):
+        if "board" in batch:
+            return batch["board"]
+        raise KeyError("batch dict missing required 'board' key")
+    if isinstance(batch, (tuple, list)):
+        if len(batch) == 0:
+            raise ValueError("empty batch tuple/list")
+        return batch[0]
+    return batch
+
+
+class _InputOnlyLoader:
+    """Adapter exposing only model inputs for torch.optim.swa_utils.update_bn."""
+
+    def __init__(self, base_loader):
+        self.base_loader = base_loader
+        self.dataset = getattr(base_loader, "dataset", None)
+        self.batch_size = getattr(base_loader, "batch_size", None)
+
+    def __iter__(self):
+        for batch in self.base_loader:
+            yield _extract_model_inputs(batch)
+
+    def __len__(self):
+        return len(self.base_loader)
+
+
+def _update_bn_from_loader(loader, swa_model, device, use_amp, amp_dtype):
+    """Run SWA BatchNorm refresh using only model inputs from loader batches."""
+    input_loader = _InputOnlyLoader(loader)
+    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+        torch.optim.swa_utils.update_bn(input_loader, swa_model, device=device)
+
+
 def _refresh_swa_bn_stats(
     train_loader,
     swa_model,
@@ -216,16 +250,20 @@ def _refresh_swa_bn_stats(
             )
         else:
             try:
-                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                    torch.optim.swa_utils.update_bn(refreshed_multi_loader, swa_model, device=device)
+                _update_bn_from_loader(
+                    refreshed_multi_loader,
+                    swa_model,
+                    device,
+                    use_amp,
+                    amp_dtype,
+                )
                 print("BatchNorm statistics updated via fresh multi-worker loader.")
                 return True, "fresh_multi_worker", None
             except Exception as refresh_exc:
                 print(f"WARNING: BN refresh failed on fresh multi-worker loader ({refresh_exc})")
 
     try:
-        with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-            torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
+        _update_bn_from_loader(train_loader, swa_model, device, use_amp, amp_dtype)
         return True, "train_loader", None
     except Exception as primary_exc:
         print(f"WARNING: BN refresh failed on training loader ({primary_exc})")
@@ -234,8 +272,13 @@ def _refresh_swa_bn_stats(
         refreshed_multi_loader = _build_fresh_multi_worker_loader(train_loader, shuffle=False)
         if refreshed_multi_loader is not None:
             try:
-                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                    torch.optim.swa_utils.update_bn(refreshed_multi_loader, swa_model, device=device)
+                _update_bn_from_loader(
+                    refreshed_multi_loader,
+                    swa_model,
+                    device,
+                    use_amp,
+                    amp_dtype,
+                )
                 print("BatchNorm statistics updated via fresh multi-worker loader.")
                 return True, "fresh_multi_worker", None
             except Exception as refresh_exc:
@@ -246,8 +289,7 @@ def _refresh_swa_bn_stats(
         return False, "none", "failed to build safe single-worker training loader"
 
     try:
-        with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-            torch.optim.swa_utils.update_bn(safe_loader, swa_model, device=device)
+        _update_bn_from_loader(safe_loader, swa_model, device, use_amp, amp_dtype)
         print("BatchNorm statistics updated via safe single-worker loader.")
         return True, "safe_single_worker", None
     except Exception as fallback_exc:
@@ -293,7 +335,6 @@ def finalize_swa_model(
     config,
     device,
     best_model_path,
-    use_mtl,
     swa_start,
     history_positions,
     expected_input_planes,
@@ -426,7 +467,6 @@ def finalize_swa_model(
         "swa_bn_updated": bool(bn_updated),
         "swa_bn_refresh_mode": bn_refresh_mode,
         "swa_finalized_on_interrupt": bool(interrupted),
-        "use_mtl": use_mtl,
         "history_positions": history_positions,
         "input_planes": expected_input_planes,
         "sliding_window_stride": stride,

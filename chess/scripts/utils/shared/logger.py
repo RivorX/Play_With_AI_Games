@@ -11,21 +11,19 @@ from pathlib import Path
 class TrainingLogger:
     """
     Universal logger for training metrics
-    Supports both IL and RL modes with optional MTL and detailed metrics
+    Supports both IL and RL modes with detailed metrics
     """
     
-    def __init__(self, log_dir, experiment_name="training", mode="il", use_mtl=False):
+    def __init__(self, log_dir, experiment_name="training", mode="il"):
         """
         Args:
             log_dir: Directory for logs
             experiment_name: Name of experiment
             mode: "il" or "rl"
-            use_mtl: Whether using multi-task learning
         """
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.mode = mode
-        self.use_mtl = use_mtl
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.csv_path = self.log_dir / f"{experiment_name}_{timestamp}.csv"
@@ -49,12 +47,6 @@ class TrainingLogger:
                     # 🆕 Elo estimation
                     'estimated_elo'
                 ]
-                
-                if use_mtl:
-                    header.extend([
-                        'train_win_loss', 'train_material_loss', 'train_check_loss',
-                        'val_win_loss', 'val_material_loss', 'val_check_loss'
-                    ])
             
             else:  # RL mode
                 header = [
@@ -95,14 +87,6 @@ class TrainingLogger:
         
         # 🆕 Elo estimation storage
         self.estimated_elos = []  # (epoch, elo) tuples
-        
-        if use_mtl:
-            self.train_win_losses = []
-            self.val_win_losses = []
-            self.train_material_losses = []
-            self.val_material_losses = []
-            self.train_check_losses = []
-            self.val_check_losses = []
         
         if mode == "rl":
             self.win_rates = []
@@ -565,16 +549,6 @@ class TrainingLogger:
                 else:
                     row.append('')
                 
-                if self.use_mtl:
-                    row.extend([
-                        train_losses.get('win', ''),
-                        train_losses.get('material', ''),
-                        train_losses.get('check', ''),
-                        val_losses.get('win', '') if val_losses else '',
-                        val_losses.get('material', '') if val_losses else '',
-                        val_losses.get('check', '') if val_losses else ''
-                    ])
-                
                 # Store for plotting
                 self.iterations.append(iteration)
                 self.train_losses.append(train_losses['total'])
@@ -607,16 +581,6 @@ class TrainingLogger:
                 if estimated_elo is not None:
                     # CSV already contains this value in the current row.
                     self.record_estimated_elo(iteration, estimated_elo, update_csv=False)
-                
-                if self.use_mtl:
-                    self.train_win_losses.append(train_losses.get('win', 0))
-                    self.train_material_losses.append(train_losses.get('material', 0))
-                    self.train_check_losses.append(train_losses.get('check', 0))
-                    
-                    if val_losses is not None:
-                        self.val_win_losses.append(val_losses.get('win', 0))
-                        self.val_material_losses.append(val_losses.get('material', 0))
-                        self.val_check_losses.append(val_losses.get('check', 0))
             
             else:  # RL mode
                 row = [
@@ -831,10 +795,7 @@ class TrainingLogger:
 
     def _plot_il(self):
         """Plot IL training progress"""
-        if self.use_mtl:
-            fig, axes = plt.subplots(5, 3, figsize=(18, 22))
-        else:
-            fig, axes = plt.subplots(5, 2, figsize=(15, 22))
+        fig, axes = plt.subplots(5, 2, figsize=(15, 22))
         
         if self.run_context_text:
             fig.suptitle(
@@ -848,314 +809,138 @@ class TrainingLogger:
         
         val_epochs = self.val_iterations if self.val_iterations else []
         
-        if not self.use_mtl:
-            # ============================================================
-            # ROW 1: LOSSES
-            # ============================================================
-            
-            # Total Loss
-            ax = axes[0, 0]
-            ax.plot(self.iterations, self.train_losses, 'b-', label='Train Loss', linewidth=2)
-            if self.val_losses:
-                ax.plot(val_epochs, self.val_losses, 'r-', label='Val Loss', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Loss')
-            ax.set_title('Total Loss')
+        # ============================================================
+        # ROW 1: LOSSES
+        # ============================================================
+        
+        # Total Loss
+        ax = axes[0, 0]
+        ax.plot(self.iterations, self.train_losses, 'b-', label='Train Loss', linewidth=2)
+        if self.val_losses:
+            ax.plot(val_epochs, self.val_losses, 'r-', label='Val Loss', linewidth=2)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('Total Loss')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Policy Loss
+        ax = axes[0, 1]
+        ax.plot(self.iterations, self.train_policy_losses, 'b-', label='Train Policy', linewidth=2)
+        if self.val_policy_losses:
+            ax.plot(val_epochs, self.val_policy_losses, 'r-', label='Val Policy', linewidth=2)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Policy Loss')
+        ax.set_title('Policy Loss')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # ============================================================
+        # ROW 2: METRICS
+        # ============================================================
+        
+        # Policy Accuracy
+        ax = axes[1, 0]
+        if self.train_policy_top1:
+            ax.plot(self.iterations, self.train_policy_top1, 'b-', label='Train Top-1', linewidth=2)
+            ax.plot(self.iterations, self.train_policy_top3, 'b--', label='Train Top-3', linewidth=2, alpha=0.7)
+        if self.val_policy_top1:
+            ax.plot(val_epochs, self.val_policy_top1, 'r-', label='Val Top-1', linewidth=2)
+            ax.plot(val_epochs, self.val_policy_top3, 'r--', label='Val Top-3', linewidth=2, alpha=0.7)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Accuracy')
+        ax.set_title('Policy Accuracy')
+        ax.set_ylim([0, 1])
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Value MAE
+        ax = axes[1, 1]
+        if self.train_value_mae:
+            ax.plot(self.iterations, self.train_value_mae, 'b-', label='Train MAE', linewidth=2, alpha=0.75, zorder=2)
+        if self.train_value_mae_weighted:
+            ax.plot(self.iterations, self.train_value_mae_weighted, 'b--', label='Train MAE (weighted)', linewidth=2, alpha=0.6, zorder=2)
+        if self.val_value_mae:
+            ax.plot(val_epochs, self.val_value_mae, 'r-', label='Val MAE', linewidth=2.5, zorder=3)
+        if self.val_value_mae_weighted:
+            ax.plot(val_epochs, self.val_value_mae_weighted, 'r--', label='Val MAE (weighted)', linewidth=2, alpha=0.85, zorder=3)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('MAE')
+        ax.set_title('Value MAE')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # ============================================================
+        # ROW 3: COMPARISON
+        # ============================================================
+        
+        # Value Loss
+        ax = axes[2, 0]
+        ax.plot(self.iterations, self.train_value_losses, 'b-', label='Train Value', linewidth=2)
+        if self.val_value_losses:
+            ax.plot(val_epochs, self.val_value_losses, 'r-', label='Val Value', linewidth=2)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Value Loss')
+        ax.set_title('Value Loss')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Loss Comparison
+        ax = axes[2, 1]
+        if self.val_losses:
+            ax.plot(self.iterations, self.train_losses, 'b-', label='Train Total', linewidth=2, alpha=0.7)
+            ax.plot(val_epochs, self.val_losses, 'r-', label='Val Total', linewidth=2, alpha=0.7)
+            ax.plot(self.iterations, self.train_policy_losses, 'b--', label='Train Policy', linewidth=1.5, alpha=0.5)
+            ax.plot(val_epochs, self.val_policy_losses, 'r--', label='Val Policy', linewidth=1.5, alpha=0.5)
+            ax.plot(self.iterations, self.train_value_losses, 'b:', label='Train Value', linewidth=1.5, alpha=0.5)
+            ax.plot(val_epochs, self.val_value_losses, 'r:', label='Val Value', linewidth=1.5, alpha=0.5)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('All Losses Comparison')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        
+        # ============================================================
+        # ROW 4: WDL METRICS
+        # ============================================================
+        
+        # WDL Accuracy
+        ax = axes[3, 0]
+        if self.train_value_wdl_acc:
+            ax.plot(self.iterations, self.train_value_wdl_acc, 'b-', label='Train WDL Acc', linewidth=2)
+        if self.val_value_wdl_acc:
+            ax.plot(val_epochs, self.val_value_wdl_acc, 'r-', label='Val WDL Acc', linewidth=2)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Accuracy')
+        ax.set_title('Value WDL Accuracy')
+        ax.set_ylim([0, 1])
+        if self.train_value_wdl_acc or self.val_value_wdl_acc:
             ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # Policy Loss
-            ax = axes[0, 1]
-            ax.plot(self.iterations, self.train_policy_losses, 'b-', label='Train Policy', linewidth=2)
-            if self.val_policy_losses:
-                ax.plot(val_epochs, self.val_policy_losses, 'r-', label='Val Policy', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Policy Loss')
-            ax.set_title('Policy Loss')
+        ax.grid(True, alpha=0.3)
+        
+        # WDL Cross-Entropy
+        ax = axes[3, 1]
+        if self.train_value_wdl_ce:
+            ax.plot(self.iterations, self.train_value_wdl_ce, 'b-', label='Train WDL CE', linewidth=2)
+        if self.val_value_wdl_ce:
+            ax.plot(val_epochs, self.val_value_wdl_ce, 'r-', label='Val WDL CE', linewidth=2)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('CE')
+        ax.set_title('Value WDL Cross-Entropy')
+        if self.train_value_wdl_ce or self.val_value_wdl_ce:
             ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # ============================================================
-            # ROW 2: METRICS
-            # ============================================================
-            
-            # Policy Accuracy
-            ax = axes[1, 0]
-            if self.train_policy_top1:
-                ax.plot(self.iterations, self.train_policy_top1, 'b-', label='Train Top-1', linewidth=2)
-                ax.plot(self.iterations, self.train_policy_top3, 'b--', label='Train Top-3', linewidth=2, alpha=0.7)
-            if self.val_policy_top1:
-                ax.plot(val_epochs, self.val_policy_top1, 'r-', label='Val Top-1', linewidth=2)
-                ax.plot(val_epochs, self.val_policy_top3, 'r--', label='Val Top-3', linewidth=2, alpha=0.7)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Accuracy')
-            ax.set_title('Policy Accuracy')
-            ax.set_ylim([0, 1])
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # Value MAE
-            ax = axes[1, 1]
-            if self.train_value_mae:
-                ax.plot(self.iterations, self.train_value_mae, 'b-', label='Train MAE', linewidth=2, alpha=0.75, zorder=2)
-            if self.train_value_mae_weighted:
-                ax.plot(self.iterations, self.train_value_mae_weighted, 'b--', label='Train MAE (weighted)', linewidth=2, alpha=0.6, zorder=2)
-            if self.val_value_mae:
-                ax.plot(val_epochs, self.val_value_mae, 'r-', label='Val MAE', linewidth=2.5, zorder=3)
-            if self.val_value_mae_weighted:
-                ax.plot(val_epochs, self.val_value_mae_weighted, 'r--', label='Val MAE (weighted)', linewidth=2, alpha=0.85, zorder=3)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('MAE')
-            ax.set_title('Value MAE')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # ============================================================
-            # ROW 3: COMPARISON
-            # ============================================================
-            
-            # Value Loss
-            ax = axes[2, 0]
-            ax.plot(self.iterations, self.train_value_losses, 'b-', label='Train Value', linewidth=2)
-            if self.val_value_losses:
-                ax.plot(val_epochs, self.val_value_losses, 'r-', label='Val Value', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Value Loss')
-            ax.set_title('Value Loss')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # Loss Comparison
-            ax = axes[2, 1]
-            if self.val_losses:
-                ax.plot(self.iterations, self.train_losses, 'b-', label='Train Total', linewidth=2, alpha=0.7)
-                ax.plot(val_epochs, self.val_losses, 'r-', label='Val Total', linewidth=2, alpha=0.7)
-                ax.plot(self.iterations, self.train_policy_losses, 'b--', label='Train Policy', linewidth=1.5, alpha=0.5)
-                ax.plot(val_epochs, self.val_policy_losses, 'r--', label='Val Policy', linewidth=1.5, alpha=0.5)
-                ax.plot(self.iterations, self.train_value_losses, 'b:', label='Train Value', linewidth=1.5, alpha=0.5)
-                ax.plot(val_epochs, self.val_value_losses, 'r:', label='Val Value', linewidth=1.5, alpha=0.5)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Loss')
-            ax.set_title('All Losses Comparison')
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3)
-            
-            # ============================================================
-            # ROW 4: WDL METRICS
-            # ============================================================
-            
-            # WDL Accuracy
-            ax = axes[3, 0]
-            if self.train_value_wdl_acc:
-                ax.plot(self.iterations, self.train_value_wdl_acc, 'b-', label='Train WDL Acc', linewidth=2)
-            if self.val_value_wdl_acc:
-                ax.plot(val_epochs, self.val_value_wdl_acc, 'r-', label='Val WDL Acc', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Accuracy')
-            ax.set_title('Value WDL Accuracy')
-            ax.set_ylim([0, 1])
-            if self.train_value_wdl_acc or self.val_value_wdl_acc:
-                ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # WDL Cross-Entropy
-            ax = axes[3, 1]
-            if self.train_value_wdl_ce:
-                ax.plot(self.iterations, self.train_value_wdl_ce, 'b-', label='Train WDL CE', linewidth=2)
-            if self.val_value_wdl_ce:
-                ax.plot(val_epochs, self.val_value_wdl_ce, 'r-', label='Val WDL CE', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('CE')
-            ax.set_title('Value WDL Cross-Entropy')
-            if self.train_value_wdl_ce or self.val_value_wdl_ce:
-                ax.legend()
-            ax.grid(True, alpha=0.3)
+        ax.grid(True, alpha=0.3)
 
-            # ============================================================
-            # ROW 5: ELO ESTIMATION + SUMMARY
-            # ============================================================
-            ax = axes[4, 0]
-            self._plot_il_elo_panel(ax)
-            
-            ax = axes[4, 1]
-            self._plot_il_summary_panel(ax)
+        # ============================================================
+        # ROW 5: ELO ESTIMATION + SUMMARY
+        # ============================================================
+        ax = axes[4, 0]
+        self._plot_il_elo_panel(ax)
         
-        else:
-            # MTL plots (5x3)
-            
-            # Row 1: Main tasks
-            ax = axes[0, 0]
-            ax.plot(self.iterations, self.train_losses, 'b-', label='Train', linewidth=2)
-            if self.val_losses:
-                ax.plot(val_epochs, self.val_losses, 'r-', label='Val', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Loss')
-            ax.set_title('Total Loss')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            ax = axes[0, 1]
-            ax.plot(self.iterations, self.train_policy_losses, 'b-', label='Train', linewidth=2)
-            if self.val_policy_losses:
-                ax.plot(val_epochs, self.val_policy_losses, 'r-', label='Val', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Policy Loss')
-            ax.set_title('Policy Loss (Main)')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            ax = axes[0, 2]
-            ax.plot(self.iterations, self.train_value_losses, 'b-', label='Train', linewidth=2)
-            if self.val_value_losses:
-                ax.plot(val_epochs, self.val_value_losses, 'r-', label='Val', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Value Loss')
-            ax.set_title('Value Loss (Main)')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # Row 2: Auxiliary tasks
-            ax = axes[1, 0]
-            ax.plot(self.iterations, self.train_win_losses, 'b-', label='Train', linewidth=2)
-            if self.val_win_losses:
-                ax.plot(val_epochs, self.val_win_losses, 'r-', label='Val', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Win Loss')
-            ax.set_title('Win Prediction (Aux)')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            ax = axes[1, 1]
-            ax.plot(self.iterations, self.train_material_losses, 'b-', label='Train', linewidth=2)
-            if self.val_material_losses:
-                ax.plot(val_epochs, self.val_material_losses, 'r-', label='Val', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Material Loss')
-            ax.set_title('Material Count (Aux)')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            ax = axes[1, 2]
-            ax.plot(self.iterations, self.train_check_losses, 'b-', label='Train', linewidth=2)
-            if self.val_check_losses:
-                ax.plot(val_epochs, self.val_check_losses, 'r-', label='Val', linewidth=2)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Check Loss')
-            ax.set_title('Check Detection (Aux)')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # Row 3: Metrics
-            ax = axes[2, 0]
-            if self.train_policy_top1:
-                ax.plot(self.iterations, self.train_policy_top1, 'b-', label='Train Top-1', linewidth=2)
-                ax.plot(self.iterations, self.train_policy_top3, 'b--', label='Train Top-3', linewidth=2, alpha=0.7)
-            if self.val_policy_top1:
-                ax.plot(val_epochs, self.val_policy_top1, 'r-', label='Val Top-1', linewidth=2)
-                ax.plot(val_epochs, self.val_policy_top3, 'r--', label='Val Top-3', linewidth=2, alpha=0.7)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Accuracy')
-            ax.set_title('Policy Accuracy')
-            ax.set_ylim([0, 1])
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            ax = axes[2, 1]
-            if self.train_value_mae:
-                ax.plot(self.iterations, self.train_value_mae, 'b-', label='Train', linewidth=2)
-            if self.train_value_mae_weighted:
-                ax.plot(self.iterations, self.train_value_mae_weighted, 'b--', label='Train (weighted)', linewidth=2, alpha=0.8)
-            if self.val_value_mae:
-                ax.plot(val_epochs, self.val_value_mae, 'r-', label='Val', linewidth=2)
-            if self.val_value_mae_weighted:
-                ax.plot(val_epochs, self.val_value_mae_weighted, 'r--', label='Val (weighted)', linewidth=2, alpha=0.8)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('MAE')
-            ax.set_title('Value MAE')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # Value WDL metrics
-            ax = axes[2, 2]
-            if self.train_value_wdl_acc:
-                ax.plot(self.iterations, self.train_value_wdl_acc, 'b-', label='Train WDL Acc', linewidth=2)
-            if self.val_value_wdl_acc:
-                ax.plot(val_epochs, self.val_value_wdl_acc, 'r-', label='Val WDL Acc', linewidth=2)
-            if self.train_value_wdl_ce:
-                ax.plot(self.iterations, self.train_value_wdl_ce, 'b--', label='Train WDL CE', linewidth=2, alpha=0.8)
-            if self.val_value_wdl_ce:
-                ax.plot(val_epochs, self.val_value_wdl_ce, 'r--', label='Val WDL CE', linewidth=2, alpha=0.8)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Metric')
-            ax.set_title('Value WDL Metrics')
-            if self.train_value_wdl_acc or self.val_value_wdl_acc or self.train_value_wdl_ce or self.val_value_wdl_ce:
-                ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3)
-            
-            # Row 4: Comparisons
-            ax = axes[3, 0]
-            ax.plot(self.iterations, self.train_win_losses, 'b-', label='Win', linewidth=2, alpha=0.7)
-            ax.plot(self.iterations, self.train_material_losses, 'g-', label='Material', linewidth=2, alpha=0.7)
-            ax.plot(self.iterations, self.train_check_losses, 'r-', label='Check', linewidth=2, alpha=0.7)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Loss')
-            ax.set_title('Auxiliary Tasks (Train)')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            ax = axes[3, 1]
-            if self.val_losses:
-                ax.plot(self.iterations, self.train_losses, 'b-', label='Train', linewidth=2)
-                ax.plot(val_epochs, self.val_losses, 'r-', label='Val', linewidth=2)
-                ax.set_xlabel('Epoch')
-                ax.set_ylabel('Total Loss')
-                ax.set_title('Train vs Validation')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-            
-            # Main tasks (Train)
-            ax = axes[3, 2]
-            ax.plot(self.iterations, self.train_losses, 'b-', label='Total', linewidth=2, alpha=0.7)
-            ax.plot(self.iterations, self.train_policy_losses, 'g--', label='Policy', linewidth=1.5, alpha=0.7)
-            ax.plot(self.iterations, self.train_value_losses, 'r--', label='Value', linewidth=1.5, alpha=0.7)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Loss')
-            ax.set_title('Main Tasks (Train)')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # Summary metrics
-            # Elo plot (MTL mode)
-            ax = axes[4, 0]
-            self._plot_il_elo_panel(ax)
-            axes[4, 1].axis('off')
-            ax = axes[4, 2]
-            ax.axis('off')
-            if self.val_policy_top1 and len(self.val_policy_top1) > 0:
-                summary_lines = [
-                    "Latest Validation Metrics:",
-                    "",
-                    f"Policy Top-1: {self.val_policy_top1[-1]:.2%}",
-                    f"Policy Top-3: {self.val_policy_top3[-1]:.2%}",
-                    f"Value MAE: {self.val_value_mae[-1]:.4f}",
-                ]
-                if self.val_value_mae_weighted:
-                    summary_lines.append(f"Value MAE (w): {self.val_value_mae_weighted[-1]:.4f}")
-                if self.val_value_wdl_acc:
-                    summary_lines.append(f"WDL Acc: {self.val_value_wdl_acc[-1]:.2%}")
-                if self.val_value_wdl_ce:
-                    summary_lines.append(f"WDL CE: {self.val_value_wdl_ce[-1]:.4f}")
-                summary_lines.append(f"Total Loss: {self.val_losses[-1]:.4f}")
-                if self.estimated_elos:
-                    summary_lines.append(f"Est. Elo: {self.estimated_elos[-1][1]}")
-                if self.final_notes:
-                    summary_lines.append("")
-                    summary_lines.append("Notes:")
-                    summary_lines.extend(self.final_notes[-3:])
-                summary_text = "\n".join(summary_lines)
-                ax.text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
-                       verticalalignment='center')
-        
+        ax = axes[4, 1]
+        self._plot_il_summary_panel(ax)
+    
+
         plt.tight_layout(rect=[0, 0, 1, 0.99])
         plt.savefig(self.plot_path, dpi=150, bbox_inches='tight')
         plt.close()

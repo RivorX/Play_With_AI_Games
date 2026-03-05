@@ -134,7 +134,6 @@ def main():
     best_model_path = base_dir / config['paths']['best_model_il']
     
     # Get configuration
-    use_mtl = config['model'].get('use_multitask_learning', False)
     history_positions = config['model'].get('history_positions', 0)
     stride = config['data'].get('sliding_window_stride', 1)
     
@@ -148,7 +147,7 @@ def main():
     )
     print(
         f"Features: metadata=on, promotions={ACTION_SIZE}, split_by_game=on, "
-        f"wdl_value=on, mtl={use_mtl}"
+        f"wdl_value=on"
     )
 
     # Setup debug logging
@@ -290,7 +289,6 @@ def main():
             f.write(f"Sliding window stride: {stride}x\n")
             f.write(f"Input planes: {expected_input_planes} (16 per position)\n")
             f.write("Chess metadata: Castling, En Passant, Halfmove, Fullmove\n")
-            f.write(f"MTL enabled: {use_mtl}\n")
             f.write("WDL Value: True (forced)\n")
             f.write("POV enabled: True\n")
             if hparam_resolution.get("mode") == "auto":
@@ -314,7 +312,6 @@ def main():
         logs_dir,
         experiment_name=f"il_training_{model_version}",
         mode="il",
-        use_mtl=use_mtl
     )
     global _LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG
     _LAST_RUN_LOG_CSV = logger.csv_path
@@ -487,7 +484,6 @@ def main():
             ("PGN files", f"{len(pgn_files):,}"),
             ("History positions", history_positions),
             ("Sliding stride", stride),
-            ("MTL", "on" if use_mtl else "off"),
             ("Debug mode", "on" if debug_enabled else "off"),
         ],
     )
@@ -509,27 +505,15 @@ def main():
 
     # Verify binary format compatibility.
     actual_position_size = metadata.get('position_size')
-    expected_position_size = 50 if not use_mtl else 62
+    expected_position_size = 50
 
     if actual_position_size != expected_position_size:
         print(f"\n⚠️ WARNING: Position size mismatch!")
         print(f"  • Expected: {expected_position_size} bytes")
         print(f"  • Actual: {actual_position_size} bytes")
-        print(f"  • This may indicate the data was preprocessed with an old format or different MTL setting")
+        print(f"  • This may indicate the data was preprocessed with an old format")
         
-        if actual_position_size == 50 and use_mtl:
-            print(f"  ❌ Data was processed WITHOUT MTL, but config has use_multitask_learning=True")
-            print(f"     Please either:")
-            print(f"     1. Set use_multitask_learning=False in config.yaml, OR")
-            print(f"     2. Delete cache and reprocess data with MTL enabled")
-            raise ValueError("MTL mismatch between data and config")
-        elif actual_position_size == 62 and not use_mtl:
-            print(f"  ❌ Data was processed WITH MTL, but config has use_multitask_learning=False")
-            print(f"     Please either:")
-            print(f"     1. Set use_multitask_learning=True in config.yaml, OR")
-            print(f"     2. Delete cache and reprocess data without MTL")
-            raise ValueError("MTL mismatch between data and config")
-        elif actual_position_size in [48, 60]:
+        if actual_position_size in [48, 60]:
             print(f"  Data was processed with OLD v4.4 format (36B board, no fullmove metadata)")
             print(f"  {model_version} adds fullmove number (38B board)")
             print(f"     Please delete cache (data/preprocessing/) and reprocess with {model_version}")
@@ -820,7 +804,7 @@ def main():
                 debug_log_file=debug_log_file,
                 profile=profile_this_epoch,
                 step_scheduler=not use_swa_scheduler_this_epoch,
-                non_blocking_transfer=non_blocking_transfers
+                non_blocking_transfer=non_blocking_transfers,
             )
             if profile_this_epoch and device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -849,10 +833,6 @@ def main():
                   f"Top-3: {train_metrics['policy_top3_acc']:.2%}, "
                   f"MAE: {train_metrics['value_mae']:.4f}")
 
-            if use_mtl:
-                print(f"       🆕 MTL - Win: {train_losses['win']:.4f}, "
-                      f"Material: {train_losses['material']:.4f}, "
-                      f"Check: {train_losses['check']:.4f}")
 
             # Evaluate
             if (epoch + 1) % config['imitation_learning']['eval_every'] == 0:
@@ -878,10 +858,6 @@ def main():
                       f"Top-3: {val_metrics['policy_top3_acc']:.2%}, "
                       f"MAE: {val_metrics['value_mae']:.4f}")
 
-                if use_mtl:
-                    print(f"     🆕 MTL - Win: {val_losses['win']:.4f}, "
-                          f"Material: {val_losses['material']:.4f}, "
-                          f"Check: {val_losses['check']:.4f}")
 
                 # Log metrics + periodic Elo estimation.
                 estimated_elo = elo_coordinator.evaluate_if_due(epoch + 1)
@@ -910,7 +886,6 @@ def main():
                         'val_value_mae': val_metrics['value_mae'],
                         'use_amp': use_amp,
                         'use_bfloat16': use_bfloat16,
-                        'use_mtl': use_mtl,
                         'history_positions': history_positions,
                         'input_planes': expected_input_planes,
                         'sliding_window_stride': stride,
@@ -1013,7 +988,6 @@ def main():
                     'val_policy_top1': val_metrics['policy_top1_acc'],
                     'val_policy_top3': val_metrics['policy_top3_acc'],
                     'val_value_mae': val_metrics['value_mae'],
-                    'use_mtl': use_mtl,
                     'history_positions': history_positions,
                     'input_planes': expected_input_planes,
                     'sliding_window_stride': stride,
@@ -1055,7 +1029,6 @@ def main():
                     swa_model=swa_model,
                     swa_start=swa_start,
                     il_dir=il_dir,
-                    use_mtl=use_mtl,
                     history_positions=history_positions,
                     expected_input_planes=expected_input_planes,
                     stride=stride,
@@ -1093,7 +1066,6 @@ def main():
         config=config,
         device=device,
         best_model_path=best_model_path,
-        use_mtl=use_mtl,
         swa_start=swa_start,
         history_positions=history_positions,
         expected_input_planes=expected_input_planes,

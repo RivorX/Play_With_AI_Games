@@ -79,7 +79,7 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v7.5"
+  version: "v7.5.1"
   # Base architecture
   num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
   filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
@@ -104,14 +104,6 @@ model:
   use_layer_scale: true         # LayerScale for better training stability
   layer_scale_init: 1e-5        # Initial LayerScale value (1e-6 to 1e-4)
 
-  # Multi-Task Learning
-  use_multitask_learning: false        # Enable auxiliary tasks
-  win_prediction_weight: 0.3          # Weight for win prediction
-  material_prediction_weight: 0.15    # Weight for material count
-  check_prediction_weight: 0.1        # Weight for check prediction
-  
-  # 🆕 v4.3: Advanced MTL options
-  use_focal_loss_check: true          # Use Focal Loss for check prediction (vs BCE)
 
 
 # ------------------------------------------------------------------------------
@@ -171,7 +163,7 @@ imitation_learning:
   value_move_weight_min: 0.1
   value_move_weight_use_game_length: true
   value_move_weight_min_total_moves: 40
-  
+
   # Evaluation & checkpointing
   eval_every: 1              # Evaluate every N epochs
   checkpoint_every: 5        # Save checkpoint every N epochs
@@ -266,7 +258,7 @@ hardware:
   # Performance optimizations
   use_amp: true              # 🚀 Mixed Precision Training (~2x speedup)
   use_bfloat16: true         # 💾 bfloat16 instead of float16 (better range)
-  num_workers: 4             # CPU workers for data loading
+  num_workers: 5             # CPU workers for data loading
   prefetch_factor: 2         # DataLoader prefetch factor
   pin_memory: true           # Faster GPU data transfer
   use_compile: true          # 🚀 torch.compile: fuse Conv+BN+ReLU kernels

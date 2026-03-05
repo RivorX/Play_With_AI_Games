@@ -21,7 +21,7 @@ def train_epoch_il(
     debug_log_file=None,
     profile=False,
     step_scheduler=True,
-    non_blocking_transfer=True
+    non_blocking_transfer=True,
 ):
     """
     đź†• v4.3: Train one epoch with WDL value head and move-weighted losses
@@ -49,8 +49,6 @@ def train_epoch_il(
     """
     model.train()
     
-    use_mtl = config['model'].get('use_multitask_learning', False)
-    
     # WDL-only path
     criterion = CombinedLoss(config)
     
@@ -58,9 +56,6 @@ def train_epoch_il(
     total_loss = 0
     total_policy_loss = 0
     total_value_loss = 0
-    total_win_loss = 0
-    total_material_loss = 0
-    total_check_loss = 0
     
     metrics_calc = MetricsCalculator()
     
@@ -96,7 +91,6 @@ def train_epoch_il(
     use_amp = config['hardware'].get('use_amp', True)
     amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
     non_blocking = bool(non_blocking_transfer and device.type == 'cuda')
-    
     for batch_idx, batch_data in enumerate(pbar):
         if profile_enabled:
             _sync()
@@ -106,15 +100,10 @@ def train_epoch_il(
             boards = batch_data['board']
             moves = batch_data['move']
             outcomes = batch_data['value']
-            
             # đź”§ v4.4 FIX: Get move_idx (not move_indices) from dict
             move_indices = batch_data.get('move_idx', None)
             total_moves = batch_data.get('total_moves', None)
-            
-            if use_mtl:
-                win_targets = batch_data['win']
-                material_targets = batch_data['material']
-                check_targets = batch_data['check']
+
         else:
             # đź”§ v4.4 FIX: Unpack move_indices from tuple
             if len(batch_data) == 5:
@@ -126,7 +115,7 @@ def train_epoch_il(
                 boards, moves, outcomes = batch_data
                 move_indices = None
                 total_moves = None
-            use_mtl = False
+
         
         # Move to device
         boards = boards.to(device, memory_format=torch.channels_last, non_blocking=non_blocking)
@@ -138,11 +127,7 @@ def train_epoch_il(
         if total_moves is not None:
             total_moves = total_moves.to(device, non_blocking=non_blocking)
         
-        if use_mtl:
-            win_targets = win_targets.to(device, non_blocking=non_blocking)
-            material_targets = material_targets.to(device, non_blocking=non_blocking)
-            check_targets = check_targets.to(device, non_blocking=non_blocking)
-        
+
         # đź”Ť DIAGNOSTIC: Print distributions for first batch
         if show_batch0_diagnostics and first_batch_targets:
             print(f"\nđź”Ť DIAGNOSTIC - Batch 0:")
@@ -150,11 +135,6 @@ def train_epoch_il(
             print(f"    Min: {outcomes.min().item():.3f}, Max: {outcomes.max().item():.3f}, Mean: {outcomes.mean().item():.3f}")
             print(f"    Unique values: {torch.unique(outcomes).cpu().numpy()[:10]}")  # First 10 unique
             print(f"    Distribution: +1: {(outcomes > 0.9).sum().item()}, 0: {(outcomes.abs() < 0.1).sum().item()}, -1: {(outcomes < -0.9).sum().item()}")
-            
-            if use_mtl:
-                print(f"  Win targets (MTL):")
-                print(f"    Min: {win_targets.min().item():.3f}, Max: {win_targets.max().item():.3f}, Mean: {win_targets.mean().item():.3f}")
-                print(f"    Distribution: 1.0: {(win_targets > 0.9).sum().item()}, 0.0: {(win_targets < 0.1).sum().item()}")
             
             first_batch_targets = False
         
@@ -166,10 +146,7 @@ def train_epoch_il(
         
         with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
             # Forward pass
-            if use_mtl:
-                policy_pred, value_pred, win_pred, material_pred, check_pred = model(boards, return_aux=True)
-            else:
-                policy_pred, value_pred = model(boards, return_aux=False)
+            policy_pred, value_pred = model(boards)
             
             # đź†• v4.3: Compute loss using CombinedLoss
             # Pack predictions and targets for CombinedLoss
@@ -203,27 +180,10 @@ def train_epoch_il(
                 print(f"    Mean target: {outcomes[:10].mean().item():.3f}\n")
                 first_batch_predictions = False
                 
-            if use_mtl:
-                predictions.update({
-                    'win': win_pred,
-                    'material': material_pred,
-                    'check': check_pred,
-                })
-                    
-                targets.update({
-                    'win': win_targets,
-                    'material': material_targets,
-                    'check': check_targets,
-                })
-                if move_indices is not None:
-                    targets['move_indices'] = move_indices  # đź†• For move weighting
-                if total_moves is not None:
-                    targets['total_moves'] = total_moves
-                
+
             # Single loss computation
             loss, loss_dict = criterion(predictions, targets)
-                
-        
+
         if profile_enabled:
             _sync()
             timers['forward'] += time.perf_counter() - t0
@@ -270,11 +230,6 @@ def train_epoch_il(
         total_loss += loss_dict['total']
         total_policy_loss += loss_dict['policy']
         total_value_loss += loss_dict['value']
-            
-        if use_mtl:
-            total_win_loss += loss_dict['win']
-            total_material_loss += loss_dict['material']
-            total_check_loss += loss_dict['check']
         
         # Update progress bar
         pbar.set_postfix({
@@ -302,13 +257,6 @@ def train_epoch_il(
         'value': total_value_loss / n
     }
     
-    if use_mtl:
-        losses.update({
-            'win': total_win_loss / n,
-            'material': total_material_loss / n,
-            'check': total_check_loss / n
-        })
-    
     metrics = metrics_calc.compute()
 
     if profile_enabled:
@@ -328,13 +276,11 @@ def train_epoch_il(
 
 def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
     """
-    đź†• v4.3: Evaluate model with WDL value head
+    Evaluate model with WDL value head
     
     Identical to train_epoch_il but without gradient updates
     """
     model.eval()
-    
-    use_mtl = config['model'].get('use_multitask_learning', False)
     
     # WDL-only path
     criterion = CombinedLoss(config)
@@ -342,13 +288,10 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
     total_loss = 0
     total_policy_loss = 0
     total_value_loss = 0
-    total_win_loss = 0
-    total_material_loss = 0
-    total_check_loss = 0
     
     metrics_calc = MetricsCalculator()
     
-    # âšˇ Pre-read AMP config outside loop
+    # Pre-read AMP config outside loop
     use_amp = config['hardware'].get('use_amp', True)
     amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
     non_blocking = bool(non_blocking_transfer and device.type == 'cuda')
@@ -359,15 +302,9 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
                 boards = batch_data['board']
                 moves = batch_data['move']
                 outcomes = batch_data['value']
-                move_indices = batch_data.get('move_idx', None)  # đź”§ v4.4 FIX: move_idx not move_indices
+                move_indices = batch_data.get('move_idx', None)
                 total_moves = batch_data.get('total_moves', None)
-                
-                if use_mtl:
-                    win_targets = batch_data['win']
-                    material_targets = batch_data['material']
-                    check_targets = batch_data['check']
             else:
-                # đź”§ v4.4 FIX: Unpack move_indices from tuple
                 if len(batch_data) == 5:
                     boards, moves, outcomes, move_indices, total_moves = batch_data
                 elif len(batch_data) == 4:
@@ -377,7 +314,6 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
                     boards, moves, outcomes = batch_data
                     move_indices = None
                     total_moves = None
-                use_mtl = False
             
             boards = boards.to(device, memory_format=torch.channels_last, non_blocking=non_blocking)
             moves = moves.to(device, non_blocking=non_blocking)
@@ -388,16 +324,8 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
             if total_moves is not None:
                 total_moves = total_moves.to(device, non_blocking=non_blocking)
             
-            if use_mtl:
-                win_targets = win_targets.to(device, non_blocking=non_blocking)
-                material_targets = material_targets.to(device, non_blocking=non_blocking)
-                check_targets = check_targets.to(device, non_blocking=non_blocking)
-            
             with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                if use_mtl:
-                    policy_pred, value_pred, win_pred, material_pred, check_pred = model(boards, return_aux=True)
-                else:
-                    policy_pred, value_pred = model(boards, return_aux=False)
+                policy_pred, value_pred = model(boards)
                 
                 predictions = {
                     'policy': policy_pred,
@@ -413,34 +341,11 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
                 if total_moves is not None:
                     targets['total_moves'] = total_moves
                     
-                if use_mtl:
-                    predictions.update({
-                        'win': win_pred,
-                        'material': material_pred,
-                        'check': check_pred,
-                    })
-                        
-                    targets.update({
-                        'win': win_targets,
-                        'material': material_targets,
-                        'check': check_targets,
-                    })
-                    if move_indices is not None:
-                        targets['move_indices'] = move_indices
-                    if total_moves is not None:
-                        targets['total_moves'] = total_moves
-                    
                 loss, loss_dict = criterion(predictions, targets)
-                    
             
             total_loss += loss_dict['total']
             total_policy_loss += loss_dict['policy']
             total_value_loss += loss_dict['value']
-                
-            if use_mtl:
-                total_win_loss += loss_dict['win']
-                total_material_loss += loss_dict['material']
-                total_check_loss += loss_dict['check']
             
             metrics_calc.update(
                 policy_pred,
@@ -462,13 +367,6 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
         'policy': total_policy_loss / n,
         'value': total_value_loss / n
     }
-    
-    if use_mtl:
-        losses.update({
-            'win': total_win_loss / n,
-            'material': total_material_loss / n,
-            'check': total_check_loss / n
-        })
     
     metrics = metrics_calc.compute()
     

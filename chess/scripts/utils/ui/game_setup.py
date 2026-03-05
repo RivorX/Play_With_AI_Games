@@ -48,7 +48,6 @@ _MODEL_ARCH_KEYS = [
     "use_coord_conv",
     "use_layer_scale",
     "layer_scale_init",
-    "use_multitask_learning",
     "policy_head_channels",
     "policy_head_conv_filters",
     "policy_head_conv_groups",
@@ -140,10 +139,6 @@ def _infer_architecture_from_state_dict(state_dict):
                 if in_ch > 0 and mid > 0:
                     inferred["se_reduction"] = max(1, in_ch // mid)
     inferred["use_layer_scale"] = any(".layer_scale.gamma" in key for key in state_dict.keys())
-    inferred["use_multitask_learning"] = any(
-        key.startswith("win_fc1.") or key.startswith("material_fc1.") or key.startswith("check_fc.")
-        for key in state_dict.keys()
-    )
 
     return inferred
 

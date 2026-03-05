@@ -151,7 +151,7 @@ def _build_model_rows(
     se_reduction = _safe_int(model_cfg.get("se_reduction"))
     use_layer_scale = bool(model_cfg.get("use_layer_scale", False))
     layer_scale_init = model_cfg.get("layer_scale_init")
-    use_mtl = bool(model_cfg.get("use_multitask_learning", False))
+
 
     rows = [("Version", version)]
     if source_label:
@@ -195,9 +195,6 @@ def _build_model_rows(
         rows.append(("Stochastic depth", f"{drop_path_rate:.3f}"))
     if policy_groups is not None and policy_groups > 1:
         rows.append(("Policy conv groups", policy_groups))
-    if use_mtl:
-        rows.append(("MTL heads", "enabled"))
-
     entry = selected_entry or {}
     if entry.get("error"):
         rows.append(("Checkpoint scan", f"error: {entry['error']}"))
@@ -251,13 +248,6 @@ def _build_parameter_rows(model, num_blocks):
         for name in ("value_conv", "value_bn", "value_fc1", "value_fc2")
     )
 
-    mtl_params = 0
-    if getattr(model, "use_mtl", False):
-        mtl_params = sum(
-            _count_params(getattr(model, name, None))
-            for name in ("win_fc1", "win_fc2", "material_fc1", "material_fc2", "check_fc")
-        )
-
     total_params = _count_params(model)
     trainable_params = _count_params(model, trainable_only=True)
     frozen_params = max(0, total_params - trainable_params)
@@ -270,9 +260,6 @@ def _build_parameter_rows(model, num_blocks):
         ("Policy head", policy_params),
         ("Value head", value_params),
     ]
-    if mtl_params > 0:
-        core_parts.append(("MTL heads", mtl_params))
-
     rows = []
     for part, params in core_parts:
         if params <= 0:

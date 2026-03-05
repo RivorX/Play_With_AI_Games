@@ -424,7 +424,7 @@ def _build_adamw_optimizer(model, lr, weight_decay, fused_preferred):
         )
 
 
-def _build_synthetic_batch(config, device, batch_size, input_planes, use_mtl, generator=None):
+def _build_synthetic_batch(config, device, batch_size, input_planes, generator=None):
     boards = torch.randn(batch_size, input_planes, 8, 8, device=device, generator=generator)
     boards = boards.to(memory_format=torch.channels_last)
 
@@ -476,32 +476,6 @@ def _build_synthetic_batch(config, device, batch_size, input_planes, use_mtl, ge
         "total_moves": total_moves,
     }
 
-    if use_mtl:
-        win_targets = torch.randint(
-            0,
-            2,
-            (batch_size, 1),
-            device=device,
-            generator=generator,
-        ).float()
-        material_targets = (
-            torch.rand(batch_size, 1, device=device, generator=generator) * 2.0 - 1.0
-        )
-        check_targets = torch.randint(
-            0,
-            2,
-            (batch_size, 1),
-            device=device,
-            generator=generator,
-        ).float()
-        targets.update(
-            {
-                "win": win_targets,
-                "material": material_targets,
-                "check": check_targets,
-            }
-        )
-
     return boards, targets
 
 
@@ -518,7 +492,6 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
-    use_mtl = bool(config.get("model", {}).get("use_multitask_learning", False))
     fused_adamw = bool(device.type == "cuda" and torch.cuda.is_available())
     criterion = CombinedLoss(config)
     probe_optimizer = None
@@ -530,8 +503,6 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
     outcomes = None
     move_indices = None
     total_moves = None
-    win_pred = material_pred = check_pred = None
-    win_targets = material_targets = check_targets = None
     predictions = None
     targets = None
     loss = None
@@ -555,7 +526,6 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
             device=device,
             batch_size=batch_size,
             input_planes=input_planes,
-            use_mtl=use_mtl,
         )
         moves = synthetic_targets["moves"]
         outcomes = synthetic_targets["values"]
@@ -565,12 +535,7 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
         with torch.enable_grad():
             probe_optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                if use_mtl:
-                    policy_pred, value_pred, win_pred, material_pred, check_pred = model(
-                        boards, return_aux=True
-                    )
-                else:
-                    policy_pred, value_pred = model(boards, return_aux=False)
+                policy_pred, value_pred = model(boards)
 
                 predictions = {
                     "policy": policy_pred,
@@ -582,22 +547,6 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
                     "move_indices": move_indices,
                     "total_moves": total_moves,
                 }
-
-                if use_mtl:
-                    predictions.update(
-                        {
-                            "win": win_pred,
-                            "material": material_pred,
-                            "check": check_pred,
-                        }
-                    )
-                    targets.update(
-                        {
-                            "win": synthetic_targets["win"],
-                            "material": synthetic_targets["material"],
-                            "check": synthetic_targets["check"],
-                        }
-                    )
 
                 loss, _ = criterion(predictions, targets)
             loss.backward()
@@ -632,12 +581,6 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
             outcomes,
             move_indices,
             total_moves,
-            win_pred,
-            material_pred,
-            check_pred,
-            win_targets,
-            material_targets,
-            check_targets,
             predictions,
             targets,
             loss,
@@ -886,7 +829,6 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
     il_cfg = config.get("imitation_learning", {}) or {}
     weight_decay = _safe_float(il_cfg.get("weight_decay"), 0.0)
     fused_adamw = bool(device.type == "cuda" and torch.cuda.is_available())
-    use_mtl = bool(config.get("model", {}).get("use_multitask_learning", False))
     input_planes = int(getattr(model, "input_planes", 16))
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
 
@@ -935,18 +877,12 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
                         device=device,
                         batch_size=tuned_batch,
                         input_planes=input_planes,
-                        use_mtl=use_mtl,
                         generator=generator,
                     )
 
                     optimizer.zero_grad(set_to_none=True)
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                        if use_mtl:
-                            policy_pred, value_pred, win_pred, material_pred, check_pred = model(
-                                boards, return_aux=True
-                            )
-                        else:
-                            policy_pred, value_pred = model(boards, return_aux=False)
+                        policy_pred, value_pred = model(boards)
 
                         predictions = {
                             "policy": policy_pred,
@@ -958,21 +894,6 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
                             "move_indices": synthetic_targets["move_indices"],
                             "total_moves": synthetic_targets["total_moves"],
                         }
-                        if use_mtl:
-                            predictions.update(
-                                {
-                                    "win": win_pred,
-                                    "material": material_pred,
-                                    "check": check_pred,
-                                }
-                            )
-                            targets.update(
-                                {
-                                    "win": synthetic_targets["win"],
-                                    "material": synthetic_targets["material"],
-                                    "check": synthetic_targets["check"],
-                                }
-                            )
 
                         loss, _ = criterion(predictions, targets)
 

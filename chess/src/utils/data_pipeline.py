@@ -107,7 +107,6 @@ class DatasetTracker:
             'game_filters': config['data'].get('game_filters', {}),
             'position_dedup': config['data'].get('position_dedup', {}),
             'position_sampling': config['data'].get('position_sampling', {}),
-            'use_multitask_learning': config['model'].get('use_multitask_learning', False),
             'action_encoding': 'az_classic_8x8x73_v1',
             'action_size': ACTION_SIZE,
             'wdl_mode': 'always',
@@ -172,7 +171,6 @@ class DatasetTracker:
             'config': {
                 'min_elo': config['data'].get('min_elo', 0),
                 'max_games': config['data'].get('max_games', float('inf')),
-                'use_mtl': config['model'].get('use_multitask_learning', False),
             }
         }
         
@@ -261,11 +259,9 @@ def merge_binary_datasets(binary_files, metadata_files, output_binary, output_me
     # Verify compatibility
     first_meta = all_metadata[0]
     position_size = first_meta['position_size']
-    use_mtl = first_meta['use_mtl']
     
     for meta in all_metadata[1:]:
-        if (meta['position_size'] != position_size or 
-            meta['use_mtl'] != use_mtl):
+        if meta['position_size'] != position_size:
             raise ValueError("Cannot merge incompatible datasets! Different configs detected.")
     
     print(f"\n  ✅ All datasets compatible")
@@ -320,7 +316,6 @@ def merge_binary_datasets(binary_files, metadata_files, output_binary, output_me
         'binary_file': str(output_binary),
         'total_positions': total_positions,
         'position_size': position_size,
-        'use_mtl': use_mtl,
         'input_planes': 16,  # 🔧 v4.5 FIX: 16 planes (12 pieces + 4 metadata)
         'source_files': [str(Path(meta['binary_file']).name) for meta in all_metadata],
         'merged_date': datetime.now().isoformat()
@@ -763,9 +758,9 @@ def extract_positions_from_game_worker(args):
     - WDL-only mode: temporal discounting disabled (clean ±1.0 targets)
     
     🔧 FIXED BINARY FORMAT:
-    [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)]
     """
-    game_data, game_id, min_elo, max_moves_per_game, use_mtl = args
+    game_data, game_id, min_elo, max_moves_per_game = args
     
     import chess
     import struct
@@ -773,9 +768,6 @@ def extract_positions_from_game_worker(args):
     # Import helpers locally
     from src.utils.data_helpers import (
         move_to_index,
-        compute_material_balance,
-        is_in_check,
-        will_win,
         pack_position_data,
         compute_discounted_outcome  # 🆕 v4.3: Temporal discounting
     )
@@ -828,24 +820,14 @@ def extract_positions_from_game_worker(args):
                     current_turn=board.turn,
                 )
                 
-                # MTL labels
-                mtl_labels = None
-                if use_mtl:
-                    mtl_labels = {
-                        'win': will_win(board, result),
-                        'material': compute_material_balance(board),
-                        'check': is_in_check(board)
-                    }
-                
                 # 🔧 Pack position using helper function (includes move_target)
-                # Format: [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+                # Format: [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)]
                 position_data = pack_position_data(
                     board=board,
                     game_id=game_id,
                     move_idx=move_idx,
                     move_target=move_target,  # 🔧 NEW: The label to predict
                     outcome=outcome,
-                    mtl_labels=mtl_labels,
                 )
                 
                 positions.append(position_data)
@@ -869,7 +851,6 @@ def extract_positions_parallel(games_data, config, phase2_workers):
     """
     min_elo = config['data'].get('min_elo', 0)
     max_moves = config['data'].get('max_moves_per_game', 200)
-    use_mtl = config['model'].get('use_multitask_learning', False)
     
     if phase2_workers <= 1:
         return extract_positions_sequential(games_data, config)
@@ -878,7 +859,7 @@ def extract_positions_parallel(games_data, config, phase2_workers):
     
     # Prepare tasks with unique game_id for each game
     # 🔧 v4.3: game_id is uint32 — no modulo needed, supports up to ~4 billion games
-    tasks = [(game, game_idx, min_elo, max_moves, use_mtl)
+    tasks = [(game, game_idx, min_elo, max_moves)
              for game_idx, game in enumerate(games_data)]
     
     # Process in parallel
@@ -904,13 +885,12 @@ def extract_positions_sequential(games_data, config):
     """
     min_elo = config['data'].get('min_elo', 0)
     max_moves = config['data'].get('max_moves_per_game', 200)
-    use_mtl = config['model'].get('use_multitask_learning', False)
     
     all_positions = []
     
     for game_idx, game in enumerate(tqdm(games_data, desc="  Extracting positions")):
         # 🔧 v4.3: game_id is uint32 — no modulo needed
-        task = (game, game_idx, min_elo, max_moves, use_mtl)
+        task = (game, game_idx, min_elo, max_moves)
         positions = extract_positions_from_game_worker(task)
         all_positions.extend(positions)
     
@@ -941,10 +921,9 @@ def get_dataset_metadata(binary_file, config):
     
     🆕 v4.2: position_size calculated WITHOUT history (history is dynamic)
     """
-    use_mtl = config['model'].get('use_multitask_learning', False)
     
     # Calculate position size WITHOUT history
-    position_size = get_position_size(use_mtl=use_mtl, history_positions=0)
+    position_size = get_position_size(history_positions=0)
     
     # Count positions
     file_size = binary_file.stat().st_size
@@ -954,7 +933,6 @@ def get_dataset_metadata(binary_file, config):
         'binary_file': str(binary_file),
         'total_positions': total_positions,
         'position_size': position_size,
-        'use_mtl': use_mtl,
         'input_planes': 16,  # 🔧 v4.5 FIX: 16 planes (12 pieces + 4 metadata)
         'created_date': datetime.now().isoformat()
     }

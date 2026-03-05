@@ -1261,7 +1261,6 @@ class ChessGUI:
         with torch.no_grad():
             policy_logits, _ = model(
                 board_tensor,
-                return_aux=False,
                 apply_log_softmax=False,
             )
             policy = policy_logits.float().cpu().numpy()[0]

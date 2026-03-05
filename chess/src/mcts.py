@@ -367,13 +367,11 @@ class BatchMCTS:
                     with torch.autocast(device_type='cuda', dtype=self.amp_dtype):
                         policy_logits_batch, values_batch = self.model(
                             board_tensors,
-                            return_aux=False,
                             apply_log_softmax=False,
                         )
                 else:
                     policy_logits_batch, values_batch = self.model(
                         board_tensors,
-                        return_aux=False,
                         apply_log_softmax=False,
                     )
                 

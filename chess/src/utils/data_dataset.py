@@ -25,14 +25,13 @@ class BinaryChessDataset(Dataset):
     - GameID tracking: Efficient history reconstruction
     """
     
-    def __init__(self, binary_file, indices, position_size, use_mtl=None, 
+    def __init__(self, binary_file, indices, position_size,
                  history_positions=0, stride=1, game_length_by_id=None, sampling_config=None):
         """
         Args:
             binary_file: Path to binary file
             indices: List of position indices to use
             position_size: Size of each position in bytes
-            use_mtl: Whether MTL is enabled
             history_positions: Number of history positions to include (dynamic)
             stride: Sliding window stride (1 = all positions, 2 = every other, etc.)
             game_length_by_id: Optional dict {game_id: total_moves} for value weighting
@@ -51,16 +50,6 @@ class BinaryChessDataset(Dataset):
         self.stride = stride
         self.game_length_by_id = game_length_by_id
         self.sampling_config = sampling_config or {}
-        
-        # Auto-detect MTL
-        # 🔧 v4.5 FIXED: base_size must match current binary layout:
-        #   Board(38) + GameID(4) + MoveIdx(2) + MoveTarget(2) + Outcome(4) = 50
-        #   Board is now 38 bytes: 32B pieces + 6B metadata (castling, ep, halfmove, fullmove)
-        if use_mtl is None:
-            base_size = 38 + 4 + 2 + 2 + 4  # = 50 (was 48 - CRITICAL FIX)
-            self.use_mtl = (position_size == base_size + 12)  # 50 + 12 = 62
-        else:
-            self.use_mtl = use_mtl
         
         # 🆕 Apply stride filter to indices
         if self.stride > 1:
@@ -306,40 +295,23 @@ class BinaryChessDataset(Dataset):
         # DataLoader collate requires resizable tensors
         stacked_board = stacked_board.copy()
         
-        if self.use_mtl:
-            # 🔧 v4.5 FIXED: MTL labels with corrected offsets
-            win      = struct.unpack('f', data[50:54])[0]  # 🔧 FIXED: offset +2
-            material = struct.unpack('f', data[54:58])[0]  # 🔧 FIXED: offset +2
-            check    = struct.unpack('f', data[58:62])[0]  # 🔧 FIXED: offset +2
-            
-            sample = {
-                'board':    torch.from_numpy(stacked_board),
-                'move':     torch.LongTensor([move_target])[0],
-                'value':    torch.FloatTensor([outcome]),
-                'move_idx': torch.LongTensor([move_idx])[0],  # 🔧 v4.4 FIX: Dodano dla move-weighted BCE
-                'win':      torch.FloatTensor([win]),
-                'material': torch.FloatTensor([material]),
-                'check':    torch.FloatTensor([check])
+        # 🆕 v4.4 FIX: Dodano move_idx dla move-weighted BCE loss
+        if total_moves is not None:
+            result = {
+                'board': torch.from_numpy(stacked_board),
+                'move': torch.LongTensor([move_target])[0],
+                'value': torch.FloatTensor([outcome]),
+                'move_idx': torch.LongTensor([move_idx])[0],
+                'total_moves': torch.LongTensor([total_moves])[0],
             }
-            if total_moves is not None:
-                sample['total_moves'] = torch.LongTensor([total_moves])[0]
-            return sample
         else:
-            # 🆕 v4.4 FIX: Dodano move_idx dla move-weighted BCE loss
-            if total_moves is not None:
-                return (
-                    torch.from_numpy(stacked_board),
-                    torch.LongTensor([move_target])[0],
-                    torch.FloatTensor([outcome]),
-                    torch.LongTensor([move_idx])[0],  # 🔧 For move-weighted BCE
-                    torch.LongTensor([total_moves])[0]
-                )
-            return (
-                torch.from_numpy(stacked_board),
-                torch.LongTensor([move_target])[0],
-                torch.FloatTensor([outcome]),
-                torch.LongTensor([move_idx])[0]  # 🔧 For move-weighted BCE
-            )
+            result = {
+                'board': torch.from_numpy(stacked_board),
+                'move': torch.LongTensor([move_target])[0],
+                'value': torch.FloatTensor([outcome]),
+                'move_idx': torch.LongTensor([move_idx])[0],
+            }
+        return result
     
     def __del__(self):
         if self._mmap is not None:
@@ -539,7 +511,8 @@ def create_dataloaders(metadata, config):
     
     split_by_game = True
     game_count = train_game_count = val_game_count = None
-    use_game_length = config['imitation_learning'].get('value_move_weight_use_game_length', False)
+    il_cfg = config.get('imitation_learning', {})
+    use_game_length = il_cfg.get('value_move_weight_use_game_length', False)
     sampling_cfg = config['data'].get('position_sampling', {})
     sampling_enabled = bool(sampling_cfg.get('enabled', False))
     if sampling_enabled:
@@ -582,7 +555,6 @@ def create_dataloaders(metadata, config):
     
     # Get configuration
     position_size = metadata.get('position_size')
-    use_mtl = metadata.get('use_mtl', False)
     history_positions = config['model'].get('history_positions', 0)
     stride = config['data'].get('sliding_window_stride', 1)
     
@@ -592,8 +564,7 @@ def create_dataloaders(metadata, config):
     print(f"\n{'='*70}")
     print("📊 Dataset Configuration:")
     print(f"  • Total positions (before stride): {total_positions:,}")
-    print(f"  • Position size: {position_size} bytes (expected: {50 if not use_mtl else 62})")
-    print(f"  • MTL: {use_mtl}")
+    print(f"  • Position size: {position_size} bytes (expected: 50)")
     print(f"  • History positions: {history_positions} (dynamic)")
     print(f"  • Sliding window stride: {stride}")
     print("  • Stride mode: fullmove_per_game_offset (fixed)")
@@ -615,21 +586,19 @@ def create_dataloaders(metadata, config):
         metadata['binary_file'], 
         train_indices, 
         position_size=position_size,
-        use_mtl=use_mtl,
         history_positions=history_positions,
         stride=stride,
         game_length_by_id=game_length_by_id,
-        sampling_config=sampling_cfg if sampling_enabled else None
+        sampling_config=sampling_cfg if sampling_enabled else None,
     )
     val_dataset = BinaryChessDataset(
         metadata['binary_file'], 
         val_indices,
         position_size=position_size,
-        use_mtl=use_mtl,
         history_positions=history_positions,
         stride=stride,
         game_length_by_id=game_length_by_id,
-        sampling_config=sampling_cfg if sampling_enabled else None
+        sampling_config=sampling_cfg if sampling_enabled else None,
     )
 
     # Debug: show progress histogram after stride + sampling
@@ -665,6 +634,7 @@ def create_dataloaders(metadata, config):
     
     # Dataloaders
     prefetch_factor = config['hardware']['prefetch_factor']
+    print("  • Train sampling mode: shuffle")
     
     train_loader = DataLoader(
         train_dataset,

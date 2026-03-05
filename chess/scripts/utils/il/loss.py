@@ -142,129 +142,6 @@ class WDLLoss(nn.Module):
         return wdl_probs[:, 0] * 1.0 + wdl_probs[:, 1] * 0.0 + wdl_probs[:, 2] * (-1.0)
 
 
-class MoveWeightedBCELoss(nn.Module):
-    """
-    🆕 Move-weighted BCE for win prediction
-    
-    KEY INSIGHT: Later positions have stronger signal!
-    - Early game (move 5): Outcome is very uncertain
-    - Late game (move 40): Outcome is nearly determined
-    
-    Weight = move_idx / max_moves gives stronger weight to later positions
-    
-    Benefits:
-    - Focuses learning on positions where outcome is clearer
-    - Reduces noise from early-game predictions
-    - +3-5% better win prediction accuracy
-    """
-    
-    def __init__(self, max_moves=200):
-        """
-        Args:
-            max_moves: Maximum moves in a game (for normalization)
-        """
-        super().__init__()
-        self.max_moves = max_moves
-        self.bce = nn.BCEWithLogitsLoss(reduction='none')
-    
-    def forward(self, win_logits, win_targets, move_indices=None):
-        """
-        Args:
-            win_logits: Model predictions - can be (B,) or (B, 1)
-            win_targets: Target labels - can be (B,) or (B, 1) in {0.0, 1.0}
-            move_indices: Optional move indices - can be (B,) or (B, 1) for weighting
-        
-        Returns:
-            Weighted BCE loss
-        """
-        # 🐛 FIX: Ensure all tensors are 1D
-        if win_logits.dim() > 1:
-            win_logits = win_logits.squeeze(-1)
-        if win_targets.dim() > 1:
-            win_targets = win_targets.squeeze(-1)
-        
-        # Base BCE loss (unreduced)
-        losses = self.bce(win_logits, win_targets)
-        
-        if move_indices is not None:
-            # Ensure 1D
-            if move_indices.dim() > 1:
-                move_indices = move_indices.squeeze(-1)
-            
-            # Compute weights: move_idx / max_moves
-            # Clamp to [0.1, 1.0] to avoid zero weight for early moves
-            weights = torch.clamp(
-                move_indices.float() / self.max_moves,
-                min=0.1,
-                max=1.0
-            )
-            
-            # Apply weights
-            weighted_losses = losses * weights
-            return weighted_losses.mean()
-        else:
-            # No weighting if move_indices not provided
-            return losses.mean()
-
-
-class FocalLoss(nn.Module):
-    """
-    🆕 Optional: Focal Loss for hard examples
-    
-    Focal Loss focuses on hard-to-classify examples by down-weighting
-    easy examples. Useful for imbalanced tasks like check prediction.
-    
-    Formula: FL = -α(1-p)^γ * log(p)
-    - γ=0: Standard cross-entropy
-    - γ=2: Standard focal loss (down-weights easy examples)
-    - α: Class balancing weight
-    """
-    
-    def __init__(self, alpha=0.25, gamma=2.0):
-        """
-        Args:
-            alpha: Balancing factor (0.25 typical)
-            gamma: Focusing parameter (2.0 typical)
-        """
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-    
-    def forward(self, logits, targets):
-        """
-        Args:
-            logits: Model predictions - can be (B,) or (B, 1)
-            targets: Target labels - can be (B,) or (B, 1) in {0.0, 1.0}
-        
-        Returns:
-            Focal loss
-        """
-        # 🐛 FIX: Ensure 1D
-        if logits.dim() > 1:
-            logits = logits.squeeze(-1)
-        if targets.dim() > 1:
-            targets = targets.squeeze(-1)
-        
-        # Convert logits to probabilities
-        probs = torch.sigmoid(logits)
-        
-        # Compute focal weight: (1-p)^γ for correct class
-        pt = torch.where(targets == 1.0, probs, 1 - probs)
-        focal_weight = (1 - pt) ** self.gamma
-        
-        # Binary cross-entropy
-        bce = F.binary_cross_entropy_with_logits(
-            logits, targets, reduction='none'
-        )
-        
-        # Focal loss with per-class alpha balancing
-        # 🔧 v4.8: alpha_t varies per sample (was flat alpha for all)
-        alpha_t = torch.where(targets == 1.0, self.alpha, 1 - self.alpha)
-        focal_loss = alpha_t * focal_weight * bce
-        
-        return focal_loss.mean()
-
-
 class CombinedLoss(nn.Module):
     """
     🆕 Combined loss for IL training with all improvements
@@ -272,9 +149,6 @@ class CombinedLoss(nn.Module):
     Components:
     1. Policy: Label-smoothed NLL
     2. Value: WDL classification (Win/Draw/Loss)
-    3. Win: Move-weighted BCE
-    4. Material: MSE (unchanged)
-    5. Check: Focal Loss (optional) or BCE
     """
     
     def __init__(self, config):
@@ -287,13 +161,6 @@ class CombinedLoss(nn.Module):
         # Extract weights
         self.policy_weight = config['imitation_learning']['policy_loss_weight']
         self.value_weight = config['imitation_learning']['value_loss_weight']
-        
-        # MTL weights
-        self.use_mtl = config['model'].get('use_multitask_learning', False)
-        if self.use_mtl:
-            self.win_weight = config['model'].get('win_prediction_weight', 0.3)
-            self.material_weight = config['model'].get('material_prediction_weight', 0.2)
-            self.check_weight = config['model'].get('check_prediction_weight', 0.15)
         
         # Loss functions
         label_smoothing = config['imitation_learning'].get('label_smoothing', 0.1)
@@ -310,20 +177,6 @@ class CombinedLoss(nn.Module):
         self.value_move_weight_use_game_length = config['imitation_learning'].get('value_move_weight_use_game_length', False)
         self.value_move_weight_min_total_moves = config['imitation_learning'].get('value_move_weight_min_total_moves', 40)
         self.value_max_moves = config['data'].get('max_moves_per_game', 200)
-        
-        if self.use_mtl:
-            # 🆕 Move-weighted win prediction
-            max_moves = config['data'].get('max_moves_per_game', 200)
-            self.win_loss_fn = MoveWeightedBCELoss(max_moves=max_moves)
-            
-            self.material_loss_fn = nn.MSELoss()
-            
-            # Optional: Focal loss for check prediction
-            use_focal = config['model'].get('use_focal_loss_check', False)
-            if use_focal:
-                self.check_loss_fn = FocalLoss(alpha=0.25, gamma=2.0)
-            else:
-                self.check_loss_fn = nn.BCEWithLogitsLoss()
     
     def forward(self, predictions, targets):
         """
@@ -333,22 +186,17 @@ class CombinedLoss(nn.Module):
             predictions: dict with model outputs:
                 - 'policy': (B, ACTION_SIZE) log probabilities
                 - 'value': (B, 3) WDL logits
-                - 'win': (B,) or (B, 1) win logits (if MTL)
-                - 'material': (B,) or (B, 1) material predictions (if MTL)
-                - 'check': (B,) or (B, 1) check logits (if MTL)
             
             targets: dict with ground truth:
                 - 'moves': (B,) move indices
                 - 'values': (B,) or (B, 1) scalar values in {-1, 0, +1}
-                - 'win': (B,) or (B, 1) win labels (if MTL)
-                - 'material': (B,) or (B, 1) material targets (if MTL)
-                - 'check': (B,) or (B, 1) check labels (if MTL)
                 - 'move_indices': (B,) or (B, 1) move numbers (optional, for weighting)
                 - 'total_moves': (B,) or (B, 1) total moves per game (optional, for value weighting)
         
         Returns:
             total_loss, loss_dict
         """
+
         # Policy loss
         policy_loss = self.policy_loss_fn(
             predictions['policy'], 
@@ -403,45 +251,11 @@ class CombinedLoss(nn.Module):
             self.policy_weight * policy_loss + 
             self.value_weight * value_loss
         )
-        
+
         loss_dict = {
             'policy': policy_loss.item(),
             'value': value_loss.item()
         }
         
-        # MTL losses
-        if self.use_mtl:
-            # 🆕 Move-weighted win prediction - handles shape variations
-            win_loss = self.win_loss_fn(
-                predictions['win'],
-                targets['win'],
-                move_indices=targets.get('move_indices', None)
-            )
-            
-            material_loss = self.material_loss_fn(
-                predictions['material'],
-                targets['material']
-            )
-            
-            # Check loss - handles shape variations
-            check_loss = self.check_loss_fn(
-                predictions['check'],
-                targets['check']
-            )
-            
-            total_loss = (
-                total_loss +
-                self.win_weight * win_loss +
-                self.material_weight * material_loss +
-                self.check_weight * check_loss
-            )
-            
-            loss_dict.update({
-                'win': win_loss.item(),
-                'material': material_loss.item(),
-                'check': check_loss.item()
-            })
-        
         loss_dict['total'] = total_loss.item()
-        
         return total_loss, loss_dict

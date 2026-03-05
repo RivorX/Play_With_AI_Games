@@ -97,7 +97,7 @@ def train_on_batch_rl(model, optimizer, batch, indices, weights, config, device,
     amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
     
     with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-        policy_pred, value_pred = model(boards, return_aux=False)
+        policy_pred, value_pred = model(boards)
         
         policy_loss = -(policy_targets * policy_pred).sum(dim=1)
         

@@ -261,12 +261,25 @@ class ILEloCoordinator:
             self.worker_cancel_event.set()
             print(f"Cancelling async Elo worker for epoch {self.worker_epoch}...")
 
+        # Normal shutdown with zero wait should still request cancellation,
+        # otherwise nested worker pools/processes can keep Python alive.
+        if (not interrupted) and self.shutdown_wait_sec <= 0 and self.worker_cancel_event is not None:
+            self.worker_cancel_event.set()
+            print(
+                f"Cancelling async Elo worker for epoch {self.worker_epoch} "
+                "(shutdown wait=0)."
+            )
+
         if (not interrupted) and self.shutdown_wait_sec > 0:
             print(
                 f"Waiting up to {self.shutdown_wait_sec:.1f}s for async Elo "
                 f"(epoch {self.worker_epoch})..."
             )
             self.worker_thread.join(timeout=self.shutdown_wait_sec)
+            self.poll_results()
+        elif (not interrupted) and self.shutdown_wait_sec <= 0:
+            # Give worker a brief chance to observe cancellation and exit.
+            self.worker_thread.join(timeout=1.0)
             self.poll_results()
         elif interrupted:
             # On Ctrl+C wait briefly so worker can stop and flush result queue.

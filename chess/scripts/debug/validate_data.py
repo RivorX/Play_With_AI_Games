@@ -137,11 +137,8 @@ class DataValidator:
             print(f"🔍 Metadata keys: {list(self.metadata.keys())}")
         
         # Parse parameters from binary filename as fallback
-        # Format: positions_elo1800_mtlTrue_hist4.bin
+        # Format: positions_elo1800_hist4.bin
         bin_name = self.binary_file.stem
-        
-        # Extract MTL flag
-        mtl_from_name = 'mtlTrue' in bin_name or 'mltTrue' in bin_name
         
         # Extract history count
         import re
@@ -153,7 +150,6 @@ class DataValidator:
             # Standard metadata format
             self.total_positions = self.metadata['total_positions']
             self.position_size = self.metadata.get('position_size', 38)
-            self.use_mtl = self.metadata.get('use_mtl', mtl_from_name)
             self.history_positions = self.metadata.get('history_positions', history_from_name)
             self.input_planes = self.metadata.get('input_planes', 12)
         else:
@@ -161,21 +157,19 @@ class DataValidator:
             print(f"⚠️  Non-standard metadata format, using filename parameters")
             
             # Use parameters from filename
-            self.use_mtl = mtl_from_name
             self.history_positions = history_from_name
             self.input_planes = 12 * (1 + self.history_positions)
             
             # Calculate position size
             # Base: 32 (board) + 32*history + 2 (move) + 4 (outcome)
             base_size = 32 + (32 * self.history_positions) + 2 + 4
-            # Add MTL: 12 bytes (3 floats)
-            self.position_size = base_size + (12 if self.use_mtl else 0)
+            self.position_size = base_size
             
             # Calculate total positions from file size
             file_size = self.binary_file.stat().st_size
             self.total_positions = file_size // self.position_size
             
-            print(f"   ✓ Parsed from filename: MTL={self.use_mtl}, History={self.history_positions}")
+            print(f"   ✓ Parsed from filename: History={self.history_positions}")
             print(f"   ✓ Calculated: position_size={self.position_size}, total={self.total_positions:,}")
         
         # Statistics
@@ -190,7 +184,6 @@ class DataValidator:
         print(f"📁 File: {self.binary_file.name}")
         print(f"📊 Total positions: {self.total_positions:,}")
         print(f"📦 Position size: {self.position_size} bytes")
-        print(f"🎯 MTL enabled: {self.use_mtl}")
         print(f"📜 History positions: {self.history_positions}")
         print(f"🎲 Input planes: {self.input_planes}")
         print(f"{'='*70}\n")
@@ -295,23 +288,6 @@ class DataValidator:
                         else:
                             legal_moves += 1
                     
-                    # Validate MTL labels if enabled
-                    if self.use_mtl:
-                        win = struct.unpack('f', data[current_offset:current_offset+4])[0]
-                        current_offset += 4
-                        material = struct.unpack('f', data[current_offset:current_offset+4])[0]
-                        current_offset += 4
-                        check = struct.unpack('f', data[current_offset:current_offset+4])[0]
-                        
-                        # Validate ranges
-                        if not (0.0 <= win <= 1.0):
-                            self.warnings.append(f"Position {idx}: Win label out of range: {win}")
-                        
-                        if not (-1.0 <= material <= 1.0):
-                            self.warnings.append(f"Position {idx}: Material out of range: {material}")
-                        
-                        if not (0.0 <= check <= 1.0):
-                            self.warnings.append(f"Position {idx}: Check label out of range: {check}")
                     
                 except Exception as e:
                     self.errors.append(f"Position {idx}: Error reading data: {str(e)}")
@@ -391,67 +367,6 @@ class DataValidator:
         win_rate = 100 * outcome_distribution['win'] / total
         if win_rate < 30 or win_rate > 70:
             self.warnings.append(f"Unusual win rate: {win_rate:.1f}%")
-        
-        return True
-    
-    def analyze_mtl_labels(self, num_samples=5000):
-        """Analyze MTL label distributions"""
-        if not self.use_mtl:
-            print("\n⏭️  MTL not enabled, skipping MTL analysis")
-            return True
-        
-        print(f"\n🔍 Analyzing MTL labels ({num_samples:,} samples)...")
-        
-        win_values = []
-        material_values = []
-        check_values = []
-        
-        indices = np.random.choice(self.total_positions, size=min(num_samples, self.total_positions), replace=False)
-        
-        with open(self.binary_file, 'rb') as f:
-            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            
-            for idx in tqdm(indices, desc="  Analyzing MTL"):
-                offset = idx * self.position_size
-                data = mm[offset:offset + self.position_size]
-                
-                # Skip to MTL labels
-                current_offset = 32 + (32 * self.history_positions) + 2 + 4
-                
-                win = struct.unpack('f', data[current_offset:current_offset+4])[0]
-                current_offset += 4
-                material = struct.unpack('f', data[current_offset:current_offset+4])[0]
-                current_offset += 4
-                check = struct.unpack('f', data[current_offset:current_offset+4])[0]
-                
-                win_values.append(win)
-                material_values.append(material)
-                check_values.append(check)
-            
-            mm.close()
-        
-        # Statistics
-        print(f"\n  📊 MTL Label Statistics:")
-        
-        print(f"\n    Win prediction:")
-        print(f"      • Mean: {np.mean(win_values):.3f}")
-        print(f"      • Std: {np.std(win_values):.3f}")
-        print(f"      • Min: {np.min(win_values):.3f}")
-        print(f"      • Max: {np.max(win_values):.3f}")
-        
-        print(f"\n    Material balance:")
-        print(f"      • Mean: {np.mean(material_values):.3f}")
-        print(f"      • Std: {np.std(material_values):.3f}")
-        print(f"      • Min: {np.min(material_values):.3f}")
-        print(f"      • Max: {np.max(material_values):.3f}")
-        
-        print(f"\n    Check prediction:")
-        print(f"      • Mean: {np.mean(check_values):.3f}")
-        print(f"      • Check rate: {100 * np.mean(np.array(check_values) > 0.5):.1f}%")
-        
-        # Sanity checks
-        if np.mean(check_values) > 0.3:
-            self.warnings.append(f"Unusually high check rate: {100 * np.mean(check_values):.1f}%")
         
         return True
     
@@ -540,12 +455,10 @@ class DataValidator:
         if self.quick_mode:
             samples_positions = 500
             samples_moves = 2000
-            samples_mtl = 1000
             samples_history = 200
         else:
             samples_positions = 2000
             samples_moves = 10000
-            samples_mtl = 5000
             samples_history = 1000
         
         # Run all checks
@@ -553,7 +466,6 @@ class DataValidator:
             ("File Integrity", self.validate_file_integrity),
             ("Sample Positions", lambda: self.validate_sample_positions(num_samples=samples_positions)),
             ("Move Distribution", lambda: self.analyze_move_distribution(num_samples=samples_moves)),
-            ("MTL Labels", lambda: self.analyze_mtl_labels(num_samples=samples_mtl)),
             ("History Consistency", lambda: self.validate_history_consistency(num_samples=samples_history)),
         ]
         

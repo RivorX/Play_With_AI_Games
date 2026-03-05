@@ -695,17 +695,16 @@ def get_turn_from_move_idx(move_idx):
 # BINARY FORMAT HELPERS - FIXED TO INCLUDE move_target
 # ==============================================================================
 
-def get_position_size(use_mtl=False, history_positions=0):
+def get_position_size(history_positions=0):
     """
     Calculate size of binary position record
     
     🆕 v4.4 FORMAT (Extended with metadata):
-    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)]
     
     Board format changed: 32B pieces + 6B metadata (castling, en passant, halfmove, fullmove)
     
     Args:
-        use_mtl: Whether Multi-Task Learning is enabled
         history_positions: Number of history positions (NOT used in new format)
     
     Returns:
@@ -717,20 +716,15 @@ def get_position_size(use_mtl=False, history_positions=0):
     base_size += 2  # MoveTarget (uint16) - the move label (0-4671)
     base_size += 4  # Outcome (float32)
     
-    if use_mtl:
-        base_size += 4  # Win (float32)
-        base_size += 4  # Material (float32)
-        base_size += 4  # Check (float32)
-    
     return base_size
 
 
-def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_labels=None):
+def pack_position_data(board, game_id, move_idx, move_target, outcome):
     """
     Pack position data into binary format
     
-    🆕 v4.4 FORMAT (Extended with metadata):
-    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [MTL (12B if enabled)]
+    v4.4 FORMAT (Extended with metadata):
+    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)]
     
     Args:
         board: chess.Board
@@ -738,14 +732,13 @@ def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_label
         move_idx: Move index in game (0-based)
         move_target: Target move index (0-4671) - THIS IS THE LABEL
         outcome: Game outcome value
-        mtl_labels: Optional dict with 'win', 'material', 'check'
     
     Returns:
         bytes: Packed binary data
     """
     data = bytearray()
     
-    # Pack board (38 bytes - 🆕 NOW INCLUDES METADATA!)
+    # Pack board (38 bytes - INCLUDES METADATA!)
     data.extend(board_to_compact(board))
     
     # Pack metadata
@@ -753,12 +746,6 @@ def pack_position_data(board, game_id, move_idx, move_target, outcome, mtl_label
     data.extend(struct.pack('H', move_idx))         # MoveIdx (2 bytes)
     data.extend(struct.pack('H', move_target))      # MoveTarget (2 bytes)
     data.extend(struct.pack('f', outcome))          # Outcome (4 bytes)
-    
-    # Pack MTL labels if provided (12 bytes)
-    if mtl_labels is not None:
-        data.extend(struct.pack('f', mtl_labels['win']))
-        data.extend(struct.pack('f', mtl_labels['material']))
-        data.extend(struct.pack('f', mtl_labels['check']))
     
     return bytes(data)
 

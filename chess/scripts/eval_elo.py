@@ -194,7 +194,6 @@ def _model_arch_keys():
         "use_coord_conv",
         "use_layer_scale",
         "layer_scale_init",
-        "use_multitask_learning",
         "policy_head_channels",
         "policy_head_conv_filters",
         "policy_head_conv_groups",
@@ -291,7 +290,6 @@ def _infer_model_overrides_from_state_dict(state_dict):
                 if mid > 0 and in_ch > 0:
                     overrides["se_reduction"] = max(1, in_ch // mid)
     overrides["use_layer_scale"] = any(".layer_scale.gamma" in key for key in state_dict.keys())
-    overrides["use_multitask_learning"] = "win_fc1.weight" in state_dict
 
     return overrides
 

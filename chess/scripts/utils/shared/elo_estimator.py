@@ -301,7 +301,6 @@ class _ModelPlayer:
         with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
             policy_logits, _ = self.model(
                 t,
-                return_aux=False,
                 apply_log_softmax=False,
             )
 

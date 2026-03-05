@@ -240,9 +240,6 @@ class ChessNet(nn.Module):
         
         use_layer_scale = config['model'].get('use_layer_scale', True)
         layer_scale_init = config['model'].get('layer_scale_init', 1e-5)
-        
-        # Multi-Task Learning
-        self.use_mtl = config['model'].get('use_multitask_learning', False)
 
         # Policy head: fixed AlphaZero-style chess head (8x8x73 action space)
         policy_channels = int(config['model'].get('policy_head_channels', 2))
@@ -287,9 +284,6 @@ class ChessNet(nn.Module):
             
             print(f"  > Policy bottleneck: 1x1 ({policy_channels} channels)")
             print(f"  > Policy Head: AZ-style planes logits (conv-only, 8x8x73)")
-            
-            if self.use_mtl:
-                print(f"  > MTL: ENABLED (Win, Material, Check auxiliary tasks)")
         
         # Input conv with dynamic input_planes
         if use_coord_conv:
@@ -344,19 +338,8 @@ class ChessNet(nn.Module):
         self.value_fc2 = nn.Linear(value_hidden, 3)  # đź†• 3 outputs: [Win, Draw, Loss]
         self.value_dropout = nn.Dropout(dropout)
         
-        # Shared GAP for value + MTL heads
+        # Shared GAP for value head
         self.shared_gap = nn.AdaptiveAvgPool2d(1)
-        
-        # MTL heads (reuse shared_gap)
-        if self.use_mtl:
-            self.win_fc1 = nn.Linear(filters, 128)
-            self.win_fc2 = nn.Linear(128, 1)
-            self.win_dropout = nn.Dropout(dropout * 0.5)
-            
-            self.material_fc1 = nn.Linear(filters, 64)
-            self.material_fc2 = nn.Linear(64, 1)
-            
-            self.check_fc = nn.Linear(filters, 1)
         
         # 🔧 v4.8: Proper weight initialization
         self._initialize_weights()
@@ -419,16 +402,6 @@ class ChessNet(nn.Module):
             self._count_parameters(self.value_fc2)
         )
 
-        mtl_params = 0
-        if self.use_mtl:
-            mtl_params = (
-                self._count_parameters(self.win_fc1) +
-                self._count_parameters(self.win_fc2) +
-                self._count_parameters(self.material_fc1) +
-                self._count_parameters(self.material_fc2) +
-                self._count_parameters(self.check_fc)
-            )
-
         total_params = self._count_parameters(self)
         trainable_params = self._count_parameters(self, trainable_only=True)
         frozen_params = total_params - trainable_params
@@ -440,14 +413,12 @@ class ChessNet(nn.Module):
         print(f"    - Final BN: {final_bn_params:,}")
         print(f"    - Policy head: {policy_params:,}")
         print(f"    - Value head: {value_params:,}")
-        if self.use_mtl:
-            print(f"    - MTL heads: {mtl_params:,}")
         print(f"    - Trainable params: {trainable_params:,}")
         if frozen_params > 0:
             print(f"    - Frozen params: {frozen_params:,}")
         print(f"    - Total params: {total_params:,}")
 
-    def forward(self, x, return_aux=False, apply_log_softmax=True):
+    def forward(self, x, apply_log_softmax=True):
         """Forward pass (policy as log-probs by default, raw logits when apply_log_softmax=False)."""
         if not x.is_contiguous(memory_format=torch.channels_last):
             x = x.contiguous(memory_format=torch.channels_last)
@@ -460,11 +431,6 @@ class ChessNet(nn.Module):
         # Final BN+ReLU after pre-activation residual tower
         x = self.final_bn(x)
         x = F.relu(x, inplace=True)
-
-        trunk_pooled = None
-        if self.use_mtl:
-            # Compute GAP only when needed by MTL heads.
-            trunk_pooled = self.shared_gap(x).flatten(1)  # (B, filters)
 
         policy = self.policy_conv(x)
         policy = self.policy_bn(policy)
@@ -491,23 +457,7 @@ class ChessNet(nn.Module):
         value = self.value_dropout(value)
         value = self.value_fc2(value)  # (B, 3) WDL logits
 
-        if not return_aux or not self.use_mtl:
-            return policy, value
-
-        # MTL predictions (reuse trunk_pooled - no extra GAP call)
-        if trunk_pooled is None:
-            trunk_pooled = self.shared_gap(x).flatten(1)
-
-        win_pred = F.relu(self.win_fc1(trunk_pooled), inplace=False)
-        win_pred = self.win_dropout(win_pred)
-        win_pred = self.win_fc2(win_pred)
-
-        material_pred = F.relu(self.material_fc1(trunk_pooled), inplace=False)
-        material_pred = torch.tanh(self.material_fc2(material_pred))
-
-        check_pred = self.check_fc(trunk_pooled)
-
-        return policy, value, win_pred, material_pred, check_pred
+        return policy, value
 
     def predict(self, board_tensor):
         """
@@ -523,7 +473,6 @@ class ChessNet(nn.Module):
                     board_tensor = board_tensor.unsqueeze(0)
                 policy_logits, value_logits = self.forward(
                     board_tensor,
-                    return_aux=False,
                     apply_log_softmax=False,
                 )
                 
