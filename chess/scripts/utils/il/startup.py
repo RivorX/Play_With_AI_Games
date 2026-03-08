@@ -64,6 +64,73 @@ def ask_transfer_freeze_epochs(default_epochs=0):
         print("Invalid value. Enter an integer >= 0.")
 
 
+def ask_transfer_post_unfreeze_lr(default_lr=None):
+    """Ask for optional manual LR applied only after full unfreeze in transfer mode."""
+    if not sys.stdin.isatty():
+        return default_lr
+
+    default_text = "blank"
+    if default_lr is not None:
+        try:
+            default_text = f"{float(default_lr):.6g}"
+        except (TypeError, ValueError):
+            default_text = "blank"
+
+    while True:
+        try:
+            raw = input(
+                "Transfer: manual learning rate after full unfreeze? "
+                f"(default {default_text}, blank = keep current schedule): "
+            ).strip()
+        except EOFError:
+            raw = ""
+
+        if raw == "":
+            return default_lr
+
+        lowered = raw.lower()
+        if lowered in {"none", "off", "auto", "schedule"}:
+            return None
+
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+        print("Invalid value. Enter a float > 0, or blank to keep current schedule.")
+
+
+def suggest_transfer_post_unfreeze_lr(base_lr, compatibility_ratio=None):
+    """Suggest a safer post-unfreeze LR based on transfer compatibility."""
+    try:
+        base_lr = float(base_lr)
+    except (TypeError, ValueError):
+        return None
+
+    if base_lr <= 0:
+        return None
+
+    try:
+        compat = float(compatibility_ratio) if compatibility_ratio is not None else None
+    except (TypeError, ValueError):
+        compat = None
+
+    if compat is None:
+        factor = 0.5
+    elif compat < 0.70:
+        factor = 0.35
+    elif compat < 0.80:
+        factor = 0.5
+    elif compat < 0.90:
+        factor = 0.7
+    else:
+        factor = 0.85
+
+    suggested = base_lr * factor
+    return float(f"{suggested:.6g}")
+
+
 def ask_il_hyperparam_source(default_mode="config"):
     """Ask whether to use auto-tuned IL batch/LR or config values."""
     if default_mode not in {"auto", "config"}:
@@ -114,14 +181,15 @@ def _path_relative_to_base(path, base_dir):
 
 def _collect_il_checkpoints(best_model_path, il_dir):
     candidates = []
-    if best_model_path.exists():
-        candidates.append(best_model_path)
-
     il_checkpoints = sorted(
         il_dir.glob("*.pt"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
+    has_version_best = any(checkpoint.name.endswith("_best.pt") for checkpoint in il_checkpoints)
+    if best_model_path.exists() and not has_version_best:
+        candidates.append(best_model_path)
+
     for checkpoint in il_checkpoints:
         if checkpoint not in candidates:
             candidates.append(checkpoint)
@@ -430,7 +498,7 @@ def _infer_changed_parameter_names(model, transfer_report):
     return sorted(changed_params)
 
 
-def plan_il_startup(model, device, base_dir, best_model_path, il_dir, start_mode=None):
+def plan_il_startup(model, device, base_dir, best_model_path, il_dir, start_mode=None, base_learning_rate=None):
     """Interactive startup menu + checkpoint selection (no state loading yet)."""
     available_checkpoints = _collect_il_checkpoints(best_model_path, il_dir)
     catalog_base_dir = best_model_path.parent
@@ -459,6 +527,8 @@ def plan_il_startup(model, device, base_dir, best_model_path, il_dir, start_mode
     selected_checkpoint_label = None
     transfer_freeze_epochs = 0
     transfer_trainable_param_names = []
+    transfer_post_unfreeze_lr = None
+    transfer_post_unfreeze_lr_suggested = None
 
     if selected_checkpoint is not None:
         selected_checkpoint_label = _path_relative_to_base(selected_checkpoint, catalog_base_dir)
@@ -475,11 +545,30 @@ def plan_il_startup(model, device, base_dir, best_model_path, il_dir, start_mode
                 preview_report = _build_transfer_report_preview(model.state_dict(), normalized_state)
                 transfer_trainable_param_names = _infer_changed_parameter_names(model, preview_report)
                 if transfer_trainable_param_names:
+                    compatibility_ratio = None
+                    if selected_entry is not None:
+                        compatibility_ratio = selected_entry.get("compatibility_ratio")
+                    transfer_post_unfreeze_lr_suggested = suggest_transfer_post_unfreeze_lr(
+                        base_learning_rate,
+                        compatibility_ratio=compatibility_ratio,
+                    )
                     print(
                         "Transfer warmup candidates "
                         f"(changed params): {len(transfer_trainable_param_names)}"
                     )
+                    if transfer_post_unfreeze_lr_suggested is not None:
+                        compat_info = "n/a"
+                        if compatibility_ratio is not None:
+                            compat_info = f"{float(compatibility_ratio) * 100:.2f}%"
+                        print(
+                            "Transfer LR suggestion after full unfreeze: "
+                            f"{transfer_post_unfreeze_lr_suggested:.6g} "
+                            f"(compatibility={compat_info}, current_lr={float(base_learning_rate):.6g})"
+                        )
                     transfer_freeze_epochs = ask_transfer_freeze_epochs(default_epochs=0)
+                    transfer_post_unfreeze_lr = ask_transfer_post_unfreeze_lr(
+                        default_lr=transfer_post_unfreeze_lr_suggested
+                    )
                 else:
                     print("Transfer warmup skipped: no changed trainable params detected.")
             else:
@@ -494,6 +583,8 @@ def plan_il_startup(model, device, base_dir, best_model_path, il_dir, start_mode
         "selected_entry": selected_entry,
         "transfer_freeze_epochs": transfer_freeze_epochs,
         "transfer_trainable_param_names": transfer_trainable_param_names,
+        "transfer_post_unfreeze_lr": transfer_post_unfreeze_lr,
+        "transfer_post_unfreeze_lr_suggested": transfer_post_unfreeze_lr_suggested,
     }
 
 
@@ -517,6 +608,7 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
     transfer_match_ratio = None
     transfer_freeze_epochs = int(startup_plan.get("transfer_freeze_epochs", 0) or 0)
     transfer_trainable_param_names = list(startup_plan.get("transfer_trainable_param_names") or [])
+    transfer_post_unfreeze_lr = _safe_float(startup_plan.get("transfer_post_unfreeze_lr"))
 
     if start_mode in {"resume", "transfer"}:
         if selected_checkpoint_label is None:
@@ -615,6 +707,7 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
                         f"(changed params): {len(transfer_trainable_param_names)}"
                     )
                     transfer_freeze_epochs = ask_transfer_freeze_epochs(default_epochs=0)
+                    transfer_post_unfreeze_lr = ask_transfer_post_unfreeze_lr(default_lr=transfer_post_unfreeze_lr)
                 else:
                     print("Transfer warmup skipped: no changed trainable params detected.")
                 start_mode = "transfer"
@@ -643,10 +736,18 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
         "transfer_match_ratio": transfer_match_ratio,
         "transfer_freeze_epochs": transfer_freeze_epochs,
         "transfer_trainable_param_names": transfer_trainable_param_names,
+        "transfer_post_unfreeze_lr": transfer_post_unfreeze_lr,
     }
 
 
 def resolve_il_startup(model, optimizer, scheduler, scaler, device, base_dir, best_model_path, il_dir):
     """Compatibility wrapper: plan + apply startup in one call."""
-    plan = plan_il_startup(model, device, base_dir, best_model_path, il_dir)
+    plan = plan_il_startup(
+        model,
+        device,
+        base_dir,
+        best_model_path,
+        il_dir,
+        base_learning_rate=None,
+    )
     return apply_il_startup_plan(plan, model, optimizer, scheduler, scaler, device)

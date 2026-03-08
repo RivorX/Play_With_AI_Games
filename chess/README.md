@@ -60,6 +60,7 @@ chess/
 |  |- train_il.py
 |  |- train_rl.py
 |  |- eval_elo.py
+|  |- download_nikonoel_pgns.py
 |  |- play.py
 |  |- utils/
 |     |- il/
@@ -80,11 +81,24 @@ Uruchamiaj z root repo (`Play_With_AI_Games`):
 
 ```bash
 pip install -r requirements.txt
+python chess/scripts/download_nikonoel_pgns.py
 python chess/scripts/train_il.py
 python chess/scripts/train_rl.py
-python chess/scripts/eval_elo.py
 python chess/scripts/play.py
 ```
+
+## Pobieranie PGN
+
+Datasety z `https://database.nikonoel.fr` mozna listowac i pobierac skryptem:
+
+```bash
+python chess/scripts/download_nikonoel_pgns.py
+```
+
+- bez argumentow skrypt przechodzi w tryb interaktywny i pyta, co pokazac / pobrac
+- rozpakowane pliki `.pgn` trafiaja zawsze do `chess/data`
+- archiwa tymczasowe sa trzymane pod `chess/data/_archives/nikonoel`
+- w `config.yaml` `data.max_games` moze byc liczbą albo `"max"` dla calego PGN
 
 ## IL (Imitation Learning)
 

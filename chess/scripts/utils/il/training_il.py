@@ -48,6 +48,11 @@ def train_epoch_il(
         Tuple of (losses_dict, metrics_dict, profile_stats or None)
     """
     model.train()
+
+    debug_cfg = config.get('debug', {})
+    debug_enabled = bool(debug_cfg.get('enabled', False))
+    log_gpu_memory = bool(debug_enabled and debug_cfg.get('log_gpu_memory', False))
+    log_grad_diagnostics = bool(debug_enabled)
     
     # WDL-only path
     criterion = CombinedLoss(config)
@@ -63,6 +68,8 @@ def train_epoch_il(
 
     profile_stats = None
     profile_enabled = bool(profile)
+    grad_diag_logged = False
+    grad_diag = None
     if profile_enabled:
         timers = {
             'data': 0.0,
@@ -78,13 +85,16 @@ def train_epoch_il(
                 torch.cuda.synchronize()
 
         data_timer_start = time.perf_counter()
+
+    if device.type == 'cuda' and torch.cuda.is_available() and (profile_enabled or log_gpu_memory):
+        torch.cuda.reset_peak_memory_stats(device)
     
     # đź”Ť DIAGNOSTIC: Track target distributions (gated by config)
     first_batch_targets = True
     first_batch_predictions = True
     show_batch0_diagnostics = (
-        config.get('debug', {}).get('enabled', False) and
-        config.get('debug', {}).get('print_batch0_diagnostics', False)
+        debug_enabled and
+        debug_cfg.get('print_batch0_diagnostics', False)
     )
     
     # âšˇ Pre-read AMP config outside loop (avoid dict lookups per batch)
@@ -202,6 +212,41 @@ def train_epoch_il(
         if grad_clip > 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        if log_grad_diagnostics and not grad_diag_logged:
+            trainable_tensors = 0
+            grad_tensors = 0
+            trainable_params = 0
+            grad_params = 0
+            missing_grad_names = []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                trainable_tensors += 1
+                trainable_params += int(param.numel())
+                if param.grad is not None:
+                    grad_tensors += 1
+                    grad_params += int(param.numel())
+                elif len(missing_grad_names) < 8:
+                    missing_grad_names.append(name)
+
+            grad_diag = {
+                'batch_idx': int(batch_idx),
+                'trainable_tensors': int(trainable_tensors),
+                'grad_tensors': int(grad_tensors),
+                'trainable_params': int(trainable_params),
+                'grad_params': int(grad_params),
+                'missing_grad_names': missing_grad_names,
+            }
+
+            if device.type == 'cuda' and torch.cuda.is_available() and log_gpu_memory:
+                grad_diag.update({
+                    'peak_allocated_mb': float(torch.cuda.max_memory_allocated(device) / (1024 ** 2)),
+                    'peak_reserved_mb': float(torch.cuda.max_memory_reserved(device) / (1024 ** 2)),
+                    'current_allocated_mb': float(torch.cuda.memory_allocated(device) / (1024 ** 2)),
+                    'current_reserved_mb': float(torch.cuda.memory_reserved(device) / (1024 ** 2)),
+                })
+            grad_diag_logged = True
         
         scaler.step(optimizer)
         scaler.update()
@@ -270,6 +315,21 @@ def train_epoch_il(
             'total': total_profile_time,
             'batches': max(1, batch_count),
         }
+
+    if grad_diag is not None:
+        if profile_stats is None:
+            profile_stats = {}
+        profile_stats['grad_diag'] = grad_diag
+
+    if device.type == 'cuda' and torch.cuda.is_available() and (profile_enabled or log_gpu_memory):
+        if profile_stats is None:
+            profile_stats = {}
+        profile_stats.update({
+            'peak_allocated_mb': float(torch.cuda.max_memory_allocated(device) / (1024 ** 2)),
+            'peak_reserved_mb': float(torch.cuda.max_memory_reserved(device) / (1024 ** 2)),
+            'current_allocated_mb': float(torch.cuda.memory_allocated(device) / (1024 ** 2)),
+            'current_reserved_mb': float(torch.cuda.memory_reserved(device) / (1024 ** 2)),
+        })
     
     return losses, metrics, profile_stats
 

@@ -20,12 +20,12 @@ paths:
 
 
 # ------------------------------------------------------------------------------
-# DATA PROCESSING - 🆕 v4.3 TEMPORAL DISCOUNTING + v4.2 POV + SLIDING WINDOW
+# DATA PROCESSING - v4.3 TEMPORAL DISCOUNTING + v4.2 POV + SLIDING WINDOW
 # ------------------------------------------------------------------------------
 data:
   min_elo: 2300              # Minimum Elo rating for games
-  max_games: 200000          # Top N games to use per PGN file
-  train_split: 0.85           # Train/validation split ratio
+  max_games: "max"           # Top N games per PGN, or "max" to use the entire file (disables per-file sort/top-N)
+  train_split: 0.85          # Train/validation split ratio
   max_moves_per_game: 200    # Skip games longer than this
   
   # Quality filtering
@@ -55,9 +55,9 @@ data:
     enabled: true
     seed: 42
     min_fullmove: 3      # hard-skip first N fullmoves
-    keep_min: 0.12       # early-game keep probability
+    keep_min: 0.1        # early-game keep probability
     keep_max: 1.0        # late-game keep probability
-    power: 1.8           # >1 biases toward mid/late game
+    power: 2.0           # >1 biases toward mid/late game
 
   # Position deduplication (across games)
   # 🆕 v4.7: SMART DEDUP with max_count + position_plus_move mode
@@ -65,11 +65,11 @@ data:
     enabled: true
     mode: "position_plus_move"   # position_plus_move | fen_no_counters | fen | pieces
     include_turn: true           # Include side-to-move in signature
-    max_count: 3                 # Max occurrences per signature (None = remove all duplicates)
+    max_count: 2                 # Max occurrences per signature (None = remove all duplicates)
     random_sample: true          # Random sample (vs first K) - prevents bias
   
   # 4-PHASE: parse -> positions -> write -> cleanup
-  files_at_once: 1           # PGN files per batch (1=seq, 2-4=batch)
+  files_at_once: 1            # PGN files per batch (1=seq, 2-4=batch)
   phase1_threads: all         # PGN parse workers (1=off, all=cpu)
   phase2_threads: all         # Position workers (1=off, all=cpu)
 
@@ -79,26 +79,26 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v7.5.1"
+  version: "v7.6"
   # Base architecture
   num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
   filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
   # Policy head (AZ-style classic chess planes, 8x8x73):
   # 1x1 conv (C -> policy_head_channels) + BN + ReLU + 1x1 conv (policy_head_channels -> 73 planes)
   # logits are reshaped to ACTION_SIZE (4672) in from_square-major order
-  policy_head_channels: 32
-  value_head_filters: 96        # Value head filters 
-  value_hidden_dim: 384         # Value head hidden dimension 
+  policy_head_channels: 128     # Policy head intermediate filters
+  value_head_filters: 128       # Value head filters 
+  value_hidden_dim: 512         # Value head hidden dimension 
   dropout: 0.2                  # Dropout rate 
 
   history_positions: 4       # Number of past positions to include (0 = current only, 4 = current + 3 history)
   
   # Advanced features
-  use_se_blocks: true           # ✅ Squeeze-and-Excitation channel attention
+  use_se_blocks: true           # Squeeze-and-Excitation channel attention
   use_se_bottleneck: true       # Use FC bottleneck in SE block (recommended)
   se_reduction: 4               # Used when bottleneck=true (4=mid=32, 8=mid=16, 16=mid=8)
   drop_path_rate: 0.1           # Stochastic Depth
-  use_coord_conv: true          # 🗺️ Position-aware conv
+  use_coord_conv: true          # Position-aware conv
   
   # Advanced architectural features
   use_layer_scale: true         # LayerScale for better training stability
@@ -118,12 +118,16 @@ auto_tune:
   min_batch_size: 64
   max_batch_size: 32768
   batch_round_to: 64
+  lr_test_enabled: true
   lr_test_min: 0.0002
-  lr_test_max: 0.002
+  lr_test_max: 0.005
   lr_test_points: 10
   lr_test_steps: 20
+  lr_test_early_stop_patience: 3   # Stop LR scan after N clearly worse candidates in a row
+  lr_test_early_stop_min_candidates: 4
+  lr_test_early_stop_score_margin: 0.0002
   lr_min: 0.0002
-  lr_max: 0.002
+  lr_max: 0.005
 
 
 # ------------------------------------------------------------------------------
@@ -146,7 +150,13 @@ imitation_learning:
   # 🆕 Stochastic Weight Averaging (SWA) for better generalization
   use_swa: true              # Enable SWA (averages weights from multiple epochs)
   swa_start_epoch: 14        # Start SWA after this epoch
-  swa_lr: 0.00005            # SWA learning rate (lower than base LR)
+  swa_auto_start: true       # Auto-start SWA earlier when transfer warmup/unfreeze suggests it
+  swa_transfer_unfreeze_offset: 2  # In transfer mode: start SWA N epoch(s) after first fully unfrozen epoch
+  swa_lr_mode: "auto"        # auto | manual
+  swa_lr: 0.00005            # Used only when swa_lr_mode=manual
+  swa_lr_ratio: 0.12         # Auto mode: target fraction of effective LR around SWA start
+  swa_lr_min: 0.00003        # Auto mode lower clamp
+  swa_lr_max: 0.00020        # Auto mode upper clamp
   
   # Advanced training features
   label_smoothing: 0.08      # Label smoothing (0.0 = off, 0.1 = standard)
@@ -164,12 +174,11 @@ imitation_learning:
   value_move_weight_use_game_length: true
   value_move_weight_min_total_moves: 40
 
-  # Evaluation & checkpointing
+  # Evaluation
   eval_every: 1              # Evaluate every N epochs
-  checkpoint_every: 5        # Save checkpoint every N epochs
   
   # Early stopping
-  max_patience: 7           # ℹ️ Stop if no improvement for N epochs
+  max_patience: 7            # Stop if no improvement for N epochs
   min_delta: 0.001           # Minimum improvement threshold
 
 # ------------------------------------------------------------------------------
@@ -178,7 +187,7 @@ imitation_learning:
 reinforcement_learning:
   # 🚀 Self-play configuration (PARALLEL)
   use_prioritized_replay: true  # Enable prioritized experience replay
-  games_per_iteration: 200   # Gier per iteracja
+  games_per_iteration: 200      # Gier per iteracja
   iterations: 50                # Total RL iterations
   self_play_device: "cuda"      # cpu | cuda | auto (auto uses GPU if available)
   self_play_workers: auto       # 0/auto = cpu_count - 1, or set explicit number
@@ -239,9 +248,9 @@ reinforcement_learning:
   augment_prob: 0.5               # 50% chance per position
   
   # Evaluation
-  eval_games: 50             # 🆕 Increased 30→50 for more reliable win rate
-  eval_every: 5              # 🆕 Changed 2→5 (less frequent but more data between evals)
-  win_rate_threshold: 0.55   # 🆕 More demanding (was 0.53)
+  eval_games: 50             # Games vs current best model for evaluation
+  eval_every: 5              # Evaluate every N iterations
+  win_rate_threshold: 0.55   # Minimum win rate to consider new model better (55% = strong improvement)
   checkpoint_every: 10        # Save checkpoint every N iterations
   
   # Loss weights
@@ -256,12 +265,12 @@ hardware:
   device: "cuda"             # Device: cuda, cpu, or mps (Mac)
   
   # Performance optimizations
-  use_amp: true              # 🚀 Mixed Precision Training (~2x speedup)
-  use_bfloat16: true         # 💾 bfloat16 instead of float16 (better range)
+  use_amp: true              # Mixed Precision Training (~2x speedup)
+  use_bfloat16: true         # bfloat16 instead of float16 (better range)
   num_workers: 5             # CPU workers for data loading
-  prefetch_factor: 2         # DataLoader prefetch factor
+  prefetch_factor: 1         # DataLoader prefetch factor
   pin_memory: true           # Faster GPU data transfer
-  use_compile: true          # 🚀 torch.compile: fuse Conv+BN+ReLU kernels
+  use_compile: true          # torch.compile: fuse Conv+BN+ReLU kernels (~3x speedup)
 
 
 # ------------------------------------------------------------------------------
@@ -280,10 +289,10 @@ elo_estimation:
   enabled: true                # Enable Elo estimation during training
   eval_every: 2                # Estimate Elo every N epochs (expensive, don't run every epoch)
   stockfish_path: "stockfish"  # Path to Stockfish binary (or just "stockfish" if on PATH)
-  workers: 0                   # 🚀 Parallel game workers (0/auto = cpu_count-2, set explicit 4-8 for best speed)
+  workers: 0                   # Parallel game workers (0/auto = cpu_count-2, set explicit 4-8 for best speed)
   prioritize_training: true    # Keep IL training/data-loading responsive while Elo runs
-  reserve_dataloader_workers: true  # Reserve hardware.num_workers CPU slots for DataLoader
-  free_threads_utilization: 1.0  # Use this fraction of free CPU threads after DataLoader reservation
+  reserve_dataloader_workers: true    # Reserve hardware.num_workers CPU slots for DataLoader
+  free_threads_utilization: 1.0       # Use this fraction of free CPU threads after DataLoader reservation
   stockfish_priority: "below_normal"  # Windows process priority for Stockfish: idle|below_normal|normal
   stockfish_hide_window: true  # Windows: spawn Stockfish without console windows
   max_error_logs_per_type: 8   # Suppress repeated Stockfish error spam after N logs
@@ -299,8 +308,8 @@ elo_estimation:
   mcts_simulations: 100        # MCTS sims per move (50-100 = fast, 200-400 = strong, 800+ = very strong)
 
   # IL async mode: run Elo in background while next epoch is training.
-  async_in_il: true            # true = do not block IL training loop on Elo
-  async_device: "cpu"          # cpu | cuda | same (same = training device)
+  async_in_il: true                # true = do not block IL training loop on Elo
+  async_device: "cpu"              # cpu | cuda | same (same = training device)
   async_wait_on_shutdown_sec: 0.0  # Optional wait for pending async Elo at normal end
 
 
@@ -309,9 +318,8 @@ elo_estimation:
 # ------------------------------------------------------------------------------
 debug:
   enabled: false                    # Master switch for debug mode
-  profile_training: true           # Time breakdown per epoch
-  log_gpu_memory: false             # GPU memory usage
-  profile_every_n_epochs: 1         # Profile frequency (if enabled)
+  profile_training: true            # Time breakdown per epoch
+  log_gpu_memory: true              # GPU memory usage
   print_batch0_diagnostics: false   # Print batch-0 target stats + WDL samples
 
 

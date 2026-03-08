@@ -6,7 +6,7 @@ import threading
 
 import torch
 
-from src.model import ChessNet
+from src.model import ChessNet, normalize_state_dict_keys
 from utils.shared.elo_estimator import estimate_model_elo
 
 
@@ -27,9 +27,10 @@ def _resolve_async_device(main_device, configured_value):
 
 def _snapshot_model_state_cpu(model):
     """Create an immutable CPU snapshot of model weights for async Elo."""
+    normalized_state = normalize_state_dict_keys(model.state_dict())
     return {
         key: tensor.detach().to(device="cpu", copy=True)
-        for key, tensor in model.state_dict().items()
+        for key, tensor in normalized_state.items()
     }
 
 

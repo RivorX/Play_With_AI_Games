@@ -6,10 +6,12 @@ Split from src.data to keep preprocessing separate from dataset/dataloader code.
 import chess
 import chess.pgn
 import gc
+import io
 import os
 import hashlib
 import json
 import pickle
+import re
 import struct
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
@@ -43,6 +45,107 @@ def _resolve_workers(value, label):
     if value <= 0:
         return max(1, os.cpu_count() or 1)
     return value
+
+
+def _normalize_max_games(value):
+    """
+    Resolve max_games from config.
+
+    Returns:
+        int for a hard limit, or None for "use the entire PGN file".
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"max", "all", "full", "entire", "inf", "infinite", "none"}:
+            return None
+        try:
+            value = int(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"max_games must be an int or one of: max/all/full/inf, got: {value}"
+            ) from exc
+    try:
+        value = int(value)
+    except Exception as exc:
+        raise ValueError(f"max_games must be an int or 'max', got: {value}") from exc
+    if value <= 0:
+        return None
+    return value
+
+
+def _get_game_selection_settings(config):
+    raw_max_games = config['data'].get('max_games', 100000)
+    max_games = _normalize_max_games(raw_max_games)
+    full_file_mode = max_games is None
+    sort_by_elo_requested = bool(config['data'].get('sort_by_avg_elo', True))
+    effective_sort_by_elo = bool(sort_by_elo_requested and not full_file_mode)
+    return {
+        'raw_max_games': raw_max_games,
+        'max_games': max_games,
+        'full_file_mode': full_file_mode,
+        'sort_by_elo_requested': sort_by_elo_requested,
+        'sort_by_elo': effective_sort_by_elo,
+    }
+
+
+_EVENT_HEADER_RE = re.compile(br"(?m)^\[Event ")
+
+
+def _scan_game_start_offsets(pgn_path, max_offsets=None, chunk_size=8 * 1024 * 1024):
+    """
+    Scan a PGN and return byte offsets for lines that begin with [Event ...
+
+    This is much faster than fully parsing the file and gives exact shard
+    boundaries for offset-based parallel parsing.
+    """
+    offsets = []
+    remainder = b""
+    remainder_offset = 0
+    file_offset = 0
+
+    with open(pgn_path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+
+            if remainder:
+                data = remainder + chunk
+                data_offset = remainder_offset
+            else:
+                data = chunk
+                data_offset = file_offset
+
+            last_newline = data.rfind(b"\n")
+            if last_newline == -1:
+                remainder = data
+                remainder_offset = data_offset
+                file_offset += len(chunk)
+                continue
+
+            process_chunk = data[: last_newline + 1]
+            remainder = data[last_newline + 1 :]
+            for match in _EVENT_HEADER_RE.finditer(process_chunk):
+                offsets.append(data_offset + match.start())
+                if max_offsets is not None and len(offsets) >= max_offsets:
+                    return offsets
+            remainder_offset = data_offset + last_newline + 1
+            file_offset += len(chunk)
+
+    if remainder:
+        for match in _EVENT_HEADER_RE.finditer(remainder):
+            offsets.append(remainder_offset + match.start())
+            if max_offsets is not None and len(offsets) >= max_offsets:
+                return offsets
+
+    if not offsets:
+        raise RuntimeError(
+            f"Could not detect any PGN games in {Path(pgn_path).name} via [Event] headers."
+        )
+
+    return offsets
 
 # ==============================================================================
 # 🆕 DATASET TRACKING SYSTEM
@@ -99,11 +202,12 @@ class DatasetTracker:
         Compute hash of processing configuration
         Only includes parameters that affect binary output
         """
+        selection = _get_game_selection_settings(config)
         relevant_config = {
             'min_elo': config['data'].get('min_elo', 0),
-            'max_games': config['data'].get('max_games', float('inf')),
+            'max_games': selection['max_games'] if selection['max_games'] is not None else 'max',
             'max_moves_per_game': config['data'].get('max_moves_per_game', 200),
-            'sort_by_avg_elo': config['data'].get('sort_by_avg_elo', True),
+            'sort_by_avg_elo': selection['sort_by_elo'],
             'game_filters': config['data'].get('game_filters', {}),
             'position_dedup': config['data'].get('position_dedup', {}),
             'position_sampling': config['data'].get('position_sampling', {}),
@@ -154,6 +258,7 @@ class DatasetTracker:
             metadata_file: Path to metadata file
             total_positions: Number of positions in dataset
         """
+        selection = _get_game_selection_settings(config)
         pgn_path = Path(pgn_path)
         file_hash = self._compute_file_hash(pgn_path)
         config_hash = self._compute_config_hash(config)
@@ -170,7 +275,8 @@ class DatasetTracker:
             'processed_date': datetime.now().isoformat(),
             'config': {
                 'min_elo': config['data'].get('min_elo', 0),
-                'max_games': config['data'].get('max_games', float('inf')),
+                'max_games': selection['max_games'] if selection['max_games'] is not None else 'max',
+                'sort_by_avg_elo': selection['sort_by_elo'],
             }
         }
         
@@ -368,37 +474,35 @@ def extract_game_data(game):
         return None
 
 
-def parse_games_batch_worker(args):
+def parse_games_offset_batch_worker(args):
     """
-    PHASE 1 WORKER: Parse a batch of games (runs in separate process)
+    PHASE 1 WORKER: Parse a batch of games from a byte offset.
+
+    Used for full-file mode to avoid re-scanning from the start of the PGN in
+    every worker.
     """
-    pgn_path, start_game, num_games = args
-    
+    pgn_path, start_offset, num_games = args
+
     import chess.pgn
-    
+
     games_data = []
-    
+
     try:
-        with open(pgn_path, 'r', encoding='utf-8', errors='ignore') as f:
-            # Skip to start position
-            for _ in range(start_game):
-                game = chess.pgn.read_game(f)
-                if game is None:
-                    return games_data
-            
-            # Read our batch
-            for _ in range(num_games):
-                game = chess.pgn.read_game(f)
-                if game is None:
-                    break
-                
-                game_data = extract_game_data(game)
-                if game_data:
-                    games_data.append(game_data)
-    
+        with open(pgn_path, "rb") as raw_f:
+            raw_f.seek(start_offset)
+            with io.TextIOWrapper(raw_f, encoding="utf-8", errors="ignore", newline="") as f:
+                for _ in range(num_games):
+                    game = chess.pgn.read_game(f)
+                    if game is None:
+                        break
+
+                    game_data = extract_game_data(game)
+                    if game_data:
+                        games_data.append(game_data)
+
     except Exception as e:
         print(f"⚠️ Worker error: {e}")
-    
+
     return games_data
 
 
@@ -408,37 +512,49 @@ def extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_workers):
     """
     if phase1_workers <= 1:
         return extract_games_sequential(pgn_path, max_games)
-    
-    print(f"  Using {phase1_workers} processes for parallel parsing...")
-    
-    # Calculate games per worker
-    games_per_worker = (max_games + phase1_workers - 1) // phase1_workers
-    
-    # Create tasks
+
+    if max_games is None:
+        print("  • max_games=max -> scanning all game offsets for parallel split...")
+        game_offsets = _scan_game_start_offsets(pgn_path)
+        effective_max_games = len(game_offsets)
+        print(f"  • Detected {effective_max_games:,} games in {Path(pgn_path).name}")
+    else:
+        print(f"  • Scanning first {max_games:,} game offsets for parallel split...")
+        game_offsets = _scan_game_start_offsets(pgn_path, max_offsets=max_games)
+        effective_max_games = len(game_offsets)
+        if effective_max_games < max_games:
+            print(
+                f"  • PGN ended early: detected {effective_max_games:,} games "
+                f"(requested {max_games:,})"
+            )
+
+    print(f"  Using {phase1_workers} processes for offset-based parallel parsing...")
+
+    games_per_worker = (effective_max_games + phase1_workers - 1) // phase1_workers
     tasks = []
     for i in range(phase1_workers):
-        start_game = i * games_per_worker
-        num_games = min(games_per_worker, max_games - start_game)
-        
-        if num_games <= 0:
+        start_idx = i * games_per_worker
+        if start_idx >= effective_max_games:
             break
-        
-        tasks.append((pgn_path, start_game, num_games))
-    
-    # Process in parallel
+        num_games = min(games_per_worker, effective_max_games - start_idx)
+        tasks.append((pgn_path, game_offsets[start_idx], num_games))
+
     all_games = []
-    
+
     with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
-        futures = {executor.submit(parse_games_batch_worker, task): i for i, task in enumerate(tasks)}
-        
+        futures = {
+            executor.submit(parse_games_offset_batch_worker, task): i
+            for i, task in enumerate(tasks)
+        }
+
         with tqdm(total=len(futures), desc="  Phase 1 workers") as pbar:
             for future in as_completed(futures):
                 games_chunk = future.result()
                 all_games.extend(games_chunk)
                 pbar.update(1)
                 pbar.set_postfix({'games': len(all_games)})
-    
-    return all_games[:max_games]
+
+    return all_games[:effective_max_games]
 
 
 def extract_games_sequential(pgn_path, max_games):
@@ -450,7 +566,7 @@ def extract_games_sequential(pgn_path, max_games):
     with open(pgn_path, 'r', encoding='utf-8', errors='ignore') as f:
         with tqdm(total=max_games, desc="  Extracting games") as pbar:
             game_count = 0
-            while game_count < max_games:
+            while max_games is None or game_count < max_games:
                 game = chess.pgn.read_game(f)
                 if game is None:
                     break
@@ -701,10 +817,19 @@ def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, sort_by
     """
     PHASE 1: Extract games from PGN file
     """
-    games_to_extract = max_games * 2 if sort_by_elo else max_games
+    max_games = _normalize_max_games(max_games)
+    full_file_mode = max_games is None
+    effective_sort_by_elo = bool(sort_by_elo and not full_file_mode)
+
+    if full_file_mode and sort_by_elo:
+        print("  • max_games=max -> sort_by_avg_elo ignored for this file (taking entire PGN)")
+
+    games_to_extract = max_games * 2 if effective_sort_by_elo else max_games
     
-    if sort_by_elo:
+    if effective_sort_by_elo:
         print(f"  📊 Extracting {games_to_extract:,} games (will sort and select top {max_games:,} by Elo)...")
+    elif full_file_mode:
+        print("  📚 Extracting entire PGN file (no top-N selection, no per-file Elo sorting)...")
     
     all_games = extract_games_from_pgn_multiprocess(pgn_path, games_to_extract, phase1_threads)
     
@@ -719,7 +844,7 @@ def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, sort_by
         all_games = _filter_games(all_games, config)
     
     # Sort by Elo and take top games
-    if sort_by_elo:
+    if effective_sort_by_elo:
         print(f"  🔝 Sorting {len(all_games):,} games by average Elo...")
         all_games = sort_games_by_elo(all_games)
         all_games = all_games[:max_games]
@@ -988,8 +1113,13 @@ def process_pgn_files(pgn_files, config):
         
         phase1_workers = _resolve_workers(config['data'].get('phase1_threads', 1), "phase1_threads")
         phase2_workers = _resolve_workers(config['data'].get('phase2_threads', 1), "phase2_threads")
-        max_games = config['data'].get('max_games', 100000)
-        sort_by_elo = config['data'].get('sort_by_avg_elo', True)
+        selection = _get_game_selection_settings(config)
+        max_games = selection['max_games']
+        sort_by_elo = selection['sort_by_elo']
+        if selection['full_file_mode']:
+            print("ℹ️ data.max_games=max -> entire PGN files will be used.")
+        elif selection['sort_by_elo']:
+            print(f"ℹ️ data.max_games={max_games:,} with per-file sort_by_avg_elo enabled.")
         
         for pgn_file in new_pgn_files:
             print(f"\n📄 Processing: {Path(pgn_file).name}")

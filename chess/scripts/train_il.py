@@ -17,10 +17,12 @@ Imitation Learning Training Script - v4.5
 
 import torch
 import torch.optim as optim
+import torch._dynamo
 import yaml
 import sys
 import time
 import math
+import shutil
 from pathlib import Path
 import numpy as np
 import gc
@@ -132,6 +134,8 @@ def main():
     logs_dir.mkdir(parents=True, exist_ok=True)
     il_dir.mkdir(parents=True, exist_ok=True)
     best_model_path = base_dir / config['paths']['best_model_il']
+    version_best_model_path = il_dir / f"{model_file_tag}_best.pt"
+    latest_checkpoint_path = il_dir / f"{model_file_tag}_latest.pt"
     
     # Get configuration
     history_positions = config['model'].get('history_positions', 0)
@@ -172,6 +176,7 @@ def main():
         best_model_path=best_model_path,
         il_dir=il_dir,
         start_mode=selected_start_mode,
+        base_learning_rate=config['imitation_learning']['learning_rate'],
     )
 
     # For resume mode, allow extending training by additional epochs.
@@ -195,40 +200,22 @@ def main():
         and torch.cuda.is_available()
     )
 
-    hparam_resolution_eager = resolve_il_hyperparameters(
+    target_runtime_profile = "compiled" if (
+        str(hparam_mode).strip().lower() == "auto" and compile_requested
+    ) else "eager"
+    hparam_resolution = resolve_il_hyperparameters(
         config=config,
         model=model,
         device=device,
         base_dir=base_dir,
         mode=hparam_mode,
-        runtime_profile="eager",
+        runtime_profile=target_runtime_profile,
+        fallback_to_eager_profile=True,
     )
-    hparam_resolution_compiled = None
-    hparam_resolution = hparam_resolution_eager
 
-    if str(hparam_mode).strip().lower() == "auto" and compile_requested:
-        eager_lr = hparam_resolution_eager.get("learning_rate")
-        try:
-            eager_lr = float(eager_lr)
-        except (TypeError, ValueError):
-            eager_lr = None
-
-        hparam_resolution_compiled = resolve_il_hyperparameters(
-            config=config,
-            model=model,
-            device=device,
-            base_dir=base_dir,
-            mode=hparam_mode,
-            runtime_profile="compiled",
-            fixed_learning_rate=eager_lr,
-            fallback_to_eager_profile=False,
-        )
-
-        if hparam_resolution_compiled.get("runtime_profile_used") == "compiled":
-            hparam_resolution = hparam_resolution_compiled
-        else:
-            hparam_resolution = hparam_resolution_eager
-            print("IL auto-tune: keeping eager profile for active training values.")
+    runtime_profile_used = str(hparam_resolution.get("runtime_profile_used") or target_runtime_profile)
+    if target_runtime_profile == "compiled" and runtime_profile_used != "compiled":
+        print("IL auto-tune: compile probe unavailable, using eager profile instead.")
 
     model_hash_short = str(hparam_resolution.get("model_hash") or "n/a")[:16]
     hparam_rows = [
@@ -238,9 +225,6 @@ def main():
         ("Learning rate", f"{float(config['imitation_learning']['learning_rate']):.6g}"),
         ("Model hash", model_hash_short),
     ]
-    if hparam_resolution_compiled is not None:
-        hparam_rows.insert(3, ("Batch size (eager)", hparam_resolution_eager.get("batch_size", "n/a")))
-        hparam_rows.insert(4, ("Batch size (compiled)", hparam_resolution_compiled.get("batch_size", "n/a")))
 
     print_status_table(
         "IL Hyperparameters",
@@ -255,10 +239,12 @@ def main():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         debug_log_file = debug_dir / f"training_profile_{timestamp}.txt"
 
+        profile_debug_enabled = bool(config['debug'].get('profile_training', False))
+        profile_mode_label = "every epoch" if profile_debug_enabled else "first epoch of each training phase"
         print(
-            f"Debug mode: profile={config['debug'].get('profile_training', False)}, "
+            f"Debug mode: profile={profile_debug_enabled}, "
             f"gpu_mem_log={config['debug'].get('log_gpu_memory', False)}, "
-            f"every={config['debug'].get('profile_every_n_epochs', 1)} ep, "
+            f"timing={profile_mode_label}, "
             f"log={debug_log_file}"
         )
 
@@ -279,12 +265,6 @@ def main():
             )
             f.write(f"Batch size: {config['imitation_learning']['batch_size']}\n")
             f.write(f"Learning rate: {config['imitation_learning']['learning_rate']}\n")
-            if hparam_resolution_compiled is not None:
-                f.write(f"Batch size (eager): {hparam_resolution_eager.get('batch_size', 'n/a')}\n")
-                f.write(
-                    "Batch size (compiled): "
-                    f"{hparam_resolution_compiled.get('batch_size', 'n/a')}\n"
-                )
             f.write(f"History positions: {history_positions} (dynamic)\n")
             f.write(f"Sliding window stride: {stride}x\n")
             f.write(f"Input planes: {expected_input_planes} (16 per position)\n")
@@ -320,37 +300,55 @@ def main():
     # 🆕 Per-layer learning rates - value head with lower LR to prevent overfitting
     value_head_lr_factor = config['imitation_learning'].get('value_head_lr_factor', 1.0)
     base_lr = config['imitation_learning']['learning_rate']
-    
-    if value_head_lr_factor != 1.0:
-        # Separate value head parameters
-        value_head_params = []
-        other_params = []
-        
-        for name, param in model.named_parameters():
-            if 'value_' in name:  # value_conv1, value_conv2, value_bn, value_fc1, value_fc2
-                value_head_params.append(param)
-            else:
-                other_params.append(param)
-        
-        param_groups = [
-            {'params': other_params, 'lr': base_lr},
-            {'params': value_head_params, 'lr': base_lr * value_head_lr_factor}
-        ]
-        
-        print(
-            f"Per-layer LR: trunk/policy={base_lr:.4f}, "
-            f"value={base_lr * value_head_lr_factor:.4f} ({value_head_lr_factor}x)"
+
+    def _build_optimizer_for_model(target_model, *, announce_per_layer_lr=False):
+        if value_head_lr_factor != 1.0:
+            # Separate value head parameters
+            value_head_params = []
+            other_params = []
+
+            for name, param in target_model.named_parameters():
+                if 'value_' in name:  # value_conv1, value_conv2, value_bn, value_fc1, value_fc2
+                    value_head_params.append(param)
+                else:
+                    other_params.append(param)
+
+            param_groups = [
+                {'params': other_params, 'lr': base_lr, 'lr_multiplier': 1.0},
+                {'params': value_head_params, 'lr': base_lr * value_head_lr_factor, 'lr_multiplier': value_head_lr_factor}
+            ]
+
+            if announce_per_layer_lr:
+                print(
+                    f"Per-layer LR: trunk/policy={base_lr:.4f}, "
+                    f"value={base_lr * value_head_lr_factor:.4f} ({value_head_lr_factor}x)"
+                )
+        else:
+            param_groups = [{'params': list(target_model.parameters()), 'lr': base_lr, 'lr_multiplier': 1.0}]
+
+        return optim.AdamW(
+            param_groups,
+            lr=base_lr,
+            weight_decay=config['imitation_learning']['weight_decay'],
+            fused=True if torch.cuda.is_available() else False
         )
-    else:
-        param_groups = model.parameters()
-    
-    # Optimizer
-    optimizer = optim.AdamW(
-        param_groups,
-        lr=base_lr,
-        weight_decay=config['imitation_learning']['weight_decay'],
-        fused=True if torch.cuda.is_available() else False
-    )
+
+    def _apply_manual_base_lr(target_optimizer, new_base_lr):
+        new_base_lr = float(new_base_lr)
+        for group in target_optimizer.param_groups:
+            multiplier = float(group.get('lr_multiplier', 1.0) or 1.0)
+            group['lr'] = new_base_lr * multiplier
+            if 'initial_lr' in group:
+                group['initial_lr'] = new_base_lr * multiplier
+
+    def _build_scheduler_for_optimizer(target_optimizer):
+        return optim.lr_scheduler.LambdaLR(target_optimizer, lr_lambda=_lr_lambda)
+
+    def _build_grad_scaler():
+        # 🔧 v4.8: GradScaler only for float16, NOT for bfloat16 (same dynamic range as float32)
+        return torch.amp.GradScaler('cuda', enabled=use_amp and not use_bfloat16)
+
+    optimizer = _build_optimizer_for_model(model, announce_per_layer_lr=True)
     
     if torch.cuda.is_available():
         print("✓ Using fused AdamW optimizer")
@@ -370,7 +368,7 @@ def main():
         progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
         return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+    scheduler = _build_scheduler_for_optimizer(optimizer)
 
     print(
         f"✓ LR schedule: warmup={warmup_epochs} ep → "
@@ -378,8 +376,7 @@ def main():
     )
     
     # AMP Gradient Scaler
-    # 🔧 v4.8: GradScaler only for float16, NOT for bfloat16 (same dynamic range as float32)
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp and not use_bfloat16)
+    scaler = _build_grad_scaler()
 
     il_cfg = config.get('imitation_learning', {})
     save_optimizer_state = il_cfg.get('save_optimizer_state', True)
@@ -405,6 +402,8 @@ def main():
     transfer_match_ratio = startup_state.get('transfer_match_ratio')
     transfer_freeze_epochs = int(startup_state.get('transfer_freeze_epochs', 0) or 0)
     transfer_trainable_param_names = startup_state.get('transfer_trainable_param_names') or []
+    transfer_post_unfreeze_lr = startup_state.get('transfer_post_unfreeze_lr')
+    transfer_post_unfreeze_lr_active = False
     selected_entry = startup_plan.get("selected_entry") or {}
 
     source_label = "new (scratch)"
@@ -453,6 +452,8 @@ def main():
             plot_run_context += (
                 f" | freeze changed-only for {transfer_freeze_epochs} ep"
             )
+        if transfer_post_unfreeze_lr is not None:
+            plot_run_context += f" | post-unfreeze lr={float(transfer_post_unfreeze_lr):.6g}"
 
     if selected_checkpoint_label and start_mode in {"resume", "transfer"}:
         plot_run_context = f"{plot_run_context} | source: {Path(selected_checkpoint_label).name}"
@@ -621,17 +622,84 @@ def main():
     use_swa = config['imitation_learning'].get('use_swa', False)
     swa_model = None
     swa_scheduler = None
-    swa_start = config['imitation_learning'].get('swa_start_epoch', 15)
+    swa_start = int(config['imitation_learning'].get('swa_start_epoch', 15))
+    swa_auto_start = bool(config['imitation_learning'].get('swa_auto_start', True))
+    swa_transfer_unfreeze_offset = int(
+        config['imitation_learning'].get('swa_transfer_unfreeze_offset', 1)
+    )
+    swa_transfer_unfreeze_offset = max(0, swa_transfer_unfreeze_offset)
+    swa_start_reason = "config"
     non_blocking_transfers = bool(
         config.get('hardware', {}).get('non_blocking_transfers', True)
         and device.type == 'cuda'
     )
 
+    if use_swa and swa_auto_start and start_mode == "transfer":
+        first_full_unfrozen_epoch = start_epoch + transfer_freeze_epochs + 1
+        auto_swa_start = max(1, first_full_unfrozen_epoch + swa_transfer_unfreeze_offset)
+        if auto_swa_start < swa_start:
+            swa_start = auto_swa_start
+            swa_start_reason = (
+                "auto-transfer "
+                f"(first_full_epoch={first_full_unfrozen_epoch}, offset={swa_transfer_unfreeze_offset})"
+            )
+
+    def _resolve_swa_lr():
+        il_cfg_local = config['imitation_learning']
+        swa_lr_mode = str(il_cfg_local.get('swa_lr_mode', 'auto')).strip().lower()
+        manual_swa_lr = float(il_cfg_local.get('swa_lr', 0.0005))
+        if swa_lr_mode not in {"auto", "manual"}:
+            swa_lr_mode = "auto"
+
+        if swa_lr_mode == "manual":
+            return manual_swa_lr, f"manual(config={manual_swa_lr:.6f})"
+
+        effective_base_lr = float(transfer_post_unfreeze_lr or base_lr)
+        swa_epoch_idx = max(0, min(total_epochs - 1, int(swa_start) - 1))
+        lr_factor_at_swa = float(_lr_lambda(swa_epoch_idx))
+        effective_lr_at_swa = effective_base_lr * lr_factor_at_swa
+
+        ratio = float(il_cfg_local.get('swa_lr_ratio', 0.12))
+        ratio = max(0.01, min(0.50, ratio))
+
+        compat_ratio = transfer_match_ratio
+        if compat_ratio is None:
+            compat_ratio = selected_compatibility_ratio
+        compat_scale = 1.0
+        if start_mode == "transfer" and compat_ratio is not None:
+            compat_ratio = float(compat_ratio)
+            if compat_ratio < 0.70:
+                compat_scale = 0.70
+            elif compat_ratio < 0.80:
+                compat_scale = 0.85
+            elif compat_ratio >= 0.90:
+                compat_scale = 1.10
+
+        transfer_scale = 0.90 if (start_mode == "transfer" and transfer_freeze_epochs > 0) else 1.0
+        target_swa_lr = effective_lr_at_swa * ratio * compat_scale * transfer_scale
+
+        swa_lr_min = float(il_cfg_local.get('swa_lr_min', 3e-5))
+        swa_lr_max = float(il_cfg_local.get('swa_lr_max', 2e-4))
+        if swa_lr_min > swa_lr_max:
+            swa_lr_min, swa_lr_max = swa_lr_max, swa_lr_min
+        target_swa_lr = max(swa_lr_min, min(swa_lr_max, target_swa_lr))
+
+        source = (
+            f"auto(base={effective_base_lr:.6g}, lr_at_swa={effective_lr_at_swa:.6g}, "
+            f"ratio={ratio:.3f}, compat_scale={compat_scale:.2f}, transfer_scale={transfer_scale:.2f})"
+        )
+        return target_swa_lr, source
+
     if use_swa:
         swa_model = torch.optim.swa_utils.AveragedModel(model)
-        swa_lr = config['imitation_learning'].get('swa_lr', 0.0005)
+        swa_lr, swa_lr_reason = _resolve_swa_lr()
         swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=swa_lr)
-        print(f"SWA enabled: start_epoch={swa_start} (inclusive), swa_lr={swa_lr:.6f}")
+        print(
+            f"SWA enabled: start_epoch={swa_start} (inclusive), "
+            f"swa_lr={swa_lr:.6f}, source={swa_start_reason}, lr_source={swa_lr_reason}"
+        )
+    else:
+        swa_lr = float(config['imitation_learning'].get('swa_lr', 0.0005))
     print(f"Non-blocking transfers: {'enabled' if non_blocking_transfers else 'disabled'}")
 
     # Training loop
@@ -646,19 +714,27 @@ def main():
     )
     if debug_enabled:
         print("Debug profiling is active")
-    profile_enabled = debug_enabled and config.get('debug', {}).get('profile_training', False)
-    profile_every = config.get('debug', {}).get('profile_every_n_epochs', 1)
+    profile_enabled = bool(debug_enabled and config.get('debug', {}).get('profile_training', False))
+    profiled_phase_keys = set()
+
+    def _profile_phase_key(epoch_idx):
+        if start_mode == "transfer" and transfer_freeze_epochs > 0:
+            return "transfer_frozen" if epoch_idx < transfer_freeze_until_epoch else "transfer_unfrozen"
+        return "default"
 
     max_patience = config['imitation_learning'].get('max_patience', 15)
     min_delta = config['imitation_learning']['min_delta']
-    checkpoint_every = config['imitation_learning'].get('checkpoint_every', 5)
     total_epochs = config['imitation_learning']['epochs']
 
     print(
-        f"early_stopping(patience={max_patience}, min_delta={min_delta}), "
-        f"checkpoint_every={checkpoint_every}"
+        f"early_stopping(patience={max_patience}, min_delta={min_delta})"
     )
-    print(f"paths: best={best_model_path}, checkpoints={il_dir}")
+    if start_mode == "transfer" and transfer_post_unfreeze_lr is not None:
+        print(f"transfer post-unfreeze lr={float(transfer_post_unfreeze_lr):.6g} (manual override)")
+    print(
+        f"paths: best={best_model_path}, version_best={version_best_model_path}, "
+        f"latest={latest_checkpoint_path}, checkpoints={il_dir}"
+    )
 
     transfer_freeze_active = False
     transfer_freeze_until_epoch = start_epoch + transfer_freeze_epochs
@@ -699,10 +775,24 @@ def main():
     elo_coordinator.print_startup_summary()
 
     # torch.compile: fuses Conv+BN+ReLU kernels → fewer GPU kernel launches.
-    # Run it after checkpoint/startup initialization so all runtime components
-    # operate on the same model instance.
+    # For transfer warmup we compile the frozen model first, then re-compile the
+    # fully unfrozen eager model once warmup ends.
     _use_compile = config['hardware'].get('use_compile', False)
-    if _use_compile and torch.cuda.is_available():
+    eager_model = model
+    _compile_strategy = None
+
+    def _maybe_compile_model(current_model, reason_label="startup"):
+        if not _use_compile:
+            return current_model
+        if not torch.cuda.is_available():
+            print("⚠️ torch.compile pominięty: CUDA niedostępna")
+            return current_model
+
+        # Important for transfer warmup → unfreeze.
+        # Without resetting Dynamo, a new compile call may still reuse guards/
+        # cached graphs specialized for the previously frozen parameter set.
+        torch._dynamo.reset()
+
         amp_enabled_for_compile = bool(use_amp and device.type == 'cuda')
         amp_dtype_for_compile = torch.bfloat16 if use_bfloat16 else torch.float16
 
@@ -712,9 +802,15 @@ def main():
             """Zwraca skompilowany model lub None jeśli się nie uda."""
             try:
                 if is_mode:
-                    _compiled = torch.compile(model, mode=backend_or_mode)
+                    try:
+                        _compiled = torch.compile(current_model, mode=backend_or_mode, dynamic=True)
+                    except TypeError:
+                        _compiled = torch.compile(current_model, mode=backend_or_mode)
                 else:
-                    _compiled = torch.compile(model, backend=backend_or_mode)
+                    try:
+                        _compiled = torch.compile(current_model, backend=backend_or_mode, dynamic=True)
+                    except TypeError:
+                        _compiled = torch.compile(current_model, backend=backend_or_mode)
                 # Próbny forward — wymusza kompilację i łapie TritonMissing / inne błędy
                 _dummy = torch.zeros(
                     1, expected_input_planes, 8, 8,
@@ -733,24 +829,48 @@ def main():
                 print(f"  ✗ {'mode=' + backend_or_mode if is_mode else 'backend=' + backend_or_mode}: {type(_e).__name__}: {_e}")
                 return None
 
-        print("torch.compile: testowanie dostępnych backendów...")
+        nonlocal _compile_strategy
+        preferred_strategy = _compile_strategy
+        if preferred_strategy is not None:
+            preferred_label = (
+                f"mode={preferred_strategy['name']}"
+                if preferred_strategy['is_mode']
+                else f"backend={preferred_strategy['name']}"
+            )
+            print(f"torch.compile: używam zapamiętanej konfiguracji ({preferred_label}, {reason_label})...")
+            _compiled_model = _try_compile(
+                preferred_strategy['name'],
+                is_mode=preferred_strategy['is_mode'],
+            )
+            if _compiled_model is not None:
+                if preferred_strategy['is_mode']:
+                    print(f"✓ torch.compile enabled (mode={preferred_strategy['name']}, cached choice)")
+                else:
+                    print(f"✓ torch.compile enabled (backend={preferred_strategy['name']}, cached choice)")
+                return _compiled_model
+            print("  ⚠️ Zapamiętana konfiguracja torch.compile nie powiodła się, fallback do pełnego testu.")
+
+        print(f"torch.compile: testowanie dostępnych backendów ({reason_label})...")
         _compiled_model = None
 
         # 1. Inductor default (wymaga Triton — najlepszy wynik)
         _compiled_model = _try_compile('default', is_mode=True)
         if _compiled_model is not None:
-            model = _compiled_model
+            _compile_strategy = {'name': 'default', 'is_mode': True}
             print("✓ torch.compile enabled (mode=default, inductor+Triton, warmup ~30-60s)")
-        else:
-            # 2. cudagraphs (nie wymaga Triton, ~10-15% gain, stabilny na Windows)
-            _compiled_model = _try_compile('cudagraphs', is_mode=False)
-            if _compiled_model is not None:
-                model = _compiled_model
-                print("✓ torch.compile enabled (backend=cudagraphs, ~10-15% gain, bez Triton)")
-            else:
-                print("⚠️ torch.compile niedostępny dla bieżącej konfiguracji — trening bez kompilacji")
-    elif _use_compile:
-        print("⚠️ torch.compile pominięty: CUDA niedostępna")
+            return _compiled_model
+
+        # 2. cudagraphs (nie wymaga Triton, ~10-15% gain, stabilny na Windows)
+        _compiled_model = _try_compile('cudagraphs', is_mode=False)
+        if _compiled_model is not None:
+            _compile_strategy = {'name': 'cudagraphs', 'is_mode': False}
+            print("✓ torch.compile enabled (backend=cudagraphs, ~10-15% gain, bez Triton)")
+            return _compiled_model
+
+        print("⚠️ torch.compile niedostępny dla bieżącej konfiguracji — trening bez kompilacji")
+        return current_model
+
+    model = _maybe_compile_model(model)
 
     def _get_elo_state_for_checkpoint():
         elo_epoch, elo_value = logger.get_latest_estimated_elo_with_epoch()
@@ -763,10 +883,15 @@ def main():
 
     training_interrupted = False
     last_epoch_idx = start_epoch - 1
+    last_val_losses = None
+    last_val_metrics = None
 
     try:
         for epoch in range(start_epoch, total_epochs):
             last_epoch_idx = epoch
+            val_losses = last_val_losses
+            val_metrics = last_val_metrics
+            should_stop = False
             if transfer_freeze_active and epoch >= transfer_freeze_until_epoch:
                 for param in model.parameters():
                     param.requires_grad = True
@@ -776,11 +901,69 @@ def main():
                     f"Transfer warmup finished at epoch {epoch + 1}. "
                     f"Full model unfrozen ({total_trainable_now:,} trainable params)."
                 )
+                if _use_compile and torch.cuda.is_available():
+                    print(
+                        "  torch.compile: świeża instancja pełnego modelu + rekompilacja po odmrożeniu — "
+                        "to może potrwać chwilę przed startem epoki."
+                    )
+                    eager_state = {
+                        key: tensor.detach().cpu().clone()
+                        for key, tensor in eager_model.state_dict().items()
+                    }
+                    optimizer_state = optimizer.state_dict()
+                    scheduler_state = scheduler.state_dict()
+                    scaler_state = scaler.state_dict()
+                    swa_model_state = swa_model.state_dict() if swa_model is not None else None
+                    swa_scheduler_state = swa_scheduler.state_dict() if swa_scheduler is not None else None
+
+                    new_eager_model = ChessNet(config).to(device)
+                    new_eager_model = new_eager_model.to(memory_format=torch.channels_last)
+                    new_eager_model.load_state_dict(eager_state, strict=True)
+                    for param in new_eager_model.parameters():
+                        param.requires_grad = True
+
+                    eager_model = new_eager_model
+                    model = eager_model
+                    optimizer = _build_optimizer_for_model(model)
+                    optimizer.load_state_dict(optimizer_state)
+                    scheduler = _build_scheduler_for_optimizer(optimizer)
+                    scheduler.load_state_dict(scheduler_state)
+                    scaler = _build_grad_scaler()
+                    if scaler_state:
+                        scaler.load_state_dict(scaler_state)
+
+                    if use_swa:
+                        swa_model = torch.optim.swa_utils.AveragedModel(model)
+                        if swa_model_state is not None:
+                            swa_model.load_state_dict(swa_model_state)
+                        swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=swa_lr)
+                        if swa_scheduler_state is not None:
+                            swa_scheduler.load_state_dict(swa_scheduler_state)
+
+                    elo_coordinator.model = model
+                    gc.collect()
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    model = _maybe_compile_model(model, reason_label=f"epoch {epoch + 1} unfreeze")
+                    elo_coordinator.model = model
+                if transfer_post_unfreeze_lr is not None:
+                    _apply_manual_base_lr(optimizer, transfer_post_unfreeze_lr)
+                    transfer_post_unfreeze_lr_active = True
+                    print(
+                        "  Transfer: applied manual LR after unfreeze: "
+                        f"base={float(transfer_post_unfreeze_lr):.6g}"
+                    )
             elo_coordinator.poll_results()
             print(f"\nEpoch {epoch + 1}/{total_epochs}")
             epoch_lr = optimizer.param_groups[0]['lr']
 
-            profile_this_epoch = profile_enabled and ((epoch + 1) % profile_every == 0)
+            phase_key = _profile_phase_key(epoch)
+            if profile_enabled:
+                profile_this_epoch = True
+            else:
+                profile_this_epoch = phase_key not in profiled_phase_keys
+                if profile_this_epoch:
+                    profiled_phase_keys.add(phase_key)
             if profile_this_epoch and device.type == 'cuda':
                 torch.cuda.synchronize()
             epoch_start_time = time.perf_counter()
@@ -803,7 +986,7 @@ def main():
                 epoch=epoch,
                 debug_log_file=debug_log_file,
                 profile=profile_this_epoch,
-                step_scheduler=not use_swa_scheduler_this_epoch,
+                step_scheduler=(not use_swa_scheduler_this_epoch) and (not transfer_post_unfreeze_lr_active),
                 non_blocking_transfer=non_blocking_transfers,
             )
             if profile_this_epoch and device.type == 'cuda':
@@ -857,6 +1040,8 @@ def main():
                 print(f"     📊 Top-1: {val_metrics['policy_top1_acc']:.2%}, "
                       f"Top-3: {val_metrics['policy_top3_acc']:.2%}, "
                       f"MAE: {val_metrics['value_mae']:.4f}")
+                last_val_losses = val_losses
+                last_val_metrics = val_metrics
 
 
                 # Log metrics + periodic Elo estimation.
@@ -909,6 +1094,13 @@ def main():
                     print(f"  💾 Saved to: {best_model_path}")
                     size_mb = best_model_path.stat().st_size / (1024**2)
                     print(f"  📦 Model size: {size_mb:.1f} MB (without optimizer)")
+                    if version_best_model_path != best_model_path:
+                        shutil.copy2(best_model_path, version_best_model_path)
+                        version_best_size_mb = version_best_model_path.stat().st_size / (1024 ** 2)
+                        print(
+                            f"  💾 Version best updated: {version_best_model_path.name} "
+                            f"({version_best_size_mb:.1f} MB)"
+                        )
                 else:
                     patience_counter += 1
                     print(f"No improvement. Patience: {patience_counter}/{max_patience}")
@@ -917,7 +1109,7 @@ def main():
                 if patience_counter >= max_patience:
                     print(f"\n🛑 Early stopping triggered!")
                     print(f"Best validation loss: {best_val_loss:.4f}")
-                    break
+                    should_stop = True
             else:
                 # Log only training metrics
                 logger.log(
@@ -940,7 +1132,7 @@ def main():
                 if train_profile is not None:
                     batches = max(1, train_profile['batches'])
                     profile_msg = (
-                        f"[PROFILE] Epoch {epoch + 1}: "
+                        f"[PROFILE] Epoch {epoch + 1} [{phase_key}]: "
                         f"data={train_profile['data']:.2f}s ({train_profile['data']*1000/batches:.1f}ms/b), "
                         f"fwd={train_profile['forward']:.2f}s ({train_profile['forward']*1000/batches:.1f}ms/b), "
                         f"bwd={train_profile['backward']:.2f}s ({train_profile['backward']*1000/batches:.1f}ms/b), "
@@ -953,91 +1145,127 @@ def main():
                     )
                 else:
                     profile_msg = (
-                        f"[PROFILE] Epoch {epoch + 1}: "
+                        f"[PROFILE] Epoch {epoch + 1} [{phase_key}]: "
                         f"train={train_time:.2f}s, "
                         f"eval={eval_time:.2f}s, "
                         f"other={other_time:.2f}s, "
                         f"total={epoch_total_time:.2f}s"
                     )
                 print(profile_msg)
+                if debug_enabled and train_profile is not None:
+                    grad_diag = train_profile.get('grad_diag') or {}
+                    if grad_diag:
+                        grad_msg = (
+                            f"[DEBUG] Epoch {epoch + 1} batch#{grad_diag.get('batch_idx', 0) + 1}: "
+                            f"grad_tensors={grad_diag.get('grad_tensors', 0)}/{grad_diag.get('trainable_tensors', 0)}, "
+                            f"grad_params={grad_diag.get('grad_params', 0):,}/{grad_diag.get('trainable_params', 0):,}"
+                        )
+                        missing_grad_names = grad_diag.get('missing_grad_names') or []
+                        if missing_grad_names:
+                            grad_msg += f", missing_sample={missing_grad_names[:4]}"
+                        print(grad_msg)
+
+                    if config.get('debug', {}).get('log_gpu_memory', False):
+                        mem_msg = (
+                            f"[DEBUG] Epoch {epoch + 1} GPU: "
+                            f"peak_alloc={train_profile.get('peak_allocated_mb', 0.0):.1f}MB, "
+                            f"peak_reserved={train_profile.get('peak_reserved_mb', 0.0):.1f}MB, "
+                            f"curr_alloc={train_profile.get('current_allocated_mb', 0.0):.1f}MB, "
+                            f"curr_reserved={train_profile.get('current_reserved_mb', 0.0):.1f}MB"
+                        )
+                        print(mem_msg)
+
+                    if debug_log_file is not None:
+                        with open(debug_log_file, 'a', encoding='utf-8') as f:
+                            f.write(profile_msg + "\n")
+                            grad_diag = train_profile.get('grad_diag') or {}
+                            if grad_diag:
+                                f.write(
+                                    f"[DEBUG] Epoch {epoch + 1} batch#{grad_diag.get('batch_idx', 0) + 1}: "
+                                    f"grad_tensors={grad_diag.get('grad_tensors', 0)}/{grad_diag.get('trainable_tensors', 0)}, "
+                                    f"grad_params={grad_diag.get('grad_params', 0):,}/{grad_diag.get('trainable_params', 0):,}, "
+                                    f"missing_sample={grad_diag.get('missing_grad_names', [])[:8]}\n"
+                                )
+                            if config.get('debug', {}).get('log_gpu_memory', False):
+                                f.write(
+                                    f"[DEBUG] Epoch {epoch + 1} GPU: "
+                                    f"peak_alloc={train_profile.get('peak_allocated_mb', 0.0):.1f}MB, "
+                                    f"peak_reserved={train_profile.get('peak_reserved_mb', 0.0):.1f}MB, "
+                                    f"curr_alloc={train_profile.get('current_allocated_mb', 0.0):.1f}MB, "
+                                    f"curr_reserved={train_profile.get('current_reserved_mb', 0.0):.1f}MB\n"
+                                )
                 if debug_log_file is not None:
                     with open(debug_log_file, 'a', encoding='utf-8') as f:
                         f.write(profile_msg + "\n")
 
-            # Save checkpoint every N epochs
-            if (epoch + 1) % checkpoint_every == 0:
-                # Get current val loss if not already computed
-                if (epoch + 1) % config['imitation_learning']['eval_every'] != 0:
-                    val_losses, val_metrics = evaluate_il(
-                        model,
-                        val_loader,
-                        config,
-                        device,
-                        non_blocking_transfer=non_blocking_transfers,
-                    )
-
-                checkpoint_name = f"{model_file_tag}_epoch_{epoch + 1:02d}.pt"
-                checkpoint_path = il_dir / checkpoint_name
-
-                model_to_save = model
-                elo_metadata, elo_epoch_for_state, elo_for_state = _get_elo_state_for_checkpoint()
-                periodic_metadata = {
+            # Save one rolling checkpoint per version for exact resume.
+            model_to_save = model
+            elo_metadata, elo_epoch_for_state, elo_for_state = _get_elo_state_for_checkpoint()
+            latest_metadata = {
+                'history_positions': history_positions,
+                'input_planes': expected_input_planes,
+                'sliding_window_stride': stride,
+                'pov_enabled': True,  # 🆕 v4.2
+                'version': model_version,
+                'startup_mode': start_mode,
+                'model_architecture': model_architecture,
+            }
+            if val_losses is not None:
+                latest_metadata.update({
                     'val_loss': val_losses['total'],
                     'val_policy_loss': val_losses['policy'],
                     'val_value_loss': val_losses['value'],
+                })
+            if val_metrics is not None:
+                latest_metadata.update({
                     'val_policy_top1': val_metrics['policy_top1_acc'],
                     'val_policy_top3': val_metrics['policy_top3_acc'],
                     'val_value_mae': val_metrics['value_mae'],
-                    'history_positions': history_positions,
-                    'input_planes': expected_input_planes,
-                    'sliding_window_stride': stride,
-                    'pov_enabled': True,  # 🆕 v4.2
-                    'version': model_version,    # 🆕 Track version
-                    'startup_mode': start_mode,
-                    'model_architecture': model_architecture,
-                }
-                periodic_metadata.update(elo_metadata)
-                save_checkpoint(
-                    model_to_save,
-                    optimizer,
-                    epoch,
-                    train_losses['total'],
-                    str(checkpoint_path),
-                    periodic_metadata,
-                    save_optimizer=save_optimizer_state,
-                    save_dtype=torch.bfloat16 if use_bfloat16 else None,
-                    extra_state=build_runtime_state(
-                        scheduler=scheduler,
-                        scaler=scaler,
-                        best_val_loss=best_val_loss,
-                        patience_counter=patience_counter,
-                        estimated_elo=elo_for_state,
-                        estimated_elo_epoch=elo_epoch_for_state,
-                    ),
-                )
+                })
+            latest_metadata.update(elo_metadata)
+            save_checkpoint(
+                model_to_save,
+                optimizer,
+                epoch,
+                train_losses['total'],
+                str(latest_checkpoint_path),
+                latest_metadata,
+                save_optimizer=save_optimizer_state,
+                save_dtype=torch.bfloat16 if use_bfloat16 else None,
+                extra_state=build_runtime_state(
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    best_val_loss=best_val_loss,
+                    patience_counter=patience_counter,
+                    estimated_elo=elo_for_state,
+                    estimated_elo_epoch=elo_epoch_for_state,
+                ),
+            )
 
-                size_mb = checkpoint_path.stat().st_size / (1024**2)
-                print(f"💾 Checkpoint saved: {checkpoint_path.name} ({size_mb:.1f} MB)")
+            latest_size_mb = latest_checkpoint_path.stat().st_size / (1024 ** 2)
+            print(f"💾 Latest checkpoint updated: {latest_checkpoint_path.name} ({latest_size_mb:.1f} MB)")
 
-                # Save SWA snapshot on the same cadence (if SWA already active).
-                save_swa_snapshot_checkpoint(
-                    epoch_idx=epoch,
-                    fallback_loss=train_losses['total'],
-                    ref_val_losses=val_losses,
-                    ref_val_metrics=val_metrics,
-                    use_swa=use_swa,
-                    swa_model=swa_model,
-                    swa_start=swa_start,
-                    il_dir=il_dir,
-                    history_positions=history_positions,
-                    expected_input_planes=expected_input_planes,
-                    stride=stride,
-                    model_version=model_version,
-                    start_mode=start_mode,
-                    use_bfloat16=use_bfloat16,
-                    model_file_tag=model_file_tag,
-                    model_architecture=model_architecture,
-                )
+            save_swa_snapshot_checkpoint(
+                epoch_idx=epoch,
+                fallback_loss=train_losses['total'],
+                ref_val_losses=val_losses,
+                ref_val_metrics=val_metrics,
+                use_swa=use_swa,
+                swa_model=swa_model,
+                swa_start=swa_start,
+                il_dir=il_dir,
+                history_positions=history_positions,
+                expected_input_planes=expected_input_planes,
+                stride=stride,
+                model_version=model_version,
+                start_mode=start_mode,
+                use_bfloat16=use_bfloat16,
+                model_file_tag=model_file_tag,
+                model_architecture=model_architecture,
+            )
+
+            if should_stop:
+                break
 
             # Cleanup
             if (epoch + 1) % 5 == 0:

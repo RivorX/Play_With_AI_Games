@@ -3,6 +3,7 @@ Unified training logger for both IL and RL training
 """
 
 import csv
+import textwrap
 import matplotlib.pyplot as plt
 from datetime import datetime
 from pathlib import Path
@@ -112,6 +113,19 @@ class TrainingLogger:
             return
         text = str(text).strip()
         self.run_context_text = text if text else None
+
+    def _build_plot_suptitle(self, base_title, wrap_width=88):
+        """Build a wrapped suptitle to avoid huge plot bounding boxes."""
+        if not self.run_context_text:
+            return base_title
+
+        wrapped_context = textwrap.fill(
+            self.run_context_text,
+            width=max(40, int(wrap_width)),
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        return f"{base_title}\n{wrapped_context}"
 
     def append_final_note(self, text):
         """Append short note shown in IL summary panel."""
@@ -396,26 +410,60 @@ class TrainingLogger:
         ax.set_title('Estimated Elo (vs Stockfish)')
         ax.grid(True, alpha=0.3)
 
+        # Visible training window for the current plot.  This avoids drawing
+        # transfer/resume seed Elo points that belong to epochs far outside the
+        # currently plotted run, which otherwise creates a misleading clipped
+        # horizontal line to the right edge of the panel.
+        if self.iterations:
+            x_min = min(self.iterations)
+            x_max = max(self.iterations)
+            if x_min == x_max:
+                x_min -= 1
+                x_max += 1
+        else:
+            x_min = None
+            x_max = None
+
         # Determine SWA epoch to exclude from the regular line
         swa_epoch = int(self.swa_elo_info[0]) if self.swa_elo_info else None
 
         if has_elos:
+            visible_elos = self.estimated_elos
+            if x_min is not None and x_max is not None:
+                visible_elos = [
+                    (ep, val) for ep, val in self.estimated_elos
+                    if x_min <= int(ep) <= x_max
+                ]
+            if not visible_elos:
+                visible_elos = self.estimated_elos[-1:]
+
             # Plot regular elo line (exclude SWA point so it gets its own marker)
             regular_elos = [
-                (ep, val) for ep, val in self.estimated_elos
+                (ep, val) for ep, val in visible_elos
                 if swa_epoch is None or int(ep) != swa_epoch
             ]
             if regular_elos:
                 elo_epochs, elo_vals = zip(*regular_elos)
-                ax.plot(elo_epochs, elo_vals, 'go-', label='Estimated Elo', linewidth=2, markersize=8)
+                if len(regular_elos) == 1:
+                    ax.plot(
+                        elo_epochs,
+                        elo_vals,
+                        color='green',
+                        marker='o',
+                        linestyle='None',
+                        label='Estimated Elo',
+                        markersize=8,
+                    )
+                else:
+                    ax.plot(elo_epochs, elo_vals, 'go-', label='Estimated Elo', linewidth=2, markersize=8)
                 all_elo_vals = elo_vals
             else:
-                all_elo_vals = [v for _, v in self.estimated_elos]
+                all_elo_vals = [v for _, v in visible_elos]
 
             for ref_elo, ref_label in [(1200, 'Beginner'), (1500, 'Club'), (1800, 'Expert'), (2000, 'Candidate Master')]:
-                all_vals = [v for _, v in self.estimated_elos]
+                all_vals = [v for _, v in visible_elos]
                 if min(all_vals) - 200 <= ref_elo <= max(all_vals) + 200:
-                    x0 = self.estimated_elos[0][0]
+                    x0 = visible_elos[0][0]
                     ax.axhline(y=ref_elo, color='gray', linestyle=':', alpha=0.4)
                     ax.text(x0, ref_elo + 15, ref_label, fontsize=8, color='gray', alpha=0.6)
 
@@ -482,16 +530,10 @@ class TrainingLogger:
                     )
 
         # Compute x-axis range, padding right side to show SWA star fully
-        if self.iterations:
-            x_min = min(self.iterations)
-            x_max = max(self.iterations)
-            if x_min == x_max:
-                x_min -= 1
-                x_max += 1
-            # If SWA point is at or near the right edge, add extra padding
+        if x_min is not None and x_max is not None:
             if self.swa_elo_info:
                 sw_ep = int(self.swa_elo_info[0])
-                if sw_ep >= x_max - 1:
+                if x_min <= sw_ep and sw_ep >= x_max - 1:
                     x_max = sw_ep + max(2, int((x_max - x_min) * 0.08) + 1)
             ax.set_xlim(x_min, x_max)
 
@@ -773,6 +815,7 @@ class TrainingLogger:
             cellLoc='center',
             loc='center',
             bbox=[0.0, 0.05, 1.0, 0.95],
+            colWidths=[0.28, 0.22, 0.22, 0.28],
         )
         tbl.auto_set_font_size(False)
         tbl.set_fontsize(12)
@@ -791,7 +834,6 @@ class TrainingLogger:
             for col_i in range(4):
                 tbl[row_i, col_i].set_height(tbl[row_i, col_i].get_height() * 1.3)
 
-        tbl.auto_set_column_width([0, 1, 2, 3])
 
     def _plot_il(self):
         """Plot IL training progress"""
@@ -799,13 +841,13 @@ class TrainingLogger:
         
         if self.run_context_text:
             fig.suptitle(
-                f"IL Training Progress\n{self.run_context_text}",
+                self._build_plot_suptitle("IL Training Progress"),
                 fontsize=14,
                 fontweight='bold',
-                y=0.999,
+                y=0.985,
             )
         else:
-            fig.suptitle('IL Training Progress', fontsize=16, fontweight='bold', y=0.999)
+            fig.suptitle('IL Training Progress', fontsize=16, fontweight='bold', y=0.985)
         
         val_epochs = self.val_iterations if self.val_iterations else []
         
@@ -941,8 +983,8 @@ class TrainingLogger:
         self._plot_il_summary_panel(ax)
     
 
-        plt.tight_layout(rect=[0, 0, 1, 0.99])
-        plt.savefig(self.plot_path, dpi=150, bbox_inches='tight')
+        fig.subplots_adjust(left=0.07, right=0.98, bottom=0.04, top=0.94, hspace=0.42, wspace=0.28)
+        fig.savefig(self.plot_path, dpi=150)
         plt.close()
         
         print(f"📈 Plot saved to: {self.plot_path}")
@@ -952,12 +994,13 @@ class TrainingLogger:
         fig, axes = plt.subplots(3, 3, figsize=(18, 14))
         if self.run_context_text:
             fig.suptitle(
-                f"RL Training Progress\n{self.run_context_text}",
+                self._build_plot_suptitle("RL Training Progress"),
                 fontsize=14,
                 fontweight='bold',
+                y=0.98,
             )
         else:
-            fig.suptitle('RL Training Progress', fontsize=16, fontweight='bold')
+            fig.suptitle('RL Training Progress', fontsize=16, fontweight='bold', y=0.98)
         
         # Row 1: Losses
         ax = axes[0, 0]
@@ -1064,8 +1107,8 @@ class TrainingLogger:
             ax.text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
                    verticalalignment='center')
         
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.savefig(self.plot_path, dpi=150, bbox_inches='tight')
+        fig.subplots_adjust(left=0.07, right=0.98, bottom=0.06, top=0.92, hspace=0.38, wspace=0.28)
+        fig.savefig(self.plot_path, dpi=150)
         plt.close()
         
         print(f"📈 Plot saved to: {self.plot_path}")

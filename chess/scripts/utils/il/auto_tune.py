@@ -819,12 +819,31 @@ def _snapshot_model_state_cpu(model):
 def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use_amp, use_bfloat16):
     """Find LR by short range test (multiple short train steps on synthetic batches)."""
     auto_cfg = _get_auto_tune_cfg(config)
+    lr_test_enabled = _safe_bool(auto_cfg.get("lr_test_enabled"), True)
+    if not lr_test_enabled:
+        selected_lr, _, _ = _clamp_learning_rate(configured_lr, auto_cfg)
+        lr_factor = float(selected_lr / max(1e-12, float(configured_lr)))
+        lr_meta = {
+            "method": "config",
+            "reason": "lr_test_disabled",
+            "selected_lr_raw": float(configured_lr),
+            "selected_lr": float(selected_lr),
+        }
+        return float(selected_lr), lr_factor, "config", lr_meta
+
     lr_candidates = _build_lr_test_candidates(config)
     test_steps = _safe_int(auto_cfg.get("lr_test_steps"), 5)
     test_steps_cap = _safe_int(auto_cfg.get("lr_test_steps_cap"), 20)
     test_steps_cap = max(3, min(50, test_steps_cap))
     test_steps = max(3, min(test_steps_cap, test_steps))
     test_seed = _safe_int(auto_cfg.get("lr_test_seed"), 12345)
+    early_stop_patience = max(0, _safe_int(auto_cfg.get("lr_test_early_stop_patience"), 3))
+    early_stop_min_candidates = max(
+        1, _safe_int(auto_cfg.get("lr_test_early_stop_min_candidates"), 4)
+    )
+    early_stop_score_margin = max(
+        0.0, _safe_float(auto_cfg.get("lr_test_early_stop_score_margin"), 2e-4)
+    )
 
     il_cfg = config.get("imitation_learning", {}) or {}
     weight_decay = _safe_float(il_cfg.get("weight_decay"), 0.0)
@@ -838,6 +857,7 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
 
     best_entry = None
     lr_test_results = []
+    consecutive_clearly_worse = 0
 
     try:
         model.train()
@@ -949,6 +969,26 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
 
             if stable and (best_entry is None or entry["score"] > best_entry["score"]):
                 best_entry = entry
+                consecutive_clearly_worse = 0
+            elif early_stop_patience > 0 and best_entry is not None:
+                best_score = float(best_entry["score"])
+                clearly_worse = (
+                    (not stable)
+                    or (
+                        float(entry["score"]) < (best_score - early_stop_score_margin)
+                        and float(entry.get("improvement", float("-inf"))) <= 0.0
+                    )
+                )
+                if clearly_worse:
+                    consecutive_clearly_worse += 1
+                else:
+                    consecutive_clearly_worse = 0
+
+                if (
+                    len(lr_test_results) >= early_stop_min_candidates
+                    and consecutive_clearly_worse >= early_stop_patience
+                ):
+                    break
     finally:
         model.load_state_dict(baseline_state, strict=True)
         _clear_probe_state(model, device)
@@ -1012,6 +1052,9 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
         "lr_max": float(lr_max),
         "test_steps": int(test_steps),
         "test_seed": int(test_seed),
+        "early_stop_patience": int(early_stop_patience),
+        "early_stop_min_candidates": int(early_stop_min_candidates),
+        "early_stop_score_margin": float(early_stop_score_margin),
         "candidates": [float(v) for v in lr_candidates],
         "results": lr_test_results,
         "best_entry": best_entry,
