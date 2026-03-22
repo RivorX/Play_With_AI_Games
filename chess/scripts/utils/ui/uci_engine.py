@@ -23,7 +23,7 @@ script_dir = Path(__file__).resolve().parent
 chess_dir = script_dir.parents[2]
 sys.path.insert(0, str(chess_dir))
 
-from src.mcts import MCTS, select_move_by_visits
+from src.batch_selfplay import MCTS, select_move_by_visits
 from src.model import ChessNet
 from src.utils.data_helpers import board_to_tensor, move_to_index
 

@@ -26,7 +26,7 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet
-from src.mcts import MCTS, select_move_by_visits
+from src.batch_selfplay import MCTS, select_move_by_visits
 
 #  v4.2: Import board_to_tensor from data_helpers
 #  v4.4: Added move_to_index for POV-aware move encoding

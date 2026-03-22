@@ -57,7 +57,13 @@ class TrainingLogger:
                     # 📊 NEW: Metrics
                     'policy_top1_acc', 'policy_top3_acc',
                     'value_mae', 'value_mae_weighted',
-                    'value_wdl_acc', 'value_wdl_ce'
+                    'value_wdl_acc', 'value_wdl_ce',
+                    # 🧠 RL stability telemetry
+                    'completed_draw_rate', 'dynamic_uniform_fraction',
+                    'priority_age_decay_lambda', 'avg_sample_age',
+                    'avg_game_value', 'value_std',
+                    'policy_entropy', 'value_pred_std',
+                    'estimated_elo',
                 ]
             
             writer.writerow(header)
@@ -161,7 +167,7 @@ class TrainingLogger:
 
     def record_estimated_elo(self, iteration, estimated_elo, update_csv=True):
         """Record estimated Elo for a specific epoch/iteration (supports async updates)."""
-        if self.mode != "il" or estimated_elo is None:
+        if estimated_elo is None:
             return
 
         try:
@@ -218,13 +224,13 @@ class TrainingLogger:
 
     def get_latest_estimated_elo(self):
         """Return latest known Elo value or None."""
-        if self.mode != "il" or not self.estimated_elos:
+        if not self.estimated_elos:
             return None
         return float(self.estimated_elos[-1][1])
 
     def get_latest_estimated_elo_with_epoch(self):
         """Return (epoch, elo) for latest known Elo, or (None, None)."""
-        if self.mode != "il" or not self.estimated_elos:
+        if not self.estimated_elos:
             return None, None
         epoch, elo = self.estimated_elos[-1]
         try:
@@ -644,8 +650,25 @@ class TrainingLogger:
                     train_metrics.get('value_mae', '') if train_metrics else '',
                     train_metrics.get('value_mae_weighted', '') if train_metrics else '',
                     train_metrics.get('value_wdl_acc', '') if train_metrics else '',
-                    train_metrics.get('value_wdl_ce', '') if train_metrics else ''
+                    train_metrics.get('value_wdl_ce', '') if train_metrics else '',
+                    kwargs.get('completed_draw_rate', ''),
+                    kwargs.get('dynamic_uniform_fraction', ''),
+                    kwargs.get('priority_age_decay_lambda', ''),
+                    kwargs.get('avg_sample_age', ''),
+                    kwargs.get('avg_game_value', ''),
+                    kwargs.get('value_std', ''),
+                    kwargs.get('policy_entropy', ''),
+                    kwargs.get('value_pred_std', ''),
                 ]
+
+                if estimated_elo is not None:
+                    try:
+                        row.append(int(round(float(estimated_elo))))
+                    except (TypeError, ValueError):
+                        row.append('')
+                        estimated_elo = None
+                else:
+                    row.append('')
                 
                 # Store for plotting
                 self.iterations.append(iteration)
@@ -667,6 +690,9 @@ class TrainingLogger:
                 
                 if 'temperature' in kwargs and kwargs['temperature'] is not None:
                     self.temperatures.append((iteration, kwargs['temperature']))
+
+                if estimated_elo is not None:
+                    self.record_estimated_elo(iteration, estimated_elo, update_csv=False)
             
             writer.writerow(row)
     
@@ -1042,8 +1068,6 @@ class TrainingLogger:
         ax = axes[1, 1]
         if self.train_value_mae:
             ax.plot(self.iterations, self.train_value_mae, 'r-', label='Value MAE', linewidth=2)
-        if self.train_value_mae_weighted:
-            ax.plot(self.iterations, self.train_value_mae_weighted, 'r--', label='Value MAE (weighted)', linewidth=2, alpha=0.8)
         ax.set_xlabel('Iteration')
         ax.set_ylabel('MAE')
         ax.set_title('Value MAE')
@@ -1095,8 +1119,6 @@ class TrainingLogger:
                 summary_lines.append(f"Policy Top-3: {self.train_policy_top3[-1]:.2%}")
             if self.train_value_mae:
                 summary_lines.append(f"Value MAE: {self.train_value_mae[-1]:.4f}")
-            if self.train_value_mae_weighted:
-                summary_lines.append(f"Value MAE (w): {self.train_value_mae_weighted[-1]:.4f}")
             if self.train_value_wdl_acc:
                 summary_lines.append(f"WDL Acc: {self.train_value_wdl_acc[-1]:.2%}")
             if self.train_value_wdl_ce:

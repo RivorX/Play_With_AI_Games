@@ -10,6 +10,7 @@ Data processing helper functions for chess AI
 import chess
 import numpy as np
 import struct
+from functools import lru_cache
 
 
 # ==============================================================================
@@ -44,6 +45,11 @@ def compute_discounted_outcome(move_idx, total_moves, result, current_turn):
 # POV (POINT OF VIEW) BOARD REPRESENTATION
 # ==============================================================================
 
+_SQUARE_ROWS = tuple(square // 8 for square in range(64))
+_SQUARE_COLS = tuple(square % 8 for square in range(64))
+_SQUARE_ROWS_FLIPPED = tuple(7 - row for row in _SQUARE_ROWS)
+_SQUARE_COLS_FLIPPED = tuple(7 - col for col in _SQUARE_COLS)
+
 def board_to_tensor(board, flip_perspective=None):
     """
     Convert chess.Board to tensor representation with POV (Point of View)
@@ -77,36 +83,18 @@ def board_to_tensor(board, flip_perspective=None):
         should_flip = (board.turn == chess.BLACK)
     else:
         should_flip = flip_perspective
+    pov_color = chess.BLACK if should_flip else chess.WHITE
+    rows = _SQUARE_ROWS_FLIPPED if should_flip else _SQUARE_ROWS
+    cols = _SQUARE_COLS_FLIPPED if should_flip else _SQUARE_COLS
     
     # === PIECE PLANES (0-11) ===
     # Use piece_map() for much faster iteration than 64 piece_at() calls
     for square, piece in board.piece_map().items():
-        # Get original coordinates
-        row = square // 8
-        col = square % 8
-        
-        # Flip if needed (black's perspective)
-        if should_flip:
-            row = 7 - row
-            col = 7 - col
-        
-        # Get piece index (PAWN=1 -> 0, KNIGHT=2 -> 1, etc.)
+        row = rows[square]
+        col = cols[square]
         piece_idx = piece.piece_type - 1
-        
-        # Determine if this piece belongs to current player or opponent
-        if should_flip:
-            # Black to move
-            if piece.color == chess.BLACK:
-                channel = piece_idx  # Current player (0-5)
-            else:
-                channel = piece_idx + 6  # Opponent (6-11)
-        else:
-            # White to move
-            if piece.color == chess.WHITE:
-                channel = piece_idx  # Current player (0-5)
-            else:
-                channel = piece_idx + 6  # Opponent (6-11)
-        
+
+        channel = piece_idx if piece.color == pov_color else piece_idx + 6
         tensor[channel, row, col] = 1.0
     
     # === METADATA PLANES (12-15) ===
@@ -471,8 +459,19 @@ def move_to_index(move, board):
     Convert chess.Move to AlphaZero-style index (8x8x73) with POV rotation.
     """
     is_black_turn = (board.turn == chess.BLACK)
-    from_square = _to_pov_square(move.from_square, is_black_turn)
-    to_square = _to_pov_square(move.to_square, is_black_turn)
+    return _move_to_index_cached(
+        move.from_square,
+        move.to_square,
+        move.promotion or 0,
+        is_black_turn,
+    )
+
+
+@lru_cache(maxsize=65536)
+def _move_to_index_cached(from_square_raw, to_square_raw, promotion, is_black_turn):
+    from_square = _to_pov_square(from_square_raw, is_black_turn)
+    to_square = _to_pov_square(to_square_raw, is_black_turn)
+    promotion = promotion or None
 
     from_row, from_col = _square_to_coords(from_square)
     to_row, to_col = _square_to_coords(to_square)
@@ -480,11 +479,14 @@ def move_to_index(move, board):
     dc = to_col - from_col
 
     # Underpromotions use dedicated planes.
-    if move.promotion in _UNDERPROMOTION_PIECE_TO_INDEX:
-        piece_idx = _UNDERPROMOTION_PIECE_TO_INDEX[move.promotion]
+    if promotion in _UNDERPROMOTION_PIECE_TO_INDEX:
+        piece_idx = _UNDERPROMOTION_PIECE_TO_INDEX[promotion]
         dir_idx = _UNDERPROMOTION_DELTA_TO_INDEX.get((dr, dc))
         if dir_idx is None:
-            raise ValueError(f"Unsupported underpromotion delta: {(dr, dc)} for move {move}")
+            raise ValueError(
+                f"Unsupported underpromotion delta: {(dr, dc)} for move "
+                f"({from_square_raw}->{to_square_raw}, promotion={promotion})"
+            )
         plane = 64 + piece_idx * 3 + dir_idx
         return from_square * ACTION_PLANES + plane
 
@@ -498,7 +500,10 @@ def move_to_index(move, board):
     if knight_idx is not None:
         return from_square * ACTION_PLANES + (56 + knight_idx)
 
-    raise ValueError(f"Unsupported move for AZ action encoding: {move} (delta={(dr, dc)})")
+    raise ValueError(
+        f"Unsupported move for AZ action encoding: "
+        f"({from_square_raw}->{to_square_raw}, promotion={promotion}) (delta={(dr, dc)})"
+    )
 
 
 def index_to_move(index, is_black_turn=False, board=None):
