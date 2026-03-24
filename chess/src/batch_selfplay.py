@@ -17,6 +17,48 @@ from src.data import board_to_tensor, move_to_index
 
 
 _EMPTY_HISTORY_TENSOR = np.zeros((16, 8, 8), dtype=np.float32)
+_SELFPLAY_OPENING_LINES = (
+    ("e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"),
+    ("e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6"),
+    ("e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4"),
+    ("e2e4", "c7c5", "g1f3", "b8c6", "d2d4", "c5d4"),
+    ("e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "g8f6"),
+    ("e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4"),
+    ("d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6"),
+    ("d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "f8g7"),
+    ("d2d4", "g8f6", "c2c4", "e7e6", "g1f3", "d7d5"),
+    ("d2d4", "d7d5", "g1f3", "g8f6", "c2c4", "e7e6"),
+    ("c2c4", "e7e5", "b1c3", "g8f6", "g2g3", "d7d5"),
+    ("g1f3", "d7d5", "d2d4", "g8f6", "c2c4", "e7e6"),
+    ("g1f3", "g8f6", "c2c4", "g7g6", "b1c3", "f8g7"),
+    ("e2e4", "g8f6", "e4e5", "f6d5", "d2d4", "d7d6"),
+    ("d2d4", "f7f5", "g2g3", "g8f6", "f1g2", "e7e6"),
+    ("e2e4", "d7d5", "e4d5", "d8d5", "b1c3", "d5a5"),
+)
+
+# Keep eval fixed openings relatively balanced, but let self-play sample from
+# a broader, sharper pool so RL escapes quiet draw-heavy shells more often.
+_SELFPLAY_SHARP_OPENING_LINES = (
+    ("e2e4", "e7e5", "f2f4", "e5f4", "g1f3", "g7g5"),
+    ("e2e4", "e7e5", "b1c3", "g8f6", "f2f4", "d7d5"),
+    ("e2e4", "e7e5", "g1f3", "b8c6", "d2d4", "e5d4", "f1c4"),
+    ("e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5", "b2b4", "c5b4", "c2c3"),
+    ("e2e4", "e7e5", "d2d4", "e5d4", "c2c3", "d4c3", "f1c4"),
+    ("e2e4", "c7c5", "d2d4", "c5d4", "c2c3", "d4c3", "b1c3"),
+    ("e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3", "a7a6"),
+    ("e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3", "g7g6"),
+    ("e2e4", "c7c5", "b1c3", "b8c6", "f2f4", "g7g6", "g1f3", "f8g7"),
+    ("e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "f8b4", "e4e5", "c7c5"),
+    ("e2e4", "c7c6", "d2d4", "d7d5", "e4d5", "c6d5", "c2c4"),
+    ("e2e4", "d7d5", "e4d5", "g8f6", "c2c4", "e7e6", "b1c3", "e6d5"),
+    ("d2d4", "g8f6", "c2c4", "c7c5", "d4d5", "b7b5", "c4b5", "a7a6"),
+    ("d2d4", "g8f6", "c2c4", "c7c5", "d4d5", "e7e6", "b1c3", "e6d5", "c4d5", "d7d6"),
+    ("d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "f8g7", "e2e4", "d7d6", "f2f4"),
+    ("d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "d7d5", "c4d5", "f6d5", "e2e4"),
+    ("d2d4", "f7f5", "e2e4", "f5e4", "b1c3", "g8f6", "c1g5"),
+    ("d2d4", "g8f6", "c2c4", "e7e5", "d4e5", "f6g4"),
+)
+_SELFPLAY_SELFPLAY_OPENING_LINES = _SELFPLAY_OPENING_LINES + _SELFPLAY_SHARP_OPENING_LINES
 
 
 class MCTSNode:
@@ -33,10 +75,21 @@ class MCTSNode:
         self.base_prior = prior
 
         self.children = {}
+        self.child_nodes = []
+        self.child_moves = ()
+        self.child_priors = np.empty(0, dtype=np.float32)
+        self.child_base_priors = np.empty(0, dtype=np.float32)
+        self.child_visit_counts = np.empty(0, dtype=np.int32)
+        self.child_value_sums = np.empty(0, dtype=np.float32)
+        self.child_virtual_losses = np.empty(0, dtype=np.int16)
+        self.child_explored_flags = np.empty(0, dtype=np.bool_)
+        self.parent_edge_index = -1
         self.visit_count = 0
         self.value_sum = 0.0
         self.expanded = False
         self.virtual_loss = 0
+        self._is_explored = False
+        self._explored_prior_sum = 0.0
 
         self._fen_cache = None
         self._is_game_over = None
@@ -54,17 +107,92 @@ class MCTSNode:
     @property
     def is_game_over(self):
         if self._is_game_over is None:
-            self._is_game_over = self.board.is_game_over(claim_draw=True)
+            # In self-play we do not want "claimable draw" states (threefold/50-move
+            # claims) to look terminal to MCTS by default, otherwise the search
+            # eagerly settles for sterile repetitions.
+            self._is_game_over = self.board.is_game_over(claim_draw=False)
         return self._is_game_over
 
     def is_leaf(self):
         return not self.expanded
 
+    def _sync_parent_edge_stats(self):
+        if self.parent is None or self.parent_edge_index < 0:
+            return
+        idx = int(self.parent_edge_index)
+        self.parent.child_visit_counts[idx] = int(self.visit_count)
+        self.parent.child_value_sums[idx] = float(self.value_sum)
+        self.parent.child_virtual_losses[idx] = int(self.virtual_loss)
+        self.parent.child_explored_flags[idx] = bool(self._is_explored)
+
+    def _set_explored(self, explored):
+        explored = bool(explored)
+        if self._is_explored == explored:
+            return
+        self._is_explored = explored
+        if self.parent is None:
+            return
+        if self.parent_edge_index >= 0:
+            self.parent.child_explored_flags[int(self.parent_edge_index)] = explored
+        if explored:
+            self.parent._explored_prior_sum += float(self.prior)
+        else:
+            self.parent._explored_prior_sum -= float(self.prior)
+            if self.parent._explored_prior_sum < 0.0:
+                self.parent._explored_prior_sum = 0.0
+
     def add_virtual_loss(self, n=1):
+        was_explored = (self.visit_count + self.virtual_loss) > 0
         self.virtual_loss += n
+        if not was_explored and (self.visit_count + self.virtual_loss) > 0:
+            self._set_explored(True)
+        self._sync_parent_edge_stats()
 
     def remove_virtual_loss(self, n=1):
+        was_explored = (self.visit_count + self.virtual_loss) > 0
         self.virtual_loss -= n
+        if was_explored and (self.visit_count + self.virtual_loss) <= 0:
+            self._set_explored(False)
+        self._sync_parent_edge_stats()
+
+    def expand_children(self, legal_moves, legal_priors):
+        legal_moves = tuple(legal_moves)
+        legal_priors = np.asarray(legal_priors, dtype=np.float32)
+        child_count = len(legal_moves)
+
+        self.child_moves = legal_moves
+        self.child_priors = legal_priors.copy()
+        self.child_base_priors = legal_priors.copy()
+        self.child_visit_counts = np.zeros(child_count, dtype=np.int32)
+        self.child_value_sums = np.zeros(child_count, dtype=np.float32)
+        self.child_virtual_losses = np.zeros(child_count, dtype=np.int16)
+        self.child_explored_flags = np.zeros(child_count, dtype=np.bool_)
+        self.child_nodes = []
+        self.children = {}
+
+        for idx, (move, prior) in enumerate(zip(self.child_moves, self.child_priors)):
+            child = MCTSNode(
+                board=None,
+                parent=self,
+                move=move,
+                prior=float(prior),
+                copy_board=False,
+            )
+            child.base_prior = float(self.child_base_priors[idx])
+            child.parent_edge_index = idx
+            self.child_nodes.append(child)
+            self.children[move] = child
+
+        self.expanded = True
+
+    def iter_child_nodes(self):
+        return zip(self.child_moves, self.child_nodes)
+
+    def child_visit_dict(self):
+        return {
+            move: int(visits)
+            for move, visits in zip(self.child_moves, self.child_visit_counts)
+        }
 
     def get_fen(self):
         if self._fen_cache is None:
@@ -117,6 +245,41 @@ def _build_sparse_policy_target_from_visits(visit_counts, board):
         torch.from_numpy(indices),
         torch.from_numpy(probs.astype(np.float32, copy=False)),
     )
+
+
+def _pack_positions_for_transfer(positions):
+    """
+    Pack self-play positions into batched tensors for queue transport.
+    """
+    if not positions:
+        return None
+
+    batch_size = len(positions)
+    boards = torch.stack([pos[0] for pos in positions]).contiguous()
+    values = torch.stack([pos[3] for pos in positions]).contiguous()
+    max_len = max(int(pos[1].numel()) for pos in positions)
+
+    policy_indices = torch.full((batch_size, max_len), -1, dtype=torch.int16)
+    policy_values = torch.zeros((batch_size, max_len), dtype=torch.float32)
+    policy_lengths = torch.zeros((batch_size,), dtype=torch.int16)
+
+    for row_idx, pos in enumerate(positions):
+        _, indices, probs, _ = pos[:4]
+        count = int(indices.numel())
+        if count <= 0:
+            continue
+        policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
+        policy_values[row_idx, :count] = probs.to(dtype=torch.float32)
+        policy_lengths[row_idx] = count
+
+    return {
+        'boards': boards,
+        'policy_indices': policy_indices,
+        'policy_values': policy_values,
+        'policy_lengths': policy_lengths,
+        'values': values,
+        'num_positions': batch_size,
+    }
 
 
 def _move_selection_temperature(board, base_temperature, threshold_fullmoves):
@@ -272,6 +435,7 @@ class MultiGameBatchMCTS:
         self.use_amp = config.get('hardware', {}).get('use_amp', False) and self.device.type == 'cuda'
         self.amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
         self._empty_history_tensor = np.zeros((16, 8, 8), dtype=np.float32)
+        self._legal_index_scratch = {}
 
     @staticmethod
     def _is_encoded_history_entry(entry):
@@ -310,6 +474,8 @@ class MultiGameBatchMCTS:
             board_history: list of previous boards (from real game history)
         """
         if self.history_positions == 0:
+            if current_tensor is not None:
+                return current_tensor
             return board_to_tensor(current_board)
 
         history_tensors = []
@@ -339,10 +505,18 @@ class MultiGameBatchMCTS:
             node._board_tensor = cached
         return cached
 
+    def _get_legal_index_scratch(self, batch_size, max_legal_count):
+        key = (int(batch_size), int(max_legal_count))
+        scratch = self._legal_index_scratch.get(key)
+        if scratch is None:
+            scratch = np.empty((batch_size, max_legal_count), dtype=np.int64)
+            self._legal_index_scratch[key] = scratch
+        return scratch
+
     def _select_child(self, node):
         """Select child with highest UCB score (optimized)"""
-        best_score = -float('inf')
-        best_child = None
+        if not node.child_nodes:
+            return None
 
         # Precalculate parent term to avoid doing it for every child
         parent_visits = node.visit_count + node.virtual_loss
@@ -360,47 +534,43 @@ class MultiGameBatchMCTS:
                 fpu_value = float(self.fpu_absolute)
             elif parent_visits > 0:
                 parent_q = (node.value_sum - node.virtual_loss) / parent_visits
-                explored_prior = 0.0
-                for child in node.children.values():
-                    if (child.visit_count + child.virtual_loss) > 0:
-                        explored_prior += child.prior
+                explored_prior = min(1.0, max(0.0, float(node._explored_prior_sum)))
                 unexplored_prior = max(0.0, 1.0 - explored_prior)
                 fpu_value = parent_q - self.fpu_reduction * math.sqrt(unexplored_prior)
 
-        for _, child in node.children.items():
-            # Inline value() and ucb_score() for speed
-            cv = child.visit_count + child.virtual_loss
-            if cv == 0:
-                q_value = fpu_value
-            else:
-                q_value = (child.value_sum - child.virtual_loss) / cv
-                
-            u_value = c_puct * child.prior * parent_sqrt / (1 + cv)
-            score = q_value + u_value
-
-            if score > best_score:
-                best_score = score
-                best_child = child
-
-        return best_child
+        cv = node.child_visit_counts.astype(np.float32, copy=False) + node.child_virtual_losses.astype(np.float32, copy=False)
+        q_values = np.full(cv.shape, fpu_value, dtype=np.float32)
+        explored_mask = cv > 0
+        if np.any(explored_mask):
+            q_values[explored_mask] = (
+                node.child_value_sums[explored_mask] - node.child_virtual_losses[explored_mask].astype(np.float32, copy=False)
+            ) / cv[explored_mask]
+        u_values = c_puct * node.child_priors * parent_sqrt / (1.0 + cv)
+        best_idx = int(np.argmax(q_values + u_values))
+        return node.child_nodes[best_idx]
 
     def _apply_root_noise(self, node):
         """Apply fresh Dirichlet noise to an already expanded root node."""
-        if self.dirichlet_weight <= 0 or not node.children:
+        if self.dirichlet_weight <= 0 or not node.child_nodes:
             return
 
-        children = list(node.children.values())
+        children = node.child_nodes
         noise = np.random.dirichlet([self.dirichlet_alpha] * len(children))
         mix = self.dirichlet_weight
 
-        for child, noise_value in zip(children, noise):
-            child.prior = (1.0 - mix) * child.base_prior + mix * float(noise_value)
+        for idx, (child, noise_value) in enumerate(zip(children, noise)):
+            new_prior = (1.0 - mix) * float(node.child_base_priors[idx]) + mix * float(noise_value)
+            if child._is_explored:
+                node._explored_prior_sum += float(new_prior - child.prior)
+            node.child_priors[idx] = new_prior
+            child.prior = new_prior
 
     def _backpropagate(self, search_path, value):
         """Backpropagate value"""
         for node in reversed(search_path):
             node.value_sum += value
             node.visit_count += 1
+            node._sync_parent_edge_stats()
             value = -value
 
     def search_many(self, game_states, num_simulations, add_root_noise=False):
@@ -430,11 +600,12 @@ class MultiGameBatchMCTS:
                     if root.get_fen() == target_fen:
                         pass
                     else:
-                        for _, child in root.children.items():
+                        for _, child in root.iter_child_nodes():
                             if child.get_fen() == target_fen:
                                 _ = child.board  # Ensure board is instantiated
                                 root = child
                                 root.parent = None
+                                root.parent_edge_index = -1
                                 break
                         else:
                             root = MCTSNode(board)
@@ -522,7 +693,7 @@ class MultiGameBatchMCTS:
                     node.remove_virtual_loss()
 
         return [
-            {move: child.visit_count for move, child in gs['root'].children.items()}
+            gs['root'].child_visit_dict()
             for gs in game_states
         ]
 
@@ -548,7 +719,7 @@ class MultiGameBatchMCTS:
 
         for node, gi in unique_entries:
             if node.is_game_over:
-                result = node.board.result(claim_draw=True)
+                result = node.board.result(claim_draw=False)
                 if result == '1-0':
                     value = 1.0 if node.board.turn == chess.WHITE else -1.0
                 elif result == '0-1':
@@ -614,10 +785,11 @@ class MultiGameBatchMCTS:
 
                 # Gather only legal move logits on GPU before transferring to CPU.
                 if max_legal_count > 0:
-                    legal_index_matrix = np.zeros(
-                        (len(non_terminal_nodes), max_legal_count),
-                        dtype=np.int64,
+                    legal_index_matrix = self._get_legal_index_scratch(
+                        len(non_terminal_nodes),
+                        max_legal_count,
                     )
+                    legal_index_matrix.fill(0)
                     for row_idx, legal_indices in enumerate(legal_indices_per_node):
                         legal_count = legal_counts[row_idx]
                         if legal_count:
@@ -658,15 +830,7 @@ class MultiGameBatchMCTS:
 
                 # Expand only if not already expanded (avoid overwriting priors in same batch)
                 if not node.expanded:
-                    for move, prior in zip(legal_moves, legal_probs):
-                        node.children[move] = MCTSNode(
-                            board=None,
-                            parent=node,
-                            move=move,
-                            prior=prior,
-                            copy_board=False,
-                        )
-                    node.expanded = True
+                    node.expand_children(legal_moves, legal_probs)
 
                 values_by_node_id[id(node)] = value
 
@@ -722,6 +886,7 @@ class BatchMCTS:
             return
         _ = child.board
         child.parent = None
+        child.parent_edge_index = -1
         self.root = child
         self._root_synced = True
 
@@ -742,57 +907,105 @@ class BatchSelfPlayMCTSBatch:
     True batch self-play: multiple games in parallel, shared GPU eval batches.
     """
 
-    def __init__(self, model, config, device, max_batch_games_per_worker, opponent_model=None):
+    def __init__(
+        self,
+        model,
+        config,
+        device,
+        max_batch_games_per_worker,
+        opponent_model=None,
+        opponent_source_label="current",
+    ):
         self.model = model
-        self.opponent_model = opponent_model
         self.config = config
         self.device = device
         self.model.eval()
-        if self.opponent_model is not None:
-            self.opponent_model.eval()
+        self.opponent_model = opponent_model
+        self.opponent_source_label = str(opponent_source_label or "current")
         rl_cfg = config.get('reinforcement_learning', {})
 
-        # Use multi-game MCTS (dual-model optional: primary vs opponent)
         self.mcts = MultiGameBatchMCTS(model, config, device)
-        self.opponent_mcts = MultiGameBatchMCTS(opponent_model, config, device) if opponent_model is not None else None
-        self.dual_model_enabled = bool(self.opponent_mcts is not None and rl_cfg.get('league_dual_color_models_enabled', True))
-        self.train_primary_positions_only = bool(
-            rl_cfg.get('league_train_primary_positions_only', True)
+        self.opponent_mcts = (
+            MultiGameBatchMCTS(opponent_model, config, device)
+            if opponent_model is not None
+            else None
         )
 
         if device.type == 'cuda':
             self.model = self.model.to(memory_format=torch.channels_last)
-            if self.opponent_model is not None:
-                self.opponent_model = self.opponent_model.to(memory_format=torch.channels_last)
 
-        self.num_simulations = config['reinforcement_learning']['mcts_simulations']
+        self.num_simulations = int(config['reinforcement_learning']['mcts_simulations'])
         self.temp_threshold = config['reinforcement_learning']['mcts_temperature_threshold']
         self.temperature = config['reinforcement_learning'].get('mcts_temperature', 1.0)
         self.max_moves = _resolve_selfplay_max_moves(config)
-
-        # Optional draw shaping to reduce drawish equilibria in very long games.
-        self.draw_value_shaping_enabled = bool(
-            rl_cfg.get('draw_value_shaping_enabled', False)
+        self.auto_claim_draw = bool(rl_cfg.get('self_play_auto_claim_draw', False))
+        self.claim_draw_after_moves = max(
+            0,
+            int(rl_cfg.get('self_play_claim_draw_after_moves', self.max_moves)),
         )
-        self.draw_value_shaping_after_moves = int(
-            rl_cfg.get('draw_value_shaping_after_moves', max(1, self.max_moves // 2))
+        self.claim_repetition_after_moves = max(
+            0,
+            int(rl_cfg.get('self_play_claim_repetition_after_moves', min(self.claim_draw_after_moves, 80))),
         )
-        self.draw_value_shaping_max_penalty = float(
-            rl_cfg.get('draw_value_shaping_max_penalty', 0.08)
-        )
-        self.draw_value_shaping_power = float(
-            rl_cfg.get('draw_value_shaping_power', 1.5)
-        )
-
-        # Optional safe resign logic to force decisive outcomes without
-        # triggering on noisy single-step value estimates.
-        self.resign_enabled = bool(rl_cfg.get('resign_enabled', False))
-        self.resign_threshold = float(rl_cfg.get('resign_threshold', -0.9))
-        self.resign_min_moves = int(rl_cfg.get('resign_min_moves', 40))
-        self.resign_check_interval = max(1, int(rl_cfg.get('resign_check_interval', 4)))
-        self.resign_required_confirmations = max(
+        self.progress_report_interval_games = max(
             1,
-            int(rl_cfg.get('resign_required_confirmations', 3)),
+            int(rl_cfg.get('self_play_progress_interval_games', 1)),
+        )
+        self.opening_diversity_enabled = bool(
+            rl_cfg.get('self_play_opening_diversity_enabled', False)
+        )
+        self.opening_diversity_fraction = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('self_play_opening_diversity_fraction', 0.5))),
+        )
+        self.opening_diversity_min_plies = max(
+            0,
+            int(rl_cfg.get('self_play_opening_diversity_min_plies', 2)),
+        )
+        self.opening_diversity_max_plies = max(
+            self.opening_diversity_min_plies,
+            int(rl_cfg.get('self_play_opening_diversity_max_plies', 6)),
+        )
+        self.adjudication_enabled = bool(rl_cfg.get('self_play_adjudication_enabled', False))
+        self.adjudication_min_moves = max(
+            0,
+            int(rl_cfg.get('self_play_adjudication_min_moves', 80)),
+        )
+        self.adjudication_threshold = min(
+            0.999,
+            max(0.0, float(rl_cfg.get('self_play_adjudication_threshold', 0.92))),
+        )
+        self.adjudication_patience = max(
+            1,
+            int(rl_cfg.get('self_play_adjudication_patience', 6)),
+        )
+        self.resignation_enabled = bool(rl_cfg.get('self_play_resignation_enabled', False))
+        self.resignation_min_moves = max(
+            0,
+            int(rl_cfg.get('self_play_resignation_min_moves', 60)),
+        )
+        self.resignation_threshold = min(
+            0.999,
+            max(0.0, float(rl_cfg.get('self_play_resignation_threshold', 0.92))),
+        )
+        self.resignation_patience = max(
+            1,
+            int(rl_cfg.get('self_play_resignation_patience', 3)),
+        )
+        self.resignation_disable_fraction = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('self_play_resignation_disable_fraction', 0.10))),
+        )
+        self.randomize_learner_color = bool(rl_cfg.get('self_play_randomize_learner_color', True))
+        self.replay_dynamic_cap_enabled = bool(rl_cfg.get('replay_dynamic_cap_enabled', False))
+        self.replay_cap_fraction_decisive = float(rl_cfg.get('replay_cap_fraction_decisive', 0.60))
+        self.replay_cap_fraction_draw = float(rl_cfg.get('replay_cap_fraction_draw', 0.15))
+        self.replay_cap_min_positions = int(rl_cfg.get('replay_cap_min_positions', 16))
+        self.replay_cap_max_positions = int(rl_cfg.get('replay_cap_max_positions', 120))
+        
+        self.max_positions_per_game = max(
+            0,
+            int(rl_cfg.get('replay_max_positions_per_game', 32)),
         )
 
         self.max_batch_games_per_worker = max(1, int(max_batch_games_per_worker))
@@ -800,35 +1013,347 @@ class BatchSelfPlayMCTSBatch:
         self._games_completed = 0
         self._progress_base = 0
 
-    def _is_primary_to_move(self, gs):
-        return gs['board'].turn == gs['primary_color']
-
-    def _active_mcts_for_game(self, gs):
-        if not self.dual_model_enabled:
-            return self.mcts
-        return self.mcts if self._is_primary_to_move(gs) else self.opponent_mcts
-
-    def _active_root_keys_for_game(self, gs):
-        if not self.dual_model_enabled:
-            return 'root', '_root_synced', None, None
-        if self._is_primary_to_move(gs):
-            return 'root_primary', '_root_primary_synced', 'root_opponent', '_root_opponent_synced'
-        return 'root_opponent', '_root_opponent_synced', 'root_primary', '_root_primary_synced'
-
     def _compute_draw_value_target(self, move_count):
-        """Return shaped draw target in [-1, 0], stronger only for long draws."""
-        if not self.draw_value_shaping_enabled:
-            return 0.0
-        if self.draw_value_shaping_max_penalty <= 0:
-            return 0.0
-        if move_count <= self.draw_value_shaping_after_moves:
-            return 0.0
+        del move_count
+        # Keep draw targets centered at 0. Non-zero draw values bias both sides in
+        # the same direction and break the zero-sum calibration expected by MCTS.
+        return 0.0
 
-        den = max(1, self.max_moves - self.draw_value_shaping_after_moves)
-        progress = (move_count - self.draw_value_shaping_after_moves) / den
-        progress = max(0.0, min(1.0, progress))
-        shaped = -self.draw_value_shaping_max_penalty * (progress ** self.draw_value_shaping_power)
-        return float(max(-1.0, min(0.0, shaped)))
+    def _select_top_scored_candidates(self, candidates, effective_cap, history_len):
+        if effective_cap <= 0 or len(candidates) <= effective_cap:
+            return list(candidates)
+        del history_len
+        positions = np.linspace(0, len(candidates) - 1, num=effective_cap)
+        selected_ids = {int(round(pos)) for pos in positions}
+        selected = []
+        for idx, item in enumerate(candidates):
+            if idx in selected_ids:
+                selected.append(item)
+        return selected
+
+    def _allocate_draw_stratified_caps(self, buckets, effective_cap):
+        bucket_count = len(buckets)
+        allocations = [0] * bucket_count
+        if effective_cap <= 0 or bucket_count <= 0:
+            return allocations
+
+        bucket_sizes = [len(bucket) for bucket in buckets]
+        non_empty = [idx for idx, size in enumerate(bucket_sizes) if size > 0]
+        if not non_empty:
+            return allocations
+
+        if effective_cap < len(non_empty):
+            desired = []
+            for idx in range(bucket_count):
+                if bucket_sizes[idx] <= 0:
+                    desired.append(0.0)
+                elif idx == bucket_count - 1:
+                    desired.append(1.0)
+                elif idx == bucket_count - 2:
+                    desired.append(0.75)
+                else:
+                    desired.append(0.5)
+        else:
+            desired = [0.20, 0.35, 0.45]
+
+        remaining = int(effective_cap)
+        for idx in non_empty:
+            allocations[idx] = 1
+            remaining -= 1
+
+        if remaining <= 0:
+            return allocations
+
+        desired_counts = [float(effective_cap) * desired[idx] for idx in range(bucket_count)]
+        remainders = []
+        for idx in range(bucket_count):
+            if bucket_sizes[idx] <= allocations[idx]:
+                continue
+            extra = int(math.floor(max(0.0, desired_counts[idx] - allocations[idx])))
+            if extra > 0:
+                grant = min(extra, bucket_sizes[idx] - allocations[idx], remaining)
+                allocations[idx] += grant
+                remaining -= grant
+            remainder = max(0.0, desired_counts[idx] - allocations[idx])
+            remainders.append((remainder, idx))
+
+        while remaining > 0:
+            progressed = False
+            remainders.sort(key=lambda pair: (-pair[0], pair[1]))
+            for _, idx in remainders:
+                if remaining <= 0:
+                    break
+                if allocations[idx] >= bucket_sizes[idx]:
+                    continue
+                allocations[idx] += 1
+                remaining -= 1
+                progressed = True
+            if not progressed:
+                break
+
+        if remaining > 0:
+            fill_order = sorted(
+                non_empty,
+                key=lambda idx: (
+                    -bucket_sizes[idx],
+                    -desired_counts[idx],
+                    -idx,
+                ),
+            )
+            while remaining > 0:
+                progressed = False
+                for idx in fill_order:
+                    if remaining <= 0:
+                        break
+                    if allocations[idx] >= bucket_sizes[idx]:
+                        continue
+                    allocations[idx] += 1
+                    remaining -= 1
+                    progressed = True
+                if not progressed:
+                    break
+
+        return allocations
+
+    def _select_draw_candidates_stratified(self, candidates, effective_cap, history_len):
+        if effective_cap <= 0 or len(candidates) <= effective_cap:
+            return list(candidates)
+
+        if effective_cap < 3:
+            return self._select_top_scored_candidates(candidates, effective_cap, history_len)
+
+        denom = float(max(1, history_len - 1))
+        buckets = [[], [], []]
+        for item in candidates:
+            progress = float(item['history_idx']) / denom
+            if progress < (1.0 / 3.0):
+                buckets[0].append(item)
+            elif progress < (2.0 / 3.0):
+                buckets[1].append(item)
+            else:
+                buckets[2].append(item)
+
+        allocations = self._allocate_draw_stratified_caps(buckets, effective_cap)
+        selected = []
+        selected_ids = set()
+        for bucket, bucket_cap in zip(buckets, allocations):
+            for item in self._select_top_scored_candidates(bucket, bucket_cap, history_len):
+                history_idx = int(item['history_idx'])
+                if history_idx in selected_ids:
+                    continue
+                selected.append(item)
+                selected_ids.add(history_idx)
+
+        if len(selected) < effective_cap:
+            leftovers = [
+                item for item in candidates
+                if int(item['history_idx']) not in selected_ids
+            ]
+            for item in self._select_top_scored_candidates(
+                leftovers,
+                effective_cap - len(selected),
+                history_len,
+            ):
+                history_idx = int(item['history_idx'])
+                if history_idx in selected_ids:
+                    continue
+                selected.append(item)
+                selected_ids.add(history_idx)
+
+        return selected
+
+    def _select_history_indices_to_keep(self, candidates, history_len, is_decisive=False):
+        total_candidates = len(candidates)
+        if total_candidates <= 0:
+            return [], 0, 0
+
+        filtered = list(candidates)
+        curriculum_dropped = 0
+
+        # Determine effective cap limits
+        if self.replay_dynamic_cap_enabled:
+            fraction = self.replay_cap_fraction_decisive if is_decisive else self.replay_cap_fraction_draw
+            effective_cap = int(math.ceil(len(filtered) * fraction))
+            effective_cap = max(self.replay_cap_min_positions, effective_cap)
+            effective_cap = min(self.replay_cap_max_positions, effective_cap)
+        else:
+            effective_cap = self.max_positions_per_game
+
+        if effective_cap <= 0 or len(filtered) <= effective_cap:
+            selected = filtered
+            cap_dropped = 0
+        else:
+            if is_decisive:
+                selected = self._select_top_scored_candidates(filtered, effective_cap, history_len)
+            else:
+                selected = self._select_draw_candidates_stratified(filtered, effective_cap, history_len)
+            cap_dropped = len(filtered) - len(selected)
+
+        selected.sort(key=lambda item: int(item['history_idx']))
+        return selected, int(curriculum_dropped), int(cap_dropped)
+
+    def _build_candidate_positions(self, gs, outcome, draw_value_target=0.0):
+        candidate_positions = []
+        is_draw = (outcome == 0.0)
+        for history_idx, history_entry in enumerate(gs['game_history']):
+            history_count, policy_indices, policy_values, turn = history_entry
+            if is_draw:
+                value = draw_value_target
+            else:
+                value = outcome if turn == chess.WHITE else -outcome
+            candidate_positions.append({
+                'history_idx': history_idx,
+                'history_count': history_count,
+                'policy_indices': policy_indices,
+                'policy_values': policy_values,
+                'turn': turn,
+                'value': value,
+            })
+        return candidate_positions
+
+    def _append_selected_positions_from_game(
+        self,
+        positions,
+        gs,
+        outcome,
+        *,
+        history_positions,
+    ):
+        history_len = len(gs['game_history'])
+        candidate_positions = self._build_candidate_positions(gs, outcome, draw_value_target=0.0)
+        selected_positions, curriculum_dropped, cap_dropped = self._select_history_indices_to_keep(
+            candidate_positions,
+            history_len,
+            is_decisive=(outcome != 0.0),
+        )
+
+        for item in selected_positions:
+            board_tensor_np = _build_history_tensor_from_encoded(
+                turn=item['turn'],
+                encoded_history=gs['board_history'],
+                history_count=item['history_count'],
+                history_positions=history_positions,
+                empty_history_tensor=_EMPTY_HISTORY_TENSOR,
+            )
+            board_tensor = torch.from_numpy(board_tensor_np)
+            positions.append((
+                board_tensor,
+                item['policy_indices'],
+                item['policy_values'],
+                torch.tensor([item['value']], dtype=torch.float32),
+            ))
+
+        return history_len, int(curriculum_dropped), int(cap_dropped)
+
+    def _should_auto_claim_draw(self, board, move_count):
+        if not self.auto_claim_draw:
+            return False
+        try:
+            if move_count >= self.claim_repetition_after_moves:
+                claim_threefold = getattr(board, 'can_claim_threefold_repetition', None)
+                if callable(claim_threefold) and bool(claim_threefold()):
+                    return True
+            if move_count < self.claim_draw_after_moves:
+                return False
+            return bool(board.can_claim_draw())
+        except Exception:
+            return False
+
+    def _sample_opening_prefix(self):
+        if not self.opening_diversity_enabled:
+            return ()
+        if self.opening_diversity_fraction <= 0.0:
+            return ()
+        if np.random.random() > self.opening_diversity_fraction:
+            return ()
+
+        line = _SELFPLAY_SELFPLAY_OPENING_LINES[
+            int(np.random.randint(0, len(_SELFPLAY_SELFPLAY_OPENING_LINES)))
+        ]
+        max_plies = min(len(line), self.opening_diversity_max_plies)
+        min_plies = min(max_plies, self.opening_diversity_min_plies)
+        if max_plies <= 0:
+            return ()
+        if min_plies >= max_plies:
+            plies = max_plies
+        else:
+            plies = int(np.random.randint(min_plies, max_plies + 1))
+        return line[:plies]
+
+    def _maybe_adjudicate_game(self, gs, root, board):
+        if not self.adjudication_enabled or root is None:
+            return None
+        if gs['move_count'] < self.adjudication_min_moves:
+            return None
+        visits = int(getattr(root, 'visit_count', 0) or 0)
+        if visits <= 0:
+            return None
+
+        root_value = float(root.value_sum / max(1, visits))
+        white_value = root_value if board.turn == chess.WHITE else -root_value
+        threshold = self.adjudication_threshold
+
+        if white_value >= threshold:
+            gs['white_advantage_streak'] = int(gs.get('white_advantage_streak', 0)) + 1
+            gs['black_advantage_streak'] = 0
+            if gs['white_advantage_streak'] >= self.adjudication_patience:
+                return '1-0'
+        elif white_value <= -threshold:
+            gs['black_advantage_streak'] = int(gs.get('black_advantage_streak', 0)) + 1
+            gs['white_advantage_streak'] = 0
+            if gs['black_advantage_streak'] >= self.adjudication_patience:
+                return '0-1'
+        else:
+            gs['white_advantage_streak'] = 0
+            gs['black_advantage_streak'] = 0
+
+        return None
+
+    def _maybe_resign_game(self, gs, root, board):
+        if not self.resignation_enabled or gs.get('resignation_disabled', False):
+            return None
+        if root is None or gs['move_count'] < self.resignation_min_moves:
+            return None
+        visits = int(getattr(root, 'visit_count', 0) or 0)
+        if visits <= 0:
+            return None
+
+        root_value = float(root.value_sum / max(1, visits))
+        if root_value <= -self.resignation_threshold:
+            gs['resign_streak'] = int(gs.get('resign_streak', 0)) + 1
+            if gs['resign_streak'] >= self.resignation_patience:
+                return '0-1' if board.turn == chess.WHITE else '1-0'
+        else:
+            gs['resign_streak'] = 0
+        return None
+
+    def _uses_learner_model(self, gs, board):
+        if self.opponent_mcts is None:
+            return True
+        learner_color = gs.get('learner_color', chess.WHITE)
+        return bool(board.turn == learner_color)
+
+    def _apply_opening_prefix(self, gs):
+        prefix = self._sample_opening_prefix()
+        if not prefix:
+            return
+
+        board = gs['board']
+        for uci in prefix:
+            try:
+                move = chess.Move.from_uci(uci)
+            except Exception:
+                break
+            if move not in board.legal_moves:
+                break
+
+            gs['board_history'].append(self.mcts._encode_history_entry(board))
+            board.push(move)
+            gs['move_count'] += 1
+
+            if board.is_game_over(claim_draw=False) or gs['move_count'] >= self.max_moves:
+                gs['done'] = True
+                break
 
     def play_games(self, num_games):
         all_positions = []
@@ -842,13 +1367,11 @@ class BatchSelfPlayMCTSBatch:
         total_completed_white_wins = 0
         total_completed_black_wins = 0
         total_completed_draws = 0
-        total_primary_wins = 0
-        total_opponent_wins = 0
-        total_model_draws = 0
-        total_primary_white_games = 0
-        total_primary_white_wins = 0
-        total_primary_black_games = 0
-        total_primary_black_wins = 0
+        total_decisive_games = 0
+        total_decisive_length_sum = 0
+        total_curriculum_dropped_positions = 0
+        total_cap_dropped_positions = 0
+        total_resigned_games = 0
 
         games_left = num_games
         batch_idx = 0
@@ -868,19 +1391,16 @@ class BatchSelfPlayMCTSBatch:
             total_completed_white_wins += int(batch_stats.get('completed_white_wins', 0))
             total_completed_black_wins += int(batch_stats.get('completed_black_wins', 0))
             total_completed_draws += int(batch_stats.get('completed_draws', 0))
-            total_primary_wins += int(batch_stats.get('primary_model_wins', 0))
-            total_opponent_wins += int(batch_stats.get('opponent_model_wins', 0))
-            total_model_draws += int(batch_stats.get('model_match_draws', 0))
-            total_primary_white_games += int(batch_stats.get('primary_white_games', 0))
-            total_primary_white_wins += int(batch_stats.get('primary_white_wins', 0))
-            total_primary_black_games += int(batch_stats.get('primary_black_games', 0))
-            total_primary_black_wins += int(batch_stats.get('primary_black_wins', 0))
+            total_decisive_games += int(batch_stats.get('decisive_games', 0))
+            total_decisive_length_sum += int(batch_stats.get('decisive_length_sum', 0))
+            total_curriculum_dropped_positions += int(batch_stats.get('curriculum_dropped_positions', 0))
+            total_cap_dropped_positions += int(batch_stats.get('cap_dropped_positions', 0))
+            total_resigned_games += int(batch_stats.get('resigned_games', 0))
 
             games_left -= batch_size
 
         total_games = len(game_lengths)
         self.last_selfplay_stats = {
-            'total_games': total_games,
             'truncated_games': total_truncated_games,
             'completed_games': max(0, total_games - total_truncated_games),
             'dropped_positions': int(total_dropped_positions),
@@ -890,13 +1410,13 @@ class BatchSelfPlayMCTSBatch:
             'completed_white_wins': int(total_completed_white_wins),
             'completed_black_wins': int(total_completed_black_wins),
             'completed_draws': int(total_completed_draws),
-            'primary_model_wins': int(total_primary_wins),
-            'opponent_model_wins': int(total_opponent_wins),
-            'model_match_draws': int(total_model_draws),
-            'primary_white_games': int(total_primary_white_games),
-            'primary_white_wins': int(total_primary_white_wins),
-            'primary_black_games': int(total_primary_black_games),
-            'primary_black_wins': int(total_primary_black_wins),
+            'decisive_games': int(total_decisive_games),
+            'decisive_length_sum': int(total_decisive_length_sum),
+            'curriculum_dropped_positions': int(total_curriculum_dropped_positions),
+            'cap_dropped_positions': int(total_cap_dropped_positions),
+            'resigned_games': int(total_resigned_games),
+            'opponent_source': self.opponent_source_label,
+            'total_games': int(total_games),
         }
         return all_positions, game_lengths
 
@@ -914,116 +1434,46 @@ class BatchSelfPlayMCTSBatch:
             return
         gs['_completion_reported'] = True
         self._games_completed += 1
-        self._report_progress()
+        if (
+            self._games_completed == 1
+            or (self._games_completed % self.progress_report_interval_games) == 0
+        ):
+            self._report_progress()
 
     def _play_batch(self, batch_size):
         max_moves = self.max_moves
 
         game_states = []
-        for game_idx in range(batch_size):
-            primary_color = chess.WHITE if (game_idx % 2 == 0) else chess.BLACK
+        for _game_idx in range(batch_size):
             game_states.append({
                 'board': chess.Board(),
                 'board_history': [],
                 'root': None,
                 '_root_synced': False,
-                'root_primary': None,
-                '_root_primary_synced': False,
-                'root_opponent': None,
-                '_root_opponent_synced': False,
-                'primary_color': primary_color,
+                'opponent_root': None,
+                '_opponent_root_synced': False,
                 'game_history': [],
                 'move_count': 0,
-                'resign_confirmations': 0,
-                'resigned_outcome': None,
                 'done': False,
+                'white_advantage_streak': 0,
+                'black_advantage_streak': 0,
+                'adjudicated_result': None,
+                'resigned_result': None,
+                'resign_streak': 0,
+                'resignation_disabled': bool(np.random.random() < self.resignation_disable_fraction),
+                'learner_color': (
+                    chess.WHITE
+                    if self.opponent_mcts is None or not self.randomize_learner_color
+                    else (chess.WHITE if np.random.random() < 0.5 else chess.BLACK)
+                ),
                 '_completion_reported': False,
             })
+            self._apply_opening_prefix(game_states[-1])
 
         while True:
             active_indices = [i for i, gs in enumerate(game_states) if not gs['done']]
             if not active_indices:
                 break
-
-            if self.resign_enabled:
-                resign_candidate_indices_primary = []
-                resign_tensors_primary = []
-                resign_candidate_indices_opponent = []
-                resign_tensors_opponent = []
-
-                for idx in active_indices:
-                    gs = game_states[idx]
-                    if gs['move_count'] < self.resign_min_moves:
-                        continue
-
-                    mcts_eval = self._active_mcts_for_game(gs)
-                    tensor = mcts_eval._build_history_tensor(
-                        gs['board'],
-                        gs['board_history'],
-                    )
-                    if self.dual_model_enabled and not self._is_primary_to_move(gs):
-                        resign_candidate_indices_opponent.append(idx)
-                        resign_tensors_opponent.append(tensor)
-                    else:
-                        resign_candidate_indices_primary.append(idx)
-                        resign_tensors_primary.append(tensor)
-
-                def _run_resign_eval(indices, tensors, model_ref, mcts_ref):
-                    if not indices:
-                        return
-                    boards_np = np.stack(tensors, axis=0)
-                    board_tensors = torch.from_numpy(boards_np).to(
-                        self.device,
-                        memory_format=torch.channels_last,
-                        non_blocking=True,
-                    )
-                    with torch.inference_mode():
-                        if mcts_ref.use_amp:
-                            with torch.autocast(device_type='cuda', dtype=mcts_ref.amp_dtype):
-                                _, resign_values = model_ref(
-                                    board_tensors,
-                                    apply_log_softmax=False,
-                                )
-                        else:
-                            _, resign_values = model_ref(
-                                board_tensors,
-                                apply_log_softmax=False,
-                            )
-
-                        if resign_values.dim() == 2 and resign_values.shape[1] == 3:
-                            wdl_probs = torch.softmax(resign_values, dim=1)
-                            resign_values = (wdl_probs[:, 0] - wdl_probs[:, 2])
-                        resign_values_np = resign_values.float().cpu().numpy()
-
-                    for i, gs_idx in enumerate(indices):
-                        gs = game_states[gs_idx]
-                        value_est = float(resign_values_np[i])
-                        if value_est <= self.resign_threshold:
-                            gs['resign_confirmations'] += 1
-                        else:
-                            gs['resign_confirmations'] = 0
-
-                        if gs['resign_confirmations'] >= self.resign_required_confirmations:
-                            # Side to move resigns: opposite side wins.
-                            gs['resigned_outcome'] = -1.0 if gs['board'].turn == chess.WHITE else 1.0
-                            gs['done'] = True
-                            gs['root'] = None
-                            gs['root_primary'] = None
-                            gs['root_opponent'] = None
-                            self._mark_game_completed(gs)
-
-                _run_resign_eval(resign_candidate_indices_primary, resign_tensors_primary, self.model, self.mcts)
-                if self.dual_model_enabled:
-                    _run_resign_eval(
-                        resign_candidate_indices_opponent,
-                        resign_tensors_opponent,
-                        self.opponent_model,
-                        self.opponent_mcts,
-                    )
-
-                active_indices = [i for i, gs in enumerate(game_states) if not gs['done']]
-                if not active_indices:
-                    break
 
             visit_counts_by_index = {}
 
@@ -1050,13 +1500,20 @@ class BatchSelfPlayMCTSBatch:
                     gs[synced_key] = bool(local_state.get('_root_synced', False))
                     visit_counts_by_index[gs_idx] = visit_counts
 
-            if self.dual_model_enabled:
-                primary_indices = [i for i in active_indices if self._is_primary_to_move(game_states[i])]
-                opponent_indices = [i for i in active_indices if not self._is_primary_to_move(game_states[i])]
-                _run_search_for_indices(primary_indices, self.mcts, 'root_primary', '_root_primary_synced')
-                _run_search_for_indices(opponent_indices, self.opponent_mcts, 'root_opponent', '_root_opponent_synced')
-            else:
+            if self.opponent_mcts is None:
                 _run_search_for_indices(active_indices, self.mcts, 'root', '_root_synced')
+            else:
+                learner_indices = [
+                    i for i in active_indices
+                    if self._uses_learner_model(game_states[i], game_states[i]['board'])
+                ]
+                learner_index_set = set(learner_indices)
+                opponent_indices = [
+                    i for i in active_indices
+                    if i not in learner_index_set
+                ]
+                _run_search_for_indices(learner_indices, self.mcts, 'root', '_root_synced')
+                _run_search_for_indices(opponent_indices, self.opponent_mcts, 'opponent_root', '_opponent_root_synced')
 
             for idx in active_indices:
                 gs = game_states[idx]
@@ -1069,49 +1526,74 @@ class BatchSelfPlayMCTSBatch:
                     temperature = self.temperature
                 else:
                     temperature = 0.0
+                learner_turn = self._uses_learner_model(gs, board)
+                root_key = 'root' if learner_turn or self.opponent_mcts is None else 'opponent_root'
+                synced_key = '_root_synced' if learner_turn or self.opponent_mcts is None else '_opponent_root_synced'
+                root = gs.get(root_key)
+                adjudicated_result = self._maybe_adjudicate_game(gs, root, board)
+                if adjudicated_result is not None:
+                    gs['done'] = True
+                    gs['adjudicated_result'] = adjudicated_result
+                    gs['root'] = None
+                    gs['opponent_root'] = None
+                    gs['_root_synced'] = False
+                    gs['_opponent_root_synced'] = False
+                    self._mark_game_completed(gs)
+                    continue
+
+                resigned_result = self._maybe_resign_game(gs, root, board)
+                if resigned_result is not None:
+                    gs['done'] = True
+                    gs['resigned_result'] = resigned_result
+                    gs['root'] = None
+                    gs['opponent_root'] = None
+                    gs['_root_synced'] = False
+                    gs['_opponent_root_synced'] = False
+                    self._mark_game_completed(gs)
+                    continue
+
                 move = self._select_move_from_visits(visit_counts, temperature)
+                if learner_turn or self.opponent_mcts is None:
+                    policy_indices, policy_values = _build_sparse_policy_target_from_visits(visit_counts, board)
+                    history_count = len(gs['board_history'])
+                    gs['game_history'].append((
+                        history_count,
+                        policy_indices,
+                        policy_values,
+                        board.turn,
+                    ))
 
-                policy_indices, policy_values = _build_sparse_policy_target_from_visits(visit_counts, board)
-                history_count = len(gs['board_history'])
-                gs['game_history'].append((
-                    history_count,
-                    policy_indices,
-                    policy_values,
-                    board.turn,
-                    self._is_primary_to_move(gs),
-                ))
-
-                active_root_key, active_synced_key, inactive_root_key, inactive_synced_key = self._active_root_keys_for_game(gs)
-                root = gs.get(active_root_key)
                 # Update history BEFORE making the move
                 # Store cached tensors for both POVs to avoid repeated FEN parse + tensor rebuild.
                 gs['board_history'].append(self.mcts._encode_history_entry(board))
 
                 # Reuse selected subtree directly to skip FEN-matching next turn.
-                if root is not None and move in root.children:
+                if self.opponent_mcts is None and root is not None and move in root.children:
                     next_root = root.children[move]
                     _ = next_root.board
                     next_root.parent = None
-                    gs[active_root_key] = next_root
-                    gs[active_synced_key] = True
+                    next_root.parent_edge_index = -1
+                    gs[root_key] = next_root
+                    gs[synced_key] = True
                 else:
-                    gs[active_root_key] = None
-                    gs[active_synced_key] = False
-
-                if inactive_root_key is not None:
-                    gs[inactive_synced_key] = False
-                else:
-                    gs['_root_synced'] = bool(gs.get('_root_synced', False))
+                    gs['root'] = None
+                    gs['_root_synced'] = False
+                    gs['opponent_root'] = None
+                    gs['_opponent_root_synced'] = False
 
                 board.push(move)
                 gs['move_count'] += 1
 
-                if board.is_game_over(claim_draw=True) or gs['move_count'] >= max_moves:
+                forced_game_over = board.is_game_over(claim_draw=False)
+                auto_claim_draw = self._should_auto_claim_draw(board, gs['move_count'])
+                if forced_game_over or auto_claim_draw or gs['move_count'] >= max_moves:
                     gs['done'] = True
+                    gs['ended_by_auto_claim_draw'] = auto_claim_draw
                     # Free up memory immediately
                     gs['root'] = None
-                    gs['root_primary'] = None
-                    gs['root_opponent'] = None
+                    gs['opponent_root'] = None
+                    gs['_root_synced'] = False
+                    gs['_opponent_root_synced'] = False
                     self._mark_game_completed(gs)
 
         positions = []
@@ -1119,155 +1601,91 @@ class BatchSelfPlayMCTSBatch:
         dropped_positions = 0
         truncated_games = 0
         claimable_draw_ended_games = 0
+        adjudicated_games = 0
+        resigned_games = 0
         completed_length_sum = 0
         truncated_length_sum = 0
         completed_white_wins = 0
         completed_black_wins = 0
         completed_draws = 0
-        primary_model_wins = 0
-        opponent_model_wins = 0
-        model_match_draws = 0
-        primary_white_games = 0
-        primary_white_wins = 0
-        primary_black_games = 0
-        primary_black_wins = 0
+        decisive_games = 0
+        decisive_length_sum = 0
+        curriculum_dropped_positions = 0
+        cap_dropped_positions = 0
         history_positions = int(self.config.get('model', {}).get('history_positions', 0))
 
         for gs in game_states:
             board = gs['board']
-            resigned_outcome = gs.get('resigned_outcome', None)
-            if resigned_outcome is not None:
-                outcome = float(resigned_outcome)
-                if outcome > 0:
-                    completed_white_wins += 1
-                else:
-                    completed_black_wins += 1
-                primary_color = gs.get('primary_color', chess.WHITE)
-                if primary_color == chess.WHITE:
-                    primary_white_games += 1
-                    if outcome > 0:
-                        primary_white_wins += 1
-                else:
-                    primary_black_games += 1
-                    if outcome < 0:
-                        primary_black_wins += 1
-                if (outcome > 0 and primary_color == chess.WHITE) or (outcome < 0 and primary_color == chess.BLACK):
-                    primary_model_wins += 1
-                else:
-                    opponent_model_wins += 1
-
-                history_len = len(gs['game_history'])
-                completed_length_sum += history_len
-
-                for history_count, policy_indices, policy_values, turn, was_primary_turn in gs['game_history']:
-                    if self.dual_model_enabled and self.train_primary_positions_only and (not was_primary_turn):
-                        continue
-                    value = outcome if turn == chess.WHITE else -outcome
-                    board_tensor_np = _build_history_tensor_from_encoded(
-                        turn=turn,
-                        encoded_history=gs['board_history'],
-                        history_count=history_count,
-                        history_positions=history_positions,
-                        empty_history_tensor=_EMPTY_HISTORY_TENSOR,
-                    )
-                    board_tensor = torch.from_numpy(board_tensor_np)
-                    positions.append((
-                        board_tensor,
-                        policy_indices,
-                        policy_values,
-                        torch.tensor([value], dtype=torch.float32)
-                    ))
-
-                game_lengths.append(history_len)
-                continue
-
             ended_by_claimable_draw = (
-                gs['move_count'] < max_moves
-                and board.is_game_over(claim_draw=True)
-                and not board.is_game_over()
-                and board.can_claim_draw()
+                bool(gs.get('ended_by_auto_claim_draw', False))
             )
             if ended_by_claimable_draw:
                 claimable_draw_ended_games += 1
-            result = board.result(claim_draw=True)
+            adjudicated_result = gs.get('adjudicated_result', None)
+            if adjudicated_result is not None:
+                adjudicated_games += 1
+            resigned_result = gs.get('resigned_result', None)
+            if resigned_result is not None:
+                resigned_games += 1
+            result = (
+                resigned_result
+                if resigned_result is not None
+                else (
+                    adjudicated_result
+                    if adjudicated_result is not None
+                    else ('1/2-1/2' if ended_by_claimable_draw else board.result(claim_draw=False))
+                )
+            )
+            game_ply_len = int(gs.get('move_count', len(gs['game_history'])))
             if result == '*':
                 truncated_games += 1
-                history_len = len(gs['game_history'])
-                dropped_positions += history_len
-                truncated_length_sum += history_len
-                game_lengths.append(history_len)
+                stored_history_len = len(gs['game_history'])
+                dropped_positions += stored_history_len
+                truncated_length_sum += game_ply_len
+                game_lengths.append(game_ply_len)
                 continue
             if result == '1-0':
                 outcome = 1.0
                 completed_white_wins += 1
+                decisive_games += 1
             elif result == '0-1':
                 outcome = -1.0
                 completed_black_wins += 1
+                decisive_games += 1
             else:
                 outcome = 0.0
                 completed_draws += 1
-            primary_color = gs.get('primary_color', chess.WHITE)
-            if primary_color == chess.WHITE:
-                primary_white_games += 1
-                if outcome > 0:
-                    primary_white_wins += 1
-            else:
-                primary_black_games += 1
-                if outcome < 0:
-                    primary_black_wins += 1
-            if outcome == 0.0:
-                model_match_draws += 1
-            elif (outcome > 0 and primary_color == chess.WHITE) or (outcome < 0 and primary_color == chess.BLACK):
-                primary_model_wins += 1
-            else:
-                opponent_model_wins += 1
-            draw_value_target = self._compute_draw_value_target(gs['move_count'])
+            completed_length_sum += game_ply_len
+            if outcome != 0.0:
+                decisive_length_sum += game_ply_len
+            _, game_curriculum_dropped, game_cap_dropped = self._append_selected_positions_from_game(
+                positions,
+                gs,
+                outcome,
+                history_positions=history_positions,
+            )
+            curriculum_dropped_positions += game_curriculum_dropped
+            cap_dropped_positions += game_cap_dropped
 
-            history_len = len(gs['game_history'])
-            completed_length_sum += history_len
-
-            for history_count, policy_indices, policy_values, turn, was_primary_turn in gs['game_history']:
-                if self.dual_model_enabled and self.train_primary_positions_only and (not was_primary_turn):
-                    continue
-                if outcome == 0.0:
-                    value = draw_value_target
-                else:
-                    value = outcome if turn == chess.WHITE else -outcome
-                board_tensor_np = _build_history_tensor_from_encoded(
-                    turn=turn,
-                    encoded_history=gs['board_history'],
-                    history_count=history_count,
-                    history_positions=history_positions,
-                    empty_history_tensor=_EMPTY_HISTORY_TENSOR,
-                )
-                board_tensor = torch.from_numpy(
-                    board_tensor_np
-                )
-                positions.append((
-                    board_tensor,
-                    policy_indices,
-                    policy_values,
-                    torch.tensor([value], dtype=torch.float32)
-                ))
-
-            game_lengths.append(history_len)
+            game_lengths.append(game_ply_len)
 
         return positions, game_lengths, {
+            'total_games': int(len(game_states)),
             'truncated_games': int(truncated_games),
             'dropped_positions': int(dropped_positions),
             'claimable_draw_ended_games': int(claimable_draw_ended_games),
+            'adjudicated_games': int(adjudicated_games),
+            'resigned_games': int(resigned_games),
             'completed_length_sum': int(completed_length_sum),
             'truncated_length_sum': int(truncated_length_sum),
             'completed_white_wins': int(completed_white_wins),
             'completed_black_wins': int(completed_black_wins),
             'completed_draws': int(completed_draws),
-            'primary_model_wins': int(primary_model_wins),
-            'opponent_model_wins': int(opponent_model_wins),
-            'model_match_draws': int(model_match_draws),
-            'primary_white_games': int(primary_white_games),
-            'primary_white_wins': int(primary_white_wins),
-            'primary_black_games': int(primary_black_games),
-            'primary_black_wins': int(primary_black_wins),
+            'decisive_games': int(decisive_games),
+            'decisive_length_sum': int(decisive_length_sum),
+            'curriculum_dropped_positions': int(curriculum_dropped_positions),
+            'cap_dropped_positions': int(cap_dropped_positions),
+            'opponent_source': self.opponent_source_label,
         }
 
     def _select_move_from_visits(self, visit_counts, temperature):
@@ -1329,7 +1747,7 @@ def _build_selfplay_worker_model(config, device):
 
 
 def _load_worker_model_state(model, model_state, rank):
-    from src.model import normalize_state_dict_keys
+    from src.model import normalize_state_dict_keys, transfer_matching_weights
 
     # Accept both raw state_dict and full training checkpoints.
     if isinstance(model_state, dict):
@@ -1348,20 +1766,38 @@ def _load_worker_model_state(model, model_state, rank):
             target_keys=set(model.state_dict().keys()),
         )
 
-    incompatible = model.load_state_dict(model_state, strict=False)
-    if incompatible.missing_keys or incompatible.unexpected_keys:
+    # Prefer strict load; when architectures differ, transfer only matching tensors.
+    try:
+        model.load_state_dict(model_state, strict=True)
+        return
+    except Exception:
+        report = transfer_matching_weights(model, model_state)
         extra_missing = [
-            k for k in incompatible.missing_keys
+            k for k in report.get('missing_keys', [])
             if not (k.endswith('coord_x') or k.endswith('coord_y'))
         ]
-        if extra_missing or incompatible.unexpected_keys:
+        unexpected = report.get('unexpected_keys', [])
+        shape_mismatch = report.get('shape_mismatch', [])
+
+        if extra_missing or unexpected or shape_mismatch:
             print(
-                f"⚠️ Worker {rank}: state_dict mismatch. "
-                f"Missing={extra_missing}, Unexpected={incompatible.unexpected_keys}"
+                f"⚠️ Worker {rank}: state_dict mismatch -> transfer fallback. "
+                f"Matched={report.get('matched_tensors', 0)}/{report.get('total_tensors', 0)} "
+                f"({report.get('match_ratio', 0.0) * 100:.1f}%), "
+                f"Missing={extra_missing}, Unexpected={unexpected}, "
+                f"ShapeMismatch={len(shape_mismatch)}"
             )
 
 
-def _create_selfplay_engine(model, config, device, num_games, wlog, opponent_model=None):
+def _create_selfplay_engine(
+    model,
+    config,
+    device,
+    num_games,
+    wlog,
+    opponent_model=None,
+    opponent_source_label="current",
+):
     rl_cfg = config.get('reinforcement_learning', {})
     use_batch = rl_cfg.get('use_batch_selfplay', False)
     max_batch_games = rl_cfg.get('max_batch_games_per_worker', 256)
@@ -1373,18 +1809,33 @@ def _create_selfplay_engine(model, config, device, num_games, wlog, opponent_mod
         configured_max = 1
         mode_label = "single-via-batch"
 
-    engine = BatchSelfPlayMCTSBatch(model, config, device, configured_max, opponent_model=opponent_model)
+    engine = BatchSelfPlayMCTSBatch(
+        model,
+        config,
+        device,
+        configured_max,
+        opponent_model=opponent_model,
+        opponent_source_label=opponent_source_label,
+    )
     actual_max = min(configured_max, num_games)
     wlog(
         f"Self-play engine: {mode_label} "
         f"(max {configured_max}, actual {actual_max})"
     )
-    if getattr(engine, 'dual_model_enabled', False):
-        wlog("Dual-color models: ON (white/black can use different checkpoints)")
     return engine
 
 
-def _play_games_with_engine(rank, engine, config, num_games, result_file_path, wlog):
+def _play_games_with_engine(
+    rank,
+    engine,
+    config,
+    num_games,
+    result_file_path,
+    wlog,
+    result_queue=None,
+    task_id=None,
+    stream_results_to_queue=False,
+):
     rl_cfg = config.get('reinforcement_learning', {})
     progress_file_path = result_file_path.replace('.pkl', '.progress')
 
@@ -1404,7 +1855,17 @@ def _play_games_with_engine(rank, engine, config, num_games, result_file_path, w
     )
 
     save_every = rl_cfg.get('self_play_save_every_games_resolved', None)
-    if save_every is None:
+    if stream_results_to_queue:
+        save_every = max(
+            1,
+            int(
+                rl_cfg.get(
+                    'self_play_queue_chunk_games',
+                    rl_cfg.get('max_batch_games_per_worker', 1),
+                )
+            ),
+        )
+    elif save_every is None:
         save_mult = rl_cfg.get('self_play_save_every_games', 0)
         try:
             save_mult = float(save_mult)
@@ -1429,9 +1890,9 @@ def _play_games_with_engine(rank, engine, config, num_games, result_file_path, w
     total_truncated_length_sum = 0
 
     if save_every and save_every > 0:
-        with open(result_file_path, 'wb') as f:
-            pass
-
+        if not stream_results_to_queue:
+            with open(result_file_path, 'wb') as f:
+                pass
         games_left = num_games
         while games_left > 0:
             chunk_games = min(save_every, games_left)
@@ -1442,8 +1903,18 @@ def _play_games_with_engine(rank, engine, config, num_games, result_file_path, w
             positions, game_lengths = engine.play_games(chunk_games)
             stats = getattr(engine, 'last_selfplay_stats', {}) or {}
 
-            with open(result_file_path, 'ab') as f:
-                pickle.dump((positions, game_lengths, stats), f)
+            if stream_results_to_queue and result_queue is not None:
+                result_queue.put({
+                    'type': 'payload',
+                    'rank': rank,
+                    'task_id': task_id,
+                    'positions': _pack_positions_for_transfer(positions),
+                    'game_lengths': list(game_lengths),
+                    'stats': stats,
+                })
+            else:
+                with open(result_file_path, 'ab') as f:
+                    pickle.dump((positions, game_lengths, stats), f)
 
             total_positions += len(positions)
             total_games += len(game_lengths)
@@ -1468,8 +1939,18 @@ def _play_games_with_engine(rank, engine, config, num_games, result_file_path, w
         total_truncated_length_sum = int(stats.get('truncated_length_sum', 0))
         _write_progress(total_games)
 
-        with open(result_file_path, 'wb') as f:
-            pickle.dump((positions, game_lengths, stats), f)
+        if stream_results_to_queue and result_queue is not None:
+            result_queue.put({
+                'type': 'payload',
+                'rank': rank,
+                'task_id': task_id,
+                'positions': _pack_positions_for_transfer(positions),
+                'game_lengths': list(game_lengths),
+                'stats': stats,
+            })
+        else:
+            with open(result_file_path, 'wb') as f:
+                pickle.dump((positions, game_lengths, stats), f)
 
     wlog(f"Generated {total_positions} positions from {total_games} games")
     if total_truncated_games > 0 or total_dropped_positions > 0:
@@ -1480,14 +1961,16 @@ def _play_games_with_engine(rank, engine, config, num_games, result_file_path, w
     if total_claimable_draw_ended_games > 0:
         wlog(f"Claimable-draw ended games: {total_claimable_draw_ended_games}")
     if total_games > 0:
+        def _format_plies(value):
+            return f"{value:.1f} plies (~{value / 2.0:.1f} full moves)"
         completed_games = max(0, total_games - total_truncated_games)
         if completed_games > 0:
             wlog(
-                f"Avg completed game length: {total_completed_length_sum / completed_games:.1f}"
+                f"Avg completed game length: {_format_plies(total_completed_length_sum / completed_games)}"
             )
         if total_truncated_games > 0:
             wlog(
-                f"Avg truncated game length: {total_truncated_length_sum / total_truncated_games:.1f}"
+                f"Avg truncated game length: {_format_plies(total_truncated_length_sum / total_truncated_games)}"
             )
     wlog(f"Saved to {result_file_path}")
     return total_positions, total_games
@@ -1509,10 +1992,10 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
         wlog(f"Persistent worker started on {device}")
 
         model = _build_selfplay_worker_model(config, device)
-        opponent_model = _build_selfplay_worker_model(config, device)
         inference_model = model
+        opponent_model = None
         engine = None
-        engine_batch_mode = None
+        engine_signature = None
 
         while True:
             task = task_queue.get()
@@ -1522,34 +2005,36 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
 
             result_file_path = task['result_file_path']
             try:
-                model_state = torch.load(task['model_state_path'], map_location='cpu')
+                if task.get('model_state') is not None:
+                    model_state = task['model_state']
+                else:
+                    model_state = torch.load(task['model_state_path'], map_location='cpu')
                 _load_worker_model_state(model, model_state, rank)
                 model.eval()
 
-                opponent_state_path = task.get('opponent_model_state_path', None)
-                if opponent_state_path:
-                    opponent_state = torch.load(opponent_state_path, map_location='cpu')
+                opponent_state = task.get('opponent_model_state')
+                opponent_label = str(task.get('opponent_label') or 'current')
+                if opponent_state is not None:
+                    if opponent_model is None:
+                        opponent_model = _build_selfplay_worker_model(config, device)
                     _load_worker_model_state(opponent_model, opponent_state, rank)
                     opponent_model.eval()
-                    inference_opponent_model = opponent_model
                 else:
-                    inference_opponent_model = None
+                    opponent_model = None
 
                 current_batch_mode = bool(rl_cfg.get('use_batch_selfplay', False))
-                if (
-                    engine is None
-                    or engine_batch_mode != current_batch_mode
-                    or bool(getattr(engine, 'dual_model_enabled', False)) != bool(inference_opponent_model is not None)
-                ):
+                current_signature = (current_batch_mode, opponent_model is not None, opponent_label)
+                if engine is None or engine_signature != current_signature:
                     engine = _create_selfplay_engine(
                         inference_model,
                         config,
                         device,
                         int(task['num_games']),
                         wlog,
-                        opponent_model=inference_opponent_model,
+                        opponent_model=opponent_model,
+                        opponent_source_label=opponent_label,
                     )
-                    engine_batch_mode = current_batch_mode
+                    engine_signature = current_signature
 
                 if hasattr(engine, 'temperature') and task.get('mcts_temperature') is not None:
                     engine.temperature = float(task['mcts_temperature'])
@@ -1561,8 +2046,12 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
                     int(task['num_games']),
                     result_file_path,
                     wlog,
+                    result_queue=result_queue,
+                    task_id=task.get('task_id'),
+                    stream_results_to_queue=bool(task.get('stream_results_to_queue', False)),
                 )
                 result_queue.put({
+                    'type': 'result',
                     'rank': rank,
                     'task_id': task['task_id'],
                     'ok': True,
@@ -1575,6 +2064,7 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
                         pickle.dump(([], []), f)
                 finally:
                     result_queue.put({
+                        'type': 'result',
                         'rank': rank,
                         'task_id': task.get('task_id'),
                         'ok': False,
@@ -1588,6 +2078,7 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
                 with open(result_file_path, 'wb') as f:
                     pickle.dump(([], []), f)
                 result_queue.put({
+                    'type': 'result',
                     'rank': rank,
                     'task_id': task.get('task_id'),
                     'ok': False,
@@ -1597,7 +2088,15 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
         raise SystemExit(130)
 
 
-def play_games_mcts_worker(rank, model_state, config, device_id, num_games, result_file_path, opponent_model_state=None):
+def play_games_mcts_worker(
+    rank,
+    model_state,
+    config,
+    device_id,
+    num_games,
+    result_file_path,
+    opponent_payload=None,
+):
     """
     🚀 One-shot worker function for parallel MCTS self-play.
     """
@@ -1614,13 +2113,13 @@ def play_games_mcts_worker(rank, model_state, config, device_id, num_games, resu
 
         model = _build_selfplay_worker_model(config, device)
         _load_worker_model_state(model, model_state, rank)
-
         opponent_model = None
-        if opponent_model_state is not None:
-            if isinstance(opponent_model_state, (str, bytes)):
-                opponent_model_state = torch.load(opponent_model_state, map_location='cpu')
+        opponent_label = 'current'
+        if isinstance(opponent_payload, dict) and opponent_payload.get('state') is not None:
             opponent_model = _build_selfplay_worker_model(config, device)
-            _load_worker_model_state(opponent_model, opponent_model_state, rank)
+            _load_worker_model_state(opponent_model, opponent_payload.get('state'), rank)
+            opponent_model.eval()
+            opponent_label = str(opponent_payload.get('label') or 'current')
 
         engine = _create_selfplay_engine(
             model,
@@ -1629,6 +2128,7 @@ def play_games_mcts_worker(rank, model_state, config, device_id, num_games, resu
             num_games,
             wlog,
             opponent_model=opponent_model,
+            opponent_source_label=opponent_label,
         )
         _play_games_with_engine(rank, engine, config, num_games, result_file_path, wlog)
     except KeyboardInterrupt:

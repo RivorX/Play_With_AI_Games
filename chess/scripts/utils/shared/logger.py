@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from pathlib import Path
 
-
 class TrainingLogger:
     """
     Universal logger for training metrics
@@ -52,8 +51,10 @@ class TrainingLogger:
             else:  # RL mode
                 header = [
                     'iteration', 'avg_loss', 'policy_loss', 'value_loss',
-                    'win_rate', 'buffer_size', 'avg_game_length', 'positions_per_sec',
+                    'score_rate', 'buffer_size', 'avg_game_length', 'positions_per_sec',
                     'selfplay_time', 'data_collection_time', 'temperature', 'beta',
+                    'true_win_rate', 'eval_wins', 'eval_draws', 'eval_losses', 'eval_unresolved',
+                    'anchor_score_rate', 'anchor_true_win_rate', 'anchor_wins', 'anchor_draws', 'anchor_losses',
                     # 📊 NEW: Metrics
                     'policy_top1_acc', 'policy_top3_acc',
                     'value_mae', 'value_mae_weighted',
@@ -63,6 +64,10 @@ class TrainingLogger:
                     'priority_age_decay_lambda', 'avg_sample_age',
                     'avg_game_value', 'value_std',
                     'policy_entropy', 'value_pred_std',
+                    'selfplay_decisive_games', 'selfplay_decisive_rate',
+                    'selfplay_auto_draw_rate',
+                    'selfplay_truncated_rate', 'selfplay_decisive_avg_length',
+                    'selfplay_curriculum_dropped_positions', 'selfplay_cap_dropped_positions',
                     'estimated_elo',
                 ]
             
@@ -97,6 +102,7 @@ class TrainingLogger:
         
         if mode == "rl":
             self.win_rates = []
+            self.true_win_rates = []
             self.temperatures = []
 
         # Optional run context shown in plot header (e.g. startup mode/resume/transfer info).
@@ -610,6 +616,13 @@ class TrainingLogger:
                     self.train_value_mae_weighted.append(train_metrics.get('value_mae_weighted', 0))
                     self.train_value_wdl_acc.append(train_metrics.get('value_wdl_acc', 0))
                     self.train_value_wdl_ce.append(train_metrics.get('value_wdl_ce', 0))
+                else:
+                    self.train_policy_top1.append(0.0)
+                    self.train_policy_top3.append(0.0)
+                    self.train_value_mae.append(0.0)
+                    self.train_value_mae_weighted.append(0.0)
+                    self.train_value_wdl_acc.append(0.0)
+                    self.train_value_wdl_ce.append(0.0)
                 
                 if val_losses is not None:
                     self.val_iterations.append(iteration)
@@ -636,7 +649,7 @@ class TrainingLogger:
                     kwargs.get('avg_loss', ''),
                     kwargs.get('policy_loss', ''),
                     kwargs.get('value_loss', ''),
-                    kwargs.get('win_rate', ''),
+                    kwargs.get('score_rate', kwargs.get('win_rate', '')),
                     kwargs.get('buffer_size', ''),
                     kwargs.get('avg_game_length', ''),
                     kwargs.get('positions_per_sec', ''),
@@ -644,6 +657,16 @@ class TrainingLogger:
                     kwargs.get('data_collection_time', ''),
                     kwargs.get('temperature', ''),
                     kwargs.get('beta', ''),
+                    kwargs.get('true_win_rate', ''),
+                    kwargs.get('eval_wins', ''),
+                    kwargs.get('eval_draws', ''),
+                    kwargs.get('eval_losses', ''),
+                    kwargs.get('eval_unresolved', ''),
+                    kwargs.get('anchor_score_rate', ''),
+                    kwargs.get('anchor_true_win_rate', ''),
+                    kwargs.get('anchor_wins', ''),
+                    kwargs.get('anchor_draws', ''),
+                    kwargs.get('anchor_losses', ''),
                     # 📊 NEW: Metrics
                     train_metrics.get('policy_top1_acc', '') if train_metrics else '',
                     train_metrics.get('policy_top3_acc', '') if train_metrics else '',
@@ -659,6 +682,13 @@ class TrainingLogger:
                     kwargs.get('value_std', ''),
                     kwargs.get('policy_entropy', ''),
                     kwargs.get('value_pred_std', ''),
+                    kwargs.get('selfplay_decisive_games', ''),
+                    kwargs.get('selfplay_decisive_rate', ''),
+                    kwargs.get('selfplay_auto_draw_rate', ''),
+                    kwargs.get('selfplay_truncated_rate', ''),
+                    kwargs.get('selfplay_decisive_avg_length', ''),
+                    kwargs.get('selfplay_curriculum_dropped_positions', ''),
+                    kwargs.get('selfplay_cap_dropped_positions', ''),
                 ]
 
                 if estimated_elo is not None:
@@ -676,6 +706,10 @@ class TrainingLogger:
                     self.train_losses.append(kwargs['avg_loss'])
                     self.train_policy_losses.append(kwargs.get('policy_loss', 0))
                     self.train_value_losses.append(kwargs.get('value_loss', 0))
+                elif 'train_losses' in kwargs:
+                    self.train_losses.append(kwargs['train_losses'].get('total', 0))
+                    self.train_policy_losses.append(kwargs['train_losses'].get('policy', 0))
+                    self.train_value_losses.append(kwargs['train_losses'].get('value', 0))
                 
                 if train_metrics:
                     self.train_policy_top1.append(train_metrics.get('policy_top1_acc', 0))
@@ -684,9 +718,19 @@ class TrainingLogger:
                     self.train_value_mae_weighted.append(train_metrics.get('value_mae_weighted', 0))
                     self.train_value_wdl_acc.append(train_metrics.get('value_wdl_acc', 0))
                     self.train_value_wdl_ce.append(train_metrics.get('value_wdl_ce', 0))
+                else:
+                    self.train_policy_top1.append(0.0)
+                    self.train_policy_top3.append(0.0)
+                    self.train_value_mae.append(0.0)
+                    self.train_value_mae_weighted.append(0.0)
+                    self.train_value_wdl_acc.append(0.0)
+                    self.train_value_wdl_ce.append(0.0)
                 
-                if 'win_rate' in kwargs and kwargs['win_rate'] is not None:
-                    self.win_rates.append((iteration, kwargs['win_rate']))
+                score_rate = kwargs.get('score_rate', kwargs.get('win_rate'))
+                if score_rate is not None:
+                    self.win_rates.append((iteration, score_rate))
+                if 'true_win_rate' in kwargs and kwargs['true_win_rate'] is not None:
+                    self.true_win_rates.append((iteration, kwargs['true_win_rate']))
                 
                 if 'temperature' in kwargs and kwargs['temperature'] is not None:
                     self.temperatures.append((iteration, kwargs['temperature']))
@@ -1077,12 +1121,15 @@ class TrainingLogger:
         ax = axes[1, 2]
         if self.win_rates:
             win_iters, win_vals = zip(*self.win_rates)
-            ax.plot(win_iters, win_vals, 'mo-', label='Win Rate', linewidth=2, markersize=8)
+            ax.plot(win_iters, win_vals, 'mo-', label='Score Rate', linewidth=2, markersize=8)
+            if self.true_win_rates:
+                true_iters, true_vals = zip(*self.true_win_rates)
+                ax.plot(true_iters, true_vals, 'co-', label='True Win Rate', linewidth=1.5, markersize=6)
             ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
             ax.axhline(y=0.55, color='green', linestyle='--', alpha=0.5)
             ax.set_xlabel('Iteration')
-            ax.set_ylabel('Win Rate')
-            ax.set_title('Win Rate vs Best')
+            ax.set_ylabel('Rate')
+            ax.set_title('Score/Win Rate vs Best')
             ax.set_ylim([0, 1])
             ax.legend()
             ax.grid(True, alpha=0.3)

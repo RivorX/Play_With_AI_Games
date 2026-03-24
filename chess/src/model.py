@@ -245,7 +245,6 @@ class ChessNet(nn.Module):
         policy_channels = int(config['model'].get('policy_head_channels', 2))
         if policy_channels < 1:
             raise ValueError(f"policy_head_channels must be >= 1, got {policy_channels}")
-        
         # v4.5: AUTO-CALCULATE input_planes with chess metadata
         # Base: 16 planes (12 pieces + 4 metadata: castling, en passant, halfmove, fullmove)
         # With history: 16 * (1 + history_positions)
@@ -284,7 +283,6 @@ class ChessNet(nn.Module):
             
             print(f"  > Policy bottleneck: 1x1 ({policy_channels} channels)")
             print(f"  > Policy Head: AZ-style planes logits (conv-only, 8x8x73)")
-        
         # Input conv with dynamic input_planes
         if use_coord_conv:
             self.conv_block = nn.Sequential(
@@ -394,7 +392,6 @@ class ChessNet(nn.Module):
             self._count_parameters(self.policy_bn) +
             self._count_parameters(self.policy_logits_conv)
         )
-
         value_params = (
             self._count_parameters(self.value_conv) +
             self._count_parameters(self.value_bn) +
@@ -441,7 +438,6 @@ class ChessNet(nn.Module):
         policy_logits = (
             policy_logits_planes.permute(0, 2, 3, 1).contiguous().view(policy_logits_planes.size(0), ACTION_SIZE)
         )
-
         if apply_log_softmax:
             policy = F.log_softmax(policy_logits, dim=1)
         else:
@@ -453,10 +449,9 @@ class ChessNet(nn.Module):
         value = F.relu(value, inplace=True)
         value = self.shared_gap(value)  # GAP: (B, C, 8, 8) -> (B, C, 1, 1)
         value = value.flatten(1)        # (B, C, 1, 1) -> (B, C)
-        value = F.relu(self.value_fc1(value), inplace=True)
-        value = self.value_dropout(value)
-        value = self.value_fc2(value)  # (B, 3) WDL logits
-
+        value_hidden = F.relu(self.value_fc1(value), inplace=True)
+        value_hidden = self.value_dropout(value_hidden)
+        value = self.value_fc2(value_hidden)  # (B, 3) WDL logits
         return policy, value
 
     def predict(self, board_tensor):

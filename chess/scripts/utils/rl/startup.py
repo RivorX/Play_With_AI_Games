@@ -159,6 +159,41 @@ def _choose_start_mode(has_checkpoints):
         print("Invalid choice. Enter 1, 2, 3, or press Enter for default.")
 
 
+def _choose_new_init_mode(has_default_init, has_checkpoints):
+    if not has_checkpoints:
+        return "default" if has_default_init else "scratch"
+
+    print("\nNew RL init source:")
+    print("1) Default init checkpoint")
+    if has_default_init:
+        print("   Usually best IL checkpoint if available")
+    else:
+        print("   No default init checkpoint found, will fall back to scratch")
+    print("2) Choose any checkpoint manually")
+    print("3) Scratch")
+
+    default_choice = "1" if has_default_init else "3"
+    mapping = {
+        "1": "default",
+        "2": "select",
+        "3": "scratch",
+        "default": "default",
+        "select": "select",
+        "scratch": "scratch",
+    }
+    while True:
+        try:
+            choice = input(f"Choose [1/2/3] (default {default_choice}): ").strip().lower()
+        except EOFError:
+            choice = default_choice
+        if not choice:
+            choice = default_choice
+        selected = mapping.get(choice)
+        if selected is not None:
+            return selected
+        print("Invalid choice. Enter 1, 2, 3, or press Enter for default.")
+
+
 def _build_checkpoint_catalog(candidates, model, device, base_dir):
     target_state = model.state_dict()
     catalog = []
@@ -267,14 +302,29 @@ def _print_transfer_report(report):
     print(f"  unexpected keys:  {len(report['unexpected_keys'])}")
 
 
-def plan_rl_startup(model, device, models_dir, best_model_rl_path, rl_dir):
+def plan_rl_startup(model, device, models_dir, best_model_rl_path, rl_dir, default_new_checkpoint=None):
     """Interactive startup menu + checkpoint selection for RL."""
     available_checkpoints = _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir)
     selected_checkpoint = None
     checkpoint_catalog = []
+    new_init_mode = "default"
 
     start_mode = _choose_start_mode(has_checkpoints=(len(available_checkpoints) > 0))
-    if start_mode in {"resume", "transfer"}:
+    if start_mode == "new":
+        has_default_init = bool(default_new_checkpoint is not None and Path(default_new_checkpoint).exists())
+        new_init_mode = _choose_new_init_mode(
+            has_default_init=has_default_init,
+            has_checkpoints=(len(available_checkpoints) > 0),
+        )
+        if new_init_mode == "select":
+            print("\nScanning checkpoints (metrics + compatibility)...")
+            checkpoint_catalog = _build_checkpoint_catalog(available_checkpoints, model, device, models_dir)
+            _print_checkpoint_catalog(checkpoint_catalog, "transfer")
+            selected_checkpoint = _choose_checkpoint_path(checkpoint_catalog)
+            if selected_checkpoint is None:
+                print("WARNING: No valid init checkpoint selected. Falling back to default init.")
+                new_init_mode = "default"
+    elif start_mode in {"resume", "transfer"}:
         print("\nScanning checkpoints (metrics + compatibility)...")
         checkpoint_catalog = _build_checkpoint_catalog(available_checkpoints, model, device, models_dir)
         _print_checkpoint_catalog(checkpoint_catalog, start_mode)
@@ -294,6 +344,7 @@ def plan_rl_startup(model, device, models_dir, best_model_rl_path, rl_dir):
         "selected_checkpoint": selected_checkpoint,
         "selected_checkpoint_label": selected_checkpoint_label,
         "selected_entry": selected_entry,
+        "new_init_mode": new_init_mode,
     }
 
 
@@ -310,6 +361,7 @@ def apply_rl_startup_plan(
     selected_checkpoint = startup_plan.get("selected_checkpoint")
     selected_checkpoint_label = startup_plan.get("selected_checkpoint_label")
     selected_entry = startup_plan.get("selected_entry") or {}
+    new_init_mode = startup_plan.get("new_init_mode", "default")
 
     selected_compatibility_ratio = selected_entry.get("compatibility_ratio")
     transfer_match_ratio = None
@@ -372,7 +424,11 @@ def apply_rl_startup_plan(
             best_win_rate = 0.0
 
     if start_mode == "new":
-        init_path = Path(default_new_checkpoint) if default_new_checkpoint is not None else None
+        init_path = None
+        if new_init_mode == "select" and selected_checkpoint is not None:
+            init_path = Path(selected_checkpoint)
+        elif new_init_mode == "default" and default_new_checkpoint is not None:
+            init_path = Path(default_new_checkpoint)
         if init_path is not None and init_path.exists():
             print(f"\nInitializing RL from: {init_path}")
             checkpoint = load_checkpoint_file(str(init_path), device)
@@ -398,4 +454,5 @@ def apply_rl_startup_plan(
         "best_win_rate": best_win_rate,
         "selected_compatibility_ratio": selected_compatibility_ratio,
         "transfer_match_ratio": transfer_match_ratio,
+        "new_init_mode": new_init_mode,
     }

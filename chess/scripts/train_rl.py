@@ -14,6 +14,7 @@ import copy
 import shutil
 import contextlib
 import multiprocessing as _stdlib_mp
+from collections import defaultdict, deque
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -66,7 +67,7 @@ import threading
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
-from src.model import ChessNet, save_checkpoint, normalize_state_dict_keys
+from src.model import ChessNet, save_checkpoint, normalize_state_dict_keys, load_checkpoint_file
 
 # Import MCTS self-play
 try:
@@ -79,7 +80,7 @@ except ImportError:
 # Import from utils
 from utils.shared.logger import TrainingLogger
 from utils.shared.elo_estimator import estimate_model_elo
-from utils.rl.replay import ReplayBuffer, PrioritizedReplayBuffer
+from utils.rl.replay import ReplayBuffer
 from utils.rl.temperature import TemperatureSchedule
 from utils.rl.training_rl import train_on_batch_rl, evaluate_models
 from utils.rl.startup import plan_rl_startup, apply_rl_startup_plan
@@ -127,12 +128,132 @@ def _resolve_elo_worker_device(main_device, configured_value):
     return resolved
 
 
-def _snapshot_model_state_cpu(model):
+def _snapshot_model_state_cpu(model, share_memory=False):
     normalized_state = normalize_state_dict_keys(model.state_dict())
-    return {
-        key: tensor.detach().to(device="cpu", copy=True)
-        for key, tensor in normalized_state.items()
+    snapshot = {}
+    for key, tensor in normalized_state.items():
+        cpu_tensor = tensor.detach().to(device="cpu", copy=True)
+        if share_memory:
+            cpu_tensor = cpu_tensor.contiguous()
+            cpu_tensor.share_memory_()
+        snapshot[key] = cpu_tensor
+    return snapshot
+
+
+def _weighted_choice_index(weights):
+    if not weights:
+        return None
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    total = float(weights_arr.sum())
+    if total <= 0.0:
+        return int(np.random.randint(0, len(weights)))
+    probs = weights_arr / total
+    return int(np.random.choice(len(weights), p=probs))
+
+
+def _build_selfplay_opponent_assignments(
+    rl_cfg,
+    worker_specs,
+    best_model_state=None,
+    recent_snapshot_pool=None,
+):
+    enabled = bool(rl_cfg.get('self_play_opponent_pool_enabled', False))
+    if not enabled or not worker_specs:
+        return {}, {}
+
+    current_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_current_fraction', 0.4)))
+    best_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_best_fraction', 0.3)))
+    recent_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_recent_fraction', 0.3)))
+
+    recent_snapshot_pool = list(recent_snapshot_pool or [])
+    available_sources = []
+    if current_fraction > 0.0:
+        available_sources.append(("current", current_fraction))
+    if best_model_state is not None and best_fraction > 0.0:
+        available_sources.append(("best", best_fraction))
+    if recent_snapshot_pool and recent_fraction > 0.0:
+        available_sources.append(("recent", recent_fraction))
+
+    if not available_sources:
+        return {}, {}
+
+    total_games = int(sum(max(0, int(games)) for _, games in worker_specs))
+    if total_games <= 0:
+        return {}, {}
+
+    source_weights = {label: float(weight) for label, weight in available_sources}
+    total_weight = float(sum(source_weights.values()))
+    if total_weight <= 0.0:
+        return {}, {}
+    for label in list(source_weights.keys()):
+        source_weights[label] = source_weights[label] / total_weight
+
+    target_games = {
+        label: int(round(total_games * source_weights[label]))
+        for label in source_weights.keys()
     }
+    assigned_target_total = int(sum(target_games.values()))
+    if assigned_target_total != total_games:
+        order = sorted(
+            source_weights.keys(),
+            key=lambda key: (-source_weights[key], key),
+        )
+        delta = total_games - assigned_target_total
+        idx = 0
+        while delta != 0 and order:
+            label = order[idx % len(order)]
+            if delta > 0:
+                target_games[label] += 1
+                delta -= 1
+            elif target_games[label] > 0:
+                target_games[label] -= 1
+                delta += 1
+            idx += 1
+
+    assignments = {}
+    assigned_counts = defaultdict(int)
+    remaining_target_games = dict(target_games)
+    sorted_workers = sorted(worker_specs, key=lambda item: (-int(item[1]), int(item[0])))
+    recent_choice_weights = [float(i + 1) for i in range(len(recent_snapshot_pool))]
+
+    for rank, games_for_worker in sorted_workers:
+        positive_candidates = [
+            label for label, remaining in remaining_target_games.items()
+            if remaining > 0
+        ]
+        if positive_candidates:
+            chosen_label = max(
+                positive_candidates,
+                key=lambda label: (remaining_target_games[label], source_weights.get(label, 0.0), label),
+            )
+        else:
+            chosen_label = max(
+                source_weights.keys(),
+                key=lambda label: (source_weights[label], label),
+            )
+
+        payload = None
+        if chosen_label == "best":
+            payload = {
+                "label": "best",
+                "state": best_model_state,
+            }
+        elif chosen_label == "recent" and recent_snapshot_pool:
+            recent_idx = _weighted_choice_index(recent_choice_weights)
+            if recent_idx is not None:
+                recent_entry = recent_snapshot_pool[recent_idx]
+                payload = {
+                    "label": str(recent_entry.get("label", "recent")),
+                    "state": recent_entry.get("state"),
+                }
+        assignments[int(rank)] = payload
+        assigned_counts[chosen_label] += int(games_for_worker)
+        remaining_target_games[chosen_label] = max(
+            0,
+            int(remaining_target_games.get(chosen_label, 0) - int(games_for_worker)),
+        )
+
+    return assignments, dict(assigned_counts)
 
 
 def _rl_elo_worker(
@@ -192,8 +313,17 @@ class RLEloCoordinator:
         self.enabled = bool(self.elo_config.get("enabled", False))
         self.every_n_evals = max(1, int(self.elo_config.get("rl_every_n_evals", 3)))
         self.final_on_shutdown = bool(self.elo_config.get("final_on_rl_shutdown", True))
-        self.min_win_rate_for_stockfish = float(self.elo_config.get("rl_min_win_rate_for_stockfish", 0.50))
-        self.last_eval_win_rate = None
+        self.min_score_rate_for_stockfish = float(
+            self.elo_config.get(
+                "rl_min_score_rate_for_stockfish",
+                self.elo_config.get("rl_min_win_rate_for_stockfish", 0.50),
+            )
+        )
+        self.min_true_win_rate_for_stockfish = float(
+            self.elo_config.get("rl_min_true_win_rate_for_stockfish", 0.0)
+        )
+        self.last_eval_score_rate = None
+        self.last_eval_true_win_rate = None
         # RL evaluation is synchronous by design (training is paused while Elo runs).
         # Prefer CUDA for RL Elo/MCTS evaluation when available.
         rl_eval_device_raw = str(self.elo_config.get("rl_device", "cuda")).strip().lower()
@@ -219,7 +349,8 @@ class RLEloCoordinator:
             f"Elo eval (RL): every {self.every_n_evals} eval(s) vs Stockfish, "
             f"sync_device={self.eval_device.type}, final_on_shutdown={self.final_on_shutdown}, "
             f"mcts={self.elo_config.get('use_mcts', False)}, "
-            f"min_win_rate={self.min_win_rate_for_stockfish:.0%}"
+            f"min_score_rate={self.min_score_rate_for_stockfish:.0%}, "
+            f"min_true_win_rate={self.min_true_win_rate_for_stockfish:.0%}"
         )
         if self.final_on_shutdown:
             print(
@@ -227,20 +358,27 @@ class RLEloCoordinator:
                 f"mcts_simulations={int(final_sims)}"
             )
 
-    def maybe_evaluate(self, iteration_num, win_rate=None):
+    def maybe_evaluate(self, iteration_num, score_rate=None, true_win_rate=None):
         if not self.enabled:
             return None
-        self.last_eval_win_rate = win_rate
+        self.last_eval_score_rate = score_rate
+        self.last_eval_true_win_rate = true_win_rate
         self.eval_counter += 1
         if (self.eval_counter % self.every_n_evals) != 0:
             return None
-        if win_rate is None:
-            print("Skipping Stockfish Elo: missing RL win rate vs best model.")
+        if score_rate is None:
+            print("Skipping Stockfish Elo: missing RL score rate vs best model.")
             return None
-        if float(win_rate) < self.min_win_rate_for_stockfish:
+        if float(score_rate) < self.min_score_rate_for_stockfish:
             print(
                 "Skipping Stockfish Elo: "
-                f"win rate {float(win_rate):.2%} < required {self.min_win_rate_for_stockfish:.0%}."
+                f"score rate {float(score_rate):.2%} < required {self.min_score_rate_for_stockfish:.0%}."
+            )
+            return None
+        if true_win_rate is not None and float(true_win_rate) < self.min_true_win_rate_for_stockfish:
+            print(
+                "Skipping Stockfish Elo: "
+                f"true win rate {float(true_win_rate):.2%} < required {self.min_true_win_rate_for_stockfish:.0%}."
             )
             return None
         return self._run_estimate(iteration_num, reason_label=f"iteration {iteration_num}")
@@ -359,6 +497,48 @@ def _handle_graceful_interrupt(logger=None, stage=None):
     print("RL training stopped gracefully.")
 
 
+def _empty_eval_stats():
+    return {
+        'wins': 0,
+        'draws': 0,
+        'losses': 0,
+        'unresolved': 0,
+        'score_rate': 0.0,
+        'win_rate': 0.0,
+        'draw_rate': 0.0,
+        'loss_rate': 0.0,
+        'num_games': 0,
+    }
+
+
+def _combine_eval_stats(*stats_items):
+    combined = _empty_eval_stats()
+    total_games = 0
+    for item in stats_items:
+        if not item:
+            continue
+        combined['wins'] += int(item.get('wins', 0) or 0)
+        combined['draws'] += int(item.get('draws', 0) or 0)
+        combined['losses'] += int(item.get('losses', 0) or 0)
+        combined['unresolved'] += int(item.get('unresolved', 0) or 0)
+        total_games += int(item.get('num_games', 0) or 0)
+
+    combined['num_games'] = int(total_games)
+    if total_games > 0:
+        combined['score_rate'] = float((combined['wins'] + 0.5 * combined['draws']) / total_games)
+        combined['win_rate'] = float(combined['wins'] / total_games)
+        combined['draw_rate'] = float(combined['draws'] / total_games)
+        combined['loss_rate'] = float(combined['losses'] / total_games)
+    return combined
+
+
+def _should_run_anchor_eval(iteration_num, rl_cfg):
+    if not bool(rl_cfg.get('anchor_eval_enabled', False)):
+        return False
+    every = max(1, int(rl_cfg.get('anchor_eval_every', 1)))
+    return (iteration_num % every) == 0
+
+
 # ==============================================================================
 # SELF-PLAY WITH PROPER MCTS
 # ==============================================================================
@@ -407,12 +587,14 @@ class _PersistentSelfPlayPool:
         model_state_path,
         temperature,
         worker_model_state_paths=None,
-        worker_opponent_state_paths=None,
+        worker_opponent_payloads=None,
+        model_state=None,
+        stream_results_to_queue=False,
     ):
         result_files = []
         progress_files = []
         worker_model_state_paths = worker_model_state_paths or {}
-        worker_opponent_state_paths = worker_opponent_state_paths or {}
+        worker_opponent_payloads = worker_opponent_payloads or {}
 
         for rank, games_for_worker in self.worker_specs:
             result_file = self.temp_dir / f"worker_{rank}_{task_id}.pkl"
@@ -426,18 +608,18 @@ class _PersistentSelfPlayPool:
             except Exception:
                 pass
 
+            opponent_payload = worker_opponent_payloads.get(rank) or {}
             self.task_queues[rank].put({
                 'cmd': 'play',
                 'task_id': task_id,
+                'model_state': model_state,
                 'model_state_path': str(worker_model_state_paths.get(rank, model_state_path)),
-                'opponent_model_state_path': (
-                    str(worker_opponent_state_paths[rank])
-                    if rank in worker_opponent_state_paths
-                    else None
-                ),
+                'opponent_model_state': opponent_payload.get('state'),
+                'opponent_label': opponent_payload.get('label'),
                 'num_games': int(games_for_worker),
                 'result_file_path': str(result_file),
                 'mcts_temperature': temperature,
+                'stream_results_to_queue': bool(stream_results_to_queue),
             })
             result_files.append(result_file)
             progress_files.append(progress_file)
@@ -520,7 +702,15 @@ def _is_interrupt_exit_code(exit_code):
     return sigint is not None and exit_code == -int(sigint)
 
 
-def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=None):
+def play_games_parallel_mcts(
+    model,
+    config,
+    device,
+    num_games,
+    replay_buffer=None,
+    best_model_state=None,
+    recent_snapshot_pool=None,
+):
     """
     Parallel self-play using MCTS
     
@@ -542,6 +732,8 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
     stream_to_replay = replay_buffer is not None and bool(
         rl_cfg.get('self_play_stream_to_replay', True)
     )
+    queue_transport_enabled = bool(rl_cfg.get('self_play_queue_transport', True))
+    use_queue_transport = bool(use_persistent_pool and stream_to_replay and queue_transport_enabled)
     
     # Parallel configuration
     num_workers = rl_cfg.get('self_play_workers', 4)
@@ -615,118 +807,16 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
     games_per_worker = [base_games + (1 if i < remainder else 0) for i in range(num_workers)]
     worker_specs = [(rank, games_per_worker[rank]) for rank in range(num_workers) if games_per_worker[rank] > 0]
 
-    # Shared temp dirs used by worker result files and league runtime snapshots.
+    opponent_assignments, _opponent_mix_games = _build_selfplay_opponent_assignments(
+        rl_cfg,
+        worker_specs,
+        best_model_state=best_model_state,
+        recent_snapshot_pool=recent_snapshot_pool,
+    )
+
+    # Shared temp dir used by worker result files.
     temp_dir = Path(tempfile.gettempdir()) / "chess_selfplay_mcts"
     temp_dir.mkdir(exist_ok=True)
-    league_runtime_dir = temp_dir / "league_pool_runtime"
-    league_runtime_dir.mkdir(exist_ok=True)
-
-    # League-style snapshot mixing: a fraction of workers uses older checkpoints
-    # to generate data against weaker/stale policies (breaks draw-heavy local optima).
-    league_cfg = rl_cfg
-    league_enabled = bool(league_cfg.get('league_selfplay_enabled', False))
-    league_worker_fraction = float(league_cfg.get('league_worker_fraction', 0.30))
-    league_worker_fraction = max(0.0, min(1.0, league_worker_fraction))
-    league_max_checkpoints = max(1, int(league_cfg.get('league_max_checkpoints', 8)))
-    league_min_pool_for_full_fraction = max(
-        2,
-        int(league_cfg.get('league_min_pool_for_full_fraction', 10)),
-    )
-    league_runtime_snapshots_enabled = bool(
-        league_cfg.get('league_runtime_snapshots_enabled', True)
-    )
-    league_runtime_snapshot_keep = max(
-        2,
-        int(league_cfg.get('league_runtime_snapshot_keep', 12)),
-    )
-    league_opponent_age_bias = float(league_cfg.get('league_opponent_age_bias', 1.25))
-    league_recent_opponent_prob = float(league_cfg.get('league_recent_opponent_prob', 0.35))
-    league_recent_opponent_prob = max(0.0, min(1.0, league_recent_opponent_prob))
-
-    def _build_time_diverse_pool(candidates, keep_count):
-        if not candidates:
-            return []
-        keep_count = max(1, int(keep_count))
-        if len(candidates) <= keep_count:
-            return list(candidates)
-        idxs = sorted({
-            int(round(v))
-            for v in np.linspace(0, len(candidates) - 1, num=keep_count)
-        })
-        if len(idxs) < keep_count:
-            for idx in range(len(candidates)):
-                if idx in idxs:
-                    continue
-                idxs.append(idx)
-                if len(idxs) >= keep_count:
-                    break
-            idxs = sorted(idxs)
-        return [candidates[idx] for idx in idxs[:keep_count]]
-
-    def _sample_league_opponent(candidates):
-        if not candidates:
-            return None
-        if len(candidates) == 1:
-            return candidates[0]
-
-        recent_bucket = max(1, len(candidates) // 3)
-        if np.random.random() < league_recent_opponent_prob:
-            recent_idx = int(np.random.randint(0, recent_bucket))
-            return candidates[recent_idx]
-
-        ranks = np.arange(len(candidates), dtype=np.float64)
-        age_bias = max(0.0, float(league_opponent_age_bias))
-        weights = (ranks + 1.0) ** age_bias
-        weights_sum = float(np.sum(weights))
-        if weights_sum <= 0.0:
-            return candidates[int(np.random.randint(0, len(candidates)))]
-        probs = weights / weights_sum
-        sampled_idx = int(np.random.choice(np.arange(len(candidates)), p=probs))
-        return candidates[sampled_idx]
-
-    worker_opponent_state_paths = {}
-    league_candidates = []
-    if league_enabled:
-        try:
-            # Runtime snapshot pool captured from this RL line (init + iter snapshots).
-            if league_runtime_snapshots_enabled and league_runtime_dir.exists():
-                runtime_snapshots = sorted(
-                    league_runtime_dir.glob('*.pt'),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                league_candidates.extend(runtime_snapshots)
-        except Exception:
-            league_candidates = []
-
-        # Deduplicate while preserving order
-        seen = set()
-        deduped = []
-        for p in league_candidates:
-            key = str(p.resolve())
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(p)
-        league_candidates = _build_time_diverse_pool(deduped, league_max_checkpoints)
-
-        # Keep league pressure modest when the snapshot pool is still tiny.
-        if league_candidates:
-            pool_scale = min(1.0, float(len(league_candidates)) / float(league_min_pool_for_full_fraction))
-            league_worker_fraction = max(0.0, min(1.0, league_worker_fraction * pool_scale))
-
-        if league_candidates and worker_specs and league_worker_fraction > 0.0:
-            league_worker_count = int(round(len(worker_specs) * league_worker_fraction))
-            league_worker_count = max(1, min(len(worker_specs), league_worker_count))
-            rank_choices = np.random.choice(
-                [rank for rank, _ in worker_specs],
-                size=league_worker_count,
-                replace=False,
-            )
-            for rank in rank_choices:
-                sampled = _sample_league_opponent(league_candidates)
-                if sampled is not None:
-                    worker_opponent_state_paths[int(rank)] = sampled
     
     global _SELFPLAY_CONFIG_PRINTED
     if not _SELFPLAY_CONFIG_PRINTED:
@@ -740,11 +830,6 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
             for _, games in worker_specs
         )
         w_games = f"{base_games}" + (f"  (+1 dla {remainder} workerów)" if remainder else "")
-        league_status = (
-            f"on ({len(worker_opponent_state_paths)}/{len(worker_specs)} workerów, pool={len(league_candidates)})"
-            if league_enabled and league_candidates
-            else ("on (brak checkpointów w puli)" if league_enabled else "off")
-        )
         print()
         unicode_lines = [
             "╔══════════════════════════════════════════════════════╗",
@@ -762,7 +847,6 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
             f"║  Symulacje MCTS          ║  {rl_cfg['mcts_simulations']:<25} ║",
             f"║  Rozmiar batcha MCTS     ║  {rl_cfg.get('mcts_batch_size', 32):<25} ║",
             f"║  Reuse drzewa            ║  {str(rl_cfg.get('mcts_reuse_tree', True)):<25} ║",
-            f"║  League opponent pool    ║  {league_status:<25} ║",
             "╚══════════════════════════╩═══════════════════════════╝",
         ]
         ascii_lines = [
@@ -781,7 +865,6 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
             f"|  Symulacje MCTS          |  {rl_cfg['mcts_simulations']:<25} |",
             f"|  Rozmiar batcha MCTS     |  {rl_cfg.get('mcts_batch_size', 32):<25} |",
             f"|  Reuse drzewa            |  {str(rl_cfg.get('mcts_reuse_tree', True)):<25} |",
-            f"|  League opponent pool    |  {league_status:<25} |",
             "+--------------------------+-------------------------+",
         ]
         _print_console_block(unicode_lines, ascii_lines=ascii_lines)
@@ -791,6 +874,26 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
     result_files = []
     progress_files = []
     model_state_path = None
+    queue_total_positions = 0
+    queue_game_lengths = []
+    queue_total_dropped_positions = 0
+    queue_total_truncated_games = 0
+    queue_total_claimable_draw_ended_games = 0
+    queue_total_adjudicated_games = 0
+    queue_total_completed_length_sum = 0
+    queue_total_truncated_length_sum = 0
+    queue_total_completed_white_wins = 0
+    queue_total_completed_black_wins = 0
+    queue_total_completed_draws = 0
+    queue_total_decisive_games = 0
+    queue_total_decisive_length_sum = 0
+    queue_total_curriculum_dropped_positions = 0
+    queue_total_cap_dropped_positions = 0
+    queue_total_value_sum = 0.0
+    queue_total_value_sq_sum = 0.0
+    queue_total_value_count = 0
+    queue_total_resigned_games = 0
+    queue_opponent_source_games = defaultdict(int)
     
     interrupted = False
     try:
@@ -803,56 +906,22 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
 
             task_id = f"{os.getpid()}_{time.time_ns()}"
             model_state_path = temp_dir / f"selfplay_model_{task_id}.pt"
-            model_state_cpu = {
-                key: tensor.detach().cpu()
-                for key, tensor in model_state.items()
-            }
+            model_state_cpu = _snapshot_model_state_cpu(model, share_memory=True)
 
-            if league_enabled and league_runtime_snapshots_enabled:
-                runtime_snapshot_path = league_runtime_dir / f"league_runtime_{task_id}.pt"
-                torch.save(model_state_cpu, runtime_snapshot_path)
-                runtime_snapshots = sorted(
-                    league_runtime_dir.glob('*.pt'),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                for stale_path in runtime_snapshots[league_runtime_snapshot_keep:]:
-                    try:
-                        stale_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-            torch.save(model_state_cpu, model_state_path)
-            del model_state_cpu
+            if not use_queue_transport:
+                torch.save(model_state_cpu, model_state_path)
 
             result_files, progress_files = _SELFPLAY_POOL.submit(
                 task_id=task_id,
                 model_state_path=model_state_path,
+                model_state=model_state_cpu,
                 temperature=rl_cfg.get('mcts_temperature'),
                 worker_model_state_paths={},
-                worker_opponent_state_paths=worker_opponent_state_paths,
+                worker_opponent_payloads=opponent_assignments,
+                stream_results_to_queue=use_queue_transport,
             )
             processes = [_SELFPLAY_POOL.processes[rank] for rank, _ in worker_specs]
         else:
-            if league_enabled and league_runtime_snapshots_enabled:
-                runtime_snapshot_path = league_runtime_dir / f"league_runtime_{os.getpid()}_{time.time_ns()}.pt"
-                model_state_cpu = {
-                    key: tensor.detach().cpu()
-                    for key, tensor in model_state.items()
-                }
-                torch.save(model_state_cpu, runtime_snapshot_path)
-                del model_state_cpu
-                runtime_snapshots = sorted(
-                    league_runtime_dir.glob('*.pt'),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                for stale_path in runtime_snapshots[league_runtime_snapshot_keep:]:
-                    try:
-                        stale_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
             mp_ctx = mp.get_context('spawn')
             for rank, games_for_worker in worker_specs:
                 if device_type == 'cuda':
@@ -872,7 +941,7 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
                         device_id,
                         games_for_worker,
                         str(result_file),
-                        str(worker_opponent_state_paths[rank]) if rank in worker_opponent_state_paths else None,
+                        opponent_assignments.get(rank),
                     )
                 )
                 p.daemon = True
@@ -916,6 +985,58 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
                     try:
                         message = _SELFPLAY_POOL.result_queue.get(timeout=0.2)
                         if message.get('task_id') == task_id:
+                            if message.get('type') == 'payload':
+                                packed = message.get('positions')
+                                chunk_lengths = list(message.get('game_lengths', []) or [])
+                                chunk_stats = message.get('stats', {}) or {}
+                                if packed is not None:
+                                    boards = packed.get('boards')
+                                    policy_indices = packed.get('policy_indices')
+                                    policy_values = packed.get('policy_values')
+                                    policy_lengths = packed.get('policy_lengths')
+                                    values = packed.get('values')
+                                    chunk_positions = int(packed.get('num_positions', 0) or 0)
+                                    if (
+                                        replay_buffer is not None
+                                        and boards is not None
+                                        and policy_indices is not None
+                                        and policy_values is not None
+                                        and policy_lengths is not None
+                                        and values is not None
+                                    ):
+                                        replay_buffer.add_packed_batch(
+                                            boards,
+                                            policy_indices,
+                                            policy_values,
+                                            policy_lengths,
+                                            values,
+                                        )
+                                    queue_total_positions += chunk_positions
+                                    if values is not None:
+                                        flat_values = values.reshape(-1).float()
+                                        queue_total_value_sum += float(flat_values.sum().item())
+                                        queue_total_value_sq_sum += float((flat_values * flat_values).sum().item())
+                                        queue_total_value_count += int(flat_values.numel())
+                                queue_game_lengths.extend(chunk_lengths)
+                                queue_total_dropped_positions += int(chunk_stats.get('dropped_positions', 0))
+                                queue_total_truncated_games += int(chunk_stats.get('truncated_games', 0))
+                                queue_total_claimable_draw_ended_games += int(chunk_stats.get('claimable_draw_ended_games', 0))
+                                queue_total_adjudicated_games += int(chunk_stats.get('adjudicated_games', 0))
+                                queue_total_completed_length_sum += int(chunk_stats.get('completed_length_sum', 0))
+                                queue_total_truncated_length_sum += int(chunk_stats.get('truncated_length_sum', 0))
+                                queue_total_completed_white_wins += int(chunk_stats.get('completed_white_wins', 0))
+                                queue_total_completed_black_wins += int(chunk_stats.get('completed_black_wins', 0))
+                                queue_total_completed_draws += int(chunk_stats.get('completed_draws', 0))
+                                queue_total_decisive_games += int(chunk_stats.get('decisive_games', 0))
+                                queue_total_decisive_length_sum += int(chunk_stats.get('decisive_length_sum', 0))
+                                queue_total_curriculum_dropped_positions += int(chunk_stats.get('curriculum_dropped_positions', 0))
+                                queue_total_cap_dropped_positions += int(chunk_stats.get('cap_dropped_positions', 0))
+                                queue_total_resigned_games += int(chunk_stats.get('resigned_games', 0))
+                                opponent_source = str(chunk_stats.get('opponent_source', 'current'))
+                                chunk_total_games = int(chunk_stats.get('total_games', len(chunk_lengths) or 0))
+                                if chunk_total_games > 0:
+                                    queue_opponent_source_games[opponent_source] += chunk_total_games
+                                continue
                             rank = message.get('rank')
                             pending.discard(rank)
                             if not message.get('ok', False):
@@ -978,7 +1099,7 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
     finally:
         if interrupted and not use_persistent_pool:
             _terminate_workers(processes)
-        if model_state_path is not None:
+        if model_state_path is not None and not use_queue_transport:
             try:
                 model_state_path.unlink(missing_ok=True)
             except Exception:
@@ -990,92 +1111,104 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
     collection_start = time.time()
     
     all_positions = [] if not stream_to_replay else None
-    total_positions = 0
-    game_lengths = []
-    total_dropped_positions = 0
-    total_truncated_games = 0
-    total_claimable_draw_ended_games = 0
-    total_completed_length_sum = 0
-    total_truncated_length_sum = 0
-    total_completed_white_wins = 0
-    total_completed_black_wins = 0
-    total_completed_draws = 0
-    total_primary_model_wins = 0
-    total_opponent_model_wins = 0
-    total_model_match_draws = 0
-    total_primary_white_games = 0
-    total_primary_white_wins = 0
-    total_primary_black_games = 0
-    total_primary_black_wins = 0
-    total_value_sum = 0.0
-    total_value_sq_sum = 0.0
-    total_value_count = 0
+    total_positions = queue_total_positions if use_queue_transport else 0
+    game_lengths = list(queue_game_lengths) if use_queue_transport else []
+    total_dropped_positions = queue_total_dropped_positions if use_queue_transport else 0
+    total_truncated_games = queue_total_truncated_games if use_queue_transport else 0
+    total_claimable_draw_ended_games = queue_total_claimable_draw_ended_games if use_queue_transport else 0
+    total_adjudicated_games = queue_total_adjudicated_games if use_queue_transport else 0
+    total_completed_length_sum = queue_total_completed_length_sum if use_queue_transport else 0
+    total_truncated_length_sum = queue_total_truncated_length_sum if use_queue_transport else 0
+    total_completed_white_wins = queue_total_completed_white_wins if use_queue_transport else 0
+    total_completed_black_wins = queue_total_completed_black_wins if use_queue_transport else 0
+    total_completed_draws = queue_total_completed_draws if use_queue_transport else 0
+    total_decisive_games = queue_total_decisive_games if use_queue_transport else 0
+    total_decisive_length_sum = queue_total_decisive_length_sum if use_queue_transport else 0
+    total_curriculum_dropped_positions = queue_total_curriculum_dropped_positions if use_queue_transport else 0
+    total_cap_dropped_positions = queue_total_cap_dropped_positions if use_queue_transport else 0
+    total_value_sum = queue_total_value_sum if use_queue_transport else 0.0
+    total_value_sq_sum = queue_total_value_sq_sum if use_queue_transport else 0.0
+    total_value_count = queue_total_value_count if use_queue_transport else 0
+    total_resigned_games = queue_total_resigned_games if use_queue_transport else 0
+    opponent_source_games = dict(queue_opponent_source_games) if use_queue_transport else {}
     
-    for idx, result_file in enumerate(result_files):
-        if result_file.exists():
-            try:
-                with open(result_file, 'rb') as f:
-                    while True:
-                        try:
-                            payload = pickle.load(f)
-                        except EOFError:
-                            break
-                        if isinstance(payload, tuple) and len(payload) == 3:
-                            positions, lengths, stats = payload
-                        elif isinstance(payload, tuple) and len(payload) == 2:
-                            positions, lengths = payload
-                            stats = {}
-                        else:
-                            # Unexpected format: preserve backward compatibility best-effort.
-                            positions, lengths, stats = [], [], {}
-
-                        total_positions += len(positions)
-                        for pos in positions:
+    if not use_queue_transport:
+        for idx, result_file in enumerate(result_files):
+            if result_file.exists():
+                try:
+                    with open(result_file, 'rb') as f:
+                        while True:
                             try:
-                                v = float(pos[3].reshape(-1)[0].item())
-                            except Exception:
-                                continue
-                            total_value_sum += v
-                            total_value_sq_sum += v * v
-                            total_value_count += 1
-                        if stream_to_replay:
-                            for position in positions:
-                                replay_buffer.add(position)
-                        else:
-                            all_positions.extend(positions)
-                        game_lengths.extend(lengths)
-                        total_dropped_positions += int((stats or {}).get('dropped_positions', 0))
-                        total_truncated_games += int((stats or {}).get('truncated_games', 0))
-                        total_claimable_draw_ended_games += int((stats or {}).get('claimable_draw_ended_games', 0))
-                        total_completed_length_sum += int((stats or {}).get('completed_length_sum', 0))
-                        total_truncated_length_sum += int((stats or {}).get('truncated_length_sum', 0))
-                        total_completed_white_wins += int((stats or {}).get('completed_white_wins', 0))
-                        total_completed_black_wins += int((stats or {}).get('completed_black_wins', 0))
-                        total_completed_draws += int((stats or {}).get('completed_draws', 0))
-                        total_primary_model_wins += int((stats or {}).get('primary_model_wins', 0))
-                        total_opponent_model_wins += int((stats or {}).get('opponent_model_wins', 0))
-                        total_model_match_draws += int((stats or {}).get('model_match_draws', 0))
-                        total_primary_white_games += int((stats or {}).get('primary_white_games', 0))
-                        total_primary_white_wins += int((stats or {}).get('primary_white_wins', 0))
-                        total_primary_black_games += int((stats or {}).get('primary_black_games', 0))
-                        total_primary_black_wins += int((stats or {}).get('primary_black_wins', 0))
-                
-                result_file.unlink()
-            except Exception as e:
-                print(f"⚠️ Warning: Failed to load results from worker {idx}: {e}")
-        else:
-            print(f"⚠️ Warning: Worker {idx} result file not found")
+                                payload = pickle.load(f)
+                            except EOFError:
+                                break
+                            if isinstance(payload, tuple) and len(payload) == 3:
+                                positions, lengths, stats = payload
+                            elif isinstance(payload, tuple) and len(payload) == 2:
+                                positions, lengths = payload
+                                stats = {}
+                            else:
+                                # Unexpected format: preserve backward compatibility best-effort.
+                                positions, lengths, stats = [], [], {}
+
+                            total_positions += len(positions)
+                            for pos in positions:
+                                try:
+                                    v = float(pos[3].reshape(-1)[0].item())
+                                except Exception:
+                                    continue
+                                total_value_sum += v
+                                total_value_sq_sum += v * v
+                                total_value_count += 1
+                            if stream_to_replay:
+                                for position in positions:
+                                    replay_buffer.add(position)
+                            else:
+                                all_positions.extend(positions)
+                            game_lengths.extend(lengths)
+                            total_dropped_positions += int((stats or {}).get('dropped_positions', 0))
+                            total_truncated_games += int((stats or {}).get('truncated_games', 0))
+                            total_claimable_draw_ended_games += int((stats or {}).get('claimable_draw_ended_games', 0))
+                            total_adjudicated_games += int((stats or {}).get('adjudicated_games', 0))
+                            total_completed_length_sum += int((stats or {}).get('completed_length_sum', 0))
+                            total_truncated_length_sum += int((stats or {}).get('truncated_length_sum', 0))
+                            total_completed_white_wins += int((stats or {}).get('completed_white_wins', 0))
+                            total_completed_black_wins += int((stats or {}).get('completed_black_wins', 0))
+                            total_completed_draws += int((stats or {}).get('completed_draws', 0))
+                            total_decisive_games += int((stats or {}).get('decisive_games', 0))
+                            total_decisive_length_sum += int((stats or {}).get('decisive_length_sum', 0))
+                            total_curriculum_dropped_positions += int((stats or {}).get('curriculum_dropped_positions', 0))
+                            total_cap_dropped_positions += int((stats or {}).get('cap_dropped_positions', 0))
+                            total_resigned_games += int((stats or {}).get('resigned_games', 0))
+                            opponent_source = str((stats or {}).get('opponent_source', 'current'))
+                            chunk_total_games = int((stats or {}).get('total_games', len(lengths) or 0))
+                            if chunk_total_games > 0:
+                                opponent_source_games[opponent_source] = int(opponent_source_games.get(opponent_source, 0)) + chunk_total_games
+                    result_file.unlink()
+                except Exception as e:
+                    print(f"⚠️ Warning: Failed to load results from worker {idx}: {e}")
+            else:
+                print(f"⚠️ Warning: Worker {idx} result file not found")
     
     collection_time = time.time() - collection_start
     total_time = time.time() - start_time
     
     positions_per_sec = total_positions / total_time if total_time > 0 else 0
     avg_length = np.mean(game_lengths) if game_lengths else 0
+    filtered_positions = int(total_curriculum_dropped_positions + total_cap_dropped_positions)
+    def _format_plies(value):
+        return f"{value:.1f} plies (~{value / 2.0:.1f} full moves)"
     
     print(f"✅ MCTS Self-play completed:")
     print(f"   Positions: {total_positions}")
     print(f"   Games: {len(game_lengths)}")
-    total_generated_positions = total_positions + total_dropped_positions
+    if opponent_source_games:
+        mix_parts = [
+            f"{label}={count}"
+            for label, count in sorted(opponent_source_games.items(), key=lambda item: item[0])
+        ]
+        print(f"   Opponent mix: {', '.join(mix_parts)}")
+    total_generated_positions = total_positions + total_dropped_positions + filtered_positions
     if total_generated_positions > 0:
         kept_ratio = 100.0 * total_positions / total_generated_positions
         print(f"   Kept positions ratio: {kept_ratio:.1f}% ({total_positions}/{total_generated_positions})")
@@ -1090,45 +1223,61 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
         if completed_games > 0:
             print(
                 "   Avg completed game length: "
-                f"{(total_completed_length_sum / completed_games):.1f} moves"
+                f"{_format_plies(total_completed_length_sum / completed_games)}"
             )
         if total_truncated_games > 0:
             print(
                 "   Avg truncated game length: "
-                f"{(total_truncated_length_sum / total_truncated_games):.1f} moves"
+                f"{_format_plies(total_truncated_length_sum / total_truncated_games)}"
             )
+        if total_decisive_games > 0:
+            print(
+                "   Avg decisive game length: "
+                f"{_format_plies(total_decisive_length_sum / total_decisive_games)}"
+            )
+    if filtered_positions > 0:
+        print(
+            "   Replay filtering drops: "
+            f"curriculum={int(total_curriculum_dropped_positions)}, "
+            f"cap={int(total_cap_dropped_positions)}"
+        )
+    if total_adjudicated_games > 0:
+        print(f"   Adjudicated decisive games: {int(total_adjudicated_games)}")
+    if total_resigned_games > 0:
+        print(f"   Resigned games: {int(total_resigned_games)}")
     print(f"   Dropped positions (truncated): {total_dropped_positions}")
     print(f"   Self-play time: {selfplay_time:.1f}s")
     print(f"   Data collection: {collection_time:.3f}s")
     print(f"   Total time: {total_time:.1f}s")
     print(f"   Speed: {positions_per_sec:.1f} positions/s")
-    print(f"   Avg game length: {avg_length:.1f} moves")
-    if total_primary_model_wins + total_opponent_model_wins + total_model_match_draws > 0:
-        print(
-            "   Model matchup (primary/opponent/draw): "
-            f"{total_primary_model_wins}/{total_opponent_model_wins}/{total_model_match_draws}"
-        )
-    if total_primary_white_games + total_primary_black_games > 0:
-        white_wr = (
-            float(total_primary_white_wins) / float(total_primary_white_games)
-            if total_primary_white_games > 0
-            else 0.0
-        )
-        black_wr = (
-            float(total_primary_black_wins) / float(total_primary_black_games)
-            if total_primary_black_games > 0
-            else 0.0
-        )
-        print(
-            "   Primary winrate by color (W/B): "
-            f"{white_wr:.2%}/{black_wr:.2%} "
-            f"(games: {total_primary_white_games}/{total_primary_black_games})"
-        )
+    print(f"   Avg game length: {_format_plies(avg_length)}")
 
     completed_games = max(0, len(game_lengths) - total_truncated_games)
+    decisive_games = int(total_decisive_games)
     completed_draw_rate = (
         float(total_completed_draws) / float(completed_games)
         if completed_games > 0
+        else 0.0
+    )
+    decisive_rate = (
+        float(decisive_games) / float(completed_games)
+        if completed_games > 0
+        else 0.0
+    )
+    total_auto_draw_ended_games = int(total_claimable_draw_ended_games)
+    auto_draw_rate = (
+        float(total_auto_draw_ended_games) / float(max(1, len(game_lengths)))
+        if game_lengths
+        else 0.0
+    )
+    truncated_rate = (
+        float(total_truncated_games) / float(max(1, len(game_lengths)))
+        if game_lengths
+        else 0.0
+    )
+    decisive_avg_length = (
+        float(total_decisive_length_sum) / float(decisive_games)
+        if decisive_games > 0
         else 0.0
     )
     avg_game_value = (total_value_sum / total_value_count) if total_value_count > 0 else 0.0
@@ -1139,18 +1288,20 @@ def play_games_parallel_mcts(model, config, device, num_games, replay_buffer=Non
         'completed_white_wins': int(total_completed_white_wins),
         'completed_black_wins': int(total_completed_black_wins),
         'completed_draws': int(total_completed_draws),
-        'primary_model_wins': int(total_primary_model_wins),
-        'opponent_model_wins': int(total_opponent_model_wins),
-        'model_match_draws': int(total_model_match_draws),
-        'primary_white_games': int(total_primary_white_games),
-        'primary_white_wins': int(total_primary_white_wins),
-        'primary_black_games': int(total_primary_black_games),
-        'primary_black_wins': int(total_primary_black_wins),
         'completed_draw_rate': float(completed_draw_rate),
         'avg_game_value': float(avg_game_value),
         'value_std': float(value_std),
         'truncated_games': int(total_truncated_games),
         'claimable_draw_ended_games': int(total_claimable_draw_ended_games),
+        'adjudicated_games': int(total_adjudicated_games),
+        'decisive_games': int(decisive_games),
+        'decisive_rate': float(decisive_rate),
+        'auto_draw_rate': float(auto_draw_rate),
+        'truncated_rate': float(truncated_rate),
+        'decisive_avg_length': float(decisive_avg_length),
+        'curriculum_dropped_positions': int(total_curriculum_dropped_positions),
+        'cap_dropped_positions': int(total_cap_dropped_positions),
+        'resigned_games': int(total_resigned_games),
     }
     
     return (
@@ -1301,6 +1452,7 @@ def main():
         models_dir=models_dir,
         best_model_rl_path=best_model_rl_path,
         rl_dir=rl_dir,
+        default_new_checkpoint=best_model_il_path,
     )
 
     # Initialize logger after startup selection.
@@ -1344,14 +1496,16 @@ def main():
     resumed_best_win_rate = float(startup_state.get("best_win_rate", 0.0) or 0.0)
     selected_compatibility_ratio = startup_state.get("selected_compatibility_ratio")
     transfer_match_ratio = startup_state.get("transfer_match_ratio")
+    new_init_mode = startup_state.get("new_init_mode", startup_plan.get("new_init_mode", "default"))
     selected_entry = startup_plan.get("selected_entry") or {}
 
     if start_mode == "new":
-        source_label = (
-            f"{best_model_il_path.name} (init)"
-            if best_model_il_path.exists()
-            else "new (scratch)"
-        )
+        if new_init_mode == "select" and selected_checkpoint_label:
+            source_label = Path(selected_checkpoint_label).name
+        elif best_model_il_path.exists():
+            source_label = f"{best_model_il_path.name} (init)"
+        else:
+            source_label = "new (scratch)"
     else:
         source_label = "selected checkpoint"
         if selected_checkpoint_label:
@@ -1370,10 +1524,21 @@ def main():
 
     if start_mode == "new":
         run_context = "startup: new RL training"
+        if new_init_mode == "select" and selected_checkpoint_label:
+            ratio = transfer_match_ratio
+            if ratio is None:
+                ratio = selected_compatibility_ratio
+            if ratio is None:
+                run_context = f"{run_context} | init={selected_checkpoint_label}"
+            else:
+                run_context = (
+                    f"{run_context} | init={selected_checkpoint_label} | "
+                    f"compatibility {ratio * 100:.2f}%"
+                )
     elif start_mode == "resume":
         run_context = (
             f"startup: resumed full state, next iteration {start_iteration + 1}, "
-            f"best win_rate={resumed_best_win_rate:.2%}"
+            f"best score_rate={resumed_best_win_rate:.2%}"
         )
     else:
         ratio = transfer_match_ratio
@@ -1393,28 +1558,48 @@ def main():
     best_model = ChessNet(config).to(device)
     best_model = best_model.to(memory_format=torch.channels_last)
     best_model.load_state_dict(model.state_dict())
+    anchor_model = None
+    anchor_model_available = False
+    if bool(config['reinforcement_learning'].get('anchor_eval_enabled', False)) and best_model_il_path.exists():
+        try:
+            anchor_model = ChessNet(config).to(device)
+            anchor_model = anchor_model.to(memory_format=torch.channels_last)
+            checkpoint = load_checkpoint_file(str(best_model_il_path), device)
+            model_state = checkpoint.get('model_state_dict') if isinstance(checkpoint, dict) else None
+            if not isinstance(model_state, dict):
+                raise KeyError("missing model_state_dict")
+            normalized_state = normalize_state_dict_keys(model_state, target_keys=set(anchor_model.state_dict().keys()))
+            anchor_model.load_state_dict(normalized_state)
+            anchor_model.eval()
+            anchor_model_available = True
+            print(f"Anchor eval enabled vs IL best: {best_model_il_path.name}")
+        except Exception as exc:
+            anchor_model = None
+            print(f"Anchor eval disabled: failed to load IL best ({exc})")
+
+    rl_cfg = config['reinforcement_learning']
+    recent_snapshot_keep = max(0, int(rl_cfg.get('self_play_recent_snapshots_to_keep', 4)))
+    recent_selfplay_snapshots = deque(maxlen=recent_snapshot_keep) if recent_snapshot_keep > 0 else deque(maxlen=0)
+    if recent_snapshot_keep > 0:
+        recent_selfplay_snapshots.append({
+            'label': 'recent_init',
+            'iteration': 0,
+            'state': _snapshot_model_state_cpu(model, share_memory=True),
+        })
 
     
     # Best files are updated only when evaluation confirms model improvement.
-    # Initialize replay buffer (prioritized or standard)
-    use_prioritized = config['reinforcement_learning'].get('use_prioritized_replay', False)
-    
     replay_fp16 = config['reinforcement_learning'].get('replay_fp16', False)
-
-    if use_prioritized:
-        replay_buffer = PrioritizedReplayBuffer(
-            max_size=config['reinforcement_learning']['replay_buffer_size'],
-            alpha=config['reinforcement_learning'].get('priority_alpha', 0.6),
-            beta_start=config['reinforcement_learning'].get('priority_beta_start', 0.4),
-            beta_end=config['reinforcement_learning'].get('priority_beta_end', 1.0),
-            epsilon=config['reinforcement_learning'].get('priority_epsilon', 0.01),
-            use_fp16=replay_fp16,
-        )
-    else:
-        replay_buffer = ReplayBuffer(
-            config['reinforcement_learning']['replay_buffer_size'],
-            use_fp16=replay_fp16,
-        )
+    replay_buffer = ReplayBuffer(
+        config['reinforcement_learning']['replay_buffer_size'],
+        use_fp16=replay_fp16,
+        decisive_sampling_fraction=float(
+            config['reinforcement_learning'].get('replay_decisive_sampling_fraction', 0.0)
+        ),
+        decisive_value_epsilon=float(
+            config['reinforcement_learning'].get('replay_decisive_value_epsilon', 0.05)
+        ),
+    )
     
     # Initialize temperature schedule
     use_temp_schedule = config['reinforcement_learning'].get('use_temperature_schedule', False)
@@ -1476,97 +1661,6 @@ def main():
         progress = max(0.0, min(1.0, iter_idx / max(1, total_iterations - 1)))
         return start_w + (end_w - start_w) * progress
 
-    def _compute_league_worker_fraction(iter_idx):
-        rl_cfg_local = config.get('reinforcement_learning', {})
-        base_fraction = float(rl_cfg_local.get('league_worker_fraction', 0.35))
-        base_fraction = max(0.0, min(1.0, base_fraction))
-        if not bool(rl_cfg_local.get('league_worker_fraction_schedule_enabled', True)):
-            return base_fraction
-
-        try:
-            start_frac = float(rl_cfg_local.get('league_worker_fraction_start', base_fraction))
-        except Exception:
-            start_frac = base_fraction
-        try:
-            end_frac = float(rl_cfg_local.get('league_worker_fraction_end', 1.0))
-        except Exception:
-            end_frac = 1.0
-
-        start_frac = max(0.0, min(1.0, start_frac))
-        end_frac = max(0.0, min(1.0, end_frac))
-
-        raw_ramp_iters = rl_cfg_local.get('league_worker_fraction_ramp_iterations', 'auto')
-        if isinstance(raw_ramp_iters, str) and raw_ramp_iters.strip().lower() == 'auto':
-            ramp_iters = max(1, int(total_iterations))
-        else:
-            try:
-                ramp_iters = max(1, int(raw_ramp_iters))
-            except Exception:
-                ramp_iters = max(1, int(total_iterations))
-
-        progress = max(0.0, min(1.0, float(iter_idx) / float(max(1, ramp_iters - 1))))
-        return start_frac + (end_frac - start_frac) * progress
-
-    def _resolve_dynamic_uniform_fraction(rl_cfg_local, draw_rate):
-        base = float(rl_cfg_local.get('priority_uniform_fraction', 0.25))
-        if not bool(rl_cfg_local.get('replay_dynamic_uniform_enabled', True)):
-            return max(0.0, min(1.0, base))
-
-        target = float(rl_cfg_local.get('replay_dynamic_uniform_draw_target', 0.55))
-        gain = float(rl_cfg_local.get('replay_dynamic_uniform_draw_gain', 0.50))
-        min_u = float(rl_cfg_local.get('replay_dynamic_uniform_min', 0.20))
-        max_u = float(rl_cfg_local.get('replay_dynamic_uniform_max', 0.50))
-        dynamic = base + gain * (draw_rate - target)
-        return max(min_u, min(max_u, dynamic))
-
-    def _resolve_priority_age_decay_lambda(rl_cfg_local, draw_rate):
-        base = float(rl_cfg_local.get('replay_priority_age_decay_lambda', 0.0))
-        if base <= 0:
-            return 0.0
-        if not bool(rl_cfg_local.get('replay_priority_age_decay_dynamic', True)):
-            return max(0.0, base)
-
-        target = float(rl_cfg_local.get('replay_dynamic_uniform_draw_target', 0.55))
-        draw_gain = float(rl_cfg_local.get('replay_priority_age_decay_draw_gain', 2.0))
-        max_lambda = float(rl_cfg_local.get('replay_priority_age_decay_lambda_max', 0.01))
-        factor = 1.0 + draw_gain * max(0.0, draw_rate - target)
-        return max(0.0, min(max_lambda, base * factor))
-
-    def _resolve_anti_draw_overrides(
-        rl_cfg_local,
-        base_temp,
-        prev_draw_rate,
-        base_dirichlet_weight,
-        base_temp_threshold,
-    ):
-        """Increase exploration pressure when previous iteration draw rate is too high."""
-        try:
-            temp = float(base_temp)
-        except Exception:
-            temp = float(rl_cfg_local.get('mcts_temperature', 1.0))
-
-        dirichlet_weight = float(base_dirichlet_weight)
-        temp_threshold = int(base_temp_threshold)
-
-        if prev_draw_rate is None or not bool(rl_cfg_local.get('anti_draw_adaptive_exploration', True)):
-            return temp, dirichlet_weight, temp_threshold, 0.0
-
-        high_draw_threshold = float(rl_cfg_local.get('anti_draw_high_draw_threshold', 0.95))
-        if prev_draw_rate <= high_draw_threshold:
-            return temp, dirichlet_weight, temp_threshold, 0.0
-
-        severity = max(0.0, min(1.0, (prev_draw_rate - high_draw_threshold) / max(1e-6, 1.0 - high_draw_threshold)))
-        max_temp_boost = float(rl_cfg_local.get('anti_draw_max_temp_boost', 0.25))
-        max_dirichlet_boost = float(rl_cfg_local.get('anti_draw_max_dirichlet_weight_boost', 0.20))
-        threshold_boost_moves = int(rl_cfg_local.get('anti_draw_temp_threshold_boost_moves', 20))
-        threshold_cap = int(rl_cfg_local.get('anti_draw_temp_threshold_cap', max(1, temp_threshold + threshold_boost_moves)))
-
-        boosted_temp = min(2.0, temp + max_temp_boost * severity)
-        boosted_dirichlet_weight = min(0.50, dirichlet_weight + max_dirichlet_boost * severity)
-        boosted_temp_threshold = temp_threshold + int(round(threshold_boost_moves * severity))
-        boosted_temp_threshold = min(threshold_cap, boosted_temp_threshold)
-        return boosted_temp, boosted_dirichlet_weight, boosted_temp_threshold, severity
-
     if use_lr_schedule:
         print(
             f"✅ LR schedule: warmup={warmup_iters} iters → "
@@ -1594,7 +1688,24 @@ def main():
     )
     print(f"   • Persistent self-play workers: {config['reinforcement_learning'].get('persistent_self_play_workers', True)}")
     print(f"   • Stream self-play to replay: {config['reinforcement_learning'].get('self_play_stream_to_replay', True)}")
-    print(f"   • 🆕 Prioritized Replay: {use_prioritized}")
+    if bool(config['reinforcement_learning'].get('self_play_opponent_pool_enabled', False)):
+        print(
+            "   • Opponent pool: "
+            f"current={float(config['reinforcement_learning'].get('self_play_opponent_current_fraction', 0.4)):.0%}, "
+            f"best={float(config['reinforcement_learning'].get('self_play_opponent_best_fraction', 0.3)):.0%}, "
+            f"recent={float(config['reinforcement_learning'].get('self_play_opponent_recent_fraction', 0.3)):.0%}"
+        )
+        print(
+            "   • Recent frozen snapshots: "
+            f"{int(config['reinforcement_learning'].get('self_play_recent_snapshots_to_keep', 4))}"
+        )
+    if bool(config['reinforcement_learning'].get('self_play_resignation_enabled', False)):
+        print(
+            "   • Resignation: "
+            f"enabled (threshold={float(config['reinforcement_learning'].get('self_play_resignation_threshold', 0.92)):.2f}, "
+            f"patience={int(config['reinforcement_learning'].get('self_play_resignation_patience', 3))}, "
+            f"disable_fraction={float(config['reinforcement_learning'].get('self_play_resignation_disable_fraction', 0.10)):.0%})"
+        )
     print(f"   • 🆕 Temperature Schedule: {use_temp_schedule}")
     print(f"   • 📊 Policy Accuracy & Value MAE tracking")
     print(f"   • Replay buffer capacity: {config['reinforcement_learning']['replay_buffer_size']:,} positions")
@@ -1602,12 +1713,6 @@ def main():
         f"   • Estimated positions per iteration: "
         f"{int(config['reinforcement_learning']['games_per_iteration'] * config['reinforcement_learning']['avg_moves_per_game']):,}"
     )
-    if use_prioritized:
-        print(
-            f"   • Prioritized replay uniform mix: "
-            f"{float(config['reinforcement_learning'].get('priority_uniform_fraction', 0.25)):.0%} uniform"
-        )
-    
     if start_iteration >= total_iterations:
         print(
             f"Resume start iteration ({start_iteration + 1}) exceeds configured total "
@@ -1616,9 +1721,15 @@ def main():
         logger.plot()
         return
 
-    rl_cfg = config['reinforcement_learning']
     base_mcts_temperature_threshold = int(rl_cfg.get('mcts_temperature_threshold', 16))
     base_mcts_dirichlet_weight = float(rl_cfg.get('mcts_dirichlet_weight', 0.25))
+    score_rate_threshold = float(rl_cfg.get('score_rate_threshold', rl_cfg.get('win_rate_threshold', 0.55)))
+    true_win_rate_threshold = float(rl_cfg.get('true_win_rate_threshold', 0.0))
+    staged_eval_enabled = bool(rl_cfg.get('eval_staged_enabled', False))
+    eval_stage1_games = max(1, int(rl_cfg.get('eval_stage1_games', rl_cfg.get('eval_games', 50))))
+    eval_stage2_games = max(0, int(rl_cfg.get('eval_stage2_games', 0)))
+    eval_stage2_gate_score_rate = float(rl_cfg.get('eval_stage2_gate_score_rate', score_rate_threshold))
+    eval_stage2_gate_true_win_rate = float(rl_cfg.get('eval_stage2_gate_true_win_rate', true_win_rate_threshold))
     prev_completed_draw_rate = None
 
     training_interrupted = False
@@ -1642,42 +1753,27 @@ def main():
             else:
                 base_current_temp = config['reinforcement_learning']['mcts_temperature']
 
-            current_temp, current_dirichlet_weight, current_temp_threshold, anti_draw_severity = _resolve_anti_draw_overrides(
-                rl_cfg,
-                base_current_temp,
-                prev_completed_draw_rate,
-                base_mcts_dirichlet_weight,
-                base_mcts_temperature_threshold,
-            )
+            current_temp = base_current_temp
+            current_dirichlet_weight = base_mcts_dirichlet_weight
+            current_temp_threshold = base_mcts_temperature_threshold
             print(f"🌡️ Temperature: {current_temp:.2f}")
             config['reinforcement_learning']['mcts_temperature'] = current_temp
             config['reinforcement_learning']['mcts_dirichlet_weight'] = current_dirichlet_weight
             config['reinforcement_learning']['mcts_temperature_threshold'] = current_temp_threshold
-            if anti_draw_severity > 0.0:
-                print(
-                    f"🚨 Anti-draw boost active (severity={anti_draw_severity:.2f}): "
-                    f"dirichlet_weight={current_dirichlet_weight:.3f}, "
-                    f"temp_threshold={current_temp_threshold}"
-                )
             
             if use_lr_schedule:
                 print(f"📉 LR: {current_lr:.2e}")
 
-            current_league_fraction = _compute_league_worker_fraction(iteration)
-            rl_cfg['league_worker_fraction'] = float(current_league_fraction)
-            print(f"🥊 League worker fraction: {current_league_fraction:.2f}")
+            rl_cfg['current_iteration'] = int(iteration + 1)
 
             current_value_loss_weight = _compute_value_loss_weight(iteration)
             print(f"⚖️ Value loss weight: {current_value_loss_weight:.3f}")
-            
-            # Update beta for importance sampling
-            if use_prioritized:
-                progress = iteration / total_iterations
-                replay_buffer.update_beta(progress)
-                print(f"🎯 Beta (IS): {replay_buffer.beta:.3f}")
-            
+
             # Self-play with MCTS
             model.eval()
+            best_model_state_for_selfplay = None
+            if bool(rl_cfg.get('self_play_opponent_pool_enabled', False)):
+                best_model_state_for_selfplay = _snapshot_model_state_cpu(best_model, share_memory=True)
             positions, positions_added, avg_game_length, positions_per_sec, selfplay_time, collection_time, selfplay_stats = \
                 play_games_parallel_mcts(
                     model,
@@ -1685,6 +1781,8 @@ def main():
                     device,
                     config['reinforcement_learning']['games_per_iteration'],
                     replay_buffer=replay_buffer,
+                    best_model_state=best_model_state_for_selfplay,
+                    recent_snapshot_pool=list(recent_selfplay_snapshots),
                 )
             
             # Add to replay buffer
@@ -1697,33 +1795,24 @@ def main():
                 f"avg_value={float((selfplay_stats or {}).get('avg_game_value', 0.0)):.3f}, "
                 f"value_std={float((selfplay_stats or {}).get('value_std', 0.0)):.3f}"
             )
-            pw_games = int((selfplay_stats or {}).get('primary_white_games', 0))
-            pb_games = int((selfplay_stats or {}).get('primary_black_games', 0))
-            if pw_games + pb_games > 0:
-                pw_wr = (
-                    float((selfplay_stats or {}).get('primary_white_wins', 0)) / float(pw_games)
-                    if pw_games > 0
-                    else 0.0
-                )
-                pb_wr = (
-                    float((selfplay_stats or {}).get('primary_black_wins', 0)) / float(pb_games)
-                    if pb_games > 0
-                    else 0.0
-                )
-                print(
-                    f"📊 Primary WR by color: white={pw_wr:.2%} ({pw_games} gier), "
-                    f"black={pb_wr:.2%} ({pb_games} gier)"
-                )
+            print(
+                f"📦 Replay shaping: curriculum_drop={int((selfplay_stats or {}).get('curriculum_dropped_positions', 0))}, "
+                f"cap_drop={int((selfplay_stats or {}).get('cap_dropped_positions', 0))}"
+            )
+            print(
+                f"Endings: decisive_rate={float((selfplay_stats or {}).get('decisive_rate', 0.0)):.2%}, "
+                f"auto_draw_rate={float((selfplay_stats or {}).get('auto_draw_rate', 0.0)):.2%}, "
+                f"truncated_rate={float((selfplay_stats or {}).get('truncated_rate', 0.0)):.2%}"
+            )
             prev_completed_draw_rate = float((selfplay_stats or {}).get('completed_draw_rate', 0.0))
 
-            dynamic_uniform_fraction = float(config['reinforcement_learning'].get('priority_uniform_fraction', 0.25))
-            dynamic_age_decay_lambda = 0.0
-            avg_sample_age = 0.0
             avg_policy_entropy = 0.0
             avg_value_pred_std = 0.0
             
             # Training with metrics
-            if len(replay_buffer) >= config['reinforcement_learning']['batch_size']:
+            replay_size = len(replay_buffer)
+            base_batch_size = int(config['reinforcement_learning']['batch_size'])
+            if replay_size > 0 and base_batch_size > 0:
                 print("Training...")
                 model.train()
                 total_loss = 0
@@ -1731,90 +1820,45 @@ def main():
                 total_value = 0
                 total_policy_entropy = 0
                 total_value_pred_std = 0
-                total_sample_age = 0
-                sample_age_steps = 0
                 
                 # 📊 Initialize metrics calculator
                 metrics_calc = MetricsCalculator()
                 
-                num_batches = len(replay_buffer) // config['reinforcement_learning']['batch_size']
+                full_batches, remainder_batch = divmod(replay_size, base_batch_size)
+                batch_sizes = [base_batch_size] * full_batches
+                if remainder_batch > 0:
+                    batch_sizes.append(remainder_batch)
+                if not batch_sizes:
+                    batch_sizes = [min(base_batch_size, replay_size)]
+                total_train_steps = config['reinforcement_learning']['train_epochs_per_iteration'] * len(batch_sizes)
                 
                 for batch_idx in tqdm(
-                    range(config['reinforcement_learning']['train_epochs_per_iteration'] * num_batches),
+                    range(total_train_steps),
                     desc="Training",
                 ):
-                    # Prioritized or standard sampling
-                    if use_prioritized:
-                        draw_rate = float((selfplay_stats or {}).get('completed_draw_rate', 0.0))
-                        uniform_fraction = _resolve_dynamic_uniform_fraction(
-                            config['reinforcement_learning'],
-                            draw_rate,
-                        )
-                        age_decay_lambda = _resolve_priority_age_decay_lambda(
-                            config['reinforcement_learning'],
-                            draw_rate,
-                        )
-                        dynamic_uniform_fraction = float(uniform_fraction)
-                        dynamic_age_decay_lambda = float(age_decay_lambda)
-                        if batch_idx == 0:
-                            print(
-                                f"🎛️ Replay mix: uniform={uniform_fraction:.3f}, "
-                                f"age_decay={age_decay_lambda:.6f}, draw_rate={draw_rate:.2%}"
-                            )
-                        if uniform_fraction > 0:
-                            batch, indices, weights = replay_buffer.sample_mixed(
-                                config['reinforcement_learning']['batch_size'],
-                                uniform_fraction=uniform_fraction,
-                                age_decay_lambda=age_decay_lambda,
-                            )
-                        else:
-                            batch, indices, weights = replay_buffer.sample(
-                                config['reinforcement_learning']['batch_size'],
-                                age_decay_lambda=age_decay_lambda,
-                            )
-
-                        loss, policy_loss, value_loss, policy_entropy, value_pred_std = train_on_batch_rl(
-                            model,
-                            optimizer,
-                            batch,
-                            indices,
-                            weights,
-                            config,
-                            device,
-                            scaler,
-                            replay_buffer,
-                            metrics_calc,
-                            value_weight_override=current_value_loss_weight,
-                        )
-                        total_sample_age += float(getattr(replay_buffer, 'last_sample_age_mean', 0.0))
-                        sample_age_steps += 1
-                    else:
-                        batch = replay_buffer.sample(config['reinforcement_learning']['batch_size'])
-                        loss, policy_loss, value_loss, policy_entropy, value_pred_std = train_on_batch_rl(
-                            model,
-                            optimizer,
-                            batch,
-                            None,
-                            None,
-                            config,
-                            device,
-                            scaler,
-                            replay_buffer,
-                            metrics_calc,
-                            value_weight_override=current_value_loss_weight,
-                        )
+                    current_batch_size = batch_sizes[batch_idx % len(batch_sizes)]
+                    batch = replay_buffer.sample(current_batch_size)
+                    loss, policy_loss, value_loss, policy_entropy, value_pred_std = train_on_batch_rl(
+                        model,
+                        optimizer,
+                        batch,
+                        config,
+                        device,
+                        scaler,
+                        metrics_calc,
+                        value_weight_override=current_value_loss_weight,
+                    )
                     
                     total_loss += loss
                     total_policy += policy_loss
                     total_value += value_loss
                     total_policy_entropy += policy_entropy
                     total_value_pred_std += value_pred_std
-                avg_loss = total_loss / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
-                avg_policy = total_policy / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
-                avg_value = total_value / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
-                avg_policy_entropy = total_policy_entropy / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
-                avg_value_pred_std = total_value_pred_std / (num_batches * config['reinforcement_learning']['train_epochs_per_iteration'])
-                avg_sample_age = (total_sample_age / sample_age_steps) if sample_age_steps > 0 else 0.0
+                avg_loss = total_loss / total_train_steps
+                avg_policy = total_policy / total_train_steps
+                avg_value = total_value / total_train_steps
+                avg_policy_entropy = total_policy_entropy / total_train_steps
+                avg_value_pred_std = total_value_pred_std / total_train_steps
                 
                 # 📊 Compute metrics
                 train_metrics = metrics_calc.compute()
@@ -1825,25 +1869,97 @@ def main():
                       f"MAE: {train_metrics['value_mae']:.4f}")
                 print(
                     f"📈 Entropy: {avg_policy_entropy:.4f}, "
-                    f"Pred value std: {avg_value_pred_std:.4f}, "
-                    f"Avg sample age: {avg_sample_age:.1f}"
+                    f"Pred value std: {avg_value_pred_std:.4f}"
                 )
             else:
                 avg_loss = avg_policy = avg_value = 0
                 train_metrics = {}
             
             # Evaluation
-            win_rate = None
+            score_rate = None
+            true_win_rate = None
+            eval_wins = eval_draws = eval_losses = eval_unresolved = None
+            anchor_score_rate = None
+            anchor_true_win_rate = None
+            anchor_wins = anchor_draws = anchor_losses = None
             estimated_elo = None
             if (iteration + 1) % config['reinforcement_learning']['eval_every'] == 0:
                 print("Evaluating vs best...")
                 model.eval()
-                win_rate = evaluate_models(
-                    model, best_model, config, device,
-                    config['reinforcement_learning']['eval_games']
+                if staged_eval_enabled:
+                    print(f"Stage 1 eval ({eval_stage1_games} games)...")
+                    eval_stage1_stats = evaluate_models(
+                        model,
+                        best_model,
+                        config,
+                        device,
+                        eval_stage1_games,
+                        game_index_offset=0,
+                    )
+                    stage1_score_rate = float((eval_stage1_stats or {}).get('score_rate', 0.0))
+                    stage1_true_win_rate = float((eval_stage1_stats or {}).get('win_rate', 0.0))
+                    print(
+                        f"Stage 1: score={stage1_score_rate:.2%}, "
+                        f"true_win_rate={stage1_true_win_rate:.2%}"
+                    )
+                    if (
+                        eval_stage2_games > 0
+                        and stage1_score_rate >= eval_stage2_gate_score_rate
+                        and stage1_true_win_rate >= eval_stage2_gate_true_win_rate
+                    ):
+                        print(f"Stage 2 eval (+{eval_stage2_games} games)...")
+                        eval_stage2_stats = evaluate_models(
+                            model,
+                            best_model,
+                            config,
+                            device,
+                            eval_stage2_games,
+                            game_index_offset=eval_stage1_games,
+                        )
+                        eval_stats = _combine_eval_stats(eval_stage1_stats, eval_stage2_stats)
+                    else:
+                        print("Stage 2 skipped: stage-1 edge not strong enough.")
+                        eval_stats = eval_stage1_stats
+                else:
+                    eval_stats = evaluate_models(
+                        model, best_model, config, device,
+                        config['reinforcement_learning']['eval_games']
+                    )
+                score_rate = float((eval_stats or {}).get('score_rate', 0.0))
+                true_win_rate = float((eval_stats or {}).get('win_rate', 0.0))
+                eval_wins = int((eval_stats or {}).get('wins', 0))
+                eval_draws = int((eval_stats or {}).get('draws', 0))
+                eval_losses = int((eval_stats or {}).get('losses', 0))
+                eval_unresolved = int((eval_stats or {}).get('unresolved', 0))
+                print(f"Score rate: {score_rate:.2%}")
+                print(
+                    f"Eval W/D/L: {eval_wins}/{eval_draws}/{eval_losses} "
+                    f"(true win rate: {true_win_rate:.2%}, unresolved draws at cap: {eval_unresolved})"
                 )
-                print(f"Win rate: {win_rate:.2%}")
-                estimated_elo = elo_coordinator.maybe_evaluate(iteration + 1, win_rate=win_rate)
+                if anchor_model_available and anchor_model is not None and _should_run_anchor_eval(iteration + 1, rl_cfg):
+                    print(f"Anchor eval vs IL-best ({int(rl_cfg.get('anchor_eval_games', 40))} games)...")
+                    anchor_stats = evaluate_models(
+                        model,
+                        anchor_model,
+                        config,
+                        device,
+                        int(rl_cfg.get('anchor_eval_games', 40)),
+                        use_fixed_openings=bool(rl_cfg.get('anchor_eval_use_fixed_openings', True)),
+                    )
+                    anchor_score_rate = float((anchor_stats or {}).get('score_rate', 0.0))
+                    anchor_true_win_rate = float((anchor_stats or {}).get('win_rate', 0.0))
+                    anchor_wins = int((anchor_stats or {}).get('wins', 0))
+                    anchor_draws = int((anchor_stats or {}).get('draws', 0))
+                    anchor_losses = int((anchor_stats or {}).get('losses', 0))
+                    print(
+                        f"Anchor W/D/L: {anchor_wins}/{anchor_draws}/{anchor_losses} "
+                        f"(score: {anchor_score_rate:.2%}, true win rate: {anchor_true_win_rate:.2%})"
+                    )
+                estimated_elo = elo_coordinator.maybe_evaluate(
+                    iteration + 1,
+                    score_rate=score_rate,
+                    true_win_rate=true_win_rate,
+                )
                 
                 # Log with all metrics
                 logger.log(
@@ -1853,37 +1969,55 @@ def main():
                     avg_loss=avg_loss,
                     policy_loss=avg_policy,
                     value_loss=avg_value,
-                    win_rate=win_rate,
+                    score_rate=score_rate,
+                    win_rate=score_rate,
+                    true_win_rate=true_win_rate,
+                    eval_wins=eval_wins,
+                    eval_draws=eval_draws,
+                    eval_losses=eval_losses,
+                    eval_unresolved=eval_unresolved,
+                    anchor_score_rate=anchor_score_rate,
+                    anchor_true_win_rate=anchor_true_win_rate,
+                    anchor_wins=anchor_wins,
+                    anchor_draws=anchor_draws,
+                    anchor_losses=anchor_losses,
                     buffer_size=len(replay_buffer),
                     avg_game_length=avg_game_length,
                     positions_per_sec=positions_per_sec,
                     selfplay_time=selfplay_time,
                     data_collection_time=collection_time,
                     temperature=current_temp,
-                    beta=replay_buffer.beta if use_prioritized else None,
+                    beta=None,
                     completed_draw_rate=(selfplay_stats or {}).get('completed_draw_rate', None),
-                    dynamic_uniform_fraction=dynamic_uniform_fraction if use_prioritized else None,
-                    priority_age_decay_lambda=dynamic_age_decay_lambda if use_prioritized else None,
-                    avg_sample_age=avg_sample_age if use_prioritized else None,
+                    dynamic_uniform_fraction=None,
+                    priority_age_decay_lambda=None,
+                    avg_sample_age=None,
                     avg_game_value=(selfplay_stats or {}).get('avg_game_value', None),
                     value_std=(selfplay_stats or {}).get('value_std', None),
                     policy_entropy=avg_policy_entropy,
                     value_pred_std=avg_value_pred_std,
+                    selfplay_decisive_games=(selfplay_stats or {}).get('decisive_games', None),
+                    selfplay_decisive_rate=(selfplay_stats or {}).get('decisive_rate', None),
+                    selfplay_auto_draw_rate=(selfplay_stats or {}).get('auto_draw_rate', None),
+                    selfplay_truncated_rate=(selfplay_stats or {}).get('truncated_rate', None),
+                    selfplay_decisive_avg_length=(selfplay_stats or {}).get('decisive_avg_length', None),
+                    selfplay_curriculum_dropped_positions=(selfplay_stats or {}).get('curriculum_dropped_positions', None),
+                    selfplay_cap_dropped_positions=(selfplay_stats or {}).get('cap_dropped_positions', None),
                 )
                 last_logged_iteration = iteration + 1
-                logger.plot()
-                
-                if win_rate >= config['reinforcement_learning']['win_rate_threshold']:
+                if score_rate >= score_rate_threshold and true_win_rate >= true_win_rate_threshold:
                     print("✅ New best model!")
                     best_model.load_state_dict(model.state_dict())
-                    best_win_rate_so_far = max(best_win_rate_so_far, float(win_rate))
+                    best_win_rate_so_far = max(best_win_rate_so_far, float(score_rate))
                     
                     model_to_save = model
                     save_checkpoint(
                         model_to_save, None, iteration, avg_loss,
                         str(best_model_rl_path),
                         {
-                            'win_rate': win_rate,
+                            'win_rate': score_rate,
+                            'score_rate': score_rate,
+                            'eval_true_win_rate': true_win_rate,
                             'policy_loss': avg_policy,
                             'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                             'value_mae': train_metrics.get('value_mae', 0),
@@ -1918,20 +2052,38 @@ def main():
                     selfplay_time=selfplay_time,
                     data_collection_time=collection_time,
                     temperature=current_temp,
-                    beta=replay_buffer.beta if use_prioritized else None,
+                    beta=None,
                     completed_draw_rate=(selfplay_stats or {}).get('completed_draw_rate', None),
-                    dynamic_uniform_fraction=dynamic_uniform_fraction if use_prioritized else None,
-                    priority_age_decay_lambda=dynamic_age_decay_lambda if use_prioritized else None,
-                    avg_sample_age=avg_sample_age if use_prioritized else None,
+                    dynamic_uniform_fraction=None,
+                    priority_age_decay_lambda=None,
+                    avg_sample_age=None,
                     avg_game_value=(selfplay_stats or {}).get('avg_game_value', None),
                     value_std=(selfplay_stats or {}).get('value_std', None),
                     policy_entropy=avg_policy_entropy,
                     value_pred_std=avg_value_pred_std,
+                    selfplay_decisive_games=(selfplay_stats or {}).get('decisive_games', None),
+                    selfplay_decisive_rate=(selfplay_stats or {}).get('decisive_rate', None),
+                    selfplay_auto_draw_rate=(selfplay_stats or {}).get('auto_draw_rate', None),
+                    selfplay_truncated_rate=(selfplay_stats or {}).get('truncated_rate', None),
+                    selfplay_decisive_avg_length=(selfplay_stats or {}).get('decisive_avg_length', None),
+                    selfplay_curriculum_dropped_positions=(selfplay_stats or {}).get('curriculum_dropped_positions', None),
+                    selfplay_cap_dropped_positions=(selfplay_stats or {}).get('cap_dropped_positions', None),
                 )
                 last_logged_iteration = iteration + 1
-            
+
+            if recent_snapshot_keep > 0:
+                recent_selfplay_snapshots.append({
+                    'label': f"recent_iter_{iteration + 1}",
+                    'iteration': int(iteration + 1),
+                    'state': _snapshot_model_state_cpu(model, share_memory=True),
+                })
+
+            logger.plot()
+
             latest_metadata = {
-                'win_rate': win_rate,
+                'win_rate': score_rate,
+                'score_rate': score_rate,
+                'eval_true_win_rate': true_win_rate,
                 'policy_loss': avg_policy,
                 'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                 'value_mae': train_metrics.get('value_mae', 0),
