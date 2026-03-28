@@ -13,6 +13,7 @@ import signal
 import copy
 import shutil
 import contextlib
+import subprocess
 import multiprocessing as _stdlib_mp
 from collections import defaultdict, deque
 
@@ -112,6 +113,41 @@ def _print_console_block(unicode_lines, ascii_lines=None):
 
     for line in lines:
         print(line)
+
+
+@contextlib.contextmanager
+def _temporary_sigint_cancel_handler(cancel_event, message=None, hard_exit=False, exit_code=130):
+    """Temporarily turn Ctrl+C into a direct cancel signal for blocking shutdown work."""
+    sigint = getattr(signal, "SIGINT", None)
+    state = {"triggered": False}
+    if sigint is None or threading.current_thread() is not threading.main_thread():
+        yield state
+        return
+
+    previous_handler = signal.getsignal(sigint)
+
+    def _handle_sigint(signum, frame):
+        first_trigger = not state["triggered"]
+        state["triggered"] = True
+        if cancel_event is not None:
+            with contextlib.suppress(Exception):
+                cancel_event.set()
+        if first_trigger and message:
+            print(message, flush=True)
+        if hard_exit:
+            with contextlib.suppress(Exception):
+                sys.stdout.flush()
+            with contextlib.suppress(Exception):
+                sys.stderr.flush()
+            os._exit(int(exit_code))
+        raise KeyboardInterrupt
+
+    signal.signal(sigint, _handle_sigint)
+    try:
+        yield state
+    finally:
+        with contextlib.suppress(Exception):
+            signal.signal(sigint, previous_handler)
 
 
 def _resolve_elo_worker_device(main_device, configured_value):
@@ -530,6 +566,7 @@ class RLEloCoordinator:
                 f"Elo final (RL): use_mcts={bool(final_use_mcts)}, "
                 f"mcts_simulations={int(final_sims)}"
             )
+            print("Elo final (RL): after Ctrl+C, one shutdown Elo runs; press Ctrl+C again to cancel it.")
 
     def maybe_evaluate(self, iteration_num, score_rate=None, true_win_rate=None):
         if not self.enabled:
@@ -576,58 +613,121 @@ class RLEloCoordinator:
             final_override=True,
         )
 
+    def _run_estimate_subprocess(self, iteration_num, elo_config, interrupt_message):
+        mp_ctx = mp.get_context('spawn')
+        result_queue = mp_ctx.Queue()
+        cancel_event = mp_ctx.Event()
+        worker_device = str(self.eval_device.type)
+        model_state_cpu = _snapshot_model_state_cpu(self.model, share_memory=True)
+        process = mp_ctx.Process(
+            target=_rl_elo_worker,
+            args=(
+                int(iteration_num),
+                model_state_cpu,
+                self.config,
+                elo_config,
+                worker_device,
+                result_queue,
+                cancel_event,
+            ),
+        )
+        process.daemon = True
+        process.start()
+
+        try:
+            while True:
+                try:
+                    message = result_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if not process.is_alive():
+                        break
+                    continue
+                if message is None:
+                    continue
+                if int(message.get("iteration", iteration_num)) != int(iteration_num):
+                    continue
+                if message.get("cancelled"):
+                    self.interrupted_during_elo = True
+                    return None
+                if message.get("error"):
+                    print(f"Elo estimation failed: {message['error']}")
+                    return None
+                return (message.get("result") or {})
+        except KeyboardInterrupt:
+            with contextlib.suppress(Exception):
+                cancel_event.set()
+            self.interrupted_during_elo = True
+            print(interrupt_message)
+            # Force-stop worker process tree immediately on user interrupt.
+            _terminate_process_tree(process, timeout_s=0.0)
+            return None
+        finally:
+            _terminate_process_tree(process, timeout_s=0.0)
+            with contextlib.suppress(Exception):
+                result_queue.close()
+
     def _run_estimate(self, iteration_num, reason_label, final_override=False):
         elo_config = dict(self.elo_config)
         elo_config.setdefault("stockfish_priority", "below_normal")
         elo_config.setdefault("stockfish_hide_window", True)
         elo_config.setdefault("max_error_logs_per_type", 8)
+        # RL Elo should not use the generic auto "cpu_total - 2" worker reserve.
+        elo_config.setdefault("auto_worker_reserve_cpus", 0)
         if final_override:
             # Final/shutdown Elo runs when training is paused/stopped;
             # allow full CPU budget for faster estimation.
             elo_config["prioritize_training"] = False
             elo_config["reserve_dataloader_workers"] = False
             elo_config["stockfish_priority"] = "normal"
+            # Final estimate is blocking/user-visible, so always show progress.
+            elo_config["progress_bar"] = "always"
             if "final_rl_use_mcts" in self.elo_config:
                 elo_config["use_mcts"] = bool(self.elo_config.get("final_rl_use_mcts"))
             if "final_rl_mcts_simulations" in self.elo_config:
                 elo_config["mcts_simulations"] = int(self.elo_config.get("final_rl_mcts_simulations"))
 
         print(f"\nEstimating Elo vs Stockfish ({reason_label})...")
-        allow_shutdown_retry = bool(final_override and reason_label == "shutdown")
-        max_attempts = 2 if allow_shutdown_retry else 1
+        if interrupted := bool(final_override and reason_label == "shutdown"):
+            print("Training stop requested by user. Running one final Elo estimate; press Ctrl+C again to cancel.")
+        max_attempts = 1
         elo_result = None
+        if interrupted:
+            interrupt_message = "\nSecond Ctrl+C detected. Final Elo estimation aborted immediately."
+        else:
+            interrupt_message = "\nCtrl+C detected during Stockfish evaluation. Cancelling evaluation..."
 
         for attempt_idx in range(max_attempts):
+            if interrupted:
+                elo_result = self._run_estimate_subprocess(iteration_num, elo_config, interrupt_message)
+                break
             elo_cancel_event = threading.Event()
+            sigint_state = {"triggered": False}
             try:
-                elo_result = estimate_model_elo(
-                    self.model,
-                    self.config,
-                    self.eval_device,
-                    elo_config,
-                    stop_event=elo_cancel_event,
-                )
+                with _temporary_sigint_cancel_handler(
+                    elo_cancel_event,
+                    message=interrupt_message,
+                ) as sigint_state:
+                    elo_result = estimate_model_elo(
+                        self.model,
+                        self.config,
+                        self.eval_device,
+                        elo_config,
+                        stop_event=elo_cancel_event,
+                    )
             except KeyboardInterrupt:
                 with contextlib.suppress(Exception):
                     elo_cancel_event.set()
                 self.interrupted_during_elo = True
-                print("Ctrl+C detected during Stockfish evaluation. Cancelling evaluation...")
+                if not sigint_state.get("triggered", False):
+                    print(interrupt_message)
                 return None
             except Exception as exc:
                 print(f"Elo estimation failed: {exc}")
                 return None
 
             elo_result = elo_result or {}
-            if (
-                elo_result.get("cancelled")
-                and allow_shutdown_retry
-                and attempt_idx == 0
-                and int(elo_result.get("total_games", 0) or 0) == 0
-            ):
-                # The first Ctrl+C was used to stop RL; require another Ctrl+C
-                # after shutdown Elo starts to cancel this estimation.
-                print("First Ctrl+C was consumed by RL shutdown. Press Ctrl+C again to cancel Stockfish Elo.")
-                continue
+            if sigint_state.get("triggered", False) and elo_result.get("cancelled"):
+                self.interrupted_during_elo = True
             break
 
         elo_result = elo_result or {}
@@ -834,6 +934,37 @@ def _shutdown_selfplay_pool(timeout_s=5):
     finally:
         _SELFPLAY_POOL = None
 
+
+def _terminate_process_tree(proc, timeout_s=0.5):
+    if proc is None:
+        return
+    with contextlib.suppress(Exception):
+        if not proc.is_alive():
+            proc.join(timeout=0.0)
+            return
+    with contextlib.suppress(Exception):
+        proc.terminate()
+    with contextlib.suppress(Exception):
+        proc.join(timeout=max(0.0, float(timeout_s)))
+    with contextlib.suppress(Exception):
+        if proc.is_alive():
+            proc.kill()
+    with contextlib.suppress(Exception):
+        proc.join(timeout=0.2)
+
+    if os.name == "nt":
+        pid = getattr(proc, "pid", None)
+        if pid:
+            with contextlib.suppress(Exception):
+                subprocess.run(
+                    ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2.0,
+                )
+
+
 def _terminate_workers(processes, timeout_s=5):
     """Terminate spawned self-play workers cleanly."""
     all_processes = []
@@ -848,21 +979,7 @@ def _terminate_workers(processes, timeout_s=5):
         all_processes.append(proc)
 
     for proc in all_processes:
-        if proc.is_alive():
-            proc.terminate()
-
-    deadline = time.time() + timeout_s
-    for proc in all_processes:
-        remaining = max(0.0, deadline - time.time())
-        proc.join(timeout=remaining)
-
-    for proc in all_processes:
-        if proc.is_alive():
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            proc.join(timeout=1.0)
+        _terminate_process_tree(proc, timeout_s=timeout_s)
 
 
 def _is_interrupt_exit_code(exit_code):

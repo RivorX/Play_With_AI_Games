@@ -17,6 +17,32 @@ from src.data import board_to_tensor, move_to_index
 
 
 _EMPTY_HISTORY_TENSOR = np.zeros((16, 8, 8), dtype=np.float32)
+
+
+def _copy_board_fast(board):
+    """Copy board state without move stack/history baggage."""
+    try:
+        return board.copy(stack=False)
+    except TypeError:
+        return board.copy()
+
+
+def _board_position_key(board):
+    """
+    Fast board identity for tree reuse.
+
+    Prefer python-chess internal transposition key when available; fallback to
+    full FEN only if needed.
+    """
+    key_fn = getattr(board, "_transposition_key", None)
+    if callable(key_fn):
+        try:
+            return key_fn()
+        except Exception:
+            pass
+    return board.fen()
+
+
 _SELFPLAY_OPENING_LINES = (
     ("e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"),
     ("e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6"),
@@ -61,12 +87,72 @@ _SELFPLAY_SHARP_OPENING_LINES = (
 _SELFPLAY_SELFPLAY_OPENING_LINES = _SELFPLAY_OPENING_LINES + _SELFPLAY_SHARP_OPENING_LINES
 
 
+class MCTSEdgeStats:
+    """Compact array-backed storage for all child-edge statistics of one node."""
+
+    def __init__(self):
+        self.moves = ()
+        self.nodes = []
+        self.priors = np.empty(0, dtype=np.float32)
+        self.base_priors = np.empty(0, dtype=np.float32)
+        self.visit_counts = np.empty(0, dtype=np.int32)
+        self.total_counts = np.empty(0, dtype=np.float32)
+        self.value_sums = np.empty(0, dtype=np.float32)
+        self.virtual_losses = np.empty(0, dtype=np.int16)
+        self.virtual_losses_f32 = np.empty(0, dtype=np.float32)
+        self.explored_flags = np.empty(0, dtype=np.bool_)
+        self.selection_scores = np.empty(0, dtype=np.float32)
+        self.ucb_buffer = np.empty(0, dtype=np.float32)
+        self._move_to_child = None
+
+    def reset(self, legal_moves, legal_priors):
+        legal_moves = tuple(legal_moves)
+        legal_priors = np.asarray(legal_priors, dtype=np.float32)
+        child_count = len(legal_moves)
+
+        self.moves = legal_moves
+        self.nodes = []
+        self.priors = legal_priors.copy()
+        self.base_priors = legal_priors.copy()
+        self.visit_counts = np.zeros(child_count, dtype=np.int32)
+        self.total_counts = np.zeros(child_count, dtype=np.float32)
+        self.value_sums = np.zeros(child_count, dtype=np.float32)
+        self.virtual_losses = np.zeros(child_count, dtype=np.int16)
+        self.virtual_losses_f32 = np.zeros(child_count, dtype=np.float32)
+        self.explored_flags = np.zeros(child_count, dtype=np.bool_)
+        self.selection_scores = np.empty(child_count, dtype=np.float32)
+        self.ucb_buffer = np.empty(child_count, dtype=np.float32)
+        self._move_to_child = None
+
+    def add_child(self, child):
+        self.nodes.append(child)
+
+    def iter_nodes(self):
+        return zip(self.moves, self.nodes)
+
+    def get_child_for_move(self, move):
+        move_to_child = self._move_to_child
+        if move_to_child is None:
+            move_to_child = {child_move: child for child_move, child in zip(self.moves, self.nodes)}
+            self._move_to_child = move_to_child
+        return move_to_child.get(move)
+
+    def visit_dict(self):
+        return {
+            move: int(visits)
+            for move, visits in zip(self.moves, self.visit_counts)
+        }
+
+    def __len__(self):
+        return len(self.nodes)
+
+
 class MCTSNode:
     """Node in the MCTS tree."""
 
     def __init__(self, board=None, parent=None, move=None, prior=0.0, copy_board=True):
         if board is not None:
-            self._board = board.copy() if copy_board else board
+            self._board = _copy_board_fast(board) if copy_board else board
         else:
             self._board = None
         self.parent = parent
@@ -74,24 +160,16 @@ class MCTSNode:
         self.prior = prior
         self.base_prior = prior
 
-        self.children = {}
-        self.child_nodes = []
-        self.child_moves = ()
-        self.child_priors = np.empty(0, dtype=np.float32)
-        self.child_base_priors = np.empty(0, dtype=np.float32)
-        self.child_visit_counts = np.empty(0, dtype=np.int32)
-        self.child_value_sums = np.empty(0, dtype=np.float32)
-        self.child_virtual_losses = np.empty(0, dtype=np.int16)
-        self.child_explored_flags = np.empty(0, dtype=np.bool_)
+        self.edges = MCTSEdgeStats()
         self.parent_edge_index = -1
-        self.visit_count = 0
-        self.value_sum = 0.0
+        self._root_visit_count = 0
+        self._root_value_sum = 0.0
         self.expanded = False
-        self.virtual_loss = 0
-        self._is_explored = False
+        self._root_virtual_loss = 0
+        self._root_is_explored = False
         self._explored_prior_sum = 0.0
 
-        self._fen_cache = None
+        self._position_key_cache = None
         self._is_game_over = None
         self._board_tensor = None
         self._legal_moves = None
@@ -100,7 +178,7 @@ class MCTSNode:
     @property
     def board(self):
         if self._board is None:
-            self._board = self.parent.board.copy()
+            self._board = _copy_board_fast(self.parent.board)
             self._board.push(self.move)
         return self._board
 
@@ -116,61 +194,101 @@ class MCTSNode:
     def is_leaf(self):
         return not self.expanded
 
-    def _sync_parent_edge_stats(self):
-        if self.parent is None or self.parent_edge_index < 0:
-            return
-        idx = int(self.parent_edge_index)
-        self.parent.child_visit_counts[idx] = int(self.visit_count)
-        self.parent.child_value_sums[idx] = float(self.value_sum)
-        self.parent.child_virtual_losses[idx] = int(self.virtual_loss)
-        self.parent.child_explored_flags[idx] = bool(self._is_explored)
+    def _has_parent_edge(self):
+        return self.parent is not None and self.parent_edge_index >= 0
+
+    @property
+    def visit_count(self):
+        if self._has_parent_edge():
+            return int(self.parent.edges.visit_counts[int(self.parent_edge_index)])
+        return int(self._root_visit_count)
+
+    @visit_count.setter
+    def visit_count(self, value):
+        value = int(value)
+        if self._has_parent_edge():
+            idx = int(self.parent_edge_index)
+            edges = self.parent.edges
+            edges.visit_counts[idx] = value
+            edges.total_counts[idx] = float(value + int(edges.virtual_losses[idx]))
+        else:
+            self._root_visit_count = value
+
+    @property
+    def value_sum(self):
+        if self._has_parent_edge():
+            return float(self.parent.edges.value_sums[int(self.parent_edge_index)])
+        return float(self._root_value_sum)
+
+    @value_sum.setter
+    def value_sum(self, value):
+        value = float(value)
+        if self._has_parent_edge():
+            self.parent.edges.value_sums[int(self.parent_edge_index)] = value
+        else:
+            self._root_value_sum = value
+
+    @property
+    def virtual_loss(self):
+        if self._has_parent_edge():
+            return int(self.parent.edges.virtual_losses[int(self.parent_edge_index)])
+        return int(self._root_virtual_loss)
+
+    @virtual_loss.setter
+    def virtual_loss(self, value):
+        value = int(value)
+        if self._has_parent_edge():
+            idx = int(self.parent_edge_index)
+            edges = self.parent.edges
+            edges.virtual_losses[idx] = value
+            edges.virtual_losses_f32[idx] = float(value)
+            edges.total_counts[idx] = float(int(edges.visit_counts[idx]) + value)
+        else:
+            self._root_virtual_loss = value
+
+    @property
+    def _is_explored(self):
+        if self._has_parent_edge():
+            return bool(self.parent.edges.explored_flags[int(self.parent_edge_index)])
+        return bool(self._root_is_explored)
+
+    @_is_explored.setter
+    def _is_explored(self, value):
+        value = bool(value)
+        if self._has_parent_edge():
+            self.parent.edges.explored_flags[int(self.parent_edge_index)] = value
+        else:
+            self._root_is_explored = value
 
     def _set_explored(self, explored):
         explored = bool(explored)
         if self._is_explored == explored:
             return
+        if self.parent is not None:
+            if explored:
+                self.parent._explored_prior_sum += float(self.prior)
+            else:
+                self.parent._explored_prior_sum -= float(self.prior)
+                if self.parent._explored_prior_sum < 0.0:
+                    self.parent._explored_prior_sum = 0.0
         self._is_explored = explored
-        if self.parent is None:
-            return
-        if self.parent_edge_index >= 0:
-            self.parent.child_explored_flags[int(self.parent_edge_index)] = explored
-        if explored:
-            self.parent._explored_prior_sum += float(self.prior)
-        else:
-            self.parent._explored_prior_sum -= float(self.prior)
-            if self.parent._explored_prior_sum < 0.0:
-                self.parent._explored_prior_sum = 0.0
 
     def add_virtual_loss(self, n=1):
         was_explored = (self.visit_count + self.virtual_loss) > 0
         self.virtual_loss += n
         if not was_explored and (self.visit_count + self.virtual_loss) > 0:
             self._set_explored(True)
-        self._sync_parent_edge_stats()
 
     def remove_virtual_loss(self, n=1):
         was_explored = (self.visit_count + self.virtual_loss) > 0
         self.virtual_loss -= n
         if was_explored and (self.visit_count + self.virtual_loss) <= 0:
             self._set_explored(False)
-        self._sync_parent_edge_stats()
 
     def expand_children(self, legal_moves, legal_priors):
-        legal_moves = tuple(legal_moves)
-        legal_priors = np.asarray(legal_priors, dtype=np.float32)
-        child_count = len(legal_moves)
+        self.edges.reset(legal_moves, legal_priors)
 
-        self.child_moves = legal_moves
-        self.child_priors = legal_priors.copy()
-        self.child_base_priors = legal_priors.copy()
-        self.child_visit_counts = np.zeros(child_count, dtype=np.int32)
-        self.child_value_sums = np.zeros(child_count, dtype=np.float32)
-        self.child_virtual_losses = np.zeros(child_count, dtype=np.int16)
-        self.child_explored_flags = np.zeros(child_count, dtype=np.bool_)
-        self.child_nodes = []
-        self.children = {}
-
-        for idx, (move, prior) in enumerate(zip(self.child_moves, self.child_priors)):
+        for idx, (move, prior) in enumerate(zip(self.edges.moves, self.edges.priors)):
             child = MCTSNode(
                 board=None,
                 parent=self,
@@ -178,26 +296,25 @@ class MCTSNode:
                 prior=float(prior),
                 copy_board=False,
             )
-            child.base_prior = float(self.child_base_priors[idx])
+            child.base_prior = float(self.edges.base_priors[idx])
             child.parent_edge_index = idx
-            self.child_nodes.append(child)
-            self.children[move] = child
+            self.edges.add_child(child)
 
         self.expanded = True
 
     def iter_child_nodes(self):
-        return zip(self.child_moves, self.child_nodes)
+        return self.edges.iter_nodes()
+
+    def get_child_for_move(self, move):
+        return self.edges.get_child_for_move(move)
 
     def child_visit_dict(self):
-        return {
-            move: int(visits)
-            for move, visits in zip(self.child_moves, self.child_visit_counts)
-        }
+        return self.edges.visit_dict()
 
-    def get_fen(self):
-        if self._fen_cache is None:
-            self._fen_cache = self.board.fen()
-        return self._fen_cache
+    def get_position_key(self):
+        if self._position_key_cache is None:
+            self._position_key_cache = _board_position_key(self.board)
+        return self._position_key_cache
 
     def get_legal_moves_and_indices(self):
         if self._legal_moves is None or self._legal_indices is None:
@@ -515,7 +632,7 @@ class MultiGameBatchMCTS:
 
     def _select_child(self, node):
         """Select child with highest UCB score (optimized)"""
-        if not node.child_nodes:
+        if not node.edges.nodes:
             return None
 
         # Precalculate parent term to avoid doing it for every child
@@ -538,31 +655,38 @@ class MultiGameBatchMCTS:
                 unexplored_prior = max(0.0, 1.0 - explored_prior)
                 fpu_value = parent_q - self.fpu_reduction * math.sqrt(unexplored_prior)
 
-        cv = node.child_visit_counts.astype(np.float32, copy=False) + node.child_virtual_losses.astype(np.float32, copy=False)
-        q_values = np.full(cv.shape, fpu_value, dtype=np.float32)
-        explored_mask = cv > 0
+        edges = node.edges
+        cv = edges.total_counts
+        q_values = edges.selection_scores
+        explored_mask = edges.explored_flags
+        q_values.fill(fpu_value)
         if np.any(explored_mask):
             q_values[explored_mask] = (
-                node.child_value_sums[explored_mask] - node.child_virtual_losses[explored_mask].astype(np.float32, copy=False)
+                edges.value_sums[explored_mask] - edges.virtual_losses_f32[explored_mask]
             ) / cv[explored_mask]
-        u_values = c_puct * node.child_priors * parent_sqrt / (1.0 + cv)
-        best_idx = int(np.argmax(q_values + u_values))
-        return node.child_nodes[best_idx]
+
+        u_values = edges.ucb_buffer
+        np.multiply(edges.priors, c_puct * parent_sqrt, out=u_values)
+        u_values /= (1.0 + cv)
+        q_values += u_values
+        best_idx = int(np.argmax(q_values))
+        return edges.nodes[best_idx]
 
     def _apply_root_noise(self, node):
         """Apply fresh Dirichlet noise to an already expanded root node."""
-        if self.dirichlet_weight <= 0 or not node.child_nodes:
+        if self.dirichlet_weight <= 0 or not node.edges.nodes:
             return
 
-        children = node.child_nodes
+        edges = node.edges
+        children = edges.nodes
         noise = np.random.dirichlet([self.dirichlet_alpha] * len(children))
         mix = self.dirichlet_weight
 
         for idx, (child, noise_value) in enumerate(zip(children, noise)):
-            new_prior = (1.0 - mix) * float(node.child_base_priors[idx]) + mix * float(noise_value)
+            new_prior = (1.0 - mix) * float(edges.base_priors[idx]) + mix * float(noise_value)
             if child._is_explored:
                 node._explored_prior_sum += float(new_prior - child.prior)
-            node.child_priors[idx] = new_prior
+            edges.priors[idx] = new_prior
             child.prior = new_prior
 
     def _backpropagate(self, search_path, value):
@@ -570,7 +694,6 @@ class MultiGameBatchMCTS:
         for node in reversed(search_path):
             node.value_sum += value
             node.visit_count += 1
-            node._sync_parent_edge_stats()
             value = -value
 
     def search_many(self, game_states, num_simulations, add_root_noise=False):
@@ -596,12 +719,12 @@ class MultiGameBatchMCTS:
                 if root_synced:
                     gs['_root_synced'] = False
                 else:
-                    target_fen = board.fen()
-                    if root.get_fen() == target_fen:
+                    target_key = _board_position_key(board)
+                    if root.get_position_key() == target_key:
                         pass
                     else:
-                        for _, child in root.iter_child_nodes():
-                            if child.get_fen() == target_fen:
+                        for child in root.edges.nodes:
+                            if child.get_position_key() == target_key:
                                 _ = child.board  # Ensure board is instantiated
                                 root = child
                                 root.parent = None
@@ -879,7 +1002,7 @@ class BatchMCTS:
     def advance_root(self, move):
         if self.root is None:
             return
-        child = self.root.children.get(move)
+        child = self.root.get_child_for_move(move)
         if child is None:
             self.root = None
             self._root_synced = False
@@ -1624,8 +1747,11 @@ class BatchSelfPlayMCTSBatch:
                 gs['board_history'].append(self.mcts._encode_history_entry(board))
 
                 # Reuse selected subtree directly to skip FEN-matching next turn.
-                if game_opponent_mcts is None and root is not None and move in root.children:
-                    next_root = root.children[move]
+                if game_opponent_mcts is None and root is not None:
+                    next_root = root.get_child_for_move(move)
+                else:
+                    next_root = None
+                if next_root is not None:
                     _ = next_root.board
                     next_root.parent = None
                     next_root.parent_edge_index = -1

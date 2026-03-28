@@ -410,7 +410,12 @@ class EloEstimator:
         except (TypeError, ValueError):
             requested = 0
         if requested <= 0:
-            requested = max(1, cpu_total - 2)
+            try:
+                reserve_auto = int(self.elo_config.get("auto_worker_reserve_cpus", 2) or 0)
+            except (TypeError, ValueError):
+                reserve_auto = 2
+            reserve_auto = max(0, min(cpu_total - 1, reserve_auto))
+            requested = max(1, cpu_total - reserve_auto)
 
         effective = max(1, requested)
         prioritize_training = bool(self.elo_config.get("prioritize_training", False))
