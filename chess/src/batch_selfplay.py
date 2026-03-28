@@ -915,6 +915,8 @@ class BatchSelfPlayMCTSBatch:
         max_batch_games_per_worker,
         opponent_model=None,
         opponent_source_label="current",
+        opponent_models_by_label=None,
+        opponent_plan_labels=None,
     ):
         self.model = model
         self.config = config
@@ -925,11 +927,20 @@ class BatchSelfPlayMCTSBatch:
         rl_cfg = config.get('reinforcement_learning', {})
 
         self.mcts = MultiGameBatchMCTS(model, config, device)
-        self.opponent_mcts = (
-            MultiGameBatchMCTS(opponent_model, config, device)
-            if opponent_model is not None
-            else None
-        )
+        self.opponent_models_by_label = {}
+        if isinstance(opponent_models_by_label, dict):
+            for label, opp_model in opponent_models_by_label.items():
+                if opp_model is not None:
+                    self.opponent_models_by_label[str(label)] = opp_model
+        elif opponent_model is not None:
+            self.opponent_models_by_label[self.opponent_source_label] = opponent_model
+        self.opponent_mcts_by_label = {
+            str(label): MultiGameBatchMCTS(opp_model, config, device)
+            for label, opp_model in self.opponent_models_by_label.items()
+            if opp_model is not None
+        }
+        self.opponent_mcts = next(iter(self.opponent_mcts_by_label.values()), None)
+        self.opponent_plan_labels = list(opponent_plan_labels or [])
 
         if device.type == 'cuda':
             self.model = self.model.to(memory_format=torch.channels_last)
@@ -1012,6 +1023,7 @@ class BatchSelfPlayMCTSBatch:
         self._progress_file = None  # Set externally to enable progress reporting
         self._games_completed = 0
         self._progress_base = 0
+        self._plan_cursor = 0
 
     def _compute_draw_value_target(self, move_count):
         del move_count
@@ -1328,10 +1340,15 @@ class BatchSelfPlayMCTSBatch:
         return None
 
     def _uses_learner_model(self, gs, board):
-        if self.opponent_mcts is None:
+        opponent_label = str(gs.get('opponent_source_label', self.opponent_source_label) or "current")
+        if opponent_label not in self.opponent_mcts_by_label:
             return True
         learner_color = gs.get('learner_color', chess.WHITE)
         return bool(board.turn == learner_color)
+
+    def _get_game_opponent_mcts(self, gs):
+        opponent_label = str(gs.get('opponent_source_label', self.opponent_source_label) or "current")
+        return self.opponent_mcts_by_label.get(opponent_label)
 
     def _apply_opening_prefix(self, gs):
         prefix = self._sample_opening_prefix()
@@ -1359,6 +1376,7 @@ class BatchSelfPlayMCTSBatch:
         all_positions = []
         game_lengths = []
         self._games_completed = 0
+        self._plan_cursor = 0
         total_dropped_positions = 0
         total_truncated_games = 0
         total_claimable_draw_ended_games = 0
@@ -1372,6 +1390,8 @@ class BatchSelfPlayMCTSBatch:
         total_curriculum_dropped_positions = 0
         total_cap_dropped_positions = 0
         total_resigned_games = 0
+        opponent_source_counts = {}
+        opponent_source_results = {}
 
         games_left = num_games
         batch_idx = 0
@@ -1380,7 +1400,9 @@ class BatchSelfPlayMCTSBatch:
             batch_size = min(self.max_batch_games_per_worker, games_left)
             batch_idx += 1
 
-            positions, lengths, batch_stats = self._play_batch(batch_size)
+            batch_plan_labels = list(self.opponent_plan_labels[self._plan_cursor:self._plan_cursor + batch_size])
+            self._plan_cursor += batch_size
+            positions, lengths, batch_stats = self._play_batch(batch_size, batch_plan_labels=batch_plan_labels)
             all_positions.extend(positions)
             game_lengths.extend(lengths)
             total_dropped_positions += int(batch_stats.get('dropped_positions', 0))
@@ -1396,10 +1418,26 @@ class BatchSelfPlayMCTSBatch:
             total_curriculum_dropped_positions += int(batch_stats.get('curriculum_dropped_positions', 0))
             total_cap_dropped_positions += int(batch_stats.get('cap_dropped_positions', 0))
             total_resigned_games += int(batch_stats.get('resigned_games', 0))
+            for label, count in dict(batch_stats.get('opponent_source_counts', {}) or {}).items():
+                opponent_source_counts[str(label)] = int(opponent_source_counts.get(str(label), 0)) + int(count)
+            for label, stats in dict(batch_stats.get('opponent_source_results', {}) or {}).items():
+                result_stats = opponent_source_results.setdefault(
+                    str(label),
+                    {'wins': 0, 'draws': 0, 'losses': 0, 'games': 0},
+                )
+                result_stats['wins'] += int((stats or {}).get('wins', 0))
+                result_stats['draws'] += int((stats or {}).get('draws', 0))
+                result_stats['losses'] += int((stats or {}).get('losses', 0))
+                result_stats['games'] += int((stats or {}).get('games', 0))
 
             games_left -= batch_size
 
         total_games = len(game_lengths)
+        source_label = self.opponent_source_label
+        if len(opponent_source_counts) > 1:
+            source_label = 'mixed'
+        elif len(opponent_source_counts) == 1:
+            source_label = next(iter(opponent_source_counts.keys()))
         self.last_selfplay_stats = {
             'truncated_games': total_truncated_games,
             'completed_games': max(0, total_games - total_truncated_games),
@@ -1415,7 +1453,9 @@ class BatchSelfPlayMCTSBatch:
             'curriculum_dropped_positions': int(total_curriculum_dropped_positions),
             'cap_dropped_positions': int(total_cap_dropped_positions),
             'resigned_games': int(total_resigned_games),
-            'opponent_source': self.opponent_source_label,
+            'opponent_source': source_label,
+            'opponent_source_counts': opponent_source_counts,
+            'opponent_source_results': opponent_source_results,
             'total_games': int(total_games),
         }
         return all_positions, game_lengths
@@ -1440,11 +1480,17 @@ class BatchSelfPlayMCTSBatch:
         ):
             self._report_progress()
 
-    def _play_batch(self, batch_size):
+    def _play_batch(self, batch_size, batch_plan_labels=None):
         max_moves = self.max_moves
 
         game_states = []
         for _game_idx in range(batch_size):
+            game_opponent_label = (
+                str(batch_plan_labels[_game_idx])
+                if batch_plan_labels is not None and _game_idx < len(batch_plan_labels)
+                else self.opponent_source_label
+            )
+            has_frozen_opponent = game_opponent_label in self.opponent_mcts_by_label
             game_states.append({
                 'board': chess.Board(),
                 'board_history': [],
@@ -1461,9 +1507,10 @@ class BatchSelfPlayMCTSBatch:
                 'resigned_result': None,
                 'resign_streak': 0,
                 'resignation_disabled': bool(np.random.random() < self.resignation_disable_fraction),
+                'opponent_source_label': game_opponent_label,
                 'learner_color': (
                     chess.WHITE
-                    if self.opponent_mcts is None or not self.randomize_learner_color
+                    if not has_frozen_opponent or not self.randomize_learner_color
                     else (chess.WHITE if np.random.random() < 0.5 else chess.BLACK)
                 ),
                 '_completion_reported': False,
@@ -1500,7 +1547,7 @@ class BatchSelfPlayMCTSBatch:
                     gs[synced_key] = bool(local_state.get('_root_synced', False))
                     visit_counts_by_index[gs_idx] = visit_counts
 
-            if self.opponent_mcts is None:
+            if not self.opponent_mcts_by_label:
                 _run_search_for_indices(active_indices, self.mcts, 'root', '_root_synced')
             else:
                 learner_indices = [
@@ -1513,7 +1560,15 @@ class BatchSelfPlayMCTSBatch:
                     if i not in learner_index_set
                 ]
                 _run_search_for_indices(learner_indices, self.mcts, 'root', '_root_synced')
-                _run_search_for_indices(opponent_indices, self.opponent_mcts, 'opponent_root', '_opponent_root_synced')
+                grouped_opponent_indices = {}
+                for idx in opponent_indices:
+                    label = str(game_states[idx].get('opponent_source_label', self.opponent_source_label) or "current")
+                    grouped_opponent_indices.setdefault(label, []).append(idx)
+                for label, indices in grouped_opponent_indices.items():
+                    opponent_mcts = self.opponent_mcts_by_label.get(label)
+                    if opponent_mcts is None:
+                        continue
+                    _run_search_for_indices(indices, opponent_mcts, 'opponent_root', '_opponent_root_synced')
 
             for idx in active_indices:
                 gs = game_states[idx]
@@ -1527,8 +1582,9 @@ class BatchSelfPlayMCTSBatch:
                 else:
                     temperature = 0.0
                 learner_turn = self._uses_learner_model(gs, board)
-                root_key = 'root' if learner_turn or self.opponent_mcts is None else 'opponent_root'
-                synced_key = '_root_synced' if learner_turn or self.opponent_mcts is None else '_opponent_root_synced'
+                game_opponent_mcts = self._get_game_opponent_mcts(gs)
+                root_key = 'root' if learner_turn or game_opponent_mcts is None else 'opponent_root'
+                synced_key = '_root_synced' if learner_turn or game_opponent_mcts is None else '_opponent_root_synced'
                 root = gs.get(root_key)
                 adjudicated_result = self._maybe_adjudicate_game(gs, root, board)
                 if adjudicated_result is not None:
@@ -1553,7 +1609,7 @@ class BatchSelfPlayMCTSBatch:
                     continue
 
                 move = self._select_move_from_visits(visit_counts, temperature)
-                if learner_turn or self.opponent_mcts is None:
+                if learner_turn or game_opponent_mcts is None:
                     policy_indices, policy_values = _build_sparse_policy_target_from_visits(visit_counts, board)
                     history_count = len(gs['board_history'])
                     gs['game_history'].append((
@@ -1568,7 +1624,7 @@ class BatchSelfPlayMCTSBatch:
                 gs['board_history'].append(self.mcts._encode_history_entry(board))
 
                 # Reuse selected subtree directly to skip FEN-matching next turn.
-                if self.opponent_mcts is None and root is not None and move in root.children:
+                if game_opponent_mcts is None and root is not None and move in root.children:
                     next_root = root.children[move]
                     _ = next_root.board
                     next_root.parent = None
@@ -1608,6 +1664,11 @@ class BatchSelfPlayMCTSBatch:
         completed_white_wins = 0
         completed_black_wins = 0
         completed_draws = 0
+        learner_wins = 0
+        learner_draws = 0
+        learner_losses = 0
+        opponent_source_counts = {}
+        opponent_source_results = {}
         decisive_games = 0
         decisive_length_sum = 0
         curriculum_dropped_positions = 0
@@ -1616,6 +1677,8 @@ class BatchSelfPlayMCTSBatch:
 
         for gs in game_states:
             board = gs['board']
+            opponent_label = str(gs.get('opponent_source_label', self.opponent_source_label) or "current")
+            opponent_source_counts[opponent_label] = int(opponent_source_counts.get(opponent_label, 0)) + 1
             ended_by_claimable_draw = (
                 bool(gs.get('ended_by_auto_claim_draw', False))
             )
@@ -1655,6 +1718,24 @@ class BatchSelfPlayMCTSBatch:
             else:
                 outcome = 0.0
                 completed_draws += 1
+
+            if opponent_label in self.opponent_mcts_by_label:
+                learner_color = gs.get('learner_color', chess.WHITE)
+                learner_outcome = outcome if learner_color == chess.WHITE else -outcome
+                result_stats = opponent_source_results.setdefault(
+                    opponent_label,
+                    {'wins': 0, 'draws': 0, 'losses': 0, 'games': 0},
+                )
+                if learner_outcome > 0.0:
+                    learner_wins += 1
+                    result_stats['wins'] += 1
+                elif learner_outcome < 0.0:
+                    learner_losses += 1
+                    result_stats['losses'] += 1
+                else:
+                    learner_draws += 1
+                    result_stats['draws'] += 1
+                result_stats['games'] += 1
             completed_length_sum += game_ply_len
             if outcome != 0.0:
                 decisive_length_sum += game_ply_len
@@ -1669,6 +1750,11 @@ class BatchSelfPlayMCTSBatch:
 
             game_lengths.append(game_ply_len)
 
+        source_label = self.opponent_source_label
+        if len(opponent_source_counts) > 1:
+            source_label = 'mixed'
+        elif len(opponent_source_counts) == 1:
+            source_label = next(iter(opponent_source_counts.keys()))
         return positions, game_lengths, {
             'total_games': int(len(game_states)),
             'truncated_games': int(truncated_games),
@@ -1681,11 +1767,16 @@ class BatchSelfPlayMCTSBatch:
             'completed_white_wins': int(completed_white_wins),
             'completed_black_wins': int(completed_black_wins),
             'completed_draws': int(completed_draws),
+            'learner_wins': int(learner_wins),
+            'learner_draws': int(learner_draws),
+            'learner_losses': int(learner_losses),
             'decisive_games': int(decisive_games),
             'decisive_length_sum': int(decisive_length_sum),
             'curriculum_dropped_positions': int(curriculum_dropped_positions),
             'cap_dropped_positions': int(cap_dropped_positions),
-            'opponent_source': self.opponent_source_label,
+            'opponent_source': source_label,
+            'opponent_source_counts': opponent_source_counts,
+            'opponent_source_results': opponent_source_results,
         }
 
     def _select_move_from_visits(self, visit_counts, temperature):
@@ -1797,6 +1888,8 @@ def _create_selfplay_engine(
     wlog,
     opponent_model=None,
     opponent_source_label="current",
+    opponent_models_by_label=None,
+    opponent_plan_labels=None,
 ):
     rl_cfg = config.get('reinforcement_learning', {})
     use_batch = rl_cfg.get('use_batch_selfplay', False)
@@ -1816,6 +1909,8 @@ def _create_selfplay_engine(
         configured_max,
         opponent_model=opponent_model,
         opponent_source_label=opponent_source_label,
+        opponent_models_by_label=opponent_models_by_label,
+        opponent_plan_labels=opponent_plan_labels,
     )
     actual_max = min(configured_max, num_games)
     wlog(
@@ -2012,29 +2107,37 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
                 _load_worker_model_state(model, model_state, rank)
                 model.eval()
 
-                opponent_state = task.get('opponent_model_state')
-                opponent_label = str(task.get('opponent_label') or 'current')
-                if opponent_state is not None:
+                opponent_payload = task.get('opponent_payload') or {}
+                opponent_plan_labels = list(opponent_payload.get('plan_labels', []) or [])
+                opponent_pool_entries = list(opponent_payload.get('pool_entries', []) or [])
+                opponent_models_by_label = {}
+                opponent_model = None
+                opponent_label = str(opponent_payload.get('label') or 'current')
+                for entry in opponent_pool_entries:
+                    entry_label = str((entry or {}).get('label') or 'current')
+                    entry_state = (entry or {}).get('state')
+                    if entry_state is None or entry_label == 'current':
+                        continue
+                    pooled_model = _build_selfplay_worker_model(config, device)
+                    _load_worker_model_state(pooled_model, entry_state, rank)
+                    pooled_model.eval()
+                    opponent_models_by_label[entry_label] = pooled_model
                     if opponent_model is None:
-                        opponent_model = _build_selfplay_worker_model(config, device)
-                    _load_worker_model_state(opponent_model, opponent_state, rank)
-                    opponent_model.eval()
-                else:
-                    opponent_model = None
+                        opponent_model = pooled_model
+                        opponent_label = entry_label
 
-                current_batch_mode = bool(rl_cfg.get('use_batch_selfplay', False))
-                current_signature = (current_batch_mode, opponent_model is not None, opponent_label)
-                if engine is None or engine_signature != current_signature:
-                    engine = _create_selfplay_engine(
-                        inference_model,
-                        config,
-                        device,
-                        int(task['num_games']),
-                        wlog,
-                        opponent_model=opponent_model,
-                        opponent_source_label=opponent_label,
-                    )
-                    engine_signature = current_signature
+                engine = _create_selfplay_engine(
+                    inference_model,
+                    config,
+                    device,
+                    int(task['num_games']),
+                    wlog,
+                    opponent_model=opponent_model,
+                    opponent_source_label=opponent_label,
+                    opponent_models_by_label=opponent_models_by_label,
+                    opponent_plan_labels=opponent_plan_labels,
+                )
+                engine_signature = None
 
                 if hasattr(engine, 'temperature') and task.get('mcts_temperature') is not None:
                     engine.temperature = float(task['mcts_temperature'])
@@ -2115,11 +2218,22 @@ def play_games_mcts_worker(
         _load_worker_model_state(model, model_state, rank)
         opponent_model = None
         opponent_label = 'current'
-        if isinstance(opponent_payload, dict) and opponent_payload.get('state') is not None:
-            opponent_model = _build_selfplay_worker_model(config, device)
-            _load_worker_model_state(opponent_model, opponent_payload.get('state'), rank)
-            opponent_model.eval()
-            opponent_label = str(opponent_payload.get('label') or 'current')
+        opponent_models_by_label = {}
+        opponent_plan_labels = []
+        if isinstance(opponent_payload, dict):
+            opponent_plan_labels = list(opponent_payload.get('plan_labels', []) or [])
+            for entry in list(opponent_payload.get('pool_entries', []) or []):
+                entry_label = str((entry or {}).get('label') or 'current')
+                entry_state = (entry or {}).get('state')
+                if entry_state is None or entry_label == 'current':
+                    continue
+                pooled_model = _build_selfplay_worker_model(config, device)
+                _load_worker_model_state(pooled_model, entry_state, rank)
+                pooled_model.eval()
+                opponent_models_by_label[entry_label] = pooled_model
+                if opponent_model is None:
+                    opponent_model = pooled_model
+                    opponent_label = entry_label
 
         engine = _create_selfplay_engine(
             model,
@@ -2129,6 +2243,8 @@ def play_games_mcts_worker(
             wlog,
             opponent_model=opponent_model,
             opponent_source_label=opponent_label,
+            opponent_models_by_label=opponent_models_by_label,
+            opponent_plan_labels=opponent_plan_labels,
         )
         _play_games_with_engine(rank, engine, config, num_games, result_file_path, wlog)
     except KeyboardInterrupt:

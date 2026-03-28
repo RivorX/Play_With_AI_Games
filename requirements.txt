@@ -1,15 +1,28 @@
-numpy
-gymnasium
-stable-baselines3[extra]
-torch
-pygame
-tqdm
-filelock
-pyyaml
-imageio
-Pillow
-sb3-contrib
-triton-windows
+--extra-index-url https://download.pytorch.org/whl/cu128
 
-# Dodatkowe dla Chess
+# Core numerics
+numpy>=1.26.0
+pyyaml>=6.0.1
+tqdm>=4.66.0
+filelock>=3.16.0
+Pillow>=10.4.0
+imageio>=2.35.0
+
+# PyTorch
+torch>=2.10.0+cu128; platform_system == "Windows"
+torchvision>=0.25.0+cu128; platform_system == "Windows"
+torchaudio>=2.10.0+cu128; platform_system == "Windows"
+torch>=2.10.0; platform_system != "Windows"
+
+# RL / training
+gymnasium>=1.0.0
+stable-baselines3[extra]>=2.4.0
+sb3-contrib>=2.4.0
+triton-windows>=3.2.0; platform_system == "Windows"
+
+# Chess / gameplay
 python-chess>=1.999
+pygame>=2.6.0
+
+# Asset / UI helpers
+requests>=2.32.0

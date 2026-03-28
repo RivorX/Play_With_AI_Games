@@ -197,7 +197,7 @@ reinforcement_learning:
   # ---------------------------
   self_play_device: "cuda"      # cpu | cuda | auto (auto uses GPU if available)
   self_play_workers: auto       # 0/auto = cpu_count - 1, or set explicit number
-  self_play_workers_per_gpu: 8  # Best measured throughput on this 1x GPU setup was around 8 workers/GPU
+  self_play_workers_per_gpu: 6  # Slightly lower worker count to leave some CPU headroom for other tasks
   self_play_torch_threads: 1    # Keep 1 thread per worker; Python MCTS already fans out across many processes
   persistent_self_play_workers: true  # Keep self-play workers alive across RL iterations
   self_play_stream_to_replay: true    # Stream worker results into replay buffer to reduce parent RAM peak
@@ -224,7 +224,7 @@ reinforcement_learning:
   self_play_resignation_threshold: 0.93  # Require a clearly losing root value before resigning
   self_play_resignation_patience: 3      # Need a short stable losing streak before resignation triggers
   self_play_resignation_disable_fraction: 0.10  # Keep a small slice of games resignation-free to reduce false positives
-  self_play_progress_interval_games: 4  # Fewer progress file writes on Windows workers
+  self_play_progress_interval_games: 5  # Fewer progress file writes on Windows workers
 
   # ---------------------------
   # Self-Play Diversity
@@ -234,11 +234,20 @@ reinforcement_learning:
   self_play_opening_diversity_min_plies: 2    # Let sharp curated lines branch early
   self_play_opening_diversity_max_plies: 8    # Allow enough depth to land in asymmetrical structures
   self_play_opponent_pool_enabled: true       # Mix current-vs-current with frozen opponents instead of only mirror self-play
-  self_play_opponent_current_fraction: 0.40   # Keep some pure self-play to adapt to the latest policy/value pair
-  self_play_opponent_best_fraction: 0.30      # Play against the current frozen best model to avoid forgetting conversion skill
-  self_play_opponent_recent_fraction: 0.30    # Play against recent snapshots to reduce cycles and draw-basin collapse
-  self_play_recent_snapshots_to_keep: 4       # Small rolling pool of frozen recent policies for self-play variety
+  self_play_opponent_current_fraction: 0.70   # Safer base prior: most games still stay on current-vs-current so RL can actually improve
+  self_play_opponent_best_fraction: 0.15      # Keep some pressure from the frozen best without letting it dominate the curriculum
+  self_play_opponent_recent_fraction: 0.15    # Use historical RL snapshots as a lighter anti-cycle signal
+  self_play_recent_snapshots_to_keep: 5       # Keep several RL iterations around so adaptive matching can pick across different ages
   self_play_randomize_learner_color: true     # Let the training model play both colors against frozen opponents
+  self_play_opponent_adaptive_enabled: true   # Reweight best/recent opponents cautiously using observed matchup scores
+  self_play_opponent_adaptive_update_every: 2 # Adjust every few iterations instead of reacting to one noisy batch
+  self_play_opponent_adaptive_min_games: 8    # Ignore tiny matchup samples
+  self_play_opponent_adaptive_history_size: 4 # Smooth score estimates over a short recent window
+  self_play_opponent_adaptive_target_score: 0.50 # Prefer opponents that are neither too easy nor too hard
+  self_play_opponent_adaptive_band: 0.15      # Treat roughly 35-65% score as the "good difficulty" band
+  self_play_opponent_adaptive_min_factor: 0.60 # Do not fully zero out hard/easy opponents
+  self_play_opponent_adaptive_max_factor: 1.40 # Also do not over-spike one opponent source
+  self_play_opponent_current_min_fraction: 0.50 # Keep at least half the games as latest-policy self-play
   
   # ---------------------------
   # Replay Shaping
@@ -288,11 +297,14 @@ reinforcement_learning:
   train_epochs_per_iteration: 3  # More updates per iteration so RL can move a strong IL starting point
 
   # Replay buffer sizing:
-  # Actual size = games_per_iteration * avg_moves_per_game * replay_buffer_multiplier
-  avg_moves_per_game: 192       # Estimated replay positions produced by one game on average
-  replay_buffer_multiplier: 4    # Refresh replay faster so stale draw-heavy snapshots stop dominating training
+  # Capacity now bootstraps small and then auto-resizes from observed positions/iteration.
+  replay_buffer_multiplier: 4     # Target capacity ~= EMA(observed positions per iteration) * multiplier
+  replay_buffer_bootstrap_positions_per_iteration: auto  # auto = start from a small conservative bootstrap instead of a large fixed guess
+  replay_buffer_ema_alpha: 0.25   # How quickly replay capacity reacts to newly observed self-play volume
+  replay_buffer_min_size: 4096    # Never shrink below a small practical floor
+  replay_buffer_capacity_round_to: 256  # Round capacity changes to reduce realloc noise
   replay_fp16: true             # Store replay tensors in float16 to reduce RAM (~2x)
-  replay_decisive_sampling_fraction: 0.25   # Bias toward decisive positions without overfitting to the tiny decisive subset
+  replay_decisive_sampling_fraction: 0.10   # Keep a small decisive bias, but avoid oversampling mostly losing decisive positions
   replay_decisive_value_epsilon: 0.05       # Treat |value| > epsilon as decisive for replay sampling
   
   # Learning rate schedule

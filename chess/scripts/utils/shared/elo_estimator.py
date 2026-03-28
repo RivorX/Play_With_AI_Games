@@ -443,18 +443,73 @@ class EloEstimator:
         with self._worker_engines_lock:
             self._worker_engines.append(engine)
 
+    def _force_close_engine(self, engine: chess.engine.SimpleEngine | None):
+        if engine is None:
+            return
+
+        protocol = None
+        transport = None
+        proc = None
+
+        with contextlib.suppress(Exception):
+            protocol = getattr(engine, "protocol", None)
+        if protocol is not None:
+            with contextlib.suppress(Exception):
+                transport = getattr(protocol, "transport", None)
+        if transport is None:
+            with contextlib.suppress(Exception):
+                transport = getattr(engine, "transport", None)
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                proc = getattr(transport, "_proc", None)
+            if proc is None:
+                with contextlib.suppress(Exception):
+                    proc = getattr(transport, "proc", None)
+
+        with contextlib.suppress(Exception):
+            engine.quit()
+        with contextlib.suppress(Exception):
+            close_fn = getattr(engine, "close", None)
+            if callable(close_fn):
+                close_fn()
+        if protocol is not None:
+            with contextlib.suppress(Exception):
+                protocol_close = getattr(protocol, "close", None)
+                if callable(protocol_close):
+                    protocol_close()
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                transport.close()
+            with contextlib.suppress(Exception):
+                transport.abort()
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=0.2)
+            with contextlib.suppress(Exception):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=0.2)
+
     def _close_worker_engines(self):
         with self._worker_engines_lock:
             engines = self._worker_engines
             self._worker_engines = []
+        worker = getattr(self._thread_local, "worker_resources", None)
+        if worker is not None:
+            with contextlib.suppress(Exception):
+                self._thread_local.worker_resources = None
+            engine = worker.get("engine")
+            if engine is not None:
+                engines = list(engines) + [engine]
         seen = set()
         for engine in engines:
             engine_id = id(engine)
             if engine_id in seen:
                 continue
             seen.add(engine_id)
-            with contextlib.suppress(Exception):
-                engine.quit()
+            self._force_close_engine(engine)
 
     def _get_thread_worker_resources(self, use_mcts: bool, simulations: int, stockfish_path: str):
         """Get or create persistent worker-local Stockfish engine and model player."""
@@ -467,8 +522,7 @@ class EloEstimator:
             )
             if same_cfg:
                 return worker["engine"], worker["player"]
-            with contextlib.suppress(Exception):
-                worker["engine"].quit()
+            self._force_close_engine(worker.get("engine"))
 
         engine = chess.engine.SimpleEngine.popen_uci(
             stockfish_path,
@@ -533,8 +587,7 @@ class EloEstimator:
                     sf_min_elo = int(opt.min)
                 if hasattr(opt, "max") and opt.max is not None:
                     sf_max_elo = int(opt.max)
-            with contextlib.suppress(Exception):
-                test_engine.quit()
+            self._force_close_engine(test_engine)
         except FileNotFoundError:
             print(f"  Warning: Stockfish not found at '{resolved_path}' - Elo estimation skipped.")
             return {
@@ -667,7 +720,11 @@ class EloEstimator:
                     if cancelled:
                         for future in futures:
                             future.cancel()
-                    executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
+                        self._close_worker_engines()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        self._close_worker_engines()
+                    else:
+                        executor.shutdown(wait=True, cancel_futures=False)
                     self._close_worker_engines()
             else:
                 player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
@@ -704,8 +761,7 @@ class EloEstimator:
                                 self.stop_event.set()
                         print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
                 finally:
-                    with contextlib.suppress(Exception):
-                        engine.quit()
+                    self._force_close_engine(engine)
         finally:
             if progress_bar is not None:
                 progress_bar.close()

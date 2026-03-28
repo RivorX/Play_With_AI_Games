@@ -1,6 +1,7 @@
 """Model loading and pre-game setup helpers for local GUI play."""
 
 import copy
+import ctypes
 from datetime import datetime
 import math
 from pathlib import Path
@@ -18,21 +19,62 @@ sys.path.insert(0, str(script_dir.parent.parent))
 from utils.shared.model_catalog import load_checkpoint_metadata
 
 
-_SETUP_BG = (18, 22, 28)
-_PANEL_BG = (31, 37, 46)
-_CARD_BG = (42, 49, 61)
-_TEXT = (236, 241, 248)
-_MUTED = (150, 160, 176)
-_ACCENT = (79, 137, 224)
-_ACCENT_BORDER = (124, 170, 236)
-_BORDER = (78, 92, 112)
-_DANGER = (170, 76, 76)
+_SETUP_BG = (12, 16, 22)
+_PANEL_BG = (24, 31, 42)
+_CARD_BG = (32, 40, 54)
+_TEXT = (241, 245, 251)
+_MUTED = (151, 165, 184)
+_ACCENT = (82, 155, 255)
+_ACCENT_BORDER = (145, 193, 255)
+_BORDER = (78, 96, 122)
+_DANGER = (177, 83, 83)
+_GLOW = (43, 92, 173)
 _CATEGORY_STYLE = {
-    "best": {"label": "BEST models", "fill": (52, 84, 70), "border": (95, 154, 126)},
-    "il": {"label": "IL models", "fill": (56, 72, 103), "border": (104, 132, 188)},
-    "rl": {"label": "RL models", "fill": (88, 68, 46), "border": (157, 122, 84)},
-    "other": {"label": "Other models", "fill": (68, 66, 80), "border": (120, 117, 137)},
+    "best": {"label": "BEST models", "fill": (44, 82, 69), "border": (99, 182, 140)},
+    "il": {"label": "IL models", "fill": (44, 64, 98), "border": (108, 149, 221)},
+    "rl": {"label": "RL models", "fill": (89, 67, 42), "border": (191, 145, 87)},
+    "other": {"label": "Other models", "fill": (62, 61, 77), "border": (135, 137, 162)},
 }
+
+
+def _maximize_native_window():
+    """Ask the OS to maximize the current window when available."""
+    try:
+        wm_info = pygame.display.get_wm_info()
+    except Exception:
+        return False
+
+    window_handle = wm_info.get("window")
+    if not window_handle:
+        return False
+
+    try:
+        ctypes.windll.user32.ShowWindow(int(window_handle), 3)
+        return True
+    except Exception:
+        return False
+
+
+def _lerp_color(color_a, color_b, t):
+    t = max(0.0, min(1.0, float(t)))
+    return tuple(int(color_a[idx] + (color_b[idx] - color_a[idx]) * t) for idx in range(3))
+
+
+def _draw_panel(screen, rect, fill=None, border=None, radius=18, shadow=True, fill_alpha=None):
+    fill = fill or _PANEL_BG
+    border = border or _BORDER
+    if shadow:
+        shadow_rect = rect.move(0, 8)
+        shadow_surface = pygame.Surface((shadow_rect.width, shadow_rect.height), pygame.SRCALPHA)
+        pygame.draw.rect(shadow_surface, (0, 0, 0, 54), shadow_surface.get_rect(), border_radius=radius)
+        screen.blit(shadow_surface, shadow_rect.topleft)
+    if fill_alpha is None:
+        pygame.draw.rect(screen, fill, rect, border_radius=radius)
+    else:
+        fill_surface = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+        pygame.draw.rect(fill_surface, (*fill, int(max(0, min(255, fill_alpha)))), fill_surface.get_rect(), border_radius=radius)
+        screen.blit(fill_surface, rect.topleft)
+    pygame.draw.rect(screen, border, rect, width=1, border_radius=radius)
 
 
 _MODEL_ARCH_KEYS = [
@@ -327,7 +369,11 @@ def write_setup_log(base_dir, config, setup):
         "game_mode": setup.get("game_mode"),
         "human_color": setup.get("human_color_name"),
         "use_mcts": bool(setup.get("use_mcts", False)),
+        "use_mcts_white": bool(setup.get("use_mcts_white", setup.get("use_mcts", False))),
+        "use_mcts_black": bool(setup.get("use_mcts_black", setup.get("use_mcts", False))),
         "mcts_simulations": setup.get("mcts_simulations"),
+        "mcts_simulations_white": setup.get("mcts_simulations_white"),
+        "mcts_simulations_black": setup.get("mcts_simulations_black"),
         "model_ai": str(setup.get("model1_path")) if setup.get("model1_path") else None,
         "model_white": str(setup.get("model_white")) if setup.get("model_white") else None,
         "model_black": str(setup.get("model_black")) if setup.get("model_black") else None,
@@ -361,17 +407,68 @@ def load_play_preferences(base_dir, config):
 
 def save_play_preferences(base_dir, config, preferences):
     path = _resolve_play_preferences_path(base_dir, config)
+    existing_payload = {}
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as file_obj:
+                existing_payload = yaml.safe_load(file_obj) or {}
+            if not isinstance(existing_payload, dict):
+                existing_payload = {}
+        except Exception:
+            existing_payload = {}
     sims = _safe_int((preferences or {}).get("mcts_simulations"), default=100)
+    sims_white = _safe_int((preferences or {}).get("mcts_simulations_white"), default=sims)
+    sims_black = _safe_int((preferences or {}).get("mcts_simulations_black"), default=sims)
     if sims is None:
         sims = 100
-    payload = {
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "use_mcts": bool((preferences or {}).get("use_mcts", False)),
-        "mcts_simulations": max(1, int(sims)),
-    }
+    if sims_white is None:
+        sims_white = sims
+    if sims_black is None:
+        sims_black = sims
+    payload = dict(existing_payload)
+    payload.update(
+        {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "use_mcts": bool((preferences or {}).get("use_mcts", False)),
+            "use_mcts_white": bool((preferences or {}).get("use_mcts_white", (preferences or {}).get("use_mcts", False))),
+            "use_mcts_black": bool((preferences or {}).get("use_mcts_black", (preferences or {}).get("use_mcts", False))),
+            "mcts_simulations": max(1, int(sims)),
+            "mcts_simulations_white": max(1, int(sims_white)),
+            "mcts_simulations_black": max(1, int(sims_black)),
+        }
+    )
+    for key in ("game_mode", "human_color", "model_ai", "model_white", "model_black"):
+        if key in (preferences or {}):
+            payload[key] = (preferences or {}).get(key)
     with open(path, "w", encoding="utf-8", newline="\n") as file_obj:
         yaml.safe_dump(payload, file_obj, sort_keys=False, allow_unicode=False)
     return path
+
+
+def _resolve_saved_model_path(saved_value, models_dir, all_models):
+    if not saved_value:
+        return None
+    try:
+        saved_path = Path(str(saved_value))
+    except Exception:
+        return None
+
+    candidates = []
+    if saved_path.is_absolute():
+        candidates.append(saved_path)
+    else:
+        candidates.append((models_dir / saved_path).resolve())
+        candidates.append((models_dir / str(saved_value).replace("/", "\\")).resolve())
+
+    all_model_set = set(all_models)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        if resolved in all_model_set:
+            return resolved
+    return None
 
 
 def _short_model_path(path, models_dir, max_len=66):
@@ -436,46 +533,46 @@ def _draw_button(
     danger=False,
 ):
     if disabled:
-        fill = (54, 60, 69)
-        text_color = (118, 127, 141)
-        border = (68, 77, 89)
+        fill = (46, 53, 64)
+        text_color = (114, 124, 139)
+        border = (66, 76, 92)
     elif danger:
-        fill = _DANGER if active else (145, 68, 68)
+        fill = _DANGER if active else (144, 73, 73)
         text_color = _TEXT
-        border = (197, 95, 95)
+        border = (214, 121, 121)
     elif active:
         fill = _ACCENT
         text_color = (247, 250, 255)
         border = _ACCENT_BORDER
     elif hovered:
-        fill = (56, 66, 80)
+        fill = (41, 50, 64)
         text_color = _TEXT
-        border = _BORDER
+        border = (109, 128, 157)
     else:
-        fill = _PANEL_BG
+        fill = (30, 38, 50)
         text_color = _TEXT
         border = _BORDER
 
     shadow = rect.move(0, 2)
-    pygame.draw.rect(screen, (12, 16, 22), shadow, border_radius=8)
-    pygame.draw.rect(screen, fill, rect, border_radius=8)
-    pygame.draw.rect(screen, border, rect, width=2, border_radius=8)
+    pygame.draw.rect(screen, (9, 12, 18), shadow, border_radius=10)
+    pygame.draw.rect(screen, fill, rect, border_radius=10)
+    pygame.draw.rect(screen, border, rect, width=1, border_radius=10)
     label = font.render(text, True, text_color)
     screen.blit(label, label.get_rect(center=rect.center))
 
 
 def _draw_chip(screen, rect, text, font, tone="neutral"):
     if tone == "accent":
-        fill = (48, 77, 118)
-        border = (113, 167, 243)
+        fill = (42, 77, 124)
+        border = (116, 177, 255)
         text_color = (229, 241, 255)
     elif tone == "ok":
-        fill = (49, 84, 68)
-        border = (98, 158, 128)
+        fill = (43, 89, 72)
+        border = (106, 184, 147)
         text_color = (227, 246, 236)
     else:
-        fill = (43, 50, 62)
-        border = (87, 103, 128)
+        fill = (32, 39, 52)
+        border = (87, 108, 138)
         text_color = (220, 228, 241)
     pygame.draw.rect(screen, fill, rect, border_radius=12)
     pygame.draw.rect(screen, border, rect, width=1, border_radius=12)
@@ -493,18 +590,18 @@ def _draw_gear_button(screen, rect, hovered=False, active=False, disabled=False)
         border = _ACCENT_BORDER
         icon = (245, 250, 255)
     elif hovered:
-        fill = (56, 66, 80)
-        border = _BORDER
+        fill = (41, 50, 64)
+        border = (109, 128, 157)
         icon = (234, 241, 252)
     else:
-        fill = _PANEL_BG
+        fill = (30, 38, 50)
         border = _BORDER
         icon = (210, 221, 240)
 
     shadow = rect.move(0, 2)
-    pygame.draw.rect(screen, (12, 16, 22), shadow, border_radius=8)
-    pygame.draw.rect(screen, fill, rect, border_radius=8)
-    pygame.draw.rect(screen, border, rect, width=2, border_radius=8)
+    pygame.draw.rect(screen, (9, 12, 18), shadow, border_radius=10)
+    pygame.draw.rect(screen, fill, rect, border_radius=10)
+    pygame.draw.rect(screen, border, rect, width=1, border_radius=10)
 
     cx, cy = rect.center
     radius_outer = max(9, min(rect.width, rect.height) // 2 - 7)
@@ -537,26 +634,36 @@ def _draw_selection_card(
     hovered=False,
 ):
     if active:
-        fill = (53, 76, 108)
-        border = (131, 181, 248)
+        fill = (28, 49, 78)
+        border = (134, 188, 255)
         title_color = (242, 248, 255)
     elif hovered:
-        fill = (50, 59, 73)
-        border = (100, 118, 143)
+        fill = (29, 38, 50)
+        border = (102, 123, 151)
         title_color = _TEXT
     else:
-        fill = (41, 48, 60)
+        fill = (22, 29, 39)
         border = _BORDER
         title_color = _TEXT
 
-    pygame.draw.rect(screen, fill, rect, border_radius=10)
-    pygame.draw.rect(screen, border, rect, width=2, border_radius=10)
-
-    screen.blit(font_title.render(title, True, title_color), (rect.left + 14, rect.top + 10))
+    _draw_panel(screen, rect, fill=fill, border=border, radius=14, shadow=False)
+    top_band_h = max(24, font_meta.get_height() + 10)
+    top_band = pygame.Rect(rect.left + 1, rect.top + 1, rect.width - 2, top_band_h)
+    pygame.draw.rect(screen, _lerp_color(fill, border, 0.18), top_band, border_top_left_radius=14, border_top_right_radius=14)
+    chip_text = title.upper()
+    chip_pad_x = 12
+    chip_h = max(20, font_meta.get_height() + 8)
+    chip_w = min(rect.width - 28, max(96, font_meta.size(chip_text)[0] + chip_pad_x * 2))
+    label_chip = pygame.Rect(rect.left + 14, top_band.bottom + 8, chip_w, chip_h)
+    pygame.draw.rect(screen, (18, 24, 33), label_chip, border_radius=10)
+    pygame.draw.rect(screen, _lerp_color(border, (255, 255, 255), 0.15), label_chip, width=1, border_radius=10)
+    chip_label = font_meta.render(chip_text, True, (208, 222, 242))
+    screen.blit(chip_label, chip_label.get_rect(center=label_chip.center))
 
     if model_path is None:
         line1 = "No model selected"
         line2 = "Choose one from the list below"
+        line3 = "Waiting for selection"
     else:
         metadata = (metadata_cache or {}).get(model_path)
         line1, line2 = _format_model_entry(
@@ -565,8 +672,41 @@ def _draw_selection_card(
             max_len=56,
             metadata=metadata,
         )
-    screen.blit(font_text.render(line1, True, _TEXT), (rect.left + 14, rect.top + 36))
-    screen.blit(font_meta.render(line2, True, _MUTED), (rect.left + 14, rect.top + 58))
+        version = metadata.get("version") if isinstance(metadata, dict) else None
+        elo = metadata.get("elo") if isinstance(metadata, dict) else None
+        size_mb = metadata.get("size_mb") if isinstance(metadata, dict) else None
+        line3_parts = []
+        if version is not None:
+            version = str(version)
+            line3_parts.append(version if version.startswith("v") else f"v{version}")
+        if elo is not None:
+            try:
+                line3_parts.append(f"Elo {int(round(float(elo)))}")
+            except Exception:
+                pass
+        if size_mb is not None:
+            try:
+                line3_parts.append(f"{float(size_mb):.1f} MB")
+            except Exception:
+                pass
+        line3 = "  |  ".join(line3_parts) if line3_parts else "Checkpoint metadata ready"
+
+    text_left = rect.left + 14
+    text_right_pad = 14
+    text_width = max(40, rect.right - text_left - text_right_pad)
+    line1_y = label_chip.bottom + 10
+    line2_y = line1_y + font_text.get_height() + 4
+    line3_y = line2_y + font_meta.get_height() + 4
+    screen.blit(font_text.render(_fit_text(font_text, line1, text_width), True, title_color), (text_left, line1_y))
+    screen.blit(font_meta.render(_fit_text(font_meta, line2, text_width), True, _MUTED), (text_left, line2_y))
+    screen.blit(font_meta.render(_fit_text(font_meta, line3, text_width), True, (216, 228, 244)), (text_left, line3_y))
+
+
+def _selection_card_height(font_text, font_meta):
+    """Resolve selection-card height from actual typography metrics."""
+    top_band_h = max(24, font_meta.get_height() + 10)
+    chip_h = max(20, font_meta.get_height() + 8)
+    return top_band_h + 8 + chip_h + 10 + font_text.get_height() + 4 + font_meta.get_height() + 4 + font_meta.get_height() + 14
 
 
 def _fit_text(font, text, max_width):
@@ -599,13 +739,16 @@ def _draw_model_info_panel(
     font_text,
     font_meta,
 ):
-    pygame.draw.rect(screen, (34, 41, 53), rect, border_radius=10)
-    pygame.draw.rect(screen, _BORDER, rect, width=2, border_radius=10)
-    screen.blit(font_h2.render("Model Info", True, _TEXT), (rect.left + 12, rect.top + 10))
+    _draw_panel(screen, rect, fill=(24, 31, 41), border=_BORDER, radius=16, shadow=False, fill_alpha=210)
+    header_chip = pygame.Rect(rect.left + 16, rect.top + 14, 108, 22)
+    pygame.draw.rect(screen, (18, 24, 33), header_chip, border_radius=11)
+    pygame.draw.rect(screen, (83, 104, 132), header_chip, width=1, border_radius=11)
+    chip_text = font_meta.render("MODEL INFO", True, (211, 224, 243))
+    screen.blit(chip_text, chip_text.get_rect(center=header_chip.center))
 
     if model_path is None:
-        screen.blit(font_text.render("No model selected", True, _MUTED), (rect.left + 12, rect.top + 42))
-        screen.blit(font_meta.render("Click a model on the left list.", True, _MUTED), (rect.left + 12, rect.top + 64))
+        screen.blit(font_text.render("No model selected", True, _MUTED), (rect.left + 16, rect.top + 54))
+        screen.blit(font_meta.render("Click a model on the left list.", True, _MUTED), (rect.left + 16, rect.top + 80))
         return
 
     metadata = metadata_cache.get(model_path)
@@ -615,8 +758,9 @@ def _draw_model_info_panel(
 
     name = metadata.get("model_name") or model_path.name
     rel = metadata.get("path_rel") or _short_model_path(model_path, models_dir, max_len=64)
-    screen.blit(font_text.render(_fit_text(font_text, name, rect.width - 24), True, _TEXT), (rect.left + 12, rect.top + 42))
-    screen.blit(font_meta.render(_fit_text(font_meta, rel, rect.width - 24), True, _MUTED), (rect.left + 12, rect.top + 62))
+    title_y = rect.top + 48
+    screen.blit(font_text.render(_fit_text(font_text, name, rect.width - 32), True, _TEXT), (rect.left + 16, title_y))
+    screen.blit(font_meta.render(_fit_text(font_meta, rel, rect.width - 32), True, _MUTED), (rect.left + 16, title_y + 24))
 
     epoch = metadata.get("epoch")
     epoch_value = str(int(epoch) + 1) if epoch is not None else "n/a"
@@ -641,23 +785,39 @@ def _draw_model_info_panel(
         ("Modified", modified),
     ]
 
-    table_rect = pygame.Rect(rect.left + 10, rect.top + 86, rect.width - 20, rect.height - 96)
-    pygame.draw.rect(screen, (28, 34, 44), table_rect, border_radius=8)
-    pygame.draw.rect(screen, (66, 78, 96), table_rect, width=1, border_radius=8)
+    top_stats = [
+        ("Elo", elo_value),
+        ("Top1", top1_value),
+        ("Epoch", epoch_value),
+    ]
+    stat_gap = 10
+    stat_w = (rect.width - 32 - stat_gap * 2) // 3
+    stat_y = rect.top + 98
+    for idx, (label, value) in enumerate(top_stats):
+        stat_rect = pygame.Rect(rect.left + 16 + idx * (stat_w + stat_gap), stat_y, stat_w, 52)
+        pygame.draw.rect(screen, (18, 24, 33), stat_rect, border_radius=12)
+        pygame.draw.rect(screen, (70, 88, 113), stat_rect, width=1, border_radius=12)
+        screen.blit(font_meta.render(label, True, (149, 166, 191)), (stat_rect.left + 12, stat_rect.top + 10))
+        value_surface = font_h2.render(str(value), True, _TEXT)
+        screen.blit(value_surface, (stat_rect.left + 12, stat_rect.top + 24))
 
-    row_h = 20
-    y = table_rect.top + 6
-    label_w = 88
+    table_rect = pygame.Rect(rect.left + 12, rect.top + 164, rect.width - 24, rect.height - 178)
+    pygame.draw.rect(screen, (19, 24, 33), table_rect, border_radius=12)
+    pygame.draw.rect(screen, (67, 83, 108), table_rect, width=1, border_radius=12)
+
+    row_h = 26
+    y = table_rect.top + 8
+    label_w = 96
     for idx, (label, value) in enumerate(rows):
         if y + row_h > table_rect.bottom - 4:
             break
-        if idx % 2 == 1:
-            stripe = pygame.Rect(table_rect.left + 4, y - 1, table_rect.width - 8, row_h)
-            pygame.draw.rect(screen, (35, 43, 55), stripe, border_radius=4)
+        stripe = pygame.Rect(table_rect.left + 6, y - 1, table_rect.width - 12, row_h - 2)
+        stripe_fill = (24, 31, 42) if idx % 2 == 0 else (29, 37, 49)
+        pygame.draw.rect(screen, stripe_fill, stripe, border_radius=8)
         label_text = _fit_text(font_meta, label, label_w)
-        value_text = _fit_text(font_meta, value, table_rect.width - label_w - 16)
-        screen.blit(font_meta.render(label_text, True, (163, 178, 201)), (table_rect.left + 8, y + 2))
-        screen.blit(font_meta.render(value_text, True, _TEXT), (table_rect.left + 8 + label_w, y + 2))
+        value_text = _fit_text(font_meta, value, table_rect.width - label_w - 28)
+        screen.blit(font_meta.render(label_text, True, (149, 166, 191)), (table_rect.left + 16, y + 5))
+        screen.blit(font_meta.render(value_text, True, _TEXT), (table_rect.left + 18 + label_w, y + 5))
         y += row_h
 
 
@@ -679,11 +839,10 @@ def _draw_model_browser(
 ):
     actions = []
 
-    pygame.draw.rect(screen, _PANEL_BG, panel_rect, border_radius=10)
-    pygame.draw.rect(screen, _BORDER, panel_rect, width=2, border_radius=10)
+    _draw_panel(screen, panel_rect, fill=(22, 29, 39), border=_BORDER, radius=16, shadow=False, fill_alpha=200)
 
     pad = 10
-    header_h = 28
+    header_h = 30
     content_y = header_h + 8
     visible_keys = [key for key in ("best", "il", "rl", "other") if grouped[key]]
 
@@ -693,8 +852,8 @@ def _draw_model_browser(
         return actions, 0
 
     header_rect = pygame.Rect(panel_rect.left + pad, panel_rect.top + pad, panel_rect.width - 2 * pad - 10, header_h)
-    pygame.draw.rect(screen, (34, 42, 55), header_rect, border_radius=7)
-    pygame.draw.rect(screen, (90, 108, 136), header_rect, width=1, border_radius=7)
+    pygame.draw.rect(screen, (16, 21, 30), header_rect, border_radius=11)
+    pygame.draw.rect(screen, (90, 108, 136), header_rect, width=1, border_radius=10)
     metric_gap = 10
     metric_w = {"ver": 56, "top1": 84, "elo": 64}
     metrics_right = header_rect.right - 10
@@ -814,19 +973,19 @@ def _draw_model_browser(
         count = len(grouped[key])
         collapsible = key != "best"
         marker = "v" if expanded.get(key, False) else ">"
-        header_text = f"{marker} {label}" if collapsible else label
+        header_text = f"{marker}  {label}" if collapsible else label
 
-        row_h = 36
+        row_h = 38
         y = panel_rect.top + pad + content_y - scroll_offset
         rect = pygame.Rect(panel_rect.left + pad, y, panel_rect.width - 2 * pad - 10, row_h)
         if rect.bottom >= content_clip.top and rect.top <= content_clip.bottom:
             hovered = rect.collidepoint(mouse_pos)
-            fill = style["fill"] if not hovered else tuple(min(255, c + 12) for c in style["fill"])
-            pygame.draw.rect(screen, fill, rect, border_radius=8)
-            pygame.draw.rect(screen, style["border"], rect, width=2, border_radius=8)
+            fill = style["fill"] if not hovered else tuple(min(255, c + 14) for c in style["fill"])
+            pygame.draw.rect(screen, fill, rect, border_radius=10)
+            pygame.draw.rect(screen, style["border"], rect, width=1, border_radius=10)
             stripe = pygame.Rect(rect.left + 7, rect.top + 5, 7, rect.height - 10)
             pygame.draw.rect(screen, style["border"], stripe, border_radius=2)
-            screen.blit(font_header.render(header_text, True, _TEXT), (rect.left + 20, rect.top + 6))
+            screen.blit(font_header.render(header_text, True, _TEXT), (rect.left + 20, rect.top + 7))
 
             count_text = str(count)
             chip_w = max(28, font_meta.size(count_text)[0] + 16)
@@ -836,7 +995,7 @@ def _draw_model_browser(
             count_label = font_meta.render(count_text, True, (224, 236, 251))
             screen.blit(count_label, count_label.get_rect(center=count_chip.center))
         if collapsible and count > 0:
-            hit_rect = rect.clip(content_clip)
+            hit_rect = pygame.Rect(rect.left, rect.top - 2, rect.width, rect.height + 4).clip(content_clip)
             if hit_rect.width > 0 and hit_rect.height > 0:
                 actions.append((hit_rect, "toggle", key))
         content_y += row_h + 8
@@ -860,24 +1019,24 @@ def _draw_model_browser(
         if rect.bottom >= content_clip.top and rect.top <= content_clip.bottom:
             hovered = rect.collidepoint(mouse_pos)
             if active:
-                fill = (79, 132, 210)
-                border = (159, 201, 255)
+                fill = (55, 106, 184)
+                border = (170, 211, 255)
                 text_color = (248, 250, 255)
                 meta_color = (226, 236, 255)
                 accent_bar = (201, 226, 255)
             else:
-                zebra_fill = (43, 51, 63) if model_row_idx % 2 == 0 else (39, 47, 59)
-                fill = zebra_fill if not hovered else (58, 69, 84)
+                zebra_fill = (26, 34, 45) if model_row_idx % 2 == 0 else (23, 31, 42)
+                fill = zebra_fill if not hovered else (34, 45, 58)
                 border = style["border"] if hovered else _BORDER
                 text_color = _TEXT
                 meta_color = (186, 201, 222)
                 accent_bar = style["border"] if hovered else (88, 106, 130)
 
-            shadow = rect.move(0, 1)
-            pygame.draw.rect(screen, (13, 18, 24), shadow, border_radius=7)
-            pygame.draw.rect(screen, fill, rect, border_radius=7)
-            pygame.draw.rect(screen, border, rect, width=1, border_radius=7)
-            left_bar = pygame.Rect(rect.left + 5, rect.top + 6, 4, rect.height - 12)
+            shadow = rect.move(0, 2)
+            pygame.draw.rect(screen, (10, 14, 19), shadow, border_radius=12)
+            pygame.draw.rect(screen, fill, rect, border_radius=10)
+            pygame.draw.rect(screen, border, rect, width=1, border_radius=10)
+            left_bar = pygame.Rect(rect.left + 8, rect.top + 8, 4, rect.height - 16)
             pygame.draw.rect(screen, accent_bar, left_bar, border_radius=2)
 
             meta = metadata_cache.get(path) or {}
@@ -894,11 +1053,11 @@ def _draw_model_browser(
             for sx in (row_ver_left - 6, row_top1_left - 6, row_elo_left - 6):
                 pygame.draw.line(screen, sep_color, (sx, rect.top + 8), (sx, rect.bottom - 8), 1)
 
-            name_x = rect.left + 16
+            name_x = rect.left + 20
             name_max_w = max(80, row_ver_left - name_x - 12)
             raw_name = _display_name_for_category(path, key)
             name = _fit_text(font_text, raw_name, name_max_w)
-            screen.blit(font_text.render(name, True, text_color), (name_x, rect.top + 12))
+            screen.blit(font_text.render(name, True, text_color), (name_x, rect.top + 11))
 
             ver_text = font_meta.render(ver, True, meta_color)
             top1_text = font_meta.render(top1, True, meta_color)
@@ -935,14 +1094,14 @@ def _draw_model_browser(
 
     if max_scroll > 0:
         track = pygame.Rect(panel_rect.right - 12, content_clip.top, 6, content_clip.height)
-        pygame.draw.rect(screen, (52, 60, 73), track, border_radius=3)
+        pygame.draw.rect(screen, (39, 48, 62), track, border_radius=3)
         thumb_h = max(28, int(track.height * (viewport / max(content_height, 1))))
         thumb_h = min(track.height, thumb_h)
         travel = track.height - thumb_h
         ratio = 0.0 if max_scroll <= 0 else (scroll_offset / max_scroll)
         thumb_y = track.top + int(travel * max(0.0, min(1.0, ratio)))
         thumb = pygame.Rect(track.left, thumb_y, track.width, thumb_h)
-        pygame.draw.rect(screen, (128, 147, 176), thumb, border_radius=3)
+        pygame.draw.rect(screen, (138, 162, 194), thumb, border_radius=3)
 
     return actions, max_scroll
 
@@ -953,8 +1112,16 @@ def _selection_to_result(
     selected_models,
     opponent_model,
     use_mcts,
+    use_mcts_white=None,
+    use_mcts_black=None,
     mcts_simulations=None,
+    mcts_simulations_white=None,
+    mcts_simulations_black=None,
 ):
+    if use_mcts_white is None:
+        use_mcts_white = use_mcts
+    if use_mcts_black is None:
+        use_mcts_black = use_mcts
     if game_mode == "human_vs_human":
         return {
             "game_mode": game_mode,
@@ -962,7 +1129,11 @@ def _selection_to_result(
             "human_color_name": "white" if human_color == chess.WHITE else "black",
             # Keep user preference unchanged; this mode just does not use AI search.
             "use_mcts": bool(use_mcts),
+            "use_mcts_white": bool(use_mcts_white),
+            "use_mcts_black": bool(use_mcts_black),
             "mcts_simulations": int(mcts_simulations) if mcts_simulations is not None else None,
+            "mcts_simulations_white": int(mcts_simulations_white) if mcts_simulations_white is not None else None,
+            "mcts_simulations_black": int(mcts_simulations_black) if mcts_simulations_black is not None else None,
             "model1_path": None,
             "model2_path": None,
             "model_white": None,
@@ -978,7 +1149,11 @@ def _selection_to_result(
             "human_color": human_color,
             "human_color_name": "white" if human_color == chess.WHITE else "black",
             "use_mcts": bool(use_mcts),
+            "use_mcts_white": bool(use_mcts_white),
+            "use_mcts_black": bool(use_mcts_black),
             "mcts_simulations": int(mcts_simulations) if mcts_simulations is not None else None,
+            "mcts_simulations_white": int(mcts_simulations_white) if mcts_simulations_white is not None else None,
+            "mcts_simulations_black": int(mcts_simulations_black) if mcts_simulations_black is not None else None,
             "model1_path": opponent_model,
             "model2_path": None,
             "model_white": model_white,
@@ -990,7 +1165,11 @@ def _selection_to_result(
         "human_color": chess.WHITE,
         "human_color_name": "white",
         "use_mcts": bool(use_mcts),
+        "use_mcts_white": bool(use_mcts_white),
+        "use_mcts_black": bool(use_mcts_black),
         "mcts_simulations": int(mcts_simulations) if mcts_simulations is not None else None,
+        "mcts_simulations_white": int(mcts_simulations_white) if mcts_simulations_white is not None else None,
+        "mcts_simulations_black": int(mcts_simulations_black) if mcts_simulations_black is not None else None,
         "model1_path": selected_models["white"],
         "model2_path": selected_models["black"],
         "model_white": selected_models["white"],
@@ -1036,6 +1215,23 @@ def select_models(
     min_height = 660
     display_flags = pygame.RESIZABLE
 
+    def _get_display_window_size():
+        try:
+            info = pygame.display.Info()
+            screen_width = int(getattr(info, "current_w", 0) or 0)
+            screen_height = int(getattr(info, "current_h", 0) or 0)
+        except Exception:
+            screen_width = 0
+            screen_height = 0
+
+        if screen_width <= 0 or screen_height <= 0:
+            return base_width, base_height
+
+        return (
+            max(min_width, screen_width),
+            max(min_height, screen_height),
+        )
+
     start_width = base_width
     start_height = base_height
     if isinstance(initial_window_size, (list, tuple)) and len(initial_window_size) == 2:
@@ -1054,14 +1250,26 @@ def select_models(
     def _build_background(width, height):
         surf = pygame.Surface((width, height))
         denom = max(1, height - 1)
+        top_color = (15, 20, 28)
+        bottom_color = (8, 11, 17)
         for y in range(height):
             t = y / denom
-            color = (
-                int(26 + (16 - 26) * t),
-                int(31 + (20 - 31) * t),
-                int(39 + (28 - 39) * t),
-            )
+            color = _lerp_color(top_color, bottom_color, t)
             pygame.draw.line(surf, color, (0, y), (width, y))
+
+        glow = pygame.Surface((width, height), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (*_GLOW, 44), (int(width * 0.18), int(height * 0.12)), int(min(width, height) * 0.24))
+        pygame.draw.circle(glow, (40, 166, 132, 22), (int(width * 0.88), int(height * 0.18)), int(min(width, height) * 0.18))
+        surf.blit(glow, (0, 0))
+
+        grid_color = (255, 255, 255, 10)
+        grid = pygame.Surface((width, height), pygame.SRCALPHA)
+        step = 48
+        for x in range(0, width, step):
+            pygame.draw.line(grid, grid_color, (x, 0), (x, height))
+        for y in range(0, height, step):
+            pygame.draw.line(grid, grid_color, (0, y), (width, y))
+        surf.blit(grid, (0, 0))
         return surf
 
     canvas = pygame.Surface((base_width, base_height))
@@ -1110,16 +1318,9 @@ def select_models(
         nonlocal screen, maximized, restore_window_size
         if not maximized:
             restore_window_size = screen.get_size()
-            if hasattr(pygame, "WINDOWMAXIMIZED"):
-                screen = pygame.display.set_mode(
-                    restore_window_size, display_flags | pygame.WINDOWMAXIMIZED
-                )
-            else:
-                info = pygame.display.Info()
-                screen = pygame.display.set_mode(
-                    (max(min_width, info.current_w), max(min_height, info.current_h)),
-                    display_flags,
-                )
+            screen = pygame.display.set_mode(_get_display_window_size(), display_flags)
+            pygame.event.pump()
+            _maximize_native_window()
             maximized = True
         else:
             screen = pygame.display.set_mode(restore_window_size, display_flags)
@@ -1147,12 +1348,22 @@ def select_models(
     font_small = pygame.font.SysFont("Segoe UI", 17)
     font_tiny = pygame.font.SysFont("Segoe UI", 14)
 
-    game_mode = "human_vs_ai" if has_models else "human_vs_human"
-    human_color = chess.WHITE
     saved_preferences = load_play_preferences(base_dir, config)
+    saved_game_mode = str(saved_preferences.get("game_mode") or "").strip().lower()
+    if saved_game_mode not in ("human_vs_ai", "ai_vs_ai", "human_vs_human"):
+        saved_game_mode = "human_vs_ai" if has_models else "human_vs_human"
+    if not has_models and saved_game_mode != "human_vs_human":
+        saved_game_mode = "human_vs_human"
+    game_mode = saved_game_mode
+
+    saved_human_color = str(saved_preferences.get("human_color") or "").strip().lower()
+    human_color = chess.BLACK if saved_human_color == "black" else chess.WHITE
+
     use_mcts = bool(default_use_mcts and has_models)
     if default_use_mcts and isinstance(saved_preferences.get("use_mcts"), bool):
         use_mcts = bool(saved_preferences.get("use_mcts", False) and has_models)
+    use_mcts_white = bool(saved_preferences.get("use_mcts_white", use_mcts) and has_models)
+    use_mcts_black = bool(saved_preferences.get("use_mcts_black", use_mcts) and has_models)
     workspace_tab = "models"
     mcts_simulations = _safe_int(
         (config or {}).get("reinforcement_learning", {}).get("mcts_simulations"),
@@ -1164,6 +1375,10 @@ def select_models(
     if mcts_simulations is None:
         mcts_simulations = 100
     mcts_simulations = max(16, min(2000, int(mcts_simulations)))
+    mcts_simulations_white = _safe_int(saved_preferences.get("mcts_simulations_white"), default=mcts_simulations)
+    mcts_simulations_black = _safe_int(saved_preferences.get("mcts_simulations_black"), default=mcts_simulations)
+    mcts_simulations_white = max(16, min(2000, int(mcts_simulations_white)))
+    mcts_simulations_black = max(16, min(2000, int(mcts_simulations_black)))
     mcts_step = 16
     mcts_profiles = [
         ("Fast", 64),
@@ -1174,10 +1389,15 @@ def select_models(
 
     default_model = _default_model(grouped)
     selected_models = {
-        "white": default_model,
-        "black": default_model,
+        "white": _resolve_saved_model_path(saved_preferences.get("model_white"), models_dir, all_models) or default_model,
+        "black": _resolve_saved_model_path(saved_preferences.get("model_black"), models_dir, all_models) or default_model,
     }
-    opponent_model = default_model
+    opponent_model = (
+        _resolve_saved_model_path(saved_preferences.get("model_ai"), models_dir, all_models)
+        or _resolve_saved_model_path(saved_preferences.get("model_black"), models_dir, all_models)
+        or _resolve_saved_model_path(saved_preferences.get("model_white"), models_dir, all_models)
+        or default_model
+    )
 
     expanded = {
         "white": {"il": False, "rl": False, "other": False},
@@ -1195,14 +1415,27 @@ def select_models(
 
     last_saved_preferences = {
         "use_mcts": bool(use_mcts),
+        "use_mcts_white": bool(use_mcts_white),
+        "use_mcts_black": bool(use_mcts_black),
         "mcts_simulations": int(mcts_simulations),
+        "mcts_simulations_white": int(mcts_simulations_white),
+        "mcts_simulations_black": int(mcts_simulations_black),
     }
 
     def persist_ui_preferences(force=False):
         nonlocal last_saved_preferences
         current = {
+            "game_mode": game_mode,
+            "human_color": "white" if human_color == chess.WHITE else "black",
             "use_mcts": bool(use_mcts),
+            "use_mcts_white": bool(use_mcts_white),
+            "use_mcts_black": bool(use_mcts_black),
             "mcts_simulations": int(max(1, mcts_simulations)),
+            "mcts_simulations_white": int(max(1, mcts_simulations_white)),
+            "mcts_simulations_black": int(max(1, mcts_simulations_black)),
+            "model_ai": str(opponent_model) if opponent_model else None,
+            "model_white": str(selected_models["white"]) if selected_models["white"] else None,
+            "model_black": str(selected_models["black"]) if selected_models["black"] else None,
         }
         if not force and current == last_saved_preferences:
             return
@@ -1227,36 +1460,39 @@ def select_models(
         mouse_pos = mapped_mouse if mapped_mouse is not None else (-9999, -9999)
         canvas.blit(background, (0, 0))
 
-        hero_rect = pygame.Rect(24, 12, base_width - 48, 96)
-        pygame.draw.rect(canvas, (30, 37, 48), hero_rect, border_radius=14)
-        pygame.draw.rect(canvas, (81, 103, 132), hero_rect, width=2, border_radius=14)
+        hero_rect = pygame.Rect(24, 16, base_width - 48, 118)
+        _draw_panel(canvas, hero_rect, fill=(22, 29, 39), border=(84, 103, 131), radius=22, shadow=True)
+        hero_band = pygame.Rect(hero_rect.left, hero_rect.top, hero_rect.width, 10)
+        pygame.draw.rect(canvas, _ACCENT, hero_band, border_top_left_radius=22, border_top_right_radius=22)
         title = font_title.render("Chess AI Setup", True, _TEXT)
-        subtitle = font_small.render("Pick mode, assign models, and start match", True, _MUTED)
+        subtitle = font_small.render("Launch a polished match: choose mode, tune settings, assign models.", True, _MUTED)
         hint = font_meta.render(
-            "Resize freely | F11 maximize/restore | Enter start | Esc cancel | Gear: settings",
+            "Enter start  |  Esc cancel  |  F11 maximize/restore",
             True,
             _MUTED,
         )
-        canvas.blit(title, (38, 20))
-        canvas.blit(subtitle, (40, 78))
-        canvas.blit(hint, (base_width - 650, 78))
-        settings_icon_rect = pygame.Rect(base_width - 62, 20, 38, 38)
-        _draw_gear_button(
+        canvas.blit(title, (42, 28))
+        canvas.blit(subtitle, (44, 82))
+        canvas.blit(hint, (44, 106))
+        settings_icon_rect = pygame.Rect(base_width - 176, 30, 136, 38)
+        _draw_button(
             canvas,
             settings_icon_rect,
+            "Settings",
+            font_meta,
             hovered=settings_icon_rect.collidepoint(mouse_pos),
             active=workspace_tab == "settings",
         )
 
         mode_label = font_small.render("Mode", True, _MUTED)
-        canvas.blit(mode_label, (36, 120))
+        canvas.blit(mode_label, (40, 156))
 
         mode_gap = 14
-        mode_btn_w = 250
+        mode_btn_w = 232
         mode_rects = {
-            "human_vs_ai": pygame.Rect(36, 142, mode_btn_w, 48),
-            "ai_vs_ai": pygame.Rect(36 + mode_btn_w + mode_gap, 142, mode_btn_w, 48),
-            "human_vs_human": pygame.Rect(36 + (mode_btn_w + mode_gap) * 2, 142, mode_btn_w, 48),
+            "human_vs_ai": pygame.Rect(40, 182, mode_btn_w, 52),
+            "ai_vs_ai": pygame.Rect(40 + mode_btn_w + mode_gap, 182, mode_btn_w, 52),
+            "human_vs_human": pygame.Rect(40 + (mode_btn_w + mode_gap) * 2, 182, mode_btn_w, 52),
         }
         _draw_button(
             canvas,
@@ -1284,16 +1520,29 @@ def select_models(
             hovered=mode_rects["human_vs_human"].collidepoint(mouse_pos),
             active=game_mode == "human_vs_human",
         )
+        if game_mode == "ai_vs_ai":
+            if use_mcts_white and use_mcts_black:
+                ready_label = "Both sides: MCTS"
+                ready_tone = "ok"
+            elif (not use_mcts_white) and (not use_mcts_black):
+                ready_label = "Both sides: Network-only"
+                ready_tone = "neutral"
+            else:
+                ready_label = "Mixed search ready"
+                ready_tone = "neutral"
+        else:
+            ready_label = "MCTS ready" if use_mcts else "Network-only ready"
+            ready_tone = "ok" if use_mcts else "neutral"
         _draw_chip(
             canvas,
-            pygame.Rect(base_width - 236, 146, 212, 28),
-            "MCTS ready" if use_mcts else "Network-only ready",
+            pygame.Rect(base_width - 248, 194, 208, 28),
+            ready_label,
             font_meta,
-            tone="ok" if use_mcts else "neutral",
+            tone=ready_tone,
         )
 
-        color_white_rect = pygame.Rect(36, 232, 160, 42)
-        color_black_rect = pygame.Rect(206, 232, 160, 42)
+        color_white_rect = pygame.Rect(40, 274, 172, 44)
+        color_black_rect = pygame.Rect(222, 274, 172, 44)
         white_card_rect = None
         black_card_rect = None
         copy_white_rect = None
@@ -1304,15 +1553,21 @@ def select_models(
         mcts_minus_rect = None
         mcts_plus_rect = None
         mcts_profile_buttons = []
-        content_top = 322
-        content_bottom = base_height - 74
+        mcts_white_toggle_rect = None
+        mcts_black_toggle_rect = None
+        mcts_white_minus_rect = None
+        mcts_white_plus_rect = None
+        mcts_black_minus_rect = None
+        mcts_black_plus_rect = None
+        content_top = 356
+        content_bottom = base_height - 92
         content_height = max(180, content_bottom - content_top)
         browser_key = None
         browser_actions = []
         browser_max_scroll = 0
 
         if game_mode == "human_vs_ai":
-            canvas.blit(font_h2.render("Human color", True, _TEXT), (36, 202))
+            canvas.blit(font_h2.render("Human color", True, _TEXT), (40, 246))
             _draw_button(
                 canvas,
                 color_white_rect,
@@ -1330,26 +1585,27 @@ def select_models(
                 active=human_color == chess.BLACK,
             )
 
-        workspace_label_y = 206 if game_mode != "human_vs_ai" else 286
-        tabs_y = workspace_label_y + 24
+        workspace_label_y = 258 if game_mode != "human_vs_ai" else 340
+        tabs_y = workspace_label_y + 18
         if workspace_tab == "settings":
             canvas.blit(
-                font_meta.render("Settings mode (click gear to return)", True, _MUTED),
-                (36, tabs_y + 10),
+                font_meta.render("Settings workspace active. Click the gear again to return to model selection.", True, _MUTED),
+                (40, tabs_y + 10),
             )
-        content_top = tabs_y + 50
-        content_bottom = base_height - 74
+        content_top = tabs_y + 46
+        content_bottom = base_height - 92
         content_height = max(180, content_bottom - content_top)
+        workspace_rect = pygame.Rect(24, content_top - 18, base_width - 48, content_height + 28)
+        _draw_panel(canvas, workspace_rect, fill=(19, 26, 35), border=(61, 76, 98), radius=22, shadow=True, fill_alpha=176)
 
         if workspace_tab == "settings":
-            settings_panel_rect = pygame.Rect(36, content_top, base_width - 72, content_height)
-            pygame.draw.rect(canvas, (31, 38, 49), settings_panel_rect, border_radius=12)
-            pygame.draw.rect(canvas, (84, 105, 133), settings_panel_rect, width=2, border_radius=12)
+            settings_panel_rect = pygame.Rect(40, content_top, base_width - 80, content_height - 10)
+            _draw_panel(canvas, settings_panel_rect, fill=(24, 31, 42), border=(78, 100, 128), radius=18, shadow=False, fill_alpha=208)
 
-            canvas.blit(font_h2.render("Search & Runtime Settings", True, _TEXT), (settings_panel_rect.left + 22, settings_panel_rect.top + 18))
+            canvas.blit(font_h2.render("Search & Runtime Settings", True, _TEXT), (settings_panel_rect.left + 24, settings_panel_rect.top + 20))
             canvas.blit(
-                font_small.render("Configure MCTS once here instead of toggling it in the model view.", True, _MUTED),
-                (settings_panel_rect.left + 22, settings_panel_rect.top + 50),
+                font_small.render("Dial in the engine once here and keep the rest of the setup clean.", True, _MUTED),
+                (settings_panel_rect.left + 24, settings_panel_rect.top + 52),
             )
 
             mcts_toggle_rect = pygame.Rect(settings_panel_rect.left + 24, settings_panel_rect.top + 86, 230, 46)
@@ -1365,43 +1621,100 @@ def select_models(
 
             if game_mode == "human_vs_human":
                 canvas.blit(
-                    font_meta.render("MCTS is disabled in Human vs Human mode.", True, (210, 165, 122)),
+                    font_meta.render("MCTS is disabled in Human vs Human mode.", True, (221, 181, 128)),
                     (mcts_toggle_rect.right + 16, mcts_toggle_rect.top + 14),
                 )
 
             sims_title_y = settings_panel_rect.top + 150
-            canvas.blit(font_small.render("MCTS simulations per move", True, _TEXT), (settings_panel_rect.left + 24, sims_title_y))
-            profile_text = "Speed profile: Fast" if mcts_simulations <= 80 else (
-                "Speed profile: Balanced" if mcts_simulations <= 140 else (
-                    "Speed profile: Strong" if mcts_simulations <= 300 else "Speed profile: Ultra"
+            if game_mode == "ai_vs_ai":
+                canvas.blit(font_small.render("MCTS simulations per side", True, _TEXT), (settings_panel_rect.left + 24, sims_title_y))
+                canvas.blit(font_meta.render("White and Black can use different search modes and budgets.", True, _MUTED), (settings_panel_rect.left + 24, sims_title_y + 24))
+
+                controls_y = settings_panel_rect.top + 198
+                card_gap = 18
+                card_w = (settings_panel_rect.width - 48 - card_gap) // 2
+                white_card = pygame.Rect(settings_panel_rect.left + 24, controls_y, card_w, 146)
+                black_card = pygame.Rect(white_card.right + card_gap, controls_y, card_w, 146)
+                for card_rect, label_text, sims_value, side_uses_mcts, is_white in (
+                    (white_card, "White search", mcts_simulations_white, use_mcts_white, True),
+                    (black_card, "Black search", mcts_simulations_black, use_mcts_black, False),
+                ):
+                    pygame.draw.rect(canvas, (18, 24, 33), card_rect, border_radius=12)
+                    pygame.draw.rect(canvas, (70, 84, 104), card_rect, width=1, border_radius=12)
+                    canvas.blit(font_small.render(label_text, True, _TEXT), (card_rect.left + 14, card_rect.top + 12))
+                    toggle_rect = pygame.Rect(card_rect.left + 14, card_rect.top + 42, card_rect.width - 28, 34)
+                    _draw_button(
+                        canvas,
+                        toggle_rect,
+                        f"MCTS: {'ON' if side_uses_mcts else 'OFF'}",
+                        font_meta,
+                        hovered=toggle_rect.collidepoint(mouse_pos),
+                        active=side_uses_mcts,
+                    )
+                    controls_row_y = card_rect.top + 90
+                    minus_rect = pygame.Rect(card_rect.left + 14, controls_row_y, 40, 38)
+                    value_rect = pygame.Rect(card_rect.left + 62, controls_row_y, card_rect.width - 124, 38)
+                    plus_rect = pygame.Rect(card_rect.right - 54, controls_row_y, 40, 38)
+                    _draw_button(
+                        canvas,
+                        minus_rect,
+                        "-",
+                        font_h2,
+                        hovered=minus_rect.collidepoint(mouse_pos),
+                    )
+                    pygame.draw.rect(canvas, (19, 25, 35), value_rect, border_radius=10)
+                    pygame.draw.rect(canvas, (94, 112, 140), value_rect, width=1, border_radius=10)
+                    value_label = font_h2.render(str(sims_value), True, _TEXT)
+                    canvas.blit(value_label, value_label.get_rect(center=value_rect.center))
+                    _draw_button(
+                        canvas,
+                        plus_rect,
+                        "+",
+                        font_h2,
+                        hovered=plus_rect.collidepoint(mouse_pos),
+                    )
+                    if is_white:
+                        mcts_white_toggle_rect = toggle_rect
+                        mcts_white_minus_rect = minus_rect
+                        mcts_white_plus_rect = plus_rect
+                    else:
+                        mcts_black_toggle_rect = toggle_rect
+                        mcts_black_minus_rect = minus_rect
+                        mcts_black_plus_rect = plus_rect
+                preset_y = controls_y + 160
+            else:
+                canvas.blit(font_small.render("MCTS simulations per move", True, _TEXT), (settings_panel_rect.left + 24, sims_title_y))
+                profile_text = "Speed profile: Fast" if mcts_simulations <= 80 else (
+                    "Speed profile: Balanced" if mcts_simulations <= 140 else (
+                        "Speed profile: Strong" if mcts_simulations <= 300 else "Speed profile: Ultra"
+                    )
                 )
-            )
-            canvas.blit(font_meta.render(profile_text, True, _MUTED), (settings_panel_rect.left + 24, sims_title_y + 24))
+                canvas.blit(font_meta.render(profile_text, True, _MUTED), (settings_panel_rect.left + 24, sims_title_y + 24))
 
-            controls_y = settings_panel_rect.top + 198
-            mcts_minus_rect = pygame.Rect(settings_panel_rect.left + 24, controls_y, 44, 42)
-            value_rect = pygame.Rect(settings_panel_rect.left + 76, controls_y, 168, 42)
-            mcts_plus_rect = pygame.Rect(settings_panel_rect.left + 252, controls_y, 44, 42)
-            _draw_button(
-                canvas,
-                mcts_minus_rect,
-                "-",
-                font_h2,
-                hovered=mcts_minus_rect.collidepoint(mouse_pos),
-            )
-            pygame.draw.rect(canvas, (26, 32, 43), value_rect, border_radius=8)
-            pygame.draw.rect(canvas, (94, 112, 140), value_rect, width=1, border_radius=8)
-            value_label = font_h2.render(str(mcts_simulations), True, _TEXT)
-            canvas.blit(value_label, value_label.get_rect(center=value_rect.center))
-            _draw_button(
-                canvas,
-                mcts_plus_rect,
-                "+",
-                font_h2,
-                hovered=mcts_plus_rect.collidepoint(mouse_pos),
-            )
+                controls_y = settings_panel_rect.top + 198
+                mcts_minus_rect = pygame.Rect(settings_panel_rect.left + 24, controls_y, 44, 42)
+                value_rect = pygame.Rect(settings_panel_rect.left + 76, controls_y, 168, 42)
+                mcts_plus_rect = pygame.Rect(settings_panel_rect.left + 252, controls_y, 44, 42)
+                _draw_button(
+                    canvas,
+                    mcts_minus_rect,
+                    "-",
+                    font_h2,
+                    hovered=mcts_minus_rect.collidepoint(mouse_pos),
+                )
+                pygame.draw.rect(canvas, (19, 25, 35), value_rect, border_radius=10)
+                pygame.draw.rect(canvas, (94, 112, 140), value_rect, width=1, border_radius=10)
+                value_label = font_h2.render(str(mcts_simulations), True, _TEXT)
+                canvas.blit(value_label, value_label.get_rect(center=value_rect.center))
+                _draw_button(
+                    canvas,
+                    mcts_plus_rect,
+                    "+",
+                    font_h2,
+                    hovered=mcts_plus_rect.collidepoint(mouse_pos),
+                )
+                preset_y = controls_y + 62
 
-            preset_y = controls_y + 62
             preset_gap = 12
             preset_width = (settings_panel_rect.width - 48 - preset_gap * (len(mcts_profiles) - 1)) // len(mcts_profiles)
             for idx, (label, value) in enumerate(mcts_profiles):
@@ -1417,7 +1730,11 @@ def select_models(
                     f"{label} ({value})",
                     font_meta,
                     hovered=rect.collidepoint(mouse_pos),
-                    active=mcts_simulations == value,
+                    active=(
+                        mcts_simulations == value
+                        if game_mode != "ai_vs_ai"
+                        else mcts_simulations_white == value and mcts_simulations_black == value
+                    ),
                 )
                 mcts_profile_buttons.append((rect, value))
 
@@ -1427,19 +1744,20 @@ def select_models(
                 "- Strong/Ultra give better move quality but each move is slower.",
             ]
             info_box = pygame.Rect(settings_panel_rect.left + 24, preset_y + 56, settings_panel_rect.width - 48, 92)
-            pygame.draw.rect(canvas, (25, 30, 40), info_box, border_radius=8)
-            pygame.draw.rect(canvas, (70, 84, 104), info_box, width=1, border_radius=8)
+            pygame.draw.rect(canvas, (18, 24, 33), info_box, border_radius=12)
+            pygame.draw.rect(canvas, (70, 84, 104), info_box, width=1, border_radius=12)
             y_row = info_box.top + 12
             for row in help_rows:
                 canvas.blit(font_meta.render(row, True, _MUTED), (info_box.left + 12, y_row))
                 y_row += 24
         elif game_mode != "human_vs_human":
             if game_mode == "ai_vs_ai":
-                canvas.blit(font_h2.render("Model Assignment", True, _TEXT), (36, content_top - 34))
+                canvas.blit(font_h2.render("Model Assignment", True, _TEXT), (40, content_top - 34))
                 cards_gap = 14
-                card_w = (base_width - 72 - cards_gap) // 2
-                white_card_rect = pygame.Rect(36, content_top, card_w, 88)
-                black_card_rect = pygame.Rect(36 + card_w + cards_gap, content_top, card_w, 88)
+                card_h = _selection_card_height(font_small, font_tiny)
+                card_w = (base_width - 80 - cards_gap) // 2
+                white_card_rect = pygame.Rect(40, content_top, card_w, card_h)
+                black_card_rect = pygame.Rect(40 + card_w + cards_gap, content_top, card_w, card_h)
                 _draw_selection_card(
                     canvas,
                     white_card_rect,
@@ -1468,10 +1786,11 @@ def select_models(
                 )
 
                 active_text = "Now choosing for: WHITE" if active_side == "white" else "Now choosing for: BLACK"
-                canvas.blit(font_small.render(active_text, True, (173, 212, 255)), (36, content_top + 98))
+                active_text_y = white_card_rect.bottom + 12
+                canvas.blit(font_small.render(active_text, True, (184, 220, 255)), (40, active_text_y))
 
-                btn_y = content_top + 96
-                copy_black_rect = pygame.Rect(base_width - 202, btn_y, 166, 34)
+                btn_y = white_card_rect.bottom + 8
+                copy_black_rect = pygame.Rect(base_width - 214, btn_y, 174, 36)
                 copy_white_rect = pygame.Rect(copy_black_rect.left - 172, btn_y, 166, 34)
                 swap_rect = pygame.Rect(copy_white_rect.left - 146, btn_y, 136, 34)
                 _draw_button(
@@ -1499,17 +1818,17 @@ def select_models(
                 )
 
                 browser_key = active_side
-                browser_top = content_top + 136
+                browser_top = white_card_rect.bottom + 54
                 browser_h = max(180, content_bottom - browser_top)
-                browser_w = int((base_width - 72) * 0.68)
-                info_w = base_width - 72 - browser_w - 12
-                browser_rect = pygame.Rect(36, browser_top, browser_w, browser_h)
+                browser_w = int((base_width - 80) * 0.67)
+                info_w = base_width - 80 - browser_w - 16
+                browser_rect = pygame.Rect(40, browser_top, browser_w, browser_h)
                 info_rect = pygame.Rect(browser_rect.right + 12, browser_top, info_w, browser_h)
             else:
                 ai_side_name = "Black" if human_color == chess.WHITE else "White"
                 header = f"Opponent model ({ai_side_name} AI side)"
-                canvas.blit(font_h2.render(header, True, _TEXT), (36, content_top - 34))
-                opponent_card_rect = pygame.Rect(36, content_top, base_width - 72, 86)
+                canvas.blit(font_h2.render(header, True, _TEXT), (40, content_top - 34))
+                opponent_card_rect = pygame.Rect(40, content_top, base_width - 80, _selection_card_height(font_small, font_tiny))
                 _draw_selection_card(
                     canvas,
                     opponent_card_rect,
@@ -1524,11 +1843,11 @@ def select_models(
                     hovered=opponent_card_rect.collidepoint(mouse_pos),
                 )
                 browser_key = "opponent"
-                browser_top = content_top + 102
+                browser_top = opponent_card_rect.bottom + 20
                 browser_h = max(180, content_bottom - browser_top)
-                browser_w = int((base_width - 72) * 0.68)
-                info_w = base_width - 72 - browser_w - 12
-                browser_rect = pygame.Rect(36, browser_top, browser_w, browser_h)
+                browser_w = int((base_width - 80) * 0.67)
+                info_w = base_width - 80 - browser_w - 16
+                browser_rect = pygame.Rect(40, browser_top, browser_w, browser_h)
                 info_rect = pygame.Rect(browser_rect.right + 12, browser_top, info_w, browser_h)
 
             selected_model = selected_models[active_side] if browser_key != "opponent" else opponent_model
@@ -1562,27 +1881,32 @@ def select_models(
             if scroll[browser_key] > browser_max_scroll:
                 scroll[browser_key] = browser_max_scroll
         else:
-            info_box = pygame.Rect(36, content_top, base_width - 72, 132)
-            pygame.draw.rect(canvas, _PANEL_BG, info_box, border_radius=12)
-            pygame.draw.rect(canvas, _BORDER, info_box, width=2, border_radius=12)
-            canvas.blit(font_h2.render("Human vs Human", True, _TEXT), (54, info_box.top + 22))
+            info_box = pygame.Rect(40, content_top, base_width - 80, 142)
+            _draw_panel(canvas, info_box, fill=(24, 31, 42), border=_BORDER, radius=18, shadow=False, fill_alpha=204)
+            canvas.blit(font_h2.render("Human vs Human", True, _TEXT), (60, info_box.top + 24))
             canvas.blit(
                 font_small.render("No model selection required. Press Start to open the board.", True, _MUTED),
-                (56, info_box.top + 60),
+                (60, info_box.top + 68),
             )
             canvas.blit(
-                font_meta.render("Open Settings tab if you want to preconfigure MCTS before switching game mode.", True, _MUTED),
-                (56, info_box.top + 88),
+                font_meta.render("Open Settings if you want to preconfigure MCTS before switching back to AI modes.", True, _MUTED),
+                (60, info_box.top + 98),
             )
 
         if not has_models:
             warn = "No model files found. Only Human vs Human is available."
-            canvas.blit(font_small.render(warn, True, (224, 176, 108)), (36, base_height - 114))
+            canvas.blit(font_small.render(warn, True, (224, 176, 108)), (40, base_height - 126))
 
         can_start = _can_start(game_mode, has_models, selected_models, opponent_model)
 
-        start_rect = pygame.Rect(base_width - 336, base_height - 64, 150, 42)
-        cancel_rect = pygame.Rect(base_width - 172, base_height - 64, 136, 42)
+        footer_rect = pygame.Rect(24, base_height - 78, base_width - 48, 54)
+        _draw_panel(canvas, footer_rect, fill=(17, 23, 31), border=(56, 72, 93), radius=18, shadow=False, fill_alpha=210)
+        footer_hint = "Selected setup is ready to launch." if can_start else "Complete the required selections to start."
+        footer_color = (184, 220, 255) if can_start else _MUTED
+        canvas.blit(font_meta.render(footer_hint, True, footer_color), (40, footer_rect.top + 18))
+
+        start_rect = pygame.Rect(base_width - 342, base_height - 70, 156, 40)
+        cancel_rect = pygame.Rect(base_width - 176, base_height - 70, 136, 40)
         _draw_button(
             canvas,
             start_rect,
@@ -1634,7 +1958,11 @@ def select_models(
                             selected_models,
                             opponent_model,
                             use_mcts,
+                            use_mcts_white,
+                            use_mcts_black,
                             mcts_simulations,
+                            mcts_simulations_white,
+                            mcts_simulations_black,
                         )
                     )
 
@@ -1664,7 +1992,11 @@ def select_models(
                             selected_models,
                             opponent_model,
                             use_mcts,
+                            use_mcts_white,
+                            use_mcts_black,
                             mcts_simulations,
+                            mcts_simulations_white,
+                            mcts_simulations_black,
                         )
                     )
 
@@ -1688,6 +2020,17 @@ def select_models(
                 if workspace_tab == "settings":
                     if mcts_toggle_rect and mcts_toggle_rect.collidepoint(ui_pos) and game_mode != "human_vs_human":
                         use_mcts = not use_mcts
+                        if game_mode == "ai_vs_ai":
+                            use_mcts_white = bool(use_mcts)
+                            use_mcts_black = bool(use_mcts)
+                        persist_ui_preferences()
+                        continue
+                    if mcts_white_toggle_rect and mcts_white_toggle_rect.collidepoint(ui_pos):
+                        use_mcts_white = not use_mcts_white
+                        persist_ui_preferences()
+                        continue
+                    if mcts_black_toggle_rect and mcts_black_toggle_rect.collidepoint(ui_pos):
+                        use_mcts_black = not use_mcts_black
                         persist_ui_preferences()
                         continue
                     if mcts_minus_rect and mcts_minus_rect.collidepoint(ui_pos):
@@ -1698,9 +2041,29 @@ def select_models(
                         mcts_simulations = min(2000, mcts_simulations + mcts_step)
                         persist_ui_preferences()
                         continue
+                    if mcts_white_minus_rect and mcts_white_minus_rect.collidepoint(ui_pos):
+                        mcts_simulations_white = max(16, mcts_simulations_white - mcts_step)
+                        persist_ui_preferences()
+                        continue
+                    if mcts_white_plus_rect and mcts_white_plus_rect.collidepoint(ui_pos):
+                        mcts_simulations_white = min(2000, mcts_simulations_white + mcts_step)
+                        persist_ui_preferences()
+                        continue
+                    if mcts_black_minus_rect and mcts_black_minus_rect.collidepoint(ui_pos):
+                        mcts_simulations_black = max(16, mcts_simulations_black - mcts_step)
+                        persist_ui_preferences()
+                        continue
+                    if mcts_black_plus_rect and mcts_black_plus_rect.collidepoint(ui_pos):
+                        mcts_simulations_black = min(2000, mcts_simulations_black + mcts_step)
+                        persist_ui_preferences()
+                        continue
                     for rect, value in mcts_profile_buttons:
                         if rect.collidepoint(ui_pos):
-                            mcts_simulations = int(value)
+                            if game_mode == "ai_vs_ai":
+                                mcts_simulations_white = int(value)
+                                mcts_simulations_black = int(value)
+                            else:
+                                mcts_simulations = int(value)
                             persist_ui_preferences()
                             break
                     continue

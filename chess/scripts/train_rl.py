@@ -151,45 +151,191 @@ def _weighted_choice_index(weights):
     return int(np.random.choice(len(weights), p=probs))
 
 
+def _safe_score_rate(wins, draws, losses):
+    total = int(wins) + int(draws) + int(losses)
+    if total <= 0:
+        return None
+    return float((float(wins) + 0.5 * float(draws)) / float(total))
+
+
+def _canonicalize_opponent_bucket(label):
+    normalized = str(label or "current").strip().lower()
+    if normalized.startswith("recent"):
+        return "recent"
+    if normalized == "best":
+        return "best"
+    return "current"
+
+
+def _build_selfplay_opponent_candidates(
+    rl_cfg,
+    best_model_state=None,
+    recent_snapshot_pool=None,
+):
+    current_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_current_fraction', 0.4)))
+    best_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_best_fraction', 0.3)))
+    recent_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_recent_fraction', 0.3)))
+    recent_snapshot_pool = list(recent_snapshot_pool or [])
+
+    candidates = []
+    if current_fraction > 0.0:
+        candidates.append({
+            "label": "current",
+            "weight": float(current_fraction),
+            "payload": None,
+        })
+    if best_model_state is not None and best_fraction > 0.0:
+        candidates.append({
+            "label": "best",
+            "weight": float(best_fraction),
+            "payload": {
+                "label": "best",
+                "state": best_model_state,
+            },
+        })
+    if recent_snapshot_pool and recent_fraction > 0.0:
+        recent_count = max(1, len(recent_snapshot_pool))
+        recent_entries = []
+        for idx, recent_entry in enumerate(recent_snapshot_pool):
+            recency_bias = float(idx + 1) / float(recent_count)
+            recent_entries.append({
+                "label": str(recent_entry.get("label", f"recent_{idx}")),
+                "state": recent_entry.get("state"),
+                "weight": float(0.75 + 0.25 * recency_bias),
+            })
+        candidates.append({
+            "label": "recent",
+            "weight": float(recent_fraction),
+            "payload": {
+                "entries": recent_entries,
+            },
+        })
+    return candidates
+
+
+def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None):
+    scheduler_state = dict(scheduler_state or {})
+    adaptive_enabled = bool(rl_cfg.get('self_play_opponent_adaptive_enabled', False))
+    base_weights = {
+        str(candidate["label"]): max(0.0, float(candidate.get("weight", 0.0)))
+        for candidate in candidates
+    }
+    if not adaptive_enabled or not candidates:
+        return base_weights, {}
+
+    score_history = scheduler_state.get("score_history", {}) or {}
+    target_score = float(rl_cfg.get('self_play_opponent_adaptive_target_score', 0.50))
+    band = max(0.05, float(rl_cfg.get('self_play_opponent_adaptive_band', 0.15)))
+    min_factor = max(0.20, float(rl_cfg.get('self_play_opponent_adaptive_min_factor', 0.60)))
+    max_factor = max(min_factor, float(rl_cfg.get('self_play_opponent_adaptive_max_factor', 1.40)))
+    current_min_fraction = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_current_min_fraction', 0.50))))
+
+    adjusted = {}
+    debug_factors = {}
+    for candidate in candidates:
+        label = str(candidate["label"])
+        base_weight = base_weights.get(label, 0.0)
+        factor = 1.0
+        history_values = score_history.get(label, []) or []
+        if label != "current" and history_values:
+            avg_score = float(sum(history_values) / len(history_values))
+            distance = min(1.0, abs(avg_score - target_score) / band)
+            closeness = max(0.0, 1.0 - distance)
+            factor = min_factor + (max_factor - min_factor) * closeness
+        adjusted[label] = base_weight * factor
+        debug_factors[label] = float(factor)
+
+    current_label = "current"
+    if current_label in adjusted:
+        adjusted[current_label] = max(float(adjusted[current_label]), float(current_min_fraction))
+
+    total_weight = float(sum(adjusted.values()))
+    if total_weight <= 0.0:
+        return base_weights, debug_factors
+    normalized = {label: (weight / total_weight) for label, weight in adjusted.items()}
+    return normalized, debug_factors
+
+
+def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_results, iteration_num):
+    state = dict(scheduler_state or {})
+    if not bool(rl_cfg.get('self_play_opponent_adaptive_enabled', False)):
+        return state, {}
+
+    update_every = max(1, int(rl_cfg.get('self_play_opponent_adaptive_update_every', 2)))
+    min_games = max(1, int(rl_cfg.get('self_play_opponent_adaptive_min_games', 8)))
+    history_size = max(1, int(rl_cfg.get('self_play_opponent_adaptive_history_size', 4)))
+    score_history = state.get("score_history")
+    if not isinstance(score_history, dict):
+        score_history = {}
+
+    observed_scores = {}
+    bucket_stats = {}
+    for label, stats in dict(opponent_results or {}).items():
+        bucket = _canonicalize_opponent_bucket(label)
+        bucket_entry = bucket_stats.setdefault(
+            bucket,
+            {"wins": 0, "draws": 0, "losses": 0, "games": 0},
+        )
+        bucket_entry["wins"] += int((stats or {}).get("wins", 0))
+        bucket_entry["draws"] += int((stats or {}).get("draws", 0))
+        bucket_entry["losses"] += int((stats or {}).get("losses", 0))
+        bucket_entry["games"] += int((stats or {}).get("games", 0))
+
+    for label, stats in bucket_stats.items():
+        games = int((stats or {}).get("games", 0))
+        if games < min_games:
+            continue
+        score_rate = _safe_score_rate(
+            (stats or {}).get("wins", 0),
+            (stats or {}).get("draws", 0),
+            (stats or {}).get("losses", 0),
+        )
+        if score_rate is None:
+            continue
+        observed_scores[str(label)] = float(score_rate)
+    if (int(iteration_num) % update_every) != 0:
+        return state, observed_scores
+
+    for label, score_rate in observed_scores.items():
+        history = deque(score_history.get(str(label), []), maxlen=history_size)
+        history.append(float(score_rate))
+        score_history[str(label)] = list(history)
+
+    state["score_history"] = score_history
+    return state, observed_scores
+
+
 def _build_selfplay_opponent_assignments(
     rl_cfg,
     worker_specs,
     best_model_state=None,
     recent_snapshot_pool=None,
+    adaptive_scheduler_state=None,
 ):
     enabled = bool(rl_cfg.get('self_play_opponent_pool_enabled', False))
     if not enabled or not worker_specs:
         return {}, {}
 
-    current_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_current_fraction', 0.4)))
-    best_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_best_fraction', 0.3)))
-    recent_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_recent_fraction', 0.3)))
-
-    recent_snapshot_pool = list(recent_snapshot_pool or [])
-    available_sources = []
-    if current_fraction > 0.0:
-        available_sources.append(("current", current_fraction))
-    if best_model_state is not None and best_fraction > 0.0:
-        available_sources.append(("best", best_fraction))
-    if recent_snapshot_pool and recent_fraction > 0.0:
-        available_sources.append(("recent", recent_fraction))
-
-    if not available_sources:
+    candidates = _build_selfplay_opponent_candidates(
+        rl_cfg,
+        best_model_state=best_model_state,
+        recent_snapshot_pool=recent_snapshot_pool,
+    )
+    if not candidates:
         return {}, {}
+
+    source_weights, _adaptive_debug = _compute_adaptive_opponent_weights(
+        rl_cfg,
+        candidates,
+        scheduler_state=adaptive_scheduler_state,
+    )
 
     total_games = int(sum(max(0, int(games)) for _, games in worker_specs))
     if total_games <= 0:
         return {}, {}
 
-    source_weights = {label: float(weight) for label, weight in available_sources}
-    total_weight = float(sum(source_weights.values()))
-    if total_weight <= 0.0:
-        return {}, {}
-    for label in list(source_weights.keys()):
-        source_weights[label] = source_weights[label] / total_weight
-
     target_games = {
-        label: int(round(total_games * source_weights[label]))
+        label: int(round(total_games * float(source_weights.get(label, 0.0))))
         for label in source_weights.keys()
     }
     assigned_target_total = int(sum(target_games.values()))
@@ -210,50 +356,77 @@ def _build_selfplay_opponent_assignments(
                 delta += 1
             idx += 1
 
+    bucket_game_plan = []
+    for label, count in target_games.items():
+        bucket_game_plan.extend([str(label)] * max(0, int(count)))
+    if len(bucket_game_plan) < total_games:
+        order = sorted(source_weights.keys(), key=lambda key: (-source_weights[key], key))
+        idx = 0
+        while len(bucket_game_plan) < total_games and order:
+            bucket_game_plan.append(str(order[idx % len(order)]))
+            idx += 1
+    elif len(bucket_game_plan) > total_games:
+        bucket_game_plan = bucket_game_plan[:total_games]
+    np.random.shuffle(bucket_game_plan)
+
+    sorted_workers = sorted(worker_specs, key=lambda item: (int(item[0])))
+    payloads_by_label = {
+        str(candidate["label"]): candidate.get("payload")
+        for candidate in candidates
+    }
+    recent_entries = list((payloads_by_label.get("recent") or {}).get("entries", []) or [])
+    recent_weights = [float(entry.get("weight", 1.0)) for entry in recent_entries]
+
     assignments = {}
     assigned_counts = defaultdict(int)
-    remaining_target_games = dict(target_games)
-    sorted_workers = sorted(worker_specs, key=lambda item: (-int(item[1]), int(item[0])))
-    recent_choice_weights = [float(i + 1) for i in range(len(recent_snapshot_pool))]
-
+    offset = 0
     for rank, games_for_worker in sorted_workers:
-        positive_candidates = [
-            label for label, remaining in remaining_target_games.items()
-            if remaining > 0
-        ]
-        if positive_candidates:
-            chosen_label = max(
-                positive_candidates,
-                key=lambda label: (remaining_target_games[label], source_weights.get(label, 0.0), label),
-            )
-        else:
-            chosen_label = max(
-                source_weights.keys(),
-                key=lambda label: (source_weights[label], label),
-            )
+        worker_plan_buckets = list(bucket_game_plan[offset: offset + int(games_for_worker)])
+        offset += int(games_for_worker)
+        plan_labels = []
+        pool_entries = {}
+        for bucket_label in worker_plan_buckets:
+            if bucket_label == "current":
+                plan_labels.append("current")
+                assigned_counts["current"] += 1
+                continue
+            if bucket_label == "best":
+                best_payload = payloads_by_label.get("best") or {}
+                best_label = str(best_payload.get("label", "best"))
+                plan_labels.append(best_label)
+                if best_payload.get("state") is not None:
+                    pool_entries[best_label] = best_payload.get("state")
+                assigned_counts[best_label] += 1
+                continue
+            if bucket_label == "recent" and recent_entries:
+                chosen_idx = _weighted_choice_index(recent_weights)
+                if chosen_idx is None:
+                    chosen_idx = 0
+                chosen_entry = recent_entries[int(chosen_idx)]
+                chosen_label = str(chosen_entry.get("label", "recent"))
+                plan_labels.append(chosen_label)
+                if chosen_entry.get("state") is not None:
+                    pool_entries[chosen_label] = chosen_entry.get("state")
+                assigned_counts[chosen_label] += 1
+                continue
+            plan_labels.append("current")
+            assigned_counts["current"] += 1
 
-        payload = None
-        if chosen_label == "best":
-            payload = {
-                "label": "best",
-                "state": best_model_state,
-            }
-        elif chosen_label == "recent" and recent_snapshot_pool:
-            recent_idx = _weighted_choice_index(recent_choice_weights)
-            if recent_idx is not None:
-                recent_entry = recent_snapshot_pool[recent_idx]
-                payload = {
-                    "label": str(recent_entry.get("label", "recent")),
-                    "state": recent_entry.get("state"),
-                }
-        assignments[int(rank)] = payload
-        assigned_counts[chosen_label] += int(games_for_worker)
-        remaining_target_games[chosen_label] = max(
-            0,
-            int(remaining_target_games.get(chosen_label, 0) - int(games_for_worker)),
-        )
+        assignments[int(rank)] = {
+            "plan_labels": plan_labels,
+            "pool_entries": [
+                {"label": label, "state": state}
+                for label, state in pool_entries.items()
+            ],
+        }
 
     return assignments, dict(assigned_counts)
+
+
+def _round_replay_capacity(value, quantum):
+    quantum = max(1, int(quantum))
+    value = max(1, int(math.ceil(float(value))))
+    return int(math.ceil(value / quantum) * quantum)
 
 
 def _rl_elo_worker(
@@ -614,8 +787,7 @@ class _PersistentSelfPlayPool:
                 'task_id': task_id,
                 'model_state': model_state,
                 'model_state_path': str(worker_model_state_paths.get(rank, model_state_path)),
-                'opponent_model_state': opponent_payload.get('state'),
-                'opponent_label': opponent_payload.get('label'),
+                'opponent_payload': opponent_payload,
                 'num_games': int(games_for_worker),
                 'result_file_path': str(result_file),
                 'mcts_temperature': temperature,
@@ -710,6 +882,7 @@ def play_games_parallel_mcts(
     replay_buffer=None,
     best_model_state=None,
     recent_snapshot_pool=None,
+    adaptive_scheduler_state=None,
 ):
     """
     Parallel self-play using MCTS
@@ -812,6 +985,7 @@ def play_games_parallel_mcts(
         worker_specs,
         best_model_state=best_model_state,
         recent_snapshot_pool=recent_snapshot_pool,
+        adaptive_scheduler_state=adaptive_scheduler_state,
     )
 
     # Shared temp dir used by worker result files.
@@ -894,6 +1068,7 @@ def play_games_parallel_mcts(
     queue_total_value_count = 0
     queue_total_resigned_games = 0
     queue_opponent_source_games = defaultdict(int)
+    queue_opponent_source_results = defaultdict(lambda: {"wins": 0, "draws": 0, "losses": 0, "games": 0})
     
     interrupted = False
     try:
@@ -1032,10 +1207,35 @@ def play_games_parallel_mcts(
                                 queue_total_curriculum_dropped_positions += int(chunk_stats.get('curriculum_dropped_positions', 0))
                                 queue_total_cap_dropped_positions += int(chunk_stats.get('cap_dropped_positions', 0))
                                 queue_total_resigned_games += int(chunk_stats.get('resigned_games', 0))
-                                opponent_source = str(chunk_stats.get('opponent_source', 'current'))
-                                chunk_total_games = int(chunk_stats.get('total_games', len(chunk_lengths) or 0))
-                                if chunk_total_games > 0:
-                                    queue_opponent_source_games[opponent_source] += chunk_total_games
+                                source_counts = dict(chunk_stats.get('opponent_source_counts', {}) or {})
+                                if source_counts:
+                                    for label, count in source_counts.items():
+                                        queue_opponent_source_games[str(label)] += int(count)
+                                else:
+                                    opponent_source = str(chunk_stats.get('opponent_source', 'current'))
+                                    chunk_total_games = int(chunk_stats.get('total_games', len(chunk_lengths) or 0))
+                                    if chunk_total_games > 0:
+                                        queue_opponent_source_games[opponent_source] += chunk_total_games
+                                source_results = dict(chunk_stats.get('opponent_source_results', {}) or {})
+                                if source_results:
+                                    for label, stats in source_results.items():
+                                        result_stats = queue_opponent_source_results[str(label)]
+                                        result_stats["wins"] += int((stats or {}).get("wins", 0))
+                                        result_stats["draws"] += int((stats or {}).get("draws", 0))
+                                        result_stats["losses"] += int((stats or {}).get("losses", 0))
+                                        result_stats["games"] += int((stats or {}).get("games", 0))
+                                else:
+                                    learner_wins = int(chunk_stats.get('learner_wins', 0))
+                                    learner_draws = int(chunk_stats.get('learner_draws', 0))
+                                    learner_losses = int(chunk_stats.get('learner_losses', 0))
+                                    learner_total = learner_wins + learner_draws + learner_losses
+                                    if learner_total > 0:
+                                        opponent_source = str(chunk_stats.get('opponent_source', 'current'))
+                                        result_stats = queue_opponent_source_results[opponent_source]
+                                        result_stats["wins"] += learner_wins
+                                        result_stats["draws"] += learner_draws
+                                        result_stats["losses"] += learner_losses
+                                        result_stats["games"] += learner_total
                                 continue
                             rank = message.get('rank')
                             pending.discard(rank)
@@ -1131,6 +1331,11 @@ def play_games_parallel_mcts(
     total_value_count = queue_total_value_count if use_queue_transport else 0
     total_resigned_games = queue_total_resigned_games if use_queue_transport else 0
     opponent_source_games = dict(queue_opponent_source_games) if use_queue_transport else {}
+    opponent_source_results = (
+        {label: dict(stats) for label, stats in queue_opponent_source_results.items()}
+        if use_queue_transport
+        else {}
+    )
     
     if not use_queue_transport:
         for idx, result_file in enumerate(result_files):
@@ -1180,10 +1385,42 @@ def play_games_parallel_mcts(
                             total_curriculum_dropped_positions += int((stats or {}).get('curriculum_dropped_positions', 0))
                             total_cap_dropped_positions += int((stats or {}).get('cap_dropped_positions', 0))
                             total_resigned_games += int((stats or {}).get('resigned_games', 0))
-                            opponent_source = str((stats or {}).get('opponent_source', 'current'))
-                            chunk_total_games = int((stats or {}).get('total_games', len(lengths) or 0))
-                            if chunk_total_games > 0:
-                                opponent_source_games[opponent_source] = int(opponent_source_games.get(opponent_source, 0)) + chunk_total_games
+                            source_counts = dict((stats or {}).get('opponent_source_counts', {}) or {})
+                            if source_counts:
+                                for label, count in source_counts.items():
+                                    label = str(label)
+                                    opponent_source_games[label] = int(opponent_source_games.get(label, 0)) + int(count)
+                            else:
+                                opponent_source = str((stats or {}).get('opponent_source', 'current'))
+                                chunk_total_games = int((stats or {}).get('total_games', len(lengths) or 0))
+                                if chunk_total_games > 0:
+                                    opponent_source_games[opponent_source] = int(opponent_source_games.get(opponent_source, 0)) + chunk_total_games
+                            source_results = dict((stats or {}).get('opponent_source_results', {}) or {})
+                            if source_results:
+                                for label, source_stat in source_results.items():
+                                    result_stats = opponent_source_results.setdefault(
+                                        str(label),
+                                        {"wins": 0, "draws": 0, "losses": 0, "games": 0},
+                                    )
+                                    result_stats["wins"] += int((source_stat or {}).get('wins', 0))
+                                    result_stats["draws"] += int((source_stat or {}).get('draws', 0))
+                                    result_stats["losses"] += int((source_stat or {}).get('losses', 0))
+                                    result_stats["games"] += int((source_stat or {}).get('games', 0))
+                            else:
+                                learner_wins = int((stats or {}).get('learner_wins', 0))
+                                learner_draws = int((stats or {}).get('learner_draws', 0))
+                                learner_losses = int((stats or {}).get('learner_losses', 0))
+                                learner_total = learner_wins + learner_draws + learner_losses
+                                if learner_total > 0:
+                                    opponent_source = str((stats or {}).get('opponent_source', 'current'))
+                                    result_stats = opponent_source_results.setdefault(
+                                        opponent_source,
+                                        {"wins": 0, "draws": 0, "losses": 0, "games": 0},
+                                    )
+                                    result_stats["wins"] += learner_wins
+                                    result_stats["draws"] += learner_draws
+                                    result_stats["losses"] += learner_losses
+                                    result_stats["games"] += learner_total
                     result_file.unlink()
                 except Exception as e:
                     print(f"⚠️ Warning: Failed to load results from worker {idx}: {e}")
@@ -1208,6 +1445,19 @@ def play_games_parallel_mcts(
             for label, count in sorted(opponent_source_games.items(), key=lambda item: item[0])
         ]
         print(f"   Opponent mix: {', '.join(mix_parts)}")
+    if opponent_source_results:
+        score_parts = []
+        for label, stats in sorted(opponent_source_results.items(), key=lambda item: item[0]):
+            score_rate = _safe_score_rate(
+                (stats or {}).get('wins', 0),
+                (stats or {}).get('draws', 0),
+                (stats or {}).get('losses', 0),
+            )
+            if score_rate is None:
+                continue
+            score_parts.append(f"{label}={score_rate:.1%}")
+        if score_parts:
+            print(f"   Opponent score: {', '.join(score_parts)}")
     total_generated_positions = total_positions + total_dropped_positions + filtered_positions
     if total_generated_positions > 0:
         kept_ratio = 100.0 * total_positions / total_generated_positions
@@ -1302,6 +1552,20 @@ def play_games_parallel_mcts(
         'curriculum_dropped_positions': int(total_curriculum_dropped_positions),
         'cap_dropped_positions': int(total_cap_dropped_positions),
         'resigned_games': int(total_resigned_games),
+        'opponent_results': {
+            str(label): {
+                'wins': int((stats or {}).get('wins', 0)),
+                'draws': int((stats or {}).get('draws', 0)),
+                'losses': int((stats or {}).get('losses', 0)),
+                'games': int((stats or {}).get('games', 0)),
+                'score_rate': float(_safe_score_rate(
+                    (stats or {}).get('wins', 0),
+                    (stats or {}).get('draws', 0),
+                    (stats or {}).get('losses', 0),
+                ) or 0.0),
+            }
+            for label, stats in sorted(opponent_source_results.items(), key=lambda item: item[0])
+        },
     }
     
     return (
@@ -1344,20 +1608,41 @@ def main():
             games_per_iter = int(games_per_iter)
         except Exception:
             games_per_iter = 0
-        avg_moves = rl_cfg.get('avg_moves_per_game', 0)
+        batch_size = rl_cfg.get('batch_size', 1024)
         try:
-            avg_moves = float(avg_moves)
+            batch_size = int(batch_size)
         except Exception:
-            avg_moves = 0
-        if avg_moves <= 0:
-            raise ValueError("avg_moves_per_game must be > 0 when using replay_buffer_multiplier.")
-        computed_size = int(games_per_iter * avg_moves * replay_multiplier)
-        rl_cfg['replay_buffer_size'] = computed_size
-        print(
-            "Replay buffer size: "
-            f"{computed_size} (games_per_iteration {games_per_iter} x "
-            f"avg_moves_per_game {avg_moves} x multiplier {replay_multiplier})"
+            batch_size = 1024
+        replay_capacity_round_to = max(1, int(rl_cfg.get('replay_buffer_capacity_round_to', 256)))
+        replay_cap_min_positions = max(1, int(rl_cfg.get('replay_cap_min_positions', 16)))
+        replay_buffer_min_size = int(
+            rl_cfg.get(
+                'replay_buffer_min_size',
+                max(batch_size * 4, games_per_iter * replay_cap_min_positions),
+            )
         )
+        replay_buffer_min_size = max(1, replay_buffer_min_size)
+
+        bootstrap_positions = rl_cfg.get('replay_buffer_bootstrap_positions_per_iteration', 'auto')
+        if isinstance(bootstrap_positions, str) and bootstrap_positions.strip().lower() == 'auto':
+            bootstrap_positions = max(batch_size, games_per_iter * replay_cap_min_positions)
+        else:
+            try:
+                bootstrap_positions = int(bootstrap_positions)
+            except Exception:
+                bootstrap_positions = max(batch_size, games_per_iter * replay_cap_min_positions)
+        bootstrap_positions = max(1, int(bootstrap_positions))
+        computed_size = _round_replay_capacity(
+            max(replay_buffer_min_size, bootstrap_positions * replay_multiplier),
+            replay_capacity_round_to,
+        )
+        rl_cfg['replay_buffer_bootstrap_positions_per_iteration_resolved'] = int(bootstrap_positions)
+        print(
+            "Replay buffer capacity: "
+            f"{computed_size} (dynamic bootstrap: {bootstrap_positions} positions/iter x multiplier {replay_multiplier}, "
+            f"min_size={replay_buffer_min_size}, round_to={replay_capacity_round_to})"
+        )
+        rl_cfg['replay_buffer_size'] = computed_size
     else:
         raise ValueError("replay_buffer_multiplier must be > 0 (replay_buffer_size is no longer used).")
 
@@ -1580,6 +1865,7 @@ def main():
     rl_cfg = config['reinforcement_learning']
     recent_snapshot_keep = max(0, int(rl_cfg.get('self_play_recent_snapshots_to_keep', 4)))
     recent_selfplay_snapshots = deque(maxlen=recent_snapshot_keep) if recent_snapshot_keep > 0 else deque(maxlen=0)
+    adaptive_opponent_scheduler_state = {'score_history': {}}
     if recent_snapshot_keep > 0:
         recent_selfplay_snapshots.append({
             'label': 'recent_init',
@@ -1600,6 +1886,13 @@ def main():
             config['reinforcement_learning'].get('replay_decisive_value_epsilon', 0.05)
         ),
     )
+    replay_capacity_round_to = max(1, int(rl_cfg.get('replay_buffer_capacity_round_to', 256)))
+    replay_buffer_min_size = max(1, int(rl_cfg.get('replay_buffer_min_size', replay_buffer.max_size)))
+    replay_buffer_ema_alpha = max(
+        0.0,
+        min(1.0, float(rl_cfg.get('replay_buffer_ema_alpha', 0.25))),
+    )
+    replay_positions_ema = None
     
     # Initialize temperature schedule
     use_temp_schedule = config['reinforcement_learning'].get('use_temperature_schedule', False)
@@ -1699,6 +1992,15 @@ def main():
             "   • Recent frozen snapshots: "
             f"{int(config['reinforcement_learning'].get('self_play_recent_snapshots_to_keep', 4))}"
         )
+    if bool(config['reinforcement_learning'].get('self_play_opponent_pool_enabled', False)) and bool(
+        config['reinforcement_learning'].get('self_play_opponent_adaptive_enabled', False)
+    ):
+        print(
+            "   â€˘ Adaptive opponent scheduler: "
+            f"on (target={float(config['reinforcement_learning'].get('self_play_opponent_adaptive_target_score', 0.50)):.0%}, "
+            f"band=Â±{float(config['reinforcement_learning'].get('self_play_opponent_adaptive_band', 0.15)):.0%}, "
+            f"current_floor={float(config['reinforcement_learning'].get('self_play_opponent_current_min_fraction', 0.50)):.0%})"
+        )
     if bool(config['reinforcement_learning'].get('self_play_resignation_enabled', False)):
         print(
             "   • Resignation: "
@@ -1710,8 +2012,11 @@ def main():
     print(f"   • 📊 Policy Accuracy & Value MAE tracking")
     print(f"   • Replay buffer capacity: {config['reinforcement_learning']['replay_buffer_size']:,} positions")
     print(
-        f"   • Estimated positions per iteration: "
-        f"{int(config['reinforcement_learning']['games_per_iteration'] * config['reinforcement_learning']['avg_moves_per_game']):,}"
+        f"   • Replay buffer dynamic sizing: "
+        f"bootstrap={int(config['reinforcement_learning'].get('replay_buffer_bootstrap_positions_per_iteration_resolved', 0)):,}, "
+        f"multiplier={replay_multiplier:.2f}, "
+        f"ema_alpha={replay_buffer_ema_alpha:.2f}, "
+        f"min_size={replay_buffer_min_size:,}"
     )
     if start_iteration >= total_iterations:
         print(
@@ -1783,13 +2088,38 @@ def main():
                     replay_buffer=replay_buffer,
                     best_model_state=best_model_state_for_selfplay,
                     recent_snapshot_pool=list(recent_selfplay_snapshots),
+                    adaptive_scheduler_state=adaptive_opponent_scheduler_state,
                 )
             
             # Add to replay buffer
             for position in positions:
                 replay_buffer.add(position)
-            
-            print(f"Replay buffer: {len(replay_buffer)} positions (+{positions_added})")
+
+            if positions_added > 0:
+                observed_positions = float(positions_added)
+                if replay_positions_ema is None:
+                    replay_positions_ema = observed_positions
+                else:
+                    replay_positions_ema = (
+                        (1.0 - replay_buffer_ema_alpha) * float(replay_positions_ema)
+                        + replay_buffer_ema_alpha * observed_positions
+                    )
+                target_capacity = _round_replay_capacity(
+                    max(
+                        replay_buffer_min_size,
+                        float(replay_positions_ema) * float(replay_multiplier),
+                    ),
+                    replay_capacity_round_to,
+                )
+                if replay_buffer.resize(target_capacity):
+                    rl_cfg['replay_buffer_size'] = int(replay_buffer.max_size)
+                    print(
+                        "Replay buffer resized: "
+                        f"{replay_buffer.max_size:,} "
+                        f"(ema_positions_per_iter={float(replay_positions_ema):.1f}, multiplier={replay_multiplier:.2f})"
+                    )
+             
+            print(f"Replay buffer: {len(replay_buffer)}/{replay_buffer.max_size} positions (+{positions_added})")
             print(
                 f"📊 Self-play stats: draw_rate={float((selfplay_stats or {}).get('completed_draw_rate', 0.0)):.2%}, "
                 f"avg_value={float((selfplay_stats or {}).get('avg_game_value', 0.0)):.3f}, "
@@ -1804,6 +2134,18 @@ def main():
                 f"auto_draw_rate={float((selfplay_stats or {}).get('auto_draw_rate', 0.0)):.2%}, "
                 f"truncated_rate={float((selfplay_stats or {}).get('truncated_rate', 0.0)):.2%}"
             )
+            adaptive_opponent_scheduler_state, observed_scores = _update_adaptive_opponent_scheduler(
+                rl_cfg,
+                adaptive_opponent_scheduler_state,
+                (selfplay_stats or {}).get('opponent_results', {}),
+                iteration + 1,
+            )
+            if observed_scores:
+                observed_parts = [
+                    f"{label}={score:.1%}"
+                    for label, score in sorted(observed_scores.items(), key=lambda item: item[0])
+                ]
+                print(f"Adaptive opponent scores: {', '.join(observed_parts)}")
             prev_completed_draw_rate = float((selfplay_stats or {}).get('completed_draw_rate', 0.0))
 
             avg_policy_entropy = 0.0

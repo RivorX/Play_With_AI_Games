@@ -2,12 +2,26 @@
 
 from datetime import datetime
 import io
+import os
 from pathlib import Path
+import threading
+from urllib.request import urlopen
 
 import chess
 import chess.pgn
 import chess.svg
 import pygame
+from PIL import Image
+
+PIECE_SVG_OVERSAMPLE = 4
+PIECE_FILL_RATIO = 0.65
+PIECE_ASSET_SET_DIR = Path(__file__).resolve().parents[3] / "assets" / "pieces" / "sashite"
+PIECE_REMOTE_BASE_URLS = {
+    "white": "https://sashite.dev/assets/chess/sides/first/representations/western",
+    "black": "https://sashite.dev/assets/chess/sides/second/representations/western",
+}
+_PIECE_PREFETCH_LOCK = threading.Lock()
+_PIECE_PREFETCH_STARTED = False
 
 
 def create_piece_surfaces(square_size=80):
@@ -16,18 +30,27 @@ def create_piece_surfaces(square_size=80):
     Falls back to text-based symbols if SVG loading fails on the host.
     """
     pieces = {}
+    base_square = max(1, int(square_size))
+    render_square = max(base_square, base_square * PIECE_SVG_OVERSAMPLE)
     for symbol in _iter_piece_symbols():
         piece = chess.Piece.from_symbol(symbol)
+        asset_path = _ensure_piece_asset(symbol)
+        if asset_path.exists():
+            try:
+                with Image.open(asset_path) as image:
+                    image = image.convert("RGBA")
+                    surface = pygame.image.fromstring(image.tobytes(), image.size, image.mode).convert_alpha()
+                pieces[symbol] = _fit_piece_surface(surface, base_square, fill_ratio=PIECE_FILL_RATIO)
+                continue
+            except Exception:
+                pass
         try:
-            svg_markup = chess.svg.piece(piece, size=square_size)
-            svg_bytes = io.BytesIO(svg_markup.encode("utf-8"))
-            surface = pygame.image.load(svg_bytes).convert_alpha()
-            if surface.get_size() != (square_size, square_size):
-                surface = pygame.transform.smoothscale(surface, (square_size, square_size))
-            pieces[symbol] = _fit_piece_surface(surface, square_size, fill_ratio=0.60)
-        except pygame.error:
-            fallback = _create_fallback_piece_surface(symbol, square_size)
-            pieces[symbol] = _fit_piece_surface(fallback, square_size, fill_ratio=0.60)
+            svg_markup = chess.svg.piece(piece, size=render_square)
+            surface = _render_svg_piece_surface(svg_markup, render_square)
+            pieces[symbol] = _fit_piece_surface(surface, base_square, fill_ratio=PIECE_FILL_RATIO)
+        except Exception:
+            fallback = _create_fallback_piece_surface(symbol, render_square)
+            pieces[symbol] = _fit_piece_surface(fallback, base_square, fill_ratio=PIECE_FILL_RATIO)
 
     return pieces
 
@@ -37,6 +60,100 @@ def _iter_piece_symbols():
     for color in (chess.WHITE, chess.BLACK):
         for piece_type in chess.PIECE_TYPES:
             yield chess.Piece(piece_type, color).symbol()
+
+
+def start_piece_asset_prefetch():
+    """Download missing piece assets into cache in the background once."""
+    global _PIECE_PREFETCH_STARTED
+    with _PIECE_PREFETCH_LOCK:
+        if _PIECE_PREFETCH_STARTED:
+            return
+        _PIECE_PREFETCH_STARTED = True
+
+    worker = threading.Thread(target=_prefetch_piece_assets, name="piece-asset-prefetch", daemon=True)
+    worker.start()
+
+
+def _piece_asset_path(symbol):
+    name_map = {
+        "k": "king",
+        "q": "queen",
+        "r": "rook",
+        "b": "bishop",
+        "n": "knight",
+        "p": "pawn",
+    }
+    color_dir = "white" if symbol.isupper() else "black"
+    return PIECE_ASSET_SET_DIR / color_dir / f"{name_map[symbol.lower()]}.png"
+
+
+def _piece_cache_root():
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        return Path(local_appdata) / "Play_With_AI_Games" / "cache" / "pieces" / "sashite"
+    return Path.home() / ".play_with_ai_games" / "cache" / "pieces" / "sashite"
+
+
+def _piece_cache_path(symbol):
+    source_path = _piece_asset_path(symbol)
+    color_dir = source_path.parent.name
+    return _piece_cache_root() / color_dir / source_path.name
+
+
+def _piece_asset_url(symbol):
+    source_path = _piece_asset_path(symbol)
+    color_dir = source_path.parent.name
+    return f"{PIECE_REMOTE_BASE_URLS[color_dir]}/{source_path.stem}-1024x1024.png"
+
+
+def _download_piece_asset(symbol, target_path):
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    url = _piece_asset_url(symbol)
+    with urlopen(url, timeout=8) as response:
+        data = response.read()
+    if not data:
+        return False
+    temp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+    temp_path.write_bytes(data)
+    temp_path.replace(target_path)
+    return True
+
+
+def _prefetch_piece_assets():
+    for symbol in _iter_piece_symbols():
+        cache_path = _piece_cache_path(symbol)
+        if cache_path.exists():
+            continue
+        try:
+            _download_piece_asset(symbol, cache_path)
+        except Exception:
+            continue
+
+
+def _ensure_piece_asset(symbol):
+    cache_path = _piece_cache_path(symbol)
+    if cache_path.exists():
+        return cache_path
+
+    try:
+        if _download_piece_asset(symbol, cache_path):
+            return cache_path
+    except Exception:
+        pass
+
+    bundled_path = _piece_asset_path(symbol)
+    if bundled_path.exists():
+        return bundled_path
+    return cache_path
+
+
+def _render_svg_piece_surface(svg_markup, render_square):
+    """Rasterize SVG chess piece as a last-resort fallback."""
+    svg_bytes = io.BytesIO(svg_markup.encode("utf-8"))
+    surface = pygame.image.load(svg_bytes).convert_alpha()
+    if surface.get_size() != (render_square, render_square):
+        surface = pygame.transform.smoothscale(surface, (render_square, render_square))
+    return surface
 
 
 def _fit_piece_surface(surface, square_size, fill_ratio=0.60):

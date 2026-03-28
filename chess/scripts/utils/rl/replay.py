@@ -35,6 +35,18 @@ class ReplayBuffer:
         self._policy_lengths = None
         self._scratch = {}
 
+    def _ordered_indices_oldest_to_newest(self):
+        if self.size <= 0:
+            return np.empty(0, dtype=np.int64)
+        if self.size < self.max_size:
+            return np.arange(self.size, dtype=np.int64)
+        return np.concatenate(
+            (
+                np.arange(self.position, self.max_size, dtype=np.int64),
+                np.arange(0, self.position, dtype=np.int64),
+            )
+        )
+
     def _ensure_storage_initialized(self, board):
         if self._boards is not None:
             return
@@ -283,6 +295,59 @@ class ReplayBuffer:
         batch_size = max(1, min(int(batch_size), int(self.size)))
         indices = self._sample_indices_with_decisive_bias(batch_size)
         return self._build_batch_from_indices(indices)
+
+    def resize(self, new_max_size):
+        new_max_size = max(1, int(new_max_size))
+        if new_max_size == self.max_size:
+            return False
+
+        if self._boards is None:
+            self.max_size = new_max_size
+            self.size = min(self.size, self.max_size)
+            self.position = min(self.position, max(0, self.max_size - 1))
+            self._scratch = {}
+            return True
+
+        keep_size = min(int(self.size), new_max_size)
+        ordered_indices = self._ordered_indices_oldest_to_newest()
+        keep_indices = ordered_indices[-keep_size:] if keep_size > 0 else np.empty(0, dtype=np.int64)
+
+        old_boards = self._boards
+        old_values = self._values
+        old_policy_indices = self._policy_indices
+        old_policy_values = self._policy_values
+        old_policy_lengths = self._policy_lengths
+
+        board_shape = tuple(old_boards.shape[1:])
+        board_dtype = old_boards.dtype
+        probs_dtype = old_policy_values.dtype
+
+        self.max_size = new_max_size
+        self._boards = torch.empty((self.max_size, *board_shape), dtype=board_dtype)
+        self._values = torch.empty((self.max_size, 1), dtype=old_values.dtype)
+        self._policy_indices = torch.full(
+            (self.max_size, _DEFAULT_MAX_POLICY_TARGETS),
+            -1,
+            dtype=old_policy_indices.dtype,
+        )
+        self._policy_values = torch.zeros(
+            (self.max_size, _DEFAULT_MAX_POLICY_TARGETS),
+            dtype=probs_dtype,
+        )
+        self._policy_lengths = torch.zeros((self.max_size,), dtype=old_policy_lengths.dtype)
+
+        if keep_size > 0:
+            idx = torch.as_tensor(keep_indices, dtype=torch.long)
+            self._boards[:keep_size].copy_(old_boards[idx])
+            self._values[:keep_size].copy_(old_values[idx])
+            self._policy_indices[:keep_size].copy_(old_policy_indices[idx])
+            self._policy_values[:keep_size].copy_(old_policy_values[idx])
+            self._policy_lengths[:keep_size].copy_(old_policy_lengths[idx])
+
+        self.size = keep_size
+        self.position = 0 if keep_size >= self.max_size else keep_size
+        self._scratch = {}
+        return True
 
     def __len__(self):
         return self.size
