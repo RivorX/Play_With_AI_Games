@@ -18,6 +18,7 @@ import math
 import ctypes
 import time
 import wave
+import numpy as np
 from array import array
 from pathlib import Path
 import pygame
@@ -48,6 +49,20 @@ from utils.ui.gui_helpers import (
     start_piece_asset_prefetch,
 )
 
+def _enable_windows_dpi_awareness():
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_enable_windows_dpi_awareness()
+
 # Initialize Pygame
 pygame.init()
 
@@ -71,12 +86,16 @@ WINDOW_WIDTH = (
 )
 WINDOW_HEIGHT = OUTER_MARGIN_Y * 2 + BOARD_SIZE
 FPS = 60
-WINDOW_MIN_WIDTH = 980
-WINDOW_MIN_HEIGHT = 700
-MAX_GAME_UI_SCALE = 1.35
+CANVAS_MIN_WIDTH = 980
+CANVAS_MIN_HEIGHT = 700
+WINDOW_MIN_WIDTH = 720
+WINDOW_MIN_HEIGHT = 540
+MIN_GAME_UI_SCALE = 0.72
+MAX_GAME_UI_SCALE = 1.12
 PANEL_MIN_WIDTH = 120
 DEFAULT_WINDOW_SCREEN_WIDTH_RATIO = 0.92
 DEFAULT_WINDOW_SCREEN_HEIGHT_RATIO = 0.92
+ANALYSIS_DISPLAY_ROWS = 4
 
 # Colors
 WHITE = (240, 217, 181)
@@ -92,8 +111,8 @@ APP_BG = (12, 16, 22)
 
 def _get_default_window_size():
     """Resolve a safe default window size from the current display."""
-    fallback_width = max(WINDOW_MIN_WIDTH, WINDOW_WIDTH)
-    fallback_height = max(WINDOW_MIN_HEIGHT, WINDOW_HEIGHT)
+    fallback_width = max(CANVAS_MIN_WIDTH, WINDOW_WIDTH)
+    fallback_height = max(CANVAS_MIN_HEIGHT, WINDOW_HEIGHT)
     try:
         info = pygame.display.Info()
         screen_width = int(getattr(info, "current_w", 0) or 0)
@@ -112,16 +131,21 @@ def _get_default_window_size():
     return default_width, default_height
 
 
-def _get_maximized_window_size():
-    """Resolve the largest safe client size for the current display."""
+def _get_display_window_size():
+    """Resolve the desktop resolution for maximized mode."""
     default_width, default_height = _get_default_window_size()
     try:
-        info = pygame.display.Info()
-        screen_width = int(getattr(info, "current_w", 0) or 0)
-        screen_height = int(getattr(info, "current_h", 0) or 0)
+        user32 = ctypes.windll.user32
+        screen_width = int(user32.GetSystemMetrics(0) or 0)
+        screen_height = int(user32.GetSystemMetrics(1) or 0)
     except Exception:
-        screen_width = 0
-        screen_height = 0
+        try:
+            info = pygame.display.Info()
+            screen_width = int(getattr(info, "current_w", 0) or 0)
+            screen_height = int(getattr(info, "current_h", 0) or 0)
+        except Exception:
+            screen_width = 0
+            screen_height = 0
 
     if screen_width <= 0 or screen_height <= 0:
         return default_width, default_height
@@ -132,14 +156,53 @@ def _get_maximized_window_size():
     )
 
 
-def _maximize_native_window():
-    """Ask the OS to maximize the current window when available."""
+def _normalize_window_size(value):
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
     try:
-        wm_info = pygame.display.get_wm_info()
+        return (
+            max(WINDOW_MIN_WIDTH, int(value[0])),
+            max(WINDOW_MIN_HEIGHT, int(value[1])),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _position_native_window(width, height):
+    """Move the current window to the top-left corner with an exact size."""
+    window_handle = _get_native_window_handle()
+    if not window_handle:
+        return False
+
+    try:
+        user32 = ctypes.windll.user32
+        swp_framechanged = 0x0020
+        swp_showwindow = 0x0040
+        user32.SetWindowPos(
+            int(window_handle),
+            0,
+            0,
+            0,
+            int(width),
+            int(height),
+            swp_framechanged | swp_showwindow,
+        )
+        return True
     except Exception:
         return False
 
-    window_handle = wm_info.get("window")
+
+def _get_native_window_handle():
+    try:
+        wm_info = pygame.display.get_wm_info()
+    except Exception:
+        return None
+    return wm_info.get("window")
+
+
+def _maximize_native_window():
+    """Maximize the current window using the native window handle."""
+    window_handle = _get_native_window_handle()
     if not window_handle:
         return False
 
@@ -148,8 +211,6 @@ def _maximize_native_window():
         return True
     except Exception:
         return False
-
-
 class ChessGUI:
     """Chess game GUI with support for multiple game modes and MCTS toggle - v4.2"""
     
@@ -203,7 +264,6 @@ class ChessGUI:
         default_history = int(config['model'].get('history_positions', 0))
         self.model1_history_positions = int(getattr(model1, 'history_positions', default_history)) if model1 else default_history
         self.model2_history_positions = int(getattr(model2, 'history_positions', self.model1_history_positions)) if model2 else self.model1_history_positions
-        self.history_positions = self.model1_history_positions
         
         # Only create MCTS if enabled
         if model1 and self.mcts_enabled:
@@ -219,10 +279,11 @@ class ChessGUI:
             self.mcts2 = None
 
         default_window_width, default_window_height = _get_default_window_size()
-        self.base_width = max(WINDOW_MIN_WIDTH, default_window_width)
-        self.base_height = max(WINDOW_MIN_HEIGHT, default_window_height)
+        self.base_width = max(CANVAS_MIN_WIDTH, default_window_width)
+        self.base_height = max(CANVAS_MIN_HEIGHT, default_window_height)
         self.display_flags = pygame.RESIZABLE
         self.maximized = False
+        self.ui_scale = 1.0
         start_width = default_window_width
         start_height = default_window_height
         if isinstance(initial_window_size, (list, tuple)) and len(initial_window_size) == 2:
@@ -233,7 +294,11 @@ class ChessGUI:
                 start_width = default_window_width
                 start_height = default_window_height
         self.restore_window_size = (start_width, start_height)
-        self.screen = pygame.display.set_mode(self.restore_window_size, self.display_flags)
+        existing_surface = pygame.display.get_surface()
+        if existing_surface is not None and existing_surface.get_size() == self.restore_window_size:
+            self.screen = existing_surface
+        else:
+            self.screen = pygame.display.set_mode(self.restore_window_size, self.display_flags)
         self.viewport_rect = pygame.Rect(0, 0, self.base_width, self.base_height)
         self.viewport_scale = 1.0
         self.canvas = pygame.Surface((self.base_width, self.base_height))
@@ -267,11 +332,8 @@ class ChessGUI:
             chess.WHITE: {"total": 0.0, "moves": 0, "last": 0.0},
             chess.BLACK: {"total": 0.0, "moves": 0, "last": 0.0},
         }
-        self.analysis_cache = {"fen": None, "rows": [], "side": None, "label": ""}
-        self.analysis_cache_by_color = {
-            chess.WHITE: {"rows": [], "label": "White", "fen": None},
-            chess.BLACK: {"rows": [], "label": "Black", "fen": None},
-        }
+        self.analysis_cache = self._empty_analysis_cache()
+        self.analysis_cache_by_color = self._empty_analysis_cache_by_color()
         self._resize_canvas(*self.restore_window_size)
         self._update_viewport()
         try:
@@ -282,16 +344,10 @@ class ChessGUI:
         pygame.display.set_caption(f"Chess AI {self.version}")
         self.clock = pygame.time.Clock()
         if bool(initial_window_maximized) or initial_window_size is None:
-            self._toggle_maximized()
+            self._set_window_maximized(True)
         
         # Load piece images
         self._ensure_piece_surfaces()
-        
-        # Fonts
-        self.text_font = pygame.font.SysFont("Segoe UI", 28, bold=True)
-        self.medium_font = pygame.font.SysFont("Segoe UI", 20, bold=True)
-        self.small_font = pygame.font.SysFont("Segoe UI", 17)
-        self.tiny_font = pygame.font.SysFont("Segoe UI", 15)
         
         # Game state
         self.board = chess.Board()
@@ -349,14 +405,36 @@ class ChessGUI:
         return surface
 
     def _resize_canvas(self, width, height):
-        self.base_width = max(WINDOW_MIN_WIDTH, int(width))
-        self.base_height = max(WINDOW_MIN_HEIGHT, int(height))
+        self.base_width = max(CANVAS_MIN_WIDTH, int(width))
+        self.base_height = max(CANVAS_MIN_HEIGHT, int(height))
         self.canvas = pygame.Surface((self.base_width, self.base_height))
         self.background = self._build_vertical_gradient(
             self.base_width, self.base_height, (27, 32, 40), (15, 19, 25)
         )
+        self._update_fonts()
         self._refresh_layout()
         self._ensure_piece_surfaces()
+
+    def _update_fonts(self):
+        width_scale = self.base_width / float(max(WINDOW_WIDTH, CANVAS_MIN_WIDTH))
+        height_scale = self.base_height / float(max(WINDOW_HEIGHT, CANVAS_MIN_HEIGHT))
+        responsive_scale = min(width_scale, height_scale) * 0.90
+        self.ui_scale = max(
+            MIN_GAME_UI_SCALE,
+            min(MAX_GAME_UI_SCALE, responsive_scale),
+        )
+        self.text_font = pygame.font.SysFont(
+            "Segoe UI", max(18, int(round(28 * self.ui_scale))), bold=True
+        )
+        self.medium_font = pygame.font.SysFont(
+            "Segoe UI", max(15, int(round(20 * self.ui_scale))), bold=True
+        )
+        self.small_font = pygame.font.SysFont(
+            "Segoe UI", max(12, int(round(17 * self.ui_scale)))
+        )
+        self.tiny_font = pygame.font.SysFont(
+            "Segoe UI", max(11, int(round(15 * self.ui_scale)))
+        )
 
     def _ensure_piece_surfaces(self):
         if int(self.square_size) <= 0:
@@ -488,13 +566,14 @@ class ChessGUI:
         content_width = max(1, self.base_width - 2 * OUTER_MARGIN_X)
         content_height = max(1, self.base_height - 2 * OUTER_MARGIN_Y)
 
-        left_min = max(PANEL_MIN_WIDTH, 210)
-        right_min = max(PANEL_MIN_WIDTH, 230)
-        left_pref = max(left_min, min(300, int(content_width * 0.20)))
-        right_pref = max(right_min, min(340, int(content_width * 0.22)))
+        panel_gap = max(14, int(PANEL_GAP * max(0.82, self.ui_scale * 0.82)))
+        left_min = max(PANEL_MIN_WIDTH, int(176 * max(0.9, self.ui_scale)))
+        right_min = max(PANEL_MIN_WIDTH, int(196 * max(0.9, self.ui_scale)))
+        left_pref = max(left_min, min(int(256 * max(0.9, self.ui_scale)), int(content_width * 0.17)))
+        right_pref = max(right_min, min(int(292 * max(0.9, self.ui_scale)), int(content_width * 0.19)))
 
         board_limit_by_h = min(BOARD_MAX_SIZE, content_height)
-        board_w_with_pref = content_width - left_pref - right_pref - (2 * PANEL_GAP)
+        board_w_with_pref = content_width - left_pref - right_pref - (2 * panel_gap)
         if board_w_with_pref >= BOARD_MIN_SIZE:
             left_width = left_pref
             right_width = right_pref
@@ -502,7 +581,7 @@ class ChessGUI:
         else:
             left_width = left_min
             right_width = right_min
-            board_size = min(board_limit_by_h, content_width - left_width - right_width - (2 * PANEL_GAP))
+            board_size = min(board_limit_by_h, content_width - left_width - right_width - (2 * panel_gap))
 
         board_size = max(8 * 24, int(board_size))
         board_size = max(8, (board_size // 8) * 8)
@@ -510,11 +589,11 @@ class ChessGUI:
         self.square_size = max(1, board_size // 8)
         board_size = self.square_size * 8
 
-        layout_width = left_width + PANEL_GAP + board_size + PANEL_GAP + right_width
+        layout_width = left_width + panel_gap + board_size + panel_gap + right_width
         start_x = content_left + max(0, (content_width - layout_width) // 2)
         left_x = start_x
-        board_x = left_x + left_width + PANEL_GAP
-        right_x = board_x + board_size + PANEL_GAP
+        board_x = left_x + left_width + panel_gap
+        right_x = board_x + board_size + panel_gap
         board_y = content_top + max(0, (content_height - board_size) // 2)
 
         self.left_panel_rect = pygame.Rect(left_x, content_top, left_width, content_height)
@@ -523,14 +602,25 @@ class ChessGUI:
 
     def _update_viewport(self):
         win_w, win_h = self.screen.get_size()
-        self.viewport_rect = pygame.Rect(0, 0, win_w, win_h)
-        self.viewport_scale = 1.0
+        scale_x = win_w / max(1, self.base_width)
+        scale_y = win_h / max(1, self.base_height)
+        self.viewport_scale = max(0.0001, min(scale_x, scale_y))
+        viewport_w = max(1, int(round(self.base_width * self.viewport_scale)))
+        viewport_h = max(1, int(round(self.base_height * self.viewport_scale)))
+        self.viewport_rect = pygame.Rect(
+            (win_w - viewport_w) // 2,
+            (win_h - viewport_h) // 2,
+            viewport_w,
+            viewport_h,
+        )
 
     def _window_to_canvas(self, pos):
         if pos is None:
             return None
-        x = int(pos[0])
-        y = int(pos[1])
+        if not self.viewport_rect.collidepoint(pos):
+            return None
+        x = int((pos[0] - self.viewport_rect.left) / max(0.0001, self.viewport_scale))
+        y = int((pos[1] - self.viewport_rect.top) / max(0.0001, self.viewport_scale))
         x = max(0, min(self.base_width - 1, x))
         y = max(0, min(self.base_height - 1, y))
         return x, y
@@ -541,19 +631,32 @@ class ChessGUI:
         self.maximized = False
         self.restore_window_size = (width, height)
         self.screen = pygame.display.set_mode((width, height), self.display_flags)
+        pygame.event.pump()
+        _position_native_window(width, height)
         self._resize_canvas(width, height)
         self._update_viewport()
 
-    def _toggle_maximized(self):
-        if not self.maximized:
-            self.restore_window_size = self.screen.get_size()
-            maximized_size = _get_maximized_window_size()
+    def _sync_window_surface(self):
+        current_surface = pygame.display.get_surface()
+        if current_surface is not None:
+            self.screen = current_surface
+        self._resize_canvas(*self.screen.get_size())
+        self._update_viewport()
+
+    def _set_window_maximized(self, enabled=True):
+        if enabled:
+            if not self.maximized:
+                self.restore_window_size = self.screen.get_size()
+            maximized_size = _get_display_window_size()
             self.screen = pygame.display.set_mode(maximized_size, self.display_flags)
             pygame.event.pump()
+            _position_native_window(*maximized_size)
             _maximize_native_window()
             self.maximized = True
         else:
             self.screen = pygame.display.set_mode(self.restore_window_size, self.display_flags)
+            pygame.event.pump()
+            _position_native_window(*self.restore_window_size)
             self.maximized = False
         self._resize_canvas(*self.screen.get_size())
         self._update_viewport()
@@ -562,6 +665,7 @@ class ChessGUI:
         return {
             "window_size": [int(self.screen.get_width()), int(self.screen.get_height())],
             "window_maximized": bool(self.maximized),
+            "window_fullscreen": False,
         }
     
     def square_to_coords(self, square):
@@ -750,6 +854,36 @@ class ChessGUI:
         idx = (pygame.time.get_ticks() // 350) % len(frames)
         return frames[idx]
 
+    @staticmethod
+    def _empty_analysis_cache():
+        return {"fen": None, "rows": [], "side": None, "label": ""}
+
+    @staticmethod
+    def _empty_analysis_cache_by_color():
+        return {
+            chess.WHITE: {"rows": [], "label": "White", "fen": None},
+            chess.BLACK: {"rows": [], "label": "Black", "fen": None},
+        }
+
+    def _reset_analysis_storage(self):
+        self.analysis_cache = self._empty_analysis_cache()
+        self.analysis_cache_by_color = self._empty_analysis_cache_by_color()
+
+    def _reset_selection_state(self):
+        self.selected_square = None
+        self.legal_moves = []
+        self.selected_history_ply = None
+        self.selected_analysis_move = None
+        self.preview_move = None
+        self.history_scroll_rows = 0
+
+    def _reset_ai_state(self, paused=False):
+        self.ai_thinking = False
+        self.ai_paused = bool(paused)
+        self.ai_thinking_color = None
+        self.ai_thinking_started_at = None
+        self.ai_pause_started_at = None
+
     def _set_preview_move(self, color, move_uci, fen=None):
         if not move_uci:
             self.preview_move = None
@@ -793,11 +927,7 @@ class ChessGUI:
             return False
         if move not in self.board.legal_moves:
             return False
-        self.ai_thinking = False
-        self.ai_thinking_color = None
-        self.ai_thinking_started_at = None
-        self.ai_pause_started_at = None
-        self.ai_paused = False
+        self._reset_ai_state(paused=False)
         self._apply_move(move)
         self.selected_analysis_move = (color, move_uci)
         self._set_preview_move(color, move_uci, fen)
@@ -904,6 +1034,24 @@ class ChessGUI:
             return self.model1 if self.board.turn == chess.WHITE else self.model2
         return self.model1
 
+    def _analysis_target_color(self):
+        if self.game_mode == "human_vs_human":
+            return None
+        if self.game_mode == "human_vs_ai":
+            if self.board.turn == self.human_color:
+                return None
+            return self.board.turn
+        return self.board.turn
+
+    def _side_has_analysis(self, color):
+        if self.game_mode == "human_vs_human":
+            return False
+        if self.game_mode == "human_vs_ai":
+            return bool(color != self.human_color and self.model1 is not None)
+        if self.game_mode == "ai_vs_ai":
+            return bool((color == chess.WHITE and self.model1 is not None) or (color == chess.BLACK and self.model2 is not None))
+        return False
+
     def _side_uses_mcts(self, color):
         if self.game_mode == "ai_vs_ai":
             return bool(self.use_mcts_white if color == chess.WHITE else self.use_mcts_black)
@@ -915,10 +1063,10 @@ class ChessGUI:
             return
 
         model = self._current_analysis_model()
-        side_label = "White" if self.board.turn == chess.WHITE else "Black"
-        if model is None:
-            self.analysis_cache = {"fen": current_fen, "rows": [], "side": self.board.turn, "label": side_label}
-            self.analysis_cache_by_color[self.board.turn] = {"rows": [], "label": side_label, "fen": current_fen}
+        analysis_color = self._analysis_target_color()
+        side_label = "White" if analysis_color == chess.WHITE else "Black"
+        if model is None or analysis_color is None:
+            self.analysis_cache = {"fen": current_fen, "rows": [], "side": analysis_color, "label": side_label if analysis_color is not None else ""}
             return
 
         try:
@@ -935,8 +1083,8 @@ class ChessGUI:
 
             legal_moves = list(self.board.legal_moves)
             if not legal_moves:
-                self.analysis_cache = {"fen": current_fen, "rows": [], "side": self.board.turn, "label": side_label}
-                self.analysis_cache_by_color[self.board.turn] = {"rows": [], "label": side_label, "fen": current_fen}
+                self.analysis_cache = {"fen": current_fen, "rows": [], "side": analysis_color, "label": side_label}
+                self.analysis_cache_by_color[analysis_color] = {"rows": [], "label": side_label, "fen": current_fen}
                 return
 
             scored_moves = []
@@ -956,8 +1104,6 @@ class ChessGUI:
             sorted_exp_scores = sorted(exp_scores, key=lambda item: item[1], reverse=True)
             for move, exp_score in sorted_exp_scores:
                 probability = (exp_score / score_sum) if score_sum > 0 else 0.0
-                if probability < 0.10:
-                    continue
                 rows.append(
                     {
                         "move": move.uci(),
@@ -965,23 +1111,13 @@ class ChessGUI:
                         "probability": probability,
                     }
                 )
-                if len(rows) >= 5:
+                if len(rows) >= ANALYSIS_DISPLAY_ROWS:
                     break
-            if not rows and sorted_exp_scores:
-                move, exp_score = sorted_exp_scores[0]
-                probability = (exp_score / score_sum) if score_sum > 0 else 0.0
-                rows.append(
-                    {
-                        "move": move.uci(),
-                        "san": self.board.san(move),
-                        "probability": probability,
-                    }
-                )
-            self.analysis_cache = {"fen": current_fen, "rows": rows, "side": self.board.turn, "label": side_label}
-            self.analysis_cache_by_color[self.board.turn] = {"rows": rows, "label": side_label, "fen": current_fen}
+            self.analysis_cache = {"fen": current_fen, "rows": rows, "side": analysis_color, "label": side_label}
+            self.analysis_cache_by_color[analysis_color] = {"rows": rows, "label": side_label, "fen": current_fen}
         except Exception:
-            self.analysis_cache = {"fen": current_fen, "rows": [], "side": self.board.turn, "label": side_label}
-            self.analysis_cache_by_color[self.board.turn] = {"rows": [], "label": side_label, "fen": current_fen}
+            self.analysis_cache = {"fen": current_fen, "rows": [], "side": analysis_color, "label": side_label}
+            self.analysis_cache_by_color[analysis_color] = {"rows": [], "label": side_label, "fen": current_fen}
 
     def _side_info(self, color):
         side_name = "White" if color == chess.WHITE else "Black"
@@ -1025,26 +1161,60 @@ class ChessGUI:
         pygame.draw.rect(self.canvas, fill, rect, border_radius=10)
         pygame.draw.rect(self.canvas, border, rect, width=1, border_radius=10)
 
-    def _player_card_lines(self, side_info):
+    def _player_card_lines(self, side_info, compact_level=0):
+        compact_level = max(0, min(2, int(compact_level)))
+        if compact_level <= 0:
+            lines = [
+                (self.tiny_font, "title"),
+                (self.small_font, f"{side_info['side']} side"),
+                (self.medium_font, side_info["name"]),
+            ]
+            if side_info["is_human"]:
+                lines.append((self.tiny_font, "Human player"))
+            else:
+                lines.extend(
+                    [
+                        (self.tiny_font, f"Ver: {side_info['version']}  |  Elo: {side_info['elo']}"),
+                        (
+                            self.tiny_font,
+                            f"Avg: {self._format_duration(side_info['avg_time'])}  |  Total: {self._format_duration(side_info['total_time'])}",
+                        ),
+                    ]
+                )
+            return lines
+
+        if compact_level == 1:
+            lines = [
+                (self.tiny_font, "title"),
+                (self.small_font, side_info["name"]),
+            ]
+            if side_info["is_human"]:
+                lines.append((self.tiny_font, f"{side_info['side']} side  |  Human"))
+            else:
+                lines.extend(
+                    [
+                        (self.tiny_font, f"{side_info['side']}  |  Elo: {side_info['elo']}"),
+                        (self.tiny_font, f"Avg: {self._format_duration(side_info['avg_time'])}"),
+                    ]
+                )
+            return lines
+
         lines = [
             (self.tiny_font, "title"),
-            (self.small_font, f"{side_info['side']} side"),
-            (self.medium_font, side_info["name"]),
+            (self.small_font, side_info["name"]),
         ]
         if side_info["is_human"]:
-            lines.append((self.tiny_font, "Type: Human"))
+            lines.append((self.tiny_font, f"{side_info['side']}  |  Human"))
         else:
-            lines.extend(
-                [
-                    (self.tiny_font, f"Version: {side_info['version']}"),
-                    (self.tiny_font, f"Elo: {side_info['elo']}"),
-                    (self.tiny_font, f"Avg: {self._format_duration(side_info['avg_time'])}"),
-                    (self.tiny_font, f"Total: {self._format_duration(side_info['total_time'])}"),
-                ]
+            lines.append(
+                (
+                    self.tiny_font,
+                    f"{side_info['side']}  |  Elo {side_info['elo']}  |  Avg {self._format_duration(side_info['avg_time'])}",
+                )
             )
         return lines
 
-    def _draw_player_card(self, rect, title, side_info, active=False):
+    def _draw_player_card(self, rect, title, side_info, active=False, compact_level=0):
         accent = (102, 168, 240) if active else (92, 109, 136)
         self._draw_card(rect, fill=(35, 43, 56), border=accent)
 
@@ -1056,7 +1226,7 @@ class ChessGUI:
         meta_color = (172, 185, 205)
         line_gap = max(5, self.tiny_font.get_height() // 3)
 
-        row_specs = self._player_card_lines(side_info)
+        row_specs = self._player_card_lines(side_info, compact_level=compact_level)
         for idx, (font, text) in enumerate(row_specs):
             if idx == 0:
                 rendered = font.render(title, True, subtitle_color)
@@ -1069,11 +1239,11 @@ class ChessGUI:
             self.canvas.blit(rendered, (inner_left, y))
             y += rendered.get_height() + line_gap
 
-    def _player_card_height(self, side_info):
+    def _player_card_height(self, side_info, compact_level=0):
         top_pad = 10
         bottom_pad = 12
         line_gap = max(5, self.tiny_font.get_height() // 3)
-        lines = self._player_card_lines(side_info)
+        lines = self._player_card_lines(side_info, compact_level=compact_level)
         total_height = top_pad + bottom_pad
         for idx, (font, _) in enumerate(lines):
             total_height += font.get_height()
@@ -1081,7 +1251,23 @@ class ChessGUI:
                 total_height += line_gap
         return total_height
 
-    def _draw_analysis_card(self, rect, color, active=False):
+    def _analysis_row_height(self):
+        return max(22, self.tiny_font.get_height() + 8)
+
+    def _analysis_card_height(self, color, row_limit=None):
+        if not self._side_has_analysis(color):
+            return 0
+        rows = list(self.analysis_cache_by_color.get(color, {}).get("rows", []))
+        if row_limit is None:
+            row_limit = ANALYSIS_DISPLAY_ROWS
+        row_limit = max(1, int(row_limit))
+        row_count = max(1, min(row_limit, len(rows)))
+        row_h = self._analysis_row_height()
+        return 18 + self.small_font.get_height() + 12 + row_count * (row_h + 2) + 10
+
+    def _draw_analysis_card(self, rect, color, active=False, row_limit=None):
+        if rect.height <= 0 or not self._side_has_analysis(color):
+            return
         label = "White" if color == chess.WHITE else "Black"
         cache = self.analysis_cache_by_color.get(color, {"rows": [], "fen": None})
         rows = list(cache.get("rows", []))
@@ -1089,19 +1275,24 @@ class ChessGUI:
         self._draw_card(rect, fill=(23, 30, 41), border=border)
         self.analysis_entry_buttons = [entry for entry in self.analysis_entry_buttons if entry.get("color") != color]
         self.canvas.blit(
-            self.small_font.render(f"Top 5 ruchow ({label})", True, TEXT_COLOR),
+            self.small_font.render(f"Top ruchy ({label})", True, TEXT_COLOR),
             (rect.left + 12, rect.top + 10),
         )
         if not rows:
+            empty_text = "Analiza pojawia sie, gdy AI jest na ruchu." if self.game_mode == "human_vs_ai" else "Brak danych analizy dla tej strony."
             self.canvas.blit(
-                self.tiny_font.render("Brak danych. Pojawia sie po ruchu tej strony.", True, (172, 185, 205)),
+                self.tiny_font.render(self._fit_text(self.tiny_font, empty_text, rect.width - 24), True, (172, 185, 205)),
                 (rect.left + 12, rect.top + 40),
             )
             return
 
         y = rect.top + 40
-        row_h = max(24, self.tiny_font.get_height() + 10)
-        for idx, row in enumerate(rows, start=1):
+        row_h = self._analysis_row_height()
+        if row_limit is None:
+            row_limit = ANALYSIS_DISPLAY_ROWS
+        row_limit = max(1, int(row_limit))
+        visible_rows = rows[:row_limit]
+        for idx, row in enumerate(visible_rows, start=1):
             row_rect = pygame.Rect(rect.left + 8, y - 2, rect.width - 16, row_h)
             probability = max(0.0, min(1.0, float(row.get("probability", 0.0))))
             if idx % 2 == 1:
@@ -1136,11 +1327,59 @@ class ChessGUI:
             )
             y += row_h + 2
 
-    def _analysis_card_height(self, color):
-        rows = list(self.analysis_cache_by_color.get(color, {}).get("rows", []))
-        row_count = max(1, min(5, len(rows)))
-        row_h = max(24, self.tiny_font.get_height() + 10)
-        return 18 + self.small_font.get_height() + 12 + row_count * (row_h + 2) + 10
+    def _resolve_left_panel_layout(self, panel, status_rect, top_info, bottom_info, top_display_color, bottom_display_color):
+        panel_inner_left = panel.left + 14
+        panel_inner_width = panel.width - 28
+        start_y = status_rect.bottom + 14
+        end_y = panel.bottom - 14
+        available_height = max(0, end_y - start_y)
+        top_has_analysis = self._side_has_analysis(top_display_color)
+        bottom_has_analysis = self._side_has_analysis(bottom_display_color)
+
+        candidates = []
+        for compact_level in (0, 1, 2):
+            top_card_h = self._player_card_height(top_info, compact_level=compact_level)
+            bottom_card_h = self._player_card_height(bottom_info, compact_level=compact_level)
+            for row_limit in range(ANALYSIS_DISPLAY_ROWS, 0, -1):
+                inner_gap = max(4, self.tiny_font.get_height() // 3 + 1 - compact_level)
+                top_group_h = top_card_h + ((inner_gap + self._analysis_card_height(top_display_color, row_limit=row_limit)) if top_has_analysis else 0)
+                bottom_group_h = bottom_card_h + ((inner_gap + self._analysis_card_height(bottom_display_color, row_limit=row_limit)) if bottom_has_analysis else 0)
+                total_height = top_group_h + bottom_group_h + inner_gap
+                candidates.append(
+                    {
+                        "compact_level": compact_level,
+                        "row_limit": row_limit,
+                        "inner_gap": inner_gap,
+                        "top_card_h": top_card_h,
+                        "bottom_card_h": bottom_card_h,
+                        "top_group_h": top_group_h,
+                        "bottom_group_h": bottom_group_h,
+                        "fits": total_height <= available_height,
+                        "overflow": total_height - available_height,
+                    }
+                )
+
+        layout = next((item for item in candidates if item["fits"]), None)
+        if layout is None and candidates:
+            layout = min(candidates, key=lambda item: item["overflow"])
+        return {
+            "panel_inner_left": panel_inner_left,
+            "panel_inner_width": panel_inner_width,
+            "start_y": start_y,
+            "end_y": end_y,
+            "available_height": available_height,
+            "top_has_analysis": top_has_analysis,
+            "bottom_has_analysis": bottom_has_analysis,
+            **(layout or {
+                "compact_level": 2,
+                "row_limit": 1,
+                "inner_gap": 4,
+                "top_card_h": self._player_card_height(top_info, compact_level=2),
+                "bottom_card_h": self._player_card_height(bottom_info, compact_level=2),
+                "top_group_h": self._player_card_height(top_info, compact_level=2),
+                "bottom_group_h": self._player_card_height(bottom_info, compact_level=2),
+            }),
+        }
 
     @staticmethod
     def _lerp_color(color_a, color_b, t):
@@ -1196,7 +1435,8 @@ class ChessGUI:
         pygame.draw.rect(self.canvas, (12, 16, 24), shadow_rect, border_radius=8)
         pygame.draw.rect(self.canvas, fill, animated_rect, border_radius=8)
         pygame.draw.rect(self.canvas, border, animated_rect, width=1, border_radius=8)
-        text = self.small_font.render(label, True, text_color)
+        label_text = self._fit_text(self.small_font, label, animated_rect.width - 14)
+        text = self.small_font.render(label_text, True, text_color)
         self.canvas.blit(text, text.get_rect(center=animated_rect.center))
 
     def _scaled_piece_icon(self, symbol, target_size, fill_ratio=0.84):
@@ -1257,33 +1497,81 @@ class ChessGUI:
             (status_rect.left + 12, status_rect.top + 40),
         )
 
-        panel_inner_left = panel.left + 14
-        panel_inner_width = panel.width - 28
-        top_card_h = self._player_card_height(top_info)
-        bottom_card_h = self._player_card_height(bottom_info)
-        top_analysis_h = self._analysis_card_height(top_display_color)
-        bottom_analysis_h = self._analysis_card_height(bottom_display_color)
-        gap = max(10, self.tiny_font.get_height() // 2 + 4)
-        top_card = pygame.Rect(panel_inner_left, status_rect.bottom + 14, panel_inner_width, top_card_h)
-        top_analysis_rect = pygame.Rect(panel_inner_left, top_card.bottom + gap, panel_inner_width, top_analysis_h)
-        bottom_card = pygame.Rect(panel_inner_left, panel.bottom - 14 - bottom_card_h, panel_inner_width, bottom_card_h)
-        bottom_analysis_rect = pygame.Rect(
-            panel_inner_left,
-            bottom_card.top - gap - bottom_analysis_h,
-            panel_inner_width,
-            bottom_analysis_h,
+        layout = self._resolve_left_panel_layout(
+            panel,
+            status_rect,
+            top_info,
+            bottom_info,
+            top_display_color,
+            bottom_display_color,
         )
-        self._draw_player_card(top_card, "Top board side", top_info, active=self.board.turn == top_display_color)
-        self._draw_player_card(bottom_card, "Bottom board side", bottom_info, active=self.board.turn == bottom_display_color)
-        available_gap = bottom_analysis_rect.top - top_analysis_rect.bottom
-        if available_gap < 8:
-            compressed_gap = max(6, gap - max(0, (8 - available_gap) // 2))
-            top_analysis_rect.top = top_card.bottom + compressed_gap
-            top_analysis_rect.height = top_analysis_h
-            bottom_analysis_rect.top = bottom_card.top - compressed_gap - bottom_analysis_h
-        if top_analysis_rect.bottom <= bottom_analysis_rect.top - 4:
-            self._draw_analysis_card(top_analysis_rect, top_display_color, active=self.board.turn == top_display_color)
-            self._draw_analysis_card(bottom_analysis_rect, bottom_display_color, active=self.board.turn == bottom_display_color)
+        panel_inner_left = layout["panel_inner_left"]
+        panel_inner_width = layout["panel_inner_width"]
+        compact_level = layout["compact_level"]
+        row_limit = layout["row_limit"]
+        gap = layout["inner_gap"]
+
+        top_card = pygame.Rect(
+            panel_inner_left,
+            layout["start_y"],
+            panel_inner_width,
+            layout["top_card_h"],
+        )
+        current_y = top_card.bottom
+        top_analysis_rect = None
+        if layout["top_has_analysis"]:
+            current_y += gap
+            top_analysis_rect = pygame.Rect(
+                panel_inner_left,
+                current_y,
+                panel_inner_width,
+                self._analysis_card_height(top_display_color, row_limit=row_limit),
+            )
+            current_y = top_analysis_rect.bottom
+
+        bottom_card = pygame.Rect(
+            panel_inner_left,
+            layout["end_y"] - layout["bottom_card_h"],
+            panel_inner_width,
+            layout["bottom_card_h"],
+        )
+        bottom_analysis_rect = None
+        if layout["bottom_has_analysis"]:
+            bottom_analysis_rect = pygame.Rect(
+                panel_inner_left,
+                bottom_card.top - gap - self._analysis_card_height(bottom_display_color, row_limit=row_limit),
+                panel_inner_width,
+                self._analysis_card_height(bottom_display_color, row_limit=row_limit),
+            )
+
+        self._draw_player_card(
+            top_card,
+            "Top board side",
+            top_info,
+            active=self.board.turn == top_display_color,
+            compact_level=compact_level,
+        )
+        if top_analysis_rect is not None:
+            self._draw_analysis_card(
+                top_analysis_rect,
+                top_display_color,
+                active=self.board.turn == top_display_color,
+                row_limit=row_limit,
+            )
+        if bottom_analysis_rect is not None:
+            self._draw_analysis_card(
+                bottom_analysis_rect,
+                bottom_display_color,
+                active=self.board.turn == bottom_display_color,
+                row_limit=row_limit,
+            )
+        self._draw_player_card(
+            bottom_card,
+            "Bottom board side",
+            bottom_info,
+            active=self.board.turn == bottom_display_color,
+            compact_level=compact_level,
+        )
 
     def _draw_right_panel(self):
         panel = self.right_panel_rect
@@ -1695,19 +1983,10 @@ class ChessGUI:
         self.board_history = rebuilt_history
         self.move_history = rebuilt_moves
         self.move_san_history = rebuilt_san
-        self.selected_square = None
-        self.legal_moves = []
-        self.ai_thinking = False
-        self.ai_thinking_color = None
-        self.ai_thinking_started_at = None
-        self.ai_pause_started_at = None
         self.game_over = self.board.is_game_over()
-        self.ai_paused = self.game_mode == "ai_vs_ai" and not self.game_over
         self.current_game_saved = False
-        self.selected_history_ply = None
-        self.selected_analysis_move = None
-        self.preview_move = None
-        self.history_scroll_rows = 0
+        self._reset_selection_state()
+        self._reset_ai_state(paused=self.game_mode == "ai_vs_ai" and not self.game_over)
         self._sync_mcts_histories()
         self._refresh_analysis_cache()
         return len(original_moves) - target_ply
@@ -1728,15 +2007,10 @@ class ChessGUI:
             undone += 1
 
         if undone > 0:
-            self.selected_square = None
-            self.legal_moves = []
-            self.ai_thinking = False
-            self.game_over = False
             self.current_game_saved = False
-            self.selected_history_ply = None
-            self.selected_analysis_move = None
-            self.preview_move = None
-            self.history_scroll_rows = 0
+            self.game_over = self.board.is_game_over()
+            self._reset_selection_state()
+            self._reset_ai_state(paused=self.game_mode == "ai_vs_ai" and not self.game_over)
             self._sync_mcts_histories()
             self._refresh_analysis_cache()
 
@@ -1905,7 +2179,6 @@ class ChessGUI:
         # Pad with ZEROS if not enough history (matching training data!)
         while len(tensors) < history_positions:
             #  v4.4 FIX: Use zeros, not chess.Board() - matches BinaryChessDataset padding
-            import numpy as np
             empty_tensor = np.zeros((16, 8, 8), dtype=np.float32)
             tensors.insert(0, empty_tensor)
         
@@ -1915,7 +2188,6 @@ class ChessGUI:
         
         # Stack: [oldest_history, ..., newest_history, current]
         # Shape: (16 * (history_positions + 1), 8, 8)
-        import numpy as np
         return np.concatenate(tensors, axis=0)
     
     def _get_network_move(self, model):
@@ -2012,33 +2284,20 @@ class ChessGUI:
 
         self.board = chess.Board()
         self.initial_fen = self.board.fen()
-        self.selected_square = None
-        self.legal_moves = []
-        self.ai_thinking = False
         self.game_over = False
         self.move_history = []
         self.move_san_history = []
         self.board_history = []  #  Clear board history
         self.current_game_saved = False
-        self.history_scroll_rows = 0
-        self.selected_history_ply = None
-        self.selected_analysis_move = None
-        self.ai_paused = False
-        self.ai_thinking_color = None
-        self.ai_thinking_started_at = None
-        self.ai_pause_started_at = None
-        self.preview_move = None
+        self._reset_selection_state()
+        self._reset_ai_state(paused=False)
         
         #  v4.2: Reset MCTS trees and histories
         if self.mcts1:
             self.mcts1.reset_tree()
         if self.mcts2:
             self.mcts2.reset_tree()
-        self.analysis_cache = {"fen": None, "rows": [], "side": None, "label": ""}
-        self.analysis_cache_by_color = {
-            chess.WHITE: {"rows": [], "label": "White", "fen": None},
-            chess.BLACK: {"rows": [], "label": "Black", "fen": None},
-        }
+        self._reset_analysis_storage()
         self._refresh_analysis_cache()
     
     def run(self):
@@ -2072,7 +2331,10 @@ class ChessGUI:
                     running = False
 
                 elif event.type == pygame.VIDEORESIZE:
-                    self._set_window_size(event.w, event.h)
+                    if self.maximized:
+                        self._sync_window_surface()
+                    else:
+                        self._set_window_size(event.w, event.h)
 
                 elif event.type == pygame.MOUSEWHEEL:
                     mapped_pos = self._window_to_canvas(pygame.mouse.get_pos())
@@ -2097,8 +2359,6 @@ class ChessGUI:
                         self.restart_game()
                     elif event.key == pygame.K_u:
                         self.undo_moves()
-                    elif event.key == pygame.K_F11:
-                        self._toggle_maximized()
                     elif event.key == pygame.K_ESCAPE:
                         if self.board.is_game_over():
                             self._save_current_game()
@@ -2132,7 +2392,11 @@ class ChessGUI:
             self._update_mouse_cursor(self.hover_any_button)
 
             self.screen.fill(APP_BG)
-            self.screen.blit(self.canvas, (0, 0))
+            if self.viewport_rect.size == (self.base_width, self.base_height):
+                self.screen.blit(self.canvas, self.viewport_rect.topleft)
+            else:
+                scaled = pygame.transform.smoothscale(self.canvas, self.viewport_rect.size)
+                self.screen.blit(scaled, self.viewport_rect.topleft)
 
             pygame.display.flip()
         self._update_mouse_cursor(False)
@@ -2186,21 +2450,15 @@ def main():
             config,
             default_use_mcts=default_use_mcts,
             initial_window_size=last_window_size,
-            initial_window_maximized=True,
+            initial_window_maximized=last_window_maximized,
         )
         if setup is None:
             print("Setup cancelled. Exiting.")
             break
 
-        setup_window_size = setup.get("window_size")
-        if isinstance(setup_window_size, (list, tuple)) and len(setup_window_size) == 2:
-            try:
-                last_window_size = [
-                    max(WINDOW_MIN_WIDTH, int(setup_window_size[0])),
-                    max(WINDOW_MIN_HEIGHT, int(setup_window_size[1])),
-                ]
-            except (TypeError, ValueError):
-                pass
+        setup_window_size = _normalize_window_size(setup.get("window_size"))
+        if setup_window_size is not None:
+            last_window_size = setup_window_size
         last_window_maximized = bool(setup.get("window_maximized", False))
 
         model1_path = setup["model1_path"]
@@ -2284,7 +2542,7 @@ def main():
             model2_name=model2_path.name if model2_path else None,
             console_verbose=verbose_console,
             initial_window_size=last_window_size,
-            initial_window_maximized=True,
+            initial_window_maximized=last_window_maximized,
             model1_meta=model1_meta,
             model2_meta=model2_meta,
             use_mcts_white=setup_use_mcts_white,
@@ -2326,15 +2584,9 @@ def main():
 
         exit_action = gui.run()
         state = gui.get_window_state()
-        gui_window_size = state.get("window_size")
-        if isinstance(gui_window_size, (list, tuple)) and len(gui_window_size) == 2:
-            try:
-                last_window_size = [
-                    max(WINDOW_MIN_WIDTH, int(gui_window_size[0])),
-                    max(WINDOW_MIN_HEIGHT, int(gui_window_size[1])),
-                ]
-            except (TypeError, ValueError):
-                pass
+        gui_window_size = _normalize_window_size(state.get("window_size"))
+        if gui_window_size is not None:
+            last_window_size = gui_window_size
         last_window_maximized = bool(state.get("window_maximized", last_window_maximized))
         if exit_action == "menu":
             if verbose_console:

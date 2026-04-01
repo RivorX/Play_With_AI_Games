@@ -17,34 +17,78 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent.parent))
 
 from utils.shared.model_catalog import load_checkpoint_metadata
+from utils.ui.gui_helpers import create_piece_surfaces, start_piece_asset_prefetch
 
 
-_SETUP_BG = (12, 16, 22)
-_PANEL_BG = (24, 31, 42)
-_CARD_BG = (32, 40, 54)
-_TEXT = (241, 245, 251)
-_MUTED = (151, 165, 184)
+def _enable_windows_dpi_awareness():
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_enable_windows_dpi_awareness()
+
+
+_SETUP_BG = (9, 12, 18)
+_PANEL_BG = (19, 25, 35)
+_CARD_BG = (29, 37, 50)
+_TEXT = (246, 249, 255)
+_MUTED = (180, 194, 214)
 _ACCENT = (82, 155, 255)
 _ACCENT_BORDER = (145, 193, 255)
-_BORDER = (78, 96, 122)
+_BORDER = (96, 118, 150)
 _DANGER = (177, 83, 83)
-_GLOW = (43, 92, 173)
+_GLOW = (55, 109, 205)
 _CATEGORY_STYLE = {
-    "best": {"label": "BEST models", "fill": (44, 82, 69), "border": (99, 182, 140)},
-    "il": {"label": "IL models", "fill": (44, 64, 98), "border": (108, 149, 221)},
-    "rl": {"label": "RL models", "fill": (89, 67, 42), "border": (191, 145, 87)},
-    "other": {"label": "Other models", "fill": (62, 61, 77), "border": (135, 137, 162)},
+    "best": {"label": "BEST models", "fill": (40, 82, 67), "border": (112, 199, 155)},
+    "il": {"label": "IL models", "fill": (39, 64, 102), "border": (122, 168, 244)},
+    "rl": {"label": "RL models", "fill": (95, 69, 38), "border": (214, 162, 93)},
+    "other": {"label": "Other models", "fill": (63, 63, 82), "border": (152, 156, 181)},
 }
+_SETUP_PIECE_SURFACES = {}
 
 
-def _maximize_native_window():
-    """Ask the OS to maximize the current window when available."""
+def _position_native_window(width, height):
+    """Move the current window to the top-left corner with an exact size."""
+    window_handle = _get_native_window_handle()
+    if not window_handle:
+        return False
+
     try:
-        wm_info = pygame.display.get_wm_info()
+        user32 = ctypes.windll.user32
+        swp_framechanged = 0x0020
+        swp_showwindow = 0x0040
+        user32.SetWindowPos(
+            int(window_handle),
+            0,
+            0,
+            0,
+            int(width),
+            int(height),
+            swp_framechanged | swp_showwindow,
+        )
+        return True
     except Exception:
         return False
 
-    window_handle = wm_info.get("window")
+
+def _get_native_window_handle():
+    try:
+        wm_info = pygame.display.get_wm_info()
+    except Exception:
+        return None
+    return wm_info.get("window")
+
+
+def _maximize_native_window():
+    """Maximize the current window using the native window handle."""
+    window_handle = _get_native_window_handle()
     if not window_handle:
         return False
 
@@ -53,8 +97,6 @@ def _maximize_native_window():
         return True
     except Exception:
         return False
-
-
 def _lerp_color(color_a, color_b, t):
     t = max(0.0, min(1.0, float(t)))
     return tuple(int(color_a[idx] + (color_b[idx] - color_a[idx]) * t) for idx in range(3))
@@ -75,6 +117,33 @@ def _draw_panel(screen, rect, fill=None, border=None, radius=18, shadow=True, fi
         pygame.draw.rect(fill_surface, (*fill, int(max(0, min(255, fill_alpha)))), fill_surface.get_rect(), border_radius=radius)
         screen.blit(fill_surface, rect.topleft)
     pygame.draw.rect(screen, border, rect, width=1, border_radius=radius)
+
+
+def _get_setup_piece_surfaces(square_size):
+    cache_key = max(1, int(square_size))
+    cached = _SETUP_PIECE_SURFACES.get(cache_key)
+    if cached is None:
+        cached = create_piece_surfaces(cache_key)
+        _SETUP_PIECE_SURFACES[cache_key] = cached
+    return cached
+
+
+def _scaled_setup_piece_icon(symbol, target_size, fill_ratio=0.82):
+    surface = _get_setup_piece_surfaces(target_size).get(symbol)
+    if surface is None:
+        return None
+    bbox = surface.get_bounding_rect(min_alpha=1)
+    if bbox.width <= 0 or bbox.height <= 0:
+        return pygame.transform.smoothscale(surface, (target_size, target_size))
+    cropped = surface.subsurface(bbox).copy()
+    target_inner = max(1, int(target_size * fill_ratio))
+    scale = min(target_inner / cropped.get_width(), target_inner / cropped.get_height())
+    new_w = max(1, int(cropped.get_width() * scale))
+    new_h = max(1, int(cropped.get_height() * scale))
+    scaled = pygame.transform.smoothscale(cropped, (new_w, new_h))
+    canvas = pygame.Surface((target_size, target_size), pygame.SRCALPHA)
+    canvas.blit(scaled, ((target_size - new_w) // 2, (target_size - new_h) // 2))
+    return canvas
 
 
 _MODEL_ARCH_KEYS = [
@@ -303,14 +372,18 @@ def _group_models(all_models):
     grouped = {"best": [], "il": [], "rl": [], "other": []}
 
     for model_path in all_models:
-        name = model_path.name.lower()
         parts = [part.lower() for part in model_path.parts]
+        try:
+            models_idx = parts.index("models")
+            rel_parts = parts[models_idx + 1 :]
+        except ValueError:
+            rel_parts = [model_path.name.lower()]
 
-        if "best_model" in name:
+        if len(rel_parts) <= 1:
             grouped["best"].append(model_path)
-        elif "il" in parts:
+        elif rel_parts[0] == "il":
             grouped["il"].append(model_path)
-        elif "rl" in parts:
+        elif rel_parts[0] == "rl":
             grouped["rl"].append(model_path)
         else:
             grouped["other"].append(model_path)
@@ -533,73 +606,75 @@ def _draw_button(
     danger=False,
 ):
     if disabled:
-        fill = (46, 53, 64)
-        text_color = (114, 124, 139)
-        border = (66, 76, 92)
+        fill = (52, 60, 73)
+        text_color = (138, 149, 167)
+        border = (82, 94, 114)
     elif danger:
-        fill = _DANGER if active else (144, 73, 73)
+        fill = _DANGER if active else (152, 73, 73)
         text_color = _TEXT
-        border = (214, 121, 121)
+        border = (224, 136, 136)
     elif active:
         fill = _ACCENT
         text_color = (247, 250, 255)
         border = _ACCENT_BORDER
     elif hovered:
-        fill = (41, 50, 64)
+        fill = (45, 56, 72)
         text_color = _TEXT
-        border = (109, 128, 157)
+        border = (126, 149, 183)
     else:
-        fill = (30, 38, 50)
+        fill = (32, 41, 55)
         text_color = _TEXT
         border = _BORDER
 
     shadow = rect.move(0, 2)
-    pygame.draw.rect(screen, (9, 12, 18), shadow, border_radius=10)
+    pygame.draw.rect(screen, (7, 10, 16), shadow, border_radius=10)
     pygame.draw.rect(screen, fill, rect, border_radius=10)
     pygame.draw.rect(screen, border, rect, width=1, border_radius=10)
-    label = font.render(text, True, text_color)
+    label_text = _fit_text(font, text, max(24, rect.width - 16))
+    label = font.render(label_text, True, text_color)
     screen.blit(label, label.get_rect(center=rect.center))
 
 
 def _draw_chip(screen, rect, text, font, tone="neutral"):
     if tone == "accent":
-        fill = (42, 77, 124)
-        border = (116, 177, 255)
-        text_color = (229, 241, 255)
+        fill = (46, 84, 136)
+        border = (132, 190, 255)
+        text_color = (238, 246, 255)
     elif tone == "ok":
-        fill = (43, 89, 72)
-        border = (106, 184, 147)
-        text_color = (227, 246, 236)
+        fill = (44, 96, 76)
+        border = (118, 199, 159)
+        text_color = (234, 249, 240)
     else:
-        fill = (32, 39, 52)
-        border = (87, 108, 138)
-        text_color = (220, 228, 241)
+        fill = (35, 44, 58)
+        border = (103, 127, 161)
+        text_color = (230, 238, 249)
     pygame.draw.rect(screen, fill, rect, border_radius=12)
     pygame.draw.rect(screen, border, rect, width=1, border_radius=12)
-    label = font.render(text, True, text_color)
+    label_text = _fit_text(font, text, max(24, rect.width - 16))
+    label = font.render(label_text, True, text_color)
     screen.blit(label, label.get_rect(center=rect.center))
 
 
 def _draw_gear_button(screen, rect, hovered=False, active=False, disabled=False):
     if disabled:
-        fill = (54, 60, 69)
-        border = (68, 77, 89)
-        icon = (118, 127, 141)
+        fill = (56, 63, 74)
+        border = (82, 92, 107)
+        icon = (137, 146, 161)
     elif active:
         fill = _ACCENT
         border = _ACCENT_BORDER
         icon = (245, 250, 255)
     elif hovered:
-        fill = (41, 50, 64)
-        border = (109, 128, 157)
-        icon = (234, 241, 252)
+        fill = (45, 56, 72)
+        border = (126, 149, 183)
+        icon = (240, 246, 255)
     else:
-        fill = (30, 38, 50)
+        fill = (32, 41, 55)
         border = _BORDER
-        icon = (210, 221, 240)
+        icon = (223, 232, 246)
 
     shadow = rect.move(0, 2)
-    pygame.draw.rect(screen, (9, 12, 18), shadow, border_radius=10)
+    pygame.draw.rect(screen, (7, 10, 16), shadow, border_radius=10)
     pygame.draw.rect(screen, fill, rect, border_radius=10)
     pygame.draw.rect(screen, border, rect, width=1, border_radius=10)
 
@@ -632,33 +707,62 @@ def _draw_selection_card(
     metadata_cache=None,
     active=False,
     hovered=False,
+    side_color=None,
 ):
-    if active:
-        fill = (28, 49, 78)
-        border = (134, 188, 255)
-        title_color = (242, 248, 255)
-    elif hovered:
-        fill = (29, 38, 50)
-        border = (102, 123, 151)
-        title_color = _TEXT
+    if side_color == chess.WHITE:
+        fill = (238, 240, 244)
+        border = (168, 177, 192)
+        title_color = (20, 24, 31)
+        meta_color = (58, 65, 78)
+        line3_color = (48, 56, 68)
+        top_band_fill = (221, 226, 233)
+        top_band_text_color = (12, 17, 24)
+    elif side_color == chess.BLACK:
+        fill = (19, 24, 33)
+        border = (86, 101, 126)
+        title_color = (241, 245, 251)
+        meta_color = (176, 189, 208)
+        line3_color = (231, 239, 250)
+        top_band_fill = (6, 8, 12)
+        top_band_text_color = (244, 247, 252)
     else:
         fill = (22, 29, 39)
         border = _BORDER
         title_color = _TEXT
+        meta_color = _MUTED
+        line3_color = (216, 228, 244)
+        top_band_fill = _lerp_color(fill, border, 0.18)
+        top_band_text_color = (214, 226, 244)
+
+    if hovered:
+        fill = _lerp_color(fill, (255, 255, 255), 0.06 if side_color == chess.WHITE else 0.08)
+        border = _lerp_color(border, _ACCENT_BORDER, 0.35)
+    if active:
+        border = (134, 188, 255) if side_color != chess.WHITE else (105, 142, 204)
+        fill = _lerp_color(fill, (82, 155, 255), 0.10 if side_color == chess.WHITE else 0.18)
+        glow_rect = rect.inflate(10, 10)
+        glow_surface = pygame.Surface((glow_rect.width, glow_rect.height), pygame.SRCALPHA)
+        glow_color = (82, 155, 255, 56) if side_color != chess.WHITE else (72, 124, 214, 44)
+        pygame.draw.rect(glow_surface, glow_color, glow_surface.get_rect(), border_radius=18)
+        screen.blit(glow_surface, glow_rect.topleft)
 
     _draw_panel(screen, rect, fill=fill, border=border, radius=14, shadow=False)
-    top_band_h = max(24, font_meta.get_height() + 10)
+    if active:
+        pygame.draw.rect(screen, _ACCENT_BORDER, rect, width=2, border_radius=14)
+    top_band_h = max(34, font_title.get_height() + 14)
     top_band = pygame.Rect(rect.left + 1, rect.top + 1, rect.width - 2, top_band_h)
-    pygame.draw.rect(screen, _lerp_color(fill, border, 0.18), top_band, border_top_left_radius=14, border_top_right_radius=14)
-    chip_text = title.upper()
-    chip_pad_x = 12
-    chip_h = max(20, font_meta.get_height() + 8)
-    chip_w = min(rect.width - 28, max(96, font_meta.size(chip_text)[0] + chip_pad_x * 2))
-    label_chip = pygame.Rect(rect.left + 14, top_band.bottom + 8, chip_w, chip_h)
-    pygame.draw.rect(screen, (18, 24, 33), label_chip, border_radius=10)
-    pygame.draw.rect(screen, _lerp_color(border, (255, 255, 255), 0.15), label_chip, width=1, border_radius=10)
-    chip_label = font_meta.render(chip_text, True, (208, 222, 242))
-    screen.blit(chip_label, chip_label.get_rect(center=label_chip.center))
+    pygame.draw.rect(screen, top_band_fill, top_band, border_top_left_radius=14, border_top_right_radius=14)
+    band_label = font_title.render(title.upper(), True, top_band_text_color)
+    screen.blit(band_label, (rect.left + 16, top_band.centery - band_label.get_height() // 2))
+    if active:
+        badge_text = font_meta.render("SELECTED", True, (246, 250, 255))
+        badge_w = badge_text.get_width() + 18
+        badge_h = max(22, badge_text.get_height() + 8)
+        badge_rect = pygame.Rect(rect.right - badge_w - 14, top_band.centery - badge_h // 2, badge_w, badge_h)
+        badge_fill = (57, 111, 196) if side_color == chess.WHITE else (70, 144, 240)
+        pygame.draw.rect(screen, badge_fill, badge_rect, border_radius=badge_h // 2)
+        pygame.draw.rect(screen, _ACCENT_BORDER, badge_rect, width=1, border_radius=badge_h // 2)
+        screen.blit(badge_text, badge_text.get_rect(center=badge_rect.center))
 
     if model_path is None:
         line1 = "No model selected"
@@ -691,22 +795,31 @@ def _draw_selection_card(
                 pass
         line3 = "  |  ".join(line3_parts) if line3_parts else "Checkpoint metadata ready"
 
-    text_left = rect.left + 14
+    content_top = top_band.bottom + 12
+    icon_size = max(72, min(104, rect.bottom - content_top - 12))
+    icon_rect = pygame.Rect(rect.left + 14, content_top, icon_size, icon_size)
+    if side_color in (chess.WHITE, chess.BLACK):
+        symbol = "K" if side_color == chess.WHITE else "k"
+        piece_surface = _scaled_setup_piece_icon(symbol, icon_size, fill_ratio=0.94)
+        if piece_surface is not None:
+            screen.blit(piece_surface, piece_surface.get_rect(center=icon_rect.center))
+
+    text_left = icon_rect.right + 12 if side_color in (chess.WHITE, chess.BLACK) else rect.left + 14
     text_right_pad = 14
     text_width = max(40, rect.right - text_left - text_right_pad)
-    line1_y = label_chip.bottom + 10
+    line1_y = content_top + 2
     line2_y = line1_y + font_text.get_height() + 4
     line3_y = line2_y + font_meta.get_height() + 4
     screen.blit(font_text.render(_fit_text(font_text, line1, text_width), True, title_color), (text_left, line1_y))
-    screen.blit(font_meta.render(_fit_text(font_meta, line2, text_width), True, _MUTED), (text_left, line2_y))
-    screen.blit(font_meta.render(_fit_text(font_meta, line3, text_width), True, (216, 228, 244)), (text_left, line3_y))
+    screen.blit(font_meta.render(_fit_text(font_meta, line2, text_width), True, meta_color), (text_left, line2_y))
+    screen.blit(font_meta.render(_fit_text(font_meta, line3, text_width), True, line3_color), (text_left, line3_y))
 
 
-def _selection_card_height(font_text, font_meta):
+def _selection_card_height(font_label, font_text, font_meta):
     """Resolve selection-card height from actual typography metrics."""
-    top_band_h = max(24, font_meta.get_height() + 10)
-    chip_h = max(20, font_meta.get_height() + 8)
-    return top_band_h + 8 + chip_h + 10 + font_text.get_height() + 4 + font_meta.get_height() + 4 + font_meta.get_height() + 14
+    top_band_h = max(34, font_label.get_height() + 14)
+    text_block_h = font_text.get_height() + 4 + font_meta.get_height() + 4 + font_meta.get_height()
+    return top_band_h + 12 + max(72, text_block_h + 8) + 12
 
 
 def _fit_text(font, text, max_width):
@@ -729,28 +842,9 @@ def _fmt_float(value, pattern):
         return "n/a"
 
 
-def _draw_model_info_panel(
-    screen,
-    rect,
-    model_path,
-    models_dir,
-    metadata_cache,
-    font_h2,
-    font_text,
-    font_meta,
-):
-    _draw_panel(screen, rect, fill=(24, 31, 41), border=_BORDER, radius=16, shadow=False, fill_alpha=210)
-    header_chip = pygame.Rect(rect.left + 16, rect.top + 14, 108, 22)
-    pygame.draw.rect(screen, (18, 24, 33), header_chip, border_radius=11)
-    pygame.draw.rect(screen, (83, 104, 132), header_chip, width=1, border_radius=11)
-    chip_text = font_meta.render("MODEL INFO", True, (211, 224, 243))
-    screen.blit(chip_text, chip_text.get_rect(center=header_chip.center))
-
+def _get_model_info_content(model_path, models_dir, metadata_cache):
     if model_path is None:
-        screen.blit(font_text.render("No model selected", True, _MUTED), (rect.left + 16, rect.top + 54))
-        screen.blit(font_meta.render("Click a model on the left list.", True, _MUTED), (rect.left + 16, rect.top + 80))
-        return
-
+        return None, None, None, [], [("Elo", "n/a"), ("Top1", "n/a"), ("Epoch", "n/a")]
     metadata = metadata_cache.get(model_path)
     if metadata is None:
         metadata = load_checkpoint_metadata(model_path, models_dir)
@@ -758,9 +852,6 @@ def _draw_model_info_panel(
 
     name = metadata.get("model_name") or model_path.name
     rel = metadata.get("path_rel") or _short_model_path(model_path, models_dir, max_len=64)
-    title_y = rect.top + 48
-    screen.blit(font_text.render(_fit_text(font_text, name, rect.width - 32), True, _TEXT), (rect.left + 16, title_y))
-    screen.blit(font_meta.render(_fit_text(font_meta, rel, rect.width - 32), True, _MUTED), (rect.left + 16, title_y + 24))
 
     epoch = metadata.get("epoch")
     epoch_value = str(int(epoch) + 1) if epoch is not None else "n/a"
@@ -790,9 +881,51 @@ def _draw_model_info_panel(
         ("Top1", top1_value),
         ("Epoch", epoch_value),
     ]
+    return metadata, name, rel, rows, top_stats
+
+
+def _model_info_panel_height(model_path, models_dir, metadata_cache, font_h2, font_text, font_meta):
+    if model_path is None:
+        return 110
+    _, _, _, rows, _ = _get_model_info_content(model_path, models_dir, metadata_cache)
+    row_h = max(24, font_meta.get_height() + 10)
+    header_h = 52 + font_text.get_height() + 14
+    stat_block_h = 52 + 16
+    table_height = 8 + len(rows) * row_h + 8
+    return header_h + stat_block_h + table_height + 12
+
+
+def _draw_model_info_panel(
+    screen,
+    rect,
+    model_path,
+    models_dir,
+    metadata_cache,
+    font_h2,
+    font_text,
+    font_meta,
+):
+    _draw_panel(screen, rect, fill=(24, 31, 41), border=_BORDER, radius=16, shadow=False, fill_alpha=210)
+    header_chip = pygame.Rect(rect.left + 16, rect.top + 14, 108, 22)
+    pygame.draw.rect(screen, (18, 24, 33), header_chip, border_radius=11)
+    pygame.draw.rect(screen, (83, 104, 132), header_chip, width=1, border_radius=11)
+    chip_text = font_meta.render("MODEL INFO", True, (211, 224, 243))
+    screen.blit(chip_text, chip_text.get_rect(center=header_chip.center))
+
+    if model_path is None:
+        screen.blit(font_text.render("No model selected", True, _MUTED), (rect.left + 16, rect.top + 54))
+        screen.blit(font_meta.render("Click a model on the left list.", True, _MUTED), (rect.left + 16, rect.top + 80))
+        return
+
+    _, name, _rel, rows, top_stats = _get_model_info_content(model_path, models_dir, metadata_cache)
+    text_left = rect.left + 16
+    text_width = max(40, rect.width - 32)
+    name_y = rect.top + 52
+    screen.blit(font_text.render(_fit_text(font_text, name, text_width), True, _TEXT), (text_left, name_y))
+
     stat_gap = 10
     stat_w = (rect.width - 32 - stat_gap * 2) // 3
-    stat_y = rect.top + 98
+    stat_y = name_y + font_text.get_height() + 14
     for idx, (label, value) in enumerate(top_stats):
         stat_rect = pygame.Rect(rect.left + 16 + idx * (stat_w + stat_gap), stat_y, stat_w, 52)
         pygame.draw.rect(screen, (18, 24, 33), stat_rect, border_radius=12)
@@ -801,16 +934,16 @@ def _draw_model_info_panel(
         value_surface = font_h2.render(str(value), True, _TEXT)
         screen.blit(value_surface, (stat_rect.left + 12, stat_rect.top + 24))
 
-    table_rect = pygame.Rect(rect.left + 12, rect.top + 164, rect.width - 24, rect.height - 178)
+    row_h = max(24, font_meta.get_height() + 10)
+    table_y = stat_y + 52 + 16
+    table_height = 8 + len(rows) * row_h + 8
+    table_rect = pygame.Rect(rect.left + 12, table_y, rect.width - 24, table_height)
     pygame.draw.rect(screen, (19, 24, 33), table_rect, border_radius=12)
     pygame.draw.rect(screen, (67, 83, 108), table_rect, width=1, border_radius=12)
 
-    row_h = 26
     y = table_rect.top + 8
     label_w = 96
     for idx, (label, value) in enumerate(rows):
-        if y + row_h > table_rect.bottom - 4:
-            break
         stripe = pygame.Rect(table_rect.left + 6, y - 1, table_rect.width - 12, row_h - 2)
         stripe_fill = (24, 31, 42) if idx % 2 == 0 else (29, 37, 49)
         pygame.draw.rect(screen, stripe_fill, stripe, border_radius=8)
@@ -1106,6 +1239,29 @@ def _draw_model_browser(
     return actions, max_scroll
 
 
+def _model_browser_panel_height(grouped, expanded_state):
+    visible_keys = [key for key in ("best", "il", "rl", "other") if grouped[key]]
+    if not visible_keys:
+        return 76
+
+    pad = 10
+    header_h = 30
+    content_y = header_h + 8
+    header_row_h = 38
+    model_row_h = 44
+
+    for idx, key in enumerate(visible_keys):
+        if idx > 0:
+            content_y += 4
+        content_y += header_row_h + 8
+        if key == "best" or expanded_state.get(key, False):
+            content_y += len(grouped[key]) * (model_row_h + 5)
+            content_y += 4
+
+    content_height = content_y + 8
+    return content_height + (2 * pad + header_h + 6)
+
+
 def _selection_to_result(
     game_mode,
     human_color,
@@ -1209,13 +1365,17 @@ def select_models(
         except Exception:
             metadata_cache[model_path] = {}
 
-    base_width = 1360
-    base_height = 900
-    min_width = 980
-    min_height = 660
+    design_width = 1360
+    design_height = 900
+    base_width = design_width
+    base_height = design_height
+    canvas_min_width = 980
+    canvas_min_height = 660
+    min_width = 720
+    min_height = 540
     display_flags = pygame.RESIZABLE
 
-    def _get_display_window_size():
+    def _get_default_window_size():
         try:
             info = pygame.display.Info()
             screen_width = int(getattr(info, "current_w", 0) or 0)
@@ -1225,22 +1385,48 @@ def select_models(
             screen_height = 0
 
         if screen_width <= 0 or screen_height <= 0:
-            return base_width, base_height
+            return design_width, design_height
+
+        width = max(min_width, min(screen_width, int(screen_width * 0.92)))
+        height = max(min_height, min(screen_height, int(screen_height * 0.92)))
+        return width, height
+
+    def _get_display_window_size():
+        try:
+            user32 = ctypes.windll.user32
+            screen_width = int(user32.GetSystemMetrics(0) or 0)
+            screen_height = int(user32.GetSystemMetrics(1) or 0)
+        except Exception:
+            try:
+                info = pygame.display.Info()
+                screen_width = int(getattr(info, "current_w", 0) or 0)
+                screen_height = int(getattr(info, "current_h", 0) or 0)
+            except Exception:
+                screen_width = 0
+                screen_height = 0
+
+        if screen_width <= 0 or screen_height <= 0:
+            return default_window_width, default_window_height
 
         return (
             max(min_width, screen_width),
             max(min_height, screen_height),
         )
 
-    start_width = base_width
-    start_height = base_height
+    default_window_width, default_window_height = _get_default_window_size()
+    start_width = default_window_width
+    start_height = default_window_height
     if isinstance(initial_window_size, (list, tuple)) and len(initial_window_size) == 2:
-        iw = _safe_int(initial_window_size[0], default=base_width)
-        ih = _safe_int(initial_window_size[1], default=base_height)
-        start_width = max(min_width, int(iw or base_width))
-        start_height = max(min_height, int(ih or base_height))
+        iw = _safe_int(initial_window_size[0], default=default_window_width)
+        ih = _safe_int(initial_window_size[1], default=default_window_height)
+        start_width = max(min_width, int(iw or default_window_width))
+        start_height = max(min_height, int(ih or default_window_height))
 
-    screen = pygame.display.set_mode((start_width, start_height), display_flags)
+    existing_surface = pygame.display.get_surface()
+    if existing_surface is not None and existing_surface.get_size() == (start_width, start_height):
+        screen = existing_surface
+    else:
+        screen = pygame.display.set_mode((start_width, start_height), display_flags)
     pygame.display.set_caption("Chess AI Setup")
     try:
         pygame.display.set_window_minimum_size((min_width, min_height))
@@ -1250,8 +1436,8 @@ def select_models(
     def _build_background(width, height):
         surf = pygame.Surface((width, height))
         denom = max(1, height - 1)
-        top_color = (15, 20, 28)
-        bottom_color = (8, 11, 17)
+        top_color = (13, 18, 26)
+        bottom_color = (6, 9, 15)
         for y in range(height):
             t = y / denom
             color = _lerp_color(top_color, bottom_color, t)
@@ -1262,7 +1448,7 @@ def select_models(
         pygame.draw.circle(glow, (40, 166, 132, 22), (int(width * 0.88), int(height * 0.18)), int(min(width, height) * 0.18))
         surf.blit(glow, (0, 0))
 
-        grid_color = (255, 255, 255, 10)
+        grid_color = (255, 255, 255, 14)
         grid = pygame.Surface((width, height), pygame.SRCALPHA)
         step = 48
         for x in range(0, width, step):
@@ -1274,34 +1460,85 @@ def select_models(
 
     canvas = pygame.Surface((base_width, base_height))
     background = _build_background(base_width, base_height)
+    page_background = background
+    page_background_height = base_height
 
     viewport_rect = pygame.Rect(0, 0, base_width, base_height)
     viewport_scale_x = 1.0
     viewport_scale_y = 1.0
     maximized = False
     restore_window_size = (start_width, start_height)
+    page_scroll_y = 0
+    page_height = base_height
+    ui_scale = 1.0
+    font_title = None
+    font_h2 = None
+    font_text = None
+    font_meta = None
+    font_small = None
+    font_tiny = None
+    font_card_label = None
+    font_card_name = None
+    font_card_meta = None
+
+    def refresh_typography():
+        nonlocal ui_scale, font_title, font_h2, font_text, font_meta, font_small, font_tiny, font_card_label, font_card_name, font_card_meta
+        responsive_scale = min(base_width / design_width, base_height / design_height) * 0.90
+        ui_scale = max(0.72, min(1.04, responsive_scale))
+        font_title = pygame.font.SysFont("Segoe UI", max(28, int(round(46 * ui_scale))), bold=True)
+        font_h2 = pygame.font.SysFont("Segoe UI", max(18, int(round(24 * ui_scale))), bold=True)
+        font_text = pygame.font.SysFont("Segoe UI", max(14, int(round(19 * ui_scale))))
+        font_meta = pygame.font.SysFont("Segoe UI", max(12, int(round(15 * ui_scale))))
+        font_small = pygame.font.SysFont("Segoe UI", max(13, int(round(17 * ui_scale))))
+        font_tiny = pygame.font.SysFont("Segoe UI", max(11, int(round(14 * ui_scale))))
+        font_card_label = pygame.font.SysFont("Bahnschrift", max(16, int(round(20 * ui_scale))), bold=True)
+        font_card_name = pygame.font.SysFont("Segoe UI", max(15, int(round(21 * ui_scale))), bold=True)
+        font_card_meta = pygame.font.SysFont("Segoe UI", max(11, int(round(14 * ui_scale))))
 
     def resize_canvas(width, height):
-        nonlocal base_width, base_height, canvas, background
-        base_width = max(min_width, int(width))
-        base_height = max(min_height, int(height))
+        nonlocal base_width, base_height, canvas, background, page_background, page_background_height, page_height, page_scroll_y
+        base_width = max(canvas_min_width, int(width))
+        base_height = max(canvas_min_height, int(height))
         canvas = pygame.Surface((base_width, base_height))
         background = _build_background(base_width, base_height)
+        page_background = background
+        page_background_height = base_height
+        page_height = max(base_height, page_height)
+        page_scroll_y = 0
+        refresh_typography()
+
+    def get_page_background(height):
+        nonlocal page_background, page_background_height
+        if height == base_height:
+            return background
+        if page_background is None or page_background_height != height or page_background.get_width() != base_width:
+            page_background = _build_background(base_width, height)
+            page_background_height = height
+        return page_background
+
+    def clamp_page_scroll():
+        nonlocal page_scroll_y
+        max_scroll = max(0, page_height - base_height)
+        page_scroll_y = max(0, min(page_scroll_y, max_scroll))
+        return max_scroll
 
     def update_viewport():
         nonlocal viewport_rect, viewport_scale_x, viewport_scale_y
         win_w, win_h = screen.get_size()
-        viewport_rect = pygame.Rect(0, 0, win_w, win_h)
-        viewport_scale_x = win_w / max(1, base_width)
-        viewport_scale_y = win_h / max(1, base_height)
+        scale = min(win_w / max(1, base_width), win_h / max(1, base_height))
+        viewport_w = max(1, int(round(base_width * scale)))
+        viewport_h = max(1, int(round(base_height * scale)))
+        viewport_rect = pygame.Rect((win_w - viewport_w) // 2, (win_h - viewport_h) // 2, viewport_w, viewport_h)
+        viewport_scale_x = viewport_w / max(1, base_width)
+        viewport_scale_y = viewport_h / max(1, base_height)
 
     def window_to_ui(pos):
         if not viewport_rect.collidepoint(pos):
             return None
         x = int((pos[0] - viewport_rect.left) / max(0.0001, viewport_scale_x))
-        y = int((pos[1] - viewport_rect.top) / max(0.0001, viewport_scale_y))
+        y = int((pos[1] - viewport_rect.top) / max(0.0001, viewport_scale_y)) + page_scroll_y
         x = max(0, min(base_width - 1, x))
-        y = max(0, min(base_height - 1, y))
+        y = max(0, min(page_height - 1, y))
         return x, y
 
     def set_window_size(width, height):
@@ -1311,19 +1548,34 @@ def select_models(
         screen = pygame.display.set_mode((width, height), display_flags)
         restore_window_size = (width, height)
         maximized = False
+        pygame.event.pump()
+        _position_native_window(width, height)
         resize_canvas(width, height)
         update_viewport()
 
-    def toggle_maximized():
+    def sync_window_surface():
+        nonlocal screen
+        current_surface = pygame.display.get_surface()
+        if current_surface is not None:
+            screen = current_surface
+        resize_canvas(*screen.get_size())
+        update_viewport()
+
+    def set_window_maximized(enabled=True):
         nonlocal screen, maximized, restore_window_size
-        if not maximized:
-            restore_window_size = screen.get_size()
-            screen = pygame.display.set_mode(_get_display_window_size(), display_flags)
+        if enabled:
+            if not maximized:
+                restore_window_size = screen.get_size()
+            maximized_size = _get_display_window_size()
+            screen = pygame.display.set_mode(maximized_size, display_flags)
             pygame.event.pump()
+            _position_native_window(*maximized_size)
             _maximize_native_window()
             maximized = True
         else:
             screen = pygame.display.set_mode(restore_window_size, display_flags)
+            pygame.event.pump()
+            _position_native_window(*restore_window_size)
             maximized = False
         resize_canvas(*screen.get_size())
         update_viewport()
@@ -1331,22 +1583,17 @@ def select_models(
     resize_canvas(*screen.get_size())
     update_viewport()
     if bool(initial_window_maximized):
-        toggle_maximized()
+        set_window_maximized(True)
 
     def _with_window_state(payload):
         if payload is None:
             return None
         payload["window_size"] = [int(screen.get_width()), int(screen.get_height())]
         payload["window_maximized"] = bool(maximized)
+        payload["window_fullscreen"] = False
         return payload
 
     clock = pygame.time.Clock()
-    font_title = pygame.font.SysFont("Segoe UI", 46, bold=True)
-    font_h2 = pygame.font.SysFont("Segoe UI", 24, bold=True)
-    font_text = pygame.font.SysFont("Segoe UI", 19)
-    font_meta = pygame.font.SysFont("Segoe UI", 15)
-    font_small = pygame.font.SysFont("Segoe UI", 17)
-    font_tiny = pygame.font.SysFont("Segoe UI", 14)
 
     saved_preferences = load_play_preferences(base_dir, config)
     saved_game_mode = str(saved_preferences.get("game_mode") or "").strip().lower()
@@ -1458,23 +1705,91 @@ def select_models(
     while True:
         mapped_mouse = window_to_ui(pygame.mouse.get_pos())
         mouse_pos = mapped_mouse if mapped_mouse is not None else (-9999, -9999)
-        canvas.blit(background, (0, 0))
 
-        hero_rect = pygame.Rect(24, 16, base_width - 48, 118)
-        _draw_panel(canvas, hero_rect, fill=(22, 29, 39), border=(84, 103, 131), radius=22, shadow=True)
-        hero_band = pygame.Rect(hero_rect.left, hero_rect.top, hero_rect.width, 10)
-        pygame.draw.rect(canvas, _ACCENT, hero_band, border_top_left_radius=22, border_top_right_radius=22)
+        scale_px = lambda value, minimum=1: max(minimum, int(round(value * ui_scale)))
+        outer_pad = scale_px(24)
+        content_pad = scale_px(40)
+        small_gap = scale_px(14)
+        section_gap = scale_px(18)
+        tiny_gap = scale_px(10)
+        header_radius = scale_px(22)
+        current_selected_model = None
+        current_browser_height = None
+        if workspace_tab == "models" and game_mode != "human_vs_human":
+            if game_mode == "ai_vs_ai":
+                current_selected_model = selected_models.get(active_side)
+                current_browser_height = _model_browser_panel_height(grouped, expanded.get(active_side, {}))
+            else:
+                current_selected_model = opponent_model
+                current_browser_height = _model_browser_panel_height(grouped, expanded.get("opponent", {}))
+        predicted_workspace_label_y = scale_px(258 if game_mode != "human_vs_ai" else 340)
+        predicted_tabs_y = predicted_workspace_label_y + section_gap
+        predicted_content_top = predicted_tabs_y + scale_px(46)
+        footer_gap = scale_px(20)
+        footer_stack_height = scale_px(78)
+        footer_top = None
+        if workspace_tab == "settings":
+            workspace_min_height = scale_px(420 if game_mode == "ai_vs_ai" else 360)
+            layout_height = max(base_height, predicted_content_top + workspace_min_height + scale_px(92))
+            footer_top = layout_height - scale_px(78)
+        elif game_mode == "ai_vs_ai":
+            card_h = _selection_card_height(font_card_label, font_small, font_tiny)
+            section_panel_height = max(
+                current_browser_height or 0,
+                _model_info_panel_height(
+                    current_selected_model,
+                    models_dir,
+                    metadata_cache,
+                    font_small,
+                    font_small,
+                    font_meta,
+                ),
+            )
+            footer_top = predicted_content_top + card_h + scale_px(54) + section_panel_height + footer_gap
+            workspace_min_height = max(scale_px(280), footer_top - predicted_content_top + scale_px(14))
+            layout_height = max(base_height, footer_top + footer_stack_height)
+        elif game_mode == "human_vs_ai":
+            card_h = _selection_card_height(font_card_label, font_small, font_tiny)
+            section_panel_height = max(
+                current_browser_height or 0,
+                _model_info_panel_height(
+                    current_selected_model,
+                    models_dir,
+                    metadata_cache,
+                    font_small,
+                    font_small,
+                    font_meta,
+                ),
+            )
+            footer_top = predicted_content_top + card_h + scale_px(20) + section_panel_height + footer_gap
+            workspace_min_height = max(scale_px(240), footer_top - predicted_content_top + scale_px(14))
+            layout_height = max(base_height, footer_top + footer_stack_height)
+        else:
+            workspace_min_height = scale_px(220)
+            footer_top = predicted_content_top + scale_px(142) + footer_gap
+            layout_height = max(base_height, footer_top + footer_stack_height)
+        page_height = layout_height
+        max_page_scroll = clamp_page_scroll()
+        canvas = pygame.Surface((base_width, page_height))
+        canvas.blit(get_page_background(page_height), (0, 0))
+
+        hero_rect = pygame.Rect(outer_pad, scale_px(16), base_width - outer_pad * 2, scale_px(118))
+        _draw_panel(canvas, hero_rect, fill=(20, 27, 37), border=(108, 130, 166), radius=header_radius, shadow=True)
+        hero_band = pygame.Rect(hero_rect.left, hero_rect.top, hero_rect.width, scale_px(10))
+        pygame.draw.rect(canvas, _ACCENT, hero_band, border_top_left_radius=header_radius, border_top_right_radius=header_radius)
         title = font_title.render("Chess AI Setup", True, _TEXT)
         subtitle = font_small.render("Launch a polished match: choose mode, tune settings, assign models.", True, _MUTED)
         hint = font_meta.render(
-            "Enter start  |  Esc cancel  |  F11 maximize/restore",
+            "Enter start  |  Esc cancel",
             True,
             _MUTED,
         )
-        canvas.blit(title, (42, 28))
-        canvas.blit(subtitle, (44, 82))
-        canvas.blit(hint, (44, 106))
-        settings_icon_rect = pygame.Rect(base_width - 176, 30, 136, 38)
+        canvas.blit(title, (content_pad + scale_px(2), scale_px(28)))
+        canvas.blit(subtitle, (content_pad + scale_px(4), scale_px(82)))
+        canvas.blit(hint, (content_pad + scale_px(4), scale_px(106)))
+        settings_w = scale_px(136)
+        settings_h = scale_px(38)
+        settings_icon_rect = pygame.Rect(base_width - content_pad - settings_w, scale_px(30), settings_w, settings_h)
         _draw_button(
             canvas,
             settings_icon_rect,
@@ -1485,14 +1800,16 @@ def select_models(
         )
 
         mode_label = font_small.render("Mode", True, _MUTED)
-        canvas.blit(mode_label, (40, 156))
+        canvas.blit(mode_label, (content_pad, scale_px(156)))
 
-        mode_gap = 14
-        mode_btn_w = 232
+        mode_gap = scale_px(14)
+        mode_btn_w = scale_px(232)
+        mode_btn_h = scale_px(52)
+        mode_y = scale_px(182)
         mode_rects = {
-            "human_vs_ai": pygame.Rect(40, 182, mode_btn_w, 52),
-            "ai_vs_ai": pygame.Rect(40 + mode_btn_w + mode_gap, 182, mode_btn_w, 52),
-            "human_vs_human": pygame.Rect(40 + (mode_btn_w + mode_gap) * 2, 182, mode_btn_w, 52),
+            "human_vs_ai": pygame.Rect(content_pad, mode_y, mode_btn_w, mode_btn_h),
+            "ai_vs_ai": pygame.Rect(content_pad + mode_btn_w + mode_gap, mode_y, mode_btn_w, mode_btn_h),
+            "human_vs_human": pygame.Rect(content_pad + (mode_btn_w + mode_gap) * 2, mode_y, mode_btn_w, mode_btn_h),
         }
         _draw_button(
             canvas,
@@ -1533,16 +1850,18 @@ def select_models(
         else:
             ready_label = "MCTS ready" if use_mcts else "Network-only ready"
             ready_tone = "ok" if use_mcts else "neutral"
+        ready_chip_w = scale_px(208)
+        ready_chip_h = scale_px(28)
         _draw_chip(
             canvas,
-            pygame.Rect(base_width - 248, 194, 208, 28),
+            pygame.Rect(base_width - content_pad - ready_chip_w, scale_px(194), ready_chip_w, ready_chip_h),
             ready_label,
             font_meta,
             tone=ready_tone,
         )
 
-        color_white_rect = pygame.Rect(40, 274, 172, 44)
-        color_black_rect = pygame.Rect(222, 274, 172, 44)
+        color_white_rect = pygame.Rect(content_pad, scale_px(274), scale_px(172), scale_px(44))
+        color_black_rect = pygame.Rect(color_white_rect.right + tiny_gap, scale_px(274), scale_px(172), scale_px(44))
         white_card_rect = None
         black_card_rect = None
         copy_white_rect = None
@@ -1559,15 +1878,16 @@ def select_models(
         mcts_white_plus_rect = None
         mcts_black_minus_rect = None
         mcts_black_plus_rect = None
-        content_top = 356
-        content_bottom = base_height - 92
-        content_height = max(180, content_bottom - content_top)
+        content_top = scale_px(356)
+        content_bottom = layout_height - scale_px(92)
+        content_height = max(scale_px(180), content_bottom - content_top)
         browser_key = None
         browser_actions = []
         browser_max_scroll = 0
+        info_rect = None
 
         if game_mode == "human_vs_ai":
-            canvas.blit(font_h2.render("Human color", True, _TEXT), (40, 246))
+            canvas.blit(font_h2.render("Human color", True, _TEXT), (content_pad, scale_px(246)))
             _draw_button(
                 canvas,
                 color_white_rect,
@@ -1585,30 +1905,30 @@ def select_models(
                 active=human_color == chess.BLACK,
             )
 
-        workspace_label_y = 258 if game_mode != "human_vs_ai" else 340
-        tabs_y = workspace_label_y + 18
+        workspace_label_y = scale_px(258 if game_mode != "human_vs_ai" else 340)
+        tabs_y = workspace_label_y + section_gap
         if workspace_tab == "settings":
             canvas.blit(
                 font_meta.render("Settings workspace active. Click the gear again to return to model selection.", True, _MUTED),
-                (40, tabs_y + 10),
+                (content_pad, tabs_y + tiny_gap),
             )
-        content_top = tabs_y + 46
-        content_bottom = base_height - 92
-        content_height = max(180, content_bottom - content_top)
-        workspace_rect = pygame.Rect(24, content_top - 18, base_width - 48, content_height + 28)
-        _draw_panel(canvas, workspace_rect, fill=(19, 26, 35), border=(61, 76, 98), radius=22, shadow=True, fill_alpha=176)
+        content_top = tabs_y + scale_px(46)
+        content_bottom = max(content_top + scale_px(180), footer_top - scale_px(14))
+        content_height = max(scale_px(180), content_bottom - content_top)
+        workspace_rect = pygame.Rect(outer_pad, content_top - section_gap, base_width - outer_pad * 2, content_height + scale_px(28))
+        _draw_panel(canvas, workspace_rect, fill=(18, 24, 34), border=(86, 105, 136), radius=header_radius, shadow=True, fill_alpha=188)
 
         if workspace_tab == "settings":
-            settings_panel_rect = pygame.Rect(40, content_top, base_width - 80, content_height - 10)
-            _draw_panel(canvas, settings_panel_rect, fill=(24, 31, 42), border=(78, 100, 128), radius=18, shadow=False, fill_alpha=208)
+            settings_panel_rect = pygame.Rect(content_pad, content_top, base_width - content_pad * 2, max(scale_px(220), content_height - scale_px(10)))
+            _draw_panel(canvas, settings_panel_rect, fill=(23, 30, 41), border=(102, 126, 162), radius=scale_px(18), shadow=False, fill_alpha=220)
 
-            canvas.blit(font_h2.render("Search & Runtime Settings", True, _TEXT), (settings_panel_rect.left + 24, settings_panel_rect.top + 20))
+            canvas.blit(font_h2.render("Search & Runtime Settings", True, _TEXT), (settings_panel_rect.left + scale_px(24), settings_panel_rect.top + scale_px(20)))
             canvas.blit(
                 font_small.render("Dial in the engine once here and keep the rest of the setup clean.", True, _MUTED),
-                (settings_panel_rect.left + 24, settings_panel_rect.top + 52),
+                (settings_panel_rect.left + scale_px(24), settings_panel_rect.top + scale_px(52)),
             )
 
-            mcts_toggle_rect = pygame.Rect(settings_panel_rect.left + 24, settings_panel_rect.top + 86, 230, 46)
+            mcts_toggle_rect = pygame.Rect(settings_panel_rect.left + scale_px(24), settings_panel_rect.top + scale_px(86), scale_px(230), scale_px(46))
             _draw_button(
                 canvas,
                 mcts_toggle_rect,
@@ -1622,27 +1942,27 @@ def select_models(
             if game_mode == "human_vs_human":
                 canvas.blit(
                     font_meta.render("MCTS is disabled in Human vs Human mode.", True, (221, 181, 128)),
-                    (mcts_toggle_rect.right + 16, mcts_toggle_rect.top + 14),
+                    (mcts_toggle_rect.right + scale_px(16), mcts_toggle_rect.top + scale_px(14)),
                 )
 
-            sims_title_y = settings_panel_rect.top + 150
+            sims_title_y = settings_panel_rect.top + scale_px(150)
             if game_mode == "ai_vs_ai":
-                canvas.blit(font_small.render("MCTS simulations per side", True, _TEXT), (settings_panel_rect.left + 24, sims_title_y))
-                canvas.blit(font_meta.render("White and Black can use different search modes and budgets.", True, _MUTED), (settings_panel_rect.left + 24, sims_title_y + 24))
+                canvas.blit(font_small.render("MCTS simulations per side", True, _TEXT), (settings_panel_rect.left + scale_px(24), sims_title_y))
+                canvas.blit(font_meta.render("White and Black can use different search modes and budgets.", True, _MUTED), (settings_panel_rect.left + scale_px(24), sims_title_y + scale_px(24)))
 
-                controls_y = settings_panel_rect.top + 198
-                card_gap = 18
-                card_w = (settings_panel_rect.width - 48 - card_gap) // 2
-                white_card = pygame.Rect(settings_panel_rect.left + 24, controls_y, card_w, 146)
-                black_card = pygame.Rect(white_card.right + card_gap, controls_y, card_w, 146)
+                controls_y = settings_panel_rect.top + scale_px(198)
+                card_gap = scale_px(18)
+                card_w = (settings_panel_rect.width - scale_px(48) - card_gap) // 2
+                white_card = pygame.Rect(settings_panel_rect.left + scale_px(24), controls_y, card_w, scale_px(146))
+                black_card = pygame.Rect(white_card.right + card_gap, controls_y, card_w, scale_px(146))
                 for card_rect, label_text, sims_value, side_uses_mcts, is_white in (
                     (white_card, "White search", mcts_simulations_white, use_mcts_white, True),
                     (black_card, "Black search", mcts_simulations_black, use_mcts_black, False),
                 ):
                     pygame.draw.rect(canvas, (18, 24, 33), card_rect, border_radius=12)
                     pygame.draw.rect(canvas, (70, 84, 104), card_rect, width=1, border_radius=12)
-                    canvas.blit(font_small.render(label_text, True, _TEXT), (card_rect.left + 14, card_rect.top + 12))
-                    toggle_rect = pygame.Rect(card_rect.left + 14, card_rect.top + 42, card_rect.width - 28, 34)
+                    canvas.blit(font_small.render(label_text, True, _TEXT), (card_rect.left + scale_px(14), card_rect.top + scale_px(12)))
+                    toggle_rect = pygame.Rect(card_rect.left + scale_px(14), card_rect.top + scale_px(42), card_rect.width - scale_px(28), scale_px(34))
                     _draw_button(
                         canvas,
                         toggle_rect,
@@ -1651,10 +1971,10 @@ def select_models(
                         hovered=toggle_rect.collidepoint(mouse_pos),
                         active=side_uses_mcts,
                     )
-                    controls_row_y = card_rect.top + 90
-                    minus_rect = pygame.Rect(card_rect.left + 14, controls_row_y, 40, 38)
-                    value_rect = pygame.Rect(card_rect.left + 62, controls_row_y, card_rect.width - 124, 38)
-                    plus_rect = pygame.Rect(card_rect.right - 54, controls_row_y, 40, 38)
+                    controls_row_y = card_rect.top + scale_px(90)
+                    minus_rect = pygame.Rect(card_rect.left + scale_px(14), controls_row_y, scale_px(40), scale_px(38))
+                    value_rect = pygame.Rect(card_rect.left + scale_px(62), controls_row_y, card_rect.width - scale_px(124), scale_px(38))
+                    plus_rect = pygame.Rect(card_rect.right - scale_px(54), controls_row_y, scale_px(40), scale_px(38))
                     _draw_button(
                         canvas,
                         minus_rect,
@@ -1681,20 +2001,20 @@ def select_models(
                         mcts_black_toggle_rect = toggle_rect
                         mcts_black_minus_rect = minus_rect
                         mcts_black_plus_rect = plus_rect
-                preset_y = controls_y + 160
+                preset_y = controls_y + scale_px(160)
             else:
-                canvas.blit(font_small.render("MCTS simulations per move", True, _TEXT), (settings_panel_rect.left + 24, sims_title_y))
+                canvas.blit(font_small.render("MCTS simulations per move", True, _TEXT), (settings_panel_rect.left + scale_px(24), sims_title_y))
                 profile_text = "Speed profile: Fast" if mcts_simulations <= 80 else (
                     "Speed profile: Balanced" if mcts_simulations <= 140 else (
                         "Speed profile: Strong" if mcts_simulations <= 300 else "Speed profile: Ultra"
                     )
                 )
-                canvas.blit(font_meta.render(profile_text, True, _MUTED), (settings_panel_rect.left + 24, sims_title_y + 24))
+                canvas.blit(font_meta.render(profile_text, True, _MUTED), (settings_panel_rect.left + scale_px(24), sims_title_y + scale_px(24)))
 
-                controls_y = settings_panel_rect.top + 198
-                mcts_minus_rect = pygame.Rect(settings_panel_rect.left + 24, controls_y, 44, 42)
-                value_rect = pygame.Rect(settings_panel_rect.left + 76, controls_y, 168, 42)
-                mcts_plus_rect = pygame.Rect(settings_panel_rect.left + 252, controls_y, 44, 42)
+                controls_y = settings_panel_rect.top + scale_px(198)
+                mcts_minus_rect = pygame.Rect(settings_panel_rect.left + scale_px(24), controls_y, scale_px(44), scale_px(42))
+                value_rect = pygame.Rect(settings_panel_rect.left + scale_px(76), controls_y, scale_px(168), scale_px(42))
+                mcts_plus_rect = pygame.Rect(settings_panel_rect.left + scale_px(252), controls_y, scale_px(44), scale_px(42))
                 _draw_button(
                     canvas,
                     mcts_minus_rect,
@@ -1713,16 +2033,16 @@ def select_models(
                     font_h2,
                     hovered=mcts_plus_rect.collidepoint(mouse_pos),
                 )
-                preset_y = controls_y + 62
+                preset_y = controls_y + scale_px(62)
 
-            preset_gap = 12
-            preset_width = (settings_panel_rect.width - 48 - preset_gap * (len(mcts_profiles) - 1)) // len(mcts_profiles)
+            preset_gap = scale_px(12)
+            preset_width = (settings_panel_rect.width - scale_px(48) - preset_gap * (len(mcts_profiles) - 1)) // len(mcts_profiles)
             for idx, (label, value) in enumerate(mcts_profiles):
                 rect = pygame.Rect(
-                    settings_panel_rect.left + 24 + idx * (preset_width + preset_gap),
+                    settings_panel_rect.left + scale_px(24) + idx * (preset_width + preset_gap),
                     preset_y,
                     preset_width,
-                    38,
+                    scale_px(38),
                 )
                 _draw_button(
                     canvas,
@@ -1743,33 +2063,43 @@ def select_models(
                 "- Fast/Balanced are better for many games and quick testing.",
                 "- Strong/Ultra give better move quality but each move is slower.",
             ]
-            info_box = pygame.Rect(settings_panel_rect.left + 24, preset_y + 56, settings_panel_rect.width - 48, 92)
+            info_box = pygame.Rect(settings_panel_rect.left + scale_px(24), preset_y + scale_px(56), settings_panel_rect.width - scale_px(48), scale_px(92))
             pygame.draw.rect(canvas, (18, 24, 33), info_box, border_radius=12)
             pygame.draw.rect(canvas, (70, 84, 104), info_box, width=1, border_radius=12)
-            y_row = info_box.top + 12
+            y_row = info_box.top + scale_px(12)
             for row in help_rows:
-                canvas.blit(font_meta.render(row, True, _MUTED), (info_box.left + 12, y_row))
-                y_row += 24
+                canvas.blit(font_meta.render(_fit_text(font_meta, row, info_box.width - scale_px(24)), True, _MUTED), (info_box.left + scale_px(12), y_row))
+                y_row += max(scale_px(18), font_meta.get_height() + scale_px(6))
         elif game_mode != "human_vs_human":
             if game_mode == "ai_vs_ai":
-                canvas.blit(font_h2.render("Model Assignment", True, _TEXT), (40, content_top - 34))
-                cards_gap = 14
-                card_h = _selection_card_height(font_small, font_tiny)
-                card_w = (base_width - 80 - cards_gap) // 2
-                white_card_rect = pygame.Rect(40, content_top, card_w, card_h)
-                black_card_rect = pygame.Rect(40 + card_w + cards_gap, content_top, card_w, card_h)
+                canvas.blit(font_h2.render("Model Assignment", True, _TEXT), (content_pad, content_top - scale_px(34)))
+                cards_gap = scale_px(14)
+                card_h = _selection_card_height(font_card_label, font_small, font_tiny)
+                row_w = base_width - content_pad * 2
+                action_labels = ("<-->", "W -> Both", "B -> Both")
+                action_inner_pad_x = scale_px(12)
+                action_button_text_w = max(font_meta.size(label)[0] for label in action_labels)
+                action_button_w = max(scale_px(92), action_button_text_w + scale_px(24))
+                center_panel_w = action_button_w + action_inner_pad_x * 2
+                card_w = max(scale_px(260), (row_w - center_panel_w - cards_gap * 2) // 2)
+                total_used = card_w * 2 + center_panel_w + cards_gap * 2
+                row_left = content_pad + max(0, (row_w - total_used) // 2)
+                white_card_rect = pygame.Rect(row_left, content_top, card_w, card_h)
+                action_panel_rect = pygame.Rect(white_card_rect.right + cards_gap, content_top, center_panel_w, card_h)
+                black_card_rect = pygame.Rect(action_panel_rect.right + cards_gap, content_top, card_w, card_h)
                 _draw_selection_card(
                     canvas,
                     white_card_rect,
                     "White model",
                     selected_models["white"],
                     models_dir,
-                    font_small,
-                    font_small,
-                    font_tiny,
+                    font_card_label,
+                    font_card_name,
+                    font_card_meta,
                     metadata_cache=metadata_cache,
                     active=active_side == "white",
                     hovered=white_card_rect.collidepoint(mouse_pos),
+                    side_color=chess.WHITE,
                 )
                 _draw_selection_card(
                     canvas,
@@ -1777,33 +2107,36 @@ def select_models(
                     "Black model",
                     selected_models["black"],
                     models_dir,
-                    font_small,
-                    font_small,
-                    font_tiny,
+                    font_card_label,
+                    font_card_name,
+                    font_card_meta,
                     metadata_cache=metadata_cache,
                     active=active_side == "black",
                     hovered=black_card_rect.collidepoint(mouse_pos),
+                    side_color=chess.BLACK,
                 )
+                _draw_panel(canvas, action_panel_rect, fill=(21, 28, 38), border=(72, 91, 118), radius=16, shadow=False, fill_alpha=212)
 
-                active_text = "Now choosing for: WHITE" if active_side == "white" else "Now choosing for: BLACK"
-                active_text_y = white_card_rect.bottom + 12
-                canvas.blit(font_small.render(active_text, True, (184, 220, 255)), (40, active_text_y))
-
-                btn_y = white_card_rect.bottom + 8
-                copy_black_rect = pygame.Rect(base_width - 214, btn_y, 174, 36)
-                copy_white_rect = pygame.Rect(copy_black_rect.left - 172, btn_y, 166, 34)
-                swap_rect = pygame.Rect(copy_white_rect.left - 146, btn_y, 136, 34)
+                inner_pad_x = action_inner_pad_x
+                button_gap = scale_px(8)
+                button_h = scale_px(28)
+                button_w = action_panel_rect.width - inner_pad_x * 2
+                buttons_total_h = button_h * 3 + button_gap * 2
+                first_button_y = action_panel_rect.centery - buttons_total_h // 2
+                swap_rect = pygame.Rect(action_panel_rect.left + inner_pad_x, first_button_y, button_w, button_h)
+                copy_white_rect = pygame.Rect(action_panel_rect.left + inner_pad_x, swap_rect.bottom + button_gap, button_w, button_h)
+                copy_black_rect = pygame.Rect(action_panel_rect.left + inner_pad_x, copy_white_rect.bottom + button_gap, button_w, button_h)
                 _draw_button(
                     canvas,
                     swap_rect,
-                    "Swap W/B",
+                    "<-->",
                     font_meta,
                     hovered=swap_rect.collidepoint(mouse_pos),
                 )
                 _draw_button(
                     canvas,
                     copy_white_rect,
-                    "White -> Both",
+                    "W -> Both",
                     font_meta,
                     hovered=copy_white_rect.collidepoint(mouse_pos),
                     disabled=selected_models["white"] is None,
@@ -1811,46 +2144,62 @@ def select_models(
                 _draw_button(
                     canvas,
                     copy_black_rect,
-                    "Black -> Both",
+                    "B -> Both",
                     font_meta,
                     hovered=copy_black_rect.collidepoint(mouse_pos),
                     disabled=selected_models["black"] is None,
                 )
 
                 browser_key = active_side
-                browser_top = white_card_rect.bottom + 54
-                browser_h = max(180, content_bottom - browser_top)
-                browser_w = int((base_width - 80) * 0.67)
-                info_w = base_width - 80 - browser_w - 16
-                browser_rect = pygame.Rect(40, browser_top, browser_w, browser_h)
-                info_rect = pygame.Rect(browser_rect.right + 12, browser_top, info_w, browser_h)
+                browser_top = max(white_card_rect.bottom, action_panel_rect.bottom, black_card_rect.bottom) + scale_px(24)
+                browser_h = max(scale_px(180), _model_browser_panel_height(grouped, expanded[browser_key]))
+                browser_w = int((base_width - content_pad * 2) * 0.67)
+                info_w = base_width - content_pad * 2 - browser_w - scale_px(16)
+                browser_rect = pygame.Rect(content_pad, browser_top, browser_w, browser_h)
+                info_rect = pygame.Rect(browser_rect.right + scale_px(12), browser_top, info_w, 0)
             else:
                 ai_side_name = "Black" if human_color == chess.WHITE else "White"
                 header = f"Opponent model ({ai_side_name} AI side)"
-                canvas.blit(font_h2.render(header, True, _TEXT), (40, content_top - 34))
-                opponent_card_rect = pygame.Rect(40, content_top, base_width - 80, _selection_card_height(font_small, font_tiny))
+                canvas.blit(font_h2.render(header, True, _TEXT), (content_pad, content_top - scale_px(34)))
+                opponent_card_rect = pygame.Rect(content_pad, content_top, base_width - content_pad * 2, _selection_card_height(font_card_label, font_small, font_tiny))
                 _draw_selection_card(
                     canvas,
                     opponent_card_rect,
                     "Selected opponent",
                     opponent_model,
                     models_dir,
-                    font_small,
-                    font_small,
-                    font_tiny,
+                    font_card_label,
+                    font_card_name,
+                    font_card_meta,
                     metadata_cache=metadata_cache,
                     active=True,
                     hovered=opponent_card_rect.collidepoint(mouse_pos),
+                    side_color=chess.BLACK if human_color == chess.WHITE else chess.WHITE,
                 )
                 browser_key = "opponent"
-                browser_top = opponent_card_rect.bottom + 20
-                browser_h = max(180, content_bottom - browser_top)
-                browser_w = int((base_width - 80) * 0.67)
-                info_w = base_width - 80 - browser_w - 16
-                browser_rect = pygame.Rect(40, browser_top, browser_w, browser_h)
-                info_rect = pygame.Rect(browser_rect.right + 12, browser_top, info_w, browser_h)
+                browser_top = opponent_card_rect.bottom + scale_px(20)
+                browser_h = max(scale_px(180), _model_browser_panel_height(grouped, expanded[browser_key]))
+                browser_w = int((base_width - content_pad * 2) * 0.67)
+                info_w = base_width - content_pad * 2 - browser_w - scale_px(16)
+                browser_rect = pygame.Rect(content_pad, browser_top, browser_w, browser_h)
+                info_rect = pygame.Rect(browser_rect.right + scale_px(12), browser_top, info_w, 0)
 
             selected_model = selected_models[active_side] if browser_key != "opponent" else opponent_model
+            info_required_h = _model_info_panel_height(
+                selected_model,
+                models_dir,
+                metadata_cache,
+                font_small,
+                font_small,
+                font_meta,
+            )
+            info_rect.height = info_required_h
+            section_bottom = browser_top + max(browser_rect.height, info_rect.height)
+            if section_bottom > content_bottom:
+                extra_needed = section_bottom - content_bottom
+                content_bottom += extra_needed
+                content_height += extra_needed
+                workspace_rect.height += extra_needed
             browser_actions, browser_max_scroll = _draw_model_browser(
                 screen=canvas,
                 panel_rect=browser_rect,
@@ -1881,32 +2230,32 @@ def select_models(
             if scroll[browser_key] > browser_max_scroll:
                 scroll[browser_key] = browser_max_scroll
         else:
-            info_box = pygame.Rect(40, content_top, base_width - 80, 142)
-            _draw_panel(canvas, info_box, fill=(24, 31, 42), border=_BORDER, radius=18, shadow=False, fill_alpha=204)
-            canvas.blit(font_h2.render("Human vs Human", True, _TEXT), (60, info_box.top + 24))
+            info_box = pygame.Rect(content_pad, content_top, base_width - content_pad * 2, scale_px(142))
+            _draw_panel(canvas, info_box, fill=(24, 31, 42), border=_BORDER, radius=scale_px(18), shadow=False, fill_alpha=204)
+            canvas.blit(font_h2.render("Human vs Human", True, _TEXT), (content_pad + scale_px(20), info_box.top + scale_px(24)))
             canvas.blit(
                 font_small.render("No model selection required. Press Start to open the board.", True, _MUTED),
-                (60, info_box.top + 68),
+                (content_pad + scale_px(20), info_box.top + scale_px(68)),
             )
             canvas.blit(
                 font_meta.render("Open Settings if you want to preconfigure MCTS before switching back to AI modes.", True, _MUTED),
-                (60, info_box.top + 98),
+                (content_pad + scale_px(20), info_box.top + scale_px(98)),
             )
 
         if not has_models:
             warn = "No model files found. Only Human vs Human is available."
-            canvas.blit(font_small.render(warn, True, (224, 176, 108)), (40, base_height - 126))
+            canvas.blit(font_small.render(warn, True, (224, 176, 108)), (content_pad, footer_top - scale_px(48)))
 
         can_start = _can_start(game_mode, has_models, selected_models, opponent_model)
 
-        footer_rect = pygame.Rect(24, base_height - 78, base_width - 48, 54)
-        _draw_panel(canvas, footer_rect, fill=(17, 23, 31), border=(56, 72, 93), radius=18, shadow=False, fill_alpha=210)
+        footer_rect = pygame.Rect(outer_pad, footer_top, base_width - outer_pad * 2, scale_px(54))
+        _draw_panel(canvas, footer_rect, fill=(17, 23, 31), border=(56, 72, 93), radius=scale_px(18), shadow=False, fill_alpha=210)
         footer_hint = "Selected setup is ready to launch." if can_start else "Complete the required selections to start."
         footer_color = (184, 220, 255) if can_start else _MUTED
-        canvas.blit(font_meta.render(footer_hint, True, footer_color), (40, footer_rect.top + 18))
+        canvas.blit(font_meta.render(_fit_text(font_meta, footer_hint, footer_rect.width - scale_px(340)), True, footer_color), (content_pad, footer_rect.top + scale_px(18)))
 
-        start_rect = pygame.Rect(base_width - 342, base_height - 70, 156, 40)
-        cancel_rect = pygame.Rect(base_width - 176, base_height - 70, 136, 40)
+        start_rect = pygame.Rect(base_width - content_pad - scale_px(302), footer_top + scale_px(8), scale_px(156), scale_px(40))
+        cancel_rect = pygame.Rect(base_width - content_pad - scale_px(136), footer_top + scale_px(8), scale_px(136), scale_px(40))
         _draw_button(
             canvas,
             start_rect,
@@ -1926,11 +2275,31 @@ def select_models(
         )
 
         screen.fill((10, 12, 18))
+        visible_rect = pygame.Rect(0, page_scroll_y, base_width, base_height)
+        visible_surface = canvas.subsurface(visible_rect)
         if viewport_rect.size == (base_width, base_height):
-            screen.blit(canvas, viewport_rect.topleft)
+            screen.blit(visible_surface, viewport_rect.topleft)
         else:
-            scaled = pygame.transform.smoothscale(canvas, viewport_rect.size)
+            scaled = pygame.transform.smoothscale(visible_surface, viewport_rect.size)
             screen.blit(scaled, viewport_rect.topleft)
+        if max_page_scroll > 0:
+            track_margin = 10
+            track_w = 8
+            track_h = max(60, viewport_rect.height - 2 * track_margin)
+            track = pygame.Rect(
+                viewport_rect.right - track_margin - track_w,
+                viewport_rect.top + track_margin,
+                track_w,
+                track_h,
+            )
+            pygame.draw.rect(screen, (32, 40, 54), track, border_radius=4)
+            thumb_h = max(32, int(track.height * (base_height / max(page_height, 1))))
+            thumb_h = min(track.height, thumb_h)
+            travel = max(0, track.height - thumb_h)
+            ratio = 0.0 if max_page_scroll <= 0 else (page_scroll_y / max_page_scroll)
+            thumb_y = track.top + int(travel * ratio)
+            thumb = pygame.Rect(track.left, thumb_y, track.width, thumb_h)
+            pygame.draw.rect(screen, (118, 165, 234), thumb, border_radius=4)
         pygame.display.flip()
 
         for event in pygame.event.get():
@@ -1939,15 +2308,27 @@ def select_models(
                 return None
 
             if event.type == pygame.VIDEORESIZE:
-                set_window_size(event.w, event.h)
+                if maximized:
+                    sync_window_surface()
+                else:
+                    set_window_size(event.w, event.h)
                 continue
 
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     persist_ui_preferences(force=True)
                     return None
-                if event.key == pygame.K_F11:
-                    toggle_maximized()
+                if event.key == pygame.K_PAGEUP:
+                    page_scroll_y = max(0, page_scroll_y - scale_px(220))
+                    continue
+                if event.key == pygame.K_PAGEDOWN:
+                    page_scroll_y = min(max_page_scroll, page_scroll_y + scale_px(220))
+                    continue
+                if event.key == pygame.K_HOME:
+                    page_scroll_y = 0
+                    continue
+                if event.key == pygame.K_END:
+                    page_scroll_y = max_page_scroll
                     continue
                 if event.key == pygame.K_RETURN and can_start:
                     persist_ui_preferences(force=True)
@@ -1966,13 +2347,22 @@ def select_models(
                         )
                     )
 
-            if event.type == pygame.MOUSEWHEEL and workspace_tab == "models" and game_mode != "human_vs_human":
-                if browser_key and browser_rect.collidepoint(mouse_pos):
+            if event.type == pygame.MOUSEWHEEL:
+                if (
+                    workspace_tab == "models"
+                    and game_mode != "human_vs_human"
+                    and browser_key
+                    and browser_rect.collidepoint(mouse_pos)
+                    and browser_max_scroll > 0
+                ):
                     scroll[browser_key] -= event.y * 30
                     if scroll[browser_key] < 0:
                         scroll[browser_key] = 0
                     if scroll[browser_key] > browser_max_scroll:
                         scroll[browser_key] = browser_max_scroll
+                elif max_page_scroll > 0:
+                    page_scroll_y -= event.y * scale_px(56)
+                    page_scroll_y = max(0, min(max_page_scroll, page_scroll_y))
 
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 ui_pos = window_to_ui(event.pos)
