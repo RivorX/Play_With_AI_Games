@@ -13,10 +13,111 @@ import chess
 import numpy as np
 import math
 import pickle
+from pathlib import Path
 from src.data import board_to_tensor, move_to_index
 
 
 _EMPTY_HISTORY_TENSOR = np.zeros((16, 8, 8), dtype=np.float32)
+_PIECE_VALUES = {
+    chess.PAWN: 1.0,
+    chess.KNIGHT: 3.0,
+    chess.BISHOP: 3.25,
+    chess.ROOK: 5.0,
+    chess.QUEEN: 9.0,
+    chess.KING: 0.0,
+}
+
+_SYZYGY_ORACLE_CACHE = {}
+
+
+class _SyzygyOracle:
+    def __init__(self, paths, max_pieces=6):
+        self.max_pieces = max(2, int(max_pieces))
+        self.paths = tuple(str(p) for p in paths)
+        self._tb = None
+
+        if not self.paths:
+            return
+
+        try:
+            import chess.syzygy
+        except Exception:
+            return
+
+        tablebase = None
+        for idx, path in enumerate(self.paths):
+            try:
+                if idx == 0:
+                    tablebase = chess.syzygy.open_tablebase(path)
+                else:
+                    tablebase.add_directory(path)
+            except Exception:
+                continue
+        self._tb = tablebase
+
+    @property
+    def enabled(self):
+        return self._tb is not None
+
+    def can_probe(self, board):
+        return self.enabled and len(board.piece_map()) <= self.max_pieces
+
+    def probe_wdl(self, board):
+        if not self.can_probe(board):
+            return None
+        try:
+            return int(self._tb.probe_wdl(board))
+        except Exception:
+            return None
+
+    def result_for_board(self, board):
+        wdl = self.probe_wdl(board)
+        if wdl is None:
+            return None
+        if wdl > 0:
+            return '1-0' if board.turn == chess.WHITE else '0-1'
+        if wdl < 0:
+            return '0-1' if board.turn == chess.WHITE else '1-0'
+        return '1/2-1/2'
+
+
+def _resolve_syzygy_paths(config):
+    rl_cfg = config.get('reinforcement_learning', {})
+    raw_paths = rl_cfg.get('syzygy_paths', []) or []
+    if isinstance(raw_paths, (str, Path)):
+        raw_paths = [raw_paths]
+
+    chess_root = Path(__file__).resolve().parents[1]
+    resolved = []
+    for raw_path in raw_paths:
+        if raw_path is None:
+            continue
+        path_str = str(raw_path).strip()
+        if not path_str:
+            continue
+        candidate = Path(path_str)
+        if not candidate.is_absolute():
+            candidate = chess_root / candidate
+        candidate = candidate.resolve()
+        if candidate.exists() and candidate.is_dir():
+            resolved.append(str(candidate))
+    return tuple(resolved)
+
+
+def _get_syzygy_oracle(config):
+    rl_cfg = config.get('reinforcement_learning', {})
+    if not bool(rl_cfg.get('syzygy_enabled', False)):
+        return None
+    paths = _resolve_syzygy_paths(config)
+    if not paths:
+        return None
+    max_pieces = int(rl_cfg.get('syzygy_max_pieces', 6) or 6)
+    cache_key = (paths, max_pieces)
+    oracle = _SYZYGY_ORACLE_CACHE.get(cache_key)
+    if oracle is None:
+        oracle = _SyzygyOracle(paths, max_pieces=max_pieces)
+        _SYZYGY_ORACLE_CACHE[cache_key] = oracle
+    return oracle if oracle.enabled else None
 
 
 def _copy_board_fast(board):
@@ -379,10 +480,12 @@ def _pack_positions_for_transfer(positions):
     policy_indices = torch.full((batch_size, max_len), -1, dtype=torch.int16)
     policy_values = torch.zeros((batch_size, max_len), dtype=torch.float32)
     policy_lengths = torch.zeros((batch_size,), dtype=torch.int16)
+    importance_scores = torch.zeros((batch_size,), dtype=torch.float32)
 
     for row_idx, pos in enumerate(positions):
         _, indices, probs, _ = pos[:4]
         count = int(indices.numel())
+        importance_scores[row_idx] = float(pos[4]) if len(pos) > 4 else 0.0
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -395,6 +498,7 @@ def _pack_positions_for_transfer(positions):
         'policy_values': policy_values,
         'policy_lengths': policy_lengths,
         'values': values,
+        'importance_scores': importance_scores,
         'num_positions': batch_size,
     }
 
@@ -547,6 +651,29 @@ class MultiGameBatchMCTS:
         # Dirichlet noise params
         self.dirichlet_alpha = config['reinforcement_learning'].get('mcts_dirichlet_alpha', 0.3)
         self.dirichlet_weight = config['reinforcement_learning'].get('mcts_dirichlet_weight', 0.0)
+        self.tactical_priors_enabled = bool(
+            config['reinforcement_learning'].get('mcts_tactical_priors_enabled', False)
+        )
+        self.tactical_capture_bonus = max(
+            0.0,
+            float(config['reinforcement_learning'].get('mcts_tactical_capture_bonus', 0.0)),
+        )
+        self.tactical_winning_capture_bonus = max(
+            0.0,
+            float(config['reinforcement_learning'].get('mcts_tactical_winning_capture_bonus', 0.0)),
+        )
+        self.tactical_check_bonus = max(
+            0.0,
+            float(config['reinforcement_learning'].get('mcts_tactical_check_bonus', 0.0)),
+        )
+        self.tactical_promotion_bonus = max(
+            0.0,
+            float(config['reinforcement_learning'].get('mcts_tactical_promotion_bonus', 0.0)),
+        )
+        self.tactical_recapture_bonus = max(
+            0.0,
+            float(config['reinforcement_learning'].get('mcts_tactical_recapture_bonus', 0.0)),
+        )
 
         # Inference optimization (AMP on GPU)
         self.use_amp = config.get('hardware', {}).get('use_amp', False) and self.device.type == 'cuda'
@@ -629,6 +756,49 @@ class MultiGameBatchMCTS:
             scratch = np.empty((batch_size, max_legal_count), dtype=np.int64)
             self._legal_index_scratch[key] = scratch
         return scratch
+
+    @staticmethod
+    def _captured_piece_value(board, move):
+        if board.is_en_passant(move):
+            return _PIECE_VALUES[chess.PAWN]
+        captured_piece = board.piece_at(move.to_square)
+        if captured_piece is None:
+            return 0.0
+        return float(_PIECE_VALUES.get(captured_piece.piece_type, 0.0))
+
+    @staticmethod
+    def _moving_piece_value(board, move):
+        moving_piece = board.piece_at(move.from_square)
+        if moving_piece is None:
+            return 0.0
+        return float(_PIECE_VALUES.get(moving_piece.piece_type, 0.0))
+
+    def _tactical_prior_multipliers(self, board, legal_moves):
+        if not self.tactical_priors_enabled or not legal_moves:
+            return np.ones((len(legal_moves),), dtype=np.float32)
+
+        multipliers = np.ones((len(legal_moves),), dtype=np.float32)
+        last_move = board.peek() if board.move_stack else None
+
+        for idx, move in enumerate(legal_moves):
+            bonus = 0.0
+            if board.is_capture(move):
+                bonus += self.tactical_capture_bonus
+                gain = self._captured_piece_value(board, move) - self._moving_piece_value(board, move)
+                if gain > 0.0:
+                    bonus += self.tactical_winning_capture_bonus * min(1.0, gain / 4.0)
+            if move.promotion is not None:
+                bonus += self.tactical_promotion_bonus
+            try:
+                if board.gives_check(move):
+                    bonus += self.tactical_check_bonus
+            except Exception:
+                pass
+            if last_move is not None and move.to_square == last_move.to_square:
+                bonus += self.tactical_recapture_bonus
+            multipliers[idx] = 1.0 + float(bonus)
+
+        return multipliers
 
     def _select_child(self, node):
         """Select child with highest UCB score (optimized)"""
@@ -937,6 +1107,10 @@ class MultiGameBatchMCTS:
                     legal_logits = legal_logits_batch[idx, :legal_count].astype(np.float32, copy=False)
                     legal_probs = np.exp(legal_logits - legal_logits.max())
                     legal_probs = legal_probs / (legal_probs.sum() + 1e-8)
+                    tactical_multipliers = self._tactical_prior_multipliers(node.board, legal_moves)
+                    if tactical_multipliers.size == legal_probs.size:
+                        legal_probs = legal_probs * tactical_multipliers
+                        legal_probs = legal_probs / (legal_probs.sum() + 1e-8)
                 else:
                     legal_probs = np.array([])
 
@@ -1113,6 +1287,7 @@ class BatchSelfPlayMCTSBatch:
             1,
             int(rl_cfg.get('self_play_adjudication_patience', 6)),
         )
+        self.syzygy = _get_syzygy_oracle(config)
         self.resignation_enabled = bool(rl_cfg.get('self_play_resignation_enabled', False))
         self.resignation_min_moves = max(
             0,
@@ -1136,6 +1311,63 @@ class BatchSelfPlayMCTSBatch:
         self.replay_cap_fraction_draw = float(rl_cfg.get('replay_cap_fraction_draw', 0.15))
         self.replay_cap_min_positions = int(rl_cfg.get('replay_cap_min_positions', 16))
         self.replay_cap_max_positions = int(rl_cfg.get('replay_cap_max_positions', 120))
+        self.playout_cap_randomization_enabled = bool(
+            rl_cfg.get('mcts_playout_cap_randomization_enabled', False)
+        )
+        self.playout_cap_randomization_low = max(
+            1,
+            int(rl_cfg.get('mcts_playout_cap_randomization_low', max(1, self.num_simulations // 2))),
+        )
+        self.playout_cap_randomization_high = max(
+            self.playout_cap_randomization_low,
+            int(rl_cfg.get('mcts_playout_cap_randomization_high', self.num_simulations)),
+        )
+        self.playout_cap_randomization_low_fraction = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('mcts_playout_cap_randomization_low_fraction', 0.50))),
+        )
+        self.policy_target_pruning_enabled = bool(
+            rl_cfg.get('policy_target_pruning_enabled', False)
+        )
+        self.policy_target_pruning_keep_top_n = max(
+            1,
+            int(rl_cfg.get('policy_target_pruning_keep_top_n', 2)),
+        )
+        self.policy_target_pruning_max_moves = max(
+            self.policy_target_pruning_keep_top_n,
+            int(rl_cfg.get('policy_target_pruning_max_moves', 12)),
+        )
+        self.policy_target_pruning_min_prob = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('policy_target_pruning_min_prob', 0.02))),
+        )
+        self.policy_target_pruning_min_fraction_of_max = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('policy_target_pruning_min_fraction_of_max', 0.12))),
+        )
+        self.policy_target_pruning_keep_mass = max(
+            0.05,
+            min(1.0, float(rl_cfg.get('policy_target_pruning_keep_mass', 0.92))),
+        )
+        self.replay_importance_gating_enabled = bool(
+            rl_cfg.get('replay_importance_gating_enabled', False)
+        )
+        self.replay_importance_gate_fraction_decisive = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('replay_importance_gate_fraction_decisive', 1.0))),
+        )
+        self.replay_importance_gate_fraction_draw = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('replay_importance_gate_fraction_draw', 1.0))),
+        )
+        self.replay_importance_gate_min_positions = max(
+            0,
+            int(rl_cfg.get('replay_importance_gate_min_positions', 0)),
+        )
+        self.replay_importance_top_fraction = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('replay_importance_top_fraction', 0.70))),
+        )
         
         self.max_positions_per_game = max(
             0,
@@ -1154,17 +1386,125 @@ class BatchSelfPlayMCTSBatch:
         # the same direction and break the zero-sum calibration expected by MCTS.
         return 0.0
 
+    def _sample_num_simulations(self):
+        if not self.playout_cap_randomization_enabled:
+            return self.num_simulations
+        if np.random.random() < self.playout_cap_randomization_low_fraction:
+            return self.playout_cap_randomization_low
+        return self.playout_cap_randomization_high
+
+    def _prune_policy_target_visits(self, visit_counts):
+        if not self.policy_target_pruning_enabled or not visit_counts:
+            return visit_counts
+
+        items = sorted(
+            ((move, float(count)) for move, count in visit_counts.items() if float(count) > 0.0),
+            key=lambda pair: (-pair[1], pair[0].uci()),
+        )
+        if not items:
+            return visit_counts
+
+        total = float(sum(count for _, count in items))
+        if total <= 0.0:
+            return visit_counts
+
+        max_count = float(items[0][1])
+        kept = []
+        cumulative = 0.0
+        for idx, (move, count) in enumerate(items):
+            prob = count / total
+            keep = idx < self.policy_target_pruning_keep_top_n
+            if not keep and len(kept) < self.policy_target_pruning_max_moves:
+                if (
+                    prob >= self.policy_target_pruning_min_prob
+                    and count >= max_count * self.policy_target_pruning_min_fraction_of_max
+                    and cumulative < self.policy_target_pruning_keep_mass
+                ):
+                    keep = True
+            if keep:
+                kept.append((move, count))
+                cumulative += prob
+            if len(kept) >= self.policy_target_pruning_max_moves:
+                break
+
+        if not kept:
+            kept = items[:1]
+        return {move: int(max(1.0, round(count))) for move, count in kept}
+
+    @staticmethod
+    def _candidate_importance(item):
+        try:
+            return float(item.get('importance_score', 0.0))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _select_evenly_spaced_candidates(candidates, effective_cap):
+        if effective_cap <= 0 or len(candidates) <= effective_cap:
+            return list(candidates)
+        ordered = sorted(candidates, key=lambda item: int(item['history_idx']))
+        positions = np.linspace(0, len(ordered) - 1, num=effective_cap)
+        selected_history = []
+        seen_history = set()
+        for pos in positions:
+            idx = int(round(float(pos)))
+            idx = max(0, min(idx, len(ordered) - 1))
+            history_idx = int(ordered[idx]['history_idx'])
+            if history_idx in seen_history:
+                continue
+            seen_history.add(history_idx)
+            selected_history.append(history_idx)
+        if len(selected_history) < effective_cap:
+            for item in ordered:
+                history_idx = int(item['history_idx'])
+                if history_idx in seen_history:
+                    continue
+                seen_history.add(history_idx)
+                selected_history.append(history_idx)
+                if len(selected_history) >= effective_cap:
+                    break
+        selected_lookup = set(selected_history[:effective_cap])
+        return [item for item in ordered if int(item['history_idx']) in selected_lookup]
+
     def _select_top_scored_candidates(self, candidates, effective_cap, history_len):
         if effective_cap <= 0 or len(candidates) <= effective_cap:
             return list(candidates)
         del history_len
-        positions = np.linspace(0, len(candidates) - 1, num=effective_cap)
-        selected_ids = {int(round(pos)) for pos in positions}
+        ranked = sorted(
+            candidates,
+            key=lambda item: (-self._candidate_importance(item), int(item['history_idx'])),
+        )
+        top_quota = int(round(effective_cap * self.replay_importance_top_fraction))
+        top_quota = max(1, min(int(effective_cap), top_quota))
+
         selected = []
-        for idx, item in enumerate(candidates):
-            if idx in selected_ids:
+        selected_history = set()
+        for item in ranked:
+            history_idx = int(item['history_idx'])
+            if history_idx in selected_history:
+                continue
+            selected.append(item)
+            selected_history.add(history_idx)
+            if len(selected) >= top_quota:
+                break
+
+        remaining = int(effective_cap - len(selected))
+        if remaining > 0:
+            leftovers = [
+                item for item in candidates
+                if int(item['history_idx']) not in selected_history
+            ]
+            for item in self._select_evenly_spaced_candidates(leftovers, remaining):
+                history_idx = int(item['history_idx'])
+                if history_idx in selected_history:
+                    continue
                 selected.append(item)
-        return selected
+                selected_history.add(history_idx)
+                if len(selected) >= effective_cap:
+                    break
+
+        selected.sort(key=lambda item: int(item['history_idx']))
+        return selected[:effective_cap]
 
     def _allocate_draw_stratified_caps(self, buckets, effective_cap):
         bucket_count = len(buckets)
@@ -1305,6 +1645,23 @@ class BatchSelfPlayMCTSBatch:
         filtered = list(candidates)
         curriculum_dropped = 0
 
+        if self.replay_importance_gating_enabled and len(filtered) > 0:
+            gate_fraction = (
+                self.replay_importance_gate_fraction_decisive
+                if is_decisive
+                else self.replay_importance_gate_fraction_draw
+            )
+            if gate_fraction < 1.0:
+                gate_keep = int(math.ceil(len(filtered) * gate_fraction))
+                gate_keep = max(self.replay_importance_gate_min_positions, gate_keep)
+                gate_keep = min(len(filtered), gate_keep)
+                if gate_keep < len(filtered):
+                    if is_decisive:
+                        filtered = self._select_top_scored_candidates(filtered, gate_keep, history_len)
+                    else:
+                        filtered = self._select_draw_candidates_stratified(filtered, gate_keep, history_len)
+                    curriculum_dropped = total_candidates - len(filtered)
+
         # Determine effective cap limits
         if self.replay_dynamic_cap_enabled:
             fraction = self.replay_cap_fraction_decisive if is_decisive else self.replay_cap_fraction_draw
@@ -1331,7 +1688,8 @@ class BatchSelfPlayMCTSBatch:
         candidate_positions = []
         is_draw = (outcome == 0.0)
         for history_idx, history_entry in enumerate(gs['game_history']):
-            history_count, policy_indices, policy_values, turn = history_entry
+            history_count, policy_indices, policy_values, turn = history_entry[:4]
+            importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
             if is_draw:
                 value = draw_value_target
             else:
@@ -1343,8 +1701,50 @@ class BatchSelfPlayMCTSBatch:
                 'policy_values': policy_values,
                 'turn': turn,
                 'value': value,
+                'importance_score': importance_score,
             })
         return candidate_positions
+
+    def _compute_position_importance(self, board, move, visit_counts, root):
+        importance = 1.0
+
+        if visit_counts:
+            visits = np.asarray(list(visit_counts.values()), dtype=np.float32)
+            total_visits = float(visits.sum())
+            if total_visits > 0.0:
+                probs = visits / total_visits
+                top_prob = float(probs.max())
+                entropy = 0.0
+                if probs.size > 1:
+                    entropy = float(-(probs * np.log(np.clip(probs, 1e-8, 1.0))).sum())
+                    entropy /= float(np.log(probs.size))
+                importance += 0.35 * (1.0 - top_prob)
+                importance += 0.30 * entropy
+
+        if root is not None:
+            root_visits = int(getattr(root, 'visit_count', 0) or 0)
+            if root_visits > 0:
+                root_value = float(root.value_sum / max(1, root_visits))
+                importance += 0.30 * abs(root_value)
+
+        if board.is_capture(move):
+            importance += 0.30
+            gain = self.mcts._captured_piece_value(board, move) - self.mcts._moving_piece_value(board, move)
+            if gain > 0.0:
+                importance += 0.20 * min(1.0, gain / 4.0)
+        if move.promotion is not None:
+            importance += 0.30
+        try:
+            if board.gives_check(move):
+                importance += 0.15
+        except Exception:
+            pass
+        if board.move_stack:
+            last_move = board.peek()
+            if last_move is not None and move.to_square == last_move.to_square:
+                importance += 0.10
+
+        return float(importance)
 
     def _append_selected_positions_from_game(
         self,
@@ -1376,6 +1776,7 @@ class BatchSelfPlayMCTSBatch:
                 item['policy_indices'],
                 item['policy_values'],
                 torch.tensor([item['value']], dtype=torch.float32),
+                float(item.get('importance_score', 0.0)),
             ))
 
         return history_len, int(curriculum_dropped), int(cap_dropped)
@@ -1443,6 +1844,37 @@ class BatchSelfPlayMCTSBatch:
             gs['black_advantage_streak'] = 0
 
         return None
+
+    @staticmethod
+    def _clear_game_search_state(gs):
+        gs['root'] = None
+        gs['opponent_root'] = None
+        gs['_root_synced'] = False
+        gs['_opponent_root_synced'] = False
+
+    def _maybe_finish_with_syzygy(self, gs, board):
+        if self.syzygy is None or board.is_game_over(claim_draw=False):
+            return None
+        if not self.syzygy.can_probe(board):
+            return None
+        gs['syzygy_probe_positions'] = int(gs.get('syzygy_probe_positions', 0)) + 1
+        wdl = self.syzygy.probe_wdl(board)
+        if wdl is None:
+            return None
+        gs['syzygy_probe_hits'] = int(gs.get('syzygy_probe_hits', 0)) + 1
+
+        if wdl > 0:
+            result = '1-0' if board.turn == chess.WHITE else '0-1'
+        elif wdl < 0:
+            result = '0-1' if board.turn == chess.WHITE else '1-0'
+        else:
+            result = '1/2-1/2'
+
+        gs['done'] = True
+        gs['syzygy_result'] = result
+        self._clear_game_search_state(gs)
+        self._mark_game_completed(gs)
+        return result
 
     def _maybe_resign_game(self, gs, root, board):
         if not self.resignation_enabled or gs.get('resignation_disabled', False):
@@ -1513,6 +1945,9 @@ class BatchSelfPlayMCTSBatch:
         total_curriculum_dropped_positions = 0
         total_cap_dropped_positions = 0
         total_resigned_games = 0
+        total_syzygy_ended_games = 0
+        total_syzygy_probe_positions = 0
+        total_syzygy_probe_hits = 0
         opponent_source_counts = {}
         opponent_source_results = {}
 
@@ -1541,6 +1976,9 @@ class BatchSelfPlayMCTSBatch:
             total_curriculum_dropped_positions += int(batch_stats.get('curriculum_dropped_positions', 0))
             total_cap_dropped_positions += int(batch_stats.get('cap_dropped_positions', 0))
             total_resigned_games += int(batch_stats.get('resigned_games', 0))
+            total_syzygy_ended_games += int(batch_stats.get('syzygy_ended_games', 0))
+            total_syzygy_probe_positions += int(batch_stats.get('syzygy_probe_positions', 0))
+            total_syzygy_probe_hits += int(batch_stats.get('syzygy_probe_hits', 0))
             for label, count in dict(batch_stats.get('opponent_source_counts', {}) or {}).items():
                 opponent_source_counts[str(label)] = int(opponent_source_counts.get(str(label), 0)) + int(count)
             for label, stats in dict(batch_stats.get('opponent_source_results', {}) or {}).items():
@@ -1576,6 +2014,9 @@ class BatchSelfPlayMCTSBatch:
             'curriculum_dropped_positions': int(total_curriculum_dropped_positions),
             'cap_dropped_positions': int(total_cap_dropped_positions),
             'resigned_games': int(total_resigned_games),
+            'syzygy_ended_games': int(total_syzygy_ended_games),
+            'syzygy_probe_positions': int(total_syzygy_probe_positions),
+            'syzygy_probe_hits': int(total_syzygy_probe_hits),
             'opponent_source': source_label,
             'opponent_source_counts': opponent_source_counts,
             'opponent_source_results': opponent_source_results,
@@ -1627,6 +2068,9 @@ class BatchSelfPlayMCTSBatch:
                 'white_advantage_streak': 0,
                 'black_advantage_streak': 0,
                 'adjudicated_result': None,
+                'syzygy_result': None,
+                'syzygy_probe_positions': 0,
+                'syzygy_probe_hits': 0,
                 'resigned_result': None,
                 'resign_streak': 0,
                 'resignation_disabled': bool(np.random.random() < self.resignation_disable_fraction),
@@ -1641,11 +2085,17 @@ class BatchSelfPlayMCTSBatch:
             self._apply_opening_prefix(game_states[-1])
 
         while True:
+            for gs in game_states:
+                if gs['done']:
+                    continue
+                self._maybe_finish_with_syzygy(gs, gs['board'])
+
             active_indices = [i for i, gs in enumerate(game_states) if not gs['done']]
             if not active_indices:
                 break
 
             visit_counts_by_index = {}
+            simulations_this_turn = self._sample_num_simulations()
 
             def _run_search_for_indices(indices, mcts_ref, root_key, synced_key):
                 if not indices:
@@ -1661,7 +2111,7 @@ class BatchSelfPlayMCTSBatch:
                     })
                 visit_counts_list_group = mcts_ref.search_many(
                     group_states,
-                    num_simulations=self.num_simulations,
+                    num_simulations=simulations_this_turn,
                     add_root_noise=True,
                 )
                 for gs_idx, local_state, visit_counts in zip(indices, group_states, visit_counts_list_group):
@@ -1711,35 +2161,32 @@ class BatchSelfPlayMCTSBatch:
                 root = gs.get(root_key)
                 adjudicated_result = self._maybe_adjudicate_game(gs, root, board)
                 if adjudicated_result is not None:
-                    gs['done'] = True
                     gs['adjudicated_result'] = adjudicated_result
-                    gs['root'] = None
-                    gs['opponent_root'] = None
-                    gs['_root_synced'] = False
-                    gs['_opponent_root_synced'] = False
+                    gs['done'] = True
+                    self._clear_game_search_state(gs)
                     self._mark_game_completed(gs)
                     continue
 
                 resigned_result = self._maybe_resign_game(gs, root, board)
                 if resigned_result is not None:
-                    gs['done'] = True
                     gs['resigned_result'] = resigned_result
-                    gs['root'] = None
-                    gs['opponent_root'] = None
-                    gs['_root_synced'] = False
-                    gs['_opponent_root_synced'] = False
+                    gs['done'] = True
+                    self._clear_game_search_state(gs)
                     self._mark_game_completed(gs)
                     continue
 
                 move = self._select_move_from_visits(visit_counts, temperature)
                 if learner_turn or game_opponent_mcts is None:
+                    visit_counts = self._prune_policy_target_visits(visit_counts)
                     policy_indices, policy_values = _build_sparse_policy_target_from_visits(visit_counts, board)
                     history_count = len(gs['board_history'])
+                    importance_score = self._compute_position_importance(board, move, visit_counts, root)
                     gs['game_history'].append((
                         history_count,
                         policy_indices,
                         policy_values,
                         board.turn,
+                        importance_score,
                     ))
 
                 # Update history BEFORE making the move
@@ -1766,16 +2213,16 @@ class BatchSelfPlayMCTSBatch:
                 board.push(move)
                 gs['move_count'] += 1
 
+                if self._maybe_finish_with_syzygy(gs, board) is not None:
+                    continue
+
                 forced_game_over = board.is_game_over(claim_draw=False)
                 auto_claim_draw = self._should_auto_claim_draw(board, gs['move_count'])
                 if forced_game_over or auto_claim_draw or gs['move_count'] >= max_moves:
                     gs['done'] = True
                     gs['ended_by_auto_claim_draw'] = auto_claim_draw
                     # Free up memory immediately
-                    gs['root'] = None
-                    gs['opponent_root'] = None
-                    gs['_root_synced'] = False
-                    gs['_opponent_root_synced'] = False
+                    self._clear_game_search_state(gs)
                     self._mark_game_completed(gs)
 
         positions = []
@@ -1784,6 +2231,9 @@ class BatchSelfPlayMCTSBatch:
         truncated_games = 0
         claimable_draw_ended_games = 0
         adjudicated_games = 0
+        syzygy_ended_games = 0
+        syzygy_probe_positions = 0
+        syzygy_probe_hits = 0
         resigned_games = 0
         completed_length_sum = 0
         truncated_length_sum = 0
@@ -1813,6 +2263,11 @@ class BatchSelfPlayMCTSBatch:
             adjudicated_result = gs.get('adjudicated_result', None)
             if adjudicated_result is not None:
                 adjudicated_games += 1
+            syzygy_result = gs.get('syzygy_result', None)
+            if syzygy_result is not None:
+                syzygy_ended_games += 1
+            syzygy_probe_positions += int(gs.get('syzygy_probe_positions', 0) or 0)
+            syzygy_probe_hits += int(gs.get('syzygy_probe_hits', 0) or 0)
             resigned_result = gs.get('resigned_result', None)
             if resigned_result is not None:
                 resigned_games += 1
@@ -1822,7 +2277,11 @@ class BatchSelfPlayMCTSBatch:
                 else (
                     adjudicated_result
                     if adjudicated_result is not None
-                    else ('1/2-1/2' if ended_by_claimable_draw else board.result(claim_draw=False))
+                    else (
+                        syzygy_result
+                        if syzygy_result is not None
+                        else ('1/2-1/2' if ended_by_claimable_draw else board.result(claim_draw=False))
+                    )
                 )
             )
             game_ply_len = int(gs.get('move_count', len(gs['game_history'])))
@@ -1887,6 +2346,9 @@ class BatchSelfPlayMCTSBatch:
             'dropped_positions': int(dropped_positions),
             'claimable_draw_ended_games': int(claimable_draw_ended_games),
             'adjudicated_games': int(adjudicated_games),
+            'syzygy_ended_games': int(syzygy_ended_games),
+            'syzygy_probe_positions': int(syzygy_probe_positions),
+            'syzygy_probe_hits': int(syzygy_probe_hits),
             'resigned_games': int(resigned_games),
             'completed_length_sum': int(completed_length_sum),
             'truncated_length_sum': int(truncated_length_sum),

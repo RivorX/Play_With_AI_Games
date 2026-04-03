@@ -392,7 +392,6 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
 
         policy_loss = policy_loss.mean()
         value_loss = value_loss.mean()
-
         policy_weight = config["reinforcement_learning"]["policy_loss_weight"]
         value_weight = (
             float(config["reinforcement_learning"]["value_loss_weight"])

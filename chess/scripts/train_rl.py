@@ -68,7 +68,7 @@ import threading
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
-from src.model import ChessNet, save_checkpoint, normalize_state_dict_keys, load_checkpoint_file
+from src.model import ChessNet, save_checkpoint, normalize_state_dict_keys, load_checkpoint_file, transfer_matching_weights
 
 # Import MCTS self-play
 try:
@@ -93,6 +93,7 @@ from utils.shared.runtime_helpers import (
     cleanup_interrupted_log_csv,
 )
 from utils.shared.model_view import print_active_model_summary
+from utils.shared.syzygy_manager import ensure_syzygy_tables, describe_syzygy_status
 
 
 _LAST_RUN_LOG_CSV = None
@@ -194,6 +195,41 @@ def _safe_score_rate(wins, draws, losses):
     return float((float(wins) + 0.5 * float(draws)) / float(total))
 
 
+def _state_dicts_identical(state_a, state_b):
+    if state_a is None or state_b is None:
+        return False
+    if state_a.keys() != state_b.keys():
+        return False
+    for key in state_a.keys():
+        tensor_a = state_a[key]
+        tensor_b = state_b[key]
+        if tensor_a.shape != tensor_b.shape or tensor_a.dtype != tensor_b.dtype:
+            return False
+        if not torch.equal(tensor_a, tensor_b):
+            return False
+    return True
+
+
+def _adaptive_factor_from_history(history_values, target_score, band, min_factor, max_factor):
+    if not history_values:
+        return 1.0
+    avg_score = float(sum(history_values) / len(history_values))
+    distance = min(1.0, abs(avg_score - target_score) / band)
+    closeness = max(0.0, 1.0 - distance)
+    return float(min_factor + (max_factor - min_factor) * closeness)
+
+
+def _normalize_weight_map(weight_map):
+    normalized = {
+        str(label): max(0.0, float(weight))
+        for label, weight in dict(weight_map or {}).items()
+    }
+    total = float(sum(normalized.values()))
+    if total <= 0.0:
+        return normalized
+    return {label: (weight / total) for label, weight in normalized.items()}
+
+
 def _canonicalize_opponent_bucket(label):
     normalized = str(label or "current").strip().lower()
     if normalized.startswith("recent"):
@@ -207,11 +243,19 @@ def _build_selfplay_opponent_candidates(
     rl_cfg,
     best_model_state=None,
     recent_snapshot_pool=None,
+    scheduler_state=None,
 ):
     current_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_current_fraction', 0.4)))
     best_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_best_fraction', 0.3)))
     recent_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_recent_fraction', 0.3)))
     recent_snapshot_pool = list(recent_snapshot_pool or [])
+    scheduler_state = dict(scheduler_state or {})
+    adaptive_enabled = bool(rl_cfg.get('self_play_opponent_adaptive_enabled', False))
+    exact_score_history = scheduler_state.get("score_history_exact", {}) or {}
+    target_score = float(rl_cfg.get('self_play_opponent_adaptive_target_score', 0.50))
+    band = max(0.05, float(rl_cfg.get('self_play_opponent_adaptive_band', 0.15)))
+    min_factor = max(0.20, float(rl_cfg.get('self_play_opponent_adaptive_min_factor', 0.60)))
+    max_factor = max(min_factor, float(rl_cfg.get('self_play_opponent_adaptive_max_factor', 1.40)))
 
     candidates = []
     if current_fraction > 0.0:
@@ -232,20 +276,40 @@ def _build_selfplay_opponent_candidates(
     if recent_snapshot_pool and recent_fraction > 0.0:
         recent_count = max(1, len(recent_snapshot_pool))
         recent_entries = []
+        dedup_states = []
+        if best_model_state is not None:
+            dedup_states.append(best_model_state)
         for idx, recent_entry in enumerate(recent_snapshot_pool):
+            recent_state = recent_entry.get("state")
+            if recent_state is None:
+                continue
+            if any(_state_dicts_identical(recent_state, existing_state) for existing_state in dedup_states):
+                continue
             recency_bias = float(idx + 1) / float(recent_count)
+            label = str(recent_entry.get("label", f"recent_{idx}"))
+            factor = 1.0
+            if adaptive_enabled:
+                factor = _adaptive_factor_from_history(
+                    exact_score_history.get(label, []) or [],
+                    target_score,
+                    band,
+                    min_factor,
+                    max_factor,
+                )
             recent_entries.append({
-                "label": str(recent_entry.get("label", f"recent_{idx}")),
-                "state": recent_entry.get("state"),
-                "weight": float(0.75 + 0.25 * recency_bias),
+                "label": label,
+                "state": recent_state,
+                "weight": float((0.75 + 0.25 * recency_bias) * factor),
             })
-        candidates.append({
-            "label": "recent",
-            "weight": float(recent_fraction),
-            "payload": {
-                "entries": recent_entries,
-            },
-        })
+            dedup_states.append(recent_state)
+        if recent_entries:
+            candidates.append({
+                "label": "recent",
+                "weight": float(recent_fraction),
+                "payload": {
+                    "entries": recent_entries,
+                },
+            })
     return candidates
 
 
@@ -257,9 +321,13 @@ def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None)
         for candidate in candidates
     }
     if not adaptive_enabled or not candidates:
-        return base_weights, {}
+        return _normalize_weight_map(base_weights), {}
 
-    score_history = scheduler_state.get("score_history", {}) or {}
+    score_history = (
+        scheduler_state.get("bucket_score_history")
+        or scheduler_state.get("score_history")
+        or {}
+    )
     target_score = float(rl_cfg.get('self_play_opponent_adaptive_target_score', 0.50))
     band = max(0.05, float(rl_cfg.get('self_play_opponent_adaptive_band', 0.15)))
     min_factor = max(0.20, float(rl_cfg.get('self_play_opponent_adaptive_min_factor', 0.60)))
@@ -274,10 +342,13 @@ def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None)
         factor = 1.0
         history_values = score_history.get(label, []) or []
         if label != "current" and history_values:
-            avg_score = float(sum(history_values) / len(history_values))
-            distance = min(1.0, abs(avg_score - target_score) / band)
-            closeness = max(0.0, 1.0 - distance)
-            factor = min_factor + (max_factor - min_factor) * closeness
+            factor = _adaptive_factor_from_history(
+                history_values,
+                target_score,
+                band,
+                min_factor,
+                max_factor,
+            )
         adjusted[label] = base_weight * factor
         debug_factors[label] = float(factor)
 
@@ -287,8 +358,25 @@ def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None)
 
     total_weight = float(sum(adjusted.values()))
     if total_weight <= 0.0:
-        return base_weights, debug_factors
+        return _normalize_weight_map(base_weights), debug_factors
     normalized = {label: (weight / total_weight) for label, weight in adjusted.items()}
+    if current_label in normalized and current_min_fraction > 0.0:
+        desired_current = min(1.0, float(current_min_fraction))
+        current_share = float(normalized.get(current_label, 0.0))
+        if current_share < desired_current:
+            other_labels = [label for label in normalized.keys() if label != current_label]
+            other_total = float(sum(normalized[label] for label in other_labels))
+            if other_total <= 0.0 or desired_current >= 1.0:
+                normalized = {
+                    label: (1.0 if label == current_label else 0.0)
+                    for label in normalized.keys()
+                }
+            else:
+                scale = max(0.0, (1.0 - desired_current) / other_total)
+                normalized = {
+                    label: (desired_current if label == current_label else normalized[label] * scale)
+                    for label in normalized.keys()
+                }
     return normalized, debug_factors
 
 
@@ -300,13 +388,28 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
     update_every = max(1, int(rl_cfg.get('self_play_opponent_adaptive_update_every', 2)))
     min_games = max(1, int(rl_cfg.get('self_play_opponent_adaptive_min_games', 8)))
     history_size = max(1, int(rl_cfg.get('self_play_opponent_adaptive_history_size', 4)))
-    score_history = state.get("score_history")
-    if not isinstance(score_history, dict):
-        score_history = {}
+    bucket_score_history = state.get("bucket_score_history")
+    if not isinstance(bucket_score_history, dict):
+        bucket_score_history = state.get("score_history")
+    if not isinstance(bucket_score_history, dict):
+        bucket_score_history = {}
+    exact_score_history = state.get("score_history_exact")
+    if not isinstance(exact_score_history, dict):
+        exact_score_history = {}
 
     observed_scores = {}
+    exact_observed_scores = {}
     bucket_stats = {}
     for label, stats in dict(opponent_results or {}).items():
+        games = int((stats or {}).get("games", 0))
+        if games >= min_games:
+            score_rate = _safe_score_rate(
+                (stats or {}).get("wins", 0),
+                (stats or {}).get("draws", 0),
+                (stats or {}).get("losses", 0),
+            )
+            if score_rate is not None:
+                exact_observed_scores[str(label)] = float(score_rate)
         bucket = _canonicalize_opponent_bucket(label)
         bucket_entry = bucket_stats.setdefault(
             bucket,
@@ -330,14 +433,24 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
             continue
         observed_scores[str(label)] = float(score_rate)
     if (int(iteration_num) % update_every) != 0:
+        state["bucket_score_history"] = bucket_score_history
+        state["score_history_exact"] = exact_score_history
+        state["score_history"] = bucket_score_history
         return state, observed_scores
 
-    for label, score_rate in observed_scores.items():
-        history = deque(score_history.get(str(label), []), maxlen=history_size)
+    for label, score_rate in exact_observed_scores.items():
+        history = deque(exact_score_history.get(str(label), []), maxlen=history_size)
         history.append(float(score_rate))
-        score_history[str(label)] = list(history)
+        exact_score_history[str(label)] = list(history)
 
-    state["score_history"] = score_history
+    for label, score_rate in observed_scores.items():
+        history = deque(bucket_score_history.get(str(label), []), maxlen=history_size)
+        history.append(float(score_rate))
+        bucket_score_history[str(label)] = list(history)
+
+    state["bucket_score_history"] = bucket_score_history
+    state["score_history_exact"] = exact_score_history
+    state["score_history"] = bucket_score_history
     return state, observed_scores
 
 
@@ -356,6 +469,7 @@ def _build_selfplay_opponent_assignments(
         rl_cfg,
         best_model_state=best_model_state,
         recent_snapshot_pool=recent_snapshot_pool,
+        scheduler_state=adaptive_scheduler_state,
     )
     if not candidates:
         return {}, {}
@@ -668,16 +782,23 @@ class RLEloCoordinator:
 
     def _run_estimate(self, iteration_num, reason_label, final_override=False):
         elo_config = dict(self.elo_config)
-        elo_config.setdefault("stockfish_priority", "below_normal")
+        # RL Elo is synchronous: training is paused while Stockfish runs, so
+        # do not keep "training-friendly" CPU reservations that were intended
+        # for async IL/background evaluation.
+        elo_config.setdefault("stockfish_priority", "normal")
         elo_config.setdefault("stockfish_hide_window", True)
         elo_config.setdefault("max_error_logs_per_type", 8)
+        elo_config["prioritize_training"] = False
+        elo_config["reserve_dataloader_workers"] = False
+        elo_config["free_threads_utilization"] = 1.0
         # RL Elo should not use the generic auto "cpu_total - 2" worker reserve.
-        elo_config.setdefault("auto_worker_reserve_cpus", 0)
+        elo_config["auto_worker_reserve_cpus"] = 0
         if final_override:
             # Final/shutdown Elo runs when training is paused/stopped;
             # allow full CPU budget for faster estimation.
             elo_config["prioritize_training"] = False
             elo_config["reserve_dataloader_workers"] = False
+            elo_config["free_threads_utilization"] = 1.0
             elo_config["stockfish_priority"] = "normal"
             # Final estimate is blocking/user-visible, so always show progress.
             elo_config["progress_bar"] = "always"
@@ -810,6 +931,23 @@ def _should_run_anchor_eval(iteration_num, rl_cfg):
         return False
     every = max(1, int(rl_cfg.get('anchor_eval_every', 1)))
     return (iteration_num % every) == 0
+
+
+def _models_have_identical_state(model_a, model_b):
+    if model_a is None or model_b is None:
+        return False
+    state_a = model_a.state_dict()
+    state_b = model_b.state_dict()
+    if state_a.keys() != state_b.keys():
+        return False
+    for key in state_a.keys():
+        tensor_a = state_a[key]
+        tensor_b = state_b[key]
+        if tensor_a.shape != tensor_b.shape or tensor_a.dtype != tensor_b.dtype:
+            return False
+        if not torch.equal(tensor_a, tensor_b):
+            return False
+    return True
 
 
 # ==============================================================================
@@ -1171,6 +1309,9 @@ def play_games_parallel_mcts(
     queue_total_truncated_games = 0
     queue_total_claimable_draw_ended_games = 0
     queue_total_adjudicated_games = 0
+    queue_total_syzygy_ended_games = 0
+    queue_total_syzygy_probe_positions = 0
+    queue_total_syzygy_probe_hits = 0
     queue_total_completed_length_sum = 0
     queue_total_truncated_length_sum = 0
     queue_total_completed_white_wins = 0
@@ -1286,6 +1427,7 @@ def play_games_parallel_mcts(
                                     policy_indices = packed.get('policy_indices')
                                     policy_values = packed.get('policy_values')
                                     policy_lengths = packed.get('policy_lengths')
+                                    importance_scores = packed.get('importance_scores')
                                     values = packed.get('values')
                                     chunk_positions = int(packed.get('num_positions', 0) or 0)
                                     if (
@@ -1302,6 +1444,7 @@ def play_games_parallel_mcts(
                                             policy_values,
                                             policy_lengths,
                                             values,
+                                            importance_scores=importance_scores,
                                         )
                                     queue_total_positions += chunk_positions
                                     if values is not None:
@@ -1314,6 +1457,9 @@ def play_games_parallel_mcts(
                                 queue_total_truncated_games += int(chunk_stats.get('truncated_games', 0))
                                 queue_total_claimable_draw_ended_games += int(chunk_stats.get('claimable_draw_ended_games', 0))
                                 queue_total_adjudicated_games += int(chunk_stats.get('adjudicated_games', 0))
+                                queue_total_syzygy_ended_games += int(chunk_stats.get('syzygy_ended_games', 0))
+                                queue_total_syzygy_probe_positions += int(chunk_stats.get('syzygy_probe_positions', 0))
+                                queue_total_syzygy_probe_hits += int(chunk_stats.get('syzygy_probe_hits', 0))
                                 queue_total_completed_length_sum += int(chunk_stats.get('completed_length_sum', 0))
                                 queue_total_truncated_length_sum += int(chunk_stats.get('truncated_length_sum', 0))
                                 queue_total_completed_white_wins += int(chunk_stats.get('completed_white_wins', 0))
@@ -1434,6 +1580,9 @@ def play_games_parallel_mcts(
     total_truncated_games = queue_total_truncated_games if use_queue_transport else 0
     total_claimable_draw_ended_games = queue_total_claimable_draw_ended_games if use_queue_transport else 0
     total_adjudicated_games = queue_total_adjudicated_games if use_queue_transport else 0
+    total_syzygy_ended_games = queue_total_syzygy_ended_games if use_queue_transport else 0
+    total_syzygy_probe_positions = queue_total_syzygy_probe_positions if use_queue_transport else 0
+    total_syzygy_probe_hits = queue_total_syzygy_probe_hits if use_queue_transport else 0
     total_completed_length_sum = queue_total_completed_length_sum if use_queue_transport else 0
     total_truncated_length_sum = queue_total_truncated_length_sum if use_queue_transport else 0
     total_completed_white_wins = queue_total_completed_white_wins if use_queue_transport else 0
@@ -1492,6 +1641,9 @@ def play_games_parallel_mcts(
                             total_truncated_games += int((stats or {}).get('truncated_games', 0))
                             total_claimable_draw_ended_games += int((stats or {}).get('claimable_draw_ended_games', 0))
                             total_adjudicated_games += int((stats or {}).get('adjudicated_games', 0))
+                            total_syzygy_ended_games += int((stats or {}).get('syzygy_ended_games', 0))
+                            total_syzygy_probe_positions += int((stats or {}).get('syzygy_probe_positions', 0))
+                            total_syzygy_probe_hits += int((stats or {}).get('syzygy_probe_hits', 0))
                             total_completed_length_sum += int((stats or {}).get('completed_length_sum', 0))
                             total_truncated_length_sum += int((stats or {}).get('truncated_length_sum', 0))
                             total_completed_white_wins += int((stats or {}).get('completed_white_wins', 0))
@@ -1608,6 +1760,15 @@ def play_games_parallel_mcts(
             f"curriculum={int(total_curriculum_dropped_positions)}, "
             f"cap={int(total_cap_dropped_positions)}"
         )
+    if total_syzygy_probe_positions > 0:
+        syzygy_hit_rate = 100.0 * float(total_syzygy_probe_hits) / float(max(1, total_syzygy_probe_positions))
+        print(
+            "   Syzygy probes: "
+            f"{int(total_syzygy_probe_hits)}/{int(total_syzygy_probe_positions)} "
+            f"({syzygy_hit_rate:.1f}% hits)"
+        )
+    if total_syzygy_ended_games > 0:
+        print(f"   Syzygy-ended games: {int(total_syzygy_ended_games)}")
     if total_adjudicated_games > 0:
         print(f"   Adjudicated decisive games: {int(total_adjudicated_games)}")
     if total_resigned_games > 0:
@@ -1661,6 +1822,9 @@ def play_games_parallel_mcts(
         'truncated_games': int(total_truncated_games),
         'claimable_draw_ended_games': int(total_claimable_draw_ended_games),
         'adjudicated_games': int(total_adjudicated_games),
+        'syzygy_ended_games': int(total_syzygy_ended_games),
+        'syzygy_probe_positions': int(total_syzygy_probe_positions),
+        'syzygy_probe_hits': int(total_syzygy_probe_hits),
         'decisive_games': int(decisive_games),
         'decisive_rate': float(decisive_rate),
         'auto_draw_rate': float(auto_draw_rate),
@@ -1706,6 +1870,25 @@ def main():
     print(f"Loading config from: {config_path}")
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+
+    try:
+        syzygy_bootstrap = ensure_syzygy_tables(config, chess_dir=script_dir.parent, logger=print)
+        syzygy_status = describe_syzygy_status(config, chess_dir=script_dir.parent)
+        syzygy_paths = syzygy_status.get('paths', [])
+        syzygy_file_count = int(syzygy_status.get('wdl_files', 0))
+        if syzygy_bootstrap.get('enabled', False):
+            if int(syzygy_bootstrap.get('downloaded_files', 0)) > 0:
+                size_mb = float(syzygy_bootstrap.get('downloaded_bytes', 0)) / 1024 / 1024
+                print(
+                    f"Syzygy auto-download complete: {int(syzygy_bootstrap.get('downloaded_files', 0))} files, "
+                    f"{size_mb:.1f} MB -> {syzygy_bootstrap.get('destination')}"
+                )
+            elif syzygy_file_count > 0:
+                print(f"Syzygy ready: {syzygy_file_count} WDL file(s) in {', '.join(str(p) for p in syzygy_paths)}")
+            else:
+                print("Syzygy enabled, but no local WDL files found yet.")
+    except Exception as exc:
+        print(f"Syzygy auto-download skipped: {exc}")
 
     if not MCTS_SELFPLAY_AVAILABLE:
         raise RuntimeError(
@@ -1971,7 +2154,10 @@ def main():
             if not isinstance(model_state, dict):
                 raise KeyError("missing model_state_dict")
             normalized_state = normalize_state_dict_keys(model_state, target_keys=set(anchor_model.state_dict().keys()))
-            anchor_model.load_state_dict(normalized_state)
+            try:
+                anchor_model.load_state_dict(normalized_state)
+            except Exception:
+                transfer_matching_weights(anchor_model, normalized_state)
             anchor_model.eval()
             anchor_model_available = True
             print(f"Anchor eval enabled vs IL best: {best_model_il_path.name}")
@@ -1982,7 +2168,11 @@ def main():
     rl_cfg = config['reinforcement_learning']
     recent_snapshot_keep = max(0, int(rl_cfg.get('self_play_recent_snapshots_to_keep', 4)))
     recent_selfplay_snapshots = deque(maxlen=recent_snapshot_keep) if recent_snapshot_keep > 0 else deque(maxlen=0)
-    adaptive_opponent_scheduler_state = {'score_history': {}}
+    adaptive_opponent_scheduler_state = {
+        'score_history': {},
+        'bucket_score_history': {},
+        'score_history_exact': {},
+    }
     if recent_snapshot_keep > 0:
         recent_selfplay_snapshots.append({
             'label': 'recent_init',
@@ -2001,6 +2191,18 @@ def main():
         ),
         decisive_value_epsilon=float(
             config['reinforcement_learning'].get('replay_decisive_value_epsilon', 0.05)
+        ),
+        hard_negative_sampling_fraction=float(
+            config['reinforcement_learning'].get('replay_hard_negative_sampling_fraction', 0.0)
+        ),
+        hard_negative_min_importance=float(
+            config['reinforcement_learning'].get('replay_hard_negative_min_importance', 0.0)
+        ),
+        resize_preserve_decisive_fraction=float(
+            config['reinforcement_learning'].get('replay_resize_preserve_decisive_fraction', 0.0)
+        ),
+        resize_preserve_decisive_min_count=int(
+            config['reinforcement_learning'].get('replay_resize_preserve_decisive_min_count', 0)
         ),
     )
     replay_capacity_round_to = max(1, int(rl_cfg.get('replay_buffer_capacity_round_to', 256)))
@@ -2396,24 +2598,27 @@ def main():
                     f"(true win rate: {true_win_rate:.2%}, unresolved draws at cap: {eval_unresolved})"
                 )
                 if anchor_model_available and anchor_model is not None and _should_run_anchor_eval(iteration + 1, rl_cfg):
-                    print(f"Anchor eval vs IL-best ({int(rl_cfg.get('anchor_eval_games', 40))} games)...")
-                    anchor_stats = evaluate_models(
-                        model,
-                        anchor_model,
-                        config,
-                        device,
-                        int(rl_cfg.get('anchor_eval_games', 40)),
-                        use_fixed_openings=bool(rl_cfg.get('anchor_eval_use_fixed_openings', True)),
-                    )
-                    anchor_score_rate = float((anchor_stats or {}).get('score_rate', 0.0))
-                    anchor_true_win_rate = float((anchor_stats or {}).get('win_rate', 0.0))
-                    anchor_wins = int((anchor_stats or {}).get('wins', 0))
-                    anchor_draws = int((anchor_stats or {}).get('draws', 0))
-                    anchor_losses = int((anchor_stats or {}).get('losses', 0))
-                    print(
-                        f"Anchor W/D/L: {anchor_wins}/{anchor_draws}/{anchor_losses} "
-                        f"(score: {anchor_score_rate:.2%}, true win rate: {anchor_true_win_rate:.2%})"
-                    )
+                    if _models_have_identical_state(best_model, anchor_model):
+                        print("Anchor eval skipped: current best still matches IL-best.")
+                    else:
+                        print(f"Anchor eval vs IL-best ({int(rl_cfg.get('anchor_eval_games', 40))} games)...")
+                        anchor_stats = evaluate_models(
+                            model,
+                            anchor_model,
+                            config,
+                            device,
+                            int(rl_cfg.get('anchor_eval_games', 40)),
+                            use_fixed_openings=bool(rl_cfg.get('anchor_eval_use_fixed_openings', True)),
+                        )
+                        anchor_score_rate = float((anchor_stats or {}).get('score_rate', 0.0))
+                        anchor_true_win_rate = float((anchor_stats or {}).get('win_rate', 0.0))
+                        anchor_wins = int((anchor_stats or {}).get('wins', 0))
+                        anchor_draws = int((anchor_stats or {}).get('draws', 0))
+                        anchor_losses = int((anchor_stats or {}).get('losses', 0))
+                        print(
+                            f"Anchor W/D/L: {anchor_wins}/{anchor_draws}/{anchor_losses} "
+                            f"(score: {anchor_score_rate:.2%}, true win rate: {anchor_true_win_rate:.2%})"
+                        )
                 estimated_elo = elo_coordinator.maybe_evaluate(
                     iteration + 1,
                     score_rate=score_rate,

@@ -101,9 +101,11 @@ def board_to_tensor(board, flip_perspective=None):
     
     # Channel 12: Castling rights
     # Mark squares where castling is possible (king position + rook position)
-    if board.has_kingside_castling_rights(board.turn):
+    # When flip_perspective is forced (history/eval paths), metadata must follow
+    # the requested POV color rather than the historical side-to-move.
+    if board.has_kingside_castling_rights(pov_color):
         # Kingside: mark king and h-rook squares
-        king_sq = board.king(board.turn)
+        king_sq = board.king(pov_color)
         if king_sq is not None:
             king_row, king_col = king_sq // 8, king_sq % 8
             if should_flip:
@@ -115,9 +117,9 @@ def board_to_tensor(board, flip_perspective=None):
                 rook_col = 7 - rook_col
             tensor[12, king_row, rook_col] = 1.0
     
-    if board.has_queenside_castling_rights(board.turn):
+    if board.has_queenside_castling_rights(pov_color):
         # Queenside: mark king and a-rook squares
-        king_sq = board.king(board.turn)
+        king_sq = board.king(pov_color)
         if king_sq is not None:
             king_row, king_col = king_sq // 8, king_sq % 8
             if should_flip:

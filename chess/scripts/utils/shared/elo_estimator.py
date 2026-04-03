@@ -48,6 +48,45 @@ _SF_TAG = "sf_17.1"  # GitHub release tag
 _SF_REPO = "official-stockfish/Stockfish"
 
 
+def _available_cpu_count() -> int:
+    """Best-effort count of CPUs actually available to this process."""
+    try:
+        process_cpu_count = getattr(os, "process_cpu_count", None)
+        if callable(process_cpu_count):
+            value = process_cpu_count()
+            if value is not None:
+                return max(1, int(value))
+    except Exception:
+        pass
+
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        pass
+
+    if platform.system().lower() == "windows":
+        try:
+            import ctypes
+
+            current_process = ctypes.windll.kernel32.GetCurrentProcess()
+            process_mask = ctypes.c_size_t()
+            system_mask = ctypes.c_size_t()
+            ok = ctypes.windll.kernel32.GetProcessAffinityMask(
+                current_process,
+                ctypes.byref(process_mask),
+                ctypes.byref(system_mask),
+            )
+            if ok:
+                mask_value = int(process_mask.value)
+                if mask_value > 0:
+                    return max(1, mask_value.bit_count())
+        except Exception:
+            pass
+
+    return max(1, int(os.cpu_count() or 1))
+
+
 def _get_stockfish_download_info() -> tuple[str, str]:
     """
     Return (download_url, expected_binary_name) for the current platform.
@@ -266,16 +305,19 @@ class _ModelPlayer:
         max_keep = self.history_positions + 4
         if len(self.board_history) > max_keep:
             self.board_history = self.board_history[-max_keep:]
+        if self.mcts is not None:
+            self.mcts.update_history(board)
 
     def _build_input_tensor(self, board: chess.Board) -> np.ndarray:
         """Build (C, 8, 8) input tensor including history planes."""
         tensors: list[np.ndarray] = []
+        flip_history = (board.turn == chess.BLACK)
 
         if self.history_positions > 0 and self.board_history:
             # Collect up to history_positions past boards (most recent last)
             history = self.board_history[-(self.history_positions):]
             for hb in history:
-                tensors.append(board_to_tensor(hb))
+                tensors.append(board_to_tensor(hb, flip_perspective=flip_history))
             # Pad with zeros if not enough history
             while len(tensors) < self.history_positions:
                 tensors.insert(0, np.zeros((16, 8, 8), dtype=np.float32))
@@ -325,6 +367,11 @@ class _ModelPlayer:
             return self._best_move_raw(board)  # Fallback
         move, _ = select_move_by_visits(visit_counts, temperature=0.0)
         return move
+
+    def on_move_played(self, move: chess.Move):
+        """Keep MCTS tree synchronized with the actual played move."""
+        if self.mcts is not None:
+            self.mcts.advance_root(move)
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +451,7 @@ class EloEstimator:
         """
         Resolve worker count with optional training-friendly CPU reservation.
         """
-        cpu_total = int(os.cpu_count() or 1)
+        cpu_total = _available_cpu_count()
         try:
             requested = int(requested_workers or 0)
         except (TypeError, ValueError):
@@ -644,6 +691,7 @@ class EloEstimator:
                 tasks.append((level, game_idx, model_is_white))
 
         workers = self._resolve_workers(workers, total_games=len(tasks))
+        print(f"  Info: Elo workers resolved to {workers} (available_cpu={_available_cpu_count()}).")
         if self._is_cancelled():
             return {
                 "estimated_elo": None,
@@ -884,11 +932,14 @@ class EloEstimator:
             if board.is_game_over(claim_draw=True):
                 break
 
+            # Keep the model-side history aligned with the real game, not only
+            # with plies where the model is to move.
+            player.record_state(board)
+
             model_turn = (board.turn == chess.WHITE) == model_is_white
 
             if model_turn:
                 # Model plays
-                player.record_state(board)
                 move = player.best_move(board)
                 if move is None or move not in board.legal_moves:
                     # Fallback: first legal move
@@ -903,6 +954,7 @@ class EloEstimator:
                     break
 
             board.push(move)
+            player.on_move_played(move)
 
         # Determine result
         result = board.result(claim_draw=True)

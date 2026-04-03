@@ -190,7 +190,7 @@ reinforcement_learning:
   # ---------------------------
   use_prioritized_replay: false  # Default to uniform replay; PER was reinforcing draw-heavy self-play collapse
   iterations: 30                # Total RL iterations
-  games_per_iteration: 10      # Enough signal per iteration without stretching self-play too long
+  games_per_iteration: 300      # Enough signal per iteration without stretching self-play too long
 
   # ---------------------------
   # Self-Play Runtime
@@ -211,14 +211,21 @@ reinforcement_learning:
   # ---------------------------
   use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
   max_batch_games_per_worker: 8     # Sweet spot with mcts_batch_size=64 on this setup; keeps batches full without overfragmenting CPU traversal
-  self_play_max_moves: 220          # Keep a firm cap so sterile games do not eat the whole iteration budget
+  self_play_max_moves: 190          # Shorter cap: cut low-value sterile games earlier instead of harvesting many doomed draw samples
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
-  self_play_claim_repetition_after_moves: 50  # Claim sterile repetition relatively early
-  self_play_claim_draw_after_moves: 100  # Do not let generic claimable draws drift forever
+  self_play_claim_repetition_after_moves: 40  # Claim sterile repetition earlier to reduce low-signal looping positions
+  self_play_claim_draw_after_moves: 85  # End generic claimable draws sooner before they flood replay with redundant samples
   self_play_adjudication_enabled: true   # Convert obviously won late positions into decisive outcomes instead of truncating them
-  self_play_adjudication_min_moves: 80   # Start adjudication only in later middlegame/endgame territory
-  self_play_adjudication_threshold: 0.85 # Let clearly won late positions convert before they hit the move cap
-  self_play_adjudication_patience: 4     # Require a short stable streak, but do not wait too long
+  self_play_adjudication_min_moves: 70   # Start a bit earlier so clearly won games convert before drifting into long drawish tails
+  self_play_adjudication_threshold: 0.82 # Slightly more eager conversion of stable winning positions into decisive outcomes
+  self_play_adjudication_patience: 3     # Need a stable edge, but finish games faster once it is obvious
+  syzygy_enabled: true                   # Probe local Syzygy tablebases in tiny endgames and finish them without wasting search
+  syzygy_paths:
+    - "data/syzygy"                      # Relative paths are resolved from chess/ (e.g. chess/data/syzygy)
+  syzygy_max_pieces: 6                   # 6-man is the practical sweet spot; 7-man is much heavier on disk
+  syzygy_auto_download_enabled: true     # If local Syzygy WDL files are missing, bootstrap them automatically on RL startup
+  syzygy_auto_download_preset: "wdl_345" # Safe default: 3-4-5 WDL only. Use "wdl_345_6" for 6-man WDL too (much larger download)
+  syzygy_auto_download_provider: "lichess" # Recommended mirror for auto-download (stable TLS + 3-4-5/6 WDL dirs)
   self_play_resignation_enabled: true    # Let hopeless positions resign before they bloat truncation-heavy games
   self_play_resignation_min_moves: 70    # Do not allow very early resigns out of the opening
   self_play_resignation_threshold: 0.93  # Require a clearly losing root value before resigning
@@ -280,12 +287,28 @@ reinforcement_learning:
   mcts_c_puct_init: 0.9      # Było 1.25. Pozwalamy MCTS od razu wejść na duże głębokości (wąskie warianty)
   mcts_c_puct_max: 1.5       # Było 2.0
   mcts_use_fpu: true         # First Play Urgency: non-visited moves get parent-aware prior value
-  mcts_fpu_reduction: 0.25   # Było 0.15. Silniejsze karanie nieodwiedzonych (Wymusza jeszcze większą głębie zamiast wchodzić w nowe liście)
+  mcts_fpu_reduction: 0.12   # Reduce FPU from parent value to encourage some exploration of unvisited moves (0.0 = no reduction, 1.0 = zero FPU)
   mcts_fpu_absolute: null    # null = adaptive parent-Q FPU, float = fixed FPU value in [-1, 1]
   mcts_temperature: 0.75      # Lower self-play move temperature so policy targets are less washed out
   mcts_temperature_threshold: 16  # (8 pełnych ruchów) Szybciej przechodzimy na determinizm, żeby gracze potrafili wykończyć błąd
   mcts_dirichlet_alpha: 0.3  # Standard rzędu szachowego
-  mcts_dirichlet_weight: 0.15  # Znacznie mocniejszy szum, żeby nie grały tylko najlepszego ruchu na ślepo
+  mcts_dirichlet_weight: 0.1  # Znacznie mocniejszy szum, żeby nie grały tylko najlepszego ruchu na ślepo
+  mcts_tactical_priors_enabled: true  # Light tactical nudges help low-budget search notice forcing moves sooner
+  mcts_tactical_capture_bonus: 0.10   # Small prior boost for captures
+  mcts_tactical_winning_capture_bonus: 0.08  # Extra nudge for obviously favorable captures
+  mcts_tactical_check_bonus: 0.06     # Checks are often tactically forcing
+  mcts_tactical_promotion_bonus: 0.12 # Promotions are rare and critical
+  mcts_tactical_recapture_bonus: 0.08 # Helps short tactical recapture sequences
+  mcts_playout_cap_randomization_enabled: true  # Mix cheaper and full searches instead of using one fixed budget every move
+  mcts_playout_cap_randomization_low: 24        # Cheap search branch for extra value diversity
+  mcts_playout_cap_randomization_high: 64       # Full search branch keeps policy targets sharp
+  mcts_playout_cap_randomization_low_fraction: 0.55 # Slightly favor cheaper branches to generate more training targets per wall-clock
+  policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
+  policy_target_pruning_keep_top_n: 2           # Always keep the top moves
+  policy_target_pruning_max_moves: 12           # Hard cap on support size of the sparse policy target
+  policy_target_pruning_min_prob: 0.02          # Remove tiny probability tails
+  policy_target_pruning_min_fraction_of_max: 0.12 # Keep moves only if they are not far below the best visit count
+  policy_target_pruning_keep_mass: 0.92         # Keep most of the signal, trim the noisiest tail
   
   # ---------------------------
   # Optimizer & Training
@@ -298,14 +321,23 @@ reinforcement_learning:
 
   # Replay buffer sizing:
   # Capacity now bootstraps small and then auto-resizes from observed positions/iteration.
-  replay_buffer_multiplier: 4     # Target capacity ~= EMA(observed positions per iteration) * multiplier
+  replay_buffer_multiplier: 8     # Larger replay horizon so fresh draw-heavy batches do not overwrite signal too quickly
   replay_buffer_bootstrap_positions_per_iteration: auto  # auto = start from a small conservative bootstrap instead of a large fixed guess
-  replay_buffer_ema_alpha: 0.25   # How quickly replay capacity reacts to newly observed self-play volume
+  replay_buffer_ema_alpha: 0.15   # React more slowly so replay size does not shrink too aggressively between iterations
   replay_buffer_min_size: 4096    # Never shrink below a small practical floor
   replay_buffer_capacity_round_to: 256  # Round capacity changes to reduce realloc noise
   replay_fp16: true             # Store replay tensors in float16 to reduce RAM (~2x)
-  replay_decisive_sampling_fraction: 0.10   # Keep a small decisive bias, but avoid oversampling mostly losing decisive positions
+  replay_decisive_sampling_fraction: 0.15   # Keep a small decisive bias, but avoid oversampling mostly losing decisive positions
   replay_decisive_value_epsilon: 0.05       # Treat |value| > epsilon as decisive for replay sampling
+  replay_hard_negative_sampling_fraction: 0.15  # Pull a slice of each batch from high-importance tactical/uncertain positions
+  replay_hard_negative_min_importance: 1.35    # Threshold for positions to count as "hard" in replay sampling
+  replay_resize_preserve_decisive_fraction: 0.15  # On buffer shrink, preserve some older decisive samples instead of only the newest data
+  replay_resize_preserve_decisive_min_count: 1024 # Floor for protected decisive positions when available
+  replay_importance_gating_enabled: true       # Gate per-game positions by importance before the normal replay cap
+  replay_importance_gate_fraction_decisive: 0.70 # Keep most decisive positions, but trim the least useful tail
+  replay_importance_gate_fraction_draw: 0.45   # Draws need stronger filtering to avoid sterile replay spam
+  replay_importance_gate_min_positions: 12     # Never let importance gating erase a game completely
+  replay_importance_top_fraction: 0.70         # Mostly keep top-importance moments plus some timeline coverage
   
   # Learning rate schedule
   use_lr_schedule: true
@@ -325,10 +357,10 @@ reinforcement_learning:
   # ---------------------------
   eval_games: 100            # Fallback total games when staged eval is disabled
   eval_mcts_simulations: 64  # Match self-play search budget more closely during model-vs-best evaluation
-  eval_max_moves: 260        # Align eval with self-play so results are not dominated by ultra-long unresolved games
+  eval_max_moves: 320        # Align eval with self-play so results are not dominated by ultra-long unresolved games
   eval_auto_claim_draw: true
-  eval_claim_repetition_after_moves: 80
-  eval_claim_draw_after_moves: 140  # Generic claimable draws after ~70 full moves
+  eval_claim_repetition_after_moves: 70
+  eval_claim_draw_after_moves: 180  # Generic claimable draws after ~70 full moves
   eval_every: 5              # Evaluate every N iterations
   eval_staged_enabled: true
   eval_stage1_games: 40
