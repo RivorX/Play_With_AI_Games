@@ -334,6 +334,7 @@ class ChessGUI:
         }
         self.analysis_cache = self._empty_analysis_cache()
         self.analysis_cache_by_color = self._empty_analysis_cache_by_color()
+        self.mcts_analysis_cache_by_color = self._empty_analysis_cache_by_color()
         self._resize_canvas(*self.restore_window_size)
         self._update_viewport()
         try:
@@ -868,6 +869,7 @@ class ChessGUI:
     def _reset_analysis_storage(self):
         self.analysis_cache = self._empty_analysis_cache()
         self.analysis_cache_by_color = self._empty_analysis_cache_by_color()
+        self.mcts_analysis_cache_by_color = self._empty_analysis_cache_by_color()
 
     def _reset_selection_state(self):
         self.selected_square = None
@@ -1052,15 +1054,71 @@ class ChessGUI:
             return bool((color == chess.WHITE and self.model1 is not None) or (color == chess.BLACK and self.model2 is not None))
         return False
 
+    def _side_has_visible_analysis(self, color):
+        if not self._side_has_analysis(color):
+            return False
+        policy_rows = list(self.analysis_cache_by_color.get(color, {}).get("rows", []))
+        mcts_rows = list(self.mcts_analysis_cache_by_color.get(color, {}).get("rows", []))
+        return bool(policy_rows or mcts_rows)
+
     def _side_uses_mcts(self, color):
         if self.game_mode == "ai_vs_ai":
             return bool(self.use_mcts_white if color == chess.WHITE else self.use_mcts_black)
         return bool(self.use_mcts)
 
+    def _analysis_mcts_for_color(self, color):
+        if not self._side_uses_mcts(color):
+            return None
+        if self.game_mode == "ai_vs_ai":
+            return self.mcts1 if color == chess.WHITE else self.mcts2
+        return self.mcts1
+
+    def _analysis_mcts_simulations(self, color):
+        if self.game_mode == "ai_vs_ai":
+            return self.mcts_simulations_white if color == chess.WHITE else self.mcts_simulations_black
+        return self.mcts_simulations_white
+
+    def _build_mcts_analysis_rows(self, color):
+        mcts = self._analysis_mcts_for_color(color)
+        if mcts is None:
+            return []
+
+        sims = max(1, int(self._analysis_mcts_simulations(color)))
+        visit_counts = mcts.search(self.board, sims)
+        if not visit_counts:
+            return []
+
+        total_visits = float(sum(max(0.0, float(v)) for v in visit_counts.values()))
+        if total_visits <= 0.0:
+            return []
+
+        rows = []
+        for move, visits in sorted(visit_counts.items(), key=lambda item: float(item[1]), reverse=True):
+            try:
+                san = self.board.san(move)
+            except Exception:
+                san = move.uci()
+            visit_value = max(0.0, float(visits))
+            rows.append(
+                {
+                    "move": move.uci(),
+                    "san": san,
+                    "probability": visit_value / total_visits,
+                    "visits": int(round(visit_value)),
+                }
+            )
+            if len(rows) >= ANALYSIS_DISPLAY_ROWS:
+                break
+        return rows
+
     def _refresh_analysis_cache(self):
         current_fen = self.board.fen()
         if self.analysis_cache.get("fen") == current_fen:
             return
+
+        for color, label in ((chess.WHITE, "White"), (chess.BLACK, "Black")):
+            self.analysis_cache_by_color[color] = {"rows": [], "label": label, "fen": current_fen}
+            self.mcts_analysis_cache_by_color[color] = {"rows": [], "label": label, "fen": current_fen}
 
         model = self._current_analysis_model()
         analysis_color = self._analysis_target_color()
@@ -1115,9 +1173,15 @@ class ChessGUI:
                     break
             self.analysis_cache = {"fen": current_fen, "rows": rows, "side": analysis_color, "label": side_label}
             self.analysis_cache_by_color[analysis_color] = {"rows": rows, "label": side_label, "fen": current_fen}
+            self.mcts_analysis_cache_by_color[analysis_color] = {
+                "rows": self._build_mcts_analysis_rows(analysis_color),
+                "label": side_label,
+                "fen": current_fen,
+            }
         except Exception:
             self.analysis_cache = {"fen": current_fen, "rows": [], "side": analysis_color, "label": side_label}
             self.analysis_cache_by_color[analysis_color] = {"rows": [], "label": side_label, "fen": current_fen}
+            self.mcts_analysis_cache_by_color[analysis_color] = {"rows": [], "label": side_label, "fen": current_fen}
 
     def _side_info(self, color):
         side_name = "White" if color == chess.WHITE else "Black"
@@ -1257,43 +1321,34 @@ class ChessGUI:
     def _analysis_card_height(self, color, row_limit=None):
         if not self._side_has_analysis(color):
             return 0
-        rows = list(self.analysis_cache_by_color.get(color, {}).get("rows", []))
+        policy_rows = list(self.analysis_cache_by_color.get(color, {}).get("rows", []))
+        mcts_rows = list(self.mcts_analysis_cache_by_color.get(color, {}).get("rows", []))
         if row_limit is None:
             row_limit = ANALYSIS_DISPLAY_ROWS
         row_limit = max(1, int(row_limit))
-        row_count = max(1, min(row_limit, len(rows)))
+        row_count = max(1, min(row_limit, max(len(policy_rows), len(mcts_rows))))
         row_h = self._analysis_row_height()
-        return 18 + self.small_font.get_height() + 12 + row_count * (row_h + 2) + 10
+        return 18 + self.small_font.get_height() + 12 + self.tiny_font.get_height() + 8 + row_count * (row_h + 2) + 10
 
-    def _draw_analysis_card(self, rect, color, active=False, row_limit=None):
-        if rect.height <= 0 or not self._side_has_analysis(color):
-            return
-        label = "White" if color == chess.WHITE else "Black"
-        cache = self.analysis_cache_by_color.get(color, {"rows": [], "fen": None})
-        rows = list(cache.get("rows", []))
-        border = (102, 168, 240) if active else (92, 109, 136)
-        self._draw_card(rect, fill=(23, 30, 41), border=border)
-        self.analysis_entry_buttons = [entry for entry in self.analysis_entry_buttons if entry.get("color") != color]
+    def _draw_analysis_column(self, rect, rows, cache_fen, color, label, row_limit, fill_color, show_visits=False):
         self.canvas.blit(
-            self.small_font.render(f"Top ruchy ({label})", True, TEXT_COLOR),
-            (rect.left + 12, rect.top + 10),
+            self.tiny_font.render(label, True, (172, 191, 220)),
+            (rect.left, rect.top),
         )
+
         if not rows:
-            empty_text = "Analiza pojawia sie, gdy AI jest na ruchu." if self.game_mode == "human_vs_ai" else "Brak danych analizy dla tej strony."
+            empty_text = "Brak danych"
             self.canvas.blit(
-                self.tiny_font.render(self._fit_text(self.tiny_font, empty_text, rect.width - 24), True, (172, 185, 205)),
-                (rect.left + 12, rect.top + 40),
+                self.tiny_font.render(self._fit_text(self.tiny_font, empty_text, rect.width), True, (132, 146, 168)),
+                (rect.left, rect.top + self.tiny_font.get_height() + 10),
             )
             return
 
-        y = rect.top + 40
+        y = rect.top + self.tiny_font.get_height() + 8
         row_h = self._analysis_row_height()
-        if row_limit is None:
-            row_limit = ANALYSIS_DISPLAY_ROWS
-        row_limit = max(1, int(row_limit))
         visible_rows = rows[:row_limit]
         for idx, row in enumerate(visible_rows, start=1):
-            row_rect = pygame.Rect(rect.left + 8, y - 2, rect.width - 16, row_h)
+            row_rect = pygame.Rect(rect.left, y - 2, rect.width, row_h)
             probability = max(0.0, min(1.0, float(row.get("probability", 0.0))))
             if idx % 2 == 1:
                 pygame.draw.rect(self.canvas, (29, 37, 49), row_rect, border_radius=6)
@@ -1301,31 +1356,90 @@ class ChessGUI:
                 pygame.draw.rect(self.canvas, (25, 32, 44), row_rect, border_radius=6)
             fill_width = max(10, int((row_rect.width - 2) * probability))
             fill_rect = pygame.Rect(row_rect.left + 1, row_rect.top + 1, fill_width, row_rect.height - 2)
-            fill_color = (54, 95, 152) if color == chess.WHITE else (76, 109, 160)
             pygame.draw.rect(self.canvas, fill_color, fill_rect, border_radius=6)
             if self.selected_analysis_move == (color, row.get("move")):
                 pygame.draw.rect(self.canvas, (160, 205, 255), row_rect, width=2, border_radius=6)
+
             self.canvas.blit(
                 self.tiny_font.render(f"{idx}.", True, (140, 154, 179)),
                 (row_rect.left + 8, y),
             )
-            pct_surface = self.tiny_font.render(f"{probability * 100:4.1f}%", True, (164, 201, 238))
-            pct_x = row_rect.right - pct_surface.get_width() - 8
-            san_width = max(40, pct_x - (row_rect.left + 28) - 8)
+
+            if show_visits:
+                visits_text = f"{int(row.get('visits', 0))}v"
+                meta_surface = self.tiny_font.render(visits_text, True, (164, 201, 238))
+            else:
+                meta_surface = self.tiny_font.render(f"{probability * 100:4.1f}%", True, (164, 201, 238))
+            meta_x = row_rect.right - meta_surface.get_width() - 8
+            san_width = max(32, meta_x - (row_rect.left + 28) - 8)
             self.canvas.blit(
                 self.tiny_font.render(self._fit_text(self.tiny_font, row["san"], san_width), True, (216, 226, 239)),
                 (row_rect.left + 28, y),
             )
-            self.canvas.blit(pct_surface, (pct_x, y))
+            self.canvas.blit(meta_surface, (meta_x, y))
             self.analysis_entry_buttons.append(
                 {
                     "rect": row_rect.copy(),
                     "color": color,
                     "move": row.get("move"),
-                    "fen": cache.get("fen"),
+                    "fen": cache_fen,
                 }
             )
             y += row_h + 2
+
+    def _draw_analysis_card(self, rect, color, active=False, row_limit=None):
+        if rect.height <= 0 or not self._side_has_visible_analysis(color):
+            return
+        label = "White" if color == chess.WHITE else "Black"
+        policy_cache = self.analysis_cache_by_color.get(color, {"rows": [], "fen": None})
+        mcts_cache = self.mcts_analysis_cache_by_color.get(color, {"rows": [], "fen": None})
+        policy_rows = list(policy_cache.get("rows", []))
+        mcts_rows = list(mcts_cache.get("rows", []))
+        border = (102, 168, 240) if active else (92, 109, 136)
+        self._draw_card(rect, fill=(23, 30, 41), border=border)
+        self.analysis_entry_buttons = [entry for entry in self.analysis_entry_buttons if entry.get("color") != color]
+        self.canvas.blit(
+            self.small_font.render(f"Analiza ({label})", True, TEXT_COLOR),
+            (rect.left + 12, rect.top + 10),
+        )
+        if row_limit is None:
+            row_limit = ANALYSIS_DISPLAY_ROWS
+        row_limit = max(1, int(row_limit))
+
+        column_gap = 8
+        inner_left = rect.left + 8
+        inner_top = rect.top + 40
+        inner_width = rect.width - 16
+        policy_rect = pygame.Rect(inner_left, inner_top, inner_width, rect.height - 48)
+        uses_mcts = self._side_uses_mcts(color)
+        mcts_rect = None
+        if uses_mcts:
+            column_width = max(64, (inner_width - column_gap) // 2)
+            policy_rect = pygame.Rect(inner_left, inner_top, column_width, rect.height - 48)
+            mcts_rect = pygame.Rect(policy_rect.right + column_gap, inner_top, column_width, rect.height - 48)
+        base_fill = (54, 95, 152) if color == chess.WHITE else (76, 109, 160)
+        mcts_fill = (92, 133, 88) if color == chess.WHITE else (116, 150, 98)
+        self._draw_analysis_column(
+            policy_rect,
+            policy_rows,
+            policy_cache.get("fen"),
+            color,
+            "Raw policy",
+            row_limit,
+            base_fill,
+            show_visits=False,
+        )
+        if uses_mcts and mcts_rect is not None:
+            self._draw_analysis_column(
+                mcts_rect,
+                mcts_rows,
+                mcts_cache.get("fen"),
+                color,
+                "MCTS visits",
+                row_limit,
+                mcts_fill,
+                show_visits=True,
+            )
 
     def _resolve_left_panel_layout(self, panel, status_rect, top_info, bottom_info, top_display_color, bottom_display_color):
         panel_inner_left = panel.left + 14
@@ -1333,8 +1447,8 @@ class ChessGUI:
         start_y = status_rect.bottom + 14
         end_y = panel.bottom - 14
         available_height = max(0, end_y - start_y)
-        top_has_analysis = self._side_has_analysis(top_display_color)
-        bottom_has_analysis = self._side_has_analysis(bottom_display_color)
+        top_has_analysis = self._side_has_visible_analysis(top_display_color)
+        bottom_has_analysis = self._side_has_visible_analysis(bottom_display_color)
 
         candidates = []
         for compact_level in (0, 1, 2):

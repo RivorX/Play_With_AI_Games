@@ -111,7 +111,7 @@ model:
 # ------------------------------------------------------------------------------
 auto_tune:
   use_for_il: true                   # IL may run probing + cache writes (when IL mode=auto)
-  use_for_rl: true                   # RL may reuse cached batch/LR from IL
+  use_for_rl: false                  # RL should not reuse IL cache; huge IL-sized batches were starving RL of update steps
   cache_path: "logs/il_auto_tune_cache.yaml"
   free_vram_utilization: 0.98
   safety_margin_gib: 0.1
@@ -210,7 +210,7 @@ reinforcement_learning:
   # Self-Play Game Flow
   # ---------------------------
   use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
-  max_batch_games_per_worker: 8     # Sweet spot with mcts_batch_size=64 on this setup; keeps batches full without overfragmenting CPU traversal
+  max_batch_games_per_worker: 6     # Slightly smaller worker batches reduce latency spikes once search gets stronger
   self_play_max_moves: 190          # Shorter cap: cut low-value sterile games earlier instead of harvesting many doomed draw samples
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
   self_play_claim_repetition_after_moves: 40  # Claim sterile repetition earlier to reduce low-signal looping positions
@@ -237,12 +237,12 @@ reinforcement_learning:
   # Self-Play Diversity
   # ---------------------------
   self_play_opening_diversity_enabled: true   # Start many games from short curated opening prefixes to avoid replaying the same opening shell forever
-  self_play_opening_diversity_fraction: 0.7   # Use curated openings often, but still keep room for fully free self-play
+  self_play_opening_diversity_fraction: 0.55  # Keep diversity, but stop overspreading the early curriculum across too many noisy starts
   self_play_opening_diversity_min_plies: 2    # Let sharp curated lines branch early
   self_play_opening_diversity_max_plies: 8    # Allow enough depth to land in asymmetrical structures
   self_play_opponent_pool_enabled: true       # Mix current-vs-current with frozen opponents instead of only mirror self-play
-  self_play_opponent_current_fraction: 0.70   # Safer base prior: most games still stay on current-vs-current so RL can actually improve
-  self_play_opponent_best_fraction: 0.15      # Keep some pressure from the frozen best without letting it dominate the curriculum
+  self_play_opponent_current_fraction: 0.60   # Still mostly current-vs-current, but leave more room for direct pressure from the IL anchor / best RL
+  self_play_opponent_best_fraction: 0.25      # More games against the actual target to beat, especially early in RL
   self_play_opponent_recent_fraction: 0.15    # Use historical RL snapshots as a lighter anti-cycle signal
   self_play_recent_snapshots_to_keep: 5       # Keep several RL iterations around so adaptive matching can pick across different ages
   self_play_randomize_learner_color: true     # Let the training model play both colors against frozen opponents
@@ -271,38 +271,37 @@ reinforcement_learning:
   # Exploration Schedule
   # ---------------------------
   use_temperature_schedule: true      # Enable adaptive temperature
-  temperature_start: 0.8              # Lower exploration to reduce random drift into long equal lines
-  temperature_end: 0.5                # Sharpen move selection later in training
+  temperature_start: 0.65             # RL should start more focused; search, not policy noise, should drive improvement
+  temperature_end: 0.35               # Sharpen later training further so the policy keeps tactical wins instead of washing them out
   temperature_decay_iterations: auto  # Auto: decay spans the full RL run (matches iterations)
 
   # ---------------------------
   # MCTS Search
   # ---------------------------
-  mcts_simulations: 64       # MCTS sims per move (higher = stronger but slower; 64 is a good balance for RTX 5060 Ti)
-  mcts_batch_size: 32        # Eval micro-batch size; code now handles root expansion correctly even with large batches
+  mcts_simulations: 96      # Stronger search targets so RL learns from decisions that can actually outperform the raw IL prior
+  mcts_batch_size: 48        # Match the heavier search budget without overfragmenting GPU inference
   mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
-  mcts_c_puct: 1.0           # Było 1.5. Zmniejszamy by MCTS szukał głębiej, a nie wszerz
+  mcts_c_puct: 1.15          # Move back toward healthier exploration; too-low PUCT was over-trusting the current policy
   mcts_dynamic_c_puct: true  # MuZero-style dynamic exploration scaling by parent visits
-  mcts_c_puct_base: 8000     # Lower than MuZero default to react earlier in low-sim RL self-play
-  mcts_c_puct_init: 0.9      # Było 1.25. Pozwalamy MCTS od razu wejść na duże głębokości (wąskie warianty)
-  mcts_c_puct_max: 1.5       # Było 2.0
+  mcts_c_puct_base: 12000    # Slightly slower scaling keeps exploration healthier over a 96-sim search budget
+  mcts_c_puct_init: 1.05     # Reduce policy lock-in early in the search
+  mcts_c_puct_max: 1.8       # Let dynamic PUCT breathe a bit more at higher visit counts
   mcts_use_fpu: true         # First Play Urgency: non-visited moves get parent-aware prior value
   mcts_fpu_reduction: 0.12   # Reduce FPU from parent value to encourage some exploration of unvisited moves (0.0 = no reduction, 1.0 = zero FPU)
   mcts_fpu_absolute: null    # null = adaptive parent-Q FPU, float = fixed FPU value in [-1, 1]
-  mcts_temperature: 0.75      # Lower self-play move temperature so policy targets are less washed out
-  mcts_temperature_threshold: 16  # (8 pełnych ruchów) Szybciej przechodzimy na determinizm, żeby gracze potrafili wykończyć błąd
+  mcts_temperature: 0.65      # Sharper visit sampling produces better policy targets once the search is strong enough
+  mcts_temperature_threshold: 12  # Quicker shift toward deterministic play helps convert advantages instead of drifting
   mcts_dirichlet_alpha: 0.3  # Standard rzędu szachowego
-  mcts_dirichlet_weight: 0.1  # Znacznie mocniejszy szum, żeby nie grały tylko najlepszego ruchu na ślepo
+  mcts_dirichlet_weight: 0.06 # Keep some root noise, but stop polluting stronger searches with too much randomization
   mcts_tactical_priors_enabled: true  # Light tactical nudges help low-budget search notice forcing moves sooner
   mcts_tactical_capture_bonus: 0.10   # Small prior boost for captures
   mcts_tactical_winning_capture_bonus: 0.08  # Extra nudge for obviously favorable captures
   mcts_tactical_check_bonus: 0.06     # Checks are often tactically forcing
   mcts_tactical_promotion_bonus: 0.12 # Promotions are rare and critical
   mcts_tactical_recapture_bonus: 0.08 # Helps short tactical recapture sequences
-  mcts_playout_cap_randomization_enabled: true  # Mix cheaper and full searches instead of using one fixed budget every move
-  mcts_playout_cap_randomization_low: 24        # Cheap search branch for extra value diversity
-  mcts_playout_cap_randomization_high: 64       # Full search branch keeps policy targets sharp
-  mcts_playout_cap_randomization_low_fraction: 0.55 # Slightly favor cheaper branches to generate more training targets per wall-clock
+  mcts_playout_cap_randomization_enabled: true  # Randomize self-play search budget around the base MCTS budget to trade some strength for much better throughput
+  mcts_playout_cap_randomization_min_multiplier: 0.6  # Per move/turn use at least 60% of base mcts_simulations
+  mcts_playout_cap_randomization_max_multiplier: 1.0  # Per move/turn use at most 100% of base mcts_simulations
   policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
   policy_target_pruning_keep_top_n: 2           # Always keep the top moves
   policy_target_pruning_max_moves: 12           # Hard cap on support size of the sparse policy target
@@ -317,7 +316,7 @@ reinforcement_learning:
   learning_rate: 0.0002      # Fallback base LR when RL auto-tune cache is unavailable
   weight_decay: 0.05         # L2 regularization (AdamW)
   grad_clip: 0.5             # Gradient clipping
-  train_epochs_per_iteration: 3  # More updates per iteration so RL can move a strong IL starting point
+  train_epochs_per_iteration: 4  # More optimizer steps per replay fill now that RL no longer inherits oversized IL batches
 
   # Replay buffer sizing:
   # Capacity now bootstraps small and then auto-resizes from observed positions/iteration.
@@ -345,7 +344,7 @@ reinforcement_learning:
   min_lr_ratio: 0.25         # Final LR = auto-tuned base_lr * min_lr_ratio
   
   # Entropy regularization
-  entropy_weight: 0.001       # Keep a little entropy regularization, but let policy sharpen more under MCTS targets
+  entropy_weight: 0.0005      # Search already injects exploration; lower entropy helps RL keep concrete improvements
   
   # Data augmentation
   use_augmentation: true
@@ -356,12 +355,12 @@ reinforcement_learning:
   # Evaluation & Promotion
   # ---------------------------
   eval_games: 100            # Fallback total games when staged eval is disabled
-  eval_mcts_simulations: 64  # Match self-play search budget more closely during model-vs-best evaluation
+  eval_mcts_simulations_multiplier: 1.0  # Eval uses base mcts_simulations * this multiplier (1.0 = same search budget as self-play base)
   eval_max_moves: 320        # Align eval with self-play so results are not dominated by ultra-long unresolved games
   eval_auto_claim_draw: true
   eval_claim_repetition_after_moves: 70
   eval_claim_draw_after_moves: 180  # Generic claimable draws after ~70 full moves
-  eval_every: 5              # Evaluate every N iterations
+  eval_every: 4              # Slightly faster feedback loop while iterating toward surpassing IL
   eval_staged_enabled: true
   eval_stage1_games: 40
   eval_stage2_games: 120

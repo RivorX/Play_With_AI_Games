@@ -68,6 +68,8 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
         "val_loss": None,
         "policy_loss": None,
         "elo": None,
+        "score_rate": None,
+        "eval_true_win_rate": None,
         "swa": False,
         "optimizer": False,
         "version": None,
@@ -99,6 +101,10 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
     entry["val_loss"] = _safe_float(checkpoint.get("val_loss", checkpoint.get("loss")))
     entry["policy_loss"] = _safe_float(checkpoint.get("val_policy_loss", checkpoint.get("policy_loss")))
     entry["elo"] = _safe_float(checkpoint.get("estimated_elo", checkpoint.get("last_estimated_elo")))
+    entry["score_rate"] = _safe_float(checkpoint.get("score_rate", checkpoint.get("win_rate")))
+    entry["eval_true_win_rate"] = _safe_float(
+        checkpoint.get("eval_true_win_rate", checkpoint.get("true_win_rate"))
+    )
     entry["swa"] = bool(checkpoint.get("swa_enabled", False) or "swa" in checkpoint_path.name.lower())
     entry["optimizer"] = "optimizer_state_dict" in checkpoint
     entry["version"] = checkpoint.get("version")

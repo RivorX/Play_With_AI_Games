@@ -1314,17 +1314,18 @@ class BatchSelfPlayMCTSBatch:
         self.playout_cap_randomization_enabled = bool(
             rl_cfg.get('mcts_playout_cap_randomization_enabled', False)
         )
-        self.playout_cap_randomization_low = max(
-            1,
-            int(rl_cfg.get('mcts_playout_cap_randomization_low', max(1, self.num_simulations // 2))),
-        )
-        self.playout_cap_randomization_high = max(
-            self.playout_cap_randomization_low,
-            int(rl_cfg.get('mcts_playout_cap_randomization_high', self.num_simulations)),
-        )
-        self.playout_cap_randomization_low_fraction = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('mcts_playout_cap_randomization_low_fraction', 0.50))),
+        try:
+            min_multiplier = float(rl_cfg.get('mcts_playout_cap_randomization_min_multiplier', 0.5))
+        except Exception:
+            min_multiplier = 0.5
+        try:
+            max_multiplier = float(rl_cfg.get('mcts_playout_cap_randomization_max_multiplier', 1.0))
+        except Exception:
+            max_multiplier = 1.0
+        self.playout_cap_randomization_min_multiplier = max(0.01, float(min_multiplier))
+        self.playout_cap_randomization_max_multiplier = max(
+            self.playout_cap_randomization_min_multiplier,
+            float(max_multiplier),
         )
         self.policy_target_pruning_enabled = bool(
             rl_cfg.get('policy_target_pruning_enabled', False)
@@ -1389,9 +1390,11 @@ class BatchSelfPlayMCTSBatch:
     def _sample_num_simulations(self):
         if not self.playout_cap_randomization_enabled:
             return self.num_simulations
-        if np.random.random() < self.playout_cap_randomization_low_fraction:
-            return self.playout_cap_randomization_low
-        return self.playout_cap_randomization_high
+        sampled_multiplier = np.random.uniform(
+            self.playout_cap_randomization_min_multiplier,
+            self.playout_cap_randomization_max_multiplier,
+        )
+        return max(1, int(round(self.num_simulations * sampled_multiplier)))
 
     def _prune_policy_target_visits(self, visit_counts):
         if not self.policy_target_pruning_enabled or not visit_counts:

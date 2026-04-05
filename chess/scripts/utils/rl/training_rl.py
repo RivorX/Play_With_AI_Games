@@ -102,6 +102,20 @@ def _resolve_eval_fixed_openings_max_plies(config):
         return 6
 
 
+def _resolve_eval_mcts_simulations(config):
+    rl_cfg = config.get("reinforcement_learning", {})
+    try:
+        base_sims = max(1, int(rl_cfg.get("mcts_simulations", 50)))
+    except Exception:
+        base_sims = 50
+
+    try:
+        multiplier = max(0.01, float(rl_cfg.get("eval_mcts_simulations_multiplier", 1.0)))
+        return max(1, int(round(base_sims * multiplier)))
+    except Exception:
+        return base_sims
+
+
 def _get_eval_opening_prefix(config, game_idx, enabled_override=None):
     enabled = _resolve_eval_fixed_openings_enabled(config) if enabled_override is None else bool(enabled_override)
     if not enabled or not _SELFPLAY_OPENING_LINES:
@@ -229,7 +243,7 @@ def _eval_worker(rank, model1_state, model2_state, config, device_str, game_indi
         draws = 0
         losses = 0
         unresolved = 0
-        sims = int(worker_config.get("reinforcement_learning", {}).get("eval_mcts_simulations", 50))
+        sims = _resolve_eval_mcts_simulations(worker_config)
         max_moves = _resolve_eval_max_moves(worker_config)
         auto_claim_draw = _resolve_eval_auto_claim_draw(worker_config)
         claim_draw_after_moves = _resolve_eval_claim_draw_after_moves(worker_config)
@@ -444,7 +458,7 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
         draws = 0
         losses = 0
         unresolved = 0
-        sims = int(config.get("reinforcement_learning", {}).get("eval_mcts_simulations", 50))
+        sims = _resolve_eval_mcts_simulations(config)
         max_moves = _resolve_eval_max_moves(config)
         auto_claim_draw = _resolve_eval_auto_claim_draw(config)
         claim_draw_after_moves = _resolve_eval_claim_draw_after_moves(config)

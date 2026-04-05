@@ -124,7 +124,41 @@ def _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir):
     return candidates
 
 
-def _choose_start_mode(has_checkpoints):
+def _suggest_start_mode_default(best_model_rl_path, rl_dir):
+    """Prefer a fresh RL run when the latest RL checkpoint is clearly underperforming."""
+    rl_candidates = []
+    if best_model_rl_path.exists():
+        rl_candidates.append(best_model_rl_path)
+
+    for checkpoint in sorted(
+        rl_dir.glob("*.pt"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        if checkpoint not in rl_candidates:
+            rl_candidates.append(checkpoint)
+
+    for checkpoint_path in rl_candidates:
+        entry = load_checkpoint_metadata(checkpoint_path)
+        if entry.get("error"):
+            continue
+
+        score_rate = _safe_float(entry.get("score_rate"))
+        true_win_rate = _safe_float(entry.get("eval_true_win_rate"))
+        optimizer_present = bool(entry.get("optimizer", False))
+
+        if not optimizer_present:
+            return "1", f"defaulting to new: {checkpoint_path.name} has no optimizer state for a true resume"
+        if score_rate is not None and score_rate < 0.50:
+            return "1", f"defaulting to new: latest RL score_rate is only {score_rate:.2%}"
+        if true_win_rate is not None and true_win_rate <= 0.0:
+            return "1", f"defaulting to new: latest RL true win rate is {true_win_rate:.2%}"
+        return "2", f"defaulting to resume: latest RL checkpoint looks healthy enough ({checkpoint_path.name})"
+
+    return "1", "defaulting to new: no healthy RL resume candidate found"
+
+
+def _choose_start_mode(has_checkpoints, default_choice="2", default_hint=None):
     if not has_checkpoints:
         _print_block_title("RL Startup")
         print("No checkpoints found. Starting new RL training.")
@@ -135,7 +169,9 @@ def _choose_start_mode(has_checkpoints):
     print("2) Resume full state (model + optimizer/scaler)")
     print("3) Transfer matching weights only")
 
-    default_choice = "2"
+    if default_hint:
+        print(default_hint)
+
     mapping = {
         "1": "new",
         "2": "resume",
@@ -309,7 +345,12 @@ def plan_rl_startup(model, device, models_dir, best_model_rl_path, rl_dir, defau
     checkpoint_catalog = []
     new_init_mode = "default"
 
-    start_mode = _choose_start_mode(has_checkpoints=(len(available_checkpoints) > 0))
+    default_choice, default_hint = _suggest_start_mode_default(best_model_rl_path, rl_dir)
+    start_mode = _choose_start_mode(
+        has_checkpoints=(len(available_checkpoints) > 0),
+        default_choice=default_choice,
+        default_hint=default_hint,
+    )
     if start_mode == "new":
         has_default_init = bool(default_new_checkpoint is not None and Path(default_new_checkpoint).exists())
         new_init_mode = _choose_new_init_mode(
