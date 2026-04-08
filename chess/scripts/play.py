@@ -1116,6 +1116,20 @@ class ChessGUI:
         if self.analysis_cache.get("fen") == current_fen:
             return
 
+        # In human-vs-AI, after AI makes a move it's the human turn.
+        # Keep the last AI analysis visible instead of clearing the panel.
+        if self.game_mode == "human_vs_ai" and self.board.turn == self.human_color:
+            ai_color = chess.BLACK if self.human_color == chess.WHITE else chess.WHITE
+            side_label = "White" if ai_color == chess.WHITE else "Black"
+            ai_rows = list(self.analysis_cache_by_color.get(ai_color, {}).get("rows", []))
+            self.analysis_cache = {
+                "fen": current_fen,
+                "rows": ai_rows,
+                "side": ai_color,
+                "label": side_label,
+            }
+            return
+
         for color, label in ((chess.WHITE, "White"), (chess.BLACK, "Black")):
             self.analysis_cache_by_color[color] = {"rows": [], "label": label, "fen": current_fen}
             self.mcts_analysis_cache_by_color[color] = {"rows": [], "label": label, "fen": current_fen}

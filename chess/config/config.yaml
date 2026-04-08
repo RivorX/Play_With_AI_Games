@@ -181,6 +181,13 @@ imitation_learning:
   max_patience: 7            # Stop if no improvement for N epochs
   min_delta: 0.001           # Minimum improvement threshold
 
+
+
+
+
+
+
+
 # ------------------------------------------------------------------------------
 # REINFORCEMENT LEARNING (RL)
 # ------------------------------------------------------------------------------
@@ -241,9 +248,9 @@ reinforcement_learning:
   self_play_opening_diversity_min_plies: 2    # Let sharp curated lines branch early
   self_play_opening_diversity_max_plies: 8    # Allow enough depth to land in asymmetrical structures
   self_play_opponent_pool_enabled: true       # Mix current-vs-current with frozen opponents instead of only mirror self-play
-  self_play_opponent_current_fraction: 0.60   # Still mostly current-vs-current, but leave more room for direct pressure from the IL anchor / best RL
-  self_play_opponent_best_fraction: 0.25      # More games against the actual target to beat, especially early in RL
-  self_play_opponent_recent_fraction: 0.15    # Use historical RL snapshots as a lighter anti-cycle signal
+  self_play_opponent_current_fraction: 0.70   # Still mostly current-vs-current, but leave more room for direct pressure from the IL anchor / best RL
+  self_play_opponent_best_fraction: 0.07      # More games against the actual target to beat, especially early in RL
+  self_play_opponent_recent_fraction: 0.23    # Use historical RL snapshots as a lighter anti-cycle signal
   self_play_recent_snapshots_to_keep: 5       # Keep several RL iterations around so adaptive matching can pick across different ages
   self_play_randomize_learner_color: true     # Let the training model play both colors against frozen opponents
   self_play_opponent_adaptive_enabled: true   # Reweight best/recent opponents cautiously using observed matchup scores
@@ -261,7 +268,7 @@ reinforcement_learning:
   # ---------------------------
   replay_dynamic_cap_enabled: true
   replay_cap_fraction_decisive: 0.95          # Keep almost all decisive positions
-  replay_cap_fraction_draw: 0.10              # Keep some draw signal, but far less than before
+  replay_cap_fraction_draw: 0.08              # Keep some draw signal, but far less than before
   replay_cap_min_positions: 16                # Avoid making draw games vanish completely from the replay
   replay_cap_max_positions: 120               # Absolute hard cap to avoid RAM bloat
   
@@ -300,13 +307,13 @@ reinforcement_learning:
   mcts_tactical_promotion_bonus: 0.12 # Promotions are rare and critical
   mcts_tactical_recapture_bonus: 0.08 # Helps short tactical recapture sequences
   mcts_playout_cap_randomization_enabled: true  # Randomize self-play search budget around the base MCTS budget to trade some strength for much better throughput
-  mcts_playout_cap_randomization_min_multiplier: 0.6  # Per move/turn use at least 60% of base mcts_simulations
+  mcts_playout_cap_randomization_min_multiplier: 0.8  # Per move/turn use at least 80% of base mcts_simulations
   mcts_playout_cap_randomization_max_multiplier: 1.0  # Per move/turn use at most 100% of base mcts_simulations
   policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
-  policy_target_pruning_keep_top_n: 2           # Always keep the top moves
+  policy_target_pruning_keep_top_n: 3           # Always keep the top moves
   policy_target_pruning_max_moves: 12           # Hard cap on support size of the sparse policy target
   policy_target_pruning_min_prob: 0.02          # Remove tiny probability tails
-  policy_target_pruning_min_fraction_of_max: 0.12 # Keep moves only if they are not far below the best visit count
+  policy_target_pruning_min_fraction_of_max: 0.08 # Keep moves only if they are not far below the best visit count
   policy_target_pruning_keep_mass: 0.92         # Keep most of the signal, trim the noisiest tail
   
   # ---------------------------
@@ -326,15 +333,15 @@ reinforcement_learning:
   replay_buffer_min_size: 4096    # Never shrink below a small practical floor
   replay_buffer_capacity_round_to: 256  # Round capacity changes to reduce realloc noise
   replay_fp16: true             # Store replay tensors in float16 to reduce RAM (~2x)
-  replay_decisive_sampling_fraction: 0.15   # Keep a small decisive bias, but avoid oversampling mostly losing decisive positions
+  replay_decisive_sampling_fraction: 0.22   # Keep a small decisive bias, but avoid oversampling mostly losing decisive positions
   replay_decisive_value_epsilon: 0.05       # Treat |value| > epsilon as decisive for replay sampling
   replay_hard_negative_sampling_fraction: 0.15  # Pull a slice of each batch from high-importance tactical/uncertain positions
   replay_hard_negative_min_importance: 1.35    # Threshold for positions to count as "hard" in replay sampling
   replay_resize_preserve_decisive_fraction: 0.15  # On buffer shrink, preserve some older decisive samples instead of only the newest data
   replay_resize_preserve_decisive_min_count: 1024 # Floor for protected decisive positions when available
   replay_importance_gating_enabled: true       # Gate per-game positions by importance before the normal replay cap
-  replay_importance_gate_fraction_decisive: 0.70 # Keep most decisive positions, but trim the least useful tail
-  replay_importance_gate_fraction_draw: 0.45   # Draws need stronger filtering to avoid sterile replay spam
+  replay_importance_gate_fraction_decisive: 0.78 # Keep most decisive positions, but trim the least useful tail
+  replay_importance_gate_fraction_draw: 0.40   # Draws need stronger filtering to avoid sterile replay spam
   replay_importance_gate_min_positions: 12     # Never let importance gating erase a game completely
   replay_importance_top_fraction: 0.70         # Mostly keep top-importance moments plus some timeline coverage
   
@@ -344,7 +351,7 @@ reinforcement_learning:
   min_lr_ratio: 0.25         # Final LR = auto-tuned base_lr * min_lr_ratio
   
   # Entropy regularization
-  entropy_weight: 0.0005      # Search already injects exploration; lower entropy helps RL keep concrete improvements
+  entropy_weight: 0.0004      # Search already injects exploration; lower entropy helps RL keep concrete improvements
   
   # Data augmentation
   use_augmentation: true
@@ -355,7 +362,7 @@ reinforcement_learning:
   # Evaluation & Promotion
   # ---------------------------
   eval_games: 100            # Fallback total games when staged eval is disabled
-  eval_mcts_simulations_multiplier: 1.0  # Eval uses base mcts_simulations * this multiplier (1.0 = same search budget as self-play base)
+  eval_mcts_simulations_multiplier: 2.5  # Eval uses base mcts_simulations * this multiplier (1.0 = same search budget as self-play base)
   eval_max_moves: 320        # Align eval with self-play so results are not dominated by ultra-long unresolved games
   eval_auto_claim_draw: true
   eval_claim_repetition_after_moves: 70
@@ -381,12 +388,16 @@ reinforcement_learning:
   # Loss Weights
   # ---------------------------
   policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 0.7     # Value loss weight (base/default)
+  value_loss_weight: 0.74    # Value loss weight (base/default)
   # Value loss weight schedule - drastycznie obniżamy na starcie!
   value_loss_weight_schedule:
-    start: 0.45
-    end: 0.8
+    start: 0.6
+    end: 0.85
   value_target_noise_std: 0.0
+
+
+
+
 
 
 # ------------------------------------------------------------------------------
