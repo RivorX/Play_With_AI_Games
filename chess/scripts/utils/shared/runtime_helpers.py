@@ -6,24 +6,45 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 
+def sanitize_filename_tag(raw, default="tag"):
+    """
+    Sanitize a short label for safe filename usage.
+
+    Preserves dots, underscores, and hyphens (e.g., v5.1, v4_3, v5-beta).
+    """
+    text = str(raw).strip()
+    if not text:
+        text = default
+    sanitized = "".join(ch if (ch.isalnum() or ch in {".", "_", "-"}) else "_" for ch in text)
+    while "__" in sanitized:
+        sanitized = sanitized.replace("__", "_")
+    sanitized = sanitized.strip("_")
+    return sanitized or default
+
+
 def build_model_file_tag(config):
     """
     Build sanitized model file tag from config.
     
     Extracts version from config and sanitizes it for use in filenames.
-    Preserves dots, underscores, and hyphens (e.g., v5.1, v4_3, v5-beta).
     """
     model_cfg = config.get('model', {})
     raw = model_cfg.get('version') or "model"
-    text = str(raw).strip()
-    if not text:
-        text = "model"
-    # Keep dots in version tags (e.g. v5.1), normalize the rest.
-    sanitized = "".join(ch if (ch.isalnum() or ch in {".", "_", "-"}) else "_" for ch in text)
-    while "__" in sanitized:
-        sanitized = sanitized.replace("__", "_")
-    sanitized = sanitized.strip("_")
-    return sanitized or "model"
+    return sanitize_filename_tag(raw, default="model")
+
+
+def build_rl_experiment_name(config):
+    """Build RL log experiment name with model version, RL version, and MCTS sims."""
+    model_version = sanitize_filename_tag(
+        config.get('model', {}).get('version') or "model",
+        default="model",
+    )
+    rl_version = sanitize_filename_tag(
+        config.get('reinforcement_learning', {}).get('version') or "rl",
+        default="rl",
+    )
+    mcts_simulations = int(config.get('reinforcement_learning', {}).get('mcts_simulations', 0))
+    return f"rl_training_{model_version}_{rl_version}_mcts_{mcts_simulations}"
 
 
 def build_model_architecture_metadata(config):

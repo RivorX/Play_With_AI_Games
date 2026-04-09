@@ -22,6 +22,11 @@ class ReplayBuffer:
         decisive_value_epsilon=0.05,
         hard_negative_sampling_fraction=0.0,
         hard_negative_min_importance=0.0,
+        recent_sampling_fraction=0.0,
+        recent_window_fraction=0.25,
+        quality_sampling_fraction=0.0,
+        quality_min_importance=0.0,
+        quality_value_bonus=0.0,
         resize_preserve_decisive_fraction=0.0,
         resize_preserve_decisive_min_count=0,
     ):
@@ -31,6 +36,11 @@ class ReplayBuffer:
         self.decisive_value_epsilon = max(0.0, float(decisive_value_epsilon))
         self.hard_negative_sampling_fraction = max(0.0, min(1.0, float(hard_negative_sampling_fraction)))
         self.hard_negative_min_importance = max(0.0, float(hard_negative_min_importance))
+        self.recent_sampling_fraction = max(0.0, min(1.0, float(recent_sampling_fraction)))
+        self.recent_window_fraction = max(0.01, min(1.0, float(recent_window_fraction)))
+        self.quality_sampling_fraction = max(0.0, min(1.0, float(quality_sampling_fraction)))
+        self.quality_min_importance = max(0.0, float(quality_min_importance))
+        self.quality_value_bonus = max(0.0, float(quality_value_bonus))
         self.resize_preserve_decisive_fraction = max(
             0.0,
             min(1.0, float(resize_preserve_decisive_fraction)),
@@ -327,15 +337,29 @@ class ReplayBuffer:
         all_indices = np.arange(self.size, dtype=np.int64)
         chosen_parts = []
         chosen = np.empty(0, dtype=np.int64)
+        values = self._values[:self.size].reshape(-1)
+        values_np = values.float().cpu().numpy()
+
+        if self.recent_sampling_fraction > 0.0:
+            ordered_indices = self._ordered_indices_oldest_to_newest()
+            recent_window = max(1, int(round(float(self.size) * self.recent_window_fraction)))
+            recent_pool = ordered_indices[-recent_window:]
+            recent_take = int(round(batch_size * self.recent_sampling_fraction))
+            recent_take = max(0, min(int(batch_size), recent_take))
+            if recent_pool.size > 0 and recent_take > 0:
+                recent_selected = self._sample_without_replacement(recent_pool, recent_take)
+                if recent_selected.size > 0:
+                    chosen_parts.append(recent_selected)
+                    chosen = np.concatenate(chosen_parts)
 
         if self.hard_negative_sampling_fraction > 0.0:
             importance = self._importance[:self.size].cpu().numpy()
             important_mask = importance >= self.hard_negative_min_importance
-            important_indices = all_indices[important_mask]
+            important_indices = np.setdiff1d(all_indices[important_mask], chosen, assume_unique=False)
             hard_take = int(round(batch_size * self.hard_negative_sampling_fraction))
             hard_take = max(0, min(int(batch_size), hard_take))
             if important_indices.size > 0 and hard_take > 0:
-                hard_weights = importance[important_mask] - self.hard_negative_min_importance + 1e-3
+                hard_weights = importance[important_indices] - self.hard_negative_min_importance + 1e-3
                 hard_selected = self._sample_without_replacement(
                     important_indices,
                     hard_take,
@@ -345,9 +369,28 @@ class ReplayBuffer:
                     chosen_parts.append(hard_selected)
                     chosen = np.concatenate(chosen_parts)
 
-        values = self._values[:self.size].reshape(-1)
         decisive_mask = torch.abs(values.float()) > self.decisive_value_epsilon
         decisive_indices = torch.nonzero(decisive_mask, as_tuple=False).reshape(-1).cpu().numpy()
+
+        if self.quality_sampling_fraction > 0.0:
+            importance = self._importance[:self.size].cpu().numpy()
+            quality_base = np.maximum(0.0, importance - self.quality_min_importance)
+            if self.quality_value_bonus > 0.0:
+                quality_base = quality_base + self.quality_value_bonus * np.abs(values_np)
+            quality_mask = quality_base > 0.0
+            quality_indices = np.setdiff1d(all_indices[quality_mask], chosen, assume_unique=False)
+            quality_take = int(round(batch_size * self.quality_sampling_fraction))
+            quality_take = max(0, min(int(batch_size), quality_take))
+            if quality_indices.size > 0 and quality_take > 0:
+                quality_weights = quality_base[quality_indices] + 1e-3
+                quality_selected = self._sample_without_replacement(
+                    quality_indices,
+                    quality_take,
+                    weights=quality_weights,
+                )
+                if quality_selected.size > 0:
+                    chosen_parts.append(quality_selected)
+                    chosen = np.concatenate(chosen_parts)
 
         if self.decisive_sampling_fraction > 0.0 and decisive_indices.size > 0:
             target_decisive = int(round(batch_size * self.decisive_sampling_fraction))

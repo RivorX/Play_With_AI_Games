@@ -35,7 +35,7 @@ except ImportError:
 
 # Imports are resolved at runtime (script_dir-based sys.path setup in train_il.py)
 from src.utils.data_helpers import board_to_tensor, move_to_index
-from src.batch_selfplay import MCTS, select_move_by_visits
+from src.batch_selfplay import MCTS, MultiGameBatchMCTS, select_move_by_visits
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +374,166 @@ class _ModelPlayer:
             self.mcts.advance_root(move)
 
 
+class _BatchedModelPlayer:
+    """Batch model-side move selection across many independent Elo games."""
+
+    def __init__(self, model, config, device, use_mcts: bool = False, simulations: int = 100):
+        self.model = model
+        self.config = config
+        self.device = device
+        self.use_mcts = use_mcts
+        self.simulations = simulations
+        self.history_positions = int(config.get('model', {}).get('history_positions', 0))
+        self.use_amp = bool(
+            config.get('hardware', {}).get('use_amp', True) and device.type == 'cuda'
+        )
+        self.amp_dtype = (
+            torch.bfloat16
+            if config.get('hardware', {}).get('use_bfloat16', False)
+            else torch.float16
+        )
+        self.multi_mcts = MultiGameBatchMCTS(model, config, device) if use_mcts else None
+
+    def create_state(self) -> dict:
+        return {
+            "board_history": [],
+            "root": None,
+            "_root_synced": False,
+        }
+
+    def reset_state(self, state: dict):
+        state["board_history"] = []
+        state["root"] = None
+        state["_root_synced"] = False
+
+    def record_state(self, state: dict, board: chess.Board):
+        history = state.setdefault("board_history", [])
+        history.append(self._encode_history_entry(board))
+        max_keep = self.history_positions + 10
+        if len(history) > max_keep:
+            state["board_history"] = history[-max_keep:]
+
+    @staticmethod
+    def _encode_history_entry(board: chess.Board):
+        return (
+            board_to_tensor(board, flip_perspective=False),
+            board_to_tensor(board, flip_perspective=True),
+        )
+
+    def _build_input_tensor(self, board: chess.Board, state: dict) -> np.ndarray:
+        tensors: list[np.ndarray] = []
+        use_black_pov = board.turn == chess.BLACK
+        history = state.get("board_history", [])
+
+        if self.history_positions > 0 and history:
+            recent_history = history[-self.history_positions:]
+            for hist_entry in recent_history:
+                hist_tensor = hist_entry[1] if use_black_pov else hist_entry[0]
+                tensors.append(hist_tensor)
+            while len(tensors) < self.history_positions:
+                tensors.insert(0, np.zeros((16, 8, 8), dtype=np.float32))
+
+        tensors.append(board_to_tensor(board))
+        return np.concatenate(tensors, axis=0)
+
+    @torch.inference_mode()
+    def best_moves(self, boards: list[chess.Board], states: list[dict]) -> list[chess.Move | None]:
+        if not boards:
+            return []
+        if self.use_mcts and self.multi_mcts is not None:
+            return self._best_moves_mcts(boards, states)
+        return self._best_moves_raw(boards, states)
+
+    def _best_moves_raw(self, boards: list[chess.Board], states: list[dict]) -> list[chess.Move | None]:
+        inputs = np.stack(
+            [self._build_input_tensor(board, state) for board, state in zip(boards, states)],
+            axis=0,
+        )
+        tensors = torch.from_numpy(inputs).to(
+            self.device,
+            memory_format=torch.channels_last,
+            non_blocking=True,
+        )
+        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
+            policy_logits, _ = self.model(
+                tensors,
+                apply_log_softmax=False,
+            )
+
+        policy_batch = policy_logits.float().cpu().numpy()
+        moves: list[chess.Move | None] = []
+        for row_idx, board in enumerate(boards):
+            best_move = None
+            best_score = -float('inf')
+            policy = policy_batch[row_idx]
+            for move in board.legal_moves:
+                idx = move_to_index(move, board)
+                if idx is not None and 0 <= idx < len(policy) and policy[idx] > best_score:
+                    best_score = policy[idx]
+                    best_move = move
+            moves.append(best_move)
+        return moves
+
+    def _best_moves_mcts(self, boards: list[chess.Board], states: list[dict]) -> list[chess.Move | None]:
+        game_states = []
+        for board, state in zip(boards, states):
+            game_states.append(
+                {
+                    "board": board,
+                    "root": state.get("root"),
+                    "_root_synced": bool(state.get("_root_synced", False)),
+                    "board_history": state.get("board_history", []),
+                }
+            )
+
+        visit_counts_list = self.multi_mcts.search_many(
+            game_states,
+            num_simulations=self.simulations,
+            add_root_noise=False,
+        )
+
+        moves: list[chess.Move | None] = []
+        raw_fallback_indices: list[int] = []
+        for idx, visit_counts in enumerate(visit_counts_list):
+            state = states[idx]
+            gs = game_states[idx]
+            state["root"] = gs.get("root")
+            state["_root_synced"] = bool(gs.get("_root_synced", False))
+            if visit_counts:
+                move, _ = select_move_by_visits(visit_counts, temperature=0.0)
+                moves.append(move)
+            else:
+                moves.append(None)
+                raw_fallback_indices.append(idx)
+
+        if raw_fallback_indices:
+            fallback_moves = self._best_moves_raw(
+                [boards[idx] for idx in raw_fallback_indices],
+                [states[idx] for idx in raw_fallback_indices],
+            )
+            for idx, move in zip(raw_fallback_indices, fallback_moves):
+                moves[idx] = move
+
+        return moves
+
+    def on_move_played(self, state: dict, move: chess.Move):
+        if self.multi_mcts is None:
+            return
+        root = state.get("root")
+        if root is None:
+            return
+        child = root.get_child_for_move(move)
+        if child is None:
+            state["root"] = None
+            state["_root_synced"] = False
+            return
+        _ = child.board
+        child.parent = None
+        child.parent_edge_index = -1
+        state["root"] = child
+        state["_root_synced"] = True
+
+
 # ---------------------------------------------------------------------------
 # Main estimator
 # ---------------------------------------------------------------------------
@@ -447,11 +607,46 @@ class EloEstimator:
             kwargs["creationflags"] = flags
         return kwargs
 
+    def _configure_stockfish_engine(self, engine: chess.engine.SimpleEngine, level: int):
+        """Apply UCI options for a Stockfish worker before a game/level batch."""
+        options = {"UCI_LimitStrength": True, "UCI_Elo": int(level)}
+
+        threads_raw = self.elo_config.get("stockfish_threads", 1)
+        try:
+            threads = max(1, int(threads_raw))
+        except (TypeError, ValueError):
+            threads = 1
+        if "Threads" in engine.options:
+            options["Threads"] = int(threads)
+
+        hash_raw = self.elo_config.get("stockfish_hash_mb", 64)
+        try:
+            hash_mb = max(1, int(hash_raw))
+        except (TypeError, ValueError):
+            hash_mb = 64
+        if "Hash" in engine.options:
+            options["Hash"] = int(hash_mb)
+
+        engine.configure(options)
+
+    def _resolve_stockfish_threads(self) -> int:
+        try:
+            return max(1, int(self.elo_config.get("stockfish_threads", 1) or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def _resolve_stockfish_hash_mb(self) -> int:
+        try:
+            return max(1, int(self.elo_config.get("stockfish_hash_mb", 64) or 64))
+        except (TypeError, ValueError):
+            return 64
+
     def _resolve_workers(self, requested_workers: int, total_games: int) -> int:
         """
         Resolve worker count with optional training-friendly CPU reservation.
         """
         cpu_total = _available_cpu_count()
+        stockfish_threads = self._resolve_stockfish_threads()
         try:
             requested = int(requested_workers or 0)
         except (TypeError, ValueError):
@@ -462,7 +657,8 @@ class EloEstimator:
             except (TypeError, ValueError):
                 reserve_auto = 2
             reserve_auto = max(0, min(cpu_total - 1, reserve_auto))
-            requested = max(1, cpu_total - reserve_auto)
+            available_threads = max(1, cpu_total - reserve_auto)
+            requested = max(1, available_threads // stockfish_threads)
 
         effective = max(1, requested)
         prioritize_training = bool(self.elo_config.get("prioritize_training", False))
@@ -476,7 +672,8 @@ class EloEstimator:
             free_threads = max(1, cpu_total - reserve_loader)
             free_util = float(self.elo_config.get("free_threads_utilization", 1.0) or 1.0)
             free_util = max(0.10, min(1.00, free_util))
-            cap = max(1, int(free_threads * free_util))
+            cap_threads = max(1, int(free_threads * free_util))
+            cap = max(1, cap_threads // stockfish_threads)
 
             effective = min(effective, cap)
 
@@ -563,6 +760,14 @@ class EloEstimator:
             seen.add(engine_id)
             self._force_close_engine(engine)
 
+    def _open_stockfish_engine(self, stockfish_path: str) -> chess.engine.SimpleEngine:
+        engine = chess.engine.SimpleEngine.popen_uci(
+            stockfish_path,
+            **self._stockfish_popen_kwargs(),
+        )
+        self._register_worker_engine(engine)
+        return engine
+
     def _get_thread_worker_resources(self, use_mcts: bool, simulations: int, stockfish_path: str):
         """Get or create persistent worker-local Stockfish engine and model player."""
         worker = getattr(self._thread_local, "worker_resources", None)
@@ -576,11 +781,8 @@ class EloEstimator:
                 return worker["engine"], worker["player"]
             self._force_close_engine(worker.get("engine"))
 
-        engine = chess.engine.SimpleEngine.popen_uci(
-            stockfish_path,
-            **self._stockfish_popen_kwargs(),
-        )
-        self._register_worker_engine(engine)
+        engine = self._open_stockfish_engine(stockfish_path)
+        self._configure_stockfish_engine(engine, level=1320)
         player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
 
         worker = {
@@ -592,6 +794,15 @@ class EloEstimator:
         }
         self._thread_local.worker_resources = worker
         return engine, player
+
+    @staticmethod
+    def _score_game_result(board: chess.Board, model_is_white: bool) -> float:
+        result = board.result(claim_draw=True)
+        if result == "1-0":
+            return 1.0 if model_is_white else 0.0
+        if result == "0-1":
+            return 0.0 if model_is_white else 1.0
+        return 0.5
 
     # -----------------------------------------------------------------------
     # Public API
@@ -691,7 +902,18 @@ class EloEstimator:
                 tasks.append((level, game_idx, model_is_white))
 
         workers = self._resolve_workers(workers, total_games=len(tasks))
+        batch_model_moves = bool(self.elo_config.get("batch_model_moves", True))
         print(f"  Info: Elo workers resolved to {workers} (available_cpu={_available_cpu_count()}).")
+        print(
+            "  Info: Stockfish config: "
+            f"threads={self._resolve_stockfish_threads()}, "
+            f"hash={self._resolve_stockfish_hash_mb()} MB, "
+            f"time_limit={float(stockfish_time_limit):.3f}s, "
+            f"games={len(tasks)}"
+        )
+        if batch_model_moves and workers > 1:
+            model_path = "batched_mcts" if use_mcts else "batched_raw"
+            print(f"  Info: Elo model path: {model_path} (shared batch scheduling enabled).")
         if self._is_cancelled():
             return {
                 "estimated_elo": None,
@@ -723,7 +945,27 @@ class EloEstimator:
         interrupted_by_user = False
 
         try:
-            if workers > 1:
+            if batch_model_moves and workers > 1:
+                try:
+                    all_opponent_elos, all_scores = self._estimate_batched_games(
+                        tasks=tasks,
+                        workers=workers,
+                        use_mcts=use_mcts,
+                        simulations=simulations,
+                        stockfish_time_limit=stockfish_time_limit,
+                        max_moves=max_moves,
+                        stockfish_path=resolved_path,
+                        progress_bar=progress_bar,
+                    )
+                except KeyboardInterrupt:
+                    interrupted_by_user = True
+                    if self.stop_event is not None:
+                        with contextlib.suppress(Exception):
+                            self.stop_event.set()
+                    print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
+                finally:
+                    self._close_worker_engines()
+            elif workers > 1:
                 executor = ThreadPoolExecutor(max_workers=workers)
                 futures = {}
                 try:
@@ -790,7 +1032,7 @@ class EloEstimator:
                         for level in levels:
                             if self._is_cancelled():
                                 break
-                            engine.configure({"UCI_LimitStrength": True, "UCI_Elo": level})
+                            self._configure_stockfish_engine(engine, level)
                             for game_idx in range(games_per_level):
                                 if self._is_cancelled():
                                     break
@@ -890,7 +1132,7 @@ class EloEstimator:
                 simulations,
                 stockfish_path,
             )
-            engine.configure({"UCI_LimitStrength": True, "UCI_Elo": level})
+            self._configure_stockfish_engine(engine, level)
         except Exception as exc:
             if self._is_cancelled():
                 return None
@@ -907,6 +1149,170 @@ class EloEstimator:
                 result = 0.0
 
         return result
+
+    def _estimate_batched_games(
+        self,
+        tasks: list[tuple[int, int, bool]],
+        workers: int,
+        use_mcts: bool,
+        simulations: int,
+        stockfish_time_limit: float,
+        max_moves: int,
+        stockfish_path: str,
+        progress_bar,
+    ) -> tuple[list[float], list[float]]:
+        all_opponent_elos: list[float] = []
+        all_scores: list[float] = []
+        max_half_moves = max(1, int(max_moves)) * 2
+
+        batched_player = _BatchedModelPlayer(
+            self.model,
+            self.config,
+            self.device,
+            use_mcts=use_mcts,
+            simulations=simulations,
+        )
+
+        idle_engines: list[chess.engine.SimpleEngine] = []
+        for _ in range(max(1, workers)):
+            idle_engines.append(self._open_stockfish_engine(stockfish_path))
+
+        pending_tasks = list(tasks)
+        active_games: list[dict] = []
+
+        def finalize_game(game: dict, score: float | None = None):
+            if score is None:
+                score = self._score_game_result(game["board"], bool(game["model_is_white"]))
+            all_opponent_elos.append(float(game["level"]))
+            all_scores.append(float(score))
+            idle_engines.append(game["engine"])
+            if progress_bar is not None:
+                progress_bar.update(1)
+
+        def launch_next_game(engine: chess.engine.SimpleEngine):
+            while pending_tasks and not self._is_cancelled():
+                level, _, model_is_white = pending_tasks.pop(0)
+                try:
+                    self._configure_stockfish_engine(engine, level)
+                except Exception as exc:
+                    self._log_limited(
+                        "stockfish_config_fail",
+                        f"  Warning: failed to configure Stockfish at level {level}: {exc}",
+                    )
+                    all_opponent_elos.append(float(level))
+                    all_scores.append(0.0)
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                    self._force_close_engine(engine)
+                    engine = self._open_stockfish_engine(stockfish_path)
+                    continue
+
+                state = batched_player.create_state()
+                batched_player.reset_state(state)
+                active_games.append(
+                    {
+                        "level": level,
+                        "model_is_white": bool(model_is_white),
+                        "board": chess.Board(),
+                        "state": state,
+                        "engine": engine,
+                        "ply_count": 0,
+                    }
+                )
+                return
+            idle_engines.append(engine)
+
+        while idle_engines and pending_tasks and not self._is_cancelled():
+            launch_next_game(idle_engines.pop())
+
+        executor = ThreadPoolExecutor(max_workers=max(1, workers))
+        try:
+            while active_games and not self._is_cancelled():
+                still_active: list[dict] = []
+                for game in active_games:
+                    if game["ply_count"] >= max_half_moves or game["board"].is_game_over(claim_draw=True):
+                        finalize_game(game)
+                    else:
+                        still_active.append(game)
+                active_games = still_active
+
+                while idle_engines and pending_tasks and not self._is_cancelled():
+                    launch_next_game(idle_engines.pop())
+                if not active_games or self._is_cancelled():
+                    continue
+
+                model_turn_games: list[dict] = []
+                stockfish_turn_games: list[dict] = []
+                for game in active_games:
+                    batched_player.record_state(game["state"], game["board"])
+                    model_turn = (game["board"].turn == chess.WHITE) == game["model_is_white"]
+                    if model_turn:
+                        model_turn_games.append(game)
+                    else:
+                        stockfish_turn_games.append(game)
+
+                for batch_games in (model_turn_games, stockfish_turn_games):
+                    if not batch_games:
+                        continue
+
+                    if batch_games is model_turn_games:
+                        moves = batched_player.best_moves(
+                            [game["board"] for game in batch_games],
+                            [game["state"] for game in batch_games],
+                        )
+                        for game, move in zip(batch_games, moves):
+                            if move is None or move not in game["board"].legal_moves:
+                                move = next(iter(game["board"].legal_moves), None)
+                            if move is None:
+                                game["ply_count"] = max_half_moves
+                                continue
+                            game["board"].push(move)
+                            batched_player.on_move_played(game["state"], move)
+                            game["ply_count"] += 1
+                    else:
+                        futures = {
+                            executor.submit(
+                                game["engine"].play,
+                                game["board"].copy(stack=False),
+                                chess.engine.Limit(time=stockfish_time_limit),
+                            ): game
+                            for game in batch_games
+                        }
+                        for future in as_completed(futures):
+                            game = futures[future]
+                            try:
+                                result = future.result()
+                                move = result.move
+                            except Exception as exc:
+                                self._log_limited(
+                                    "stockfish_batch_play_fail",
+                                    f"  Warning: Stockfish move failed at level {game['level']}: {exc}",
+                                )
+                                move = None
+                            if move is None or move not in game["board"].legal_moves:
+                                game["ply_count"] = max_half_moves
+                                continue
+                            game["board"].push(move)
+                            batched_player.on_move_played(game["state"], move)
+                            game["ply_count"] += 1
+
+                finished_games: list[dict] = []
+                still_active = []
+                for game in active_games:
+                    if game["ply_count"] >= max_half_moves or game["board"].is_game_over(claim_draw=True):
+                        finished_games.append(game)
+                    else:
+                        still_active.append(game)
+                active_games = still_active
+                for game in finished_games:
+                    finalize_game(game)
+
+                while idle_engines and pending_tasks and not self._is_cancelled():
+                    launch_next_game(idle_engines.pop())
+        finally:
+            executor.shutdown(wait=True, cancel_futures=False)
+
+        return all_opponent_elos, all_scores
 
     def _play_game(
         self,
@@ -957,13 +1363,7 @@ class EloEstimator:
             player.on_move_played(move)
 
         # Determine result
-        result = board.result(claim_draw=True)
-        if result == "1-0":
-            return 1.0 if model_is_white else 0.0
-        elif result == "0-1":
-            return 0.0 if model_is_white else 1.0
-        else:
-            return 0.5
+        return self._score_game_result(board, model_is_white)
 
 
 # ---------------------------------------------------------------------------

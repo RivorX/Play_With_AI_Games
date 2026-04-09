@@ -82,12 +82,13 @@ except ImportError:
 from utils.shared.logger import TrainingLogger
 from utils.shared.elo_estimator import estimate_model_elo
 from utils.rl.replay import ReplayBuffer
-from utils.rl.temperature import TemperatureSchedule
+from utils.rl.temperature import TemperatureSchedule, AdaptiveTemperatureController
 from utils.rl.training_rl import train_on_batch_rl, evaluate_models
 from utils.rl.startup import plan_rl_startup, apply_rl_startup_plan
 from utils.il.auto_tune import resolve_rl_hyperparameters
 from utils.shared.metrics import MetricsCalculator
 from utils.shared.runtime_helpers import (
+    build_rl_experiment_name,
     build_model_file_tag,
     build_model_architecture_metadata,
     cleanup_interrupted_log_csv,
@@ -219,6 +220,35 @@ def _adaptive_factor_from_history(history_values, target_score, band, min_factor
     return float(min_factor + (max_factor - min_factor) * closeness)
 
 
+def _average_score_from_history(history_values):
+    if not history_values:
+        return None
+    return float(sum(float(value) for value in history_values) / len(history_values))
+
+
+def _score_closeness(avg_score, target_score, band):
+    if avg_score is None:
+        return 0.5
+    distance = min(1.0, abs(float(avg_score) - float(target_score)) / max(1e-8, float(band)))
+    return max(0.0, 1.0 - distance)
+
+
+def _safe_draw_rate(wins, draws, losses):
+    total = int(wins) + int(draws) + int(losses)
+    if total <= 0:
+        return None
+    return float(float(draws) / float(total))
+
+
+def _draw_heaviness_penalty(draw_rate, target_draw_rate, band, min_factor):
+    if draw_rate is None:
+        return 1.0
+    if draw_rate <= target_draw_rate:
+        return 1.0
+    distance = min(1.0, (float(draw_rate) - float(target_draw_rate)) / max(1e-8, float(band)))
+    return float(1.0 - (1.0 - float(min_factor)) * distance)
+
+
 def _normalize_weight_map(weight_map):
     normalized = {
         str(label): max(0.0, float(weight))
@@ -256,6 +286,18 @@ def _build_selfplay_opponent_candidates(
     band = max(0.05, float(rl_cfg.get('self_play_opponent_adaptive_band', 0.15)))
     min_factor = max(0.20, float(rl_cfg.get('self_play_opponent_adaptive_min_factor', 0.60)))
     max_factor = max(min_factor, float(rl_cfg.get('self_play_opponent_adaptive_max_factor', 1.40)))
+    min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_min_score', 0.0))))
+    max_score = max(min_score, min(1.0, float(rl_cfg.get('self_play_opponent_max_score', 1.0))))
+    best_min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_best_min_score', min_score))))
+    recent_min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_recent_min_score', min_score))))
+    recent_max_score = max(recent_min_score, min(1.0, float(rl_cfg.get('self_play_opponent_recent_max_score', max_score))))
+    recent_candidate_limit = max(1, int(rl_cfg.get('self_play_recent_candidate_pool_size', 4)))
+    recent_fallback_min_count = max(1, int(rl_cfg.get('self_play_recent_fallback_min_count', 2)))
+    recent_recency_bias = max(0.0, float(rl_cfg.get('self_play_recent_recency_bias', 0.35)))
+    target_draw_rate = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_target_draw_rate', 0.45))))
+    draw_band = max(0.01, float(rl_cfg.get('self_play_opponent_draw_band', 0.20)))
+    draw_penalty_min_factor = max(0.20, min(1.0, float(rl_cfg.get('self_play_opponent_draw_penalty_min_factor', 0.70))))
+    exact_draw_history = scheduler_state.get("draw_history_exact", {}) or {}
 
     candidates = []
     if current_fraction > 0.0:
@@ -265,9 +307,24 @@ def _build_selfplay_opponent_candidates(
             "payload": None,
         })
     if best_model_state is not None and best_fraction > 0.0:
+        best_factor = 1.0
+        if adaptive_enabled:
+            best_factor = _adaptive_factor_from_history(
+                exact_score_history.get("best", []) or [],
+                target_score,
+                band,
+                min_factor,
+                max_factor,
+            )
+        best_factor *= _draw_heaviness_penalty(
+            _average_score_from_history(exact_draw_history.get("best", []) or []),
+            target_draw_rate,
+            draw_band,
+            draw_penalty_min_factor,
+        )
         candidates.append({
             "label": "best",
-            "weight": float(best_fraction),
+            "weight": float(best_fraction * best_factor),
             "payload": {
                 "label": "best",
                 "state": best_model_state,
@@ -275,7 +332,7 @@ def _build_selfplay_opponent_candidates(
         })
     if recent_snapshot_pool and recent_fraction > 0.0:
         recent_count = max(1, len(recent_snapshot_pool))
-        recent_entries = []
+        recent_entries_all = []
         dedup_states = []
         if best_model_state is not None:
             dedup_states.append(best_model_state)
@@ -288,6 +345,11 @@ def _build_selfplay_opponent_candidates(
             recency_bias = float(idx + 1) / float(recent_count)
             label = str(recent_entry.get("label", f"recent_{idx}"))
             factor = 1.0
+            avg_score = _average_score_from_history(exact_score_history.get(label, []) or [])
+            avg_draw_rate = _average_score_from_history(exact_draw_history.get(label, []) or [])
+            in_band = True
+            if avg_score is not None and (avg_score < recent_min_score or avg_score > recent_max_score):
+                in_band = False
             if adaptive_enabled:
                 factor = _adaptive_factor_from_history(
                     exact_score_history.get(label, []) or [],
@@ -296,21 +358,67 @@ def _build_selfplay_opponent_candidates(
                     min_factor,
                     max_factor,
                 )
-            recent_entries.append({
+            draw_penalty = _draw_heaviness_penalty(
+                avg_draw_rate,
+                target_draw_rate,
+                draw_band,
+                draw_penalty_min_factor,
+            )
+            factor *= draw_penalty
+            recent_entries_all.append({
                 "label": label,
                 "state": recent_state,
                 "weight": float((0.75 + 0.25 * recency_bias) * factor),
+                "avg_score": avg_score,
+                "avg_draw_rate": avg_draw_rate,
+                "in_band": bool(in_band),
+                "recency_bias": recency_bias,
+                "draw_penalty": float(draw_penalty),
+                "selection_score": float(
+                    (1.0 - recent_recency_bias) * _score_closeness(avg_score, target_score, band)
+                    + recent_recency_bias * recency_bias
+                ),
             })
             dedup_states.append(recent_state)
-        if recent_entries:
+        if recent_entries_all:
+            in_band_entries = [entry for entry in recent_entries_all if bool(entry.get("in_band", False))]
+            candidate_entries = in_band_entries if len(in_band_entries) >= recent_fallback_min_count else list(recent_entries_all)
+            candidate_entries.sort(
+                key=lambda entry: (
+                    -float(entry.get("selection_score", 0.0)),
+                    -float(entry.get("recency_bias", 0.0)),
+                    str(entry.get("label", "")),
+                )
+            )
+            recent_entries = candidate_entries[:recent_candidate_limit]
             candidates.append({
                 "label": "recent",
                 "weight": float(recent_fraction),
                 "payload": {
                     "entries": recent_entries,
+                    "all_entries": recent_entries_all,
                 },
             })
-    return candidates
+    filtered_candidates = []
+    for candidate in candidates:
+        label = str(candidate.get("label", "current"))
+        if label == "best":
+            avg_score = _average_score_from_history(exact_score_history.get("best", []) or [])
+            if avg_score is not None and avg_score < best_min_score:
+                continue
+        elif label != "current":
+            bucket_history = scheduler_state.get("bucket_score_history", {}) or {}
+            avg_score = _average_score_from_history(bucket_history.get(label, []) or [])
+            if avg_score is not None and (avg_score < min_score or avg_score > max_score):
+                continue
+        filtered_candidates.append(candidate)
+    if not any(str(candidate.get("label")) == "current" for candidate in filtered_candidates) and current_fraction > 0.0:
+        filtered_candidates.append({
+            "label": "current",
+            "weight": float(max(current_fraction, 1e-6)),
+            "payload": None,
+        })
+    return filtered_candidates
 
 
 def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None):
@@ -333,6 +441,7 @@ def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None)
     min_factor = max(0.20, float(rl_cfg.get('self_play_opponent_adaptive_min_factor', 0.60)))
     max_factor = max(min_factor, float(rl_cfg.get('self_play_opponent_adaptive_max_factor', 1.40)))
     current_min_fraction = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_current_min_fraction', 0.50))))
+    current_max_fraction = max(current_min_fraction, min(1.0, float(rl_cfg.get('self_play_opponent_current_max_fraction', 1.0))))
 
     adjusted = {}
     debug_factors = {}
@@ -377,6 +486,22 @@ def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None)
                     label: (desired_current if label == current_label else normalized[label] * scale)
                     for label in normalized.keys()
                 }
+    if current_label in normalized and current_max_fraction < 1.0:
+        current_share = float(normalized.get(current_label, 0.0))
+        if current_share > current_max_fraction:
+            other_labels = [label for label in normalized.keys() if label != current_label]
+            other_total = float(sum(normalized[label] for label in other_labels))
+            if other_total > 0.0:
+                freed_mass = current_share - current_max_fraction
+                scale = (other_total + freed_mass) / other_total
+                normalized = {
+                    label: (
+                        current_max_fraction
+                        if label == current_label
+                        else normalized[label] * scale
+                    )
+                    for label in normalized.keys()
+                }
     return normalized, debug_factors
 
 
@@ -396,9 +521,17 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
     exact_score_history = state.get("score_history_exact")
     if not isinstance(exact_score_history, dict):
         exact_score_history = {}
+    exact_draw_history = state.get("draw_history_exact")
+    if not isinstance(exact_draw_history, dict):
+        exact_draw_history = {}
+    bucket_draw_history = state.get("bucket_draw_history")
+    if not isinstance(bucket_draw_history, dict):
+        bucket_draw_history = {}
 
     observed_scores = {}
     exact_observed_scores = {}
+    observed_draw_rates = {}
+    exact_observed_draw_rates = {}
     bucket_stats = {}
     for label, stats in dict(opponent_results or {}).items():
         games = int((stats or {}).get("games", 0))
@@ -410,6 +543,13 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
             )
             if score_rate is not None:
                 exact_observed_scores[str(label)] = float(score_rate)
+            draw_rate = _safe_draw_rate(
+                (stats or {}).get("wins", 0),
+                (stats or {}).get("draws", 0),
+                (stats or {}).get("losses", 0),
+            )
+            if draw_rate is not None:
+                exact_observed_draw_rates[str(label)] = float(draw_rate)
         bucket = _canonicalize_opponent_bucket(label)
         bucket_entry = bucket_stats.setdefault(
             bucket,
@@ -432,9 +572,18 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
         if score_rate is None:
             continue
         observed_scores[str(label)] = float(score_rate)
+        draw_rate = _safe_draw_rate(
+            (stats or {}).get("wins", 0),
+            (stats or {}).get("draws", 0),
+            (stats or {}).get("losses", 0),
+        )
+        if draw_rate is not None:
+            observed_draw_rates[str(label)] = float(draw_rate)
     if (int(iteration_num) % update_every) != 0:
         state["bucket_score_history"] = bucket_score_history
         state["score_history_exact"] = exact_score_history
+        state["draw_history_exact"] = exact_draw_history
+        state["bucket_draw_history"] = bucket_draw_history
         state["score_history"] = bucket_score_history
         return state, observed_scores
 
@@ -442,14 +591,24 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
         history = deque(exact_score_history.get(str(label), []), maxlen=history_size)
         history.append(float(score_rate))
         exact_score_history[str(label)] = list(history)
+    for label, draw_rate in exact_observed_draw_rates.items():
+        history = deque(exact_draw_history.get(str(label), []), maxlen=history_size)
+        history.append(float(draw_rate))
+        exact_draw_history[str(label)] = list(history)
 
     for label, score_rate in observed_scores.items():
         history = deque(bucket_score_history.get(str(label), []), maxlen=history_size)
         history.append(float(score_rate))
         bucket_score_history[str(label)] = list(history)
+    for label, draw_rate in observed_draw_rates.items():
+        history = deque(bucket_draw_history.get(str(label), []), maxlen=history_size)
+        history.append(float(draw_rate))
+        bucket_draw_history[str(label)] = list(history)
 
     state["bucket_score_history"] = bucket_score_history
     state["score_history_exact"] = exact_score_history
+    state["draw_history_exact"] = exact_draw_history
+    state["bucket_draw_history"] = bucket_draw_history
     state["score_history"] = bucket_score_history
     return state, observed_scores
 
@@ -463,7 +622,7 @@ def _build_selfplay_opponent_assignments(
 ):
     enabled = bool(rl_cfg.get('self_play_opponent_pool_enabled', False))
     if not enabled or not worker_specs:
-        return {}, {}
+        return {}, {}, {}
 
     candidates = _build_selfplay_opponent_candidates(
         rl_cfg,
@@ -472,7 +631,7 @@ def _build_selfplay_opponent_assignments(
         scheduler_state=adaptive_scheduler_state,
     )
     if not candidates:
-        return {}, {}
+        return {}, {}, {}
 
     source_weights, _adaptive_debug = _compute_adaptive_opponent_weights(
         rl_cfg,
@@ -482,7 +641,7 @@ def _build_selfplay_opponent_assignments(
 
     total_games = int(sum(max(0, int(games)) for _, games in worker_specs))
     if total_games <= 0:
-        return {}, {}
+        return {}, {}, {}
 
     target_games = {
         label: int(round(total_games * float(source_weights.get(label, 0.0))))
@@ -529,6 +688,11 @@ def _build_selfplay_opponent_assignments(
 
     assignments = {}
     assigned_counts = defaultdict(int)
+    debug_info = {
+        "source_weights": {str(k): float(v) for k, v in source_weights.items()},
+        "selected_recent_pool": [],
+        "recent_pool_all": [],
+    }
     offset = 0
     for rank, games_for_worker in sorted_workers:
         worker_plan_buckets = list(bucket_game_plan[offset: offset + int(games_for_worker)])
@@ -570,7 +734,28 @@ def _build_selfplay_opponent_assignments(
             ],
         }
 
-    return assignments, dict(assigned_counts)
+    recent_payload = payloads_by_label.get("recent") or {}
+    for entry in list(recent_payload.get("entries", []) or []):
+        debug_info["selected_recent_pool"].append({
+            "label": str(entry.get("label", "")),
+            "avg_score": entry.get("avg_score", None),
+            "avg_draw_rate": entry.get("avg_draw_rate", None),
+            "selection_score": entry.get("selection_score", None),
+            "draw_penalty": entry.get("draw_penalty", None),
+            "recency_bias": entry.get("recency_bias", None),
+        })
+    for entry in list(recent_payload.get("all_entries", []) or []):
+        debug_info["recent_pool_all"].append({
+            "label": str(entry.get("label", "")),
+            "avg_score": entry.get("avg_score", None),
+            "avg_draw_rate": entry.get("avg_draw_rate", None),
+            "selection_score": entry.get("selection_score", None),
+            "draw_penalty": entry.get("draw_penalty", None),
+            "recency_bias": entry.get("recency_bias", None),
+            "in_band": bool(entry.get("in_band", False)),
+        })
+
+    return assignments, dict(assigned_counts), debug_info
 
 
 def _round_replay_capacity(value, quantum):
@@ -793,6 +978,21 @@ class RLEloCoordinator:
         elo_config["free_threads_utilization"] = 1.0
         # RL Elo should not use the generic auto "cpu_total - 2" worker reserve.
         elo_config["auto_worker_reserve_cpus"] = 0
+        if not final_override:
+            if "rl_games_per_level" in self.elo_config:
+                elo_config["games_per_level"] = int(self.elo_config.get("rl_games_per_level"))
+            if "rl_levels" in self.elo_config:
+                elo_config["levels"] = list(self.elo_config.get("rl_levels") or [])
+            if "rl_stockfish_time_limit" in self.elo_config:
+                elo_config["stockfish_time_limit"] = float(self.elo_config.get("rl_stockfish_time_limit"))
+            if "rl_max_moves" in self.elo_config:
+                elo_config["max_moves"] = int(self.elo_config.get("rl_max_moves"))
+            if "rl_workers" in self.elo_config:
+                elo_config["workers"] = int(self.elo_config.get("rl_workers"))
+            if "rl_stockfish_threads" in self.elo_config:
+                elo_config["stockfish_threads"] = int(self.elo_config.get("rl_stockfish_threads"))
+            if "rl_stockfish_hash_mb" in self.elo_config:
+                elo_config["stockfish_hash_mb"] = int(self.elo_config.get("rl_stockfish_hash_mb"))
         if final_override:
             # Final/shutdown Elo runs when training is paused/stopped;
             # allow full CPU budget for faster estimation.
@@ -806,6 +1006,20 @@ class RLEloCoordinator:
                 elo_config["use_mcts"] = bool(self.elo_config.get("final_rl_use_mcts"))
             if "final_rl_mcts_simulations" in self.elo_config:
                 elo_config["mcts_simulations"] = int(self.elo_config.get("final_rl_mcts_simulations"))
+            if "final_rl_games_per_level" in self.elo_config:
+                elo_config["games_per_level"] = int(self.elo_config.get("final_rl_games_per_level"))
+            if "final_rl_levels" in self.elo_config:
+                elo_config["levels"] = list(self.elo_config.get("final_rl_levels") or [])
+            if "final_rl_stockfish_time_limit" in self.elo_config:
+                elo_config["stockfish_time_limit"] = float(self.elo_config.get("final_rl_stockfish_time_limit"))
+            if "final_rl_max_moves" in self.elo_config:
+                elo_config["max_moves"] = int(self.elo_config.get("final_rl_max_moves"))
+            if "final_rl_workers" in self.elo_config:
+                elo_config["workers"] = int(self.elo_config.get("final_rl_workers"))
+            if "final_rl_stockfish_threads" in self.elo_config:
+                elo_config["stockfish_threads"] = int(self.elo_config.get("final_rl_stockfish_threads"))
+            if "final_rl_stockfish_hash_mb" in self.elo_config:
+                elo_config["stockfish_hash_mb"] = int(self.elo_config.get("final_rl_stockfish_hash_mb"))
 
         print(f"\nEstimating Elo vs Stockfish ({reason_label})...")
         if interrupted := bool(final_override and reason_label == "shutdown"):
@@ -926,6 +1140,28 @@ def _combine_eval_stats(*stats_items):
     return combined
 
 
+def _flatten_dynamic_opponent_payloads(worker_specs, opponent_assignments):
+    """Merge worker-local opponent plans into a global sequential plan for dynamic dispatch."""
+    global_plan_labels = []
+    global_pool_entries = {}
+    for rank, _games_for_worker in sorted(worker_specs, key=lambda item: int(item[0])):
+        payload = dict(opponent_assignments.get(int(rank), {}) or {})
+        global_plan_labels.extend(list(payload.get("plan_labels", []) or []))
+        for entry in list(payload.get("pool_entries", []) or []):
+            label = str((entry or {}).get("label") or "current")
+            state = (entry or {}).get("state")
+            if state is None or label == "current" or label in global_pool_entries:
+                continue
+            global_pool_entries[label] = state
+    return {
+        "plan_labels": global_plan_labels,
+        "pool_entries": [
+            {"label": label, "state": state}
+            for label, state in global_pool_entries.items()
+        ],
+    }
+
+
 def _should_run_anchor_eval(iteration_num, rl_cfg):
     if not bool(rl_cfg.get('anchor_eval_enabled', False)):
         return False
@@ -992,6 +1228,44 @@ class _PersistentSelfPlayPool:
 
         self.started = True
 
+    def _prepare_task_files(self, rank, task_id):
+        result_file = self.temp_dir / f"worker_{rank}_{task_id}.pkl"
+        progress_file = self.temp_dir / f"worker_{rank}_{task_id}.progress"
+        try:
+            result_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            progress_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return result_file, progress_file
+
+    def dispatch_task(
+        self,
+        rank,
+        task_id,
+        model_state_path,
+        temperature,
+        num_games,
+        opponent_payload=None,
+        model_state=None,
+        stream_results_to_queue=False,
+    ):
+        result_file, progress_file = self._prepare_task_files(rank, task_id)
+        self.task_queues[rank].put({
+            'cmd': 'play',
+            'task_id': task_id,
+            'model_state': model_state,
+            'model_state_path': str(model_state_path),
+            'opponent_payload': opponent_payload or {},
+            'num_games': int(num_games),
+            'result_file_path': str(result_file),
+            'mcts_temperature': temperature,
+            'stream_results_to_queue': bool(stream_results_to_queue),
+        })
+        return result_file, progress_file
+
     def submit(
         self,
         task_id,
@@ -1008,29 +1282,17 @@ class _PersistentSelfPlayPool:
         worker_opponent_payloads = worker_opponent_payloads or {}
 
         for rank, games_for_worker in self.worker_specs:
-            result_file = self.temp_dir / f"worker_{rank}_{task_id}.pkl"
-            progress_file = self.temp_dir / f"worker_{rank}_{task_id}.progress"
-            try:
-                result_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            try:
-                progress_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-
             opponent_payload = worker_opponent_payloads.get(rank) or {}
-            self.task_queues[rank].put({
-                'cmd': 'play',
-                'task_id': task_id,
-                'model_state': model_state,
-                'model_state_path': str(worker_model_state_paths.get(rank, model_state_path)),
-                'opponent_payload': opponent_payload,
-                'num_games': int(games_for_worker),
-                'result_file_path': str(result_file),
-                'mcts_temperature': temperature,
-                'stream_results_to_queue': bool(stream_results_to_queue),
-            })
+            result_file, progress_file = self.dispatch_task(
+                rank=rank,
+                task_id=task_id,
+                model_state_path=worker_model_state_paths.get(rank, model_state_path),
+                temperature=temperature,
+                num_games=int(games_for_worker),
+                opponent_payload=opponent_payload,
+                model_state=model_state,
+                stream_results_to_queue=stream_results_to_queue,
+            )
             result_files.append(result_file)
             progress_files.append(progress_file)
 
@@ -1162,6 +1424,11 @@ def play_games_parallel_mcts(
     )
     queue_transport_enabled = bool(rl_cfg.get('self_play_queue_transport', True))
     use_queue_transport = bool(use_persistent_pool and stream_to_replay and queue_transport_enabled)
+    dynamic_dispatch_enabled = bool(
+        use_persistent_pool
+        and use_queue_transport
+        and rl_cfg.get('self_play_dynamic_dispatch', True)
+    )
     
     # Parallel configuration
     num_workers = rl_cfg.get('self_play_workers', 4)
@@ -1235,13 +1502,21 @@ def play_games_parallel_mcts(
     games_per_worker = [base_games + (1 if i < remainder else 0) for i in range(num_workers)]
     worker_specs = [(rank, games_per_worker[rank]) for rank in range(num_workers) if games_per_worker[rank] > 0]
 
-    opponent_assignments, _opponent_mix_games = _build_selfplay_opponent_assignments(
+    opponent_assignments, _opponent_mix_games, opponent_debug = _build_selfplay_opponent_assignments(
         rl_cfg,
         worker_specs,
         best_model_state=best_model_state,
         recent_snapshot_pool=recent_snapshot_pool,
         adaptive_scheduler_state=adaptive_scheduler_state,
     )
+    dynamic_dispatch_chunk_games = max(
+        1,
+        int(rl_cfg.get('self_play_dispatch_chunk_games', max_batch_games)),
+    )
+    global_dynamic_opponent_payload = _flatten_dynamic_opponent_payloads(
+        worker_specs,
+        opponent_assignments,
+    ) if dynamic_dispatch_enabled else {}
 
     # Shared temp dir used by worker result files.
     temp_dir = Path(tempfile.gettempdir()) / "chess_selfplay_mcts"
@@ -1260,6 +1535,17 @@ def play_games_parallel_mcts(
         )
         w_games = f"{base_games}" + (f"  (+1 dla {remainder} workerów)" if remainder else "")
         print()
+        if opponent_debug.get("selected_recent_pool"):
+            selected_recent_parts = []
+            for entry in opponent_debug.get("selected_recent_pool", []):
+                selected_recent_parts.append(
+                    f"{entry.get('label')}("
+                    f"score={float(entry.get('avg_score') or 0.0):.1%}, "
+                    f"draw={float(entry.get('avg_draw_rate') or 0.0):.1%}, "
+                    f"sel={float(entry.get('selection_score') or 0.0):.2f})"
+                )
+            print("Selected recent pool: " + ", ".join(selected_recent_parts))
+
         unicode_lines = [
             "╔══════════════════════════════════════════════════════╗",
             "║           KONFIGURACJA SELF-PLAY (stała)             ║",
@@ -1344,15 +1630,80 @@ def play_games_parallel_mcts(
             if not use_queue_transport:
                 torch.save(model_state_cpu, model_state_path)
 
-            result_files, progress_files = _SELFPLAY_POOL.submit(
-                task_id=task_id,
-                model_state_path=model_state_path,
-                model_state=model_state_cpu,
-                temperature=rl_cfg.get('mcts_temperature'),
-                worker_model_state_paths={},
-                worker_opponent_payloads=opponent_assignments,
-                stream_results_to_queue=use_queue_transport,
-            )
+            if dynamic_dispatch_enabled:
+                result_files = []
+                progress_files = []
+                idle_ranks = []
+                active_workers = {}
+                completed_games_by_rank = {}
+                current_progress_files = {}
+                next_game_offset = 0
+
+                for rank, _games_for_worker in worker_specs:
+                    idle_ranks.append(int(rank))
+                    completed_games_by_rank[int(rank)] = 0
+
+                def _dispatch_next_chunk(rank):
+                    nonlocal next_game_offset
+                    if next_game_offset >= num_games:
+                        return False
+                    chunk_games = min(dynamic_dispatch_chunk_games, num_games - next_game_offset)
+                    chunk_plan_labels = list(
+                        global_dynamic_opponent_payload.get("plan_labels", [])[next_game_offset: next_game_offset + chunk_games]
+                    )
+                    needed_pool_labels = {
+                        str(label)
+                        for label in chunk_plan_labels
+                        if str(label) != "current"
+                    }
+                    payload = {
+                        "plan_labels": chunk_plan_labels,
+                        "pool_entries": [
+                            entry
+                            for entry in list(global_dynamic_opponent_payload.get("pool_entries", []) or [])
+                            if str((entry or {}).get("label") or "current") in needed_pool_labels
+                        ],
+                    }
+                    result_file, progress_file = _SELFPLAY_POOL.dispatch_task(
+                        rank=int(rank),
+                        task_id=task_id,
+                        model_state_path=model_state_path,
+                        model_state=model_state_cpu,
+                        temperature=rl_cfg.get('mcts_temperature'),
+                        num_games=chunk_games,
+                        opponent_payload=payload,
+                        stream_results_to_queue=use_queue_transport,
+                    )
+                    active_workers[int(rank)] = {
+                        "chunk_games": int(chunk_games),
+                        "progress_file": progress_file,
+                    }
+                    current_progress_files[int(rank)] = progress_file
+                    result_files.append(result_file)
+                    progress_files.append(progress_file)
+                    next_game_offset += chunk_games
+                    return True
+
+                for rank in list(idle_ranks):
+                    if not _dispatch_next_chunk(rank):
+                        break
+                idle_ranks = [rank for rank in idle_ranks if rank not in active_workers]
+            else:
+                result_files, progress_files = _SELFPLAY_POOL.submit(
+                    task_id=task_id,
+                    model_state_path=model_state_path,
+                    model_state=model_state_cpu,
+                    temperature=rl_cfg.get('mcts_temperature'),
+                    worker_model_state_paths={},
+                    worker_opponent_payloads=opponent_assignments,
+                    stream_results_to_queue=use_queue_transport,
+                )
+                active_workers = {int(rank): {} for rank, _ in worker_specs}
+                completed_games_by_rank = {int(rank): 0 for rank, _ in worker_specs}
+                current_progress_files = {
+                    int(rank): pf
+                    for (rank, _), pf in zip(worker_specs, progress_files)
+                }
             processes = [_SELFPLAY_POOL.processes[rank] for rank, _ in worker_specs]
         else:
             mp_ctx = mp.get_context('spawn')
@@ -1385,6 +1736,11 @@ def play_games_parallel_mcts(
                 temp_dir / f"worker_{rank}_mcts_results.progress"
                 for rank, _ in worker_specs
             ]
+            completed_games_by_rank = {int(rank): 0 for rank, _ in worker_specs}
+            current_progress_files = {
+                int(rank): pf
+                for (rank, _), pf in zip(worker_specs, progress_files)
+            }
 
         # Wait for workers with a live games-completed progress bar.
         games_bar = tqdm(
@@ -1395,19 +1751,25 @@ def play_games_parallel_mcts(
             leave=True,
         )
         try:
-            pending = {rank for rank, _ in worker_specs}
+            pending = (
+                set(active_workers.keys())
+                if use_persistent_pool and dynamic_dispatch_enabled
+                else {rank for rank, _ in worker_specs}
+            )
             rank_to_index = {rank: idx for idx, (rank, _) in enumerate(worker_specs)}
             games_reported = {rank: 0 for rank, _ in worker_specs}
             games_bar_last = 0
             while pending:
                 # Update games progress from .progress files
                 total_done = 0
-                for rank, pf in zip((rank for rank, _ in worker_specs), progress_files):
+                for rank, _ in worker_specs:
+                    pf = current_progress_files.get(rank)
                     try:
-                        raw = pf.read_text().strip()
-                        games_reported[rank] = int(raw) if raw else 0
+                        raw = pf.read_text().strip() if pf is not None else ""
+                        active_progress = int(raw) if raw else 0
                     except Exception:
-                        pass
+                        active_progress = 0
+                    games_reported[rank] = int(completed_games_by_rank.get(rank, 0)) + active_progress
                     total_done += games_reported[rank]
                 inc = total_done - games_bar_last
                 if inc > 0:
@@ -1501,7 +1863,16 @@ def play_games_parallel_mcts(
                                         result_stats["games"] += learner_total
                                 continue
                             rank = message.get('rank')
-                            pending.discard(rank)
+                            completed_games_by_rank[int(rank)] = int(
+                                completed_games_by_rank.get(int(rank), 0)
+                            ) + int(message.get('games', 0) or 0)
+                            try:
+                                progress_file = current_progress_files.get(int(rank))
+                                if progress_file is not None:
+                                    progress_file.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                            active_workers.pop(int(rank), None)
                             if not message.get('ok', False):
                                 interrupted = bool(message.get('interrupt', False))
                                 if interrupted:
@@ -1510,6 +1881,10 @@ def play_games_parallel_mcts(
                                 raise RuntimeError(
                                     f"Persistent self-play worker {rank} failed: {message.get('error', 'unknown error')}"
                                 )
+                            if dynamic_dispatch_enabled and _dispatch_next_chunk(int(rank)):
+                                pending.add(int(rank))
+                                continue
+                            pending.discard(rank)
                     except queue.Empty:
                         pass
 
@@ -1847,6 +2222,7 @@ def play_games_parallel_mcts(
             }
             for label, stats in sorted(opponent_source_results.items(), key=lambda item: item[0])
         },
+        'opponent_debug': dict(opponent_debug or {}),
     }
     
     return (
@@ -2043,7 +2419,7 @@ def main():
     # Initialize logger after startup selection.
     logger = TrainingLogger(
         logs_dir,
-        experiment_name=f"rl_training_{model_version}_mcts",
+        experiment_name=build_rl_experiment_name(config),
         mode="rl"
     )
     global _LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG
@@ -2172,6 +2548,8 @@ def main():
         'score_history': {},
         'bucket_score_history': {},
         'score_history_exact': {},
+        'draw_history_exact': {},
+        'bucket_draw_history': {},
     }
     if recent_snapshot_keep > 0:
         recent_selfplay_snapshots.append({
@@ -2197,6 +2575,21 @@ def main():
         ),
         hard_negative_min_importance=float(
             config['reinforcement_learning'].get('replay_hard_negative_min_importance', 0.0)
+        ),
+        recent_sampling_fraction=float(
+            config['reinforcement_learning'].get('replay_recent_sampling_fraction', 0.0)
+        ),
+        recent_window_fraction=float(
+            config['reinforcement_learning'].get('replay_recent_window_fraction', 0.25)
+        ),
+        quality_sampling_fraction=float(
+            config['reinforcement_learning'].get('replay_quality_sampling_fraction', 0.0)
+        ),
+        quality_min_importance=float(
+            config['reinforcement_learning'].get('replay_quality_min_importance', 0.0)
+        ),
+        quality_value_bonus=float(
+            config['reinforcement_learning'].get('replay_quality_value_bonus', 0.0)
         ),
         resize_preserve_decisive_fraction=float(
             config['reinforcement_learning'].get('replay_resize_preserve_decisive_fraction', 0.0)
@@ -2232,6 +2625,7 @@ def main():
             end_temp=config['reinforcement_learning'].get('temperature_end', 0.5),
             decay_iterations=decay_iterations
         )
+    adaptive_temp_controller = AdaptiveTemperatureController(config['reinforcement_learning'])
     
     # LR schedule (same shape as IL, but stepped per RL iteration)
     use_lr_schedule = config['reinforcement_learning'].get('use_lr_schedule', False)
@@ -2315,9 +2709,9 @@ def main():
         config['reinforcement_learning'].get('self_play_opponent_adaptive_enabled', False)
     ):
         print(
-            "   â€˘ Adaptive opponent scheduler: "
+            "   • Adaptive opponent scheduler: "
             f"on (target={float(config['reinforcement_learning'].get('self_play_opponent_adaptive_target_score', 0.50)):.0%}, "
-            f"band=Â±{float(config['reinforcement_learning'].get('self_play_opponent_adaptive_band', 0.15)):.0%}, "
+            f"band=±{float(config['reinforcement_learning'].get('self_play_opponent_adaptive_band', 0.15)):.0%}, "
             f"current_floor={float(config['reinforcement_learning'].get('self_play_opponent_current_min_fraction', 0.50)):.0%})"
         )
     if bool(config['reinforcement_learning'].get('self_play_resignation_enabled', False)):
@@ -2354,7 +2748,21 @@ def main():
     eval_stage2_games = max(0, int(rl_cfg.get('eval_stage2_games', 0)))
     eval_stage2_gate_score_rate = float(rl_cfg.get('eval_stage2_gate_score_rate', score_rate_threshold))
     eval_stage2_gate_true_win_rate = float(rl_cfg.get('eval_stage2_gate_true_win_rate', true_win_rate_threshold))
+    early_stop_enabled = bool(rl_cfg.get('early_stop_enabled', True))
+    early_stop_patience = max(1, int(rl_cfg.get('early_stop_patience', 5)))
+    early_stop_min_score_improvement = float(rl_cfg.get('early_stop_min_score_improvement', 0.01))
+    early_stop_min_true_win_improvement = float(rl_cfg.get('early_stop_min_true_win_improvement', 0.005))
     prev_completed_draw_rate = None
+    prev_decisive_rate = None
+    prev_eval_score_rate_for_temp = None
+    best_eval_score_seen = None
+    best_eval_true_win_seen = None
+    no_improvement_eval_streak = 0
+    value_guard_recent_mae = deque(
+        maxlen=max(2, int(rl_cfg.get('value_guard_mae_window', 3)))
+    )
+    value_guard_poor_eval_streak = 0
+    last_eval_score_rate_for_guard = None
 
     training_interrupted = False
     interrupted_stage = None
@@ -2377,10 +2785,25 @@ def main():
             else:
                 base_current_temp = config['reinforcement_learning']['mcts_temperature']
 
-            current_temp = base_current_temp
+            current_temp, current_temp_threshold, temp_debug = adaptive_temp_controller.compute(
+                base_temp=base_current_temp,
+                base_threshold=base_mcts_temperature_threshold,
+                prev_draw_rate=prev_completed_draw_rate,
+                prev_decisive_rate=prev_decisive_rate,
+                last_eval_score_rate=last_eval_score_rate_for_guard,
+                previous_eval_score_rate=prev_eval_score_rate_for_temp,
+                value_guard_streak=value_guard_poor_eval_streak,
+            )
             current_dirichlet_weight = base_mcts_dirichlet_weight
-            current_temp_threshold = base_mcts_temperature_threshold
             print(f"🌡️ Temperature: {current_temp:.2f}")
+            if temp_debug.get("enabled", False):
+                print(
+                    "   Adaptive temp: "
+                    f"base={base_current_temp:.2f}, "
+                    f"adjust={float(temp_debug.get('adjustment', 0.0)):+.3f}, "
+                    f"threshold={int(current_temp_threshold)}, "
+                    f"reason={temp_debug.get('reason', 'stable')}"
+                )
             config['reinforcement_learning']['mcts_temperature'] = current_temp
             config['reinforcement_learning']['mcts_dirichlet_weight'] = current_dirichlet_weight
             config['reinforcement_learning']['mcts_temperature_threshold'] = current_temp_threshold
@@ -2391,6 +2814,16 @@ def main():
             rl_cfg['current_iteration'] = int(iteration + 1)
 
             current_value_loss_weight = _compute_value_loss_weight(iteration)
+            if bool(rl_cfg.get('value_guard_enabled', True)):
+                guard_patience = max(1, int(rl_cfg.get('value_guard_patience', 2)))
+                guard_scale = max(0.1, min(1.0, float(rl_cfg.get('value_guard_scale', 0.85))))
+                guard_min_weight = max(0.05, float(rl_cfg.get('value_guard_min_weight', 0.40)))
+                if len(value_guard_recent_mae) >= value_guard_recent_mae.maxlen:
+                    if value_guard_poor_eval_streak >= guard_patience:
+                        current_value_loss_weight = max(
+                            guard_min_weight,
+                            current_value_loss_weight * (guard_scale ** value_guard_poor_eval_streak),
+                        )
             print(f"⚖️ Value loss weight: {current_value_loss_weight:.3f}")
 
             # Self-play with MCTS
@@ -2465,7 +2898,21 @@ def main():
                     for label, score in sorted(observed_scores.items(), key=lambda item: item[0])
                 ]
                 print(f"Adaptive opponent scores: {', '.join(observed_parts)}")
+            opponent_debug = dict((selfplay_stats or {}).get('opponent_debug', {}) or {})
+            selected_recent_pool = list(opponent_debug.get('selected_recent_pool', []) or [])
+            if selected_recent_pool:
+                selected_parts = [
+                    (
+                        f"{str(entry.get('label', 'recent'))}:"
+                        f"score={float(entry.get('avg_score') or 0.0):.1%},"
+                        f"draw={float(entry.get('avg_draw_rate') or 0.0):.1%},"
+                        f"sel={float(entry.get('selection_score') or 0.0):.2f}"
+                    )
+                    for entry in selected_recent_pool
+                ]
+                print(f"Recent pool selected: {', '.join(selected_parts)}")
             prev_completed_draw_rate = float((selfplay_stats or {}).get('completed_draw_rate', 0.0))
+            prev_decisive_rate = float((selfplay_stats or {}).get('decisive_rate', 0.0))
 
             avg_policy_entropy = 0.0
             avg_value_pred_std = 0.0
@@ -2532,6 +2979,9 @@ def main():
                     f"📈 Entropy: {avg_policy_entropy:.4f}, "
                     f"Pred value std: {avg_value_pred_std:.4f}"
                 )
+                current_train_mae = float(train_metrics.get('value_mae', 0.0) or 0.0)
+                if current_train_mae > 0.0:
+                    value_guard_recent_mae.append(current_train_mae)
             else:
                 avg_loss = avg_policy = avg_value = 0
                 train_metrics = {}
@@ -2597,6 +3047,27 @@ def main():
                     f"Eval W/D/L: {eval_wins}/{eval_draws}/{eval_losses} "
                     f"(true win rate: {true_win_rate:.2%}, unresolved draws at cap: {eval_unresolved})"
                 )
+                if bool(rl_cfg.get('value_guard_enabled', True)):
+                    mae_tol = max(0.0, float(rl_cfg.get('value_guard_mae_increase_tolerance', 0.01)))
+                    min_score_gain = float(rl_cfg.get('value_guard_min_score_gain', 0.005))
+                    mae_worsening = False
+                    if len(value_guard_recent_mae) >= value_guard_recent_mae.maxlen:
+                        first_mae = float(value_guard_recent_mae[0])
+                        last_mae = float(value_guard_recent_mae[-1])
+                        mae_worsening = (last_mae - first_mae) >= mae_tol
+                    poor_eval = False
+                    if last_eval_score_rate_for_guard is not None:
+                        poor_eval = float(score_rate) <= float(last_eval_score_rate_for_guard) + min_score_gain
+                    if mae_worsening and poor_eval:
+                        value_guard_poor_eval_streak += 1
+                        print(
+                            f"Value guard: streak={value_guard_poor_eval_streak} "
+                            f"(MAE worsened, eval gain <= {min_score_gain:.3f})"
+                        )
+                    else:
+                        value_guard_poor_eval_streak = 0
+                    prev_eval_score_rate_for_temp = last_eval_score_rate_for_guard
+                    last_eval_score_rate_for_guard = float(score_rate)
                 if anchor_model_available and anchor_model is not None and _should_run_anchor_eval(iteration + 1, rl_cfg):
                     if _models_have_identical_state(best_model, anchor_model):
                         print("Anchor eval skipped: current best still matches IL-best.")
@@ -2667,6 +3138,8 @@ def main():
                     selfplay_decisive_avg_length=(selfplay_stats or {}).get('decisive_avg_length', None),
                     selfplay_curriculum_dropped_positions=(selfplay_stats or {}).get('curriculum_dropped_positions', None),
                     selfplay_cap_dropped_positions=(selfplay_stats or {}).get('cap_dropped_positions', None),
+                    adaptive_temp_adjustment=temp_debug.get('adjustment', None),
+                    adaptive_temp_threshold=current_temp_threshold,
                 )
                 last_logged_iteration = iteration + 1
                 if score_rate >= score_rate_threshold and true_win_rate >= true_win_rate_threshold:
@@ -2702,6 +3175,38 @@ def main():
                             f"💾 Version best updated: {version_best_model_path.name} "
                             f"({version_best_size_mb:.1f} MB)"
                         )
+                improved_score = (
+                    best_eval_score_seen is None
+                    or float(score_rate) >= float(best_eval_score_seen) + early_stop_min_score_improvement
+                )
+                improved_true_win = (
+                    best_eval_true_win_seen is None
+                    or float(true_win_rate) >= float(best_eval_true_win_seen) + early_stop_min_true_win_improvement
+                )
+                if improved_score:
+                    best_eval_score_seen = float(score_rate)
+                elif best_eval_score_seen is None:
+                    best_eval_score_seen = float(score_rate)
+                if improved_true_win:
+                    best_eval_true_win_seen = float(true_win_rate)
+                elif best_eval_true_win_seen is None:
+                    best_eval_true_win_seen = float(true_win_rate)
+
+                if improved_score or improved_true_win:
+                    no_improvement_eval_streak = 0
+                else:
+                    no_improvement_eval_streak += 1
+                    print(
+                        "Early-stop monitor: "
+                        f"no-improvement eval streak {no_improvement_eval_streak}/{early_stop_patience}"
+                    )
+                if early_stop_enabled and no_improvement_eval_streak >= early_stop_patience:
+                    print(
+                        "Early stopping: no meaningful improvement in eval "
+                        f"for {no_improvement_eval_streak} evaluation cycle(s)."
+                    )
+                    logger.plot()
+                    break
             else:
                 logger.log(
                     iteration + 1,
@@ -2732,6 +3237,8 @@ def main():
                     selfplay_decisive_avg_length=(selfplay_stats or {}).get('decisive_avg_length', None),
                     selfplay_curriculum_dropped_positions=(selfplay_stats or {}).get('curriculum_dropped_positions', None),
                     selfplay_cap_dropped_positions=(selfplay_stats or {}).get('cap_dropped_positions', None),
+                    adaptive_temp_adjustment=temp_debug.get('adjustment', None),
+                    adaptive_temp_threshold=current_temp_threshold,
                 )
                 last_logged_iteration = iteration + 1
 

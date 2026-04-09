@@ -195,7 +195,7 @@ reinforcement_learning:
   # ---------------------------
   # Core RL Loop
   # ---------------------------
-  use_prioritized_replay: false  # Default to uniform replay; PER was reinforcing draw-heavy self-play collapse
+  version: "rl1"             # RL run/version tag added to RL log filenames
   iterations: 30                # Total RL iterations
   games_per_iteration: 300      # Enough signal per iteration without stretching self-play too long
 
@@ -204,7 +204,7 @@ reinforcement_learning:
   # ---------------------------
   self_play_device: "cuda"      # cpu | cuda | auto (auto uses GPU if available)
   self_play_workers: auto       # 0/auto = cpu_count - 1, or set explicit number
-  self_play_workers_per_gpu: 6  # Better throughput on 1x RTX 5060 Ti + Ryzen 7500F; fewer workers means less GPU/context fragmentation
+  self_play_workers_per_gpu: 10  # Better throughput on 1x RTX 5060 Ti + Ryzen 7500F; fewer workers means less GPU/context fragmentation
   self_play_torch_threads: 1    # Keep 1 thread per worker; Python MCTS already fans out across many processes
   persistent_self_play_workers: true  # Keep self-play workers alive across RL iterations
   self_play_stream_to_replay: true    # Stream worker results into replay buffer to reduce parent RAM peak
@@ -217,7 +217,7 @@ reinforcement_learning:
   # Self-Play Game Flow
   # ---------------------------
   use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
-  max_batch_games_per_worker: 6     # Slightly smaller worker batches reduce latency spikes once search gets stronger
+  max_batch_games_per_worker: 10     # Slightly smaller worker batches reduce latency spikes once search gets stronger
   self_play_max_moves: 190          # Shorter cap: cut low-value sterile games earlier instead of harvesting many doomed draw samples
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
   self_play_claim_repetition_after_moves: 40  # Claim sterile repetition earlier to reduce low-signal looping positions
@@ -244,31 +244,43 @@ reinforcement_learning:
   # Self-Play Diversity
   # ---------------------------
   self_play_opening_diversity_enabled: true   # Start many games from short curated opening prefixes to avoid replaying the same opening shell forever
-  self_play_opening_diversity_fraction: 0.55  # Keep diversity, but stop overspreading the early curriculum across too many noisy starts
+  self_play_opening_diversity_fraction: 0.45  # Slightly less opening randomization so more games stay in repeatable training regimes
   self_play_opening_diversity_min_plies: 2    # Let sharp curated lines branch early
   self_play_opening_diversity_max_plies: 8    # Allow enough depth to land in asymmetrical structures
   self_play_opponent_pool_enabled: true       # Mix current-vs-current with frozen opponents instead of only mirror self-play
-  self_play_opponent_current_fraction: 0.70   # Still mostly current-vs-current, but leave more room for direct pressure from the IL anchor / best RL
-  self_play_opponent_best_fraction: 0.07      # More games against the actual target to beat, especially early in RL
-  self_play_opponent_recent_fraction: 0.23    # Use historical RL snapshots as a lighter anti-cycle signal
-  self_play_recent_snapshots_to_keep: 5       # Keep several RL iterations around so adaptive matching can pick across different ages
+  self_play_opponent_current_fraction: 0.45   # Reduce mirror self-play; too much current-vs-current was feeding draw-heavy targets
+  self_play_opponent_best_fraction: 0.03      # Keep some anchor pressure, but back off when best is far too hard
+  self_play_opponent_recent_fraction: 0.52    # Prefer recent snapshots that are closer in strength and give more learnable targets
+  self_play_recent_snapshots_to_keep: 10       # Keep a wider recent window, then let the smart selector choose the actually useful opponents
+  self_play_recent_candidate_pool_size: 4     # From the wider recent window, expose only the best-matched few snapshots to self-play
+  self_play_recent_fallback_min_count: 2      # If too few recent snapshots fall into the preferred score band, still keep at least a small fallback pool
+  self_play_recent_recency_bias: 0.35         # Prefer fresher snapshots, but still let matchup quality dominate the selection
   self_play_randomize_learner_color: true     # Let the training model play both colors against frozen opponents
   self_play_opponent_adaptive_enabled: true   # Reweight best/recent opponents cautiously using observed matchup scores
   self_play_opponent_adaptive_update_every: 2 # Adjust every few iterations instead of reacting to one noisy batch
   self_play_opponent_adaptive_min_games: 8    # Ignore tiny matchup samples
   self_play_opponent_adaptive_history_size: 4 # Smooth score estimates over a short recent window
   self_play_opponent_adaptive_target_score: 0.50 # Prefer opponents that are neither too easy nor too hard
-  self_play_opponent_adaptive_band: 0.15      # Treat roughly 35-65% score as the "good difficulty" band
+  self_play_opponent_adaptive_band: 0.12      # Tighten the preferred difficulty band so the scheduler reacts sooner to bad matchups
   self_play_opponent_adaptive_min_factor: 0.60 # Do not fully zero out hard/easy opponents
   self_play_opponent_adaptive_max_factor: 1.40 # Also do not over-spike one opponent source
-  self_play_opponent_current_min_fraction: 0.50 # Keep at least half the games as latest-policy self-play
-  
+  self_play_opponent_current_min_fraction: 0.30 # Keep current-vs-current present, but no longer let it dominate the signal
+  self_play_opponent_current_max_fraction: 0.55 # Also cap mirror self-play so adaptive weighting cannot drift back into draw spam
+  self_play_opponent_min_score: 0.28            # Avoid opponent buckets that are so hard they mostly generate hopeless targets
+  self_play_opponent_max_score: 0.72            # Avoid buckets that are so easy they stop challenging the policy
+  self_play_opponent_best_min_score: 0.18       # If best becomes overwhelmingly strong, downweight it entirely for self-play
+  self_play_opponent_recent_min_score: 0.32     # Recent snapshots should usually be in the learnable band
+  self_play_opponent_recent_max_score: 0.68     # Also skip recent snapshots that have become too easy
+  self_play_opponent_target_draw_rate: 0.45     # Prefer opponents that still produce some decisive games instead of nearly-all-draw matchups
+  self_play_opponent_draw_band: 0.20            # Tolerance band before draw-heaviness starts getting penalized
+  self_play_opponent_draw_penalty_min_factor: 0.70 # Do not fully zero out draw-heavy opponents, but make them less likely
+
   # ---------------------------
   # Replay Shaping
   # ---------------------------
   replay_dynamic_cap_enabled: true
   replay_cap_fraction_decisive: 0.95          # Keep almost all decisive positions
-  replay_cap_fraction_draw: 0.08              # Keep some draw signal, but far less than before
+  replay_cap_fraction_draw: 0.12              # Keep a bit more draw structure so value targets are less brittle
   replay_cap_min_positions: 16                # Avoid making draw games vanish completely from the replay
   replay_cap_max_positions: 120               # Absolute hard cap to avoid RAM bloat
   
@@ -281,12 +293,24 @@ reinforcement_learning:
   temperature_start: 0.65             # RL should start more focused; search, not policy noise, should drive improvement
   temperature_end: 0.35               # Sharpen later training further so the policy keeps tactical wins instead of washing them out
   temperature_decay_iterations: auto  # Auto: decay spans the full RL run (matches iterations)
+  adaptive_temperature_enabled: true  # Apply small telemetry-driven corrections on top of the base decay schedule
+  adaptive_temperature_min: 0.28      # Never let adaptive control collapse exploration completely
+  adaptive_temperature_max: 0.68      # Also avoid over-correcting above the intended search regime
+  adaptive_temperature_max_adjustment: 0.12 # Allow the controller to react more visibly when self-play turns too draw-heavy
+  adaptive_temperature_draw_target: 0.26    # Prefer a moderate draw rate instead of sterile 30%+ draw-heavy self-play
+  adaptive_temperature_draw_band: 0.04      # React a bit earlier once draw rate starts drifting upward
+  adaptive_temperature_decisive_target: 0.70 # Aim for mostly decisive completed games
+  adaptive_temperature_decisive_band: 0.06   # React a bit sooner when decisive rate falls off
+  adaptive_temperature_min_eval_gain: 0.015  # Require a bit more eval progress before calling the run healthy
+  adaptive_temperature_value_guard_step: 0.015 # Extra temp reduction per active value-guard streak
+  adaptive_temperature_smoothing: 0.35       # Lower smoothing so adjustments appear faster on the next iterations
+  adaptive_temperature_threshold_step: 3     # Let deterministic-play threshold move a bit more with temperature
 
   # ---------------------------
   # MCTS Search
   # ---------------------------
   mcts_simulations: 96      # Stronger search targets so RL learns from decisions that can actually outperform the raw IL prior
-  mcts_batch_size: 48        # Match the heavier search budget without overfragmenting GPU inference
+  mcts_batch_size: 128        # Match the heavier search budget without overfragmenting GPU inference
   mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
   mcts_c_puct: 1.15          # Move back toward healthier exploration; too-low PUCT was over-trusting the current policy
   mcts_dynamic_c_puct: true  # MuZero-style dynamic exploration scaling by parent visits
@@ -335,23 +359,28 @@ reinforcement_learning:
   replay_fp16: true             # Store replay tensors in float16 to reduce RAM (~2x)
   replay_decisive_sampling_fraction: 0.22   # Keep a small decisive bias, but avoid oversampling mostly losing decisive positions
   replay_decisive_value_epsilon: 0.05       # Treat |value| > epsilon as decisive for replay sampling
-  replay_hard_negative_sampling_fraction: 0.15  # Pull a slice of each batch from high-importance tactical/uncertain positions
+  replay_hard_negative_sampling_fraction: 0.10  # Keep some tactical focus, but stop over-concentrating batches on noisy tails
   replay_hard_negative_min_importance: 1.35    # Threshold for positions to count as "hard" in replay sampling
+  replay_recent_sampling_fraction: 0.25       # Always reserve part of each batch for fresh self-play so the learner tracks the current policy regime
+  replay_recent_window_fraction: 0.30         # Define "recent" as the newest ~30% of the replay buffer
+  replay_quality_sampling_fraction: 0.18      # Separate from hard negatives: sample positions that look globally high-quality, not only hard/noisy
+  replay_quality_min_importance: 1.15         # Lower than hard negatives so quality replay includes more than just the tactical tail
+  replay_quality_value_bonus: 0.20            # Slightly prefer positions with clearer value targets inside the quality slice
   replay_resize_preserve_decisive_fraction: 0.15  # On buffer shrink, preserve some older decisive samples instead of only the newest data
   replay_resize_preserve_decisive_min_count: 1024 # Floor for protected decisive positions when available
   replay_importance_gating_enabled: true       # Gate per-game positions by importance before the normal replay cap
-  replay_importance_gate_fraction_decisive: 0.78 # Keep most decisive positions, but trim the least useful tail
-  replay_importance_gate_fraction_draw: 0.40   # Draws need stronger filtering to avoid sterile replay spam
+  replay_importance_gate_fraction_decisive: 0.90 # Keep more decisive trajectories intact for stabler value learning
+  replay_importance_gate_fraction_draw: 0.55   # Still filter sterile draws, but keep enough context to learn from them
   replay_importance_gate_min_positions: 12     # Never let importance gating erase a game completely
   replay_importance_top_fraction: 0.70         # Mostly keep top-importance moments plus some timeline coverage
   
   # Learning rate schedule
   use_lr_schedule: true
-  warmup_pct: 0.05           # Same schedule shape as IL: warmup over this fraction of RL iterations
+  warmup_pct: 0.05           # RL already uses warmup + cosine decay over iterations
   min_lr_ratio: 0.25         # Final LR = auto-tuned base_lr * min_lr_ratio
   
   # Entropy regularization
-  entropy_weight: 0.0004      # Search already injects exploration; lower entropy helps RL keep concrete improvements
+  entropy_weight: 0.0003      # Keep some policy spread, but do not push late self-play back toward drawish entropy
   
   # Data augmentation
   use_augmentation: true
@@ -368,13 +397,17 @@ reinforcement_learning:
   eval_claim_repetition_after_moves: 70
   eval_claim_draw_after_moves: 180  # Generic claimable draws after ~70 full moves
   eval_every: 4              # Slightly faster feedback loop while iterating toward surpassing IL
-  eval_staged_enabled: true
-  eval_stage1_games: 40
-  eval_stage2_games: 120
-  eval_stage2_gate_score_rate: 0.52
-  eval_stage2_gate_true_win_rate: 0.02
+  eval_staged_enabled: true   # true = two-stage eval vs best: short MCTS screen first, then extra MCTS games only if stage 1 looks promising
+  eval_stage1_games: 40       # Stage 1 uses the normal eval MCTS path too; this is the cheap first sample
+  eval_stage2_games: 120      # Stage 2 adds this many more MCTS games and combines them with stage 1 for the final eval result
+  eval_stage2_gate_score_rate: 0.52  # Run stage 2 only if stage 1 score_rate reaches at least this threshold
+  eval_stage2_gate_true_win_rate: 0.02  # Also require a small decisive edge in stage 1 to avoid paying for stage 2 on drawish noise
   eval_fixed_openings_enabled: true
   eval_fixed_openings_max_plies: 6
+  early_stop_enabled: true
+  early_stop_patience: 5          # Stop RL after 5 eval cycles without meaningful improvement
+  early_stop_min_score_improvement: 0.01   # Require at least +1pp score-rate improvement to reset patience
+  early_stop_min_true_win_improvement: 0.005 # Or at least +0.5pp true-win improvement
   score_rate_threshold: 0.55    # Promote best model only if score vs current best is clearly positive
   true_win_rate_threshold: 0.02 # Also require some real decisive edge, not only draw-heavy scoring
   win_rate_threshold: 0.55      # Backward-compat alias; current code uses score_rate_threshold for promotion
@@ -388,11 +421,18 @@ reinforcement_learning:
   # Loss Weights
   # ---------------------------
   policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 0.74    # Value loss weight (base/default)
+  value_loss_weight: 0.55    # Lower the value head pressure until self-play value targets are cleaner again
   # Value loss weight schedule - drastycznie obniżamy na starcie!
   value_loss_weight_schedule:
-    start: 0.6
-    end: 0.85
+    start: 0.50
+    end: 0.60
+  value_guard_enabled: true
+  value_guard_mae_window: 3
+  value_guard_patience: 2
+  value_guard_mae_increase_tolerance: 0.01
+  value_guard_min_score_gain: 0.005
+  value_guard_scale: 0.85
+  value_guard_min_weight: 0.40
   value_target_noise_std: 0.0
 
 
@@ -436,12 +476,15 @@ elo_estimation:
   rl_min_win_rate_for_stockfish: 0.50       # Backward-compat alias for score-rate gate
   final_on_rl_shutdown: true   # In RL: run one final Elo test on normal end and after Ctrl+C training stop; press Ctrl+C again during that Elo to cancel it
   stockfish_path: "stockfish"  # Path to Stockfish binary (or just "stockfish" if on PATH)
-  workers: 0                   # Parallel game workers (0/auto = cpu_count-2, set explicit 4-8 for best speed)
+  workers: 0                   # Parallel game workers (0/auto = use full available CPU budget, adjusted by stockfish_threads in RL)
   prioritize_training: true    # Keep IL training/data-loading responsive while Elo runs
   reserve_dataloader_workers: true    # Reserve hardware.num_workers CPU slots for DataLoader
   free_threads_utilization: 1.0       # Use this fraction of free CPU threads after DataLoader reservation
   stockfish_priority: "below_normal"  # Windows process priority for Stockfish: idle|below_normal|normal
   stockfish_hide_window: true  # Windows: spawn Stockfish without console windows
+  batch_model_moves: true      # Batch model-side Elo moves across active games to better use GPU/CPU, especially with MCTS
+  stockfish_threads: 1         # Threads per Stockfish process; tune together with workers (e.g. 12x1, 6x2, 4x3)
+  stockfish_hash_mb: 64        # Hash MB per Stockfish process; total RAM ~= workers * hash_mb plus engine overhead
   max_error_logs_per_type: 8   # Suppress repeated Stockfish error spam after N logs
   cancel_shutdown_wait_s: 0.0  # After Ctrl+C, do not wait for graceful unwind; cancel shutdown Elo immediately
   
@@ -449,13 +492,25 @@ elo_estimation:
   levels: [1320, 1400, 1500, 1600, 1700, 1850, 2000, 2200]  # Stockfish UCI_Elo levels (min 1320 for SF 17+)
   stockfish_time_limit: 0.2    # Seconds per Stockfish move (lower = faster but weaker play)
   max_moves: 150               # Max full moves per game before declaring draw
+  rl_games_per_level: 12       # Faster periodic RL Stockfish check: 8 levels x 12 games = 96 total games
+  rl_stockfish_time_limit: 0.10  # Faster periodic RL Elo; keep constant across runs for comparability
+  rl_max_moves: 120            # Shorter periodic RL Elo games to avoid very long low-signal endings
+  rl_workers: 12               # Fill the CPU budget during periodic RL Elo
+  rl_stockfish_threads: 1      # Throughput-oriented periodic RL Elo: many 1-thread engines
+  rl_stockfish_hash_mb: 32     # Enough cache for short time controls without wasting RAM
+  final_rl_games_per_level: 24   # Final RL Elo can be slower/more stable than periodic checks
+  final_rl_stockfish_time_limit: 0.20  # Keep final RL Elo closer to the previous baseline
+  final_rl_max_moves: 150      # Final RL Elo keeps the normal move horizon
+  final_rl_workers: 6          # Better CPU saturation for final Elo with 2-thread Stockfish workers
+  final_rl_stockfish_threads: 2  # Stronger per-game Stockfish search in final RL Elo
+  final_rl_stockfish_hash_mb: 64  # More cache is reasonable when fewer final Elo workers are active
   
   # MCTS options (for stronger but slower play)
   # NOTE: IL training forces this to false (raw net only for speed).
   use_mcts: false              # Enable MCTS for model moves (default false)
   mcts_simulations: 100        # MCTS sims per move (50-100 = fast, 200-400 = strong, 800+ = very strong)
   final_rl_use_mcts: true      # In RL final Elo: optionally override use_mcts for the last Stockfish test
-  final_rl_mcts_simulations: 100  # In RL final Elo: override MCTS sims used for the final Stockfish test
+  final_rl_mcts_simulations: 200  # In RL final Elo: override MCTS sims used for the final Stockfish test
 
   # Async worker device (used by IL background Elo and RL cancellable Elo worker).
   async_in_il: true                # true = do not block IL training loop on Elo

@@ -68,6 +68,7 @@ class TrainingLogger:
                     'selfplay_auto_draw_rate',
                     'selfplay_truncated_rate', 'selfplay_decisive_avg_length',
                     'selfplay_curriculum_dropped_positions', 'selfplay_cap_dropped_positions',
+                    'adaptive_temp_adjustment', 'adaptive_temp_threshold',
                     'estimated_elo',
                 ]
             
@@ -103,7 +104,11 @@ class TrainingLogger:
         if mode == "rl":
             self.win_rates = []
             self.true_win_rates = []
+            self.anchor_score_rates = []
+            self.anchor_true_win_rates = []
             self.temperatures = []
+            self.adaptive_temp_adjustments = []
+            self.adaptive_temp_thresholds = []
 
         # Optional run context shown in plot header (e.g. startup mode/resume/transfer info).
         self.run_context_text = None
@@ -689,6 +694,8 @@ class TrainingLogger:
                     kwargs.get('selfplay_decisive_avg_length', ''),
                     kwargs.get('selfplay_curriculum_dropped_positions', ''),
                     kwargs.get('selfplay_cap_dropped_positions', ''),
+                    kwargs.get('adaptive_temp_adjustment', ''),
+                    kwargs.get('adaptive_temp_threshold', ''),
                 ]
 
                 if estimated_elo is not None:
@@ -731,9 +738,17 @@ class TrainingLogger:
                     self.win_rates.append((iteration, score_rate))
                 if 'true_win_rate' in kwargs and kwargs['true_win_rate'] is not None:
                     self.true_win_rates.append((iteration, kwargs['true_win_rate']))
-                
+                if 'anchor_score_rate' in kwargs and kwargs['anchor_score_rate'] is not None:
+                    self.anchor_score_rates.append((iteration, kwargs['anchor_score_rate']))
+                if 'anchor_true_win_rate' in kwargs and kwargs['anchor_true_win_rate'] is not None:
+                    self.anchor_true_win_rates.append((iteration, kwargs['anchor_true_win_rate']))
+                 
                 if 'temperature' in kwargs and kwargs['temperature'] is not None:
                     self.temperatures.append((iteration, kwargs['temperature']))
+                if 'adaptive_temp_adjustment' in kwargs and kwargs['adaptive_temp_adjustment'] is not None:
+                    self.adaptive_temp_adjustments.append((iteration, kwargs['adaptive_temp_adjustment']))
+                if 'adaptive_temp_threshold' in kwargs and kwargs['adaptive_temp_threshold'] is not None:
+                    self.adaptive_temp_thresholds.append((iteration, kwargs['adaptive_temp_threshold']))
 
                 if estimated_elo is not None:
                     self.record_estimated_elo(iteration, estimated_elo, update_csv=False)
@@ -1119,17 +1134,24 @@ class TrainingLogger:
         ax.grid(True, alpha=0.3)
         
         ax = axes[1, 2]
-        if self.win_rates:
-            win_iters, win_vals = zip(*self.win_rates)
-            ax.plot(win_iters, win_vals, 'mo-', label='Score Rate', linewidth=2, markersize=8)
+        if self.win_rates or self.anchor_score_rates:
+            if self.win_rates:
+                win_iters, win_vals = zip(*self.win_rates)
+                ax.plot(win_iters, win_vals, 'mo-', label='Score Rate', linewidth=2, markersize=8)
             if self.true_win_rates:
                 true_iters, true_vals = zip(*self.true_win_rates)
                 ax.plot(true_iters, true_vals, 'co-', label='True Win Rate', linewidth=1.5, markersize=6)
+            if self.anchor_score_rates:
+                anchor_iters, anchor_vals = zip(*self.anchor_score_rates)
+                ax.plot(anchor_iters, anchor_vals, 'yo-', label='Anchor Score Rate', linewidth=2, markersize=7)
+            if self.anchor_true_win_rates:
+                anchor_true_iters, anchor_true_vals = zip(*self.anchor_true_win_rates)
+                ax.plot(anchor_true_iters, anchor_true_vals, 'ko--', label='Anchor True Win Rate', linewidth=1.5, markersize=5, alpha=0.85)
             ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
             ax.axhline(y=0.55, color='green', linestyle='--', alpha=0.5)
             ax.set_xlabel('Iteration')
             ax.set_ylabel('Rate')
-            ax.set_title('Score/Win Rate vs Best')
+            ax.set_title('Score/Win Rate vs Best + Anchor')
             ax.set_ylim([0, 1])
             ax.legend()
             ax.grid(True, alpha=0.3)
@@ -1138,10 +1160,13 @@ class TrainingLogger:
         ax = axes[2, 0]
         if self.temperatures:
             temp_iters, temp_vals = zip(*self.temperatures)
-            ax.plot(temp_iters, temp_vals, 'orange', linewidth=2, label='Temperature')
+            ax.plot(temp_iters, temp_vals, 'orange', linewidth=2, label='Applied Temperature')
+            if self.adaptive_temp_adjustments:
+                adj_iters, adj_vals = zip(*self.adaptive_temp_adjustments)
+                ax.plot(adj_iters, adj_vals, color='tab:red', linestyle='--', linewidth=1.5, label='Adaptive Adjustment')
             ax.set_xlabel('Iteration')
             ax.set_ylabel('Temperature')
-            ax.set_title('Temperature Schedule')
+            ax.set_title('Applied Temperature Schedule')
             ax.legend()
             ax.grid(True, alpha=0.3)
         
