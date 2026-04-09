@@ -1078,6 +1078,23 @@ class ChessGUI:
             return self.mcts_simulations_white if color == chess.WHITE else self.mcts_simulations_black
         return self.mcts_simulations_white
 
+    def _get_cached_mcts_top_move(self, color):
+        cache = self.mcts_analysis_cache_by_color.get(color, {})
+        if cache.get("fen") != self.board.fen():
+            return None
+        rows = list(cache.get("rows", []))
+        if not rows:
+            return None
+
+        move_uci = rows[0].get("move")
+        if not move_uci:
+            return None
+        try:
+            move = chess.Move.from_uci(str(move_uci))
+        except ValueError:
+            return None
+        return move if move in self.board.legal_moves else None
+
     def _build_mcts_analysis_rows(self, color):
         mcts = self._analysis_mcts_for_color(color)
         if mcts is None:
@@ -2383,13 +2400,15 @@ class ChessGUI:
         
         #  Get AI move - with MCTS or network-only
         if self._side_uses_mcts(self.board.turn) and current_mcts is not None:
-            # MCTS mode (if available)
-            current_mcts_sims = self.mcts_simulations_white if self.board.turn == chess.WHITE else self.mcts_simulations_black
-            visit_counts = current_mcts.search(
-                self.board, 
-                current_mcts_sims
-            )
-            move, _ = select_move_by_visits(visit_counts, temperature=0)
+            # MCTS mode: prefer the exact move shown in the current MCTS panel snapshot.
+            move = self._get_cached_mcts_top_move(self.board.turn)
+            if move is None:
+                current_mcts_sims = self.mcts_simulations_white if self.board.turn == chess.WHITE else self.mcts_simulations_black
+                visit_counts = current_mcts.search(
+                    self.board,
+                    current_mcts_sims
+                )
+                move, _ = select_move_by_visits(visit_counts, temperature=0)
         else:
             #  v4.2: Network-only mode with POV support
             move = self._get_network_move(current_model)
