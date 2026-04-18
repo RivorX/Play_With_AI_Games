@@ -2383,6 +2383,10 @@ def main():
             use_bfloat16 = False
     
     best_model_il_path = base_dir / config['paths']['best_model_il']
+    best_model_il_swa_path = best_model_il_path.parent / "best_model_il_swa.pt"
+    rl_init_checkpoint_path = (
+        best_model_il_swa_path if best_model_il_swa_path.exists() else best_model_il_path
+    )
     best_model_rl_path = base_dir / config['paths']['best_model_rl']
     version_best_model_path = rl_dir / f"{model_file_tag}_best.pt"
     latest_checkpoint_path = rl_dir / f"{model_file_tag}_latest.pt"
@@ -2413,7 +2417,7 @@ def main():
         models_dir=models_dir,
         best_model_rl_path=best_model_rl_path,
         rl_dir=rl_dir,
-        default_new_checkpoint=best_model_il_path,
+        default_new_checkpoint=rl_init_checkpoint_path,
     )
 
     # Initialize logger after startup selection.
@@ -2449,7 +2453,7 @@ def main():
         optimizer=optimizer,
         scaler=scaler,
         device=device,
-        default_new_checkpoint=best_model_il_path,
+        default_new_checkpoint=rl_init_checkpoint_path,
     )
     start_mode = startup_state.get("start_mode", "new")
     selected_checkpoint_label = startup_state.get("selected_checkpoint_label")
@@ -2463,8 +2467,8 @@ def main():
     if start_mode == "new":
         if new_init_mode == "select" and selected_checkpoint_label:
             source_label = Path(selected_checkpoint_label).name
-        elif best_model_il_path.exists():
-            source_label = f"{best_model_il_path.name} (init)"
+        elif rl_init_checkpoint_path.exists():
+            source_label = f"{rl_init_checkpoint_path.name} (init)"
         else:
             source_label = "new (scratch)"
     else:
@@ -2521,11 +2525,11 @@ def main():
     best_model.load_state_dict(model.state_dict())
     anchor_model = None
     anchor_model_available = False
-    if bool(config['reinforcement_learning'].get('anchor_eval_enabled', False)) and best_model_il_path.exists():
+    if bool(config['reinforcement_learning'].get('anchor_eval_enabled', False)) and rl_init_checkpoint_path.exists():
         try:
             anchor_model = ChessNet(config).to(device)
             anchor_model = anchor_model.to(memory_format=torch.channels_last)
-            checkpoint = load_checkpoint_file(str(best_model_il_path), device)
+            checkpoint = load_checkpoint_file(str(rl_init_checkpoint_path), device)
             model_state = checkpoint.get('model_state_dict') if isinstance(checkpoint, dict) else None
             if not isinstance(model_state, dict):
                 raise KeyError("missing model_state_dict")
@@ -2536,7 +2540,7 @@ def main():
                 transfer_matching_weights(anchor_model, normalized_state)
             anchor_model.eval()
             anchor_model_available = True
-            print(f"Anchor eval enabled vs IL best: {best_model_il_path.name}")
+            print(f"Anchor eval enabled vs IL best: {rl_init_checkpoint_path.name}")
         except Exception as exc:
             anchor_model = None
             print(f"Anchor eval disabled: failed to load IL best ({exc})")
@@ -2741,6 +2745,21 @@ def main():
 
     base_mcts_temperature_threshold = int(rl_cfg.get('mcts_temperature_threshold', 16))
     base_mcts_dirichlet_weight = float(rl_cfg.get('mcts_dirichlet_weight', 0.25))
+    adaptive_dirichlet_enabled = bool(rl_cfg.get('adaptive_dirichlet_enabled', True))
+    adaptive_dirichlet_min_weight = float(
+        rl_cfg.get('adaptive_dirichlet_min_weight', max(0.0, base_mcts_dirichlet_weight * 0.30))
+    )
+    adaptive_dirichlet_draw_scale = float(
+        rl_cfg.get('adaptive_dirichlet_draw_scale', 0.75)
+    )
+    adaptive_dirichlet_value_guard_scale = float(
+        rl_cfg.get('adaptive_dirichlet_value_guard_scale', 0.85)
+    )
+    adaptive_dirichlet_eval_scale = float(
+        rl_cfg.get('adaptive_dirichlet_eval_scale', 0.85)
+    )
+    adaptive_draw_target = float(rl_cfg.get('adaptive_temperature_draw_target', 0.30))
+    adaptive_draw_band = max(0.01, float(rl_cfg.get('adaptive_temperature_draw_band', 0.05)))
     score_rate_threshold = float(rl_cfg.get('score_rate_threshold', rl_cfg.get('win_rate_threshold', 0.55)))
     true_win_rate_threshold = float(rl_cfg.get('true_win_rate_threshold', 0.0))
     staged_eval_enabled = bool(rl_cfg.get('eval_staged_enabled', False))
@@ -2795,6 +2814,25 @@ def main():
                 value_guard_streak=value_guard_poor_eval_streak,
             )
             current_dirichlet_weight = base_mcts_dirichlet_weight
+            if adaptive_dirichlet_enabled:
+                if prev_completed_draw_rate is not None:
+                    draw_excess = max(0.0, float(prev_completed_draw_rate) - adaptive_draw_target)
+                    if draw_excess > 0.0:
+                        excess_ratio = min(1.0, draw_excess / adaptive_draw_band)
+                        target_scale = 1.0 - (1.0 - adaptive_dirichlet_draw_scale) * excess_ratio
+                        current_dirichlet_weight *= max(0.0, target_scale)
+                if value_guard_poor_eval_streak > 0:
+                    current_dirichlet_weight *= adaptive_dirichlet_value_guard_scale ** int(value_guard_poor_eval_streak)
+                if (
+                    last_eval_score_rate_for_guard is not None
+                    and prev_eval_score_rate_for_temp is not None
+                    and float(last_eval_score_rate_for_guard) <= float(prev_eval_score_rate_for_temp) + 0.005
+                ):
+                    current_dirichlet_weight *= adaptive_dirichlet_eval_scale
+                current_dirichlet_weight = max(
+                    adaptive_dirichlet_min_weight,
+                    min(base_mcts_dirichlet_weight, float(current_dirichlet_weight)),
+                )
             print(f"🌡️ Temperature: {current_temp:.2f}")
             if temp_debug.get("enabled", False):
                 print(
@@ -2803,6 +2841,11 @@ def main():
                     f"adjust={float(temp_debug.get('adjustment', 0.0)):+.3f}, "
                     f"threshold={int(current_temp_threshold)}, "
                     f"reason={temp_debug.get('reason', 'stable')}"
+                )
+            if adaptive_dirichlet_enabled and base_mcts_dirichlet_weight > 0.0:
+                print(
+                    "   Adaptive dirichlet: "
+                    f"base={base_mcts_dirichlet_weight:.3f}, current={current_dirichlet_weight:.3f}"
                 )
             config['reinforcement_learning']['mcts_temperature'] = current_temp
             config['reinforcement_learning']['mcts_dirichlet_weight'] = current_dirichlet_weight

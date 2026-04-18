@@ -1380,6 +1380,25 @@ class BatchSelfPlayMCTSBatch:
         self._games_completed = 0
         self._progress_base = 0
         self._plan_cursor = 0
+        rl_cfg = self.config.get('reinforcement_learning', {})
+        self.value_target_temporal_decay = float(
+            rl_cfg.get('value_target_temporal_decay', 0.992)
+        )
+        self.value_target_min_scale = float(
+            rl_cfg.get('value_target_min_scale', 0.25)
+        )
+        self.value_target_root_blend_enabled = bool(
+            rl_cfg.get('value_target_root_blend_enabled', True)
+        )
+        self.value_target_root_blend_start = float(
+            rl_cfg.get('value_target_root_blend_start', 0.75)
+        )
+        self.value_target_root_blend_end = float(
+            rl_cfg.get('value_target_root_blend_end', 0.15)
+        )
+        self.value_target_root_blend_power = float(
+            rl_cfg.get('value_target_root_blend_power', 1.5)
+        )
 
     def _compute_draw_value_target(self, move_count):
         del move_count
@@ -1690,13 +1709,34 @@ class BatchSelfPlayMCTSBatch:
     def _build_candidate_positions(self, gs, outcome, draw_value_target=0.0):
         candidate_positions = []
         is_draw = (outcome == 0.0)
+        total_history = len(gs['game_history'])
         for history_idx, history_entry in enumerate(gs['game_history']):
             history_count, policy_indices, policy_values, turn = history_entry[:4]
             importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
+            root_value = float(history_entry[5]) if len(history_entry) > 5 else 0.0
             if is_draw:
                 value = draw_value_target
             else:
-                value = outcome if turn == chess.WHITE else -outcome
+                remaining_plies = max(0, (total_history - 1) - history_idx)
+                temporal_scale = max(
+                    self.value_target_min_scale,
+                    self.value_target_temporal_decay ** remaining_plies,
+                )
+                signed_outcome = outcome if turn == chess.WHITE else -outcome
+                value = float(signed_outcome * temporal_scale)
+            if self.value_target_root_blend_enabled and total_history > 0:
+                progress = float(history_idx) / float(max(1, total_history - 1))
+                blend_progress = progress ** max(0.1, self.value_target_root_blend_power)
+                search_weight = (
+                    self.value_target_root_blend_start
+                    + (self.value_target_root_blend_end - self.value_target_root_blend_start) * blend_progress
+                )
+                search_weight = float(min(1.0, max(0.0, search_weight)))
+                blended_root_value = float(max(-1.0, min(1.0, root_value)))
+                value = float(
+                    search_weight * blended_root_value
+                    + (1.0 - search_weight) * value
+                )
             candidate_positions.append({
                 'history_idx': history_idx,
                 'history_count': history_count,
@@ -2184,12 +2224,18 @@ class BatchSelfPlayMCTSBatch:
                     policy_indices, policy_values = _build_sparse_policy_target_from_visits(visit_counts, board)
                     history_count = len(gs['board_history'])
                     importance_score = self._compute_position_importance(board, move, visit_counts, root)
+                    root_value = 0.0
+                    if root is not None:
+                        root_visits = int(getattr(root, 'visit_count', 0) or 0)
+                        if root_visits > 0:
+                            root_value = float(root.value_sum / max(1, root_visits))
                     gs['game_history'].append((
                         history_count,
                         policy_indices,
                         policy_values,
                         board.turn,
                         importance_score,
+                        root_value,
                     ))
 
                 # Update history BEFORE making the move

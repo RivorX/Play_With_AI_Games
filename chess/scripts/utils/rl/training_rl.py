@@ -483,7 +483,6 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
                 )
                 if was_unresolved:
                     unresolved += 1
-                    draws += 1
                     eval_bar.update(1)
                     continue
                 game_wins, game_draws, game_losses = _result_for_model1(model1_as_white, result)
@@ -497,7 +496,7 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
         if unresolved > 0:
             print(
                 f"Eval unresolved at ply cap ({max_moves}, ~{max_moves / 2.0:.1f} full moves): "
-                f"{unresolved}/{num_games} -> counted as draws"
+                f"{unresolved}/{num_games} -> excluded from draw count"
             )
 
         return {
@@ -510,6 +509,7 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
             "win_rate": wins / num_games,
             "draw_rate": draws / num_games,
             "loss_rate": losses / num_games,
+            "resolved_games": num_games - unresolved,
         }
 
     model1_state = {k: v.detach().cpu() for k, v in model1.state_dict().items()}
@@ -575,7 +575,7 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
         max_moves = _resolve_eval_max_moves(config)
         print(
             f"Eval unresolved at ply cap ({max_moves}, ~{max_moves / 2.0:.1f} full moves): "
-            f"{unresolved}/{num_games} -> counted as draws"
+            f"{unresolved}/{num_games} -> excluded from draw count"
         )
 
     return {
@@ -588,4 +588,5 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
         "win_rate": wins / num_games,
         "draw_rate": draws / num_games,
         "loss_rate": losses / num_games,
+        "resolved_games": num_games - unresolved,
     }

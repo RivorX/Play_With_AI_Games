@@ -195,9 +195,9 @@ reinforcement_learning:
   # ---------------------------
   # Core RL Loop
   # ---------------------------
-  version: "rl1"             # RL run/version tag added to RL log filenames
-  iterations: 30                # Total RL iterations
-  games_per_iteration: 300      # Enough signal per iteration without stretching self-play too long
+  version: "rl3"             # RL run/version tag added to RL log filenames
+  iterations: 40                # Total RL iterations
+  games_per_iteration: 400      # Enough signal per iteration without stretching self-play too long
 
   # ---------------------------
   # Self-Play Runtime
@@ -222,7 +222,7 @@ reinforcement_learning:
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
   self_play_claim_repetition_after_moves: 40  # Claim sterile repetition earlier to reduce low-signal looping positions
   self_play_claim_draw_after_moves: 85  # End generic claimable draws sooner before they flood replay with redundant samples
-  self_play_adjudication_enabled: true   # Convert obviously won late positions into decisive outcomes instead of truncating them
+  self_play_adjudication_enabled: false  # Disabled by default: self-generated terminal labels were destabilizing value training
   self_play_adjudication_min_moves: 70   # Start a bit earlier so clearly won games convert before drifting into long drawish tails
   self_play_adjudication_threshold: 0.82 # Slightly more eager conversion of stable winning positions into decisive outcomes
   self_play_adjudication_patience: 3     # Need a stable edge, but finish games faster once it is obvious
@@ -233,7 +233,7 @@ reinforcement_learning:
   syzygy_auto_download_enabled: true     # If local Syzygy WDL files are missing, bootstrap them automatically on RL startup
   syzygy_auto_download_preset: "wdl_345" # Safe default: 3-4-5 WDL only. Use "wdl_345_6" for 6-man WDL too (much larger download)
   syzygy_auto_download_provider: "lichess" # Recommended mirror for auto-download (stable TLS + 3-4-5/6 WDL dirs)
-  self_play_resignation_enabled: true    # Let hopeless positions resign before they bloat truncation-heavy games
+  self_play_resignation_enabled: false   # Disabled by default: resignation targets fed back the model's own value errors
   self_play_resignation_min_moves: 70    # Do not allow very early resigns out of the opening
   self_play_resignation_threshold: 0.93  # Require a clearly losing root value before resigning
   self_play_resignation_patience: 3      # Need a short stable losing streak before resignation triggers
@@ -248,9 +248,9 @@ reinforcement_learning:
   self_play_opening_diversity_min_plies: 2    # Let sharp curated lines branch early
   self_play_opening_diversity_max_plies: 8    # Allow enough depth to land in asymmetrical structures
   self_play_opponent_pool_enabled: true       # Mix current-vs-current with frozen opponents instead of only mirror self-play
-  self_play_opponent_current_fraction: 0.45   # Reduce mirror self-play; too much current-vs-current was feeding draw-heavy targets
-  self_play_opponent_best_fraction: 0.03      # Keep some anchor pressure, but back off when best is far too hard
-  self_play_opponent_recent_fraction: 0.52    # Prefer recent snapshots that are closer in strength and give more learnable targets
+  self_play_opponent_current_fraction: 0.35   # Reduce mirror self-play further so training signal is less self-referential
+  self_play_opponent_best_fraction: 0.10      # Increase anchor pressure: more direct practice against IL-best weaknesses
+  self_play_opponent_recent_fraction: 0.55    # Keep most games vs recent snapshots while preserving stronger anchor exposure
   self_play_recent_snapshots_to_keep: 10       # Keep a wider recent window, then let the smart selector choose the actually useful opponents
   self_play_recent_candidate_pool_size: 4     # From the wider recent window, expose only the best-matched few snapshots to self-play
   self_play_recent_fallback_min_count: 2      # If too few recent snapshots fall into the preferred score band, still keep at least a small fallback pool
@@ -268,7 +268,7 @@ reinforcement_learning:
   self_play_opponent_current_max_fraction: 0.55 # Also cap mirror self-play so adaptive weighting cannot drift back into draw spam
   self_play_opponent_min_score: 0.28            # Avoid opponent buckets that are so hard they mostly generate hopeless targets
   self_play_opponent_max_score: 0.72            # Avoid buckets that are so easy they stop challenging the policy
-  self_play_opponent_best_min_score: 0.18       # If best becomes overwhelmingly strong, downweight it entirely for self-play
+  self_play_opponent_best_min_score: 0.10       # Keep best-opponent channel alive longer; avoid dropping anchor pressure too early
   self_play_opponent_recent_min_score: 0.32     # Recent snapshots should usually be in the learnable band
   self_play_opponent_recent_max_score: 0.68     # Also skip recent snapshots that have become too easy
   self_play_opponent_target_draw_rate: 0.45     # Prefer opponents that still produce some decisive games instead of nearly-all-draw matchups
@@ -309,7 +309,7 @@ reinforcement_learning:
   # ---------------------------
   # MCTS Search
   # ---------------------------
-  mcts_simulations: 96      # Stronger search targets so RL learns from decisions that can actually outperform the raw IL prior
+  mcts_simulations: 160     # Higher search pressure so RL learns from targets that more clearly improve over the IL prior
   mcts_batch_size: 128        # Match the heavier search budget without overfragmenting GPU inference
   mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
   mcts_c_puct: 1.15          # Move back toward healthier exploration; too-low PUCT was over-trusting the current policy
@@ -334,9 +334,9 @@ reinforcement_learning:
   mcts_playout_cap_randomization_min_multiplier: 0.8  # Per move/turn use at least 80% of base mcts_simulations
   mcts_playout_cap_randomization_max_multiplier: 1.0  # Per move/turn use at most 100% of base mcts_simulations
   policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
-  policy_target_pruning_keep_top_n: 3           # Always keep the top moves
-  policy_target_pruning_max_moves: 12           # Hard cap on support size of the sparse policy target
-  policy_target_pruning_min_prob: 0.02          # Remove tiny probability tails
+  policy_target_pruning_keep_top_n: 5           # Keep a wider support so RL can learn from more than only the top few searched moves
+  policy_target_pruning_max_moves: 20           # Allow more visit-support to preserve search-discovered alternatives
+  policy_target_pruning_min_prob: 0.005         # Trim only the weakest tail so promising low-probability moves still reach the learner
   policy_target_pruning_min_fraction_of_max: 0.08 # Keep moves only if they are not far below the best visit count
   policy_target_pruning_keep_mass: 0.92         # Keep most of the signal, trim the noisiest tail
   
@@ -347,11 +347,11 @@ reinforcement_learning:
   learning_rate: 0.0002      # Fallback base LR when RL auto-tune cache is unavailable
   weight_decay: 0.05         # L2 regularization (AdamW)
   grad_clip: 0.5             # Gradient clipping
-  train_epochs_per_iteration: 4  # More optimizer steps per replay fill now that RL no longer inherits oversized IL batches
+  train_epochs_per_iteration: 3  # Fewer passes per iteration to reduce overfitting to stale replay slices
 
   # Replay buffer sizing:
   # Capacity now bootstraps small and then auto-resizes from observed positions/iteration.
-  replay_buffer_multiplier: 8     # Larger replay horizon so fresh draw-heavy batches do not overwrite signal too quickly
+  replay_buffer_multiplier: 5     # Shorter horizon: fresher replay distribution, lower non-stationarity pressure on value head
   replay_buffer_bootstrap_positions_per_iteration: auto  # auto = start from a small conservative bootstrap instead of a large fixed guess
   replay_buffer_ema_alpha: 0.15   # React more slowly so replay size does not shrink too aggressively between iterations
   replay_buffer_min_size: 4096    # Never shrink below a small practical floor
@@ -361,7 +361,7 @@ reinforcement_learning:
   replay_decisive_value_epsilon: 0.05       # Treat |value| > epsilon as decisive for replay sampling
   replay_hard_negative_sampling_fraction: 0.10  # Keep some tactical focus, but stop over-concentrating batches on noisy tails
   replay_hard_negative_min_importance: 1.35    # Threshold for positions to count as "hard" in replay sampling
-  replay_recent_sampling_fraction: 0.25       # Always reserve part of each batch for fresh self-play so the learner tracks the current policy regime
+  replay_recent_sampling_fraction: 0.35       # Heavier recent slice so updates follow current opponent/policy regime faster
   replay_recent_window_fraction: 0.30         # Define "recent" as the newest ~30% of the replay buffer
   replay_quality_sampling_fraction: 0.18      # Separate from hard negatives: sample positions that look globally high-quality, not only hard/noisy
   replay_quality_min_importance: 1.15         # Lower than hard negatives so quality replay includes more than just the tactical tail
@@ -396,9 +396,9 @@ reinforcement_learning:
   eval_auto_claim_draw: true
   eval_claim_repetition_after_moves: 70
   eval_claim_draw_after_moves: 180  # Generic claimable draws after ~70 full moves
-  eval_every: 4              # Slightly faster feedback loop while iterating toward surpassing IL
+  eval_every: 3              # Slightly faster feedback loop while iterating toward surpassing IL
   eval_staged_enabled: true   # true = two-stage eval vs best: short MCTS screen first, then extra MCTS games only if stage 1 looks promising
-  eval_stage1_games: 40       # Stage 1 uses the normal eval MCTS path too; this is the cheap first sample
+  eval_stage1_games: 60       # Stage 1 uses the normal eval MCTS path too; this is the cheap first sample
   eval_stage2_games: 120      # Stage 2 adds this many more MCTS games and combines them with stage 1 for the final eval result
   eval_stage2_gate_score_rate: 0.52  # Run stage 2 only if stage 1 score_rate reaches at least this threshold
   eval_stage2_gate_true_win_rate: 0.02  # Also require a small decisive edge in stage 1 to avoid paying for stage 2 on drawish noise
@@ -425,15 +425,26 @@ reinforcement_learning:
   # Value loss weight schedule - drastycznie obniżamy na starcie!
   value_loss_weight_schedule:
     start: 0.50
-    end: 0.60
+    end: 0.54
   value_guard_enabled: true
   value_guard_mae_window: 3
-  value_guard_patience: 2
-  value_guard_mae_increase_tolerance: 0.01
+  value_guard_patience: 1
+  value_guard_mae_increase_tolerance: 0.006
   value_guard_min_score_gain: 0.005
-  value_guard_scale: 0.85
+  value_guard_scale: 0.75
   value_guard_min_weight: 0.40
   value_target_noise_std: 0.0
+  value_target_temporal_decay: 0.992   # Decay decisive targets for earlier plies so value learns less from noisy distant outcomes
+  value_target_min_scale: 0.25         # Keep some supervised signal even for early-game positions
+  value_target_root_blend_enabled: true  # Blend final outcome with root MCTS value so early targets are less noisy
+  value_target_root_blend_start: 0.75    # Early positions lean more on root search evaluation than distant game outcome
+  value_target_root_blend_end: 0.15      # Late positions still mostly learn from the actual final outcome
+  value_target_root_blend_power: 1.5     # Decay the root-value blend smoothly as the game approaches the end
+  adaptive_dirichlet_enabled: true       # Reduce root noise when self-play turns too draw-heavy or eval stagnates
+  adaptive_dirichlet_min_weight: 0.015   # Keep a small amount of root noise for exploration even under heavy draw pressure
+  adaptive_dirichlet_draw_scale: 0.65    # Cut root noise harder when completed draw rate drifts above target
+  adaptive_dirichlet_value_guard_scale: 0.85 # Reduce root noise further while value guard is active
+  adaptive_dirichlet_eval_scale: 0.85    # Also tighten root noise when eval stops improving
 
 
 
