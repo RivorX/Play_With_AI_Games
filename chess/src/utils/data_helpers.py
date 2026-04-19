@@ -49,6 +49,21 @@ _SQUARE_ROWS = tuple(square // 8 for square in range(64))
 _SQUARE_COLS = tuple(square % 8 for square in range(64))
 _SQUARE_ROWS_FLIPPED = tuple(7 - row for row in _SQUARE_ROWS)
 _SQUARE_COLS_FLIPPED = tuple(7 - col for col in _SQUARE_COLS)
+_PIECE_MASKS_WITH_INDEX = (
+    (chess.PAWN, 0),
+    (chess.KNIGHT, 1),
+    (chess.BISHOP, 2),
+    (chess.ROOK, 3),
+    (chess.QUEEN, 4),
+    (chess.KING, 5),
+)
+
+
+def _iter_bitboard_squares(bitboard):
+    while bitboard:
+        lsb = bitboard & -bitboard
+        yield lsb.bit_length() - 1
+        bitboard ^= lsb
 
 def board_to_tensor(board, flip_perspective=None):
     """
@@ -88,14 +103,24 @@ def board_to_tensor(board, flip_perspective=None):
     cols = _SQUARE_COLS_FLIPPED if should_flip else _SQUARE_COLS
     
     # === PIECE PLANES (0-11) ===
-    # Use piece_map() for much faster iteration than 64 piece_at() calls
-    for square, piece in board.piece_map().items():
-        row = rows[square]
-        col = cols[square]
-        piece_idx = piece.piece_type - 1
+    own_occupied = board.occupied_co[pov_color]
+    opp_occupied = board.occupied_co[not pov_color]
+    for piece_type, piece_idx in _PIECE_MASKS_WITH_INDEX:
+        piece_mask = getattr(board, chess.piece_name(piece_type) + "s")
 
-        channel = piece_idx if piece.color == pov_color else piece_idx + 6
-        tensor[channel, row, col] = 1.0
+        own_bb = piece_mask & own_occupied
+        while own_bb:
+            lsb = own_bb & -own_bb
+            square = lsb.bit_length() - 1
+            tensor[piece_idx, rows[square], cols[square]] = 1.0
+            own_bb ^= lsb
+
+        opp_bb = piece_mask & opp_occupied
+        while opp_bb:
+            lsb = opp_bb & -opp_bb
+            square = lsb.bit_length() - 1
+            tensor[piece_idx + 6, rows[square], cols[square]] = 1.0
+            opp_bb ^= lsb
     
     # === METADATA PLANES (12-15) ===
     
@@ -141,12 +166,12 @@ def board_to_tensor(board, flip_perspective=None):
     # Channel 14: Halfmove clock (normalized to 0-1, scaled by 50-move rule)
     # Uniform plane with value = halfmove_clock / 50
     halfmove_normalized = min(board.halfmove_clock / 50.0, 1.0)
-    tensor[14, :, :] = halfmove_normalized
+    tensor[14].fill(halfmove_normalized)
 
     # Channel 15: Fullmove number (normalized to 0-1)
     # Fullmove starts at 1 and increments after Black's move
     fullmove_normalized = min(board.fullmove_number / 100.0, 1.0)
-    tensor[15, :, :] = fullmove_normalized
+    tensor[15].fill(fullmove_normalized)
     
     return tensor
 

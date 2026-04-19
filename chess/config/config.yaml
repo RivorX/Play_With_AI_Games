@@ -533,7 +533,7 @@ elo_estimation:
 # 🆕 DEBUG & PROFILING
 # ------------------------------------------------------------------------------
 debug:
-  enabled: false                    # Master switch for debug mode
+  enabled: true                    # Master switch for debug mode
   profile_training: true            # Time breakdown per epoch
   log_gpu_memory: true              # GPU memory usage
   print_batch0_diagnostics: false   # Print batch-0 target stats + WDL samples

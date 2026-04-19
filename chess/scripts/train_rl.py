@@ -117,6 +117,54 @@ def _print_console_block(unicode_lines, ascii_lines=None):
         print(line)
 
 
+def _cuda_memory_stats(device):
+    if device is None or device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    return {
+        "current_allocated_mb": float(torch.cuda.memory_allocated(device) / (1024 ** 2)),
+        "current_reserved_mb": float(torch.cuda.memory_reserved(device) / (1024 ** 2)),
+        "peak_allocated_mb": float(torch.cuda.max_memory_allocated(device) / (1024 ** 2)),
+        "peak_reserved_mb": float(torch.cuda.max_memory_reserved(device) / (1024 ** 2)),
+    }
+
+
+def _print_rl_iteration_profile(
+    iteration_num,
+    total_iterations,
+    stage_times=None,
+    total_time_s=None,
+    gpu_stats=None,
+    include_stage_times=True,
+):
+    print("Iteration profile:")
+    if include_stage_times and stage_times is not None and total_time_s is not None:
+        ordered_keys = [
+            "setup",
+            "selfplay",
+            "replay",
+            "train",
+            "eval_log",
+            "checkpoint",
+            "gc",
+        ]
+        for key in ordered_keys:
+            value = float(stage_times.get(key, 0.0) or 0.0)
+            if value <= 0.0 and key not in stage_times:
+                continue
+            pct = (100.0 * value / total_time_s) if total_time_s > 0.0 else 0.0
+            print(f"   {key:<12} {value:7.2f}s  ({pct:5.1f}%)")
+        print(f"   {'total':<12} {float(total_time_s):7.2f}s")
+    if gpu_stats:
+        print(
+            "   GPU memory   "
+            f"alloc={float(gpu_stats.get('current_allocated_mb', 0.0)):.0f} MB, "
+            f"reserved={float(gpu_stats.get('current_reserved_mb', 0.0)):.0f} MB, "
+            f"peak_alloc={float(gpu_stats.get('peak_allocated_mb', 0.0)):.0f} MB, "
+            f"peak_reserved={float(gpu_stats.get('peak_reserved_mb', 0.0)):.0f} MB"
+        )
+    print(f"   Iteration     {int(iteration_num)}/{int(total_iterations)}")
+
+
 @contextlib.contextmanager
 def _temporary_sigint_cancel_handler(cancel_event, message=None, hard_exit=False, exit_code=130):
     """Temporarily turn Ctrl+C into a direct cancel signal for blocking shutdown work."""
@@ -1611,10 +1659,22 @@ def play_games_parallel_mcts(
     queue_total_value_sq_sum = 0.0
     queue_total_value_count = 0
     queue_total_resigned_games = 0
+    queue_wait_total_s = 0.0
+    queue_wait_events = 0
+    queue_profile_stats = {}
     queue_opponent_source_games = defaultdict(int)
     queue_opponent_source_results = defaultdict(lambda: {"wins": 0, "draws": 0, "losses": 0, "games": 0})
     
     interrupted = False
+    startup_done_time = None
+
+    def _accumulate_profile_stats(target, source):
+        for key, value in dict(source or {}).items():
+            if isinstance(value, (int, np.integer)):
+                target[str(key)] = int(target.get(str(key), 0)) + int(value)
+            else:
+                target[str(key)] = float(target.get(str(key), 0.0)) + float(value)
+
     try:
         if use_persistent_pool:
             global _SELFPLAY_POOL
@@ -1743,6 +1803,7 @@ def play_games_parallel_mcts(
             }
 
         # Wait for workers with a live games-completed progress bar.
+        startup_done_time = time.time()
         games_bar = tqdm(
             total=num_games,
             desc="🎮 Self-play gry",
@@ -1777,8 +1838,11 @@ def play_games_parallel_mcts(
                     games_bar_last = total_done
 
                 if use_persistent_pool:
+                    queue_wait_t0 = time.perf_counter()
                     try:
                         message = _SELFPLAY_POOL.result_queue.get(timeout=0.2)
+                        queue_wait_total_s += float(time.perf_counter() - queue_wait_t0)
+                        queue_wait_events += 1
                         if message.get('task_id') == task_id:
                             if message.get('type') == 'payload':
                                 packed = message.get('positions')
@@ -1832,6 +1896,7 @@ def play_games_parallel_mcts(
                                 queue_total_curriculum_dropped_positions += int(chunk_stats.get('curriculum_dropped_positions', 0))
                                 queue_total_cap_dropped_positions += int(chunk_stats.get('cap_dropped_positions', 0))
                                 queue_total_resigned_games += int(chunk_stats.get('resigned_games', 0))
+                                _accumulate_profile_stats(queue_profile_stats, chunk_stats.get('profile', {}) or {})
                                 source_counts = dict(chunk_stats.get('opponent_source_counts', {}) or {})
                                 if source_counts:
                                     for label, count in source_counts.items():
@@ -1886,6 +1951,8 @@ def play_games_parallel_mcts(
                                 continue
                             pending.discard(rank)
                     except queue.Empty:
+                        queue_wait_total_s += float(time.perf_counter() - queue_wait_t0)
+                        queue_wait_events += 1
                         pass
 
                     for rank in list(pending):
@@ -1944,6 +2011,7 @@ def play_games_parallel_mcts(
                 pass
     
     selfplay_time = time.time() - start_time
+    selfplay_startup_time = max(0.0, float((startup_done_time or start_time) - start_time))
     
     # Collect results
     collection_start = time.time()
@@ -1971,6 +2039,16 @@ def play_games_parallel_mcts(
     total_value_sq_sum = queue_total_value_sq_sum if use_queue_transport else 0.0
     total_value_count = queue_total_value_count if use_queue_transport else 0
     total_resigned_games = queue_total_resigned_games if use_queue_transport else 0
+    total_profile_stats = dict(queue_profile_stats) if use_queue_transport else {}
+    if use_queue_transport:
+        avg_queue_wait_ms = 1000.0 * float(queue_wait_total_s) / float(max(1, queue_wait_events))
+        total_profile_stats['queue_wait_time_ms'] = float(avg_queue_wait_ms)
+        total_profile_stats['queue_wait_total_s'] = float(queue_wait_total_s)
+        total_profile_stats['queue_wait_events'] = int(queue_wait_events)
+    else:
+        total_profile_stats['queue_wait_time_ms'] = 0.0
+        total_profile_stats['queue_wait_total_s'] = 0.0
+        total_profile_stats['queue_wait_events'] = 0
     opponent_source_games = dict(queue_opponent_source_games) if use_queue_transport else {}
     opponent_source_results = (
         {label: dict(stats) for label, stats in queue_opponent_source_results.items()}
@@ -2029,6 +2107,7 @@ def play_games_parallel_mcts(
                             total_curriculum_dropped_positions += int((stats or {}).get('curriculum_dropped_positions', 0))
                             total_cap_dropped_positions += int((stats or {}).get('cap_dropped_positions', 0))
                             total_resigned_games += int((stats or {}).get('resigned_games', 0))
+                            _accumulate_profile_stats(total_profile_stats, (stats or {}).get('profile', {}) or {})
                             source_counts = dict((stats or {}).get('opponent_source_counts', {}) or {})
                             if source_counts:
                                 for label, count in source_counts.items():
@@ -2187,6 +2266,7 @@ def play_games_parallel_mcts(
     value_var = (total_value_sq_sum / total_value_count) - (avg_game_value ** 2) if total_value_count > 0 else 0.0
     value_std = math.sqrt(max(0.0, value_var))
     selfplay_stats = {
+        'startup_time': float(selfplay_startup_time),
         'completed_games': int(completed_games),
         'completed_white_wins': int(total_completed_white_wins),
         'completed_black_wins': int(total_completed_black_wins),
@@ -2223,6 +2303,7 @@ def play_games_parallel_mcts(
             for label, stats in sorted(opponent_source_results.items(), key=lambda item: item[0])
         },
         'opponent_debug': dict(opponent_debug or {}),
+        'profile': dict(total_profile_stats),
     }
     
     return (
@@ -2246,6 +2327,10 @@ def main():
     print(f"Loading config from: {config_path}")
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+
+    debug_cfg = config.get('debug', {}) or {}
+    profile_training_enabled = bool(debug_cfg.get('profile_training', False))
+    log_gpu_memory_enabled = bool(debug_cfg.get('log_gpu_memory', False))
 
     try:
         syzygy_bootstrap = ensure_syzygy_tables(config, chess_dir=script_dir.parent, logger=print)
@@ -2359,6 +2444,12 @@ def main():
     
     device = torch.device(config['hardware']['device'])
     print(f"Using device: {device}")
+    if profile_training_enabled or log_gpu_memory_enabled:
+        print(
+            "RL debug timing: "
+            f"profile_training={profile_training_enabled}, "
+            f"log_gpu_memory={log_gpu_memory_enabled}"
+        )
     
     if torch.cuda.is_available():
         print(f"GPUs available: {torch.cuda.device_count()}")
@@ -2792,6 +2883,44 @@ def main():
             print(f"\n{'='*70}")
             print(f"Iteration {iteration + 1}/{total_iterations}")
             print('='*70)
+            iteration_profile_printed = False
+            iteration_stage_times = {}
+            iteration_start_time = time.perf_counter()
+            iteration_stage_start = iteration_start_time
+
+            if device.type == 'cuda' and torch.cuda.is_available() and (profile_training_enabled or log_gpu_memory_enabled):
+                torch.cuda.reset_peak_memory_stats(device)
+
+            def _profile_sync():
+                if profile_training_enabled and device.type == 'cuda' and torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
+
+            def _finish_stage(stage_name):
+                nonlocal iteration_stage_start
+                if not profile_training_enabled:
+                    return
+                _profile_sync()
+                now = time.perf_counter()
+                stage_key = str(stage_name)
+                iteration_stage_times[stage_key] = float(iteration_stage_times.get(stage_key, 0.0)) + (now - iteration_stage_start)
+                iteration_stage_start = now
+
+            def _emit_iteration_profile():
+                nonlocal iteration_profile_printed
+                if iteration_profile_printed or not (profile_training_enabled or log_gpu_memory_enabled):
+                    return
+                _profile_sync()
+                total_time_s = time.perf_counter() - iteration_start_time if profile_training_enabled else None
+                gpu_stats = _cuda_memory_stats(device) if log_gpu_memory_enabled else None
+                _print_rl_iteration_profile(
+                    iteration + 1,
+                    total_iterations,
+                    iteration_stage_times if profile_training_enabled else None,
+                    total_time_s,
+                    gpu_stats=gpu_stats,
+                    include_stage_times=profile_training_enabled,
+                )
+                iteration_profile_printed = True
             
             # Update learning rate (cosine decay + warmup)
             current_lr = _compute_lr(iteration)
@@ -2869,6 +2998,8 @@ def main():
                         )
             print(f"⚖️ Value loss weight: {current_value_loss_weight:.3f}")
 
+            _finish_stage('setup')
+
             # Self-play with MCTS
             model.eval()
             best_model_state_for_selfplay = None
@@ -2885,7 +3016,19 @@ def main():
                     recent_snapshot_pool=list(recent_selfplay_snapshots),
                     adaptive_scheduler_state=adaptive_opponent_scheduler_state,
                 )
-            
+            _finish_stage('selfplay')
+            if profile_training_enabled:
+                startup_time_in_selfplay = max(
+                    0.0,
+                    float((selfplay_stats or {}).get('startup_time', 0.0) or 0.0),
+                )
+                if startup_time_in_selfplay > 0.0:
+                    current_selfplay_stage = max(0.0, float(iteration_stage_times.get('selfplay', 0.0) or 0.0))
+                    transfer_time = min(current_selfplay_stage, startup_time_in_selfplay)
+                    if transfer_time > 0.0:
+                        iteration_stage_times['selfplay'] = float(current_selfplay_stage - transfer_time)
+                        iteration_stage_times['setup'] = float(iteration_stage_times.get('setup', 0.0) or 0.0) + float(transfer_time)
+             
             # Add to replay buffer
             for position in positions:
                 replay_buffer.add(position)
@@ -2929,6 +3072,126 @@ def main():
                 f"auto_draw_rate={float((selfplay_stats or {}).get('auto_draw_rate', 0.0)):.2%}, "
                 f"truncated_rate={float((selfplay_stats or {}).get('truncated_rate', 0.0)):.2%}"
             )
+            selfplay_profile = dict((selfplay_stats or {}).get('profile', {}) or {})
+            if profile_training_enabled and selfplay_profile:
+                wall_selfplay_time = max(1e-8, float(selfplay_time))
+                summed_worker_reference_time = float(
+                    selfplay_profile.get("mcts_search_many_time", 0.0) or 0.0
+                )
+                if summed_worker_reference_time <= 0.0:
+                    fallback_profile_values = [
+                        float(selfplay_profile.get("mcts_batch_expand_eval_time", 0.0) or 0.0),
+                        float(selfplay_profile.get("mcts_board_to_tensor_time", 0.0) or 0.0),
+                        float(selfplay_profile.get("mcts_nn_inference_time", 0.0) or 0.0),
+                        float(selfplay_profile.get("policy_target_build_time", 0.0) or 0.0),
+                        float(selfplay_profile.get("policy_target_postgame_time", 0.0) or 0.0),
+                        float(selfplay_profile.get("move_selection_time", 0.0) or 0.0),
+                        float(selfplay_profile.get("adjudication_time", 0.0) or 0.0),
+                        float(selfplay_profile.get("syzygy_time", 0.0) or 0.0),
+                    ]
+                    summed_worker_reference_time = max(fallback_profile_values) if fallback_profile_values else wall_selfplay_time
+                summed_worker_reference_time = max(1e-8, float(summed_worker_reference_time))
+
+                search_many_time = max(0.0, float(selfplay_profile.get("mcts_search_many_time", 0.0) or 0.0))
+                batch_expand_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_eval_time", 0.0) or 0.0))
+                board_to_tensor_time = max(0.0, float(selfplay_profile.get("mcts_board_to_tensor_time", 0.0) or 0.0))
+                nn_inference_time = max(0.0, float(selfplay_profile.get("mcts_nn_inference_time", 0.0) or 0.0))
+                policy_target_build_time = max(0.0, float(selfplay_profile.get("policy_target_build_time", 0.0) or 0.0))
+                policy_target_postgame_time = max(0.0, float(selfplay_profile.get("policy_target_postgame_time", 0.0) or 0.0))
+                move_selection_time = max(0.0, float(selfplay_profile.get("move_selection_time", 0.0) or 0.0))
+                adjudication_time = max(0.0, float(selfplay_profile.get("adjudication_time", 0.0) or 0.0))
+                syzygy_time = max(0.0, float(selfplay_profile.get("syzygy_time", 0.0) or 0.0))
+
+                batch_expand_capped = min(batch_expand_time, search_many_time)
+                nn_inference_capped = min(nn_inference_time, batch_expand_capped)
+                board_to_tensor_capped = min(board_to_tensor_time, batch_expand_capped)
+                batch_other_time = max(0.0, batch_expand_capped - nn_inference_capped - board_to_tensor_capped)
+                search_other_time = max(0.0, search_many_time - batch_expand_capped)
+                gpu_utilization_pct_display = 0.0
+                if search_many_time > 0.0:
+                    gpu_utilization_pct_display = 100.0 * (nn_inference_capped / search_many_time)
+                gpu_utilization_pct_display = max(0.0, min(100.0, float(gpu_utilization_pct_display)))
+
+                def _pct_of_search(value):
+                    return 100.0 * float(value) / max(1e-8, search_many_time)
+
+                def _pct_of_batch_expand(value):
+                    return 100.0 * float(value) / max(1e-8, batch_expand_capped)
+
+                top_level_components = [
+                    ("search_many", search_many_time),
+                    ("policy_target_build", policy_target_build_time),
+                    ("policy_target_postgame", policy_target_postgame_time),
+                    ("move_selection", move_selection_time),
+                    ("adjudication", adjudication_time),
+                    ("syzygy", syzygy_time),
+                ]
+                total_selfplay_sum_time = sum(float(value) for _, value in top_level_components)
+
+                def _pct_of_selfplay_total(value):
+                    return 100.0 * float(value) / max(1e-8, total_selfplay_sum_time)
+
+                def _print_total_line(label, value):
+                    print(
+                        f"   - {label:<22} {float(value):7.2f}s "
+                        f"({_pct_of_selfplay_total(value):5.1f}% selfplay_total)"
+                    )
+
+                def _print_search_line(label, value):
+                    print(
+                        f"     - {label:<20} {float(value):7.2f}s "
+                        f"({_pct_of_search(value):5.1f}% search_many)"
+                    )
+
+                def _print_batch_expand_line(label, value):
+                    print(
+                        f"       - {label:<18} {float(value):7.2f}s "
+                        f"({_pct_of_batch_expand(value):5.1f}% _batch_expand_eval)"
+                    )
+
+                summed_vs_wall_ratio = summed_worker_reference_time / wall_selfplay_time
+                print("Self-play profiler (sumowany czas workerow):")
+                print(
+                    "   "
+                    f"wall_clock={wall_selfplay_time:.2f}s, "
+                    f"reference_sum={summed_worker_reference_time:.2f}s, "
+                    f"sum/wall={summed_vs_wall_ratio:.2f}x"
+                )
+                print("")
+                print(f"   Sekcja A: Self-play total ({total_selfplay_sum_time:.2f}s, 100.0%):")
+                _print_total_line("search_many", search_many_time)
+                _print_search_line("_batch_expand_eval", batch_expand_capped)
+                _print_batch_expand_line("nn_inference", nn_inference_capped)
+                _print_batch_expand_line("board_to_tensor", board_to_tensor_capped)
+                _print_batch_expand_line("batch_expand_other", batch_other_time)
+                _print_search_line("search_other", search_other_time)
+                _print_total_line("policy_target_build", policy_target_build_time)
+                _print_total_line("policy_target_postgame", policy_target_postgame_time)
+                _print_total_line("move_selection", move_selection_time)
+                _print_total_line("adjudication", adjudication_time)
+                _print_total_line("syzygy", syzygy_time)
+                print("")
+                print(f"   Sekcja B: GPU ({nn_inference_capped:.2f}s inference czasu):")
+                print(
+                    f"   {'gpu_utilization %':<24} "
+                    f"{gpu_utilization_pct_display:7.2f}% "
+                    f"(nn_inference/search_many)"
+                )
+                print(
+                    f"   {'average_batch_size':<24} "
+                    f"{float(selfplay_profile.get('average_batch_size', 0.0) or 0.0):7.2f} pos/batch"
+                )
+                queue_wait_total_s = max(0.0, float(selfplay_profile.get('queue_wait_total_s', 0.0) or 0.0))
+                print("")
+                print(f"   Sekcja C: Queue/IPC ({queue_wait_total_s:.2f}s lacznego czekania):")
+                print(
+                    f"   {'queue_wait_time_ms':<24} "
+                    f"{float(selfplay_profile.get('queue_wait_time_ms', 0.0) or 0.0):7.2f} ms/event"
+                )
+                print(
+                    f"   {'queue_wait_events':<24} "
+                    f"{int(selfplay_profile.get('queue_wait_events', 0) or 0)}"
+                )
             adaptive_opponent_scheduler_state, observed_scores = _update_adaptive_opponent_scheduler(
                 rl_cfg,
                 adaptive_opponent_scheduler_state,
@@ -2956,6 +3219,7 @@ def main():
                 print(f"Recent pool selected: {', '.join(selected_parts)}")
             prev_completed_draw_rate = float((selfplay_stats or {}).get('completed_draw_rate', 0.0))
             prev_decisive_rate = float((selfplay_stats or {}).get('decisive_rate', 0.0))
+            _finish_stage('replay')
 
             avg_policy_entropy = 0.0
             avg_value_pred_std = 0.0
@@ -3028,7 +3292,8 @@ def main():
             else:
                 avg_loss = avg_policy = avg_value = 0
                 train_metrics = {}
-            
+            _finish_stage('train')
+             
             # Evaluation
             score_rate = None
             true_win_rate = None
@@ -3249,6 +3514,8 @@ def main():
                         f"for {no_improvement_eval_streak} evaluation cycle(s)."
                     )
                     logger.plot()
+                    _finish_stage('eval_log')
+                    _emit_iteration_profile()
                     break
             else:
                 logger.log(
@@ -3284,6 +3551,7 @@ def main():
                     adaptive_temp_threshold=current_temp_threshold,
                 )
                 last_logged_iteration = iteration + 1
+            _finish_stage('eval_log')
 
             if recent_snapshot_keep > 0:
                 recent_selfplay_snapshots.append({
@@ -3322,7 +3590,10 @@ def main():
             latest_size_mb = latest_checkpoint_path.stat().st_size / (1024 ** 2)
             print(f"💾 Latest checkpoint updated: {latest_checkpoint_path.name} ({latest_size_mb:.1f} MB)")
             
+            _finish_stage('checkpoint')
             gc.collect()
+            _finish_stage('gc')
+            _emit_iteration_profile()
     except RLTrainingInterrupted as exc:
         training_interrupted = True
         interrupted_stage = str(exc) or "self-play"

@@ -13,6 +13,7 @@ import chess
 import numpy as np
 import math
 import pickle
+import time
 from pathlib import Path
 from src.data import board_to_tensor, move_to_index
 
@@ -212,7 +213,7 @@ class MCTSEdgeStats:
         child_count = len(legal_moves)
 
         self.moves = legal_moves
-        self.nodes = []
+        self.nodes = [None] * child_count
         self.priors = legal_priors.copy()
         self.base_priors = legal_priors.copy()
         self.visit_counts = np.zeros(child_count, dtype=np.int32)
@@ -225,18 +226,42 @@ class MCTSEdgeStats:
         self.ucb_buffer = np.empty(child_count, dtype=np.float32)
         self._move_to_child = None
 
-    def add_child(self, child):
-        self.nodes.append(child)
-
     def iter_nodes(self):
-        return zip(self.moves, self.nodes)
+        for idx, move in enumerate(self.moves):
+            child = self.nodes[idx]
+            if child is not None:
+                yield move, child
 
-    def get_child_for_move(self, move):
+    def _get_move_index(self, move):
         move_to_child = self._move_to_child
         if move_to_child is None:
-            move_to_child = {child_move: child for child_move, child in zip(self.moves, self.nodes)}
+            move_to_child = {child_move: idx for idx, child_move in enumerate(self.moves)}
             self._move_to_child = move_to_child
         return move_to_child.get(move)
+
+    def get_or_create_child(self, parent, idx):
+        idx = int(idx)
+        child = self.nodes[idx]
+        if child is not None:
+            return child
+
+        child = MCTSNode(
+            board=None,
+            parent=parent,
+            move=self.moves[idx],
+            prior=float(self.priors[idx]),
+            copy_board=False,
+        )
+        child.base_prior = float(self.base_priors[idx])
+        child.parent_edge_index = idx
+        self.nodes[idx] = child
+        return child
+
+    def get_child_for_move(self, parent, move):
+        idx = self._get_move_index(move)
+        if idx is None:
+            return None
+        return self.get_or_create_child(parent, idx)
 
     def visit_dict(self):
         return {
@@ -245,7 +270,7 @@ class MCTSEdgeStats:
         }
 
     def __len__(self):
-        return len(self.nodes)
+        return len(self.moves)
 
 
 class MCTSNode:
@@ -388,26 +413,13 @@ class MCTSNode:
 
     def expand_children(self, legal_moves, legal_priors):
         self.edges.reset(legal_moves, legal_priors)
-
-        for idx, (move, prior) in enumerate(zip(self.edges.moves, self.edges.priors)):
-            child = MCTSNode(
-                board=None,
-                parent=self,
-                move=move,
-                prior=float(prior),
-                copy_board=False,
-            )
-            child.base_prior = float(self.edges.base_priors[idx])
-            child.parent_edge_index = idx
-            self.edges.add_child(child)
-
         self.expanded = True
 
     def iter_child_nodes(self):
         return self.edges.iter_nodes()
 
     def get_child_for_move(self, move):
-        return self.edges.get_child_for_move(move)
+        return self.edges.get_child_for_move(self, move)
 
     def child_visit_dict(self):
         return self.edges.visit_dict()
@@ -679,7 +691,48 @@ class MultiGameBatchMCTS:
         self.use_amp = config.get('hardware', {}).get('use_amp', False) and self.device.type == 'cuda'
         self.amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
         self._empty_history_tensor = np.zeros((16, 8, 8), dtype=np.float32)
+        self._board_planes = int(self._empty_history_tensor.shape[0])
+        self._history_planes = int(self.history_positions) * self._board_planes
+        self._input_planes = self._board_planes + self._history_planes
         self._legal_index_scratch = {}
+        self._board_input_scratch = {}
+        self.profile_enabled = bool(config.get('debug', {}).get('profile_training', False))
+        self._profile_stats = {}
+
+        self._tactical_capture_enabled = (
+            self.tactical_capture_bonus > 0.0
+            or self.tactical_winning_capture_bonus > 0.0
+        )
+        self._tactical_promotion_enabled = self.tactical_promotion_bonus > 0.0
+        self._tactical_check_enabled = self.tactical_check_bonus > 0.0
+        self._tactical_recapture_enabled = self.tactical_recapture_bonus > 0.0
+        self.reset_profile_stats()
+
+    def reset_profile_stats(self):
+        self._profile_stats = {
+            'search_many_time': 0.0,
+            'search_many_calls': 0,
+            'batch_expand_eval_time': 0.0,
+            'batch_expand_eval_calls': 0,
+            'board_to_tensor_time': 0.0,
+            'board_to_tensor_calls': 0,
+            'nn_inference_time': 0.0,
+            'nn_inference_calls': 0,
+            'nn_inference_batch_items': 0,
+        }
+
+    def _profile_add(self, key, value):
+        if not self.profile_enabled:
+            return
+        self._profile_stats[key] = float(self._profile_stats.get(key, 0.0)) + float(value)
+
+    def _profile_inc(self, key, value=1):
+        if not self.profile_enabled:
+            return
+        self._profile_stats[key] = int(self._profile_stats.get(key, 0)) + int(value)
+
+    def get_profile_stats(self):
+        return dict(self._profile_stats)
 
     @staticmethod
     def _is_encoded_history_entry(entry):
@@ -704,10 +757,18 @@ class MultiGameBatchMCTS:
         if not isinstance(board_obj, chess.Board):
             raise TypeError(f"Unsupported history entry type: {type(board_or_fen)}")
 
-        return (
-            board_to_tensor(board_obj, flip_perspective=False),
-            board_to_tensor(board_obj, flip_perspective=True),
-        )
+        if not self.profile_enabled:
+            return (
+                board_to_tensor(board_obj, flip_perspective=False),
+                board_to_tensor(board_obj, flip_perspective=True),
+            )
+
+        t0 = time.perf_counter()
+        white_tensor = board_to_tensor(board_obj, flip_perspective=False)
+        black_tensor = board_to_tensor(board_obj, flip_perspective=True)
+        self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
+        self._profile_inc('board_to_tensor_calls', 2)
+        return (white_tensor, black_tensor)
 
     def _build_history_tensor(self, current_board, board_history, current_tensor=None):
         """
@@ -720,7 +781,13 @@ class MultiGameBatchMCTS:
         if self.history_positions == 0:
             if current_tensor is not None:
                 return current_tensor
-            return board_to_tensor(current_board)
+            if not self.profile_enabled:
+                return board_to_tensor(current_board)
+            t0 = time.perf_counter()
+            tensor = board_to_tensor(current_board)
+            self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
+            self._profile_inc('board_to_tensor_calls', 1)
+            return tensor
 
         history_tensors = []
         use_black_pov = current_board.turn == chess.BLACK
@@ -736,16 +803,27 @@ class MultiGameBatchMCTS:
             history_tensors = [self._empty_history_tensor] * pad_count + history_tensors
 
         if current_tensor is None:
-            current_tensor = board_to_tensor(current_board)
+            if not self.profile_enabled:
+                current_tensor = board_to_tensor(current_board)
+            else:
+                t0 = time.perf_counter()
+                current_tensor = board_to_tensor(current_board)
+                self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
+                self._profile_inc('board_to_tensor_calls', 1)
         history_tensors.append(current_tensor)
 
         return np.concatenate(history_tensors, axis=0)
 
-    @staticmethod
-    def _current_tensor_for_node(node):
+    def _current_tensor_for_node(self, node):
         cached = getattr(node, "_board_tensor", None)
         if cached is None:
-            cached = board_to_tensor(node.board)
+            if not self.profile_enabled:
+                cached = board_to_tensor(node.board)
+            else:
+                t0 = time.perf_counter()
+                cached = board_to_tensor(node.board)
+                self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
+                self._profile_inc('board_to_tensor_calls', 1)
             node._board_tensor = cached
         return cached
 
@@ -755,6 +833,14 @@ class MultiGameBatchMCTS:
         if scratch is None:
             scratch = np.empty((batch_size, max_legal_count), dtype=np.int64)
             self._legal_index_scratch[key] = scratch
+        return scratch
+
+    def _get_board_input_scratch(self, batch_size):
+        key = int(batch_size)
+        scratch = self._board_input_scratch.get(key)
+        if scratch is None:
+            scratch = np.empty((batch_size, self._input_planes, 8, 8), dtype=np.float32)
+            self._board_input_scratch[key] = scratch
         return scratch
 
     @staticmethod
@@ -773,28 +859,88 @@ class MultiGameBatchMCTS:
             return 0.0
         return float(_PIECE_VALUES.get(moving_piece.piece_type, 0.0))
 
+    @staticmethod
+    def _move_may_give_check_fast(board, move):
+        """Cheap geometric prefilter before the expensive python-chess gives_check()."""
+        moved_piece = board.piece_at(move.from_square)
+        if moved_piece is None:
+            return False
+
+        king_square = board.king(not board.turn)
+        if king_square is None:
+            return False
+
+        target_square = move.to_square
+        piece_type = move.promotion or moved_piece.piece_type
+
+        from_row = chess.square_rank(target_square)
+        from_col = chess.square_file(target_square)
+        king_row = chess.square_rank(king_square)
+        king_col = chess.square_file(king_square)
+        dr = king_row - from_row
+        dc = king_col - from_col
+        abs_dr = abs(dr)
+        abs_dc = abs(dc)
+
+        if piece_type == chess.KNIGHT:
+            return (abs_dr, abs_dc) in {(1, 2), (2, 1)}
+        if piece_type == chess.BISHOP:
+            return abs_dr == abs_dc
+        if piece_type == chess.ROOK:
+            return dr == 0 or dc == 0
+        if piece_type == chess.QUEEN:
+            return dr == 0 or dc == 0 or abs_dr == abs_dc
+        if piece_type == chess.KING:
+            return max(abs_dr, abs_dc) == 1
+        if piece_type == chess.PAWN:
+            if moved_piece.color == chess.WHITE:
+                return dr == 1 and abs_dc == 1
+            return dr == -1 and abs_dc == 1
+        return False
+
     def _tactical_prior_multipliers(self, board, legal_moves):
         if not self.tactical_priors_enabled or not legal_moves:
             return np.ones((len(legal_moves),), dtype=np.float32)
 
+        if not (
+            self._tactical_capture_enabled
+            or self._tactical_promotion_enabled
+            or self._tactical_check_enabled
+            or self._tactical_recapture_enabled
+        ):
+            return np.ones((len(legal_moves),), dtype=np.float32)
+
         multipliers = np.ones((len(legal_moves),), dtype=np.float32)
-        last_move = board.peek() if board.move_stack else None
+        last_move = board.peek() if (self._tactical_recapture_enabled and board.move_stack) else None
 
         for idx, move in enumerate(legal_moves):
             bonus = 0.0
-            if board.is_capture(move):
+            if self._tactical_capture_enabled and board.is_capture(move):
                 bonus += self.tactical_capture_bonus
                 gain = self._captured_piece_value(board, move) - self._moving_piece_value(board, move)
                 if gain > 0.0:
                     bonus += self.tactical_winning_capture_bonus * min(1.0, gain / 4.0)
-            if move.promotion is not None:
+            if self._tactical_promotion_enabled and move.promotion is not None:
                 bonus += self.tactical_promotion_bonus
-            try:
-                if board.gives_check(move):
-                    bonus += self.tactical_check_bonus
-            except Exception:
-                pass
-            if last_move is not None and move.to_square == last_move.to_square:
+
+            should_eval_check = (
+                self._tactical_check_enabled
+                and (
+                    bonus > 0.0
+                    or (
+                        not self._tactical_capture_enabled
+                        and not self._tactical_promotion_enabled
+                        and not self._tactical_recapture_enabled
+                    )
+                )
+            )
+            if should_eval_check:
+                try:
+                    if self._move_may_give_check_fast(board, move) and board.gives_check(move):
+                        bonus += self.tactical_check_bonus
+                except Exception:
+                    pass
+            if self._tactical_recapture_enabled and last_move is not None and move.to_square == last_move.to_square:
                 bonus += self.tactical_recapture_bonus
             multipliers[idx] = 1.0 + float(bonus)
 
@@ -802,11 +948,14 @@ class MultiGameBatchMCTS:
 
     def _select_child(self, node):
         """Select child with highest UCB score (optimized)"""
-        if not node.edges.nodes:
+        edges = node.edges
+        if not edges.moves:
             return None
 
         # Precalculate parent term to avoid doing it for every child
-        parent_visits = node.visit_count + node.virtual_loss
+        node_visit_count = node.visit_count
+        node_virtual_loss = node.virtual_loss
+        parent_visits = node_visit_count + node_virtual_loss
         parent_sqrt = math.sqrt(parent_visits + 1)
         if self.use_dynamic_c_puct:
             c_puct = math.log((parent_visits + self.c_puct_base + 1.0) / self.c_puct_base) + self.c_puct_init
@@ -820,44 +969,52 @@ class MultiGameBatchMCTS:
             if self.fpu_absolute is not None:
                 fpu_value = float(self.fpu_absolute)
             elif parent_visits > 0:
-                parent_q = (node.value_sum - node.virtual_loss) / parent_visits
-                explored_prior = min(1.0, max(0.0, float(node._explored_prior_sum)))
-                unexplored_prior = max(0.0, 1.0 - explored_prior)
+                parent_q = (node.value_sum - node_virtual_loss) / parent_visits
+                explored_prior = float(node._explored_prior_sum)
+                if explored_prior < 0.0:
+                    explored_prior = 0.0
+                elif explored_prior > 1.0:
+                    explored_prior = 1.0
+                unexplored_prior = 1.0 - explored_prior
+                if unexplored_prior < 0.0:
+                    unexplored_prior = 0.0
                 fpu_value = parent_q - self.fpu_reduction * math.sqrt(unexplored_prior)
 
-        edges = node.edges
         cv = edges.total_counts
         q_values = edges.selection_scores
         explored_mask = edges.explored_flags
         q_values.fill(fpu_value)
-        if np.any(explored_mask):
+        if explored_mask.any():
             q_values[explored_mask] = (
                 edges.value_sums[explored_mask] - edges.virtual_losses_f32[explored_mask]
             ) / cv[explored_mask]
 
         u_values = edges.ucb_buffer
         np.multiply(edges.priors, c_puct * parent_sqrt, out=u_values)
-        u_values /= (1.0 + cv)
-        q_values += u_values
-        best_idx = int(np.argmax(q_values))
-        return edges.nodes[best_idx]
+        np.divide(u_values, (1.0 + cv), out=u_values)
+        np.add(q_values, u_values, out=q_values)
+        best_idx = int(q_values.argmax())
+        return edges.get_or_create_child(node, best_idx)
 
     def _apply_root_noise(self, node):
         """Apply fresh Dirichlet noise to an already expanded root node."""
-        if self.dirichlet_weight <= 0 or not node.edges.nodes:
+        if self.dirichlet_weight <= 0 or not node.edges.moves:
             return
 
         edges = node.edges
-        children = edges.nodes
-        noise = np.random.dirichlet([self.dirichlet_alpha] * len(children))
+        child_count = len(edges.moves)
+        noise = np.random.dirichlet([self.dirichlet_alpha] * child_count)
         mix = self.dirichlet_weight
 
-        for idx, (child, noise_value) in enumerate(zip(children, noise)):
+        for idx, noise_value in enumerate(noise):
+            old_prior = float(edges.priors[idx])
             new_prior = (1.0 - mix) * float(edges.base_priors[idx]) + mix * float(noise_value)
-            if child._is_explored:
-                node._explored_prior_sum += float(new_prior - child.prior)
             edges.priors[idx] = new_prior
-            child.prior = new_prior
+            if edges.explored_flags[idx]:
+                node._explored_prior_sum += float(new_prior - old_prior)
+            child = edges.nodes[idx]
+            if child is not None:
+                child.prior = new_prior
 
     def _backpropagate(self, search_path, value):
         """Backpropagate value"""
@@ -878,23 +1035,46 @@ class MultiGameBatchMCTS:
         """
         if not game_states:
             return []
+        search_t0 = time.perf_counter() if self.profile_enabled else None
 
-        # Initialize / reuse roots per game
-        for gs in game_states:
-            board = gs['board']
-            root = gs.get('root', None)
-            root_synced = bool(gs.get('_root_synced', False))
+        game_count = len(game_states)
+        boards = [None] * game_count
+        roots = [None] * game_count
+        root_synced_flags = [False] * game_count
+        needs_root_noise_on_expand = [False] * game_count
+        board_histories = [None] * game_count
+        is_mapping_state = [False] * game_count
+
+        # Initialize / reuse roots per game.
+        # Supports both dict states and packed list states:
+        # [board, root, root_synced, board_history].
+        for idx, gs in enumerate(game_states):
+            if isinstance(gs, dict):
+                is_mapping_state[idx] = True
+                board = gs['board']
+                root = gs.get('root', None)
+                root_synced = bool(gs.get('_root_synced', False))
+                board_history = gs.get('board_history', [])
+            else:
+                board = gs[0]
+                root = gs[1] if len(gs) > 1 else None
+                root_synced = bool(gs[2]) if len(gs) > 2 else False
+                board_history = gs[3] if len(gs) > 3 else []
+
+            boards[idx] = board
+            board_histories[idx] = board_history
 
             if self.reuse_tree and root is not None:
                 if root_synced:
-                    gs['_root_synced'] = False
+                    root_synced = False
                 else:
                     target_key = _board_position_key(board)
                     if root.get_position_key() == target_key:
                         pass
                     else:
-                        for child in root.edges.nodes:
-                            if child.get_position_key() == target_key:
+                        for move in root.edges.moves:
+                            child = root.get_child_for_move(move)
+                            if child is not None and child.get_position_key() == target_key:
                                 _ = child.board  # Ensure board is instantiated
                                 root = child
                                 root.parent = None
@@ -904,17 +1084,18 @@ class MultiGameBatchMCTS:
                             root = MCTSNode(board)
             else:
                 root = MCTSNode(board)
-                gs['_root_synced'] = False
+                root_synced = False
 
-            gs['root'] = root
+            roots[idx] = root
+            root_synced_flags[idx] = bool(root_synced)
             if add_root_noise and root.expanded:
                 self._apply_root_noise(root)
-                gs['_needs_root_noise_on_expand'] = False
+                needs_root_noise_on_expand[idx] = False
             else:
-                gs['_needs_root_noise_on_expand'] = bool(add_root_noise and not root.expanded)
+                needs_root_noise_on_expand[idx] = bool(add_root_noise and not root.expanded)
 
-        remaining = [num_simulations] * len(game_states)
-        total_remaining = num_simulations * len(game_states)
+        remaining = [num_simulations] * game_count
+        total_remaining = num_simulations * game_count
         game_ptr = 0
 
         while total_remaining > 0:
@@ -924,40 +1105,38 @@ class MultiGameBatchMCTS:
             # root is never traversed after expansion, children stay at 0 visits).
             max_remaining_any_game = max(remaining) if remaining else 1
             slots_per_game = max(1, min(
-                self.eval_batch_size // max(1, len(game_states)),
+                self.eval_batch_size // max(1, game_count),
                 max_remaining_any_game // 4,
             ))
             batch_size = min(self.eval_batch_size, total_remaining,
-                             slots_per_game * len(game_states))
+                             slots_per_game * game_count)
             leaf_nodes = []
             search_paths = []
             leaf_game_indices = []
-            selected_this_batch = [0] * len(game_states)
+            selected_this_batch = [0] * game_count
 
             for _ in range(batch_size):
                 # Find next game with remaining sims
                 found = False
-                for _ in range(len(game_states)):
-                    current_gs = game_states[game_ptr]
+                for _ in range(game_count):
+                    current_root = roots[game_ptr]
                     if (
                         remaining[game_ptr] > 0
                         and not (
                             selected_this_batch[game_ptr] > 0
-                            and current_gs['root'] is not None
-                            and not current_gs['root'].expanded
+                            and current_root is not None
+                            and not current_root.expanded
                         )
                     ):
                         found = True
                         break
-                    game_ptr = (game_ptr + 1) % len(game_states)
+                    game_ptr = (game_ptr + 1) % game_count
 
                 if not found:
                     break
 
                 gs_idx = game_ptr
-                gs = game_states[gs_idx]
-
-                node = gs['root']
+                node = roots[gs_idx]
                 search_path = [node]
                 node.add_virtual_loss()
 
@@ -973,27 +1152,57 @@ class MultiGameBatchMCTS:
 
                 remaining[gs_idx] -= 1
                 total_remaining -= 1
-                game_ptr = (game_ptr + 1) % len(game_states)
+                game_ptr = (game_ptr + 1) % game_count
 
             if not leaf_nodes:
                 break
 
-            values = self._batch_expand_and_evaluate(leaf_nodes, leaf_game_indices, game_states)
+            values = self._batch_expand_and_evaluate(
+                leaf_nodes,
+                leaf_game_indices,
+                board_histories,
+                roots,
+                needs_root_noise_on_expand,
+            )
 
             for search_path, value in zip(search_paths, values):
                 self._backpropagate(search_path, value)
                 for node in search_path:
                     node.remove_virtual_loss()
 
-        return [
-            gs['root'].child_visit_dict()
-            for gs in game_states
-        ]
+        # Sync roots back to caller-provided state containers.
+        for idx, gs in enumerate(game_states):
+            if is_mapping_state[idx]:
+                gs['root'] = roots[idx]
+                gs['_root_synced'] = bool(root_synced_flags[idx])
+                gs['_needs_root_noise_on_expand'] = bool(needs_root_noise_on_expand[idx])
+            else:
+                if len(gs) > 1:
+                    gs[1] = roots[idx]
+                if len(gs) > 2:
+                    gs[2] = bool(root_synced_flags[idx])
 
-    def _batch_expand_and_evaluate(self, nodes, game_indices, game_states):
+        result = [
+            (root.child_visit_dict() if root is not None else {})
+            for root in roots
+        ]
+        if self.profile_enabled:
+            self._profile_add('search_many_time', time.perf_counter() - search_t0)
+            self._profile_inc('search_many_calls', 1)
+        return result
+
+    def _batch_expand_and_evaluate(
+        self,
+        nodes,
+        game_indices,
+        board_histories,
+        roots,
+        needs_root_noise_on_expand,
+    ):
         """
         Batch expansion + evaluation for leaf nodes across games.
         """
+        eval_t0 = time.perf_counter() if self.profile_enabled else None
         # The same leaf can appear multiple times in one batch.
         # Evaluate each unique node once and fan-out value to duplicates.
         node_occurrences = {}
@@ -1027,6 +1236,32 @@ class MultiGameBatchMCTS:
         values_by_node_id = {}
 
         if non_terminal_nodes:
+            history_prefix_cache = {}
+
+            def _get_history_prefix_for_game(game_idx, turn):
+                if self.history_positions <= 0:
+                    return None
+
+                cache_key = (int(game_idx), bool(turn == chess.BLACK))
+                if cache_key in history_prefix_cache:
+                    return history_prefix_cache[cache_key]
+
+                encoded_history = board_histories[game_idx]
+                use_black_pov = (turn == chess.BLACK)
+                history_slice = encoded_history[-self.history_positions:] if encoded_history else []
+                history_tensors = [
+                    encoded[1] if use_black_pov else encoded[0]
+                    for encoded in history_slice
+                ]
+
+                pad_count = max(0, self.history_positions - len(history_tensors))
+                if pad_count:
+                    history_tensors = [self._empty_history_tensor] * pad_count + history_tensors
+
+                cached = np.concatenate(history_tensors, axis=0) if history_tensors else None
+                history_prefix_cache[cache_key] = cached
+                return cached
+
             legal_moves_per_node = []
             legal_indices_per_node = []
             legal_counts = []
@@ -1040,23 +1275,24 @@ class MultiGameBatchMCTS:
                 if legal_count > max_legal_count:
                     max_legal_count = legal_count
 
-            boards_np = np.stack(
-                [
-                    self._build_history_tensor(
-                        node.board,
-                        game_states[gi]['board_history'],
-                        current_tensor=self._current_tensor_for_node(node),
-                    )
-                    for node, gi in zip(non_terminal_nodes, non_terminal_game_indices)
-                ],
-                axis=0,
-            )
+            batch_n = len(non_terminal_nodes)
+            boards_np = self._get_board_input_scratch(batch_n)
+            for row_idx, (node, gi) in enumerate(zip(non_terminal_nodes, non_terminal_game_indices)):
+                current_tensor = self._current_tensor_for_node(node)
+                history_prefix = _get_history_prefix_for_game(gi, node.board.turn)
+                if history_prefix is None:
+                    boards_np[row_idx, :, :, :] = current_tensor
+                else:
+                    boards_np[row_idx, :self._history_planes, :, :] = history_prefix
+                    boards_np[row_idx, self._history_planes:, :, :] = current_tensor
+
             board_tensors = torch.from_numpy(boards_np).to(
                 self.device,
                 memory_format=torch.channels_last,
                 non_blocking=True,
             )
 
+            inference_t0 = time.perf_counter() if self.profile_enabled else None
             with torch.inference_mode():
                 if self.use_amp:
                     with torch.autocast(device_type='cuda', dtype=self.amp_dtype):
@@ -1096,6 +1332,10 @@ class MultiGameBatchMCTS:
                 else:
                     legal_logits_batch = None
                 values_batch = values_batch.float().cpu().numpy()
+            if self.profile_enabled:
+                self._profile_add('nn_inference_time', time.perf_counter() - inference_t0)
+                self._profile_inc('nn_inference_calls', 1)
+                self._profile_inc('nn_inference_batch_items', batch_n)
 
             for idx, node in enumerate(non_terminal_nodes):
                 value = float(values_batch[idx])
@@ -1116,14 +1356,14 @@ class MultiGameBatchMCTS:
 
                 gi = non_terminal_game_indices[idx]
                 add_noise = (
-                    game_states[gi].get('_needs_root_noise_on_expand', False)
-                    and node is game_states[gi]['root']
+                    needs_root_noise_on_expand[gi]
+                    and node is roots[gi]
                 )
 
                 if add_noise and len(legal_moves) > 0:
                     noise = np.random.dirichlet([self.dirichlet_alpha] * len(legal_moves))
                     legal_probs = (1 - self.dirichlet_weight) * legal_probs + self.dirichlet_weight * noise
-                    game_states[gi]['_needs_root_noise_on_expand'] = False
+                    needs_root_noise_on_expand[gi] = False
 
                 # Expand only if not already expanded (avoid overwriting priors in same batch)
                 if not node.expanded:
@@ -1137,6 +1377,9 @@ class MultiGameBatchMCTS:
             for idx in indices:
                 all_values[idx] = value
 
+        if self.profile_enabled:
+            self._profile_add('batch_expand_eval_time', time.perf_counter() - eval_t0)
+            self._profile_inc('batch_expand_eval_calls', 1)
         return all_values
 
 
@@ -1399,12 +1642,82 @@ class BatchSelfPlayMCTSBatch:
         self.value_target_root_blend_power = float(
             rl_cfg.get('value_target_root_blend_power', 1.5)
         )
+        self.profile_enabled = bool(self.config.get('debug', {}).get('profile_training', False))
+        self._profile_stats = {}
+        self.reset_profile_stats()
 
     def _compute_draw_value_target(self, move_count):
         del move_count
         # Keep draw targets centered at 0. Non-zero draw values bias both sides in
         # the same direction and break the zero-sum calibration expected by MCTS.
         return 0.0
+
+    def reset_profile_stats(self):
+        self._profile_stats = {
+            'move_selection_time': 0.0,
+            'move_selection_calls': 0,
+            'adjudication_time': 0.0,
+            'adjudication_calls': 0,
+            'syzygy_time': 0.0,
+            'syzygy_calls': 0,
+            'policy_target_build_time': 0.0,
+            'policy_target_build_calls': 0,
+            'policy_target_postgame_time': 0.0,
+            'policy_target_postgame_calls': 0,
+        }
+
+    def _profile_add(self, key, value):
+        if not self.profile_enabled:
+            return
+        self._profile_stats[key] = float(self._profile_stats.get(key, 0.0)) + float(value)
+
+    def _profile_inc(self, key, value=1):
+        if not self.profile_enabled:
+            return
+        self._profile_stats[key] = int(self._profile_stats.get(key, 0)) + int(value)
+
+    def _merge_profile_stats(self, target, source):
+        for key, value in dict(source or {}).items():
+            if isinstance(value, (int, np.integer)):
+                target[key] = int(target.get(key, 0)) + int(value)
+            else:
+                target[key] = float(target.get(key, 0.0)) + float(value)
+
+    def _aggregate_engine_profile_stats(self):
+        aggregated = dict(self._profile_stats)
+        self._merge_profile_stats(
+            aggregated,
+            {f"learner_mcts_{k}": v for k, v in self.mcts.get_profile_stats().items()},
+        )
+        for label, opponent_mcts in self.opponent_mcts_by_label.items():
+            self._merge_profile_stats(
+                aggregated,
+                {f"opponent_mcts_{label}_{k}": v for k, v in opponent_mcts.get_profile_stats().items()},
+            )
+        search_many_time = float(aggregated.get('learner_mcts_search_many_time', 0.0))
+        batch_expand_time = float(aggregated.get('learner_mcts_batch_expand_eval_time', 0.0))
+        board_tensor_time = float(aggregated.get('learner_mcts_board_to_tensor_time', 0.0))
+        nn_time = float(aggregated.get('learner_mcts_nn_inference_time', 0.0))
+        nn_calls = int(aggregated.get('learner_mcts_nn_inference_calls', 0) or 0)
+        nn_batch_items = int(aggregated.get('learner_mcts_nn_inference_batch_items', 0) or 0)
+        for label in self.opponent_mcts_by_label.keys():
+            prefix = f"opponent_mcts_{label}_"
+            search_many_time += float(aggregated.get(prefix + 'search_many_time', 0.0))
+            batch_expand_time += float(aggregated.get(prefix + 'batch_expand_eval_time', 0.0))
+            board_tensor_time += float(aggregated.get(prefix + 'board_to_tensor_time', 0.0))
+            nn_time += float(aggregated.get(prefix + 'nn_inference_time', 0.0))
+            nn_calls += int(aggregated.get(prefix + 'nn_inference_calls', 0) or 0)
+            nn_batch_items += int(aggregated.get(prefix + 'nn_inference_batch_items', 0) or 0)
+        aggregated['mcts_search_many_time'] = float(search_many_time)
+        aggregated['mcts_batch_expand_eval_time'] = float(batch_expand_time)
+        aggregated['mcts_board_to_tensor_time'] = float(board_tensor_time)
+        aggregated['mcts_nn_inference_time'] = float(nn_time)
+        aggregated['mcts_nn_inference_calls'] = int(nn_calls)
+        aggregated['mcts_nn_inference_batch_items'] = int(nn_batch_items)
+        aggregated['average_batch_size'] = float(nn_batch_items / nn_calls) if nn_calls > 0 else 0.0
+        gpu_utilization_pct = 100.0 * float(nn_time) / max(1e-8, float(search_many_time))
+        aggregated['gpu_utilization_pct'] = float(max(0.0, min(100.0, gpu_utilization_pct)))
+        return aggregated
 
     def _sample_num_simulations(self):
         if not self.playout_cap_randomization_enabled:
@@ -1706,47 +2019,63 @@ class BatchSelfPlayMCTSBatch:
         selected.sort(key=lambda item: int(item['history_idx']))
         return selected, int(curriculum_dropped), int(cap_dropped)
 
-    def _build_candidate_positions(self, gs, outcome, draw_value_target=0.0):
-        candidate_positions = []
-        is_draw = (outcome == 0.0)
-        total_history = len(gs['game_history'])
+    def _build_history_selection_candidates(self, gs):
+        candidates = []
         for history_idx, history_entry in enumerate(gs['game_history']):
-            history_count, policy_indices, policy_values, turn = history_entry[:4]
             importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
-            root_value = float(history_entry[5]) if len(history_entry) > 5 else 0.0
-            if is_draw:
-                value = draw_value_target
-            else:
-                remaining_plies = max(0, (total_history - 1) - history_idx)
-                temporal_scale = max(
-                    self.value_target_min_scale,
-                    self.value_target_temporal_decay ** remaining_plies,
-                )
-                signed_outcome = outcome if turn == chess.WHITE else -outcome
-                value = float(signed_outcome * temporal_scale)
-            if self.value_target_root_blend_enabled and total_history > 0:
-                progress = float(history_idx) / float(max(1, total_history - 1))
-                blend_progress = progress ** max(0.1, self.value_target_root_blend_power)
-                search_weight = (
-                    self.value_target_root_blend_start
-                    + (self.value_target_root_blend_end - self.value_target_root_blend_start) * blend_progress
-                )
-                search_weight = float(min(1.0, max(0.0, search_weight)))
-                blended_root_value = float(max(-1.0, min(1.0, root_value)))
-                value = float(
-                    search_weight * blended_root_value
-                    + (1.0 - search_weight) * value
-                )
-            candidate_positions.append({
+            candidates.append({
                 'history_idx': history_idx,
-                'history_count': history_count,
-                'policy_indices': policy_indices,
-                'policy_values': policy_values,
-                'turn': turn,
-                'value': value,
                 'importance_score': importance_score,
             })
-        return candidate_positions
+        return candidates
+
+    def _build_training_position_from_history_entry(
+        self,
+        gs,
+        history_idx,
+        outcome,
+        draw_value_target=0.0,
+    ):
+        total_history = len(gs['game_history'])
+        history_entry = gs['game_history'][int(history_idx)]
+        history_count, policy_indices, policy_values, turn = history_entry[:4]
+        importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
+        root_value = float(history_entry[5]) if len(history_entry) > 5 else 0.0
+
+        if outcome == 0.0:
+            value = draw_value_target
+        else:
+            remaining_plies = max(0, (total_history - 1) - int(history_idx))
+            temporal_scale = max(
+                self.value_target_min_scale,
+                self.value_target_temporal_decay ** remaining_plies,
+            )
+            signed_outcome = outcome if turn == chess.WHITE else -outcome
+            value = float(signed_outcome * temporal_scale)
+
+        if self.value_target_root_blend_enabled and total_history > 0:
+            progress = float(history_idx) / float(max(1, total_history - 1))
+            blend_progress = progress ** max(0.1, self.value_target_root_blend_power)
+            search_weight = (
+                self.value_target_root_blend_start
+                + (self.value_target_root_blend_end - self.value_target_root_blend_start) * blend_progress
+            )
+            search_weight = float(min(1.0, max(0.0, search_weight)))
+            blended_root_value = float(max(-1.0, min(1.0, root_value)))
+            value = float(
+                search_weight * blended_root_value
+                + (1.0 - search_weight) * value
+            )
+
+        return {
+            'history_idx': int(history_idx),
+            'history_count': history_count,
+            'policy_indices': policy_indices,
+            'policy_values': policy_values,
+            'turn': turn,
+            'value': value,
+            'importance_score': importance_score,
+        }
 
     def _compute_position_importance(self, board, move, visit_counts, root):
         importance = 1.0
@@ -1797,15 +2126,22 @@ class BatchSelfPlayMCTSBatch:
         *,
         history_positions,
     ):
+        postgame_t0 = time.perf_counter() if self.profile_enabled else None
         history_len = len(gs['game_history'])
-        candidate_positions = self._build_candidate_positions(gs, outcome, draw_value_target=0.0)
-        selected_positions, curriculum_dropped, cap_dropped = self._select_history_indices_to_keep(
-            candidate_positions,
+        selection_candidates = self._build_history_selection_candidates(gs)
+        selected_candidates, curriculum_dropped, cap_dropped = self._select_history_indices_to_keep(
+            selection_candidates,
             history_len,
             is_decisive=(outcome != 0.0),
         )
 
-        for item in selected_positions:
+        for candidate in selected_candidates:
+            item = self._build_training_position_from_history_entry(
+                gs,
+                candidate['history_idx'],
+                outcome,
+                draw_value_target=0.0,
+            )
             board_tensor_np = _build_history_tensor_from_encoded(
                 turn=item['turn'],
                 encoded_history=gs['board_history'],
@@ -1821,7 +2157,9 @@ class BatchSelfPlayMCTSBatch:
                 torch.tensor([item['value']], dtype=torch.float32),
                 float(item.get('importance_score', 0.0)),
             ))
-
+        if self.profile_enabled:
+            self._profile_add('policy_target_postgame_time', time.perf_counter() - postgame_t0)
+            self._profile_inc('policy_target_postgame_calls', 1)
         return history_len, int(curriculum_dropped), int(cap_dropped)
 
     def _should_auto_claim_draw(self, board, move_count):
@@ -1975,6 +2313,10 @@ class BatchSelfPlayMCTSBatch:
         game_lengths = []
         self._games_completed = 0
         self._plan_cursor = 0
+        self.reset_profile_stats()
+        self.mcts.reset_profile_stats()
+        for opponent_mcts in self.opponent_mcts_by_label.values():
+            opponent_mcts.reset_profile_stats()
         total_dropped_positions = 0
         total_truncated_games = 0
         total_claimable_draw_ended_games = 0
@@ -2064,6 +2406,7 @@ class BatchSelfPlayMCTSBatch:
             'opponent_source_counts': opponent_source_counts,
             'opponent_source_results': opponent_source_results,
             'total_games': int(total_games),
+            'profile': self._aggregate_engine_profile_stats(),
         }
         return all_positions, game_lengths
 
@@ -2097,7 +2440,8 @@ class BatchSelfPlayMCTSBatch:
                 if batch_plan_labels is not None and _game_idx < len(batch_plan_labels)
                 else self.opponent_source_label
             )
-            has_frozen_opponent = game_opponent_label in self.opponent_mcts_by_label
+            opponent_mcts = self.opponent_mcts_by_label.get(game_opponent_label)
+            has_frozen_opponent = opponent_mcts is not None
             game_states.append({
                 'board': chess.Board(),
                 'board_history': [],
@@ -2118,6 +2462,8 @@ class BatchSelfPlayMCTSBatch:
                 'resign_streak': 0,
                 'resignation_disabled': bool(np.random.random() < self.resignation_disable_fraction),
                 'opponent_source_label': game_opponent_label,
+                'opponent_mcts': opponent_mcts,
+                'has_frozen_opponent': has_frozen_opponent,
                 'learner_color': (
                     chess.WHITE
                     if not has_frozen_opponent or not self.randomize_learner_color
@@ -2128,12 +2474,35 @@ class BatchSelfPlayMCTSBatch:
             self._apply_opening_prefix(game_states[-1])
 
         while True:
-            for gs in game_states:
+            active_indices = []
+            learner_indices = []
+            grouped_opponent_indices = {}
+            for i, gs in enumerate(game_states):
                 if gs['done']:
                     continue
-                self._maybe_finish_with_syzygy(gs, gs['board'])
+                board = gs['board']
+                syzygy_t0 = time.perf_counter() if self.profile_enabled else None
+                self._maybe_finish_with_syzygy(gs, board)
+                if self.profile_enabled:
+                    self._profile_add('syzygy_time', time.perf_counter() - syzygy_t0)
+                    self._profile_inc('syzygy_calls', 1)
+                if gs['done']:
+                    continue
 
-            active_indices = [i for i, gs in enumerate(game_states) if not gs['done']]
+                active_indices.append(i)
+                if not gs.get('has_frozen_opponent', False):
+                    gs['_learner_turn_cache'] = True
+                    learner_indices.append(i)
+                    continue
+
+                learner_turn = bool(board.turn == gs.get('learner_color', chess.WHITE))
+                gs['_learner_turn_cache'] = learner_turn
+                if learner_turn:
+                    learner_indices.append(i)
+                else:
+                    label = str(gs.get('opponent_source_label', self.opponent_source_label) or "current")
+                    grouped_opponent_indices.setdefault(label, []).append(i)
+
             if not active_indices:
                 break
 
@@ -2146,12 +2515,12 @@ class BatchSelfPlayMCTSBatch:
                 group_states = []
                 for i in indices:
                     gs = game_states[i]
-                    group_states.append({
-                        'board': gs['board'],
-                        'root': gs.get(root_key),
-                        '_root_synced': bool(gs.get(synced_key, False)),
-                        'board_history': gs['board_history'],
-                    })
+                    group_states.append([
+                        gs['board'],
+                        gs.get(root_key),
+                        bool(gs.get(synced_key, False)),
+                        gs['board_history'],
+                    ])
                 visit_counts_list_group = mcts_ref.search_many(
                     group_states,
                     num_simulations=simulations_this_turn,
@@ -2159,27 +2528,14 @@ class BatchSelfPlayMCTSBatch:
                 )
                 for gs_idx, local_state, visit_counts in zip(indices, group_states, visit_counts_list_group):
                     gs = game_states[gs_idx]
-                    gs[root_key] = local_state.get('root')
-                    gs[synced_key] = bool(local_state.get('_root_synced', False))
+                    gs[root_key] = local_state[1]
+                    gs[synced_key] = bool(local_state[2])
                     visit_counts_by_index[gs_idx] = visit_counts
 
             if not self.opponent_mcts_by_label:
                 _run_search_for_indices(active_indices, self.mcts, 'root', '_root_synced')
             else:
-                learner_indices = [
-                    i for i in active_indices
-                    if self._uses_learner_model(game_states[i], game_states[i]['board'])
-                ]
-                learner_index_set = set(learner_indices)
-                opponent_indices = [
-                    i for i in active_indices
-                    if i not in learner_index_set
-                ]
                 _run_search_for_indices(learner_indices, self.mcts, 'root', '_root_synced')
-                grouped_opponent_indices = {}
-                for idx in opponent_indices:
-                    label = str(game_states[idx].get('opponent_source_label', self.opponent_source_label) or "current")
-                    grouped_opponent_indices.setdefault(label, []).append(idx)
                 for label, indices in grouped_opponent_indices.items():
                     opponent_mcts = self.opponent_mcts_by_label.get(label)
                     if opponent_mcts is None:
@@ -2197,12 +2553,16 @@ class BatchSelfPlayMCTSBatch:
                     temperature = self.temperature
                 else:
                     temperature = 0.0
-                learner_turn = self._uses_learner_model(gs, board)
-                game_opponent_mcts = self._get_game_opponent_mcts(gs)
+                learner_turn = bool(gs.get('_learner_turn_cache', True))
+                game_opponent_mcts = gs.get('opponent_mcts')
                 root_key = 'root' if learner_turn or game_opponent_mcts is None else 'opponent_root'
                 synced_key = '_root_synced' if learner_turn or game_opponent_mcts is None else '_opponent_root_synced'
                 root = gs.get(root_key)
+                adjudication_t0 = time.perf_counter() if self.profile_enabled else None
                 adjudicated_result = self._maybe_adjudicate_game(gs, root, board)
+                if self.profile_enabled:
+                    self._profile_add('adjudication_time', time.perf_counter() - adjudication_t0)
+                    self._profile_inc('adjudication_calls', 1)
                 if adjudicated_result is not None:
                     gs['adjudicated_result'] = adjudicated_result
                     gs['done'] = True
@@ -2218,8 +2578,13 @@ class BatchSelfPlayMCTSBatch:
                     self._mark_game_completed(gs)
                     continue
 
+                move_t0 = time.perf_counter() if self.profile_enabled else None
                 move = self._select_move_from_visits(visit_counts, temperature)
+                if self.profile_enabled:
+                    self._profile_add('move_selection_time', time.perf_counter() - move_t0)
+                    self._profile_inc('move_selection_calls', 1)
                 if learner_turn or game_opponent_mcts is None:
+                    policy_t0 = time.perf_counter() if self.profile_enabled else None
                     visit_counts = self._prune_policy_target_visits(visit_counts)
                     policy_indices, policy_values = _build_sparse_policy_target_from_visits(visit_counts, board)
                     history_count = len(gs['board_history'])
@@ -2237,6 +2602,9 @@ class BatchSelfPlayMCTSBatch:
                         importance_score,
                         root_value,
                     ))
+                    if self.profile_enabled:
+                        self._profile_add('policy_target_build_time', time.perf_counter() - policy_t0)
+                        self._profile_inc('policy_target_build_calls', 1)
 
                 # Update history BEFORE making the move
                 # Store cached tensors for both POVs to avoid repeated FEN parse + tensor rebuild.
@@ -2262,8 +2630,15 @@ class BatchSelfPlayMCTSBatch:
                 board.push(move)
                 gs['move_count'] += 1
 
+                syzygy_t0 = time.perf_counter() if self.profile_enabled else None
                 if self._maybe_finish_with_syzygy(gs, board) is not None:
+                    if self.profile_enabled:
+                        self._profile_add('syzygy_time', time.perf_counter() - syzygy_t0)
+                        self._profile_inc('syzygy_calls', 1)
                     continue
+                if self.profile_enabled:
+                    self._profile_add('syzygy_time', time.perf_counter() - syzygy_t0)
+                    self._profile_inc('syzygy_calls', 1)
 
                 forced_game_over = board.is_game_over(claim_draw=False)
                 auto_claim_draw = self._should_auto_claim_draw(board, gs['move_count'])
