@@ -3096,6 +3096,13 @@ def main():
                 batch_expand_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_eval_time", 0.0) or 0.0))
                 board_to_tensor_time = max(0.0, float(selfplay_profile.get("mcts_board_to_tensor_time", 0.0) or 0.0))
                 nn_inference_time = max(0.0, float(selfplay_profile.get("mcts_nn_inference_time", 0.0) or 0.0))
+                nn_calls = int(selfplay_profile.get("mcts_nn_inference_calls", 0) or 0)
+                nn_batch_items = int(selfplay_profile.get("mcts_nn_inference_batch_items", 0) or 0)
+                nn_legal_move_items = int(selfplay_profile.get("mcts_nn_legal_move_items", 0) or 0)
+                nn_h2d_time = max(0.0, float(selfplay_profile.get("mcts_nn_h2d_time", 0.0) or 0.0))
+                nn_gpu_forward_time = max(0.0, float(selfplay_profile.get("mcts_nn_gpu_forward_time", 0.0) or 0.0))
+                nn_gpu_postprocess_time = max(0.0, float(selfplay_profile.get("mcts_nn_gpu_postprocess_time", 0.0) or 0.0))
+                nn_d2h_time = max(0.0, float(selfplay_profile.get("mcts_nn_d2h_time", 0.0) or 0.0))
                 policy_target_build_time = max(0.0, float(selfplay_profile.get("policy_target_build_time", 0.0) or 0.0))
                 policy_target_postgame_time = max(0.0, float(selfplay_profile.get("policy_target_postgame_time", 0.0) or 0.0))
                 move_selection_time = max(0.0, float(selfplay_profile.get("move_selection_time", 0.0) or 0.0))
@@ -3111,6 +3118,39 @@ def main():
                 if search_many_time > 0.0:
                     gpu_utilization_pct_display = 100.0 * (nn_inference_capped / search_many_time)
                 gpu_utilization_pct_display = max(0.0, min(100.0, float(gpu_utilization_pct_display)))
+                average_batch_size_display = float(nn_batch_items / nn_calls) if nn_calls > 0 else 0.0
+                average_legal_moves_display = float(nn_legal_move_items / nn_batch_items) if nn_batch_items > 0 else 0.0
+                inference_per_batch_ms_display = (
+                    1000.0 * float(nn_inference_capped) / float(nn_calls) if nn_calls > 0 else 0.0
+                )
+                inference_per_position_ms_display = (
+                    1000.0 * float(nn_inference_capped) / float(nn_batch_items) if nn_batch_items > 0 else 0.0
+                )
+
+                h2d_capped = min(nn_h2d_time, nn_inference_capped)
+                gpu_forward_capped = min(nn_gpu_forward_time, nn_inference_capped)
+                gpu_postprocess_capped = min(nn_gpu_postprocess_time, nn_inference_capped)
+                d2h_capped = min(nn_d2h_time, nn_inference_capped)
+                staged_inference_total = h2d_capped + gpu_forward_capped + gpu_postprocess_capped + d2h_capped
+                if staged_inference_total > nn_inference_capped and staged_inference_total > 1e-8:
+                    stage_scale = nn_inference_capped / staged_inference_total
+                    h2d_capped *= stage_scale
+                    gpu_forward_capped *= stage_scale
+                    gpu_postprocess_capped *= stage_scale
+                    d2h_capped *= stage_scale
+                transfer_total_capped = h2d_capped + d2h_capped
+
+                def _pct_of_inference(value):
+                    return 100.0 * float(value) / max(1e-8, nn_inference_capped)
+
+                gpu_bottleneck = "mixed"
+                if nn_inference_capped > 0.0:
+                    if gpu_forward_capped >= max(transfer_total_capped * 1.25, nn_inference_capped * 0.55):
+                        gpu_bottleneck = "compute-bound"
+                    elif transfer_total_capped >= max(gpu_forward_capped * 0.95, nn_inference_capped * 0.45):
+                        gpu_bottleneck = "transfer-bound"
+                    elif gpu_postprocess_capped >= max(nn_inference_capped * 0.20, transfer_total_capped * 0.85):
+                        gpu_bottleneck = "postprocess-bound"
 
                 def _pct_of_search(value):
                     return 100.0 * float(value) / max(1e-8, search_many_time)
@@ -3179,7 +3219,43 @@ def main():
                 )
                 print(
                     f"   {'average_batch_size':<24} "
-                    f"{float(selfplay_profile.get('average_batch_size', 0.0) or 0.0):7.2f} pos/batch"
+                    f"{average_batch_size_display:7.2f} pos/batch"
+                )
+                print(
+                    f"   {'average_legal_moves':<24} "
+                    f"{average_legal_moves_display:7.2f} legal/pos"
+                )
+                print(
+                    f"   {'h2d_transfer':<24} "
+                    f"{h2d_capped:7.2f}s "
+                    f"({_pct_of_inference(h2d_capped):5.1f}% inference)"
+                )
+                print(
+                    f"   {'gpu_forward':<24} "
+                    f"{gpu_forward_capped:7.2f}s "
+                    f"({_pct_of_inference(gpu_forward_capped):5.1f}% inference)"
+                )
+                print(
+                    f"   {'gpu_postprocess':<24} "
+                    f"{gpu_postprocess_capped:7.2f}s "
+                    f"({_pct_of_inference(gpu_postprocess_capped):5.1f}% inference)"
+                )
+                print(
+                    f"   {'d2h_transfer':<24} "
+                    f"{d2h_capped:7.2f}s "
+                    f"({_pct_of_inference(d2h_capped):5.1f}% inference)"
+                )
+                print(
+                    f"   {'inference_per_batch':<24} "
+                    f"{inference_per_batch_ms_display:7.2f} ms/batch"
+                )
+                print(
+                    f"   {'inference_per_position':<24} "
+                    f"{inference_per_position_ms_display:7.2f} ms/pos"
+                )
+                print(
+                    f"   {'gpu_bottleneck':<24} "
+                    f"{gpu_bottleneck}"
                 )
                 queue_wait_total_s = max(0.0, float(selfplay_profile.get('queue_wait_total_s', 0.0) or 0.0))
                 print("")

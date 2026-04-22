@@ -719,6 +719,11 @@ class MultiGameBatchMCTS:
             'nn_inference_time': 0.0,
             'nn_inference_calls': 0,
             'nn_inference_batch_items': 0,
+            'nn_h2d_time': 0.0,
+            'nn_gpu_forward_time': 0.0,
+            'nn_gpu_postprocess_time': 0.0,
+            'nn_d2h_time': 0.0,
+            'nn_legal_move_items': 0,
         }
 
     def _profile_add(self, key, value):
@@ -1286,13 +1291,34 @@ class MultiGameBatchMCTS:
                     boards_np[row_idx, :self._history_planes, :, :] = history_prefix
                     boards_np[row_idx, self._history_planes:, :, :] = current_tensor
 
+            use_cuda_stage_timing = (
+                self.profile_enabled
+                and self.device.type == 'cuda'
+                and torch.cuda.is_available()
+            )
+
+            def _cuda_event():
+                if not use_cuda_stage_timing:
+                    return None
+                return torch.cuda.Event(enable_timing=True)
+
+            h2d_start = _cuda_event()
+            h2d_end = _cuda_event()
+            if h2d_start is not None:
+                h2d_start.record()
             board_tensors = torch.from_numpy(boards_np).to(
                 self.device,
                 memory_format=torch.channels_last,
                 non_blocking=True,
             )
+            if h2d_end is not None:
+                h2d_end.record()
 
             inference_t0 = time.perf_counter() if self.profile_enabled else None
+            forward_start = _cuda_event()
+            forward_end = _cuda_event()
+            if forward_start is not None:
+                forward_start.record()
             with torch.inference_mode():
                 if self.use_amp:
                     with torch.autocast(device_type='cuda', dtype=self.amp_dtype):
@@ -1305,14 +1331,21 @@ class MultiGameBatchMCTS:
                         board_tensors,
                         apply_log_softmax=False,
                     )
+                if forward_end is not None:
+                    forward_end.record()
                 
                 # 🔥 OPTIMIZATION: Transfer entire batch to CPU at once, not row by row
+                postprocess_start = _cuda_event()
+                postprocess_end = _cuda_event()
+                if postprocess_start is not None:
+                    postprocess_start.record()
                 if values_batch.dim() == 2 and values_batch.shape[1] == 3:
                     # WDL output: compute softmax on GPU before transfer
                     wdl_probs = torch.softmax(values_batch, dim=1)
                     values_batch = (wdl_probs[:, 0] - wdl_probs[:, 2])
 
                 # Gather only legal move logits on GPU before transferring to CPU.
+                h2d_legal_end = None
                 if max_legal_count > 0:
                     legal_index_matrix = self._get_legal_index_scratch(
                         len(non_terminal_nodes),
@@ -1327,15 +1360,53 @@ class MultiGameBatchMCTS:
                         self.device,
                         non_blocking=True,
                     )
+                    h2d_legal_end = _cuda_event()
+                    if h2d_legal_end is not None:
+                        h2d_legal_end.record()
                     legal_logits_batch = torch.gather(policy_logits_batch, 1, legal_index_tensor)
+                    d2h_legal_start = _cuda_event()
+                    d2h_legal_end = _cuda_event()
+                    if postprocess_end is not None:
+                        postprocess_end.record()
+                    if d2h_legal_start is not None:
+                        d2h_legal_start.record()
                     legal_logits_batch = legal_logits_batch.to(dtype=torch.float16).cpu().numpy()
+                    if d2h_legal_end is not None:
+                        d2h_legal_end.record()
                 else:
                     legal_logits_batch = None
+                    d2h_legal_start = None
+                    d2h_legal_end = None
+                    if postprocess_end is not None:
+                        postprocess_end.record()
+                d2h_values_start = _cuda_event()
+                d2h_values_end = _cuda_event()
+                if d2h_values_start is not None:
+                    d2h_values_start.record()
                 values_batch = values_batch.float().cpu().numpy()
+                if d2h_values_end is not None:
+                    d2h_values_end.record()
             if self.profile_enabled:
                 self._profile_add('nn_inference_time', time.perf_counter() - inference_t0)
                 self._profile_inc('nn_inference_calls', 1)
                 self._profile_inc('nn_inference_batch_items', batch_n)
+                self._profile_inc('nn_legal_move_items', sum(legal_counts))
+                if use_cuda_stage_timing:
+                    torch.cuda.synchronize(self.device)
+
+                    def _elapsed_s(start_event, end_event):
+                        if start_event is None or end_event is None:
+                            return 0.0
+                        return max(0.0, float(start_event.elapsed_time(end_event)) / 1000.0)
+
+                    h2d_time = _elapsed_s(h2d_start, h2d_end)
+                    if h2d_legal_end is not None:
+                        h2d_time += _elapsed_s(h2d_end, h2d_legal_end)
+                    d2h_time = _elapsed_s(d2h_legal_start, d2h_legal_end) + _elapsed_s(d2h_values_start, d2h_values_end)
+                    self._profile_add('nn_h2d_time', h2d_time)
+                    self._profile_add('nn_gpu_forward_time', _elapsed_s(forward_start, forward_end))
+                    self._profile_add('nn_gpu_postprocess_time', _elapsed_s(postprocess_start, postprocess_end))
+                    self._profile_add('nn_d2h_time', d2h_time)
 
             for idx, node in enumerate(non_terminal_nodes):
                 value = float(values_batch[idx])
@@ -1700,6 +1771,11 @@ class BatchSelfPlayMCTSBatch:
         nn_time = float(aggregated.get('learner_mcts_nn_inference_time', 0.0))
         nn_calls = int(aggregated.get('learner_mcts_nn_inference_calls', 0) or 0)
         nn_batch_items = int(aggregated.get('learner_mcts_nn_inference_batch_items', 0) or 0)
+        nn_h2d_time = float(aggregated.get('learner_mcts_nn_h2d_time', 0.0))
+        nn_gpu_forward_time = float(aggregated.get('learner_mcts_nn_gpu_forward_time', 0.0))
+        nn_gpu_postprocess_time = float(aggregated.get('learner_mcts_nn_gpu_postprocess_time', 0.0))
+        nn_d2h_time = float(aggregated.get('learner_mcts_nn_d2h_time', 0.0))
+        nn_legal_move_items = int(aggregated.get('learner_mcts_nn_legal_move_items', 0) or 0)
         for label in self.opponent_mcts_by_label.keys():
             prefix = f"opponent_mcts_{label}_"
             search_many_time += float(aggregated.get(prefix + 'search_many_time', 0.0))
@@ -1708,13 +1784,35 @@ class BatchSelfPlayMCTSBatch:
             nn_time += float(aggregated.get(prefix + 'nn_inference_time', 0.0))
             nn_calls += int(aggregated.get(prefix + 'nn_inference_calls', 0) or 0)
             nn_batch_items += int(aggregated.get(prefix + 'nn_inference_batch_items', 0) or 0)
+            nn_h2d_time += float(aggregated.get(prefix + 'nn_h2d_time', 0.0))
+            nn_gpu_forward_time += float(aggregated.get(prefix + 'nn_gpu_forward_time', 0.0))
+            nn_gpu_postprocess_time += float(aggregated.get(prefix + 'nn_gpu_postprocess_time', 0.0))
+            nn_d2h_time += float(aggregated.get(prefix + 'nn_d2h_time', 0.0))
+            nn_legal_move_items += int(aggregated.get(prefix + 'nn_legal_move_items', 0) or 0)
         aggregated['mcts_search_many_time'] = float(search_many_time)
         aggregated['mcts_batch_expand_eval_time'] = float(batch_expand_time)
         aggregated['mcts_board_to_tensor_time'] = float(board_tensor_time)
         aggregated['mcts_nn_inference_time'] = float(nn_time)
         aggregated['mcts_nn_inference_calls'] = int(nn_calls)
         aggregated['mcts_nn_inference_batch_items'] = int(nn_batch_items)
+        aggregated['mcts_nn_h2d_time'] = float(nn_h2d_time)
+        aggregated['mcts_nn_gpu_forward_time'] = float(nn_gpu_forward_time)
+        aggregated['mcts_nn_gpu_postprocess_time'] = float(nn_gpu_postprocess_time)
+        aggregated['mcts_nn_d2h_time'] = float(nn_d2h_time)
+        aggregated['mcts_nn_legal_move_items'] = int(nn_legal_move_items)
         aggregated['average_batch_size'] = float(nn_batch_items / nn_calls) if nn_calls > 0 else 0.0
+        aggregated['average_legal_moves_per_position'] = (
+            float(nn_legal_move_items / nn_batch_items) if nn_batch_items > 0 else 0.0
+        )
+        aggregated['average_legal_moves_per_batch'] = (
+            float(nn_legal_move_items / nn_calls) if nn_calls > 0 else 0.0
+        )
+        aggregated['inference_time_per_batch_ms'] = (
+            1000.0 * float(nn_time) / float(nn_calls) if nn_calls > 0 else 0.0
+        )
+        aggregated['inference_time_per_position_ms'] = (
+            1000.0 * float(nn_time) / float(nn_batch_items) if nn_batch_items > 0 else 0.0
+        )
         gpu_utilization_pct = 100.0 * float(nn_time) / max(1e-8, float(search_many_time))
         aggregated['gpu_utilization_pct'] = float(max(0.0, min(100.0, gpu_utilization_pct)))
         return aggregated

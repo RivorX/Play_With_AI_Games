@@ -195,9 +195,9 @@ reinforcement_learning:
   # ---------------------------
   # Core RL Loop
   # ---------------------------
-  version: "rl3"             # RL run/version tag added to RL log filenames
+  version: "rl4"             # RL run/version tag added to RL log filenames
   iterations: 40                # Total RL iterations
-  games_per_iteration: 400      # Enough signal per iteration without stretching self-play too long
+  games_per_iteration: 100      # Enough signal per iteration without stretching self-play too long
 
   # ---------------------------
   # Self-Play Runtime
