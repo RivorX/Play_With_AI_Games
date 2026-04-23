@@ -8,12 +8,15 @@ Plays multiple games using MCTS for move selection
 - High-quality training data
 """
 
+import os
+import tempfile
 import torch
 import chess
 import numpy as np
 import math
 import pickle
 import time
+import logging
 from pathlib import Path
 from src.data import board_to_tensor, move_to_index
 
@@ -29,6 +32,19 @@ _PIECE_VALUES = {
 }
 
 _SYZYGY_ORACLE_CACHE = {}
+_SELFPLAY_COMPILE_LOCKFILE = "selfplay_torch_compile.lock"
+
+
+class _InductorSMWarningFilter(logging.Filter):
+    """Drop noisy Inductor warning for low-SM GPUs during self-play."""
+
+    _needle = "Not enough SMs to use max_autotune_gemm mode"
+
+    def filter(self, record):
+        try:
+            return self._needle not in record.getMessage()
+        except Exception:
+            return True
 
 
 class _SyzygyOracle:
@@ -119,6 +135,178 @@ def _get_syzygy_oracle(config):
         oracle = _SyzygyOracle(paths, max_pieces=max_pieces)
         _SYZYGY_ORACLE_CACHE[cache_key] = oracle
     return oracle if oracle.enabled else None
+
+
+class _SelfPlayCompileLock:
+    def __init__(self, lock_path, timeout_s=900.0, poll_s=0.2, stale_after_s=1800.0):
+        self.lock_path = Path(lock_path)
+        self.timeout_s = max(1.0, float(timeout_s))
+        self.poll_s = max(0.05, float(poll_s))
+        self.stale_after_s = max(self.timeout_s, float(stale_after_s))
+        self._fd = None
+
+    def __enter__(self):
+        start_t = time.perf_counter()
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                self._fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                payload = f"{os.getpid()} {time.time():.6f}\n".encode("ascii", errors="ignore")
+                os.write(self._fd, payload)
+                return self
+            except FileExistsError:
+                try:
+                    stat = self.lock_path.stat()
+                    age_s = max(0.0, time.time() - float(stat.st_mtime))
+                    if age_s > self.stale_after_s:
+                        self.lock_path.unlink(missing_ok=True)
+                        continue
+                except Exception:
+                    pass
+                if (time.perf_counter() - start_t) >= self.timeout_s:
+                    raise TimeoutError(f"Timed out waiting for compile lock: {self.lock_path}")
+                time.sleep(self.poll_s)
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._fd is not None:
+                os.close(self._fd)
+        finally:
+            self._fd = None
+            try:
+                self.lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _resolve_selfplay_compile_enabled(config, device):
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        return False
+    rl_cfg = config.get('reinforcement_learning', {})
+    if 'self_play_use_compile' in rl_cfg:
+        return bool(rl_cfg.get('self_play_use_compile', False))
+    return bool(config.get('hardware', {}).get('use_compile', False))
+
+
+def _resolve_selfplay_compile_use_lock(config):
+    rl_cfg = config.get('reinforcement_learning', {})
+    if 'self_play_compile_use_lock' in rl_cfg:
+        return bool(rl_cfg.get('self_play_compile_use_lock', False))
+    # Default to parallel compile across workers.
+    return False
+
+
+def _configure_selfplay_compile_cache(rank, device):
+    if device.type != 'cuda':
+        return None
+    root = Path(tempfile.gettempdir()) / "play_with_ai_games" / "torch_compile_cache"
+    worker_dir = root / f"cuda_worker_{int(rank)}"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(worker_dir / "inductor")
+    os.environ["TRITON_CACHE_DIR"] = str(worker_dir / "triton")
+    return root
+
+
+def _configure_inductor_for_selfplay(config):
+    rl_cfg = config.get('reinforcement_learning', {})
+
+    # Allow explicit control of Inductor compile worker threads.
+    compile_threads_raw = rl_cfg.get('self_play_compile_threads', None)
+    if compile_threads_raw is not None:
+        try:
+            compile_threads = int(compile_threads_raw)
+            if compile_threads > 0:
+                os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(compile_threads)
+        except Exception:
+            pass
+
+    # Silence the low-SM max_autotune warning in self-play logs by default.
+    suppress_sm_warning = bool(
+        rl_cfg.get('self_play_suppress_inductor_sm_warning', True)
+    )
+    if not suppress_sm_warning:
+        return
+
+    try:
+        from torch._inductor import config as inductor_config
+        inductor_config.max_autotune_gemm = False
+    except Exception:
+        pass
+
+    try:
+        logger = logging.getLogger("torch._inductor.utils")
+        has_filter = any(
+            isinstance(existing, _InductorSMWarningFilter)
+            for existing in logger.filters
+        )
+        if not has_filter:
+            logger.addFilter(_InductorSMWarningFilter())
+    except Exception:
+        pass
+
+
+def _maybe_compile_selfplay_model(model, config, device, rank, model_label="learner"):
+    if not _resolve_selfplay_compile_enabled(config, device):
+        return model
+    if not hasattr(torch, "compile"):
+        return model
+
+    rl_cfg = config.get('reinforcement_learning', {})
+    compile_root = _configure_selfplay_compile_cache(rank, device)
+    lock_path = (
+        compile_root / _SELFPLAY_COMPILE_LOCKFILE
+        if compile_root is not None
+        else Path(tempfile.gettempdir()) / _SELFPLAY_COMPILE_LOCKFILE
+    )
+    timeout_s = float(rl_cfg.get('self_play_compile_lock_timeout_s', 900.0) or 900.0)
+    use_compile_lock = _resolve_selfplay_compile_use_lock(config)
+
+    history_positions = int(config.get('model', {}).get('history_positions', 0) or 0)
+    expected_input_planes = 16 * (1 + history_positions)
+    use_amp = bool(config.get('hardware', {}).get('use_amp', False) and device.type == 'cuda')
+    use_bfloat16 = bool(config.get('hardware', {}).get('use_bfloat16', False))
+    amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+
+    try:
+        torch._dynamo.reset()
+    except Exception:
+        pass
+
+    try:
+        def _compile_and_warmup(target_model):
+            compiled_model = torch.compile(target_model, mode='default', dynamic=True)
+            dummy_input = torch.zeros(
+                1,
+                expected_input_planes,
+                8,
+                8,
+                device=device,
+                dtype=torch.float32,
+            )
+            if device.type == 'cuda':
+                dummy_input = dummy_input.to(memory_format=torch.channels_last)
+            with torch.inference_mode():
+                with torch.autocast(
+                    device_type='cuda',
+                    enabled=use_amp,
+                    dtype=amp_dtype,
+                ):
+                    compiled_model(dummy_input, apply_log_softmax=False)
+            return compiled_model
+
+        if use_compile_lock:
+            with _SelfPlayCompileLock(lock_path, timeout_s=timeout_s):
+                compiled = _compile_and_warmup(model)
+        else:
+            compiled = _compile_and_warmup(model)
+
+        return compiled
+    except Exception as exc:
+        print(
+            f"⚠️ Self-play worker {rank}: torch.compile skipped for {model_label} "
+            f"({type(exc).__name__}: {exc})"
+        )
+        return model
 
 
 def _copy_board_fast(board):
@@ -2909,6 +3097,8 @@ def _configure_selfplay_worker_runtime(config, device_id):
     rl_cfg = config.get('reinforcement_learning', {})
     self_play_threads = rl_cfg.get('self_play_torch_threads', None)
 
+    _configure_inductor_for_selfplay(config)
+
     if self_play_threads is not None:
         try:
             self_play_threads = int(self_play_threads)
@@ -3197,7 +3387,13 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
         wlog(f"Persistent worker started on {device}")
 
         model = _build_selfplay_worker_model(config, device)
-        inference_model = model
+        inference_model = _maybe_compile_selfplay_model(
+            model,
+            config,
+            device,
+            rank,
+            model_label="learner",
+        )
         opponent_model = None
         engine = None
         engine_signature = None
@@ -3231,6 +3427,13 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
                     pooled_model = _build_selfplay_worker_model(config, device)
                     _load_worker_model_state(pooled_model, entry_state, rank)
                     pooled_model.eval()
+                    pooled_model = _maybe_compile_selfplay_model(
+                        pooled_model,
+                        config,
+                        device,
+                        rank,
+                        model_label=f"opponent:{entry_label}",
+                    )
                     opponent_models_by_label[entry_label] = pooled_model
                     if opponent_model is None:
                         opponent_model = pooled_model
@@ -3326,6 +3529,13 @@ def play_games_mcts_worker(
 
         model = _build_selfplay_worker_model(config, device)
         _load_worker_model_state(model, model_state, rank)
+        model = _maybe_compile_selfplay_model(
+            model,
+            config,
+            device,
+            rank,
+            model_label="learner",
+        )
         opponent_model = None
         opponent_label = 'current'
         opponent_models_by_label = {}
@@ -3340,6 +3550,13 @@ def play_games_mcts_worker(
                 pooled_model = _build_selfplay_worker_model(config, device)
                 _load_worker_model_state(pooled_model, entry_state, rank)
                 pooled_model.eval()
+                pooled_model = _maybe_compile_selfplay_model(
+                    pooled_model,
+                    config,
+                    device,
+                    rank,
+                    model_label=f"opponent:{entry_label}",
+                )
                 opponent_models_by_label[entry_label] = pooled_model
                 if opponent_model is None:
                     opponent_model = pooled_model

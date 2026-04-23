@@ -281,6 +281,38 @@ def _score_closeness(avg_score, target_score, band):
     return max(0.0, 1.0 - distance)
 
 
+def _allocate_counts_from_weights(labels, weights, total_count):
+    labels = [str(label) for label in list(labels or [])]
+    if not labels or int(total_count) <= 0:
+        return {}
+
+    total_count = int(total_count)
+    weights_arr = np.asarray(list(weights or []), dtype=np.float64)
+    if weights_arr.size != len(labels):
+        weights_arr = np.ones((len(labels),), dtype=np.float64)
+    weights_arr = np.clip(weights_arr, 0.0, None)
+
+    weight_sum = float(weights_arr.sum())
+    if weight_sum <= 0.0:
+        weights_arr.fill(1.0 / float(len(labels)))
+    else:
+        weights_arr /= weight_sum
+
+    raw = weights_arr * float(total_count)
+    base = np.floor(raw).astype(np.int64)
+    counts = {label: int(base[idx]) for idx, label in enumerate(labels)}
+    assigned = int(sum(counts.values()))
+    remainder = int(total_count - assigned)
+    if remainder > 0:
+        order = sorted(
+            range(len(labels)),
+            key=lambda idx: (-(raw[idx] - float(base[idx])), labels[idx]),
+        )
+        for idx in order[:remainder]:
+            counts[labels[idx]] = int(counts.get(labels[idx], 0)) + 1
+    return counts
+
+
 def _safe_draw_rate(wins, draws, losses):
     total = int(wins) + int(draws) + int(losses)
     if total <= 0:
@@ -342,10 +374,23 @@ def _build_selfplay_opponent_candidates(
     recent_candidate_limit = max(1, int(rl_cfg.get('self_play_recent_candidate_pool_size', 4)))
     recent_fallback_min_count = max(1, int(rl_cfg.get('self_play_recent_fallback_min_count', 2)))
     recent_recency_bias = max(0.0, float(rl_cfg.get('self_play_recent_recency_bias', 0.35)))
+    recent_min_games_for_confidence = max(
+        1.0,
+        float(rl_cfg.get('self_play_recent_confidence_games', 24)),
+    )
+    recent_uncertainty_bonus = max(
+        0.0,
+        min(0.5, float(rl_cfg.get('self_play_recent_uncertainty_bonus', 0.15))),
+    )
+    recent_in_band_boost = max(
+        1.0,
+        float(rl_cfg.get('self_play_recent_in_band_boost', 1.10)),
+    )
     target_draw_rate = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_target_draw_rate', 0.45))))
     draw_band = max(0.01, float(rl_cfg.get('self_play_opponent_draw_band', 0.20)))
     draw_penalty_min_factor = max(0.20, min(1.0, float(rl_cfg.get('self_play_opponent_draw_penalty_min_factor', 0.70))))
     exact_draw_history = scheduler_state.get("draw_history_exact", {}) or {}
+    exact_games_history = scheduler_state.get("games_history_exact", {}) or {}
 
     candidates = []
     if current_fraction > 0.0:
@@ -395,6 +440,7 @@ def _build_selfplay_opponent_candidates(
             factor = 1.0
             avg_score = _average_score_from_history(exact_score_history.get(label, []) or [])
             avg_draw_rate = _average_score_from_history(exact_draw_history.get(label, []) or [])
+            avg_games = _average_score_from_history(exact_games_history.get(label, []) or [])
             in_band = True
             if avg_score is not None and (avg_score < recent_min_score or avg_score > recent_max_score):
                 in_band = False
@@ -413,19 +459,32 @@ def _build_selfplay_opponent_candidates(
                 draw_penalty_min_factor,
             )
             factor *= draw_penalty
+            confidence = 0.0
+            if avg_games is not None:
+                confidence = min(1.0, float(avg_games) / recent_min_games_for_confidence)
+            uncertainty_bonus = (1.0 - confidence) * recent_uncertainty_bonus
+            match_quality = _score_closeness(avg_score, target_score, band)
+            if in_band:
+                match_quality = min(1.0, match_quality * recent_in_band_boost)
+            selection_score = float(
+                (
+                    (1.0 - recent_recency_bias) * match_quality
+                    + recent_recency_bias * recency_bias
+                    + uncertainty_bonus
+                )
+                * draw_penalty
+            )
             recent_entries_all.append({
                 "label": label,
                 "state": recent_state,
                 "weight": float((0.75 + 0.25 * recency_bias) * factor),
                 "avg_score": avg_score,
                 "avg_draw_rate": avg_draw_rate,
+                "avg_games": avg_games,
                 "in_band": bool(in_band),
                 "recency_bias": recency_bias,
                 "draw_penalty": float(draw_penalty),
-                "selection_score": float(
-                    (1.0 - recent_recency_bias) * _score_closeness(avg_score, target_score, band)
-                    + recent_recency_bias * recency_bias
-                ),
+                "selection_score": selection_score,
             })
             dedup_states.append(recent_state)
         if recent_entries_all:
@@ -572,12 +631,16 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
     exact_draw_history = state.get("draw_history_exact")
     if not isinstance(exact_draw_history, dict):
         exact_draw_history = {}
+    exact_games_history = state.get("games_history_exact")
+    if not isinstance(exact_games_history, dict):
+        exact_games_history = {}
     bucket_draw_history = state.get("bucket_draw_history")
     if not isinstance(bucket_draw_history, dict):
         bucket_draw_history = {}
 
     observed_scores = {}
     exact_observed_scores = {}
+    exact_observed_games = {}
     observed_draw_rates = {}
     exact_observed_draw_rates = {}
     bucket_stats = {}
@@ -591,6 +654,7 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
             )
             if score_rate is not None:
                 exact_observed_scores[str(label)] = float(score_rate)
+                exact_observed_games[str(label)] = int(games)
             draw_rate = _safe_draw_rate(
                 (stats or {}).get("wins", 0),
                 (stats or {}).get("draws", 0),
@@ -631,6 +695,7 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
         state["bucket_score_history"] = bucket_score_history
         state["score_history_exact"] = exact_score_history
         state["draw_history_exact"] = exact_draw_history
+        state["games_history_exact"] = exact_games_history
         state["bucket_draw_history"] = bucket_draw_history
         state["score_history"] = bucket_score_history
         return state, observed_scores
@@ -643,6 +708,10 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
         history = deque(exact_draw_history.get(str(label), []), maxlen=history_size)
         history.append(float(draw_rate))
         exact_draw_history[str(label)] = list(history)
+    for label, games in exact_observed_games.items():
+        history = deque(exact_games_history.get(str(label), []), maxlen=history_size)
+        history.append(float(games))
+        exact_games_history[str(label)] = list(history)
 
     for label, score_rate in observed_scores.items():
         history = deque(bucket_score_history.get(str(label), []), maxlen=history_size)
@@ -656,6 +725,7 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
     state["bucket_score_history"] = bucket_score_history
     state["score_history_exact"] = exact_score_history
     state["draw_history_exact"] = exact_draw_history
+    state["games_history_exact"] = exact_games_history
     state["bucket_draw_history"] = bucket_draw_history
     state["score_history"] = bucket_score_history
     return state, observed_scores
@@ -733,6 +803,21 @@ def _build_selfplay_opponent_assignments(
     }
     recent_entries = list((payloads_by_label.get("recent") or {}).get("entries", []) or [])
     recent_weights = [float(entry.get("weight", 1.0)) for entry in recent_entries]
+    recent_bucket_total = int(sum(1 for label in bucket_game_plan if str(label) == "recent"))
+    recent_quota = _allocate_counts_from_weights(
+        [str(entry.get("label", "recent")) for entry in recent_entries],
+        recent_weights,
+        recent_bucket_total,
+    )
+    recent_label_plan = []
+    for entry in recent_entries:
+        entry_label = str(entry.get("label", "recent"))
+        recent_label_plan.extend([entry_label] * max(0, int(recent_quota.get(entry_label, 0))))
+    if len(recent_label_plan) < recent_bucket_total and recent_entries:
+        top_label = str(recent_entries[0].get("label", "recent"))
+        recent_label_plan.extend([top_label] * int(recent_bucket_total - len(recent_label_plan)))
+    np.random.shuffle(recent_label_plan)
+    recent_label_cursor = 0
 
     assignments = {}
     assigned_counts = defaultdict(int)
@@ -761,14 +846,19 @@ def _build_selfplay_opponent_assignments(
                 assigned_counts[best_label] += 1
                 continue
             if bucket_label == "recent" and recent_entries:
-                chosen_idx = _weighted_choice_index(recent_weights)
-                if chosen_idx is None:
-                    chosen_idx = 0
-                chosen_entry = recent_entries[int(chosen_idx)]
-                chosen_label = str(chosen_entry.get("label", "recent"))
+                if recent_label_cursor < len(recent_label_plan):
+                    chosen_label = str(recent_label_plan[recent_label_cursor])
+                    recent_label_cursor += 1
+                else:
+                    chosen_label = str(recent_entries[0].get("label", "recent"))
                 plan_labels.append(chosen_label)
-                if chosen_entry.get("state") is not None:
-                    pool_entries[chosen_label] = chosen_entry.get("state")
+                chosen_state = None
+                for entry in recent_entries:
+                    if str(entry.get("label", "recent")) == chosen_label:
+                        chosen_state = entry.get("state")
+                        break
+                if chosen_state is not None:
+                    pool_entries[chosen_label] = chosen_state
                 assigned_counts[chosen_label] += 1
                 continue
             plan_labels.append("current")
@@ -788,6 +878,7 @@ def _build_selfplay_opponent_assignments(
             "label": str(entry.get("label", "")),
             "avg_score": entry.get("avg_score", None),
             "avg_draw_rate": entry.get("avg_draw_rate", None),
+            "avg_games": entry.get("avg_games", None),
             "selection_score": entry.get("selection_score", None),
             "draw_penalty": entry.get("draw_penalty", None),
             "recency_bias": entry.get("recency_bias", None),
@@ -797,6 +888,7 @@ def _build_selfplay_opponent_assignments(
             "label": str(entry.get("label", "")),
             "avg_score": entry.get("avg_score", None),
             "avg_draw_rate": entry.get("avg_draw_rate", None),
+            "avg_games": entry.get("avg_games", None),
             "selection_score": entry.get("selection_score", None),
             "draw_penalty": entry.get("draw_penalty", None),
             "recency_bias": entry.get("recency_bias", None),
@@ -2644,6 +2736,7 @@ def main():
         'bucket_score_history': {},
         'score_history_exact': {},
         'draw_history_exact': {},
+        'games_history_exact': {},
         'bucket_draw_history': {},
     }
     if recent_snapshot_keep > 0:
@@ -3127,29 +3220,23 @@ def main():
                     1000.0 * float(nn_inference_capped) / float(nn_batch_items) if nn_batch_items > 0 else 0.0
                 )
 
-                h2d_capped = min(nn_h2d_time, nn_inference_capped)
-                gpu_forward_capped = min(nn_gpu_forward_time, nn_inference_capped)
-                gpu_postprocess_capped = min(nn_gpu_postprocess_time, nn_inference_capped)
-                d2h_capped = min(nn_d2h_time, nn_inference_capped)
-                staged_inference_total = h2d_capped + gpu_forward_capped + gpu_postprocess_capped + d2h_capped
-                if staged_inference_total > nn_inference_capped and staged_inference_total > 1e-8:
-                    stage_scale = nn_inference_capped / staged_inference_total
-                    h2d_capped *= stage_scale
-                    gpu_forward_capped *= stage_scale
-                    gpu_postprocess_capped *= stage_scale
-                    d2h_capped *= stage_scale
-                transfer_total_capped = h2d_capped + d2h_capped
+                h2d_raw = max(0.0, float(nn_h2d_time))
+                gpu_forward_raw = max(0.0, float(nn_gpu_forward_time))
+                gpu_postprocess_raw = max(0.0, float(nn_gpu_postprocess_time))
+                d2h_raw = max(0.0, float(nn_d2h_time))
+                gpu_stage_total = h2d_raw + gpu_forward_raw + gpu_postprocess_raw + d2h_raw
+                transfer_total_raw = h2d_raw + d2h_raw
 
-                def _pct_of_inference(value):
-                    return 100.0 * float(value) / max(1e-8, nn_inference_capped)
+                def _pct_of_gpu_stages(value):
+                    return 100.0 * float(value) / max(1e-8, gpu_stage_total)
 
                 gpu_bottleneck = "mixed"
-                if nn_inference_capped > 0.0:
-                    if gpu_forward_capped >= max(transfer_total_capped * 1.25, nn_inference_capped * 0.55):
+                if gpu_stage_total > 0.0:
+                    if gpu_forward_raw >= max(transfer_total_raw * 1.25, gpu_stage_total * 0.55):
                         gpu_bottleneck = "compute-bound"
-                    elif transfer_total_capped >= max(gpu_forward_capped * 0.95, nn_inference_capped * 0.45):
+                    elif transfer_total_raw >= max(gpu_forward_raw * 0.95, gpu_stage_total * 0.45):
                         gpu_bottleneck = "transfer-bound"
-                    elif gpu_postprocess_capped >= max(nn_inference_capped * 0.20, transfer_total_capped * 0.85):
+                    elif gpu_postprocess_raw >= max(gpu_stage_total * 0.20, transfer_total_raw * 0.85):
                         gpu_bottleneck = "postprocess-bound"
 
                 def _pct_of_search(value):
@@ -3211,7 +3298,10 @@ def main():
                 _print_total_line("adjudication", adjudication_time)
                 _print_total_line("syzygy", syzygy_time)
                 print("")
-                print(f"   Sekcja B: GPU ({nn_inference_capped:.2f}s inference czasu):")
+                print(
+                    f"   Sekcja B: GPU (raw_stage_sum={gpu_stage_total:.2f}s, "
+                    f"inference_wall={nn_inference_capped:.2f}s):"
+                )
                 print(
                     f"   {'gpu_utilization %':<24} "
                     f"{gpu_utilization_pct_display:7.2f}% "
@@ -3227,23 +3317,23 @@ def main():
                 )
                 print(
                     f"   {'h2d_transfer':<24} "
-                    f"{h2d_capped:7.2f}s "
-                    f"({_pct_of_inference(h2d_capped):5.1f}% inference)"
+                    f"{h2d_raw:7.2f}s "
+                    f"({_pct_of_gpu_stages(h2d_raw):5.1f}% gpu_stages)"
                 )
                 print(
                     f"   {'gpu_forward':<24} "
-                    f"{gpu_forward_capped:7.2f}s "
-                    f"({_pct_of_inference(gpu_forward_capped):5.1f}% inference)"
+                    f"{gpu_forward_raw:7.2f}s "
+                    f"({_pct_of_gpu_stages(gpu_forward_raw):5.1f}% gpu_stages)"
                 )
                 print(
                     f"   {'gpu_postprocess':<24} "
-                    f"{gpu_postprocess_capped:7.2f}s "
-                    f"({_pct_of_inference(gpu_postprocess_capped):5.1f}% inference)"
+                    f"{gpu_postprocess_raw:7.2f}s "
+                    f"({_pct_of_gpu_stages(gpu_postprocess_raw):5.1f}% gpu_stages)"
                 )
                 print(
                     f"   {'d2h_transfer':<24} "
-                    f"{d2h_capped:7.2f}s "
-                    f"({_pct_of_inference(d2h_capped):5.1f}% inference)"
+                    f"{d2h_raw:7.2f}s "
+                    f"({_pct_of_gpu_stages(d2h_raw):5.1f}% gpu_stages)"
                 )
                 print(
                     f"   {'inference_per_batch':<24} "

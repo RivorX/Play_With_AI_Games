@@ -197,7 +197,7 @@ reinforcement_learning:
   # ---------------------------
   version: "rl4"             # RL run/version tag added to RL log filenames
   iterations: 40                # Total RL iterations
-  games_per_iteration: 100      # Enough signal per iteration without stretching self-play too long
+  games_per_iteration: 400      # Enough signal per iteration without stretching self-play too long
 
   # ---------------------------
   # Self-Play Runtime
@@ -206,10 +206,12 @@ reinforcement_learning:
   self_play_workers: auto       # 0/auto = cpu_count - 1, or set explicit number
   self_play_workers_per_gpu: 10  # Better throughput on 1x RTX 5060 Ti + Ryzen 7500F; fewer workers means less GPU/context fragmentation
   self_play_torch_threads: 1    # Keep 1 thread per worker; Python MCTS already fans out across many processes
+  self_play_use_compile: true   # Self-play workers: torch.compile(mode=default) on CUDA; guarded so Windows workers don't compile/cache concurrently
   persistent_self_play_workers: true  # Keep self-play workers alive across RL iterations
   self_play_stream_to_replay: true    # Stream worker results into replay buffer to reduce parent RAM peak
   self_play_queue_transport: true     # For persistent workers + stream_to_replay: send packed batches over mp queue instead of writing them to disk
   self_play_queue_chunk_games: 5      # Number of games bundled into one queue payload
+  self_play_compile_lock_timeout_s: 900  # Max wait for another worker to finish compile/cache warmup before falling back
 
   self_play_save_every_games: 1  # Multiplier of games_per_iteration (0=off); progress still updates per finished game
   
@@ -217,7 +219,7 @@ reinforcement_learning:
   # Self-Play Game Flow
   # ---------------------------
   use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
-  max_batch_games_per_worker: 10     # Slightly smaller worker batches reduce latency spikes once search gets stronger
+  max_batch_games_per_worker: 24     # Slightly smaller worker batches reduce latency spikes once search gets stronger
   self_play_max_moves: 190          # Shorter cap: cut low-value sterile games earlier instead of harvesting many doomed draw samples
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
   self_play_claim_repetition_after_moves: 40  # Claim sterile repetition earlier to reduce low-signal looping positions
@@ -255,6 +257,9 @@ reinforcement_learning:
   self_play_recent_candidate_pool_size: 4     # From the wider recent window, expose only the best-matched few snapshots to self-play
   self_play_recent_fallback_min_count: 2      # If too few recent snapshots fall into the preferred score band, still keep at least a small fallback pool
   self_play_recent_recency_bias: 0.35         # Prefer fresher snapshots, but still let matchup quality dominate the selection
+  self_play_recent_confidence_games: 24       # Avg games needed before a recent snapshot score is treated as high-confidence
+  self_play_recent_uncertainty_bonus: 0.15    # Small exploration bonus for newer/under-tested recent snapshots
+  self_play_recent_in_band_boost: 1.10        # Slight boost for recent snapshots already inside the preferred score band
   self_play_randomize_learner_color: true     # Let the training model play both colors against frozen opponents
   self_play_opponent_adaptive_enabled: true   # Reweight best/recent opponents cautiously using observed matchup scores
   self_play_opponent_adaptive_update_every: 2 # Adjust every few iterations instead of reacting to one noisy batch
@@ -310,7 +315,7 @@ reinforcement_learning:
   # MCTS Search
   # ---------------------------
   mcts_simulations: 160     # Higher search pressure so RL learns from targets that more clearly improve over the IL prior
-  mcts_batch_size: 128        # Match the heavier search budget without overfragmenting GPU inference
+  mcts_batch_size: 256        # Match the heavier search budget without overfragmenting GPU inference
   mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
   mcts_c_puct: 1.15          # Move back toward healthier exploration; too-low PUCT was over-trusting the current policy
   mcts_dynamic_c_puct: true  # MuZero-style dynamic exploration scaling by parent visits
@@ -421,11 +426,11 @@ reinforcement_learning:
   # Loss Weights
   # ---------------------------
   policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 0.55    # Lower the value head pressure until self-play value targets are cleaner again
-  # Value loss weight schedule - drastycznie obniżamy na starcie!
+  value_loss_weight: 0.45    # Keep value learning alive, but reduce pressure until RL targets get cleaner
+  # Value loss weight schedule - start conservatively and only warm up slightly later
   value_loss_weight_schedule:
-    start: 0.50
-    end: 0.54
+    start: 0.40
+    end: 0.48
   value_guard_enabled: true
   value_guard_mae_window: 3
   value_guard_patience: 1
@@ -434,12 +439,12 @@ reinforcement_learning:
   value_guard_scale: 0.75
   value_guard_min_weight: 0.40
   value_target_noise_std: 0.0
-  value_target_temporal_decay: 0.992   # Decay decisive targets for earlier plies so value learns less from noisy distant outcomes
-  value_target_min_scale: 0.25         # Keep some supervised signal even for early-game positions
+  value_target_temporal_decay: 0.990   # Earlier plies should trust distant final outcomes less aggressively
+  value_target_min_scale: 0.18         # Reduce noisy early-game supervision from far-away terminal outcomes
   value_target_root_blend_enabled: true  # Blend final outcome with root MCTS value so early targets are less noisy
-  value_target_root_blend_start: 0.75    # Early positions lean more on root search evaluation than distant game outcome
-  value_target_root_blend_end: 0.15      # Late positions still mostly learn from the actual final outcome
-  value_target_root_blend_power: 1.5     # Decay the root-value blend smoothly as the game approaches the end
+  value_target_root_blend_start: 0.85    # Early positions should lean much more on current search evaluation
+  value_target_root_blend_end: 0.22      # Late positions still learn mostly from the real game outcome
+  value_target_root_blend_power: 1.7     # Keep the stronger root-value blend a bit longer into the game
   adaptive_dirichlet_enabled: true       # Reduce root noise when self-play turns too draw-heavy or eval stagnates
   adaptive_dirichlet_min_weight: 0.015   # Keep a small amount of root noise for exploration even under heavy draw pressure
   adaptive_dirichlet_draw_scale: 0.65    # Cut root noise harder when completed draw rate drifts above target
