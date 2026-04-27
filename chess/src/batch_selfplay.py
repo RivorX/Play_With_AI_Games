@@ -33,6 +33,7 @@ _PIECE_VALUES = {
 
 _SYZYGY_ORACLE_CACHE = {}
 _SELFPLAY_COMPILE_LOCKFILE = "selfplay_torch_compile.lock"
+_DEFAULT_REPLAY_MAX_POLICY_TARGETS = 256
 
 
 class _InductorSMWarningFilter(logging.Filter):
@@ -665,7 +666,7 @@ def _build_sparse_policy_target_from_visits(visit_counts, board):
     )
 
 
-def _pack_positions_for_transfer(positions):
+def _pack_positions_for_transfer(positions, max_policy_targets=None):
     """
     Pack self-play positions into batched tensors for queue transport.
     """
@@ -676,6 +677,8 @@ def _pack_positions_for_transfer(positions):
     boards = torch.stack([pos[0] for pos in positions]).contiguous()
     values = torch.stack([pos[3] for pos in positions]).contiguous()
     max_len = max(int(pos[1].numel()) for pos in positions)
+    if max_policy_targets is not None:
+        max_len = min(max_len, max(1, int(max_policy_targets)))
 
     policy_indices = torch.full((batch_size, max_len), -1, dtype=torch.int16)
     policy_values = torch.zeros((batch_size, max_len), dtype=torch.float32)
@@ -685,6 +688,8 @@ def _pack_positions_for_transfer(positions):
     for row_idx, pos in enumerate(positions):
         _, indices, probs, _ = pos[:4]
         count = int(indices.numel())
+        if max_policy_targets is not None:
+            count = min(count, max(1, int(max_policy_targets)))
         importance_scores[row_idx] = float(pos[4]) if len(pos) > 4 else 0.0
         if count <= 0:
             continue
@@ -701,6 +706,17 @@ def _pack_positions_for_transfer(positions):
         'importance_scores': importance_scores,
         'num_positions': batch_size,
     }
+
+
+def _resolve_replay_max_policy_targets(config):
+    rl_cfg = config.get('reinforcement_learning', {})
+    raw_value = rl_cfg.get('replay_max_policy_targets', None)
+    if raw_value is None:
+        raw_value = rl_cfg.get('policy_target_pruning_max_moves', _DEFAULT_REPLAY_MAX_POLICY_TARGETS)
+    try:
+        return max(1, int(raw_value))
+    except Exception:
+        return _DEFAULT_REPLAY_MAX_POLICY_TARGETS
 
 
 def _move_selection_temperature(board, base_temperature, threshold_fullmoves):
@@ -2339,7 +2355,10 @@ class BatchSelfPlayMCTSBatch:
             signed_outcome = outcome if turn == chess.WHITE else -outcome
             value = float(signed_outcome * temporal_scale)
 
-        if self.value_target_root_blend_enabled and total_history > 0:
+        # Keep draw targets centered at zero. Blending search value into draws
+        # makes neutral outcomes inherit noisy non-zero labels and weakens the
+        # intended zero-sum calibration of the value target.
+        if self.value_target_root_blend_enabled and total_history > 0 and outcome != 0.0:
             progress = float(history_idx) / float(max(1, total_history - 1))
             blend_progress = progress ** max(0.1, self.value_target_root_blend_power)
             search_weight = (
@@ -3250,6 +3269,7 @@ def _play_games_with_engine(
     )
 
     save_every = rl_cfg.get('self_play_save_every_games_resolved', None)
+    replay_max_policy_targets = _resolve_replay_max_policy_targets(config)
     if stream_results_to_queue:
         save_every = max(
             1,
@@ -3303,7 +3323,10 @@ def _play_games_with_engine(
                     'type': 'payload',
                     'rank': rank,
                     'task_id': task_id,
-                    'positions': _pack_positions_for_transfer(positions),
+                    'positions': _pack_positions_for_transfer(
+                        positions,
+                        max_policy_targets=replay_max_policy_targets,
+                    ),
                     'game_lengths': list(game_lengths),
                     'stats': stats,
                 })
@@ -3335,14 +3358,17 @@ def _play_games_with_engine(
         _write_progress(total_games)
 
         if stream_results_to_queue and result_queue is not None:
-            result_queue.put({
-                'type': 'payload',
-                'rank': rank,
-                'task_id': task_id,
-                'positions': _pack_positions_for_transfer(positions),
-                'game_lengths': list(game_lengths),
-                'stats': stats,
-            })
+                result_queue.put({
+                    'type': 'payload',
+                    'rank': rank,
+                    'task_id': task_id,
+                    'positions': _pack_positions_for_transfer(
+                        positions,
+                        max_policy_targets=replay_max_policy_targets,
+                    ),
+                    'game_lengths': list(game_lengths),
+                    'stats': stats,
+                })
         else:
             with open(result_file_path, 'wb') as f:
                 pickle.dump((positions, game_lengths, stats), f)

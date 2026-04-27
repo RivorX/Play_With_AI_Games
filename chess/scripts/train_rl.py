@@ -904,6 +904,17 @@ def _round_replay_capacity(value, quantum):
     return int(math.ceil(value / quantum) * quantum)
 
 
+def _resolve_replay_max_policy_targets(config):
+    rl_cfg = config.get('reinforcement_learning', {})
+    raw_value = rl_cfg.get('replay_max_policy_targets', None)
+    if raw_value is None:
+        raw_value = rl_cfg.get('policy_target_pruning_max_moves', 256)
+    try:
+        return max(1, int(raw_value))
+    except Exception:
+        return 256
+
+
 def _rl_elo_worker(
     iteration_num,
     model_state_cpu,
@@ -2749,8 +2760,10 @@ def main():
     
     # Best files are updated only when evaluation confirms model improvement.
     replay_fp16 = config['reinforcement_learning'].get('replay_fp16', False)
+    replay_max_policy_targets = _resolve_replay_max_policy_targets(config)
     replay_buffer = ReplayBuffer(
         config['reinforcement_learning']['replay_buffer_size'],
+        max_policy_targets=replay_max_policy_targets,
         use_fp16=replay_fp16,
         decisive_sampling_fraction=float(
             config['reinforcement_learning'].get('replay_decisive_sampling_fraction', 0.0)
@@ -2912,6 +2925,7 @@ def main():
     print(f"   • 🆕 Temperature Schedule: {use_temp_schedule}")
     print(f"   • 📊 Policy Accuracy & Value MAE tracking")
     print(f"   • Replay buffer capacity: {config['reinforcement_learning']['replay_buffer_size']:,} positions")
+    print(f"   • Replay policy target cap: {replay_max_policy_targets} moves/position")
     print(
         f"   • Replay buffer dynamic sizing: "
         f"bootstrap={int(config['reinforcement_learning'].get('replay_buffer_bootstrap_positions_per_iteration_resolved', 0)):,}, "
@@ -3389,6 +3403,7 @@ def main():
 
             avg_policy_entropy = 0.0
             avg_value_pred_std = 0.0
+            avg_target_value_std = 0.0
             
             # Training with metrics
             replay_size = len(replay_buffer)
@@ -3401,6 +3416,7 @@ def main():
                 total_value = 0
                 total_policy_entropy = 0
                 total_value_pred_std = 0
+                total_target_value_std = 0
                 
                 # 📊 Initialize metrics calculator
                 metrics_calc = MetricsCalculator()
@@ -3419,7 +3435,7 @@ def main():
                 ):
                     current_batch_size = batch_sizes[batch_idx % len(batch_sizes)]
                     batch = replay_buffer.sample(current_batch_size)
-                    loss, policy_loss, value_loss, policy_entropy, value_pred_std = train_on_batch_rl(
+                    loss, policy_loss, value_loss, policy_entropy, value_pred_std, target_value_std = train_on_batch_rl(
                         model,
                         optimizer,
                         batch,
@@ -3435,11 +3451,13 @@ def main():
                     total_value += value_loss
                     total_policy_entropy += policy_entropy
                     total_value_pred_std += value_pred_std
+                    total_target_value_std += target_value_std
                 avg_loss = total_loss / total_train_steps
                 avg_policy = total_policy / total_train_steps
                 avg_value = total_value / total_train_steps
                 avg_policy_entropy = total_policy_entropy / total_train_steps
                 avg_value_pred_std = total_value_pred_std / total_train_steps
+                avg_target_value_std = total_target_value_std / total_train_steps
                 
                 # 📊 Compute metrics
                 train_metrics = metrics_calc.compute()
@@ -3450,7 +3468,8 @@ def main():
                       f"MAE: {train_metrics['value_mae']:.4f}")
                 print(
                     f"📈 Entropy: {avg_policy_entropy:.4f}, "
-                    f"Pred value std: {avg_value_pred_std:.4f}"
+                    f"Pred value std: {avg_value_pred_std:.4f}, "
+                    f"Target value std: {avg_target_value_std:.4f}"
                 )
                 current_train_mae = float(train_metrics.get('value_mae', 0.0) or 0.0)
                 if current_train_mae > 0.0:
@@ -3471,6 +3490,9 @@ def main():
             if (iteration + 1) % config['reinforcement_learning']['eval_every'] == 0:
                 print("Evaluating vs best...")
                 model.eval()
+                if device.type == 'cuda' and torch.cuda.is_available():
+                    with contextlib.suppress(Exception):
+                        torch.cuda.empty_cache()
                 if staged_eval_enabled:
                     print(f"Stage 1 eval ({eval_stage1_games} games)...")
                     eval_stage1_stats = evaluate_models(
@@ -3579,7 +3601,7 @@ def main():
                     policy_loss=avg_policy,
                     value_loss=avg_value,
                     score_rate=score_rate,
-                    win_rate=score_rate,
+                    win_rate=true_win_rate,
                     true_win_rate=true_win_rate,
                     eval_wins=eval_wins,
                     eval_draws=eval_draws,
@@ -3626,7 +3648,7 @@ def main():
                         model_to_save, None, iteration, avg_loss,
                         str(best_model_rl_path),
                         {
-                            'win_rate': score_rate,
+                            'win_rate': true_win_rate,
                             'score_rate': score_rate,
                             'eval_true_win_rate': true_win_rate,
                             'policy_loss': avg_policy,
@@ -3729,7 +3751,7 @@ def main():
             logger.plot()
 
             latest_metadata = {
-                'win_rate': score_rate,
+                'win_rate': true_win_rate,
                 'score_rate': score_rate,
                 'eval_true_win_rate': true_win_rate,
                 'policy_loss': avg_policy,

@@ -4,6 +4,7 @@ Reinforcement learning training helpers.
 
 import os
 import sys
+import contextlib
 from pathlib import Path
 
 import chess
@@ -25,13 +26,25 @@ _HFLIP_INV_INDEX_MAP = None
 _HFLIP_FWD_INDEX_MAP = None
 
 
+def _snapshot_state_dict_cpu_shared(model):
+    snapshot = {}
+    for key, tensor in model.state_dict().items():
+        cpu_tensor = tensor.detach().to(device="cpu", copy=True).contiguous()
+        cpu_tensor.share_memory_()
+        snapshot[key] = cpu_tensor
+    return snapshot
+
+
 def _resolve_eval_workers(config, device, num_games):
     rl_cfg = config.get("reinforcement_learning", {})
     raw_workers = rl_cfg.get("eval_workers", None)
 
     if raw_workers is None:
         if device.type == "cuda":
-            raw_workers = rl_cfg.get("self_play_workers_per_gpu", 1)
+            # Eval loads full models + MCTS state per worker, so CUDA eval is
+            # much more memory-sensitive than self-play. Default to a single
+            # worker on GPU unless the user explicitly opts into more.
+            raw_workers = 1
         else:
             raw_workers = max(1, (os.cpu_count() or 2) - 1)
 
@@ -41,6 +54,21 @@ def _resolve_eval_workers(config, device, num_games):
         workers = 1
 
     return max(1, min(int(num_games), workers))
+
+
+def _terminate_eval_processes(processes, timeout_s=0.5):
+    for proc in list(processes or []):
+        with contextlib.suppress(Exception):
+            if proc is None or not proc.is_alive():
+                continue
+            proc.terminate()
+        with contextlib.suppress(Exception):
+            proc.join(timeout=max(0.0, float(timeout_s)))
+        with contextlib.suppress(Exception):
+            if proc is not None and proc.is_alive():
+                proc.kill()
+        with contextlib.suppress(Exception):
+            proc.join(timeout=0.2)
 
 
 def _resolve_eval_max_moves(config):
@@ -266,7 +294,6 @@ def _eval_worker(rank, model1_state, model2_state, config, device_str, game_indi
             )
             if was_unresolved:
                 unresolved += 1
-                draws += 1
                 result_queue.put({"type": "progress", "rank": rank, "completed": 1})
                 continue
             game_wins, game_draws, game_losses = _result_for_model1(model1_as_white, result)
@@ -375,9 +402,14 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
     use_amp = config["hardware"].get("use_amp", True)
     amp_dtype = torch.bfloat16 if config["hardware"].get("use_bfloat16", False) else torch.float16
 
+    value_aux_scalar_loss_weight = float(
+        config.get("reinforcement_learning", {}).get("value_aux_scalar_loss_weight", 0.25)
+    )
+
     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
         policy_pred, value_pred = model(boards)
         value_pred_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
+        target_value_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
 
         if policy_indices.numel() == 0:
             policy_loss = torch.zeros(policy_pred.size(0), device=policy_pred.device, dtype=policy_pred.dtype)
@@ -389,6 +421,7 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
 
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
             target_scalar = value_targets.squeeze()
+            target_value_std = target_scalar.std(unbiased=False)
             target_win = torch.clamp(target_scalar, min=0.0, max=1.0)
             target_loss = torch.clamp(-target_scalar, min=0.0, max=1.0)
             target_draw = torch.clamp(1.0 - torch.abs(target_scalar), min=0.0, max=1.0)
@@ -396,12 +429,22 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
             target_wdl = target_wdl / target_wdl.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
             value_log_probs = F.log_softmax(value_pred, dim=1)
-            value_loss = -(target_wdl * value_log_probs).sum(dim=1)
-            wdl_probs_detached = torch.softmax(value_pred.detach(), dim=1)
-            value_scalar_detached = wdl_probs_detached[:, 0] - wdl_probs_detached[:, 2]
+            value_ce_loss = -(target_wdl * value_log_probs).sum(dim=1)
+            value_probs = torch.softmax(value_pred, dim=1)
+            value_scalar = value_probs[:, 0] - value_probs[:, 2]
+            value_scalar_aux_loss = F.smooth_l1_loss(
+                value_scalar,
+                target_scalar,
+                reduction="none",
+                beta=0.25,
+            )
+            value_loss = value_ce_loss + value_aux_scalar_loss_weight * value_scalar_aux_loss
+            value_scalar_detached = value_scalar.detach()
             value_pred_std = value_scalar_detached.std(unbiased=False)
         else:
-            value_loss = (value_pred.squeeze() - value_targets.squeeze()) ** 2
+            target_scalar = value_targets.squeeze()
+            target_value_std = target_scalar.std(unbiased=False)
+            value_loss = (value_pred.squeeze() - target_scalar) ** 2
             value_pred_std = value_pred.detach().squeeze().std(unbiased=False)
 
         policy_loss = policy_loss.mean()
@@ -445,6 +488,7 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
         value_loss.item(),
         float(policy_entropy.detach().item()),
         float(value_pred_std.detach().item()),
+        float(target_value_std.detach().item()),
     )
 
 
@@ -512,8 +556,8 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
             "resolved_games": num_games - unresolved,
         }
 
-    model1_state = {k: v.detach().cpu() for k, v in model1.state_dict().items()}
-    model2_state = {k: v.detach().cpu() for k, v in model2.state_dict().items()}
+    model1_state = _snapshot_state_dict_cpu_shared(model1)
+    model2_state = _snapshot_state_dict_cpu_shared(model2)
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
     processes = []
@@ -547,6 +591,7 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
     unresolved = 0
     completed = 0
     eval_bar = tqdm(total=num_games, desc="Eval vs best", unit="game")
+    worker_error = None
     try:
         finished_workers = 0
         while finished_workers < len(processes):
@@ -565,11 +610,40 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
             elif message_type == "interrupt":
                 raise KeyboardInterrupt
             elif message_type == "error":
-                raise RuntimeError(f"Eval worker failed: {message.get('error', 'unknown error')}")
+                worker_error = str(message.get("error", "unknown error"))
+                _terminate_eval_processes(processes)
+                break
     finally:
         eval_bar.close()
         for p in processes:
-            p.join()
+            with contextlib.suppress(Exception):
+                p.join(timeout=0.5)
+
+    if (
+        worker_error is not None
+        and device.type == "cuda"
+        and workers > 1
+        and ("out of memory" in worker_error.lower() or "cudaerrormemoryallocation" in worker_error.lower())
+    ):
+        print("Eval OOM on multi-worker CUDA; retrying with a single CUDA eval worker.")
+        retry_config = dict(config)
+        retry_rl_cfg = dict(config.get("reinforcement_learning", {}))
+        retry_rl_cfg["eval_workers"] = 1
+        retry_config["reinforcement_learning"] = retry_rl_cfg
+        if torch.cuda.is_available():
+            with contextlib.suppress(Exception):
+                torch.cuda.empty_cache()
+        return evaluate_models(
+            model1,
+            model2,
+            retry_config,
+            device,
+            num_games=num_games,
+            game_index_offset=game_index_offset,
+            use_fixed_openings=use_fixed_openings,
+        )
+    if worker_error is not None:
+        raise RuntimeError(f"Eval worker failed: {worker_error}")
 
     if unresolved > 0:
         max_moves = _resolve_eval_max_moves(config)

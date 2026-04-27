@@ -195,9 +195,9 @@ reinforcement_learning:
   # ---------------------------
   # Core RL Loop
   # ---------------------------
-  version: "rl4"             # RL run/version tag added to RL log filenames
+  version: "rl5"             # RL run/version tag added to RL log filenames
   iterations: 40                # Total RL iterations
-  games_per_iteration: 400      # Enough signal per iteration without stretching self-play too long
+  games_per_iteration: 600      # Enough signal per iteration without stretching self-play too long
 
   # ---------------------------
   # Self-Play Runtime
@@ -269,24 +269,24 @@ reinforcement_learning:
   self_play_opponent_adaptive_band: 0.12      # Tighten the preferred difficulty band so the scheduler reacts sooner to bad matchups
   self_play_opponent_adaptive_min_factor: 0.60 # Do not fully zero out hard/easy opponents
   self_play_opponent_adaptive_max_factor: 1.40 # Also do not over-spike one opponent source
-  self_play_opponent_current_min_fraction: 0.30 # Keep current-vs-current present, but no longer let it dominate the signal
+  self_play_opponent_current_min_fraction: 0.20 # Let the scheduler reduce mirror self-play harder when it becomes too draw-heavy
   self_play_opponent_current_max_fraction: 0.55 # Also cap mirror self-play so adaptive weighting cannot drift back into draw spam
   self_play_opponent_min_score: 0.28            # Avoid opponent buckets that are so hard they mostly generate hopeless targets
   self_play_opponent_max_score: 0.72            # Avoid buckets that are so easy they stop challenging the policy
   self_play_opponent_best_min_score: 0.10       # Keep best-opponent channel alive longer; avoid dropping anchor pressure too early
   self_play_opponent_recent_min_score: 0.32     # Recent snapshots should usually be in the learnable band
   self_play_opponent_recent_max_score: 0.68     # Also skip recent snapshots that have become too easy
-  self_play_opponent_target_draw_rate: 0.45     # Prefer opponents that still produce some decisive games instead of nearly-all-draw matchups
-  self_play_opponent_draw_band: 0.20            # Tolerance band before draw-heaviness starts getting penalized
-  self_play_opponent_draw_penalty_min_factor: 0.70 # Do not fully zero out draw-heavy opponents, but make them less likely
+  self_play_opponent_target_draw_rate: 0.35     # Prefer matchups that stay meaningfully decisive instead of settling into draw-heavy shells
+  self_play_opponent_draw_band: 0.10            # React sooner once an opponent source starts producing too many draws
+  self_play_opponent_draw_penalty_min_factor: 0.45 # Penalize draw-heavy opponent sources more aggressively while still keeping some diversity
 
   # ---------------------------
   # Replay Shaping
   # ---------------------------
   replay_dynamic_cap_enabled: true
   replay_cap_fraction_decisive: 0.95          # Keep almost all decisive positions
-  replay_cap_fraction_draw: 0.12              # Keep a bit more draw structure so value targets are less brittle
-  replay_cap_min_positions: 16                # Avoid making draw games vanish completely from the replay
+  replay_cap_fraction_draw: 0.08              # Keep fewer draw positions overall so decisive trajectories dominate replay more clearly
+  replay_cap_min_positions: 12                # Still preserve some draw structure, but waste less replay budget on sterile games
   replay_cap_max_positions: 120               # Absolute hard cap to avoid RAM bloat
   
   replay_max_positions_per_game: 32           # Fallback hard cap if dynamic is disabled
@@ -339,11 +339,11 @@ reinforcement_learning:
   mcts_playout_cap_randomization_min_multiplier: 0.8  # Per move/turn use at least 80% of base mcts_simulations
   mcts_playout_cap_randomization_max_multiplier: 1.0  # Per move/turn use at most 100% of base mcts_simulations
   policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
-  policy_target_pruning_keep_top_n: 5           # Keep a wider support so RL can learn from more than only the top few searched moves
-  policy_target_pruning_max_moves: 20           # Allow more visit-support to preserve search-discovered alternatives
-  policy_target_pruning_min_prob: 0.005         # Trim only the weakest tail so promising low-probability moves still reach the learner
-  policy_target_pruning_min_fraction_of_max: 0.08 # Keep moves only if they are not far below the best visit count
-  policy_target_pruning_keep_mass: 0.92         # Keep most of the signal, trim the noisiest tail
+  policy_target_pruning_keep_top_n: 8           # Always keep a broader top slice so uncertain positions retain more searched alternatives
+  policy_target_pruning_max_moves: 28           # Let wider post-search support reach the learner before pruning the long tail
+  policy_target_pruning_min_prob: 0.005         # Still trim only the weakest tail; low-probability tactical moves can survive if search supports them
+  policy_target_pruning_min_fraction_of_max: 0.05 # Keep moves that are closer to the best visit count instead of over-sharpening the target
+  policy_target_pruning_keep_mass: 0.96         # Preserve more of the MCTS distribution when many moves are similarly plausible
   
   # ---------------------------
   # Optimizer & Training
@@ -362,6 +362,7 @@ reinforcement_learning:
   replay_buffer_min_size: 4096    # Never shrink below a small practical floor
   replay_buffer_capacity_round_to: 256  # Round capacity changes to reduce realloc noise
   replay_fp16: true             # Store replay tensors in float16 to reduce RAM (~2x)
+  replay_max_policy_targets: 28 # Hard cap for stored policy support; keeps replay/queue tensors aligned with pruning and cuts RAM
   replay_decisive_sampling_fraction: 0.22   # Keep a small decisive bias, but avoid oversampling mostly losing decisive positions
   replay_decisive_value_epsilon: 0.05       # Treat |value| > epsilon as decisive for replay sampling
   replay_hard_negative_sampling_fraction: 0.10  # Keep some tactical focus, but stop over-concentrating batches on noisy tails
@@ -375,7 +376,7 @@ reinforcement_learning:
   replay_resize_preserve_decisive_min_count: 1024 # Floor for protected decisive positions when available
   replay_importance_gating_enabled: true       # Gate per-game positions by importance before the normal replay cap
   replay_importance_gate_fraction_decisive: 0.90 # Keep more decisive trajectories intact for stabler value learning
-  replay_importance_gate_fraction_draw: 0.55   # Still filter sterile draws, but keep enough context to learn from them
+  replay_importance_gate_fraction_draw: 0.35   # Filter draw games more aggressively before the per-game cap so replay stays less draw-dominated
   replay_importance_gate_min_positions: 12     # Never let importance gating erase a game completely
   replay_importance_top_fraction: 0.70         # Mostly keep top-importance moments plus some timeline coverage
   
@@ -427,6 +428,7 @@ reinforcement_learning:
   # ---------------------------
   policy_loss_weight: 1.0    # Policy loss weight
   value_loss_weight: 0.45    # Keep value learning alive, but reduce pressure until RL targets get cleaner
+  value_aux_scalar_loss_weight: 0.25  # Extra scalar consistency term on (P(win)-P(loss)); helps prevent value collapse toward perpetual draws
   # Value loss weight schedule - start conservatively and only warm up slightly later
   value_loss_weight_schedule:
     start: 0.40
@@ -439,11 +441,11 @@ reinforcement_learning:
   value_guard_scale: 0.75
   value_guard_min_weight: 0.40
   value_target_noise_std: 0.0
-  value_target_temporal_decay: 0.990   # Earlier plies should trust distant final outcomes less aggressively
-  value_target_min_scale: 0.18         # Reduce noisy early-game supervision from far-away terminal outcomes
+  value_target_temporal_decay: 0.993   # Carry final outcomes farther back so early/midgame value targets stay informative
+  value_target_min_scale: 0.25         # Keep a stronger minimum supervision signal for early positions
   value_target_root_blend_enabled: true  # Blend final outcome with root MCTS value so early targets are less noisy
-  value_target_root_blend_start: 0.85    # Early positions should lean much more on current search evaluation
-  value_target_root_blend_end: 0.22      # Late positions still learn mostly from the real game outcome
+  value_target_root_blend_start: 0.70    # Trust root eval less early so value learns more from actual game outcomes
+  value_target_root_blend_end: 0.10      # Lean even harder on true outcomes in later plies
   value_target_root_blend_power: 1.7     # Keep the stronger root-value blend a bit longer into the game
   adaptive_dirichlet_enabled: true       # Reduce root noise when self-play turns too draw-heavy or eval stagnates
   adaptive_dirichlet_min_weight: 0.015   # Keep a small amount of root noise for exploration even under heavy draw pressure

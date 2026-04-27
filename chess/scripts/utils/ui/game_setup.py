@@ -345,8 +345,13 @@ def load_model_from_checkpoint(checkpoint_path, config, device, model_class, ver
                     print(f"  Val Loss: {float(val_loss):.4f}")
                 print(f"  Policy Loss: {checkpoint['val_policy_loss']:.4f}")
                 print(f"  Value Loss: {checkpoint['val_value_loss']:.4f}")
-            elif "win_rate" in checkpoint:
-                print(f"  Win Rate: {checkpoint['win_rate']:.2%}")
+            elif "score_rate" in checkpoint or "win_rate" in checkpoint:
+                score_rate = checkpoint.get("score_rate", checkpoint.get("win_rate"))
+                if isinstance(score_rate, (int, float)):
+                    print(f"  Score Rate: {float(score_rate):.2%}")
+                true_win_rate = checkpoint.get("eval_true_win_rate", checkpoint.get("true_win_rate", checkpoint.get("win_rate")))
+                if isinstance(true_win_rate, (int, float)):
+                    print(f"  True Win Rate: {float(true_win_rate):.2%}")
     else:
         runtime_config = copy.deepcopy(config)
         runtime_config.setdefault("model", {})

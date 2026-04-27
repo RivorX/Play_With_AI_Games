@@ -428,9 +428,9 @@ def apply_rl_startup_plan(
                 if checkpoint_epoch is not None:
                     start_iteration = max(0, checkpoint_epoch + 1)
 
-                checkpoint_win_rate = _safe_float(checkpoint.get("win_rate"))
-                if checkpoint_win_rate is not None:
-                    best_win_rate = checkpoint_win_rate
+                checkpoint_score_rate = _safe_float(checkpoint.get("score_rate", checkpoint.get("win_rate")))
+                if checkpoint_score_rate is not None:
+                    best_win_rate = checkpoint_score_rate
 
                 if optimizer is not None:
                     optimizer_state = checkpoint.get("optimizer_state_dict")

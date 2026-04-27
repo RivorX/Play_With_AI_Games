@@ -17,6 +17,7 @@ class ReplayBuffer:
     def __init__(
         self,
         max_size,
+        max_policy_targets=_DEFAULT_MAX_POLICY_TARGETS,
         use_fp16=False,
         decisive_sampling_fraction=0.0,
         decisive_value_epsilon=0.05,
@@ -31,6 +32,7 @@ class ReplayBuffer:
         resize_preserve_decisive_min_count=0,
     ):
         self.max_size = int(max_size)
+        self.max_policy_targets = max(1, int(max_policy_targets))
         self.use_fp16 = bool(use_fp16)
         self.decisive_sampling_fraction = max(0.0, min(1.0, float(decisive_sampling_fraction)))
         self.decisive_value_epsilon = max(0.0, float(decisive_value_epsilon))
@@ -83,12 +85,12 @@ class ReplayBuffer:
         self._boards = torch.empty((self.max_size, *board_shape), dtype=board_dtype)
         self._values = torch.empty((self.max_size, 1), dtype=board_dtype)
         self._policy_indices = torch.full(
-            (self.max_size, _DEFAULT_MAX_POLICY_TARGETS),
+            (self.max_size, self.max_policy_targets),
             -1,
             dtype=torch.int16,
         )
         self._policy_values = torch.zeros(
-            (self.max_size, _DEFAULT_MAX_POLICY_TARGETS),
+            (self.max_size, self.max_policy_targets),
             dtype=probs_dtype,
         )
         self._policy_lengths = torch.zeros((self.max_size,), dtype=torch.int16)
@@ -137,8 +139,8 @@ class ReplayBuffer:
         board, policy_indices, policy_values, value, importance = self._normalize_position(position)
 
         count = int(policy_indices.numel())
-        if count > _DEFAULT_MAX_POLICY_TARGETS:
-            count = _DEFAULT_MAX_POLICY_TARGETS
+        if count > self.max_policy_targets:
+            count = self.max_policy_targets
             policy_indices = policy_indices[:count]
             policy_values = policy_values[:count]
 
@@ -202,8 +204,8 @@ class ReplayBuffer:
             importance_scores = importance_scores.reshape(-1).to(dtype=torch.float32).contiguous()
 
         max_len = int(policy_indices.shape[1]) if policy_indices.dim() == 2 else 0
-        if max_len > _DEFAULT_MAX_POLICY_TARGETS:
-            max_len = _DEFAULT_MAX_POLICY_TARGETS
+        if max_len > self.max_policy_targets:
+            max_len = self.max_policy_targets
             policy_indices = policy_indices[:, :max_len]
             policy_values = policy_values[:, :max_len]
             policy_lengths = torch.clamp(policy_lengths, max=max_len)
@@ -478,12 +480,12 @@ class ReplayBuffer:
         self._boards = torch.empty((self.max_size, *board_shape), dtype=board_dtype)
         self._values = torch.empty((self.max_size, 1), dtype=old_values.dtype)
         self._policy_indices = torch.full(
-            (self.max_size, _DEFAULT_MAX_POLICY_TARGETS),
+            (self.max_size, self.max_policy_targets),
             -1,
             dtype=old_policy_indices.dtype,
         )
         self._policy_values = torch.zeros(
-            (self.max_size, _DEFAULT_MAX_POLICY_TARGETS),
+            (self.max_size, self.max_policy_targets),
             dtype=probs_dtype,
         )
         self._policy_lengths = torch.zeros((self.max_size,), dtype=old_policy_lengths.dtype)
