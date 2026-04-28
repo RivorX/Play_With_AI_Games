@@ -374,7 +374,7 @@ def _maybe_augment_batch(boards, policy_indices, policy_values, policy_mask, con
 
 
 def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_calc=None, value_weight_override=None):
-    boards, policy_indices, policy_values, policy_mask, value_targets = batch
+    boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights = batch
     if config["reinforcement_learning"].get("replay_fp16", False):
         boards = boards.float()
         policy_values = policy_values.float()
@@ -388,6 +388,8 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
     policy_values = policy_values.to(device, non_blocking=True)
     policy_mask = policy_mask.to(device, non_blocking=True)
     value_targets = value_targets.to(device, non_blocking=True)
+    policy_sample_weights = policy_sample_weights.to(device, non_blocking=True)
+    effective_policy_mask = policy_mask & (policy_sample_weights.unsqueeze(1) > 0)
 
     value_target_noise_std = float(config.get("reinforcement_learning", {}).get("value_target_noise_std", 0.0))
     if value_target_noise_std > 0:
@@ -416,8 +418,9 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
         else:
             safe_indices = policy_indices.long().clamp_min(0)
             gathered_log_probs = torch.gather(policy_pred, 1, safe_indices)
-            gathered_log_probs = torch.where(policy_mask, gathered_log_probs, torch.zeros_like(gathered_log_probs))
+            gathered_log_probs = torch.where(effective_policy_mask, gathered_log_probs, torch.zeros_like(gathered_log_probs))
             policy_loss = -(policy_values * gathered_log_probs).sum(dim=1)
+            policy_loss = policy_loss * policy_sample_weights.to(dtype=policy_loss.dtype)
 
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
             target_scalar = value_targets.squeeze()
@@ -447,7 +450,14 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
             value_loss = (value_pred.squeeze() - target_scalar) ** 2
             value_pred_std = value_pred.detach().squeeze().std(unbiased=False)
 
-        policy_loss = policy_loss.mean()
+        if policy_loss.numel() == 0:
+            policy_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        else:
+            policy_weight_total = policy_sample_weights.to(dtype=policy_loss.dtype).sum()
+            if float(policy_weight_total.detach().item()) > 0.0:
+                policy_loss = policy_loss.sum() / policy_weight_total
+            else:
+                policy_loss = policy_loss.sum() * 0.0
         value_loss = value_loss.mean()
         policy_weight = config["reinforcement_learning"]["policy_loss_weight"]
         value_weight = (

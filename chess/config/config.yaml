@@ -195,7 +195,7 @@ reinforcement_learning:
   # ---------------------------
   # Core RL Loop
   # ---------------------------
-  version: "rl5"             # RL run/version tag added to RL log filenames
+  version: "rl6"             # RL run/version tag added to RL log filenames
   iterations: 40                # Total RL iterations
   games_per_iteration: 600      # Enough signal per iteration without stretching self-play too long
 
@@ -335,9 +335,12 @@ reinforcement_learning:
   mcts_tactical_check_bonus: 0.06     # Checks are often tactically forcing
   mcts_tactical_promotion_bonus: 0.12 # Promotions are rare and critical
   mcts_tactical_recapture_bonus: 0.08 # Helps short tactical recapture sequences
-  mcts_playout_cap_randomization_enabled: true  # Randomize self-play search budget around the base MCTS budget to trade some strength for much better throughput
-  mcts_playout_cap_randomization_min_multiplier: 0.8  # Per move/turn use at least 80% of base mcts_simulations
-  mcts_playout_cap_randomization_max_multiplier: 1.0  # Per move/turn use at most 100% of base mcts_simulations
+  mcts_adaptive_search_enabled: true            # Stop self-play search early when the root move distribution is already confident instead of using a random playout cap
+  mcts_adaptive_search_min_simulations: 64      # Never stop before this many sims; easy positions still get a minimum amount of search
+  mcts_adaptive_search_top_visit_confidence: 0.76 # Early-stop only when the best move owns a large share of root visits
+  mcts_adaptive_search_visit_gap: 0.2           # Also require a healthy lead over the runner-up move
+  mcts_adaptive_search_max_entropy: 0.52        # Prevent early stop when root policy is still broad/uncertain
+  mcts_adaptive_policy_weight_min_fraction: 0.75 # Policy target gets weight 1 only if search used at least this fraction of the full budget
   policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
   policy_target_pruning_keep_top_n: 8           # Always keep a broader top slice so uncertain positions retain more searched alternatives
   policy_target_pruning_max_moves: 28           # Let wider post-search support reach the learner before pruning the long tail

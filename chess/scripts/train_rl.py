@@ -1762,6 +1762,9 @@ def play_games_parallel_mcts(
     queue_total_value_sq_sum = 0.0
     queue_total_value_count = 0
     queue_total_resigned_games = 0
+    queue_search_simulations_used_sum = 0
+    queue_search_samples = 0
+    queue_search_simulations_used_samples = []
     queue_wait_total_s = 0.0
     queue_wait_events = 0
     queue_profile_stats = {}
@@ -1957,6 +1960,7 @@ def play_games_parallel_mcts(
                                     policy_values = packed.get('policy_values')
                                     policy_lengths = packed.get('policy_lengths')
                                     importance_scores = packed.get('importance_scores')
+                                    policy_weights = packed.get('policy_weights')
                                     values = packed.get('values')
                                     chunk_positions = int(packed.get('num_positions', 0) or 0)
                                     if (
@@ -1974,6 +1978,7 @@ def play_games_parallel_mcts(
                                             policy_lengths,
                                             values,
                                             importance_scores=importance_scores,
+                                            policy_weights=policy_weights,
                                         )
                                     queue_total_positions += chunk_positions
                                     if values is not None:
@@ -1999,6 +2004,9 @@ def play_games_parallel_mcts(
                                 queue_total_curriculum_dropped_positions += int(chunk_stats.get('curriculum_dropped_positions', 0))
                                 queue_total_cap_dropped_positions += int(chunk_stats.get('cap_dropped_positions', 0))
                                 queue_total_resigned_games += int(chunk_stats.get('resigned_games', 0))
+                                queue_search_simulations_used_sum += int(chunk_stats.get('search_simulations_used_sum', 0))
+                                queue_search_samples += int(chunk_stats.get('search_samples', 0))
+                                queue_search_simulations_used_samples.extend(list(chunk_stats.get('search_simulations_used_samples', []) or []))
                                 _accumulate_profile_stats(queue_profile_stats, chunk_stats.get('profile', {}) or {})
                                 source_counts = dict(chunk_stats.get('opponent_source_counts', {}) or {})
                                 if source_counts:
@@ -2142,6 +2150,9 @@ def play_games_parallel_mcts(
     total_value_sq_sum = queue_total_value_sq_sum if use_queue_transport else 0.0
     total_value_count = queue_total_value_count if use_queue_transport else 0
     total_resigned_games = queue_total_resigned_games if use_queue_transport else 0
+    total_search_simulations_used_sum = queue_search_simulations_used_sum if use_queue_transport else 0
+    total_search_samples = queue_search_samples if use_queue_transport else 0
+    total_search_simulations_used_samples = list(queue_search_simulations_used_samples) if use_queue_transport else []
     total_profile_stats = dict(queue_profile_stats) if use_queue_transport else {}
     if use_queue_transport:
         avg_queue_wait_ms = 1000.0 * float(queue_wait_total_s) / float(max(1, queue_wait_events))
@@ -2210,6 +2221,9 @@ def play_games_parallel_mcts(
                             total_curriculum_dropped_positions += int((stats or {}).get('curriculum_dropped_positions', 0))
                             total_cap_dropped_positions += int((stats or {}).get('cap_dropped_positions', 0))
                             total_resigned_games += int((stats or {}).get('resigned_games', 0))
+                            total_search_simulations_used_sum += int((stats or {}).get('search_simulations_used_sum', 0))
+                            total_search_samples += int((stats or {}).get('search_samples', 0))
+                            total_search_simulations_used_samples.extend(list((stats or {}).get('search_simulations_used_samples', []) or []))
                             _accumulate_profile_stats(total_profile_stats, (stats or {}).get('profile', {}) or {})
                             source_counts = dict((stats or {}).get('opponent_source_counts', {}) or {})
                             if source_counts:
@@ -2391,6 +2405,9 @@ def play_games_parallel_mcts(
         'curriculum_dropped_positions': int(total_curriculum_dropped_positions),
         'cap_dropped_positions': int(total_cap_dropped_positions),
         'resigned_games': int(total_resigned_games),
+        'search_simulations_used_avg': float(total_search_simulations_used_sum) / float(total_search_samples) if total_search_samples > 0 else 0.0,
+        'search_simulations_used_p10': float(np.percentile(np.asarray(total_search_simulations_used_samples, dtype=np.float32), 10)) if total_search_simulations_used_samples else 0.0,
+        'search_samples': int(total_search_samples),
         'opponent_results': {
             str(label): {
                 'wins': int((stats or {}).get('wins', 0)),
@@ -3169,6 +3186,11 @@ def main():
                 f"📊 Self-play stats: draw_rate={float((selfplay_stats or {}).get('completed_draw_rate', 0.0)):.2%}, "
                 f"avg_value={float((selfplay_stats or {}).get('avg_game_value', 0.0)):.3f}, "
                 f"value_std={float((selfplay_stats or {}).get('value_std', 0.0)):.3f}"
+            )
+            print(
+                f"🎯 MCTS sims: avg={float((selfplay_stats or {}).get('search_simulations_used_avg', 0.0)):.1f}, "
+                f"p10={float((selfplay_stats or {}).get('search_simulations_used_p10', 0.0)):.1f}, "
+                f"samples={int((selfplay_stats or {}).get('search_samples', 0))}"
             )
             print(
                 f"📦 Replay shaping: curriculum_drop={int((selfplay_stats or {}).get('curriculum_dropped_positions', 0))}, "

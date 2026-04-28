@@ -1,7 +1,6 @@
 """
 🎯 BATCH SELF-PLAY WITH FULL MCTS - AlphaZero Style
 Plays multiple games using MCTS for move selection
-
 ✅ CORRECT IMPLEMENTATION:
 - Uses MCTS for all move selections (not raw network)
 - Training targets = MCTS visit distributions
@@ -684,6 +683,7 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     policy_values = torch.zeros((batch_size, max_len), dtype=torch.float32)
     policy_lengths = torch.zeros((batch_size,), dtype=torch.int16)
     importance_scores = torch.zeros((batch_size,), dtype=torch.float32)
+    policy_weights = torch.ones((batch_size,), dtype=torch.float32)
 
     for row_idx, pos in enumerate(positions):
         _, indices, probs, _ = pos[:4]
@@ -691,6 +691,7 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         if max_policy_targets is not None:
             count = min(count, max(1, int(max_policy_targets)))
         importance_scores[row_idx] = float(pos[4]) if len(pos) > 4 else 0.0
+        policy_weights[row_idx] = float(pos[5]) if len(pos) > 5 else 1.0
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -704,6 +705,7 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         'policy_lengths': policy_lengths,
         'values': values,
         'importance_scores': importance_scores,
+        'policy_weights': policy_weights,
         'num_positions': batch_size,
     }
 
@@ -857,6 +859,29 @@ class MultiGameBatchMCTS:
         )
         self.fpu_absolute = config['reinforcement_learning'].get('mcts_fpu_absolute', None)
         self.eval_batch_size = config['reinforcement_learning'].get('mcts_batch_size', 32)
+        self.adaptive_search_enabled = bool(
+            config['reinforcement_learning'].get('mcts_adaptive_search_enabled', True)
+        )
+        self.adaptive_search_min_simulations = max(
+            1,
+            int(config['reinforcement_learning'].get('mcts_adaptive_search_min_simulations', 64)),
+        )
+        self.adaptive_search_top_visit_confidence = max(
+            0.0,
+            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_top_visit_confidence', 0.84))),
+        )
+        self.adaptive_search_visit_gap = max(
+            0.0,
+            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_visit_gap', 0.28))),
+        )
+        self.adaptive_search_max_entropy = max(
+            0.0,
+            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_max_entropy', 0.40))),
+        )
+        self.adaptive_policy_weight_min_fraction = max(
+            0.0,
+            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_policy_weight_min_fraction', 0.90))),
+        )
 
         # History configuration (POV)
         self.history_positions = config['model'].get('history_positions', 0)
@@ -1232,7 +1257,61 @@ class MultiGameBatchMCTS:
             node.visit_count += 1
             value = -value
 
-    def search_many(self, game_states, num_simulations, add_root_noise=False):
+    def _summarize_root_search(self, root, simulation_budget, initial_root_visits=0):
+        budget = max(1, int(simulation_budget))
+        total_root_visits = 0 if root is None else int(getattr(root, 'visit_count', 0) or 0)
+        used = max(0, total_root_visits - max(0, int(initial_root_visits)))
+        summary = {
+            'simulations_used': used,
+            'simulation_budget': budget,
+            'top_visit_prob': 0.0,
+            'visit_gap': 0.0,
+            'visit_entropy': 1.0,
+            'stopped_early': used < budget,
+            'policy_weight': 1.0 if used >= int(math.ceil(budget * self.adaptive_policy_weight_min_fraction)) else 0.0,
+        }
+        if root is None or not root.expanded or root.edges is None:
+            return summary
+
+        visits = root.edges.visit_counts.astype(np.float32, copy=False)
+        visits = visits[visits > 0]
+        total = float(visits.sum())
+        if total <= 0.0:
+            return summary
+
+        visits.sort()
+        top = float(visits[-1])
+        second = float(visits[-2]) if visits.size > 1 else 0.0
+        probs = visits / total
+        entropy = 0.0
+        if probs.size > 1:
+            entropy = float(-(probs * np.log(np.clip(probs, 1e-8, 1.0))).sum())
+            entropy /= float(np.log(probs.size))
+
+        summary['top_visit_prob'] = top / total
+        summary['visit_gap'] = max(0.0, (top - second) / total)
+        summary['visit_entropy'] = float(max(0.0, min(1.0, entropy)))
+        return summary
+
+    def _should_stop_adaptive_search(self, root, simulation_budget, initial_root_visits=0):
+        if not self.adaptive_search_enabled:
+            return False
+        summary = self._summarize_root_search(root, simulation_budget, initial_root_visits=initial_root_visits)
+        used = int(summary['simulations_used'])
+        if used < self.adaptive_search_min_simulations:
+            return False
+        if root is None or not root.expanded or root.edges is None:
+            return False
+        legal_count = len(root.edges.moves) if root.edges.moves is not None else 0
+        if legal_count <= 1:
+            return True
+        return bool(
+            summary['top_visit_prob'] >= self.adaptive_search_top_visit_confidence
+            and summary['visit_gap'] >= self.adaptive_search_visit_gap
+            and summary['visit_entropy'] <= self.adaptive_search_max_entropy
+        )
+
+    def search_many(self, game_states, num_simulations, add_root_noise=False, return_search_metadata=False):
         """
         Run MCTS for multiple games and batch leaf evaluations across games.
 
@@ -1243,12 +1322,15 @@ class MultiGameBatchMCTS:
             List[Dict[chess.Move, int]] visit counts for each game in order
         """
         if not game_states:
+            if return_search_metadata:
+                return [], []
             return []
         search_t0 = time.perf_counter() if self.profile_enabled else None
 
         game_count = len(game_states)
         boards = [None] * game_count
         roots = [None] * game_count
+        initial_root_visits = [0] * game_count
         root_synced_flags = [False] * game_count
         needs_root_noise_on_expand = [False] * game_count
         board_histories = [None] * game_count
@@ -1296,6 +1378,7 @@ class MultiGameBatchMCTS:
                 root_synced = False
 
             roots[idx] = root
+            initial_root_visits[idx] = 0 if root is None else int(getattr(root, 'visit_count', 0) or 0)
             root_synced_flags[idx] = bool(root_synced)
             if add_root_noise and root.expanded:
                 self._apply_root_noise(root)
@@ -1379,6 +1462,19 @@ class MultiGameBatchMCTS:
                 for node in search_path:
                     node.remove_virtual_loss()
 
+            if self.adaptive_search_enabled:
+                for idx, root in enumerate(roots):
+                    if remaining[idx] <= 0:
+                        continue
+                    if not self._should_stop_adaptive_search(
+                        root,
+                        num_simulations,
+                        initial_root_visits=initial_root_visits[idx],
+                    ):
+                        continue
+                    total_remaining -= int(remaining[idx])
+                    remaining[idx] = 0
+
         # Sync roots back to caller-provided state containers.
         for idx, gs in enumerate(game_states):
             if is_mapping_state[idx]:
@@ -1395,9 +1491,19 @@ class MultiGameBatchMCTS:
             (root.child_visit_dict() if root is not None else {})
             for root in roots
         ]
+        search_metadata = [
+            self._summarize_root_search(
+                root,
+                num_simulations,
+                initial_root_visits=initial_root_visits[idx],
+            )
+            for idx, root in enumerate(roots)
+        ]
         if self.profile_enabled:
             self._profile_add('search_many_time', time.perf_counter() - search_t0)
             self._profile_inc('search_many_calls', 1)
+        if return_search_metadata:
+            return result, search_metadata
         return result
 
     def _batch_expand_and_evaluate(
@@ -1829,22 +1935,6 @@ class BatchSelfPlayMCTSBatch:
         self.replay_cap_fraction_draw = float(rl_cfg.get('replay_cap_fraction_draw', 0.15))
         self.replay_cap_min_positions = int(rl_cfg.get('replay_cap_min_positions', 16))
         self.replay_cap_max_positions = int(rl_cfg.get('replay_cap_max_positions', 120))
-        self.playout_cap_randomization_enabled = bool(
-            rl_cfg.get('mcts_playout_cap_randomization_enabled', False)
-        )
-        try:
-            min_multiplier = float(rl_cfg.get('mcts_playout_cap_randomization_min_multiplier', 0.5))
-        except Exception:
-            min_multiplier = 0.5
-        try:
-            max_multiplier = float(rl_cfg.get('mcts_playout_cap_randomization_max_multiplier', 1.0))
-        except Exception:
-            max_multiplier = 1.0
-        self.playout_cap_randomization_min_multiplier = max(0.01, float(min_multiplier))
-        self.playout_cap_randomization_max_multiplier = max(
-            self.playout_cap_randomization_min_multiplier,
-            float(max_multiplier),
-        )
         self.policy_target_pruning_enabled = bool(
             rl_cfg.get('policy_target_pruning_enabled', False)
         )
@@ -2020,15 +2110,6 @@ class BatchSelfPlayMCTSBatch:
         gpu_utilization_pct = 100.0 * float(nn_time) / max(1e-8, float(search_many_time))
         aggregated['gpu_utilization_pct'] = float(max(0.0, min(100.0, gpu_utilization_pct)))
         return aggregated
-
-    def _sample_num_simulations(self):
-        if not self.playout_cap_randomization_enabled:
-            return self.num_simulations
-        sampled_multiplier = np.random.uniform(
-            self.playout_cap_randomization_min_multiplier,
-            self.playout_cap_randomization_max_multiplier,
-        )
-        return max(1, int(round(self.num_simulations * sampled_multiplier)))
 
     def _prune_policy_target_visits(self, visit_counts):
         if not self.policy_target_pruning_enabled or not visit_counts:
@@ -2343,6 +2424,7 @@ class BatchSelfPlayMCTSBatch:
         history_count, policy_indices, policy_values, turn = history_entry[:4]
         importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
         root_value = float(history_entry[5]) if len(history_entry) > 5 else 0.0
+        policy_weight = float(history_entry[6]) if len(history_entry) > 6 else 1.0
 
         if outcome == 0.0:
             value = draw_value_target
@@ -2380,6 +2462,7 @@ class BatchSelfPlayMCTSBatch:
             'turn': turn,
             'value': value,
             'importance_score': importance_score,
+            'policy_weight': policy_weight,
         }
 
     def _compute_position_importance(self, board, move, visit_counts, root):
@@ -2461,6 +2544,7 @@ class BatchSelfPlayMCTSBatch:
                 item['policy_values'],
                 torch.tensor([item['value']], dtype=torch.float32),
                 float(item.get('importance_score', 0.0)),
+                float(item.get('policy_weight', 1.0)),
             ))
         if self.profile_enabled:
             self._profile_add('policy_target_postgame_time', time.perf_counter() - postgame_t0)
@@ -2638,6 +2722,9 @@ class BatchSelfPlayMCTSBatch:
         total_syzygy_ended_games = 0
         total_syzygy_probe_positions = 0
         total_syzygy_probe_hits = 0
+        total_search_simulations_used = 0
+        total_search_samples = 0
+        search_simulations_used_samples = []
         opponent_source_counts = {}
         opponent_source_results = {}
 
@@ -2669,6 +2756,9 @@ class BatchSelfPlayMCTSBatch:
             total_syzygy_ended_games += int(batch_stats.get('syzygy_ended_games', 0))
             total_syzygy_probe_positions += int(batch_stats.get('syzygy_probe_positions', 0))
             total_syzygy_probe_hits += int(batch_stats.get('syzygy_probe_hits', 0))
+            total_search_simulations_used += int(batch_stats.get('search_simulations_used_sum', 0))
+            total_search_samples += int(batch_stats.get('search_samples', 0))
+            search_simulations_used_samples.extend(list(batch_stats.get('search_simulations_used_samples', []) or []))
             for label, count in dict(batch_stats.get('opponent_source_counts', {}) or {}).items():
                 opponent_source_counts[str(label)] = int(opponent_source_counts.get(str(label), 0)) + int(count)
             for label, stats in dict(batch_stats.get('opponent_source_results', {}) or {}).items():
@@ -2689,6 +2779,16 @@ class BatchSelfPlayMCTSBatch:
             source_label = 'mixed'
         elif len(opponent_source_counts) == 1:
             source_label = next(iter(opponent_source_counts.keys()))
+        avg_search_simulations_used = (
+            float(total_search_simulations_used) / float(total_search_samples)
+            if total_search_samples > 0
+            else 0.0
+        )
+        p10_search_simulations_used = (
+            float(np.percentile(np.asarray(search_simulations_used_samples, dtype=np.float32), 10))
+            if search_simulations_used_samples
+            else 0.0
+        )
         self.last_selfplay_stats = {
             'truncated_games': total_truncated_games,
             'completed_games': max(0, total_games - total_truncated_games),
@@ -2710,6 +2810,11 @@ class BatchSelfPlayMCTSBatch:
             'opponent_source': source_label,
             'opponent_source_counts': opponent_source_counts,
             'opponent_source_results': opponent_source_results,
+            'search_simulations_used_avg': float(avg_search_simulations_used),
+            'search_simulations_used_p10': float(p10_search_simulations_used),
+            'search_simulations_used_sum': int(total_search_simulations_used),
+            'search_simulations_used_samples': list(search_simulations_used_samples),
+            'search_samples': int(total_search_samples),
             'total_games': int(total_games),
             'profile': self._aggregate_engine_profile_stats(),
         }
@@ -2778,6 +2883,9 @@ class BatchSelfPlayMCTSBatch:
             })
             self._apply_opening_prefix(game_states[-1])
 
+        # Initialize search statistics used across this batch
+        search_stats = {'sim_used': 0, 'samples': 0, 'samples_list': []}
+
         while True:
             active_indices = []
             learner_indices = []
@@ -2812,7 +2920,7 @@ class BatchSelfPlayMCTSBatch:
                 break
 
             visit_counts_by_index = {}
-            simulations_this_turn = self._sample_num_simulations()
+            simulations_this_turn = self.num_simulations
 
             def _run_search_for_indices(indices, mcts_ref, root_key, synced_key):
                 if not indices:
@@ -2826,16 +2934,26 @@ class BatchSelfPlayMCTSBatch:
                         bool(gs.get(synced_key, False)),
                         gs['board_history'],
                     ])
-                visit_counts_list_group = mcts_ref.search_many(
+                visit_counts_list_group, search_metadata_group = mcts_ref.search_many(
                     group_states,
                     num_simulations=simulations_this_turn,
                     add_root_noise=True,
+                    return_search_metadata=True,
                 )
-                for gs_idx, local_state, visit_counts in zip(indices, group_states, visit_counts_list_group):
+                for gs_idx, local_state, visit_counts, search_metadata in zip(
+                    indices,
+                    group_states,
+                    visit_counts_list_group,
+                    search_metadata_group,
+                ):
                     gs = game_states[gs_idx]
                     gs[root_key] = local_state[1]
                     gs[synced_key] = bool(local_state[2])
-                    visit_counts_by_index[gs_idx] = visit_counts
+                    visit_counts_by_index[gs_idx] = (visit_counts, search_metadata)
+                    used = int(search_metadata.get('simulations_used', 0)) if isinstance(search_metadata, dict) else 0
+                    search_stats['sim_used'] += used
+                    search_stats['samples'] += 1
+                    search_stats['samples_list'].append(used)
 
             if not self.opponent_mcts_by_label:
                 _run_search_for_indices(active_indices, self.mcts, 'root', '_root_synced')
@@ -2850,9 +2968,10 @@ class BatchSelfPlayMCTSBatch:
             for idx in active_indices:
                 gs = game_states[idx]
                 board = gs['board']
-                visit_counts = visit_counts_by_index.get(idx, None)
-                if visit_counts is None:
+                visit_payload = visit_counts_by_index.get(idx, None)
+                if visit_payload is None:
                     continue
+                visit_counts, search_metadata = visit_payload
 
                 if self.temp_threshold > 0 and gs['move_count'] < self.temp_threshold:
                     temperature = self.temperature
@@ -2895,6 +3014,7 @@ class BatchSelfPlayMCTSBatch:
                     history_count = len(gs['board_history'])
                     importance_score = self._compute_position_importance(board, move, visit_counts, root)
                     root_value = 0.0
+                    policy_weight = float(search_metadata.get('policy_weight', 1.0)) if isinstance(search_metadata, dict) else 1.0
                     if root is not None:
                         root_visits = int(getattr(root, 'visit_count', 0) or 0)
                         if root_visits > 0:
@@ -2906,6 +3026,7 @@ class BatchSelfPlayMCTSBatch:
                         board.turn,
                         importance_score,
                         root_value,
+                        policy_weight,
                     ))
                     if self.profile_enabled:
                         self._profile_add('policy_target_build_time', time.perf_counter() - policy_t0)
@@ -3078,6 +3199,9 @@ class BatchSelfPlayMCTSBatch:
             'syzygy_ended_games': int(syzygy_ended_games),
             'syzygy_probe_positions': int(syzygy_probe_positions),
             'syzygy_probe_hits': int(syzygy_probe_hits),
+            'search_simulations_used_sum': int(search_stats['sim_used']),
+            'search_samples': int(search_stats['samples']),
+            'search_simulations_used_samples': list(search_stats['samples_list']),
             'resigned_games': int(resigned_games),
             'completed_length_sum': int(completed_length_sum),
             'truncated_length_sum': int(truncated_length_sum),
