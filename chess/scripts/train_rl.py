@@ -1,10 +1,10 @@
-"""
+﻿"""
 Reinforcement Learning Training Script with Comprehensive Metrics
 
 NEW Features:
-- 📊 Policy Accuracy tracking during training
-- 📊 Value MAE monitoring
-- 📊 Enhanced self-play statistics
+- đź“Š Policy Accuracy tracking during training
+- đź“Š Value MAE monitoring
+- đź“Š Enhanced self-play statistics
 """
 
 import os
@@ -72,11 +72,14 @@ from src.model import ChessNet, save_checkpoint, normalize_state_dict_keys, load
 
 # Import MCTS self-play
 try:
-    from src.batch_selfplay import play_games_mcts_worker, persistent_selfplay_worker
+    from src.batch_selfplay import (
+        play_games_mcts_worker,
+        _resolve_replay_max_policy_targets,
+    )
     MCTS_SELFPLAY_AVAILABLE = True
 except ImportError:
     MCTS_SELFPLAY_AVAILABLE = False
-    print("⚠️ MCTS self-play not available")
+    print("âš ď¸Ź MCTS self-play not available")
 
 # Import from utils
 from utils.shared.logger import TrainingLogger
@@ -85,6 +88,19 @@ from utils.rl.replay import ReplayBuffer
 from utils.rl.temperature import TemperatureSchedule, AdaptiveTemperatureController
 from utils.rl.training_rl import train_on_batch_rl, evaluate_models
 from utils.rl.startup import plan_rl_startup, apply_rl_startup_plan
+from utils.rl.profiler import print_selfplay_profiler
+from utils.rl.opponent_scheduler import (
+    _safe_score_rate,
+    _build_selfplay_opponent_assignments,
+    _update_adaptive_opponent_scheduler,
+)
+from utils.rl.persistent_pool import (
+    get_or_create_selfplay_pool,
+    _shutdown_selfplay_pool,
+    _terminate_process_tree,
+    _terminate_workers,
+    _is_interrupt_exit_code,
+)
 from utils.il.auto_tune import resolve_rl_hyperparameters
 from utils.shared.metrics import MetricsCalculator
 from utils.shared.runtime_helpers import (
@@ -99,9 +115,7 @@ from utils.shared.syzygy_manager import ensure_syzygy_tables, describe_syzygy_st
 
 _LAST_RUN_LOG_CSV = None
 _LAST_RUN_LOG_PNG = None
-_WORKER_INTERRUPT_EXIT_CODE = 130
 _SELFPLAY_CONFIG_PRINTED = False
-_SELFPLAY_POOL = None
 
 
 def _print_console_block(unicode_lines, ascii_lines=None):
@@ -200,20 +214,6 @@ def _temporary_sigint_cancel_handler(cancel_event, message=None, hard_exit=False
             signal.signal(sigint, previous_handler)
 
 
-def _resolve_elo_worker_device(main_device, configured_value):
-    value = str(configured_value).strip().lower()
-    if value in {"same", ""}:
-        resolved = main_device
-    elif value == "cuda":
-        resolved = torch.device("cuda")
-    else:
-        resolved = torch.device("cpu")
-
-    if resolved.type == "cuda" and not torch.cuda.is_available():
-        return torch.device("cpu")
-    return resolved
-
-
 def _snapshot_model_state_cpu(model, share_memory=False):
     normalized_state = normalize_state_dict_keys(model.state_dict())
     snapshot = {}
@@ -226,693 +226,10 @@ def _snapshot_model_state_cpu(model, share_memory=False):
     return snapshot
 
 
-def _weighted_choice_index(weights):
-    if not weights:
-        return None
-    weights_arr = np.asarray(weights, dtype=np.float64)
-    total = float(weights_arr.sum())
-    if total <= 0.0:
-        return int(np.random.randint(0, len(weights)))
-    probs = weights_arr / total
-    return int(np.random.choice(len(weights), p=probs))
-
-
-def _safe_score_rate(wins, draws, losses):
-    total = int(wins) + int(draws) + int(losses)
-    if total <= 0:
-        return None
-    return float((float(wins) + 0.5 * float(draws)) / float(total))
-
-
-def _state_dicts_identical(state_a, state_b):
-    if state_a is None or state_b is None:
-        return False
-    if state_a.keys() != state_b.keys():
-        return False
-    for key in state_a.keys():
-        tensor_a = state_a[key]
-        tensor_b = state_b[key]
-        if tensor_a.shape != tensor_b.shape or tensor_a.dtype != tensor_b.dtype:
-            return False
-        if not torch.equal(tensor_a, tensor_b):
-            return False
-    return True
-
-
-def _adaptive_factor_from_history(history_values, target_score, band, min_factor, max_factor):
-    if not history_values:
-        return 1.0
-    avg_score = float(sum(history_values) / len(history_values))
-    distance = min(1.0, abs(avg_score - target_score) / band)
-    closeness = max(0.0, 1.0 - distance)
-    return float(min_factor + (max_factor - min_factor) * closeness)
-
-
-def _average_score_from_history(history_values):
-    if not history_values:
-        return None
-    return float(sum(float(value) for value in history_values) / len(history_values))
-
-
-def _score_closeness(avg_score, target_score, band):
-    if avg_score is None:
-        return 0.5
-    distance = min(1.0, abs(float(avg_score) - float(target_score)) / max(1e-8, float(band)))
-    return max(0.0, 1.0 - distance)
-
-
-def _allocate_counts_from_weights(labels, weights, total_count):
-    labels = [str(label) for label in list(labels or [])]
-    if not labels or int(total_count) <= 0:
-        return {}
-
-    total_count = int(total_count)
-    weights_arr = np.asarray(list(weights or []), dtype=np.float64)
-    if weights_arr.size != len(labels):
-        weights_arr = np.ones((len(labels),), dtype=np.float64)
-    weights_arr = np.clip(weights_arr, 0.0, None)
-
-    weight_sum = float(weights_arr.sum())
-    if weight_sum <= 0.0:
-        weights_arr.fill(1.0 / float(len(labels)))
-    else:
-        weights_arr /= weight_sum
-
-    raw = weights_arr * float(total_count)
-    base = np.floor(raw).astype(np.int64)
-    counts = {label: int(base[idx]) for idx, label in enumerate(labels)}
-    assigned = int(sum(counts.values()))
-    remainder = int(total_count - assigned)
-    if remainder > 0:
-        order = sorted(
-            range(len(labels)),
-            key=lambda idx: (-(raw[idx] - float(base[idx])), labels[idx]),
-        )
-        for idx in order[:remainder]:
-            counts[labels[idx]] = int(counts.get(labels[idx], 0)) + 1
-    return counts
-
-
-def _safe_draw_rate(wins, draws, losses):
-    total = int(wins) + int(draws) + int(losses)
-    if total <= 0:
-        return None
-    return float(float(draws) / float(total))
-
-
-def _draw_heaviness_penalty(draw_rate, target_draw_rate, band, min_factor):
-    if draw_rate is None:
-        return 1.0
-    if draw_rate <= target_draw_rate:
-        return 1.0
-    distance = min(1.0, (float(draw_rate) - float(target_draw_rate)) / max(1e-8, float(band)))
-    return float(1.0 - (1.0 - float(min_factor)) * distance)
-
-
-def _normalize_weight_map(weight_map):
-    normalized = {
-        str(label): max(0.0, float(weight))
-        for label, weight in dict(weight_map or {}).items()
-    }
-    total = float(sum(normalized.values()))
-    if total <= 0.0:
-        return normalized
-    return {label: (weight / total) for label, weight in normalized.items()}
-
-
-def _canonicalize_opponent_bucket(label):
-    normalized = str(label or "current").strip().lower()
-    if normalized.startswith("recent"):
-        return "recent"
-    if normalized == "best":
-        return "best"
-    return "current"
-
-
-def _build_selfplay_opponent_candidates(
-    rl_cfg,
-    best_model_state=None,
-    recent_snapshot_pool=None,
-    scheduler_state=None,
-):
-    current_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_current_fraction', 0.4)))
-    best_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_best_fraction', 0.3)))
-    recent_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_recent_fraction', 0.3)))
-    recent_snapshot_pool = list(recent_snapshot_pool or [])
-    scheduler_state = dict(scheduler_state or {})
-    adaptive_enabled = bool(rl_cfg.get('self_play_opponent_adaptive_enabled', False))
-    exact_score_history = scheduler_state.get("score_history_exact", {}) or {}
-    target_score = float(rl_cfg.get('self_play_opponent_adaptive_target_score', 0.50))
-    band = max(0.05, float(rl_cfg.get('self_play_opponent_adaptive_band', 0.15)))
-    min_factor = max(0.20, float(rl_cfg.get('self_play_opponent_adaptive_min_factor', 0.60)))
-    max_factor = max(min_factor, float(rl_cfg.get('self_play_opponent_adaptive_max_factor', 1.40)))
-    min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_min_score', 0.0))))
-    max_score = max(min_score, min(1.0, float(rl_cfg.get('self_play_opponent_max_score', 1.0))))
-    best_min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_best_min_score', min_score))))
-    recent_min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_recent_min_score', min_score))))
-    recent_max_score = max(recent_min_score, min(1.0, float(rl_cfg.get('self_play_opponent_recent_max_score', max_score))))
-    recent_candidate_limit = max(1, int(rl_cfg.get('self_play_recent_candidate_pool_size', 4)))
-    recent_fallback_min_count = max(1, int(rl_cfg.get('self_play_recent_fallback_min_count', 2)))
-    recent_recency_bias = max(0.0, float(rl_cfg.get('self_play_recent_recency_bias', 0.35)))
-    recent_min_games_for_confidence = max(
-        1.0,
-        float(rl_cfg.get('self_play_recent_confidence_games', 24)),
-    )
-    recent_uncertainty_bonus = max(
-        0.0,
-        min(0.5, float(rl_cfg.get('self_play_recent_uncertainty_bonus', 0.15))),
-    )
-    recent_in_band_boost = max(
-        1.0,
-        float(rl_cfg.get('self_play_recent_in_band_boost', 1.10)),
-    )
-    target_draw_rate = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_target_draw_rate', 0.45))))
-    draw_band = max(0.01, float(rl_cfg.get('self_play_opponent_draw_band', 0.20)))
-    draw_penalty_min_factor = max(0.20, min(1.0, float(rl_cfg.get('self_play_opponent_draw_penalty_min_factor', 0.70))))
-    exact_draw_history = scheduler_state.get("draw_history_exact", {}) or {}
-    exact_games_history = scheduler_state.get("games_history_exact", {}) or {}
-
-    candidates = []
-    if current_fraction > 0.0:
-        candidates.append({
-            "label": "current",
-            "weight": float(current_fraction),
-            "payload": None,
-        })
-    if best_model_state is not None and best_fraction > 0.0:
-        best_factor = 1.0
-        if adaptive_enabled:
-            best_factor = _adaptive_factor_from_history(
-                exact_score_history.get("best", []) or [],
-                target_score,
-                band,
-                min_factor,
-                max_factor,
-            )
-        best_factor *= _draw_heaviness_penalty(
-            _average_score_from_history(exact_draw_history.get("best", []) or []),
-            target_draw_rate,
-            draw_band,
-            draw_penalty_min_factor,
-        )
-        candidates.append({
-            "label": "best",
-            "weight": float(best_fraction * best_factor),
-            "payload": {
-                "label": "best",
-                "state": best_model_state,
-            },
-        })
-    if recent_snapshot_pool and recent_fraction > 0.0:
-        recent_count = max(1, len(recent_snapshot_pool))
-        recent_entries_all = []
-        dedup_states = []
-        if best_model_state is not None:
-            dedup_states.append(best_model_state)
-        for idx, recent_entry in enumerate(recent_snapshot_pool):
-            recent_state = recent_entry.get("state")
-            if recent_state is None:
-                continue
-            if any(_state_dicts_identical(recent_state, existing_state) for existing_state in dedup_states):
-                continue
-            recency_bias = float(idx + 1) / float(recent_count)
-            label = str(recent_entry.get("label", f"recent_{idx}"))
-            factor = 1.0
-            avg_score = _average_score_from_history(exact_score_history.get(label, []) or [])
-            avg_draw_rate = _average_score_from_history(exact_draw_history.get(label, []) or [])
-            avg_games = _average_score_from_history(exact_games_history.get(label, []) or [])
-            in_band = True
-            if avg_score is not None and (avg_score < recent_min_score or avg_score > recent_max_score):
-                in_band = False
-            if adaptive_enabled:
-                factor = _adaptive_factor_from_history(
-                    exact_score_history.get(label, []) or [],
-                    target_score,
-                    band,
-                    min_factor,
-                    max_factor,
-                )
-            draw_penalty = _draw_heaviness_penalty(
-                avg_draw_rate,
-                target_draw_rate,
-                draw_band,
-                draw_penalty_min_factor,
-            )
-            factor *= draw_penalty
-            confidence = 0.0
-            if avg_games is not None:
-                confidence = min(1.0, float(avg_games) / recent_min_games_for_confidence)
-            uncertainty_bonus = (1.0 - confidence) * recent_uncertainty_bonus
-            match_quality = _score_closeness(avg_score, target_score, band)
-            if in_band:
-                match_quality = min(1.0, match_quality * recent_in_band_boost)
-            selection_score = float(
-                (
-                    (1.0 - recent_recency_bias) * match_quality
-                    + recent_recency_bias * recency_bias
-                    + uncertainty_bonus
-                )
-                * draw_penalty
-            )
-            recent_entries_all.append({
-                "label": label,
-                "state": recent_state,
-                "weight": float((0.75 + 0.25 * recency_bias) * factor),
-                "avg_score": avg_score,
-                "avg_draw_rate": avg_draw_rate,
-                "avg_games": avg_games,
-                "in_band": bool(in_band),
-                "recency_bias": recency_bias,
-                "draw_penalty": float(draw_penalty),
-                "selection_score": selection_score,
-            })
-            dedup_states.append(recent_state)
-        if recent_entries_all:
-            in_band_entries = [entry for entry in recent_entries_all if bool(entry.get("in_band", False))]
-            candidate_entries = in_band_entries if len(in_band_entries) >= recent_fallback_min_count else list(recent_entries_all)
-            candidate_entries.sort(
-                key=lambda entry: (
-                    -float(entry.get("selection_score", 0.0)),
-                    -float(entry.get("recency_bias", 0.0)),
-                    str(entry.get("label", "")),
-                )
-            )
-            recent_entries = candidate_entries[:recent_candidate_limit]
-            candidates.append({
-                "label": "recent",
-                "weight": float(recent_fraction),
-                "payload": {
-                    "entries": recent_entries,
-                    "all_entries": recent_entries_all,
-                },
-            })
-    filtered_candidates = []
-    for candidate in candidates:
-        label = str(candidate.get("label", "current"))
-        if label == "best":
-            avg_score = _average_score_from_history(exact_score_history.get("best", []) or [])
-            if avg_score is not None and avg_score < best_min_score:
-                continue
-        elif label != "current":
-            bucket_history = scheduler_state.get("bucket_score_history", {}) or {}
-            avg_score = _average_score_from_history(bucket_history.get(label, []) or [])
-            if avg_score is not None and (avg_score < min_score or avg_score > max_score):
-                continue
-        filtered_candidates.append(candidate)
-    if not any(str(candidate.get("label")) == "current" for candidate in filtered_candidates) and current_fraction > 0.0:
-        filtered_candidates.append({
-            "label": "current",
-            "weight": float(max(current_fraction, 1e-6)),
-            "payload": None,
-        })
-    return filtered_candidates
-
-
-def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None):
-    scheduler_state = dict(scheduler_state or {})
-    adaptive_enabled = bool(rl_cfg.get('self_play_opponent_adaptive_enabled', False))
-    base_weights = {
-        str(candidate["label"]): max(0.0, float(candidate.get("weight", 0.0)))
-        for candidate in candidates
-    }
-    if not adaptive_enabled or not candidates:
-        return _normalize_weight_map(base_weights), {}
-
-    score_history = (
-        scheduler_state.get("bucket_score_history")
-        or scheduler_state.get("score_history")
-        or {}
-    )
-    target_score = float(rl_cfg.get('self_play_opponent_adaptive_target_score', 0.50))
-    band = max(0.05, float(rl_cfg.get('self_play_opponent_adaptive_band', 0.15)))
-    min_factor = max(0.20, float(rl_cfg.get('self_play_opponent_adaptive_min_factor', 0.60)))
-    max_factor = max(min_factor, float(rl_cfg.get('self_play_opponent_adaptive_max_factor', 1.40)))
-    current_min_fraction = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_current_min_fraction', 0.50))))
-    current_max_fraction = max(current_min_fraction, min(1.0, float(rl_cfg.get('self_play_opponent_current_max_fraction', 1.0))))
-
-    adjusted = {}
-    debug_factors = {}
-    for candidate in candidates:
-        label = str(candidate["label"])
-        base_weight = base_weights.get(label, 0.0)
-        factor = 1.0
-        history_values = score_history.get(label, []) or []
-        if label != "current" and history_values:
-            factor = _adaptive_factor_from_history(
-                history_values,
-                target_score,
-                band,
-                min_factor,
-                max_factor,
-            )
-        adjusted[label] = base_weight * factor
-        debug_factors[label] = float(factor)
-
-    current_label = "current"
-    if current_label in adjusted:
-        adjusted[current_label] = max(float(adjusted[current_label]), float(current_min_fraction))
-
-    total_weight = float(sum(adjusted.values()))
-    if total_weight <= 0.0:
-        return _normalize_weight_map(base_weights), debug_factors
-    normalized = {label: (weight / total_weight) for label, weight in adjusted.items()}
-    if current_label in normalized and current_min_fraction > 0.0:
-        desired_current = min(1.0, float(current_min_fraction))
-        current_share = float(normalized.get(current_label, 0.0))
-        if current_share < desired_current:
-            other_labels = [label for label in normalized.keys() if label != current_label]
-            other_total = float(sum(normalized[label] for label in other_labels))
-            if other_total <= 0.0 or desired_current >= 1.0:
-                normalized = {
-                    label: (1.0 if label == current_label else 0.0)
-                    for label in normalized.keys()
-                }
-            else:
-                scale = max(0.0, (1.0 - desired_current) / other_total)
-                normalized = {
-                    label: (desired_current if label == current_label else normalized[label] * scale)
-                    for label in normalized.keys()
-                }
-    if current_label in normalized and current_max_fraction < 1.0:
-        current_share = float(normalized.get(current_label, 0.0))
-        if current_share > current_max_fraction:
-            other_labels = [label for label in normalized.keys() if label != current_label]
-            other_total = float(sum(normalized[label] for label in other_labels))
-            if other_total > 0.0:
-                freed_mass = current_share - current_max_fraction
-                scale = (other_total + freed_mass) / other_total
-                normalized = {
-                    label: (
-                        current_max_fraction
-                        if label == current_label
-                        else normalized[label] * scale
-                    )
-                    for label in normalized.keys()
-                }
-    return normalized, debug_factors
-
-
-def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_results, iteration_num):
-    state = dict(scheduler_state or {})
-    if not bool(rl_cfg.get('self_play_opponent_adaptive_enabled', False)):
-        return state, {}
-
-    update_every = max(1, int(rl_cfg.get('self_play_opponent_adaptive_update_every', 2)))
-    min_games = max(1, int(rl_cfg.get('self_play_opponent_adaptive_min_games', 8)))
-    history_size = max(1, int(rl_cfg.get('self_play_opponent_adaptive_history_size', 4)))
-    bucket_score_history = state.get("bucket_score_history")
-    if not isinstance(bucket_score_history, dict):
-        bucket_score_history = state.get("score_history")
-    if not isinstance(bucket_score_history, dict):
-        bucket_score_history = {}
-    exact_score_history = state.get("score_history_exact")
-    if not isinstance(exact_score_history, dict):
-        exact_score_history = {}
-    exact_draw_history = state.get("draw_history_exact")
-    if not isinstance(exact_draw_history, dict):
-        exact_draw_history = {}
-    exact_games_history = state.get("games_history_exact")
-    if not isinstance(exact_games_history, dict):
-        exact_games_history = {}
-    bucket_draw_history = state.get("bucket_draw_history")
-    if not isinstance(bucket_draw_history, dict):
-        bucket_draw_history = {}
-
-    observed_scores = {}
-    exact_observed_scores = {}
-    exact_observed_games = {}
-    observed_draw_rates = {}
-    exact_observed_draw_rates = {}
-    bucket_stats = {}
-    for label, stats in dict(opponent_results or {}).items():
-        games = int((stats or {}).get("games", 0))
-        if games >= min_games:
-            score_rate = _safe_score_rate(
-                (stats or {}).get("wins", 0),
-                (stats or {}).get("draws", 0),
-                (stats or {}).get("losses", 0),
-            )
-            if score_rate is not None:
-                exact_observed_scores[str(label)] = float(score_rate)
-                exact_observed_games[str(label)] = int(games)
-            draw_rate = _safe_draw_rate(
-                (stats or {}).get("wins", 0),
-                (stats or {}).get("draws", 0),
-                (stats or {}).get("losses", 0),
-            )
-            if draw_rate is not None:
-                exact_observed_draw_rates[str(label)] = float(draw_rate)
-        bucket = _canonicalize_opponent_bucket(label)
-        bucket_entry = bucket_stats.setdefault(
-            bucket,
-            {"wins": 0, "draws": 0, "losses": 0, "games": 0},
-        )
-        bucket_entry["wins"] += int((stats or {}).get("wins", 0))
-        bucket_entry["draws"] += int((stats or {}).get("draws", 0))
-        bucket_entry["losses"] += int((stats or {}).get("losses", 0))
-        bucket_entry["games"] += int((stats or {}).get("games", 0))
-
-    for label, stats in bucket_stats.items():
-        games = int((stats or {}).get("games", 0))
-        if games < min_games:
-            continue
-        score_rate = _safe_score_rate(
-            (stats or {}).get("wins", 0),
-            (stats or {}).get("draws", 0),
-            (stats or {}).get("losses", 0),
-        )
-        if score_rate is None:
-            continue
-        observed_scores[str(label)] = float(score_rate)
-        draw_rate = _safe_draw_rate(
-            (stats or {}).get("wins", 0),
-            (stats or {}).get("draws", 0),
-            (stats or {}).get("losses", 0),
-        )
-        if draw_rate is not None:
-            observed_draw_rates[str(label)] = float(draw_rate)
-    if (int(iteration_num) % update_every) != 0:
-        state["bucket_score_history"] = bucket_score_history
-        state["score_history_exact"] = exact_score_history
-        state["draw_history_exact"] = exact_draw_history
-        state["games_history_exact"] = exact_games_history
-        state["bucket_draw_history"] = bucket_draw_history
-        state["score_history"] = bucket_score_history
-        return state, observed_scores
-
-    for label, score_rate in exact_observed_scores.items():
-        history = deque(exact_score_history.get(str(label), []), maxlen=history_size)
-        history.append(float(score_rate))
-        exact_score_history[str(label)] = list(history)
-    for label, draw_rate in exact_observed_draw_rates.items():
-        history = deque(exact_draw_history.get(str(label), []), maxlen=history_size)
-        history.append(float(draw_rate))
-        exact_draw_history[str(label)] = list(history)
-    for label, games in exact_observed_games.items():
-        history = deque(exact_games_history.get(str(label), []), maxlen=history_size)
-        history.append(float(games))
-        exact_games_history[str(label)] = list(history)
-
-    for label, score_rate in observed_scores.items():
-        history = deque(bucket_score_history.get(str(label), []), maxlen=history_size)
-        history.append(float(score_rate))
-        bucket_score_history[str(label)] = list(history)
-    for label, draw_rate in observed_draw_rates.items():
-        history = deque(bucket_draw_history.get(str(label), []), maxlen=history_size)
-        history.append(float(draw_rate))
-        bucket_draw_history[str(label)] = list(history)
-
-    state["bucket_score_history"] = bucket_score_history
-    state["score_history_exact"] = exact_score_history
-    state["draw_history_exact"] = exact_draw_history
-    state["games_history_exact"] = exact_games_history
-    state["bucket_draw_history"] = bucket_draw_history
-    state["score_history"] = bucket_score_history
-    return state, observed_scores
-
-
-def _build_selfplay_opponent_assignments(
-    rl_cfg,
-    worker_specs,
-    best_model_state=None,
-    recent_snapshot_pool=None,
-    adaptive_scheduler_state=None,
-):
-    enabled = bool(rl_cfg.get('self_play_opponent_pool_enabled', False))
-    if not enabled or not worker_specs:
-        return {}, {}, {}
-
-    candidates = _build_selfplay_opponent_candidates(
-        rl_cfg,
-        best_model_state=best_model_state,
-        recent_snapshot_pool=recent_snapshot_pool,
-        scheduler_state=adaptive_scheduler_state,
-    )
-    if not candidates:
-        return {}, {}, {}
-
-    source_weights, _adaptive_debug = _compute_adaptive_opponent_weights(
-        rl_cfg,
-        candidates,
-        scheduler_state=adaptive_scheduler_state,
-    )
-
-    total_games = int(sum(max(0, int(games)) for _, games in worker_specs))
-    if total_games <= 0:
-        return {}, {}, {}
-
-    target_games = {
-        label: int(round(total_games * float(source_weights.get(label, 0.0))))
-        for label in source_weights.keys()
-    }
-    assigned_target_total = int(sum(target_games.values()))
-    if assigned_target_total != total_games:
-        order = sorted(
-            source_weights.keys(),
-            key=lambda key: (-source_weights[key], key),
-        )
-        delta = total_games - assigned_target_total
-        idx = 0
-        while delta != 0 and order:
-            label = order[idx % len(order)]
-            if delta > 0:
-                target_games[label] += 1
-                delta -= 1
-            elif target_games[label] > 0:
-                target_games[label] -= 1
-                delta += 1
-            idx += 1
-
-    bucket_game_plan = []
-    for label, count in target_games.items():
-        bucket_game_plan.extend([str(label)] * max(0, int(count)))
-    if len(bucket_game_plan) < total_games:
-        order = sorted(source_weights.keys(), key=lambda key: (-source_weights[key], key))
-        idx = 0
-        while len(bucket_game_plan) < total_games and order:
-            bucket_game_plan.append(str(order[idx % len(order)]))
-            idx += 1
-    elif len(bucket_game_plan) > total_games:
-        bucket_game_plan = bucket_game_plan[:total_games]
-    np.random.shuffle(bucket_game_plan)
-
-    sorted_workers = sorted(worker_specs, key=lambda item: (int(item[0])))
-    payloads_by_label = {
-        str(candidate["label"]): candidate.get("payload")
-        for candidate in candidates
-    }
-    recent_entries = list((payloads_by_label.get("recent") or {}).get("entries", []) or [])
-    recent_weights = [float(entry.get("weight", 1.0)) for entry in recent_entries]
-    recent_bucket_total = int(sum(1 for label in bucket_game_plan if str(label) == "recent"))
-    recent_quota = _allocate_counts_from_weights(
-        [str(entry.get("label", "recent")) for entry in recent_entries],
-        recent_weights,
-        recent_bucket_total,
-    )
-    recent_label_plan = []
-    for entry in recent_entries:
-        entry_label = str(entry.get("label", "recent"))
-        recent_label_plan.extend([entry_label] * max(0, int(recent_quota.get(entry_label, 0))))
-    if len(recent_label_plan) < recent_bucket_total and recent_entries:
-        top_label = str(recent_entries[0].get("label", "recent"))
-        recent_label_plan.extend([top_label] * int(recent_bucket_total - len(recent_label_plan)))
-    np.random.shuffle(recent_label_plan)
-    recent_label_cursor = 0
-
-    assignments = {}
-    assigned_counts = defaultdict(int)
-    debug_info = {
-        "source_weights": {str(k): float(v) for k, v in source_weights.items()},
-        "selected_recent_pool": [],
-        "recent_pool_all": [],
-    }
-    offset = 0
-    for rank, games_for_worker in sorted_workers:
-        worker_plan_buckets = list(bucket_game_plan[offset: offset + int(games_for_worker)])
-        offset += int(games_for_worker)
-        plan_labels = []
-        pool_entries = {}
-        for bucket_label in worker_plan_buckets:
-            if bucket_label == "current":
-                plan_labels.append("current")
-                assigned_counts["current"] += 1
-                continue
-            if bucket_label == "best":
-                best_payload = payloads_by_label.get("best") or {}
-                best_label = str(best_payload.get("label", "best"))
-                plan_labels.append(best_label)
-                if best_payload.get("state") is not None:
-                    pool_entries[best_label] = best_payload.get("state")
-                assigned_counts[best_label] += 1
-                continue
-            if bucket_label == "recent" and recent_entries:
-                if recent_label_cursor < len(recent_label_plan):
-                    chosen_label = str(recent_label_plan[recent_label_cursor])
-                    recent_label_cursor += 1
-                else:
-                    chosen_label = str(recent_entries[0].get("label", "recent"))
-                plan_labels.append(chosen_label)
-                chosen_state = None
-                for entry in recent_entries:
-                    if str(entry.get("label", "recent")) == chosen_label:
-                        chosen_state = entry.get("state")
-                        break
-                if chosen_state is not None:
-                    pool_entries[chosen_label] = chosen_state
-                assigned_counts[chosen_label] += 1
-                continue
-            plan_labels.append("current")
-            assigned_counts["current"] += 1
-
-        assignments[int(rank)] = {
-            "plan_labels": plan_labels,
-            "pool_entries": [
-                {"label": label, "state": state}
-                for label, state in pool_entries.items()
-            ],
-        }
-
-    recent_payload = payloads_by_label.get("recent") or {}
-    for entry in list(recent_payload.get("entries", []) or []):
-        debug_info["selected_recent_pool"].append({
-            "label": str(entry.get("label", "")),
-            "avg_score": entry.get("avg_score", None),
-            "avg_draw_rate": entry.get("avg_draw_rate", None),
-            "avg_games": entry.get("avg_games", None),
-            "selection_score": entry.get("selection_score", None),
-            "draw_penalty": entry.get("draw_penalty", None),
-            "recency_bias": entry.get("recency_bias", None),
-        })
-    for entry in list(recent_payload.get("all_entries", []) or []):
-        debug_info["recent_pool_all"].append({
-            "label": str(entry.get("label", "")),
-            "avg_score": entry.get("avg_score", None),
-            "avg_draw_rate": entry.get("avg_draw_rate", None),
-            "avg_games": entry.get("avg_games", None),
-            "selection_score": entry.get("selection_score", None),
-            "draw_penalty": entry.get("draw_penalty", None),
-            "recency_bias": entry.get("recency_bias", None),
-            "in_band": bool(entry.get("in_band", False)),
-        })
-
-    return assignments, dict(assigned_counts), debug_info
-
-
 def _round_replay_capacity(value, quantum):
     quantum = max(1, int(quantum))
     value = max(1, int(math.ceil(float(value))))
     return int(math.ceil(value / quantum) * quantum)
-
-
-def _resolve_replay_max_policy_targets(config):
-    rl_cfg = config.get('reinforcement_learning', {})
-    raw_value = rl_cfg.get('replay_max_policy_targets', None)
-    if raw_value is None:
-        raw_value = rl_cfg.get('policy_target_pruning_max_moves', 256)
-    try:
-        return max(1, int(raw_value))
-    except Exception:
-        return 256
 
 
 def _rl_elo_worker(
@@ -973,10 +290,7 @@ class RLEloCoordinator:
         self.every_n_evals = max(1, int(self.elo_config.get("rl_every_n_evals", 3)))
         self.final_on_shutdown = bool(self.elo_config.get("final_on_rl_shutdown", True))
         self.min_score_rate_for_stockfish = float(
-            self.elo_config.get(
-                "rl_min_score_rate_for_stockfish",
-                self.elo_config.get("rl_min_win_rate_for_stockfish", 0.50),
-            )
+            self.elo_config.get("rl_min_score_rate_for_stockfish", 0.50)
         )
         self.min_true_win_rate_for_stockfish = float(
             self.elo_config.get("rl_min_true_win_rate_for_stockfish", 0.0)
@@ -1341,207 +655,6 @@ def _models_have_identical_state(model_a, model_b):
 # SELF-PLAY WITH PROPER MCTS
 # ==============================================================================
 
-class _PersistentSelfPlayPool:
-    def __init__(self, config, worker_specs, device_type, temp_dir):
-        self.config = config
-        self.worker_specs = list(worker_specs)
-        self.device_type = device_type
-        self.temp_dir = Path(temp_dir)
-        self.mp_ctx = mp.get_context('spawn')
-        self.result_queue = self.mp_ctx.Queue()
-        self.task_queues = {}
-        self.processes = {}
-        self.started = False
-
-    def matches(self, worker_specs, device_type, temp_dir):
-        return (
-            self.worker_specs == list(worker_specs)
-            and self.device_type == device_type
-            and self.temp_dir == Path(temp_dir)
-        )
-
-    def start(self):
-        if self.started:
-            return
-
-        gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        for rank, _ in self.worker_specs:
-            device_id = rank % gpu_count if self.device_type == 'cuda' and gpu_count > 0 else 'cpu'
-            task_queue = self.mp_ctx.Queue()
-            process = self.mp_ctx.Process(
-                target=persistent_selfplay_worker,
-                args=(rank, self.config, device_id, task_queue, self.result_queue),
-            )
-            process.daemon = True
-            process.start()
-            self.task_queues[rank] = task_queue
-            self.processes[rank] = process
-
-        self.started = True
-
-    def _prepare_task_files(self, rank, task_id):
-        result_file = self.temp_dir / f"worker_{rank}_{task_id}.pkl"
-        progress_file = self.temp_dir / f"worker_{rank}_{task_id}.progress"
-        try:
-            result_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-        try:
-            progress_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return result_file, progress_file
-
-    def dispatch_task(
-        self,
-        rank,
-        task_id,
-        model_state_path,
-        temperature,
-        num_games,
-        opponent_payload=None,
-        model_state=None,
-        stream_results_to_queue=False,
-    ):
-        result_file, progress_file = self._prepare_task_files(rank, task_id)
-        self.task_queues[rank].put({
-            'cmd': 'play',
-            'task_id': task_id,
-            'model_state': model_state,
-            'model_state_path': str(model_state_path),
-            'opponent_payload': opponent_payload or {},
-            'num_games': int(num_games),
-            'result_file_path': str(result_file),
-            'mcts_temperature': temperature,
-            'stream_results_to_queue': bool(stream_results_to_queue),
-        })
-        return result_file, progress_file
-
-    def submit(
-        self,
-        task_id,
-        model_state_path,
-        temperature,
-        worker_model_state_paths=None,
-        worker_opponent_payloads=None,
-        model_state=None,
-        stream_results_to_queue=False,
-    ):
-        result_files = []
-        progress_files = []
-        worker_model_state_paths = worker_model_state_paths or {}
-        worker_opponent_payloads = worker_opponent_payloads or {}
-
-        for rank, games_for_worker in self.worker_specs:
-            opponent_payload = worker_opponent_payloads.get(rank) or {}
-            result_file, progress_file = self.dispatch_task(
-                rank=rank,
-                task_id=task_id,
-                model_state_path=worker_model_state_paths.get(rank, model_state_path),
-                temperature=temperature,
-                num_games=int(games_for_worker),
-                opponent_payload=opponent_payload,
-                model_state=model_state,
-                stream_results_to_queue=stream_results_to_queue,
-            )
-            result_files.append(result_file)
-            progress_files.append(progress_file)
-
-        return result_files, progress_files
-
-    def shutdown(self, timeout_s=5):
-        if not self.started:
-            return
-
-        for task_queue in self.task_queues.values():
-            try:
-                task_queue.put({'cmd': 'stop'})
-            except Exception:
-                pass
-
-        _terminate_workers(list(self.processes.values()), timeout_s=timeout_s)
-
-        for task_queue in self.task_queues.values():
-            try:
-                task_queue.close()
-            except Exception:
-                pass
-        try:
-            self.result_queue.close()
-        except Exception:
-            pass
-
-        self.task_queues.clear()
-        self.processes.clear()
-        self.started = False
-
-
-def _shutdown_selfplay_pool(timeout_s=5):
-    global _SELFPLAY_POOL
-    if _SELFPLAY_POOL is None:
-        return
-    try:
-        _SELFPLAY_POOL.shutdown(timeout_s=timeout_s)
-    finally:
-        _SELFPLAY_POOL = None
-
-
-def _terminate_process_tree(proc, timeout_s=0.5):
-    if proc is None:
-        return
-    with contextlib.suppress(Exception):
-        if not proc.is_alive():
-            proc.join(timeout=0.0)
-            return
-    with contextlib.suppress(Exception):
-        proc.terminate()
-    with contextlib.suppress(Exception):
-        proc.join(timeout=max(0.0, float(timeout_s)))
-    with contextlib.suppress(Exception):
-        if proc.is_alive():
-            proc.kill()
-    with contextlib.suppress(Exception):
-        proc.join(timeout=0.2)
-
-    if os.name == "nt":
-        pid = getattr(proc, "pid", None)
-        if pid:
-            with contextlib.suppress(Exception):
-                subprocess.run(
-                    ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2.0,
-                )
-
-
-def _terminate_workers(processes, timeout_s=5):
-    """Terminate spawned self-play workers cleanly."""
-    all_processes = []
-    seen = set()
-    for proc in list(processes) + list(mp.active_children()):
-        if proc is None:
-            continue
-        key = proc.pid if proc.pid is not None else id(proc)
-        if key in seen:
-            continue
-        seen.add(key)
-        all_processes.append(proc)
-
-    for proc in all_processes:
-        _terminate_process_tree(proc, timeout_s=timeout_s)
-
-
-def _is_interrupt_exit_code(exit_code):
-    if exit_code is None:
-        return False
-    if exit_code == _WORKER_INTERRUPT_EXIT_CODE:
-        return True
-    sigint = getattr(signal, "SIGINT", None)
-    return sigint is not None and exit_code == -int(sigint)
-
-
 def play_games_parallel_mcts(
     model,
     config,
@@ -1563,7 +676,7 @@ def play_games_parallel_mcts(
     start_time = time.time()
     
     if not MCTS_SELFPLAY_AVAILABLE:
-        print("❌ MCTS self-play not available!")
+        print("âťŚ MCTS self-play not available!")
         return [], 0, 0, 0, 0, 0
     
     model_state = model.state_dict()
@@ -1612,7 +725,7 @@ def play_games_parallel_mcts(
         if torch.cuda.is_available():
             device_type = 'cuda'
         else:
-            print("⚠️ self_play_device=cuda but no GPU available. Falling back to CPU.")
+            print("âš ď¸Ź self_play_device=cuda but no GPU available. Falling back to CPU.")
             device_type = 'cpu'
     elif self_play_device == 'cpu':
         device_type = 'cpu'
@@ -1660,9 +773,18 @@ def play_games_parallel_mcts(
         recent_snapshot_pool=recent_snapshot_pool,
         adaptive_scheduler_state=adaptive_scheduler_state,
     )
-    dynamic_dispatch_chunk_games = max(
+    dispatch_chunk_raw = rl_cfg.get('self_play_dispatch_chunk_games', max_batch_games)
+    try:
+        requested_dispatch_chunk_games = max(1, int(dispatch_chunk_raw))
+    except Exception:
+        requested_dispatch_chunk_games = max_batch_games
+    max_initial_fair_chunk_games = max(
         1,
-        int(rl_cfg.get('self_play_dispatch_chunk_games', max_batch_games)),
+        int(math.ceil(float(num_games) / float(max(1, len(worker_specs))))),
+    )
+    dynamic_dispatch_chunk_games = min(
+        requested_dispatch_chunk_games,
+        max_initial_fair_chunk_games,
     )
     global_dynamic_opponent_payload = _flatten_dynamic_opponent_payloads(
         worker_specs,
@@ -1680,11 +802,16 @@ def play_games_parallel_mcts(
         wpg = rl_cfg.get('self_play_workers_per_gpu', 1) if device_type == 'cuda' else '-'
         threads = rl_cfg.get('self_play_torch_threads', 1)
         batch_info = f"on  (max {max_batch_games} gier/worker)" if use_batch_selfplay else "off"
+        dispatch_chunk_info = (
+            str(dynamic_dispatch_chunk_games)
+            if dynamic_dispatch_enabled
+            else "-"
+        )
         max_parallel_games = sum(
             min(max_batch_games if use_batch_selfplay else 1, games)
             for _, games in worker_specs
         )
-        w_games = f"{base_games}" + (f"  (+1 dla {remainder} workerów)" if remainder else "")
+        w_games = f"{base_games}" + (f"  (+1 dla {remainder} workerĂłw)" if remainder else "")
         print()
         if opponent_debug.get("selected_recent_pool"):
             selected_recent_parts = []
@@ -1698,22 +825,23 @@ def play_games_parallel_mcts(
             print("Selected recent pool: " + ", ".join(selected_recent_parts))
 
         unicode_lines = [
-            "╔══════════════════════════════════════════════════════╗",
-            "║           KONFIGURACJA SELF-PLAY (stała)             ║",
-            "╠══════════════════════════╦═══════════════════════════╣",
-            f"║  Urządzenie              ║  {device_type:<25} ║",
-            f"║  GPU dostępne            ║  {gpus:<25} ║",
-            f"║  Workerów per GPU        ║  {str(wpg):<25} ║",
-            f"║  Workerów łącznie        ║  {len(worker_specs):<25} ║",
-            f"║  Wątków per worker       ║  {str(threads):<25} ║",
-            f"║  Gier per iterację       ║  {num_games:<25} ║",
-            f"║  Gier per worker         ║  {w_games:<25} ║",
-            f"║  Batch self-play         ║  {batch_info:<25} ║",
-            f"║  Gier równolegle max     ║  {max_parallel_games:<25} ║",
-            f"║  Symulacje MCTS          ║  {rl_cfg['mcts_simulations']:<25} ║",
-            f"║  Rozmiar batcha MCTS     ║  {rl_cfg.get('mcts_batch_size', 32):<25} ║",
-            f"║  Reuse drzewa            ║  {str(rl_cfg.get('mcts_reuse_tree', True)):<25} ║",
-            "╚══════════════════════════╩═══════════════════════════╝",
+            "â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+            "â•‘           KONFIGURACJA SELF-PLAY (staĹ‚a)             â•‘",
+            "â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•¦â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•Ł",
+            f"â•‘  UrzÄ…dzenie              â•‘  {device_type:<25} â•‘",
+            f"â•‘  GPU dostÄ™pne            â•‘  {gpus:<25} â•‘",
+            f"â•‘  WorkerĂłw per GPU        â•‘  {str(wpg):<25} â•‘",
+            f"â•‘  WorkerĂłw Ĺ‚Ä…cznie        â•‘  {len(worker_specs):<25} â•‘",
+            f"â•‘  WÄ…tkĂłw per worker       â•‘  {str(threads):<25} â•‘",
+            f"â•‘  Gier per iteracjÄ™       â•‘  {num_games:<25} â•‘",
+            f"â•‘  Gier per worker         â•‘  {w_games:<25} â•‘",
+            f"â•‘  Batch self-play         â•‘  {batch_info:<25} â•‘",
+            f"â•‘  Chunk dispatch          â•‘  {dispatch_chunk_info:<25} â•‘",
+            f"â•‘  Gier rĂłwnolegle max     â•‘  {max_parallel_games:<25} â•‘",
+            f"â•‘  Symulacje MCTS          â•‘  {rl_cfg['mcts_simulations']:<25} â•‘",
+            f"â•‘  Rozmiar batcha MCTS     â•‘  {rl_cfg.get('mcts_batch_size', 32):<25} â•‘",
+            f"â•‘  Reuse drzewa            â•‘  {str(rl_cfg.get('mcts_reuse_tree', True)):<25} â•‘",
+            "â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•©â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•ť",
         ]
         ascii_lines = [
             "+----------------------------------------------------+",
@@ -1727,6 +855,7 @@ def play_games_parallel_mcts(
             f"|  Gier per iteracje       |  {num_games:<25} |",
             f"|  Gier per worker         |  {w_games:<25} |",
             f"|  Batch self-play         |  {batch_info:<25} |",
+            f"|  Chunk dispatch          |  {dispatch_chunk_info:<25} |",
             f"|  Gier rownolegle max     |  {max_parallel_games:<25} |",
             f"|  Symulacje MCTS          |  {rl_cfg['mcts_simulations']:<25} |",
             f"|  Rozmiar batcha MCTS     |  {rl_cfg.get('mcts_batch_size', 32):<25} |",
@@ -1765,11 +894,14 @@ def play_games_parallel_mcts(
     queue_search_simulations_used_sum = 0
     queue_search_samples = 0
     queue_search_simulations_used_samples = []
+    queue_adaptive_stopped_early = 0
+    queue_adaptive_stop_reasons = {}
     queue_wait_total_s = 0.0
     queue_wait_events = 0
     queue_profile_stats = {}
     queue_opponent_source_games = defaultdict(int)
     queue_opponent_source_results = defaultdict(lambda: {"wins": 0, "draws": 0, "losses": 0, "games": 0})
+    selfplay_pool = None
     
     interrupted = False
     startup_done_time = None
@@ -1783,11 +915,7 @@ def play_games_parallel_mcts(
 
     try:
         if use_persistent_pool:
-            global _SELFPLAY_POOL
-            if _SELFPLAY_POOL is None or not _SELFPLAY_POOL.matches(worker_specs, device_type, temp_dir):
-                _shutdown_selfplay_pool()
-                _SELFPLAY_POOL = _PersistentSelfPlayPool(config, worker_specs, device_type, temp_dir)
-                _SELFPLAY_POOL.start()
+            selfplay_pool = get_or_create_selfplay_pool(config, worker_specs, device_type, temp_dir)
 
             task_id = f"{os.getpid()}_{time.time_ns()}"
             model_state_path = temp_dir / f"selfplay_model_{task_id}.pt"
@@ -1830,7 +958,7 @@ def play_games_parallel_mcts(
                             if str((entry or {}).get("label") or "current") in needed_pool_labels
                         ],
                     }
-                    result_file, progress_file = _SELFPLAY_POOL.dispatch_task(
+                    result_file, progress_file = selfplay_pool.dispatch_task(
                         rank=int(rank),
                         task_id=task_id,
                         model_state_path=model_state_path,
@@ -1855,7 +983,7 @@ def play_games_parallel_mcts(
                         break
                 idle_ranks = [rank for rank in idle_ranks if rank not in active_workers]
             else:
-                result_files, progress_files = _SELFPLAY_POOL.submit(
+                result_files, progress_files = selfplay_pool.submit(
                     task_id=task_id,
                     model_state_path=model_state_path,
                     model_state=model_state_cpu,
@@ -1870,7 +998,7 @@ def play_games_parallel_mcts(
                     int(rank): pf
                     for (rank, _), pf in zip(worker_specs, progress_files)
                 }
-            processes = [_SELFPLAY_POOL.processes[rank] for rank, _ in worker_specs]
+            processes = [selfplay_pool.processes[rank] for rank, _ in worker_specs]
         else:
             mp_ctx = mp.get_context('spawn')
             for rank, games_for_worker in worker_specs:
@@ -1912,7 +1040,7 @@ def play_games_parallel_mcts(
         startup_done_time = time.time()
         games_bar = tqdm(
             total=num_games,
-            desc="🎮 Self-play gry",
+            desc="đźŽ® Self-play gry",
             unit="gra",
             dynamic_ncols=True,
             leave=True,
@@ -1946,7 +1074,7 @@ def play_games_parallel_mcts(
                 if use_persistent_pool:
                     queue_wait_t0 = time.perf_counter()
                     try:
-                        message = _SELFPLAY_POOL.result_queue.get(timeout=0.2)
+                        message = selfplay_pool.result_queue.get(timeout=0.2)
                         queue_wait_total_s += float(time.perf_counter() - queue_wait_t0)
                         queue_wait_events += 1
                         if message.get('task_id') == task_id:
@@ -2007,6 +1135,12 @@ def play_games_parallel_mcts(
                                 queue_search_simulations_used_sum += int(chunk_stats.get('search_simulations_used_sum', 0))
                                 queue_search_samples += int(chunk_stats.get('search_samples', 0))
                                 queue_search_simulations_used_samples.extend(list(chunk_stats.get('search_simulations_used_samples', []) or []))
+                                queue_adaptive_stopped_early += int(chunk_stats.get('adaptive_stopped_early', 0))
+                                for reason, count in dict(chunk_stats.get('adaptive_stop_reasons', {}) or {}).items():
+                                    reason = str(reason)
+                                    queue_adaptive_stop_reasons[reason] = (
+                                        int(queue_adaptive_stop_reasons.get(reason, 0)) + int(count)
+                                    )
                                 _accumulate_profile_stats(queue_profile_stats, chunk_stats.get('profile', {}) or {})
                                 source_counts = dict(chunk_stats.get('opponent_source_counts', {}) or {})
                                 if source_counts:
@@ -2067,7 +1201,7 @@ def play_games_parallel_mcts(
                         pass
 
                     for rank in list(pending):
-                        proc = _SELFPLAY_POOL.processes.get(rank)
+                        proc = selfplay_pool.processes.get(rank)
                         if proc is None or proc.is_alive():
                             continue
                         interrupted = _is_interrupt_exit_code(proc.exitcode)
@@ -2153,6 +1287,8 @@ def play_games_parallel_mcts(
     total_search_simulations_used_sum = queue_search_simulations_used_sum if use_queue_transport else 0
     total_search_samples = queue_search_samples if use_queue_transport else 0
     total_search_simulations_used_samples = list(queue_search_simulations_used_samples) if use_queue_transport else []
+    total_adaptive_stopped_early = queue_adaptive_stopped_early if use_queue_transport else 0
+    total_adaptive_stop_reasons = dict(queue_adaptive_stop_reasons) if use_queue_transport else {}
     total_profile_stats = dict(queue_profile_stats) if use_queue_transport else {}
     if use_queue_transport:
         avg_queue_wait_ms = 1000.0 * float(queue_wait_total_s) / float(max(1, queue_wait_events))
@@ -2182,12 +1318,8 @@ def play_games_parallel_mcts(
                                 break
                             if isinstance(payload, tuple) and len(payload) == 3:
                                 positions, lengths, stats = payload
-                            elif isinstance(payload, tuple) and len(payload) == 2:
-                                positions, lengths = payload
-                                stats = {}
                             else:
-                                # Unexpected format: preserve backward compatibility best-effort.
-                                positions, lengths, stats = [], [], {}
+                                raise ValueError(f"Unexpected self-play result payload format: {type(payload).__name__}")
 
                             total_positions += len(positions)
                             for pos in positions:
@@ -2224,6 +1356,12 @@ def play_games_parallel_mcts(
                             total_search_simulations_used_sum += int((stats or {}).get('search_simulations_used_sum', 0))
                             total_search_samples += int((stats or {}).get('search_samples', 0))
                             total_search_simulations_used_samples.extend(list((stats or {}).get('search_simulations_used_samples', []) or []))
+                            total_adaptive_stopped_early += int((stats or {}).get('adaptive_stopped_early', 0))
+                            for reason, count in dict((stats or {}).get('adaptive_stop_reasons', {}) or {}).items():
+                                reason = str(reason)
+                                total_adaptive_stop_reasons[reason] = (
+                                    int(total_adaptive_stop_reasons.get(reason, 0)) + int(count)
+                                )
                             _accumulate_profile_stats(total_profile_stats, (stats or {}).get('profile', {}) or {})
                             source_counts = dict((stats or {}).get('opponent_source_counts', {}) or {})
                             if source_counts:
@@ -2263,9 +1401,9 @@ def play_games_parallel_mcts(
                                     result_stats["games"] += learner_total
                     result_file.unlink()
                 except Exception as e:
-                    print(f"⚠️ Warning: Failed to load results from worker {idx}: {e}")
+                    print(f"âš ď¸Ź Warning: Failed to load results from worker {idx}: {e}")
             else:
-                print(f"⚠️ Warning: Worker {idx} result file not found")
+                print(f"âš ď¸Ź Warning: Worker {idx} result file not found")
     
     collection_time = time.time() - collection_start
     total_time = time.time() - start_time
@@ -2276,7 +1414,7 @@ def play_games_parallel_mcts(
     def _format_plies(value):
         return f"{value:.1f} plies (~{value / 2.0:.1f} full moves)"
     
-    print(f"✅ MCTS Self-play completed:")
+    print(f"âś… MCTS Self-play completed:")
     print(f"   Positions: {total_positions}")
     print(f"   Games: {len(game_lengths)}")
     if opponent_source_games:
@@ -2408,6 +1546,9 @@ def play_games_parallel_mcts(
         'search_simulations_used_avg': float(total_search_simulations_used_sum) / float(total_search_samples) if total_search_samples > 0 else 0.0,
         'search_simulations_used_p10': float(np.percentile(np.asarray(total_search_simulations_used_samples, dtype=np.float32), 10)) if total_search_simulations_used_samples else 0.0,
         'search_samples': int(total_search_samples),
+        'adaptive_stopped_early': int(total_adaptive_stopped_early),
+        'adaptive_stop_rate': float(total_adaptive_stopped_early) / float(total_search_samples) if total_search_samples > 0 else 0.0,
+        'adaptive_stop_reasons': dict(total_adaptive_stop_reasons),
         'opponent_results': {
             str(label): {
                 'wins': int((stats or {}).get('wins', 0)),
@@ -2590,7 +1731,7 @@ def main():
     
     if use_bfloat16 and torch.cuda.is_available():
         if not torch.cuda.is_bf16_supported():
-            print("⚠️ bfloat16 not supported")
+            print("âš ď¸Ź bfloat16 not supported")
             use_bfloat16 = False
     
     best_model_il_path = base_dir / config['paths']['best_model_il']
@@ -2755,6 +1896,13 @@ def main():
         except Exception as exc:
             anchor_model = None
             print(f"Anchor eval disabled: failed to load IL best ({exc})")
+    anchor_eval_unlocked = bool(
+        anchor_model_available
+        and anchor_model is not None
+        and not _models_have_identical_state(best_model, anchor_model)
+    )
+    if anchor_model_available and not anchor_eval_unlocked:
+        print("Anchor eval locked until the first promoted best has at least one true win vs current best.")
 
     rl_cfg = config['reinforcement_learning']
     recent_snapshot_keep = max(0, int(rl_cfg.get('self_play_recent_snapshots_to_keep', 4)))
@@ -2887,64 +2035,64 @@ def main():
 
     if use_lr_schedule:
         print(
-            f"✅ LR schedule: warmup={warmup_iters} iters → "
+            f"âś… LR schedule: warmup={warmup_iters} iters â†’ "
             f"cosine decay (base_lr={lr_base:.6g}, min_lr_ratio={min_lr_ratio})"
         )
 
     print("\n=== Starting RL training with PROPER MCTS ===")
-    print("🎯 OPTIMIZATIONS:")
-    print(f"   • MCTS self-play (AlphaZero approach)")
-    print(f"   • MCTS simulations: {config['reinforcement_learning']['mcts_simulations']}")
-    print(f"   • Tree reuse: {config['reinforcement_learning'].get('mcts_reuse_tree', True)}")
-    print(f"   • Batch MCTS: {config['reinforcement_learning'].get('mcts_batch_size', 32)}")
+    print("đźŽŻ OPTIMIZATIONS:")
+    print(f"   â€˘ MCTS self-play (AlphaZero approach)")
+    print(f"   â€˘ MCTS simulations: {config['reinforcement_learning']['mcts_simulations']}")
+    print(f"   â€˘ Tree reuse: {config['reinforcement_learning'].get('mcts_reuse_tree', True)}")
+    print(f"   â€˘ Batch MCTS: {config['reinforcement_learning'].get('mcts_batch_size', 32)}")
     print(
-        "   • Dynamic c_puct: "
+        "   â€˘ Dynamic c_puct: "
         f"{config['reinforcement_learning'].get('mcts_dynamic_c_puct', True)} "
         f"(init={float(config['reinforcement_learning'].get('mcts_c_puct_init', config['reinforcement_learning'].get('mcts_c_puct', 1.5))):.2f}, "
         f"base={int(config['reinforcement_learning'].get('mcts_c_puct_base', 19652))}, "
         f"max={config['reinforcement_learning'].get('mcts_c_puct_max', None)})"
     )
     print(
-        "   • FPU: "
+        "   â€˘ FPU: "
         f"{config['reinforcement_learning'].get('mcts_use_fpu', True)} "
         f"(reduction={float(config['reinforcement_learning'].get('mcts_fpu_reduction', 0.30)):.2f}, "
         f"absolute={config['reinforcement_learning'].get('mcts_fpu_absolute', None)})"
     )
-    print(f"   • Persistent self-play workers: {config['reinforcement_learning'].get('persistent_self_play_workers', True)}")
-    print(f"   • Stream self-play to replay: {config['reinforcement_learning'].get('self_play_stream_to_replay', True)}")
+    print(f"   â€˘ Persistent self-play workers: {config['reinforcement_learning'].get('persistent_self_play_workers', True)}")
+    print(f"   â€˘ Stream self-play to replay: {config['reinforcement_learning'].get('self_play_stream_to_replay', True)}")
     if bool(config['reinforcement_learning'].get('self_play_opponent_pool_enabled', False)):
         print(
-            "   • Opponent pool: "
+            "   â€˘ Opponent pool: "
             f"current={float(config['reinforcement_learning'].get('self_play_opponent_current_fraction', 0.4)):.0%}, "
             f"best={float(config['reinforcement_learning'].get('self_play_opponent_best_fraction', 0.3)):.0%}, "
             f"recent={float(config['reinforcement_learning'].get('self_play_opponent_recent_fraction', 0.3)):.0%}"
         )
         print(
-            "   • Recent frozen snapshots: "
+            "   â€˘ Recent frozen snapshots: "
             f"{int(config['reinforcement_learning'].get('self_play_recent_snapshots_to_keep', 4))}"
         )
     if bool(config['reinforcement_learning'].get('self_play_opponent_pool_enabled', False)) and bool(
         config['reinforcement_learning'].get('self_play_opponent_adaptive_enabled', False)
     ):
         print(
-            "   • Adaptive opponent scheduler: "
+            "   â€˘ Adaptive opponent scheduler: "
             f"on (target={float(config['reinforcement_learning'].get('self_play_opponent_adaptive_target_score', 0.50)):.0%}, "
-            f"band=±{float(config['reinforcement_learning'].get('self_play_opponent_adaptive_band', 0.15)):.0%}, "
+            f"band=Â±{float(config['reinforcement_learning'].get('self_play_opponent_adaptive_band', 0.15)):.0%}, "
             f"current_floor={float(config['reinforcement_learning'].get('self_play_opponent_current_min_fraction', 0.50)):.0%})"
         )
     if bool(config['reinforcement_learning'].get('self_play_resignation_enabled', False)):
         print(
-            "   • Resignation: "
+            "   â€˘ Resignation: "
             f"enabled (threshold={float(config['reinforcement_learning'].get('self_play_resignation_threshold', 0.92)):.2f}, "
             f"patience={int(config['reinforcement_learning'].get('self_play_resignation_patience', 3))}, "
             f"disable_fraction={float(config['reinforcement_learning'].get('self_play_resignation_disable_fraction', 0.10)):.0%})"
         )
-    print(f"   • 🆕 Temperature Schedule: {use_temp_schedule}")
-    print(f"   • 📊 Policy Accuracy & Value MAE tracking")
-    print(f"   • Replay buffer capacity: {config['reinforcement_learning']['replay_buffer_size']:,} positions")
-    print(f"   • Replay policy target cap: {replay_max_policy_targets} moves/position")
+    print(f"   â€˘ đź†• Temperature Schedule: {use_temp_schedule}")
+    print(f"   â€˘ đź“Š Policy Accuracy & Value MAE tracking")
+    print(f"   â€˘ Replay buffer capacity: {config['reinforcement_learning']['replay_buffer_size']:,} positions")
+    print(f"   â€˘ Replay policy target cap: {replay_max_policy_targets} moves/position")
     print(
-        f"   • Replay buffer dynamic sizing: "
+        f"   â€˘ Replay buffer dynamic sizing: "
         f"bootstrap={int(config['reinforcement_learning'].get('replay_buffer_bootstrap_positions_per_iteration_resolved', 0)):,}, "
         f"multiplier={replay_multiplier:.2f}, "
         f"ema_alpha={replay_buffer_ema_alpha:.2f}, "
@@ -2975,7 +2123,7 @@ def main():
     )
     adaptive_draw_target = float(rl_cfg.get('adaptive_temperature_draw_target', 0.30))
     adaptive_draw_band = max(0.01, float(rl_cfg.get('adaptive_temperature_draw_band', 0.05)))
-    score_rate_threshold = float(rl_cfg.get('score_rate_threshold', rl_cfg.get('win_rate_threshold', 0.55)))
+    score_rate_threshold = float(rl_cfg.get('score_rate_threshold', 0.55))
     true_win_rate_threshold = float(rl_cfg.get('true_win_rate_threshold', 0.0))
     staged_eval_enabled = bool(rl_cfg.get('eval_staged_enabled', False))
     eval_stage1_games = max(1, int(rl_cfg.get('eval_stage1_games', rl_cfg.get('eval_games', 50))))
@@ -3086,7 +2234,7 @@ def main():
                     adaptive_dirichlet_min_weight,
                     min(base_mcts_dirichlet_weight, float(current_dirichlet_weight)),
                 )
-            print(f"🌡️ Temperature: {current_temp:.2f}")
+            print(f"đźŚˇď¸Ź Temperature: {current_temp:.2f}")
             if temp_debug.get("enabled", False):
                 print(
                     "   Adaptive temp: "
@@ -3105,7 +2253,7 @@ def main():
             config['reinforcement_learning']['mcts_temperature_threshold'] = current_temp_threshold
             
             if use_lr_schedule:
-                print(f"📉 LR: {current_lr:.2e}")
+                print(f"đź“‰ LR: {current_lr:.2e}")
 
             rl_cfg['current_iteration'] = int(iteration + 1)
 
@@ -3120,7 +2268,7 @@ def main():
                             guard_min_weight,
                             current_value_loss_weight * (guard_scale ** value_guard_poor_eval_streak),
                         )
-            print(f"⚖️ Value loss weight: {current_value_loss_weight:.3f}")
+            print(f"âš–ď¸Ź Value loss weight: {current_value_loss_weight:.3f}")
 
             _finish_stage('setup')
 
@@ -3183,17 +2331,25 @@ def main():
              
             print(f"Replay buffer: {len(replay_buffer)}/{replay_buffer.max_size} positions (+{positions_added})")
             print(
-                f"📊 Self-play stats: draw_rate={float((selfplay_stats or {}).get('completed_draw_rate', 0.0)):.2%}, "
+                f"đź“Š Self-play stats: draw_rate={float((selfplay_stats or {}).get('completed_draw_rate', 0.0)):.2%}, "
                 f"avg_value={float((selfplay_stats or {}).get('avg_game_value', 0.0)):.3f}, "
                 f"value_std={float((selfplay_stats or {}).get('value_std', 0.0)):.3f}"
             )
             print(
-                f"🎯 MCTS sims: avg={float((selfplay_stats or {}).get('search_simulations_used_avg', 0.0)):.1f}, "
+                f"đźŽŻ MCTS sims: avg={float((selfplay_stats or {}).get('search_simulations_used_avg', 0.0)):.1f}, "
                 f"p10={float((selfplay_stats or {}).get('search_simulations_used_p10', 0.0)):.1f}, "
+                f"early={100.0 * float((selfplay_stats or {}).get('adaptive_stop_rate', 0.0)):.1f}%, "
                 f"samples={int((selfplay_stats or {}).get('search_samples', 0))}"
             )
+            adaptive_stop_reasons = dict((selfplay_stats or {}).get('adaptive_stop_reasons', {}) or {})
+            if adaptive_stop_reasons:
+                reason_text = ", ".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(adaptive_stop_reasons.items())
+                )
+                print(f"MCTS adaptive stops: {reason_text}")
             print(
-                f"📦 Replay shaping: curriculum_drop={int((selfplay_stats or {}).get('curriculum_dropped_positions', 0))}, "
+                f"đź“¦ Replay shaping: curriculum_drop={int((selfplay_stats or {}).get('curriculum_dropped_positions', 0))}, "
                 f"cap_drop={int((selfplay_stats or {}).get('cap_dropped_positions', 0))}"
             )
             print(
@@ -3203,197 +2359,7 @@ def main():
             )
             selfplay_profile = dict((selfplay_stats or {}).get('profile', {}) or {})
             if profile_training_enabled and selfplay_profile:
-                wall_selfplay_time = max(1e-8, float(selfplay_time))
-                summed_worker_reference_time = float(
-                    selfplay_profile.get("mcts_search_many_time", 0.0) or 0.0
-                )
-                if summed_worker_reference_time <= 0.0:
-                    fallback_profile_values = [
-                        float(selfplay_profile.get("mcts_batch_expand_eval_time", 0.0) or 0.0),
-                        float(selfplay_profile.get("mcts_board_to_tensor_time", 0.0) or 0.0),
-                        float(selfplay_profile.get("mcts_nn_inference_time", 0.0) or 0.0),
-                        float(selfplay_profile.get("policy_target_build_time", 0.0) or 0.0),
-                        float(selfplay_profile.get("policy_target_postgame_time", 0.0) or 0.0),
-                        float(selfplay_profile.get("move_selection_time", 0.0) or 0.0),
-                        float(selfplay_profile.get("adjudication_time", 0.0) or 0.0),
-                        float(selfplay_profile.get("syzygy_time", 0.0) or 0.0),
-                    ]
-                    summed_worker_reference_time = max(fallback_profile_values) if fallback_profile_values else wall_selfplay_time
-                summed_worker_reference_time = max(1e-8, float(summed_worker_reference_time))
-
-                search_many_time = max(0.0, float(selfplay_profile.get("mcts_search_many_time", 0.0) or 0.0))
-                batch_expand_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_eval_time", 0.0) or 0.0))
-                board_to_tensor_time = max(0.0, float(selfplay_profile.get("mcts_board_to_tensor_time", 0.0) or 0.0))
-                nn_inference_time = max(0.0, float(selfplay_profile.get("mcts_nn_inference_time", 0.0) or 0.0))
-                nn_calls = int(selfplay_profile.get("mcts_nn_inference_calls", 0) or 0)
-                nn_batch_items = int(selfplay_profile.get("mcts_nn_inference_batch_items", 0) or 0)
-                nn_legal_move_items = int(selfplay_profile.get("mcts_nn_legal_move_items", 0) or 0)
-                nn_h2d_time = max(0.0, float(selfplay_profile.get("mcts_nn_h2d_time", 0.0) or 0.0))
-                nn_gpu_forward_time = max(0.0, float(selfplay_profile.get("mcts_nn_gpu_forward_time", 0.0) or 0.0))
-                nn_gpu_postprocess_time = max(0.0, float(selfplay_profile.get("mcts_nn_gpu_postprocess_time", 0.0) or 0.0))
-                nn_d2h_time = max(0.0, float(selfplay_profile.get("mcts_nn_d2h_time", 0.0) or 0.0))
-                policy_target_build_time = max(0.0, float(selfplay_profile.get("policy_target_build_time", 0.0) or 0.0))
-                policy_target_postgame_time = max(0.0, float(selfplay_profile.get("policy_target_postgame_time", 0.0) or 0.0))
-                move_selection_time = max(0.0, float(selfplay_profile.get("move_selection_time", 0.0) or 0.0))
-                adjudication_time = max(0.0, float(selfplay_profile.get("adjudication_time", 0.0) or 0.0))
-                syzygy_time = max(0.0, float(selfplay_profile.get("syzygy_time", 0.0) or 0.0))
-
-                batch_expand_capped = min(batch_expand_time, search_many_time)
-                nn_inference_capped = min(nn_inference_time, batch_expand_capped)
-                board_to_tensor_capped = min(board_to_tensor_time, batch_expand_capped)
-                batch_other_time = max(0.0, batch_expand_capped - nn_inference_capped - board_to_tensor_capped)
-                search_other_time = max(0.0, search_many_time - batch_expand_capped)
-                gpu_utilization_pct_display = 0.0
-                if search_many_time > 0.0:
-                    gpu_utilization_pct_display = 100.0 * (nn_inference_capped / search_many_time)
-                gpu_utilization_pct_display = max(0.0, min(100.0, float(gpu_utilization_pct_display)))
-                average_batch_size_display = float(nn_batch_items / nn_calls) if nn_calls > 0 else 0.0
-                average_legal_moves_display = float(nn_legal_move_items / nn_batch_items) if nn_batch_items > 0 else 0.0
-                inference_per_batch_ms_display = (
-                    1000.0 * float(nn_inference_capped) / float(nn_calls) if nn_calls > 0 else 0.0
-                )
-                inference_per_position_ms_display = (
-                    1000.0 * float(nn_inference_capped) / float(nn_batch_items) if nn_batch_items > 0 else 0.0
-                )
-
-                h2d_raw = max(0.0, float(nn_h2d_time))
-                gpu_forward_raw = max(0.0, float(nn_gpu_forward_time))
-                gpu_postprocess_raw = max(0.0, float(nn_gpu_postprocess_time))
-                d2h_raw = max(0.0, float(nn_d2h_time))
-                gpu_stage_total = h2d_raw + gpu_forward_raw + gpu_postprocess_raw + d2h_raw
-                transfer_total_raw = h2d_raw + d2h_raw
-
-                def _pct_of_gpu_stages(value):
-                    return 100.0 * float(value) / max(1e-8, gpu_stage_total)
-
-                gpu_bottleneck = "mixed"
-                if gpu_stage_total > 0.0:
-                    if gpu_forward_raw >= max(transfer_total_raw * 1.25, gpu_stage_total * 0.55):
-                        gpu_bottleneck = "compute-bound"
-                    elif transfer_total_raw >= max(gpu_forward_raw * 0.95, gpu_stage_total * 0.45):
-                        gpu_bottleneck = "transfer-bound"
-                    elif gpu_postprocess_raw >= max(gpu_stage_total * 0.20, transfer_total_raw * 0.85):
-                        gpu_bottleneck = "postprocess-bound"
-
-                def _pct_of_search(value):
-                    return 100.0 * float(value) / max(1e-8, search_many_time)
-
-                def _pct_of_batch_expand(value):
-                    return 100.0 * float(value) / max(1e-8, batch_expand_capped)
-
-                top_level_components = [
-                    ("search_many", search_many_time),
-                    ("policy_target_build", policy_target_build_time),
-                    ("policy_target_postgame", policy_target_postgame_time),
-                    ("move_selection", move_selection_time),
-                    ("adjudication", adjudication_time),
-                    ("syzygy", syzygy_time),
-                ]
-                total_selfplay_sum_time = sum(float(value) for _, value in top_level_components)
-
-                def _pct_of_selfplay_total(value):
-                    return 100.0 * float(value) / max(1e-8, total_selfplay_sum_time)
-
-                def _print_total_line(label, value):
-                    print(
-                        f"   - {label:<22} {float(value):7.2f}s "
-                        f"({_pct_of_selfplay_total(value):5.1f}% selfplay_total)"
-                    )
-
-                def _print_search_line(label, value):
-                    print(
-                        f"     - {label:<20} {float(value):7.2f}s "
-                        f"({_pct_of_search(value):5.1f}% search_many)"
-                    )
-
-                def _print_batch_expand_line(label, value):
-                    print(
-                        f"       - {label:<18} {float(value):7.2f}s "
-                        f"({_pct_of_batch_expand(value):5.1f}% _batch_expand_eval)"
-                    )
-
-                summed_vs_wall_ratio = summed_worker_reference_time / wall_selfplay_time
-                print("Self-play profiler (sumowany czas workerow):")
-                print(
-                    "   "
-                    f"wall_clock={wall_selfplay_time:.2f}s, "
-                    f"reference_sum={summed_worker_reference_time:.2f}s, "
-                    f"sum/wall={summed_vs_wall_ratio:.2f}x"
-                )
-                print("")
-                print(f"   Sekcja A: Self-play total ({total_selfplay_sum_time:.2f}s, 100.0%):")
-                _print_total_line("search_many", search_many_time)
-                _print_search_line("_batch_expand_eval", batch_expand_capped)
-                _print_batch_expand_line("nn_inference", nn_inference_capped)
-                _print_batch_expand_line("board_to_tensor", board_to_tensor_capped)
-                _print_batch_expand_line("batch_expand_other", batch_other_time)
-                _print_search_line("search_other", search_other_time)
-                _print_total_line("policy_target_build", policy_target_build_time)
-                _print_total_line("policy_target_postgame", policy_target_postgame_time)
-                _print_total_line("move_selection", move_selection_time)
-                _print_total_line("adjudication", adjudication_time)
-                _print_total_line("syzygy", syzygy_time)
-                print("")
-                print(
-                    f"   Sekcja B: GPU (raw_stage_sum={gpu_stage_total:.2f}s, "
-                    f"inference_wall={nn_inference_capped:.2f}s):"
-                )
-                print(
-                    f"   {'gpu_utilization %':<24} "
-                    f"{gpu_utilization_pct_display:7.2f}% "
-                    f"(nn_inference/search_many)"
-                )
-                print(
-                    f"   {'average_batch_size':<24} "
-                    f"{average_batch_size_display:7.2f} pos/batch"
-                )
-                print(
-                    f"   {'average_legal_moves':<24} "
-                    f"{average_legal_moves_display:7.2f} legal/pos"
-                )
-                print(
-                    f"   {'h2d_transfer':<24} "
-                    f"{h2d_raw:7.2f}s "
-                    f"({_pct_of_gpu_stages(h2d_raw):5.1f}% gpu_stages)"
-                )
-                print(
-                    f"   {'gpu_forward':<24} "
-                    f"{gpu_forward_raw:7.2f}s "
-                    f"({_pct_of_gpu_stages(gpu_forward_raw):5.1f}% gpu_stages)"
-                )
-                print(
-                    f"   {'gpu_postprocess':<24} "
-                    f"{gpu_postprocess_raw:7.2f}s "
-                    f"({_pct_of_gpu_stages(gpu_postprocess_raw):5.1f}% gpu_stages)"
-                )
-                print(
-                    f"   {'d2h_transfer':<24} "
-                    f"{d2h_raw:7.2f}s "
-                    f"({_pct_of_gpu_stages(d2h_raw):5.1f}% gpu_stages)"
-                )
-                print(
-                    f"   {'inference_per_batch':<24} "
-                    f"{inference_per_batch_ms_display:7.2f} ms/batch"
-                )
-                print(
-                    f"   {'inference_per_position':<24} "
-                    f"{inference_per_position_ms_display:7.2f} ms/pos"
-                )
-                print(
-                    f"   {'gpu_bottleneck':<24} "
-                    f"{gpu_bottleneck}"
-                )
-                queue_wait_total_s = max(0.0, float(selfplay_profile.get('queue_wait_total_s', 0.0) or 0.0))
-                print("")
-                print(f"   Sekcja C: Queue/IPC ({queue_wait_total_s:.2f}s lacznego czekania):")
-                print(
-                    f"   {'queue_wait_time_ms':<24} "
-                    f"{float(selfplay_profile.get('queue_wait_time_ms', 0.0) or 0.0):7.2f} ms/event"
-                )
-                print(
-                    f"   {'queue_wait_events':<24} "
-                    f"{int(selfplay_profile.get('queue_wait_events', 0) or 0)}"
-                )
+                print_selfplay_profiler(selfplay_profile, selfplay_time)
             adaptive_opponent_scheduler_state, observed_scores = _update_adaptive_opponent_scheduler(
                 rl_cfg,
                 adaptive_opponent_scheduler_state,
@@ -3440,7 +2406,7 @@ def main():
                 total_value_pred_std = 0
                 total_target_value_std = 0
                 
-                # 📊 Initialize metrics calculator
+                # đź“Š Initialize metrics calculator
                 metrics_calc = MetricsCalculator()
                 
                 full_batches, remainder_batch = divmod(replay_size, base_batch_size)
@@ -3481,15 +2447,15 @@ def main():
                 avg_value_pred_std = total_value_pred_std / total_train_steps
                 avg_target_value_std = total_target_value_std / total_train_steps
                 
-                # 📊 Compute metrics
+                # đź“Š Compute metrics
                 train_metrics = metrics_calc.compute()
                 
                 print(f"Loss: {avg_loss:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}")
-                print(f"📊 Top-1: {train_metrics['policy_top1_acc']:.2%}, "
+                print(f"đź“Š Top-1: {train_metrics['policy_top1_acc']:.2%}, "
                       f"Top-3: {train_metrics['policy_top3_acc']:.2%}, "
                       f"MAE: {train_metrics['value_mae']:.4f}")
                 print(
-                    f"📈 Entropy: {avg_policy_entropy:.4f}, "
+                    f"đź“ Entropy: {avg_policy_entropy:.4f}, "
                     f"Pred value std: {avg_value_pred_std:.4f}, "
                     f"Target value std: {avg_target_value_std:.4f}"
                 )
@@ -3560,9 +2526,9 @@ def main():
                 eval_draws = int((eval_stats or {}).get('draws', 0))
                 eval_losses = int((eval_stats or {}).get('losses', 0))
                 eval_unresolved = int((eval_stats or {}).get('unresolved', 0))
-                print(f"Score rate: {score_rate:.2%}")
+                print(f"Score rate vs best: {score_rate:.2%}")
                 print(
-                    f"Eval W/D/L: {eval_wins}/{eval_draws}/{eval_losses} "
+                    f"Eval vs best W/D/L: {eval_wins}/{eval_draws}/{eval_losses} "
                     f"(true win rate: {true_win_rate:.2%}, unresolved draws at cap: {eval_unresolved})"
                 )
                 if bool(rl_cfg.get('value_guard_enabled', True)):
@@ -3587,7 +2553,9 @@ def main():
                     prev_eval_score_rate_for_temp = last_eval_score_rate_for_guard
                     last_eval_score_rate_for_guard = float(score_rate)
                 if anchor_model_available and anchor_model is not None and _should_run_anchor_eval(iteration + 1, rl_cfg):
-                    if _models_have_identical_state(best_model, anchor_model):
+                    if not anchor_eval_unlocked:
+                        print("Anchor eval skipped: locked until first true-win promotion vs best.")
+                    elif _models_have_identical_state(best_model, anchor_model):
                         print("Anchor eval skipped: current best still matches IL-best.")
                     else:
                         print(f"Anchor eval vs IL-best ({int(rl_cfg.get('anchor_eval_games', 40))} games)...")
@@ -3661,9 +2629,11 @@ def main():
                 )
                 last_logged_iteration = iteration + 1
                 if score_rate >= score_rate_threshold and true_win_rate >= true_win_rate_threshold:
-                    print("✅ New best model!")
+                    print("âś… New best model!")
                     best_model.load_state_dict(model.state_dict())
                     best_win_rate_so_far = max(best_win_rate_so_far, float(score_rate))
+                    if int(eval_wins or 0) > 0 and anchor_model_available:
+                        anchor_eval_unlocked = True
                     
                     model_to_save = model
                     save_checkpoint(
@@ -3685,12 +2655,12 @@ def main():
                     )
                     
                     size_mb = best_model_rl_path.stat().st_size / (1024**2)
-                    print(f"💾 Saved: {best_model_rl_path} ({size_mb:.1f} MB)")
+                    print(f"đź’ľ Saved: {best_model_rl_path} ({size_mb:.1f} MB)")
                     if version_best_model_path != best_model_rl_path:
                         shutil.copy2(best_model_rl_path, version_best_model_path)
                         version_best_size_mb = version_best_model_path.stat().st_size / (1024 ** 2)
                         print(
-                            f"💾 Version best updated: {version_best_model_path.name} "
+                            f"đź’ľ Version best updated: {version_best_model_path.name} "
                             f"({version_best_size_mb:.1f} MB)"
                         )
                 improved_score = (
@@ -3798,7 +2768,7 @@ def main():
                 },
             )
             latest_size_mb = latest_checkpoint_path.stat().st_size / (1024 ** 2)
-            print(f"💾 Latest checkpoint updated: {latest_checkpoint_path.name} ({latest_size_mb:.1f} MB)")
+            print(f"đź’ľ Latest checkpoint updated: {latest_checkpoint_path.name} ({latest_size_mb:.1f} MB)")
             
             _finish_stage('checkpoint')
             gc.collect()
@@ -3837,3 +2807,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         _handle_graceful_interrupt(logger=None, stage="runtime")
+
+

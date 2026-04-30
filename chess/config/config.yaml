@@ -219,7 +219,8 @@ reinforcement_learning:
   # Self-Play Game Flow
   # ---------------------------
   use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
-  max_batch_games_per_worker: 24     # Slightly smaller worker batches reduce latency spikes once search gets stronger
+  max_batch_games_per_worker: 24     # Active self-play game slots per worker; completed games are continuously replaced inside a dispatch chunk
+  self_play_dispatch_chunk_games: 96 # Requested chunk cap; runtime caps it by games/worker so large chunks do not starve workers
   self_play_max_moves: 190          # Shorter cap: cut low-value sterile games earlier instead of harvesting many doomed draw samples
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
   self_play_claim_repetition_after_moves: 40  # Claim sterile repetition earlier to reduce low-signal looping positions
@@ -255,7 +256,6 @@ reinforcement_learning:
   self_play_opponent_recent_fraction: 0.55    # Keep most games vs recent snapshots while preserving stronger anchor exposure
   self_play_recent_snapshots_to_keep: 10       # Keep a wider recent window, then let the smart selector choose the actually useful opponents
   self_play_recent_candidate_pool_size: 4     # From the wider recent window, expose only the best-matched few snapshots to self-play
-  self_play_recent_fallback_min_count: 2      # If too few recent snapshots fall into the preferred score band, still keep at least a small fallback pool
   self_play_recent_recency_bias: 0.35         # Prefer fresher snapshots, but still let matchup quality dominate the selection
   self_play_recent_confidence_games: 24       # Avg games needed before a recent snapshot score is treated as high-confidence
   self_play_recent_uncertainty_bonus: 0.15    # Small exploration bonus for newer/under-tested recent snapshots
@@ -336,10 +336,17 @@ reinforcement_learning:
   mcts_tactical_promotion_bonus: 0.12 # Promotions are rare and critical
   mcts_tactical_recapture_bonus: 0.08 # Helps short tactical recapture sequences
   mcts_adaptive_search_enabled: true            # Stop self-play search early when the root move distribution is already confident instead of using a random playout cap
-  mcts_adaptive_search_min_simulations: 64      # Never stop before this many sims; easy positions still get a minimum amount of search
-  mcts_adaptive_search_top_visit_confidence: 0.76 # Early-stop only when the best move owns a large share of root visits
-  mcts_adaptive_search_visit_gap: 0.2           # Also require a healthy lead over the runner-up move
-  mcts_adaptive_search_max_entropy: 0.52        # Prevent early stop when root policy is still broad/uncertain
+  mcts_adaptive_search_min_simulations: 32      # Let clearly decided positions stop at the first post-expansion confidence check
+  mcts_adaptive_search_check_interval: 16       # Check adaptive stop in coarser chunks to avoid spending CPU on root stats every tiny MCTS step
+  mcts_adaptive_search_low_branching_moves: 6   # Positions with few legal moves need less proof before early-stop can trigger
+  mcts_adaptive_search_low_branching_min_simulations: 16 # Lower floor for simple low-branching positions
+  mcts_adaptive_search_endgame_piece_count: 10  # Small endgames often become search-stable quickly, especially with Syzygy support nearby
+  mcts_adaptive_search_endgame_min_simulations: 24 # Lower floor for small endgames that are not tablebase-resolved yet
+  mcts_adaptive_search_top_visit_confidence: 0.68 # Early-stop when the best move owns a clear root-visit majority
+  mcts_adaptive_search_visit_gap: 0.16          # Also require a useful lead over the runner-up move
+  mcts_adaptive_search_locked_margin: 2         # Stop when the runner-up cannot realistically catch the leader with remaining sims
+  mcts_adaptive_search_max_entropy: 0.62        # Prevent early stop when root policy is still broad/uncertain
+  mcts_adaptive_search_low_branching_confidence_delta: 0.06 # Slightly relax confidence gates when there are only a few legal moves
   mcts_adaptive_policy_weight_min_fraction: 0.75 # Policy target gets weight 1 only if search used at least this fraction of the full budget
   policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
   policy_target_pruning_keep_top_n: 8           # Always keep a broader top slice so uncertain positions retain more searched alternatives
@@ -419,7 +426,6 @@ reinforcement_learning:
   early_stop_min_true_win_improvement: 0.005 # Or at least +0.5pp true-win improvement
   score_rate_threshold: 0.55    # Promote best model only if score vs current best is clearly positive
   true_win_rate_threshold: 0.02 # Also require some real decisive edge, not only draw-heavy scoring
-  win_rate_threshold: 0.55      # Backward-compat alias; current code uses score_rate_threshold for promotion
   anchor_eval_enabled: true
   anchor_eval_every: 1          # Run anchor eval on every RL evaluation cycle
   anchor_eval_games: 40
@@ -494,7 +500,6 @@ elo_estimation:
   rl_every_n_evals: 3          # In RL: run Stockfish Elo every Nth model-vs-best evaluation
   rl_min_score_rate_for_stockfish: 0.50     # Gate periodic Stockfish Elo by score rate vs current best
   rl_min_true_win_rate_for_stockfish: 0.02  # Also require at least a small decisive edge before paying for Elo
-  rl_min_win_rate_for_stockfish: 0.50       # Backward-compat alias for score-rate gate
   final_on_rl_shutdown: true   # In RL: run one final Elo test on normal end and after Ctrl+C training stop; press Ctrl+C again during that Elo to cancel it
   stockfish_path: "stockfish"  # Path to Stockfish binary (or just "stockfish" if on PATH)
   workers: 0                   # Parallel game workers (0/auto = use full available CPU budget, adjusted by stockfish_threads in RL)

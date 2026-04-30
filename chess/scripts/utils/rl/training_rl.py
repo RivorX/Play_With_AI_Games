@@ -82,38 +82,26 @@ def _resolve_eval_max_moves(config):
 
 def _resolve_eval_auto_claim_draw(config):
     rl_cfg = config.get("reinforcement_learning", {})
-    return bool(
-        rl_cfg.get(
-            "eval_auto_claim_draw",
-            rl_cfg.get("self_play_auto_claim_draw", False),
-        )
-    )
+    return bool(rl_cfg.get("eval_auto_claim_draw", False))
 
 
 def _resolve_eval_claim_draw_after_moves(config):
     rl_cfg = config.get("reinforcement_learning", {})
-    fallback = rl_cfg.get(
-        "self_play_claim_draw_after_moves",
-        _resolve_eval_max_moves(config),
-    )
-    raw_value = rl_cfg.get("eval_claim_draw_after_moves", fallback)
+    raw_value = rl_cfg.get("eval_claim_draw_after_moves", _resolve_eval_max_moves(config))
     try:
         return max(0, int(raw_value))
     except Exception:
-        return max(0, int(fallback))
+        return _resolve_eval_max_moves(config)
 
 
 def _resolve_eval_claim_repetition_after_moves(config):
     rl_cfg = config.get("reinforcement_learning", {})
-    fallback = rl_cfg.get(
-        "self_play_claim_repetition_after_moves",
-        min(_resolve_eval_claim_draw_after_moves(config), 80),
-    )
-    raw_value = rl_cfg.get("eval_claim_repetition_after_moves", fallback)
+    default_value = min(_resolve_eval_claim_draw_after_moves(config), 80)
+    raw_value = rl_cfg.get("eval_claim_repetition_after_moves", default_value)
     try:
         return max(0, int(raw_value))
     except Exception:
-        return max(0, int(fallback))
+        return default_value
 
 
 def _resolve_eval_fixed_openings_enabled(config):
@@ -629,29 +617,6 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
             with contextlib.suppress(Exception):
                 p.join(timeout=0.5)
 
-    if (
-        worker_error is not None
-        and device.type == "cuda"
-        and workers > 1
-        and ("out of memory" in worker_error.lower() or "cudaerrormemoryallocation" in worker_error.lower())
-    ):
-        print("Eval OOM on multi-worker CUDA; retrying with a single CUDA eval worker.")
-        retry_config = dict(config)
-        retry_rl_cfg = dict(config.get("reinforcement_learning", {}))
-        retry_rl_cfg["eval_workers"] = 1
-        retry_config["reinforcement_learning"] = retry_rl_cfg
-        if torch.cuda.is_available():
-            with contextlib.suppress(Exception):
-                torch.cuda.empty_cache()
-        return evaluate_models(
-            model1,
-            model2,
-            retry_config,
-            device,
-            num_games=num_games,
-            game_index_offset=game_index_offset,
-            use_fixed_openings=use_fixed_openings,
-        )
     if worker_error is not None:
         raise RuntimeError(f"Eval worker failed: {worker_error}")
 

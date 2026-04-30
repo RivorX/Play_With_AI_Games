@@ -441,23 +441,6 @@ class ReplayBuffer:
                 chosen = np.concatenate(chosen_parts)
 
         indices = np.concatenate(chosen_parts) if chosen_parts else np.empty(0, dtype=np.int64)
-        if indices.size < batch_size:
-            fallback_pool = np.setdiff1d(
-                np.arange(self.size, dtype=np.int64),
-                indices,
-                assume_unique=False,
-            )
-            if fallback_pool.size > 0:
-                indices = np.concatenate(
-                    [
-                        indices,
-                        np.random.choice(
-                            fallback_pool,
-                            min(batch_size - int(indices.size), int(fallback_pool.size)),
-                            replace=False,
-                        ),
-                    ]
-                )
         if indices.size > batch_size:
             indices = indices[:batch_size]
         np.random.shuffle(indices)
