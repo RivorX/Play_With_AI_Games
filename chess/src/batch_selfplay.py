@@ -814,6 +814,10 @@ class MultiGameBatchMCTS:
             config['reinforcement_learning'].get('mcts_fpu_reduction', 0.30)
         )
         self.fpu_absolute = config['reinforcement_learning'].get('mcts_fpu_absolute', None)
+        self.root_value_q_blend = max(
+            0.0,
+            min(1.0, float(config['reinforcement_learning'].get('mcts_root_value_q_blend', 0.35))),
+        )
         self.eval_batch_size = config['reinforcement_learning'].get('mcts_batch_size', 32)
         self.adaptive_search_enabled = bool(
             config['reinforcement_learning'].get('mcts_adaptive_search_enabled', True)
@@ -1253,8 +1257,11 @@ class MultiGameBatchMCTS:
         explored_mask = edges.explored_flags
         q_values.fill(fpu_value)
         if explored_mask.any():
+            # Edge value_sums live on child nodes, so they are from the child
+            # side-to-move perspective. The parent must negate them when
+            # deciding which move is good for the current player.
             q_values[explored_mask] = (
-                edges.value_sums[explored_mask] - edges.virtual_losses_f32[explored_mask]
+                -edges.value_sums[explored_mask] - edges.virtual_losses_f32[explored_mask]
             ) / cv[explored_mask]
 
         u_values = edges.ucb_buffer
@@ -1301,6 +1308,9 @@ class MultiGameBatchMCTS:
             'top_visit_prob': 0.0,
             'visit_gap': 0.0,
             'visit_entropy': 1.0,
+            'root_value': 0.0,
+            'root_child_q_value': 0.0,
+            'root_blended_value': 0.0,
             'stopped_early': used < budget,
             'adaptive_stop_reason': 'budget' if used >= budget else 'unknown',
             'policy_weight': 1.0 if used >= int(math.ceil(budget * self.adaptive_policy_weight_min_fraction)) else 0.0,
@@ -1313,6 +1323,30 @@ class MultiGameBatchMCTS:
         total = float(visits.sum())
         if total <= 0.0:
             return summary
+
+        root_value = 0.0
+        root_visits = int(getattr(root, 'visit_count', 0) or 0)
+        if root_visits > 0:
+            root_value = float(root.value_sum / max(1, root_visits))
+            root_value = float(max(-1.0, min(1.0, root_value)))
+
+        visited_mask = root.edges.visit_counts > 0
+        child_q_value = root_value
+        if visited_mask.any():
+            child_visits = root.edges.visit_counts[visited_mask].astype(np.float32, copy=False)
+            child_value_sums = root.edges.value_sums[visited_mask].astype(np.float32, copy=False)
+            child_total = float(child_visits.sum())
+            if child_total > 0.0:
+                # Child values are stored from child perspective; negate to get
+                # the root player's expected value for those moves.
+                child_q_value = float((-child_value_sums).sum() / child_total)
+                child_q_value = float(max(-1.0, min(1.0, child_q_value)))
+
+        q_blend = float(self.root_value_q_blend)
+        blended_value = (1.0 - q_blend) * root_value + q_blend * child_q_value
+        summary['root_value'] = root_value
+        summary['root_child_q_value'] = child_q_value
+        summary['root_blended_value'] = float(max(-1.0, min(1.0, blended_value)))
 
         visits.sort()
         top = float(visits[-1])
@@ -3160,6 +3194,11 @@ class BatchSelfPlayMCTSBatch:
                         root_visits = int(getattr(root, 'visit_count', 0) or 0)
                         if root_visits > 0:
                             root_value = float(root.value_sum / max(1, root_visits))
+                    if isinstance(search_metadata, dict) and 'root_blended_value' in search_metadata:
+                        try:
+                            root_value = float(search_metadata.get('root_blended_value', root_value))
+                        except Exception:
+                            pass
                     gs['game_history'].append((
                         history_count,
                         policy_indices,

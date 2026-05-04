@@ -195,7 +195,7 @@ reinforcement_learning:
   # ---------------------------
   # Core RL Loop
   # ---------------------------
-  version: "rl6"             # RL run/version tag added to RL log filenames
+  version: "rl7"             # RL run/version tag added to RL log filenames
   iterations: 40                # Total RL iterations
   games_per_iteration: 600      # Enough signal per iteration without stretching self-play too long
 
@@ -325,6 +325,7 @@ reinforcement_learning:
   mcts_use_fpu: true         # First Play Urgency: non-visited moves get parent-aware prior value
   mcts_fpu_reduction: 0.12   # Reduce FPU from parent value to encourage some exploration of unvisited moves (0.0 = no reduction, 1.0 = zero FPU)
   mcts_fpu_absolute: null    # null = adaptive parent-Q FPU, float = fixed FPU value in [-1, 1]
+  mcts_root_value_q_blend: 0.35 # Blend root value with visit-weighted child Q for less noisy value targets at small sim budgets
   mcts_temperature: 0.65      # Sharper visit sampling produces better policy targets once the search is strong enough
   mcts_temperature_threshold: 12  # Quicker shift toward deterministic play helps convert advantages instead of drifting
   mcts_dirichlet_alpha: 0.3  # Standard rzędu szachowego
@@ -413,6 +414,10 @@ reinforcement_learning:
   eval_claim_repetition_after_moves: 70
   eval_claim_draw_after_moves: 180  # Generic claimable draws after ~70 full moves
   eval_every: 3              # Slightly faster feedback loop while iterating toward surpassing IL
+  eval_no_mcts_enabled: true  # Extra policy-only evaluation: no MCTS, does not affect best-model promotion
+  eval_no_mcts_every: 1       # Run the no-MCTS eval every RL iteration
+  eval_no_mcts_games: 30      # Requested cheap signal: 30 raw-policy games per iteration
+  eval_no_mcts_use_fixed_openings: true
   eval_staged_enabled: true   # true = two-stage eval vs best: short MCTS screen first, then extra MCTS games only if stage 1 looks promising
   eval_stage1_games: 60       # Stage 1 uses the normal eval MCTS path too; this is the cheap first sample
   eval_stage2_games: 120      # Stage 2 adds this many more MCTS games and combines them with stage 1 for the final eval result

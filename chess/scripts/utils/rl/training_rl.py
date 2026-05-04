@@ -8,6 +8,7 @@ import contextlib
 from pathlib import Path
 
 import chess
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ project_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(project_root))
 
 from src.batch_selfplay import BatchMCTS, select_move_by_visits, _SELFPLAY_OPENING_LINES
+from src.data import board_to_tensor, move_to_index
 from src.model import ChessNet
 from src.utils.data_helpers import ACTION_SIZE, build_hflip_inverse_index_map
 
@@ -166,6 +168,134 @@ def _apply_opening_prefix_for_eval(board, opening_prefix, mcts_white, mcts_black
         board.push(move)
         applied += 1
     return applied
+
+
+def _encode_eval_history_entry(board):
+    return (
+        board_to_tensor(board, flip_perspective=False),
+        board_to_tensor(board, flip_perspective=True),
+    )
+
+
+def _build_no_mcts_eval_input(board, board_history, config):
+    history_positions = int(config.get("model", {}).get("history_positions", 0) or 0)
+    current_tensor = board_to_tensor(board)
+    if history_positions <= 0:
+        return current_tensor
+
+    use_black_pov = (board.turn == chess.BLACK)
+    history_slice = list(board_history[-history_positions:]) if board_history else []
+    history_tensors = [
+        encoded[1] if use_black_pov else encoded[0]
+        for encoded in history_slice
+    ]
+    pad_count = max(0, history_positions - len(history_tensors))
+    if pad_count:
+        empty = np.zeros((16, 8, 8), dtype=np.float32)
+        history_tensors = [empty] * pad_count + history_tensors
+    history_tensors.append(current_tensor)
+    return np.concatenate(history_tensors, axis=0)
+
+
+def _select_no_mcts_policy_move(model, board, board_history, config, device):
+    legal_moves = tuple(board.legal_moves)
+    if not legal_moves:
+        return None
+
+    board_np = _build_no_mcts_eval_input(board, board_history, config)
+    board_tensor = torch.from_numpy(board_np).unsqueeze(0).to(
+        device,
+        dtype=torch.float32,
+        memory_format=torch.channels_last,
+        non_blocking=True,
+    )
+    legal_indices = torch.tensor(
+        [move_to_index(move, board) for move in legal_moves],
+        dtype=torch.long,
+        device=device,
+    )
+    use_amp = bool(config.get("hardware", {}).get("use_amp", False) and device.type == "cuda")
+    amp_dtype = torch.bfloat16 if config.get("hardware", {}).get("use_bfloat16", False) else torch.float16
+    with torch.inference_mode():
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", enabled=True, dtype=amp_dtype)
+            if use_amp
+            else contextlib.nullcontext()
+        )
+        with autocast_ctx:
+            policy_logits, _value = model(board_tensor, apply_log_softmax=False)
+        legal_logits = policy_logits[0].index_select(0, legal_indices)
+        best_idx = int(torch.argmax(legal_logits).item())
+    return legal_moves[best_idx]
+
+
+def _apply_opening_prefix_for_no_mcts_eval(board, board_history, opening_prefix):
+    if not opening_prefix:
+        return 0
+
+    applied = 0
+    for uci in opening_prefix:
+        if board.is_game_over(claim_draw=False):
+            break
+        try:
+            move = chess.Move.from_uci(uci)
+        except Exception:
+            break
+        if move not in board.legal_moves:
+            break
+        board_history.append(_encode_eval_history_entry(board))
+        board.push(move)
+        applied += 1
+    return applied
+
+
+def _evaluate_single_game_no_mcts(
+    model_white,
+    model_black,
+    config,
+    device,
+    max_moves,
+    auto_claim_draw,
+    claim_draw_after_moves,
+    claim_repetition_after_moves=0,
+    opening_prefix=(),
+):
+    board = chess.Board()
+    board_history = []
+    move_count = _apply_opening_prefix_for_no_mcts_eval(board, board_history, opening_prefix)
+    ended_by_auto_claim_draw = False
+
+    while move_count < max_moves:
+        if board.is_game_over(claim_draw=False):
+            break
+
+        model = model_white if board.turn == chess.WHITE else model_black
+        move = _select_no_mcts_policy_move(model, board, board_history, config, device)
+        if move is None:
+            break
+
+        board_history.append(_encode_eval_history_entry(board))
+        board.push(move)
+        move_count += 1
+
+        if auto_claim_draw:
+            try:
+                if move_count >= claim_repetition_after_moves:
+                    claim_threefold = getattr(board, "can_claim_threefold_repetition", None)
+                    if callable(claim_threefold) and bool(claim_threefold()):
+                        ended_by_auto_claim_draw = True
+                        break
+                if move_count >= claim_draw_after_moves and board.can_claim_draw():
+                    ended_by_auto_claim_draw = True
+                    break
+            except Exception:
+                pass
+
+    if ended_by_auto_claim_draw:
+        return "1/2-1/2", False
+
+    result = board.result(claim_draw=False)
+    return result, (result == "*")
 
 
 def _evaluate_single_game(
@@ -637,5 +767,68 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
         "win_rate": wins / num_games,
         "draw_rate": draws / num_games,
         "loss_rate": losses / num_games,
+        "resolved_games": num_games - unresolved,
+    }
+
+
+def evaluate_models_no_mcts(model1, model2, config, device, num_games=30, game_index_offset=0, use_fixed_openings=None):
+    """Policy-head-only evaluation. This is intentionally separate from promotion eval."""
+    wins = 0
+    draws = 0
+    losses = 0
+    unresolved = 0
+    max_moves = _resolve_eval_max_moves(config)
+    auto_claim_draw = _resolve_eval_auto_claim_draw(config)
+    claim_draw_after_moves = _resolve_eval_claim_draw_after_moves(config)
+    claim_repetition_after_moves = _resolve_eval_claim_repetition_after_moves(config)
+
+    model1.eval()
+    model2.eval()
+    eval_bar = tqdm(total=num_games, desc="Eval no MCTS", unit="game")
+    try:
+        for game_idx in range(game_index_offset, game_index_offset + num_games):
+            model1_as_white = (game_idx % 2 == 0)
+            white_model = model1 if model1_as_white else model2
+            black_model = model2 if model1_as_white else model1
+            opening_prefix = _get_eval_opening_prefix(config, game_idx, enabled_override=use_fixed_openings)
+            result, was_unresolved = _evaluate_single_game_no_mcts(
+                white_model,
+                black_model,
+                config,
+                device,
+                max_moves,
+                auto_claim_draw,
+                claim_draw_after_moves,
+                claim_repetition_after_moves=claim_repetition_after_moves,
+                opening_prefix=opening_prefix,
+            )
+            if was_unresolved:
+                unresolved += 1
+                eval_bar.update(1)
+                continue
+            game_wins, game_draws, game_losses = _result_for_model1(model1_as_white, result)
+            wins += game_wins
+            draws += game_draws
+            losses += game_losses
+            eval_bar.update(1)
+    finally:
+        eval_bar.close()
+
+    if unresolved > 0:
+        print(
+            f"No-MCTS eval unresolved at ply cap ({max_moves}, ~{max_moves / 2.0:.1f} full moves): "
+            f"{unresolved}/{num_games} -> excluded from draw count"
+        )
+
+    return {
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+        "unresolved": unresolved,
+        "num_games": num_games,
+        "score_rate": (wins + 0.5 * draws) / num_games if num_games > 0 else 0.0,
+        "win_rate": wins / num_games if num_games > 0 else 0.0,
+        "draw_rate": draws / num_games if num_games > 0 else 0.0,
+        "loss_rate": losses / num_games if num_games > 0 else 0.0,
         "resolved_games": num_games - unresolved,
     }

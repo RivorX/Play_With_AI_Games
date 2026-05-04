@@ -79,14 +79,14 @@ try:
     MCTS_SELFPLAY_AVAILABLE = True
 except ImportError:
     MCTS_SELFPLAY_AVAILABLE = False
-    print("âš ď¸Ź MCTS self-play not available")
+    print("Warning: MCTS self-play not available")
 
 # Import from utils
 from utils.shared.logger import TrainingLogger
 from utils.shared.elo_estimator import estimate_model_elo
 from utils.rl.replay import ReplayBuffer
 from utils.rl.temperature import TemperatureSchedule, AdaptiveTemperatureController
-from utils.rl.training_rl import train_on_batch_rl, evaluate_models
+from utils.rl.training_rl import train_on_batch_rl, evaluate_models, evaluate_models_no_mcts
 from utils.rl.startup import plan_rl_startup, apply_rl_startup_plan
 from utils.rl.profiler import print_selfplay_profiler
 from utils.rl.opponent_scheduler import (
@@ -676,7 +676,7 @@ def play_games_parallel_mcts(
     start_time = time.time()
     
     if not MCTS_SELFPLAY_AVAILABLE:
-        print("âťŚ MCTS self-play not available!")
+        print("MCTS self-play not available!")
         return [], 0, 0, 0, 0, 0
     
     model_state = model.state_dict()
@@ -725,7 +725,7 @@ def play_games_parallel_mcts(
         if torch.cuda.is_available():
             device_type = 'cuda'
         else:
-            print("âš ď¸Ź self_play_device=cuda but no GPU available. Falling back to CPU.")
+            print("Warning: self_play_device=cuda but no GPU available. Falling back to CPU.")
             device_type = 'cpu'
     elif self_play_device == 'cpu':
         device_type = 'cpu'
@@ -824,25 +824,6 @@ def play_games_parallel_mcts(
                 )
             print("Selected recent pool: " + ", ".join(selected_recent_parts))
 
-        unicode_lines = [
-            "â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
-            "â•‘           KONFIGURACJA SELF-PLAY (staĹ‚a)             â•‘",
-            "â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•¦â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•Ł",
-            f"â•‘  UrzÄ…dzenie              â•‘  {device_type:<25} â•‘",
-            f"â•‘  GPU dostÄ™pne            â•‘  {gpus:<25} â•‘",
-            f"â•‘  WorkerĂłw per GPU        â•‘  {str(wpg):<25} â•‘",
-            f"â•‘  WorkerĂłw Ĺ‚Ä…cznie        â•‘  {len(worker_specs):<25} â•‘",
-            f"â•‘  WÄ…tkĂłw per worker       â•‘  {str(threads):<25} â•‘",
-            f"â•‘  Gier per iteracjÄ™       â•‘  {num_games:<25} â•‘",
-            f"â•‘  Gier per worker         â•‘  {w_games:<25} â•‘",
-            f"â•‘  Batch self-play         â•‘  {batch_info:<25} â•‘",
-            f"â•‘  Chunk dispatch          â•‘  {dispatch_chunk_info:<25} â•‘",
-            f"â•‘  Gier rĂłwnolegle max     â•‘  {max_parallel_games:<25} â•‘",
-            f"â•‘  Symulacje MCTS          â•‘  {rl_cfg['mcts_simulations']:<25} â•‘",
-            f"â•‘  Rozmiar batcha MCTS     â•‘  {rl_cfg.get('mcts_batch_size', 32):<25} â•‘",
-            f"â•‘  Reuse drzewa            â•‘  {str(rl_cfg.get('mcts_reuse_tree', True)):<25} â•‘",
-            "â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•©â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•ť",
-        ]
         ascii_lines = [
             "+----------------------------------------------------+",
             "|           KONFIGURACJA SELF-PLAY (stala)          |",
@@ -862,7 +843,7 @@ def play_games_parallel_mcts(
             f"|  Reuse drzewa            |  {str(rl_cfg.get('mcts_reuse_tree', True)):<25} |",
             "+--------------------------+-------------------------+",
         ]
-        _print_console_block(unicode_lines, ascii_lines=ascii_lines)
+        _print_console_block(ascii_lines)
         print()
     
     processes = []
@@ -1040,7 +1021,7 @@ def play_games_parallel_mcts(
         startup_done_time = time.time()
         games_bar = tqdm(
             total=num_games,
-            desc="đźŽ® Self-play gry",
+            desc="Self-play gry",
             unit="gra",
             dynamic_ncols=True,
             leave=True,
@@ -1401,9 +1382,9 @@ def play_games_parallel_mcts(
                                     result_stats["games"] += learner_total
                     result_file.unlink()
                 except Exception as e:
-                    print(f"âš ď¸Ź Warning: Failed to load results from worker {idx}: {e}")
+                    print(f"Warning: Failed to load results from worker {idx}: {e}")
             else:
-                print(f"âš ď¸Ź Warning: Worker {idx} result file not found")
+                print(f"Warning: Worker {idx} result file not found")
     
     collection_time = time.time() - collection_start
     total_time = time.time() - start_time
@@ -1414,7 +1395,7 @@ def play_games_parallel_mcts(
     def _format_plies(value):
         return f"{value:.1f} plies (~{value / 2.0:.1f} full moves)"
     
-    print(f"âś… MCTS Self-play completed:")
+    print("MCTS Self-play completed:")
     print(f"   Positions: {total_positions}")
     print(f"   Games: {len(game_lengths)}")
     if opponent_source_games:
@@ -1731,7 +1712,7 @@ def main():
     
     if use_bfloat16 and torch.cuda.is_available():
         if not torch.cuda.is_bf16_supported():
-            print("âš ď¸Ź bfloat16 not supported")
+            print("Warning: bfloat16 not supported")
             use_bfloat16 = False
     
     best_model_il_path = base_dir / config['paths']['best_model_il']
@@ -2035,64 +2016,64 @@ def main():
 
     if use_lr_schedule:
         print(
-            f"âś… LR schedule: warmup={warmup_iters} iters â†’ "
+            f"LR schedule: warmup={warmup_iters} iters -> "
             f"cosine decay (base_lr={lr_base:.6g}, min_lr_ratio={min_lr_ratio})"
         )
 
     print("\n=== Starting RL training with PROPER MCTS ===")
-    print("đźŽŻ OPTIMIZATIONS:")
-    print(f"   â€˘ MCTS self-play (AlphaZero approach)")
-    print(f"   â€˘ MCTS simulations: {config['reinforcement_learning']['mcts_simulations']}")
-    print(f"   â€˘ Tree reuse: {config['reinforcement_learning'].get('mcts_reuse_tree', True)}")
-    print(f"   â€˘ Batch MCTS: {config['reinforcement_learning'].get('mcts_batch_size', 32)}")
+    print("OPTIMIZATIONS:")
+    print(f"   - MCTS self-play (AlphaZero approach)")
+    print(f"   - MCTS simulations: {config['reinforcement_learning']['mcts_simulations']}")
+    print(f"   - Tree reuse: {config['reinforcement_learning'].get('mcts_reuse_tree', True)}")
+    print(f"   - Batch MCTS: {config['reinforcement_learning'].get('mcts_batch_size', 32)}")
     print(
-        "   â€˘ Dynamic c_puct: "
+        "   - Dynamic c_puct: "
         f"{config['reinforcement_learning'].get('mcts_dynamic_c_puct', True)} "
         f"(init={float(config['reinforcement_learning'].get('mcts_c_puct_init', config['reinforcement_learning'].get('mcts_c_puct', 1.5))):.2f}, "
         f"base={int(config['reinforcement_learning'].get('mcts_c_puct_base', 19652))}, "
         f"max={config['reinforcement_learning'].get('mcts_c_puct_max', None)})"
     )
     print(
-        "   â€˘ FPU: "
+        "   - FPU: "
         f"{config['reinforcement_learning'].get('mcts_use_fpu', True)} "
         f"(reduction={float(config['reinforcement_learning'].get('mcts_fpu_reduction', 0.30)):.2f}, "
         f"absolute={config['reinforcement_learning'].get('mcts_fpu_absolute', None)})"
     )
-    print(f"   â€˘ Persistent self-play workers: {config['reinforcement_learning'].get('persistent_self_play_workers', True)}")
-    print(f"   â€˘ Stream self-play to replay: {config['reinforcement_learning'].get('self_play_stream_to_replay', True)}")
+    print(f"   - Persistent self-play workers: {config['reinforcement_learning'].get('persistent_self_play_workers', True)}")
+    print(f"   - Stream self-play to replay: {config['reinforcement_learning'].get('self_play_stream_to_replay', True)}")
     if bool(config['reinforcement_learning'].get('self_play_opponent_pool_enabled', False)):
         print(
-            "   â€˘ Opponent pool: "
+            "   - Opponent pool: "
             f"current={float(config['reinforcement_learning'].get('self_play_opponent_current_fraction', 0.4)):.0%}, "
             f"best={float(config['reinforcement_learning'].get('self_play_opponent_best_fraction', 0.3)):.0%}, "
             f"recent={float(config['reinforcement_learning'].get('self_play_opponent_recent_fraction', 0.3)):.0%}"
         )
         print(
-            "   â€˘ Recent frozen snapshots: "
+            "   - Recent frozen snapshots: "
             f"{int(config['reinforcement_learning'].get('self_play_recent_snapshots_to_keep', 4))}"
         )
     if bool(config['reinforcement_learning'].get('self_play_opponent_pool_enabled', False)) and bool(
         config['reinforcement_learning'].get('self_play_opponent_adaptive_enabled', False)
     ):
         print(
-            "   â€˘ Adaptive opponent scheduler: "
+            "   - Adaptive opponent scheduler: "
             f"on (target={float(config['reinforcement_learning'].get('self_play_opponent_adaptive_target_score', 0.50)):.0%}, "
-            f"band=Â±{float(config['reinforcement_learning'].get('self_play_opponent_adaptive_band', 0.15)):.0%}, "
+            f"band=+/-{float(config['reinforcement_learning'].get('self_play_opponent_adaptive_band', 0.15)):.0%}, "
             f"current_floor={float(config['reinforcement_learning'].get('self_play_opponent_current_min_fraction', 0.50)):.0%})"
         )
     if bool(config['reinforcement_learning'].get('self_play_resignation_enabled', False)):
         print(
-            "   â€˘ Resignation: "
+            "   - Resignation: "
             f"enabled (threshold={float(config['reinforcement_learning'].get('self_play_resignation_threshold', 0.92)):.2f}, "
             f"patience={int(config['reinforcement_learning'].get('self_play_resignation_patience', 3))}, "
             f"disable_fraction={float(config['reinforcement_learning'].get('self_play_resignation_disable_fraction', 0.10)):.0%})"
         )
-    print(f"   â€˘ đź†• Temperature Schedule: {use_temp_schedule}")
-    print(f"   â€˘ đź“Š Policy Accuracy & Value MAE tracking")
-    print(f"   â€˘ Replay buffer capacity: {config['reinforcement_learning']['replay_buffer_size']:,} positions")
-    print(f"   â€˘ Replay policy target cap: {replay_max_policy_targets} moves/position")
+    print(f"   - Temperature Schedule: {use_temp_schedule}")
+    print(f"   - Policy Accuracy & Value MAE tracking")
+    print(f"   - Replay buffer capacity: {config['reinforcement_learning']['replay_buffer_size']:,} positions")
+    print(f"   - Replay policy target cap: {replay_max_policy_targets} moves/position")
     print(
-        f"   â€˘ Replay buffer dynamic sizing: "
+        f"   - Replay buffer dynamic sizing: "
         f"bootstrap={int(config['reinforcement_learning'].get('replay_buffer_bootstrap_positions_per_iteration_resolved', 0)):,}, "
         f"multiplier={replay_multiplier:.2f}, "
         f"ema_alpha={replay_buffer_ema_alpha:.2f}, "
@@ -2130,6 +2111,9 @@ def main():
     eval_stage2_games = max(0, int(rl_cfg.get('eval_stage2_games', 0)))
     eval_stage2_gate_score_rate = float(rl_cfg.get('eval_stage2_gate_score_rate', score_rate_threshold))
     eval_stage2_gate_true_win_rate = float(rl_cfg.get('eval_stage2_gate_true_win_rate', true_win_rate_threshold))
+    no_mcts_eval_enabled = bool(rl_cfg.get('eval_no_mcts_enabled', True))
+    no_mcts_eval_every = max(1, int(rl_cfg.get('eval_no_mcts_every', 1)))
+    no_mcts_eval_games = max(1, int(rl_cfg.get('eval_no_mcts_games', 30)))
     early_stop_enabled = bool(rl_cfg.get('early_stop_enabled', True))
     early_stop_patience = max(1, int(rl_cfg.get('early_stop_patience', 5)))
     early_stop_min_score_improvement = float(rl_cfg.get('early_stop_min_score_improvement', 0.01))
@@ -2234,7 +2218,7 @@ def main():
                     adaptive_dirichlet_min_weight,
                     min(base_mcts_dirichlet_weight, float(current_dirichlet_weight)),
                 )
-            print(f"đźŚˇď¸Ź Temperature: {current_temp:.2f}")
+            print(f"Temperature: {current_temp:.2f}")
             if temp_debug.get("enabled", False):
                 print(
                     "   Adaptive temp: "
@@ -2253,7 +2237,7 @@ def main():
             config['reinforcement_learning']['mcts_temperature_threshold'] = current_temp_threshold
             
             if use_lr_schedule:
-                print(f"đź“‰ LR: {current_lr:.2e}")
+                print(f"LR: {current_lr:.2e}")
 
             rl_cfg['current_iteration'] = int(iteration + 1)
 
@@ -2268,7 +2252,7 @@ def main():
                             guard_min_weight,
                             current_value_loss_weight * (guard_scale ** value_guard_poor_eval_streak),
                         )
-            print(f"âš–ď¸Ź Value loss weight: {current_value_loss_weight:.3f}")
+            print(f"Value loss weight: {current_value_loss_weight:.3f}")
 
             _finish_stage('setup')
 
@@ -2331,12 +2315,12 @@ def main():
              
             print(f"Replay buffer: {len(replay_buffer)}/{replay_buffer.max_size} positions (+{positions_added})")
             print(
-                f"đź“Š Self-play stats: draw_rate={float((selfplay_stats or {}).get('completed_draw_rate', 0.0)):.2%}, "
+                f"Self-play stats: draw_rate={float((selfplay_stats or {}).get('completed_draw_rate', 0.0)):.2%}, "
                 f"avg_value={float((selfplay_stats or {}).get('avg_game_value', 0.0)):.3f}, "
                 f"value_std={float((selfplay_stats or {}).get('value_std', 0.0)):.3f}"
             )
             print(
-                f"đźŽŻ MCTS sims: avg={float((selfplay_stats or {}).get('search_simulations_used_avg', 0.0)):.1f}, "
+                f"MCTS sims: avg={float((selfplay_stats or {}).get('search_simulations_used_avg', 0.0)):.1f}, "
                 f"p10={float((selfplay_stats or {}).get('search_simulations_used_p10', 0.0)):.1f}, "
                 f"early={100.0 * float((selfplay_stats or {}).get('adaptive_stop_rate', 0.0)):.1f}%, "
                 f"samples={int((selfplay_stats or {}).get('search_samples', 0))}"
@@ -2349,7 +2333,7 @@ def main():
                 )
                 print(f"MCTS adaptive stops: {reason_text}")
             print(
-                f"đź“¦ Replay shaping: curriculum_drop={int((selfplay_stats or {}).get('curriculum_dropped_positions', 0))}, "
+                f"Replay shaping: curriculum_drop={int((selfplay_stats or {}).get('curriculum_dropped_positions', 0))}, "
                 f"cap_drop={int((selfplay_stats or {}).get('cap_dropped_positions', 0))}"
             )
             print(
@@ -2451,11 +2435,11 @@ def main():
                 train_metrics = metrics_calc.compute()
                 
                 print(f"Loss: {avg_loss:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}")
-                print(f"đź“Š Top-1: {train_metrics['policy_top1_acc']:.2%}, "
+                print(f"Top-1: {train_metrics['policy_top1_acc']:.2%}, "
                       f"Top-3: {train_metrics['policy_top3_acc']:.2%}, "
                       f"MAE: {train_metrics['value_mae']:.4f}")
                 print(
-                    f"đź“ Entropy: {avg_policy_entropy:.4f}, "
+                    f"Entropy: {avg_policy_entropy:.4f}, "
                     f"Pred value std: {avg_value_pred_std:.4f}, "
                     f"Target value std: {avg_target_value_std:.4f}"
                 )
@@ -2475,6 +2459,34 @@ def main():
             anchor_true_win_rate = None
             anchor_wins = anchor_draws = anchor_losses = None
             estimated_elo = None
+            no_mcts_score_rate = None
+            no_mcts_true_win_rate = None
+            no_mcts_wins = no_mcts_draws = no_mcts_losses = no_mcts_unresolved = None
+            if no_mcts_eval_enabled and ((iteration + 1) % no_mcts_eval_every == 0):
+                print(f"Evaluating vs best without MCTS ({no_mcts_eval_games} games)...")
+                model.eval()
+                if device.type == 'cuda' and torch.cuda.is_available():
+                    with contextlib.suppress(Exception):
+                        torch.cuda.empty_cache()
+                no_mcts_stats = evaluate_models_no_mcts(
+                    model,
+                    best_model,
+                    config,
+                    device,
+                    no_mcts_eval_games,
+                    use_fixed_openings=bool(rl_cfg.get('eval_no_mcts_use_fixed_openings', True)),
+                )
+                no_mcts_score_rate = float((no_mcts_stats or {}).get('score_rate', 0.0))
+                no_mcts_true_win_rate = float((no_mcts_stats or {}).get('win_rate', 0.0))
+                no_mcts_wins = int((no_mcts_stats or {}).get('wins', 0))
+                no_mcts_draws = int((no_mcts_stats or {}).get('draws', 0))
+                no_mcts_losses = int((no_mcts_stats or {}).get('losses', 0))
+                no_mcts_unresolved = int((no_mcts_stats or {}).get('unresolved', 0))
+                print(
+                    f"No-MCTS eval W/D/L: {no_mcts_wins}/{no_mcts_draws}/{no_mcts_losses} "
+                    f"(score: {no_mcts_score_rate:.2%}, true win rate: {no_mcts_true_win_rate:.2%}, "
+                    f"unresolved: {no_mcts_unresolved})"
+                )
             if (iteration + 1) % config['reinforcement_learning']['eval_every'] == 0:
                 print("Evaluating vs best...")
                 model.eval()
@@ -2597,6 +2609,12 @@ def main():
                     eval_draws=eval_draws,
                     eval_losses=eval_losses,
                     eval_unresolved=eval_unresolved,
+                    no_mcts_score_rate=no_mcts_score_rate,
+                    no_mcts_true_win_rate=no_mcts_true_win_rate,
+                    no_mcts_wins=no_mcts_wins,
+                    no_mcts_draws=no_mcts_draws,
+                    no_mcts_losses=no_mcts_losses,
+                    no_mcts_unresolved=no_mcts_unresolved,
                     anchor_score_rate=anchor_score_rate,
                     anchor_true_win_rate=anchor_true_win_rate,
                     anchor_wins=anchor_wins,
@@ -2629,7 +2647,7 @@ def main():
                 )
                 last_logged_iteration = iteration + 1
                 if score_rate >= score_rate_threshold and true_win_rate >= true_win_rate_threshold:
-                    print("âś… New best model!")
+                    print("New best model!")
                     best_model.load_state_dict(model.state_dict())
                     best_win_rate_so_far = max(best_win_rate_so_far, float(score_rate))
                     if int(eval_wins or 0) > 0 and anchor_model_available:
@@ -2655,12 +2673,12 @@ def main():
                     )
                     
                     size_mb = best_model_rl_path.stat().st_size / (1024**2)
-                    print(f"đź’ľ Saved: {best_model_rl_path} ({size_mb:.1f} MB)")
+                    print(f"Saved: {best_model_rl_path} ({size_mb:.1f} MB)")
                     if version_best_model_path != best_model_rl_path:
                         shutil.copy2(best_model_rl_path, version_best_model_path)
                         version_best_size_mb = version_best_model_path.stat().st_size / (1024 ** 2)
                         print(
-                            f"đź’ľ Version best updated: {version_best_model_path.name} "
+                            f"Version best updated: {version_best_model_path.name} "
                             f"({version_best_size_mb:.1f} MB)"
                         )
                 improved_score = (
@@ -2710,6 +2728,12 @@ def main():
                     positions_per_sec=positions_per_sec,
                     selfplay_time=selfplay_time,
                     data_collection_time=collection_time,
+                    no_mcts_score_rate=no_mcts_score_rate,
+                    no_mcts_true_win_rate=no_mcts_true_win_rate,
+                    no_mcts_wins=no_mcts_wins,
+                    no_mcts_draws=no_mcts_draws,
+                    no_mcts_losses=no_mcts_losses,
+                    no_mcts_unresolved=no_mcts_unresolved,
                     temperature=current_temp,
                     beta=None,
                     completed_draw_rate=(selfplay_stats or {}).get('completed_draw_rate', None),
@@ -2746,6 +2770,8 @@ def main():
                 'win_rate': true_win_rate,
                 'score_rate': score_rate,
                 'eval_true_win_rate': true_win_rate,
+                'no_mcts_score_rate': no_mcts_score_rate,
+                'no_mcts_true_win_rate': no_mcts_true_win_rate,
                 'policy_loss': avg_policy,
                 'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                 'value_mae': train_metrics.get('value_mae', 0),
@@ -2768,7 +2794,7 @@ def main():
                 },
             )
             latest_size_mb = latest_checkpoint_path.stat().st_size / (1024 ** 2)
-            print(f"đź’ľ Latest checkpoint updated: {latest_checkpoint_path.name} ({latest_size_mb:.1f} MB)")
+            print(f"Latest checkpoint updated: {latest_checkpoint_path.name} ({latest_size_mb:.1f} MB)")
             
             _finish_stage('checkpoint')
             gc.collect()
