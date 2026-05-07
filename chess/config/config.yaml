@@ -219,7 +219,7 @@ reinforcement_learning:
   # Self-Play Game Flow
   # ---------------------------
   use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
-  max_batch_games_per_worker: 24     # Active self-play game slots per worker; completed games are continuously replaced inside a dispatch chunk
+  max_batch_games_per_worker: 32     # Larger active pools improve MCTS inference batch size when games split across opponent models
   self_play_dispatch_chunk_games: 96 # Requested chunk cap; runtime caps it by games/worker so large chunks do not starve workers
   self_play_max_moves: 190          # Shorter cap: cut low-value sterile games earlier instead of harvesting many doomed draw samples
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
@@ -251,11 +251,11 @@ reinforcement_learning:
   self_play_opening_diversity_min_plies: 2    # Let sharp curated lines branch early
   self_play_opening_diversity_max_plies: 8    # Allow enough depth to land in asymmetrical structures
   self_play_opponent_pool_enabled: true       # Mix current-vs-current with frozen opponents instead of only mirror self-play
-  self_play_opponent_current_fraction: 0.35   # Reduce mirror self-play further so training signal is less self-referential
-  self_play_opponent_best_fraction: 0.10      # Increase anchor pressure: more direct practice against IL-best weaknesses
-  self_play_opponent_recent_fraction: 0.55    # Keep most games vs recent snapshots while preserving stronger anchor exposure
+  self_play_opponent_current_fraction: 0.50   # Keep a large current-vs-current slice so recent snapshots cannot dominate the run
+  self_play_opponent_best_fraction: 0.15      # Keep a steady best-model anchor in the pool
+  self_play_opponent_recent_fraction: 0.35    # Cap recent-snapshot pressure to avoid echo-chamber training
   self_play_recent_snapshots_to_keep: 10       # Keep a wider recent window, then let the smart selector choose the actually useful opponents
-  self_play_recent_candidate_pool_size: 4     # From the wider recent window, expose only the best-matched few snapshots to self-play
+  self_play_recent_candidate_pool_size: 3     # Fewer simultaneous frozen recent models reduces MCTS batch fragmentation
   self_play_recent_recency_bias: 0.35         # Prefer fresher snapshots, but still let matchup quality dominate the selection
   self_play_recent_confidence_games: 24       # Avg games needed before a recent snapshot score is treated as high-confidence
   self_play_recent_uncertainty_bonus: 0.15    # Small exploration bonus for newer/under-tested recent snapshots
@@ -271,9 +271,13 @@ reinforcement_learning:
   self_play_opponent_adaptive_max_factor: 1.40 # Also do not over-spike one opponent source
   self_play_opponent_current_min_fraction: 0.20 # Let the scheduler reduce mirror self-play harder when it becomes too draw-heavy
   self_play_opponent_current_max_fraction: 0.55 # Also cap mirror self-play so adaptive weighting cannot drift back into draw spam
+  self_play_opponent_best_min_fraction: 0.15    # Adaptive scheduler may not drop best-model games below this share when best exists
+  self_play_opponent_recent_max_fraction: 0.40  # Adaptive scheduler may not assign more than this share to all recent snapshots
+  self_play_recent_latest_cap_count: 2          # Treat the newest N recent snapshots as one capped echo-chamber bucket
+  self_play_recent_latest_max_fraction: 0.35    # Newest recent snapshots may not exceed this share of all self-play games
   self_play_opponent_min_score: 0.28            # Avoid opponent buckets that are so hard they mostly generate hopeless targets
   self_play_opponent_max_score: 0.72            # Avoid buckets that are so easy they stop challenging the policy
-  self_play_opponent_best_min_score: 0.10       # Keep best-opponent channel alive longer; avoid dropping anchor pressure too early
+  self_play_opponent_best_min_score: 0.00       # Keep best-opponent channel alive even when it is temporarily hard
   self_play_opponent_recent_min_score: 0.32     # Recent snapshots should usually be in the learnable band
   self_play_opponent_recent_max_score: 0.68     # Also skip recent snapshots that have become too easy
   self_play_opponent_target_draw_rate: 0.35     # Prefer matchups that stay meaningfully decisive instead of settling into draw-heavy shells
@@ -337,7 +341,7 @@ reinforcement_learning:
   mcts_tactical_promotion_bonus: 0.12 # Promotions are rare and critical
   mcts_tactical_recapture_bonus: 0.08 # Helps short tactical recapture sequences
   mcts_adaptive_search_enabled: true            # Stop self-play search early when the root move distribution is already confident instead of using a random playout cap
-  mcts_adaptive_search_min_simulations: 32      # Let clearly decided positions stop at the first post-expansion confidence check
+  mcts_adaptive_search_min_simulations: 64      # Require a fuller low-budget search before adaptive early-stop can fire
   mcts_adaptive_search_check_interval: 16       # Check adaptive stop in coarser chunks to avoid spending CPU on root stats every tiny MCTS step
   mcts_adaptive_search_low_branching_moves: 6   # Positions with few legal moves need less proof before early-stop can trigger
   mcts_adaptive_search_low_branching_min_simulations: 16 # Lower floor for simple low-branching positions
@@ -348,7 +352,7 @@ reinforcement_learning:
   mcts_adaptive_search_locked_margin: 2         # Stop when the runner-up cannot realistically catch the leader with remaining sims
   mcts_adaptive_search_max_entropy: 0.62        # Prevent early stop when root policy is still broad/uncertain
   mcts_adaptive_search_low_branching_confidence_delta: 0.06 # Slightly relax confidence gates when there are only a few legal moves
-  mcts_adaptive_policy_weight_min_fraction: 0.75 # Policy target gets weight 1 only if search used at least this fraction of the full budget
+  mcts_adaptive_policy_weight_min_fraction: 0.75 # Legacy knob; policy targets now use continuous used/budget weighting
   policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
   policy_target_pruning_keep_top_n: 8           # Always keep a broader top slice so uncertain positions retain more searched alternatives
   policy_target_pruning_max_moves: 28           # Let wider post-search support reach the learner before pruning the long tail
@@ -416,7 +420,7 @@ reinforcement_learning:
   eval_every: 3              # Slightly faster feedback loop while iterating toward surpassing IL
   eval_no_mcts_enabled: true  # Extra policy-only evaluation: no MCTS, does not affect best-model promotion
   eval_no_mcts_every: 1       # Run the no-MCTS eval every RL iteration
-  eval_no_mcts_games: 30      # Requested cheap signal: 30 raw-policy games per iteration
+  eval_no_mcts_games: 100       # Cheap raw-policy signal every iteration without slowing RL too much
   eval_no_mcts_use_fixed_openings: true
   eval_staged_enabled: true   # true = two-stage eval vs best: short MCTS screen first, then extra MCTS games only if stage 1 looks promising
   eval_stage1_games: 60       # Stage 1 uses the normal eval MCTS path too; this is the cheap first sample

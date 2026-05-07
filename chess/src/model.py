@@ -415,7 +415,7 @@ class ChessNet(nn.Module):
             print(f"    - Frozen params: {frozen_params:,}")
         print(f"    - Total params: {total_params:,}")
 
-    def forward(self, x, apply_log_softmax=True):
+    def forward(self, x, apply_log_softmax=True, policy_only=False):
         """Forward pass (policy as log-probs by default, raw logits when apply_log_softmax=False)."""
         if not x.is_contiguous(memory_format=torch.channels_last):
             x = x.contiguous(memory_format=torch.channels_last)
@@ -442,6 +442,8 @@ class ChessNet(nn.Module):
             policy = F.log_softmax(policy_logits, dim=1)
         else:
             policy = policy_logits
+        if policy_only:
+            return policy, None
 
         # Value head - AlphaZero-style: Conv -> BN -> ReLU -> GAP -> FC -> WDL
         value = self.value_conv(x)

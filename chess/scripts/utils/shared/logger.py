@@ -5,6 +5,7 @@ Unified training logger for both IL and RL training
 import csv
 import textwrap
 import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
 from datetime import datetime
 from pathlib import Path
 
@@ -51,10 +52,10 @@ class TrainingLogger:
             else:  # RL mode
                 header = [
                     'iteration', 'avg_loss', 'policy_loss', 'value_loss',
-                    'score_rate', 'buffer_size', 'avg_game_length', 'positions_per_sec',
-                    'selfplay_time', 'data_collection_time', 'temperature', 'beta',
+                    'score_rate', 'buffer_size', 'avg_game_length', 'temperature', 'beta',
                     'true_win_rate', 'eval_wins', 'eval_draws', 'eval_losses', 'eval_unresolved',
-                    'no_mcts_score_rate', 'no_mcts_true_win_rate',
+                    'no_mcts_score_rate', 'no_mcts_win_rate',
+                    'no_mcts_draw_rate', 'no_mcts_loss_rate',
                     'no_mcts_wins', 'no_mcts_draws', 'no_mcts_losses', 'no_mcts_unresolved',
                     'anchor_score_rate', 'anchor_true_win_rate', 'anchor_wins', 'anchor_draws', 'anchor_losses',
                     # 📊 NEW: Metrics
@@ -104,13 +105,57 @@ class TrainingLogger:
         self.estimated_elos = []  # (epoch, elo) tuples
         
         if mode == "rl":
+            self.performance_dir = self.log_dir / "performance"
+            self.performance_dir.mkdir(parents=True, exist_ok=True)
+            self.performance_log_path = self.performance_dir / "RL.csv"
+            self.performance_plot_path = self.performance_dir / "RL.png"
+            for old_log_path in list(self.performance_dir.glob("*.log")) + list(self.performance_dir.glob("*.csv")):
+                if old_log_path != self.performance_log_path:
+                    try:
+                        old_log_path.unlink()
+                    except OSError:
+                        pass
+            with open(self.performance_log_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'iteration',
+                    'timestamp',
+                    'positions_per_sec',
+                    'selfplay_time_s',
+                    'data_collection_time_s',
+                    'avg_game_length',
+                    'mcts_avg_batch_size',
+                    'mcts_gpu_utilization_pct',
+                    'mcts_inference_ms_per_position',
+                    'mcts_inference_ms_per_batch',
+                    'mcts_search_many_time_s',
+                    'mcts_nn_inference_time_s',
+                    'mcts_nn_inference_calls',
+                    'mcts_nn_inference_batch_items',
+                    'mcts_avg_legal_moves_per_position',
+                    'queue_wait_time_ms',
+                ])
+            try:
+                if self.performance_plot_path.exists():
+                    self.performance_plot_path.unlink()
+            except OSError:
+                pass
             self.win_rates = []
             self.true_win_rates = []
+            self.no_mcts_score_rates = []
+            self.no_mcts_true_win_rates = []
+            self.no_mcts_draw_rates = []
+            self.no_mcts_loss_rates = []
             self.anchor_score_rates = []
             self.anchor_true_win_rates = []
+            self.rl_best_model_markers = []
             self.temperatures = []
             self.adaptive_temp_adjustments = []
             self.adaptive_temp_thresholds = []
+        else:
+            self.performance_dir = None
+            self.performance_log_path = None
+            self.performance_plot_path = None
 
         # Optional run context shown in plot header (e.g. startup mode/resume/transfer info).
         self.run_context_text = None
@@ -123,7 +168,9 @@ class TrainingLogger:
         # 🆕 Full SWA metrics for summary panel.
         self.swa_metrics = None  # dict: {epoch, val_loss, top1, top3, mae, wdl_acc, wdl_ce, elo}
         
-        print(f"📊 Logging to: {self.csv_path}")
+        print(f"Logging to: {self.csv_path}")
+        if self.mode == "rl":
+            print(f"RL performance log: {self.performance_log_path}")
 
     def set_run_context(self, text):
         """Set optional short context displayed on generated PNG plots."""
@@ -177,6 +224,158 @@ class TrainingLogger:
         if not replaced:
             self.elo_epoch_markers.append((iteration, text))
             self.elo_epoch_markers.sort(key=lambda x: x[0])
+
+    def add_rl_best_model_marker(self, iteration, label=None):
+        """Mark an RL iteration where the best model was replaced."""
+        if self.mode != "rl":
+            return
+        try:
+            iteration = int(iteration)
+        except (TypeError, ValueError):
+            return
+
+        text = str(label).strip() if label is not None else ""
+        if not text:
+            text = "New RL best"
+
+        replaced = False
+        for idx, (it, _) in enumerate(self.rl_best_model_markers):
+            if int(it) == iteration:
+                self.rl_best_model_markers[idx] = (iteration, text)
+                replaced = True
+                break
+        if not replaced:
+            self.rl_best_model_markers.append((iteration, text))
+            self.rl_best_model_markers.sort(key=lambda x: x[0])
+
+    def log_rl_performance(
+        self,
+        iteration,
+        positions_per_sec=None,
+        selfplay_time=None,
+        data_collection_time=None,
+        avg_game_length=None,
+        profile=None,
+    ):
+        """Append RL speed/profile metrics to the single latest performance log."""
+        if self.mode != "rl" or self.performance_log_path is None:
+            return
+        profile = dict(profile or {})
+
+        def _value(key, default=''):
+            value = profile.get(key, default)
+            return default if value is None else value
+
+        row = [
+            int(iteration),
+            datetime.now().isoformat(timespec='seconds'),
+            '' if positions_per_sec is None else positions_per_sec,
+            '' if selfplay_time is None else selfplay_time,
+            '' if data_collection_time is None else data_collection_time,
+            '' if avg_game_length is None else avg_game_length,
+            _value('average_batch_size'),
+            _value('gpu_utilization_pct'),
+            _value('inference_time_per_position_ms'),
+            _value('inference_time_per_batch_ms'),
+            _value('mcts_search_many_time'),
+            _value('mcts_nn_inference_time'),
+            _value('mcts_nn_inference_calls'),
+            _value('mcts_nn_inference_batch_items'),
+            _value('average_legal_moves_per_position'),
+            _value('queue_wait_time_ms'),
+        ]
+        with open(self.performance_log_path, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+
+    def plot_rl_performance(self):
+        """Generate a performance plot from logs/performance/RL.csv."""
+        if self.mode != "rl" or self.performance_log_path is None:
+            return
+        if not self.performance_log_path.exists():
+            return
+
+        try:
+            with open(self.performance_log_path, 'r', newline='') as f:
+                rows = list(csv.DictReader(f))
+        except OSError:
+            return
+        if not rows:
+            return
+
+        def _series(column):
+            xs = []
+            ys = []
+            for row in rows:
+                try:
+                    x = int(float(row.get('iteration', '')))
+                    raw = row.get(column, '')
+                    if raw is None or raw == '':
+                        continue
+                    y = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                xs.append(x)
+                ys.append(y)
+            return xs, ys
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+        fig.suptitle('RL Performance', fontsize=16, fontweight='bold')
+
+        ax = axes[0, 0]
+        xs, ys = _series('positions_per_sec')
+        if xs:
+            ax.plot(xs, ys, 'bo-', linewidth=2, markersize=5)
+        ax.set_title('Positions / sec')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('positions/s')
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[0, 1]
+        for column, label, style in [
+            ('selfplay_time_s', 'Self-play', 'ro-'),
+            ('data_collection_time_s', 'Collection', 'go-'),
+            ('mcts_search_many_time_s', 'MCTS search_many', 'mo--'),
+        ]:
+            xs, ys = _series(column)
+            if xs:
+                ax.plot(xs, ys, style, linewidth=1.8, markersize=5, label=label)
+        ax.set_title('Runtime')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('seconds')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[1, 0]
+        xs, ys = _series('mcts_avg_batch_size')
+        if xs:
+            ax.plot(xs, ys, 'co-', linewidth=2, markersize=5, label='Avg batch')
+        ax.set_title('MCTS Inference Batch')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('batch items')
+        ax.grid(True, alpha=0.3)
+        ax2 = ax.twinx()
+        xs2, ys2 = _series('mcts_inference_ms_per_position')
+        if xs2:
+            ax2.plot(xs2, ys2, color='tab:orange', marker='s', linestyle='--', linewidth=1.8, label='ms/position')
+        ax2.set_ylabel('ms / position')
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            ax.legend(lines + lines2, labels + labels2, loc='best')
+
+        ax = axes[1, 1]
+        xs, ys = _series('mcts_gpu_utilization_pct')
+        if xs:
+            ax.plot(xs, ys, 'yo-', linewidth=2, markersize=5)
+        ax.set_title('MCTS GPU Utilization Proxy')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('percent')
+        ax.set_ylim(0, 100)
+        ax.grid(True, alpha=0.3)
+
+        fig.subplots_adjust(left=0.07, right=0.96, bottom=0.08, top=0.9, hspace=0.32, wspace=0.28)
+        fig.savefig(self.performance_plot_path, dpi=150)
+        plt.close(fig)
 
     def record_estimated_elo(self, iteration, estimated_elo, update_csv=True):
         """Record estimated Elo for a specific epoch/iteration (supports async updates)."""
@@ -659,9 +858,6 @@ class TrainingLogger:
                     kwargs.get('score_rate', kwargs.get('win_rate', '')),
                     kwargs.get('buffer_size', ''),
                     kwargs.get('avg_game_length', ''),
-                    kwargs.get('positions_per_sec', ''),
-                    kwargs.get('selfplay_time', ''),
-                    kwargs.get('data_collection_time', ''),
                     kwargs.get('temperature', ''),
                     kwargs.get('beta', ''),
                     kwargs.get('true_win_rate', ''),
@@ -670,7 +866,9 @@ class TrainingLogger:
                     kwargs.get('eval_losses', ''),
                     kwargs.get('eval_unresolved', ''),
                     kwargs.get('no_mcts_score_rate', ''),
-                    kwargs.get('no_mcts_true_win_rate', ''),
+                    kwargs.get('no_mcts_win_rate', kwargs.get('no_mcts_true_win_rate', '')),
+                    kwargs.get('no_mcts_draw_rate', ''),
+                    kwargs.get('no_mcts_loss_rate', ''),
                     kwargs.get('no_mcts_wins', ''),
                     kwargs.get('no_mcts_draws', ''),
                     kwargs.get('no_mcts_losses', ''),
@@ -746,6 +944,15 @@ class TrainingLogger:
                     self.win_rates.append((iteration, score_rate))
                 if 'true_win_rate' in kwargs and kwargs['true_win_rate'] is not None:
                     self.true_win_rates.append((iteration, kwargs['true_win_rate']))
+                if 'no_mcts_score_rate' in kwargs and kwargs['no_mcts_score_rate'] is not None:
+                    self.no_mcts_score_rates.append((iteration, kwargs['no_mcts_score_rate']))
+                no_mcts_win_rate = kwargs.get('no_mcts_win_rate', kwargs.get('no_mcts_true_win_rate'))
+                if no_mcts_win_rate is not None:
+                    self.no_mcts_true_win_rates.append((iteration, no_mcts_win_rate))
+                if 'no_mcts_draw_rate' in kwargs and kwargs['no_mcts_draw_rate'] is not None:
+                    self.no_mcts_draw_rates.append((iteration, kwargs['no_mcts_draw_rate']))
+                if 'no_mcts_loss_rate' in kwargs and kwargs['no_mcts_loss_rate'] is not None:
+                    self.no_mcts_loss_rates.append((iteration, kwargs['no_mcts_loss_rate']))
                 if 'anchor_score_rate' in kwargs and kwargs['anchor_score_rate'] is not None:
                     self.anchor_score_rates.append((iteration, kwargs['anchor_score_rate']))
                 if 'anchor_true_win_rate' in kwargs and kwargs['anchor_true_win_rate'] is not None:
@@ -1080,7 +1287,7 @@ class TrainingLogger:
         fig.savefig(self.plot_path, dpi=150)
         plt.close()
         
-        print(f"📈 Plot saved to: {self.plot_path}")
+        print(f"Plot saved to: {self.plot_path}")
     
     def _plot_rl(self):
         """Plot RL training progress"""
@@ -1142,25 +1349,74 @@ class TrainingLogger:
         ax.grid(True, alpha=0.3)
         
         ax = axes[1, 2]
-        if self.win_rates or self.anchor_score_rates:
+        if self.win_rates or self.no_mcts_score_rates or self.anchor_score_rates:
             if self.win_rates:
                 win_iters, win_vals = zip(*self.win_rates)
-                ax.plot(win_iters, win_vals, 'mo-', label='Score Rate', linewidth=2, markersize=8)
+                ax.plot(win_iters, win_vals, 'mo-', label='MCTS Score Rate', linewidth=2, markersize=8)
             if self.true_win_rates:
                 true_iters, true_vals = zip(*self.true_win_rates)
-                ax.plot(true_iters, true_vals, 'co-', label='True Win Rate', linewidth=1.5, markersize=6)
+                ax.plot(true_iters, true_vals, 'co-', label='MCTS Win Rate', linewidth=1.5, markersize=6)
+            if self.no_mcts_score_rates:
+                no_mcts_iters, no_mcts_vals = zip(*self.no_mcts_score_rates)
+                ax.plot(
+                    no_mcts_iters,
+                    no_mcts_vals,
+                    color='tab:purple',
+                    marker='s',
+                    linestyle='--',
+                    label='No-MCTS Score Rate',
+                    linewidth=2,
+                    markersize=6,
+                )
+            if self.no_mcts_true_win_rates:
+                no_mcts_win_iters, no_mcts_win_vals = zip(*self.no_mcts_true_win_rates)
+                ax.plot(
+                    no_mcts_win_iters,
+                    no_mcts_win_vals,
+                    color='tab:cyan',
+                    marker='s',
+                    linestyle=':',
+                    label='No-MCTS Win Rate',
+                    linewidth=1.8,
+                    markersize=5,
+                )
             if self.anchor_score_rates:
                 anchor_iters, anchor_vals = zip(*self.anchor_score_rates)
                 ax.plot(anchor_iters, anchor_vals, 'yo-', label='Anchor Score Rate', linewidth=2, markersize=7)
             if self.anchor_true_win_rates:
                 anchor_true_iters, anchor_true_vals = zip(*self.anchor_true_win_rates)
                 ax.plot(anchor_true_iters, anchor_true_vals, 'ko--', label='Anchor True Win Rate', linewidth=1.5, markersize=5, alpha=0.85)
+            if self.rl_best_model_markers:
+                marker_label_added = False
+                for marker_iter, marker_text in self.rl_best_model_markers:
+                    ax.axvline(
+                        x=int(marker_iter),
+                        color='gray',
+                        linestyle='-',
+                        linewidth=1.4,
+                        alpha=0.45,
+                        label='RL best replaced' if not marker_label_added else None,
+                    )
+                    marker_label_added = True
+                    y_text = 0.96
+                    ax.text(
+                        int(marker_iter),
+                        y_text,
+                        str(marker_text),
+                        rotation=90,
+                        va='top',
+                        ha='right',
+                        fontsize=8,
+                        color='dimgray',
+                        alpha=0.85,
+                    )
             ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
             ax.axhline(y=0.55, color='green', linestyle='--', alpha=0.5)
             ax.set_xlabel('Iteration')
-            ax.set_ylabel('Rate')
-            ax.set_title('Score/Win Rate vs Best + Anchor')
+            ax.set_ylabel('Percent')
+            ax.set_title('Eval Score/Win Rate vs Best')
             ax.set_ylim([0, 1])
+            ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
             ax.legend()
             ax.grid(True, alpha=0.3)
         
@@ -1205,6 +1461,12 @@ class TrainingLogger:
                 summary_lines.append(f"WDL CE: {self.train_value_wdl_ce[-1]:.4f}")
             if self.train_losses:
                 summary_lines.append(f"Total Loss: {self.train_losses[-1]:.4f}")
+            if self.no_mcts_score_rates:
+                summary_lines.append(f"No-MCTS Score: {self.no_mcts_score_rates[-1][1]:.2%}")
+            if self.no_mcts_true_win_rates:
+                summary_lines.append(f"No-MCTS Win: {self.no_mcts_true_win_rates[-1][1]:.2%}")
+            if self.rl_best_model_markers:
+                summary_lines.append(f"RL best replaced: iter {self.rl_best_model_markers[-1][0]}")
             summary_text = "\n".join(summary_lines)
             ax.text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
                    verticalalignment='center')
@@ -1213,4 +1475,4 @@ class TrainingLogger:
         fig.savefig(self.plot_path, dpi=150)
         plt.close()
         
-        print(f"📈 Plot saved to: {self.plot_path}")
+        print(f"Plot saved to: {self.plot_path}")

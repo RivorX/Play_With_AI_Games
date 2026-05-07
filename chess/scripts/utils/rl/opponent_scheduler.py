@@ -81,6 +81,60 @@ def _allocate_counts_from_weights(labels, weights, total_count):
     return counts
 
 
+def _cap_recent_latest_counts(recent_entries, counts, total_games, rl_cfg):
+    if not recent_entries or not counts or int(total_games) <= 0:
+        return dict(counts)
+
+    latest_count = max(0, int(rl_cfg.get('self_play_recent_latest_cap_count', 2)))
+    latest_fraction = max(
+        0.0,
+        min(1.0, float(rl_cfg.get('self_play_recent_latest_max_fraction', 1.0))),
+    )
+    if latest_count <= 0 or latest_fraction >= 1.0:
+        return dict(counts)
+
+    ordered = sorted(
+        list(recent_entries),
+        key=lambda entry: (
+            -float(entry.get("recency_bias", 0.0)),
+            str(entry.get("label", "")),
+        ),
+    )
+    latest_labels = {str(entry.get("label", "recent")) for entry in ordered[:latest_count]}
+    older_labels = [
+        str(entry.get("label", "recent"))
+        for entry in ordered
+        if str(entry.get("label", "recent")) not in latest_labels
+    ]
+    if not latest_labels or not older_labels:
+        return dict(counts)
+
+    adjusted = {str(label): int(count) for label, count in dict(counts).items()}
+    latest_total = int(sum(adjusted.get(label, 0) for label in latest_labels))
+    latest_cap = int(np.floor(float(total_games) * latest_fraction))
+    if latest_total <= latest_cap:
+        return adjusted
+
+    excess = int(latest_total - latest_cap)
+    for label in sorted(latest_labels, key=lambda item: (-adjusted.get(item, 0), item)):
+        if excess <= 0:
+            break
+        take = min(excess, max(0, int(adjusted.get(label, 0))))
+        adjusted[label] = int(adjusted.get(label, 0)) - take
+        excess -= take
+
+    if excess <= 0:
+        older_weights = [
+            max(0.0, float(entry.get("weight", 1.0)))
+            for entry in ordered
+            if str(entry.get("label", "recent")) in older_labels
+        ]
+        older_extra = _allocate_counts_from_weights(older_labels, older_weights, latest_total - latest_cap)
+        for label, extra in older_extra.items():
+            adjusted[str(label)] = int(adjusted.get(str(label), 0)) + int(extra)
+    return adjusted
+
+
 def _safe_draw_rate(wins, draws, losses):
     total = int(wins) + int(draws) + int(losses)
     if total <= 0:
@@ -106,6 +160,76 @@ def _normalize_weight_map(weight_map):
     if total <= 0.0:
         return normalized
     return {label: (weight / total) for label, weight in normalized.items()}
+
+
+def _bounded_normalize_weight_map(weight_map, min_shares=None, max_shares=None):
+    """Normalize weights onto a bounded simplex while preserving proportions."""
+    labels = [str(label) for label in dict(weight_map or {}).keys()]
+    if not labels:
+        return {}
+
+    base = {
+        label: max(0.0, float(dict(weight_map or {}).get(label, 0.0)))
+        for label in labels
+    }
+    if float(sum(base.values())) <= 0.0:
+        equal = 1.0 / float(len(labels))
+        base = {label: equal for label in labels}
+    else:
+        total_base = float(sum(base.values()))
+        base = {label: float(value) / total_base for label, value in base.items()}
+
+    min_shares = {str(k): max(0.0, min(1.0, float(v))) for k, v in dict(min_shares or {}).items()}
+    max_shares = {str(k): max(0.0, min(1.0, float(v))) for k, v in dict(max_shares or {}).items()}
+    lower = {label: float(min_shares.get(label, 0.0)) for label in labels}
+    upper = {
+        label: max(float(lower[label]), float(max_shares.get(label, 1.0)))
+        for label in labels
+    }
+
+    lower_total = float(sum(lower.values()))
+    if lower_total > 1.0:
+        scale = 1.0 / max(1e-8, lower_total)
+        lower = {label: float(value) * scale for label, value in lower.items()}
+        upper = {label: max(float(lower[label]), float(upper[label])) for label in labels}
+    upper_total = float(sum(upper.values()))
+    if upper_total < 1.0:
+        upper = {label: 1.0 for label in labels}
+
+    assigned = {}
+    free = set(labels)
+    remaining = 1.0
+    eps = 1e-9
+    while free:
+        free_base_total = float(sum(base[label] for label in free))
+        if free_base_total <= eps:
+            proposal = {label: remaining / float(len(free)) for label in free}
+        else:
+            proposal = {
+                label: remaining * float(base[label]) / free_base_total
+                for label in free
+            }
+
+        clamped = []
+        for label, value in proposal.items():
+            if value < lower[label] - eps:
+                clamped.append((label, lower[label]))
+            elif value > upper[label] + eps:
+                clamped.append((label, upper[label]))
+
+        if not clamped:
+            assigned.update(proposal)
+            break
+
+        for label, value in clamped:
+            if label not in free:
+                continue
+            assigned[label] = float(value)
+            remaining -= float(value)
+            free.remove(label)
+        remaining = max(0.0, remaining)
+
+    return _normalize_weight_map(assigned)
 
 
 def _canonicalize_opponent_bucket(label):
@@ -317,6 +441,8 @@ def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None)
     max_factor = max(min_factor, float(rl_cfg.get('self_play_opponent_adaptive_max_factor', 1.40)))
     current_min_fraction = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_current_min_fraction', 0.50))))
     current_max_fraction = max(current_min_fraction, min(1.0, float(rl_cfg.get('self_play_opponent_current_max_fraction', 1.0))))
+    best_min_fraction = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_best_min_fraction', 0.0))))
+    recent_max_fraction = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_recent_max_fraction', 1.0))))
 
     adjusted = {}
     debug_factors = {}
@@ -336,47 +462,23 @@ def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None)
         adjusted[label] = base_weight * factor
         debug_factors[label] = float(factor)
 
-    current_label = "current"
-    if current_label in adjusted:
-        adjusted[current_label] = max(float(adjusted[current_label]), float(current_min_fraction))
-
     total_weight = float(sum(adjusted.values()))
     if total_weight <= 0.0:
         return _normalize_weight_map(base_weights), debug_factors
-    normalized = {label: (weight / total_weight) for label, weight in adjusted.items()}
-    if current_label in normalized and current_min_fraction > 0.0:
-        desired_current = min(1.0, float(current_min_fraction))
-        current_share = float(normalized.get(current_label, 0.0))
-        if current_share < desired_current:
-            other_labels = [label for label in normalized.keys() if label != current_label]
-            other_total = float(sum(normalized[label] for label in other_labels))
-            if other_total <= 0.0 or desired_current >= 1.0:
-                normalized = {
-                    label: (1.0 if label == current_label else 0.0)
-                    for label in normalized.keys()
-                }
-            else:
-                scale = max(0.0, (1.0 - desired_current) / other_total)
-                normalized = {
-                    label: (desired_current if label == current_label else normalized[label] * scale)
-                    for label in normalized.keys()
-                }
-    if current_label in normalized and current_max_fraction < 1.0:
-        current_share = float(normalized.get(current_label, 0.0))
-        if current_share > current_max_fraction:
-            other_labels = [label for label in normalized.keys() if label != current_label]
-            other_total = float(sum(normalized[label] for label in other_labels))
-            if other_total > 0.0:
-                freed_mass = current_share - current_max_fraction
-                scale = (other_total + freed_mass) / other_total
-                normalized = {
-                    label: (
-                        current_max_fraction
-                        if label == current_label
-                        else normalized[label] * scale
-                    )
-                    for label in normalized.keys()
-                }
+    min_shares = {}
+    max_shares = {}
+    if "current" in adjusted:
+        min_shares["current"] = current_min_fraction
+        max_shares["current"] = current_max_fraction
+    if "best" in adjusted:
+        min_shares["best"] = best_min_fraction
+    if "recent" in adjusted:
+        max_shares["recent"] = recent_max_fraction
+    normalized = _bounded_normalize_weight_map(
+        adjusted,
+        min_shares=min_shares,
+        max_shares=max_shares,
+    )
     return normalized, debug_factors
 
 
@@ -529,27 +631,12 @@ def _build_selfplay_opponent_assignments(
     if total_games <= 0:
         return {}, {}, {}
 
-    target_games = {
-        label: int(round(total_games * float(source_weights.get(label, 0.0))))
-        for label in source_weights.keys()
-    }
-    assigned_target_total = int(sum(target_games.values()))
-    if assigned_target_total != total_games:
-        order = sorted(
-            source_weights.keys(),
-            key=lambda key: (-source_weights[key], key),
-        )
-        delta = total_games - assigned_target_total
-        idx = 0
-        while delta != 0 and order:
-            label = order[idx % len(order)]
-            if delta > 0:
-                target_games[label] += 1
-                delta -= 1
-            elif target_games[label] > 0:
-                target_games[label] -= 1
-                delta += 1
-            idx += 1
+    source_labels = [str(label) for label in source_weights.keys()]
+    target_games = _allocate_counts_from_weights(
+        source_labels,
+        [float(source_weights.get(label, 0.0)) for label in source_labels],
+        total_games,
+    )
 
     bucket_game_plan = []
     for label, count in target_games.items():
@@ -577,6 +664,12 @@ def _build_selfplay_opponent_assignments(
         recent_weights,
         recent_bucket_total,
     )
+    recent_quota = _cap_recent_latest_counts(
+        recent_entries,
+        recent_quota,
+        total_games,
+        rl_cfg,
+    )
     recent_label_plan = []
     for entry in recent_entries:
         entry_label = str(entry.get("label", "recent"))
@@ -591,8 +684,10 @@ def _build_selfplay_opponent_assignments(
     assigned_counts = defaultdict(int)
     debug_info = {
         "source_weights": {str(k): float(v) for k, v in source_weights.items()},
+        "target_games": {str(k): int(v) for k, v in target_games.items()},
         "selected_recent_pool": [],
         "recent_pool_all": [],
+        "model_fallbacks": {},
     }
     offset = 0
     for rank, games_for_worker in sorted_workers:
@@ -608,9 +703,16 @@ def _build_selfplay_opponent_assignments(
             if bucket_label == "best":
                 best_payload = payloads_by_label.get("best") or {}
                 best_label = str(best_payload.get("label", "best"))
+                best_state = best_payload.get("state")
+                if best_state is None:
+                    plan_labels.append("current")
+                    assigned_counts["current"] += 1
+                    debug_info["model_fallbacks"][best_label] = (
+                        int(debug_info["model_fallbacks"].get(best_label, 0)) + 1
+                    )
+                    continue
                 plan_labels.append(best_label)
-                if best_payload.get("state") is not None:
-                    pool_entries[best_label] = best_payload.get("state")
+                pool_entries[best_label] = best_state
                 assigned_counts[best_label] += 1
                 continue
             if bucket_label == "recent" and recent_entries:
@@ -619,18 +721,43 @@ def _build_selfplay_opponent_assignments(
                     recent_label_cursor += 1
                 else:
                     chosen_label = str(recent_entries[0].get("label", "recent"))
-                plan_labels.append(chosen_label)
                 chosen_state = None
                 for entry in recent_entries:
                     if str(entry.get("label", "recent")) == chosen_label:
                         chosen_state = entry.get("state")
                         break
-                if chosen_state is not None:
-                    pool_entries[chosen_label] = chosen_state
+                if chosen_state is None:
+                    plan_labels.append("current")
+                    assigned_counts["current"] += 1
+                    debug_info["model_fallbacks"][chosen_label] = (
+                        int(debug_info["model_fallbacks"].get(chosen_label, 0)) + 1
+                    )
+                    continue
+                plan_labels.append(chosen_label)
+                pool_entries[chosen_label] = chosen_state
                 assigned_counts[chosen_label] += 1
                 continue
             plan_labels.append("current")
             assigned_counts["current"] += 1
+            debug_info["model_fallbacks"][str(bucket_label)] = (
+                int(debug_info["model_fallbacks"].get(str(bucket_label), 0)) + 1
+            )
+
+        non_current_labels = {
+            str(label)
+            for label in plan_labels
+            if str(label) != "current"
+        }
+        missing_labels = sorted(label for label in non_current_labels if label not in pool_entries)
+        if missing_labels:
+            for label in missing_labels:
+                debug_info["model_fallbacks"][label] = (
+                    int(debug_info["model_fallbacks"].get(label, 0)) + plan_labels.count(label)
+                )
+            plan_labels = [
+                "current" if str(label) in set(missing_labels) else str(label)
+                for label in plan_labels
+            ]
 
         assignments[int(rank)] = {
             "plan_labels": plan_labels,
@@ -639,6 +766,10 @@ def _build_selfplay_opponent_assignments(
                 for label, state in pool_entries.items()
             ],
         }
+
+    debug_info["assigned_games"] = {str(k): int(v) for k, v in assigned_counts.items()}
+    debug_info["assigned_total_games"] = int(sum(assigned_counts.values()))
+    debug_info["expected_total_games"] = int(total_games)
 
     recent_payload = payloads_by_label.get("recent") or {}
     for entry in list(recent_payload.get("entries", []) or []):

@@ -1313,7 +1313,7 @@ class MultiGameBatchMCTS:
             'root_blended_value': 0.0,
             'stopped_early': used < budget,
             'adaptive_stop_reason': 'budget' if used >= budget else 'unknown',
-            'policy_weight': 1.0 if used >= int(math.ceil(budget * self.adaptive_policy_weight_min_fraction)) else 0.0,
+            'policy_weight': float(max(0.0, min(1.0, used / float(budget)))),
         }
         if root is None or not root.expanded or root.edges is None:
             return summary
@@ -1646,8 +1646,6 @@ class MultiGameBatchMCTS:
             if stop_reason is None:
                 stop_reason = 'budget' if not metadata.get('stopped_early', False) else 'unknown'
             metadata['adaptive_stop_reason'] = stop_reason
-            if stop_reason in {'forced', 'locked', 'confident'}:
-                metadata['policy_weight'] = 1.0
             search_metadata.append(metadata)
         if self.profile_enabled:
             self._profile_add('search_metadata_time', time.perf_counter() - metadata_t0)
@@ -1989,6 +1987,7 @@ class BatchSelfPlayMCTSBatch:
         }
         self.opponent_mcts = next(iter(self.opponent_mcts_by_label.values()), None)
         self.opponent_plan_labels = list(opponent_plan_labels or [])
+        self._warned_missing_opponent_labels = set()
 
         if device.type == 'cuda':
             self.model = self.model.to(memory_format=torch.channels_last)
@@ -2988,6 +2987,16 @@ class BatchSelfPlayMCTSBatch:
                 else self.opponent_source_label
             )
             opponent_mcts = self.opponent_mcts_by_label.get(game_opponent_label)
+            if game_opponent_label != "current" and opponent_mcts is None:
+                if game_opponent_label not in self._warned_missing_opponent_labels:
+                    print(
+                        "Warning: opponent plan references "
+                        f"'{game_opponent_label}', but this worker has no model for it. "
+                        "Falling back to current."
+                    )
+                    self._warned_missing_opponent_labels.add(game_opponent_label)
+                game_opponent_label = "current"
+                opponent_mcts = None
             has_frozen_opponent = opponent_mcts is not None
             gs = {
                 'board': chess.Board(),

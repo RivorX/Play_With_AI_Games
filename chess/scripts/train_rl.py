@@ -564,6 +564,7 @@ def _handle_graceful_interrupt(logger=None, stage=None):
     if logger is not None:
         try:
             logger.plot()
+            logger.plot_rl_performance()
         except Exception:
             pass
     cleanup_interrupted_log_csv(_LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG, "RL")
@@ -773,6 +774,30 @@ def play_games_parallel_mcts(
         recent_snapshot_pool=recent_snapshot_pool,
         adaptive_scheduler_state=adaptive_scheduler_state,
     )
+    if _opponent_mix_games:
+        mix_parts = [
+            f"{label}={count}"
+            for label, count in sorted(_opponent_mix_games.items(), key=lambda item: str(item[0]))
+        ]
+        weight_parts = [
+            f"{label}={float(weight):.1%}"
+            for label, weight in sorted(
+                dict((opponent_debug or {}).get("source_weights", {}) or {}).items(),
+                key=lambda item: str(item[0]),
+            )
+        ]
+        suffix = f" ({', '.join(weight_parts)})" if weight_parts else ""
+        print(f"Planned opponent mix: {', '.join(mix_parts)}{suffix}")
+    model_fallbacks = dict((opponent_debug or {}).get("model_fallbacks", {}) or {})
+    if model_fallbacks:
+        fallback_parts = [
+            f"{label}->{count}"
+            for label, count in sorted(model_fallbacks.items(), key=lambda item: str(item[0]))
+        ]
+        print(
+            "Warning: opponent scheduler used current-model fallback for missing opponent models: "
+            + ", ".join(fallback_parts)
+        )
     dispatch_chunk_raw = rl_cfg.get('self_play_dispatch_chunk_games', max_batch_games)
     try:
         requested_dispatch_chunk_games = max(1, int(dispatch_chunk_raw))
@@ -2059,7 +2084,9 @@ def main():
             "   - Adaptive opponent scheduler: "
             f"on (target={float(config['reinforcement_learning'].get('self_play_opponent_adaptive_target_score', 0.50)):.0%}, "
             f"band=+/-{float(config['reinforcement_learning'].get('self_play_opponent_adaptive_band', 0.15)):.0%}, "
-            f"current_floor={float(config['reinforcement_learning'].get('self_play_opponent_current_min_fraction', 0.50)):.0%})"
+            f"current_floor={float(config['reinforcement_learning'].get('self_play_opponent_current_min_fraction', 0.50)):.0%}, "
+            f"best_floor={float(config['reinforcement_learning'].get('self_play_opponent_best_min_fraction', 0.0)):.0%}, "
+            f"recent_cap={float(config['reinforcement_learning'].get('self_play_opponent_recent_max_fraction', 1.0)):.0%})"
         )
     if bool(config['reinforcement_learning'].get('self_play_resignation_enabled', False)):
         print(
@@ -2085,6 +2112,7 @@ def main():
             f"({total_iterations}). Nothing to train."
         )
         logger.plot()
+        logger.plot_rl_performance()
         return
 
     base_mcts_temperature_threshold = int(rl_cfg.get('mcts_temperature_threshold', 16))
@@ -2344,6 +2372,14 @@ def main():
             selfplay_profile = dict((selfplay_stats or {}).get('profile', {}) or {})
             if profile_training_enabled and selfplay_profile:
                 print_selfplay_profiler(selfplay_profile, selfplay_time)
+            logger.log_rl_performance(
+                iteration + 1,
+                positions_per_sec=positions_per_sec,
+                selfplay_time=selfplay_time,
+                data_collection_time=collection_time,
+                avg_game_length=avg_game_length,
+                profile=selfplay_profile,
+            )
             adaptive_opponent_scheduler_state, observed_scores = _update_adaptive_opponent_scheduler(
                 rl_cfg,
                 adaptive_opponent_scheduler_state,
@@ -2461,6 +2497,8 @@ def main():
             estimated_elo = None
             no_mcts_score_rate = None
             no_mcts_true_win_rate = None
+            no_mcts_draw_rate = None
+            no_mcts_loss_rate = None
             no_mcts_wins = no_mcts_draws = no_mcts_losses = no_mcts_unresolved = None
             if no_mcts_eval_enabled and ((iteration + 1) % no_mcts_eval_every == 0):
                 print(f"Evaluating vs best without MCTS ({no_mcts_eval_games} games)...")
@@ -2478,6 +2516,8 @@ def main():
                 )
                 no_mcts_score_rate = float((no_mcts_stats or {}).get('score_rate', 0.0))
                 no_mcts_true_win_rate = float((no_mcts_stats or {}).get('win_rate', 0.0))
+                no_mcts_draw_rate = float((no_mcts_stats or {}).get('draw_rate', 0.0))
+                no_mcts_loss_rate = float((no_mcts_stats or {}).get('loss_rate', 0.0))
                 no_mcts_wins = int((no_mcts_stats or {}).get('wins', 0))
                 no_mcts_draws = int((no_mcts_stats or {}).get('draws', 0))
                 no_mcts_losses = int((no_mcts_stats or {}).get('losses', 0))
@@ -2610,7 +2650,10 @@ def main():
                     eval_losses=eval_losses,
                     eval_unresolved=eval_unresolved,
                     no_mcts_score_rate=no_mcts_score_rate,
+                    no_mcts_win_rate=no_mcts_true_win_rate,
                     no_mcts_true_win_rate=no_mcts_true_win_rate,
+                    no_mcts_draw_rate=no_mcts_draw_rate,
+                    no_mcts_loss_rate=no_mcts_loss_rate,
                     no_mcts_wins=no_mcts_wins,
                     no_mcts_draws=no_mcts_draws,
                     no_mcts_losses=no_mcts_losses,
@@ -2622,9 +2665,6 @@ def main():
                     anchor_losses=anchor_losses,
                     buffer_size=len(replay_buffer),
                     avg_game_length=avg_game_length,
-                    positions_per_sec=positions_per_sec,
-                    selfplay_time=selfplay_time,
-                    data_collection_time=collection_time,
                     temperature=current_temp,
                     beta=None,
                     completed_draw_rate=(selfplay_stats or {}).get('completed_draw_rate', None),
@@ -2648,6 +2688,10 @@ def main():
                 last_logged_iteration = iteration + 1
                 if score_rate >= score_rate_threshold and true_win_rate >= true_win_rate_threshold:
                     print("New best model!")
+                    logger.add_rl_best_model_marker(
+                        iteration + 1,
+                        f"RL best {iteration + 1}",
+                    )
                     best_model.load_state_dict(model.state_dict())
                     best_win_rate_so_far = max(best_win_rate_so_far, float(score_rate))
                     if int(eval_wins or 0) > 0 and anchor_model_available:
@@ -2712,6 +2756,7 @@ def main():
                         f"for {no_improvement_eval_streak} evaluation cycle(s)."
                     )
                     logger.plot()
+                    logger.plot_rl_performance()
                     _finish_stage('eval_log')
                     _emit_iteration_profile()
                     break
@@ -2725,11 +2770,11 @@ def main():
                     value_loss=avg_value,
                     buffer_size=len(replay_buffer),
                     avg_game_length=avg_game_length,
-                    positions_per_sec=positions_per_sec,
-                    selfplay_time=selfplay_time,
-                    data_collection_time=collection_time,
                     no_mcts_score_rate=no_mcts_score_rate,
+                    no_mcts_win_rate=no_mcts_true_win_rate,
                     no_mcts_true_win_rate=no_mcts_true_win_rate,
+                    no_mcts_draw_rate=no_mcts_draw_rate,
+                    no_mcts_loss_rate=no_mcts_loss_rate,
                     no_mcts_wins=no_mcts_wins,
                     no_mcts_draws=no_mcts_draws,
                     no_mcts_losses=no_mcts_losses,
@@ -2765,13 +2810,17 @@ def main():
                 })
 
             logger.plot()
+            logger.plot_rl_performance()
 
             latest_metadata = {
                 'win_rate': true_win_rate,
                 'score_rate': score_rate,
                 'eval_true_win_rate': true_win_rate,
                 'no_mcts_score_rate': no_mcts_score_rate,
+                'no_mcts_win_rate': no_mcts_true_win_rate,
                 'no_mcts_true_win_rate': no_mcts_true_win_rate,
+                'no_mcts_draw_rate': no_mcts_draw_rate,
+                'no_mcts_loss_rate': no_mcts_loss_rate,
                 'policy_loss': avg_policy,
                 'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                 'value_mae': train_metrics.get('value_mae', 0),
@@ -2821,6 +2870,7 @@ def main():
         print("Final Elo skipped: no completed iteration available to evaluate.")
 
     logger.plot()
+    logger.plot_rl_performance()
     if training_interrupted:
         _handle_graceful_interrupt(logger=logger, stage=interrupted_stage)
         return

@@ -134,6 +134,35 @@ def _resolve_eval_mcts_simulations(config):
         return base_sims
 
 
+def _build_eval_stats(wins, draws, losses, unresolved, num_games):
+    num_games = int(num_games)
+    wins = int(wins)
+    draws = int(draws)
+    losses = int(losses)
+    unresolved = int(unresolved)
+    return {
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+        "unresolved": unresolved,
+        "num_games": num_games,
+        "score_rate": (wins + 0.5 * draws) / num_games if num_games > 0 else 0.0,
+        "win_rate": wins / num_games if num_games > 0 else 0.0,
+        "draw_rate": draws / num_games if num_games > 0 else 0.0,
+        "loss_rate": losses / num_games if num_games > 0 else 0.0,
+        "resolved_games": num_games - unresolved,
+    }
+
+
+def _print_eval_unresolved(label, unresolved, num_games, max_moves):
+    if int(unresolved) <= 0:
+        return
+    print(
+        f"{label} unresolved at ply cap ({max_moves}, ~{max_moves / 2.0:.1f} full moves): "
+        f"{unresolved}/{num_games} -> excluded from draw count"
+    )
+
+
 def _get_eval_opening_prefix(config, game_idx, enabled_override=None):
     enabled = _resolve_eval_fixed_openings_enabled(config) if enabled_override is None else bool(enabled_override)
     if not enabled or not _SELFPLAY_OPENING_LINES:
@@ -223,7 +252,7 @@ def _select_no_mcts_policy_move(model, board, board_history, config, device):
             else contextlib.nullcontext()
         )
         with autocast_ctx:
-            policy_logits, _value = model(board_tensor, apply_log_softmax=False)
+            policy_logits, _value = model(board_tensor, apply_log_softmax=False, policy_only=True)
         legal_logits = policy_logits[0].index_select(0, legal_indices)
         best_idx = int(torch.argmax(legal_logits).item())
     return legal_moves[best_idx]
@@ -666,23 +695,9 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
             eval_bar.close()
 
         if unresolved > 0:
-            print(
-                f"Eval unresolved at ply cap ({max_moves}, ~{max_moves / 2.0:.1f} full moves): "
-                f"{unresolved}/{num_games} -> excluded from draw count"
-            )
+            _print_eval_unresolved("Eval", unresolved, num_games, max_moves)
 
-        return {
-            "wins": wins,
-            "draws": draws,
-            "losses": losses,
-            "unresolved": unresolved,
-            "num_games": num_games,
-            "score_rate": (wins + 0.5 * draws) / num_games,
-            "win_rate": wins / num_games,
-            "draw_rate": draws / num_games,
-            "loss_rate": losses / num_games,
-            "resolved_games": num_games - unresolved,
-        }
+        return _build_eval_stats(wins, draws, losses, unresolved, num_games)
 
     model1_state = _snapshot_state_dict_cpu_shared(model1)
     model2_state = _snapshot_state_dict_cpu_shared(model2)
@@ -752,23 +767,9 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
 
     if unresolved > 0:
         max_moves = _resolve_eval_max_moves(config)
-        print(
-            f"Eval unresolved at ply cap ({max_moves}, ~{max_moves / 2.0:.1f} full moves): "
-            f"{unresolved}/{num_games} -> excluded from draw count"
-        )
+        _print_eval_unresolved("Eval", unresolved, num_games, max_moves)
 
-    return {
-        "wins": wins,
-        "draws": draws,
-        "losses": losses,
-        "unresolved": unresolved,
-        "num_games": num_games,
-        "score_rate": (wins + 0.5 * draws) / num_games,
-        "win_rate": wins / num_games,
-        "draw_rate": draws / num_games,
-        "loss_rate": losses / num_games,
-        "resolved_games": num_games - unresolved,
-    }
+    return _build_eval_stats(wins, draws, losses, unresolved, num_games)
 
 
 def evaluate_models_no_mcts(model1, model2, config, device, num_games=30, game_index_offset=0, use_fixed_openings=None):
@@ -815,20 +816,6 @@ def evaluate_models_no_mcts(model1, model2, config, device, num_games=30, game_i
         eval_bar.close()
 
     if unresolved > 0:
-        print(
-            f"No-MCTS eval unresolved at ply cap ({max_moves}, ~{max_moves / 2.0:.1f} full moves): "
-            f"{unresolved}/{num_games} -> excluded from draw count"
-        )
+        _print_eval_unresolved("No-MCTS eval", unresolved, num_games, max_moves)
 
-    return {
-        "wins": wins,
-        "draws": draws,
-        "losses": losses,
-        "unresolved": unresolved,
-        "num_games": num_games,
-        "score_rate": (wins + 0.5 * draws) / num_games if num_games > 0 else 0.0,
-        "win_rate": wins / num_games if num_games > 0 else 0.0,
-        "draw_rate": draws / num_games if num_games > 0 else 0.0,
-        "loss_rate": losses / num_games if num_games > 0 else 0.0,
-        "resolved_games": num_games - unresolved,
-    }
+    return _build_eval_stats(wins, draws, losses, unresolved, num_games)
