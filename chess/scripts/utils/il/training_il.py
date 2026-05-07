@@ -49,9 +49,14 @@ def train_epoch_il(
     """
     model.train()
 
-    debug_cfg = config.get('debug', {})
+    debug_cfg = config.get('debug', {}) or {}
+    il_debug_cfg = debug_cfg.get('il', {}) or {}
+    if not isinstance(il_debug_cfg, dict):
+        il_debug_cfg = {}
     debug_enabled = bool(debug_cfg.get('enabled', False))
-    log_gpu_memory = bool(debug_enabled and debug_cfg.get('log_gpu_memory', False))
+    log_gpu_memory = bool(
+        debug_enabled and il_debug_cfg.get('log_gpu_memory', debug_cfg.get('log_gpu_memory', False))
+    )
     log_grad_diagnostics = bool(debug_enabled)
     
     # WDL-only path
@@ -94,7 +99,7 @@ def train_epoch_il(
     first_batch_predictions = True
     show_batch0_diagnostics = (
         debug_enabled and
-        debug_cfg.get('print_batch0_diagnostics', False)
+        il_debug_cfg.get('print_batch0_diagnostics', debug_cfg.get('print_batch0_diagnostics', False))
     )
     
     # âšˇ Pre-read AMP config outside loop (avoid dict lookups per batch)

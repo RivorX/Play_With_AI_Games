@@ -1179,6 +1179,10 @@ class EloEstimator:
 
         pending_tasks = list(tasks)
         active_games: list[dict] = []
+        model_move_calls = 0
+        model_move_positions = 0
+        model_move_time_s = 0.0
+        stockfish_move_time_s = 0.0
 
         def finalize_game(game: dict, score: float | None = None):
             if score is None:
@@ -1251,50 +1255,56 @@ class EloEstimator:
                     else:
                         stockfish_turn_games.append(game)
 
-                for batch_games in (model_turn_games, stockfish_turn_games):
-                    if not batch_games:
-                        continue
+                stockfish_futures = {}
+                stockfish_t0 = time.perf_counter()
+                if stockfish_turn_games:
+                    stockfish_futures = {
+                        executor.submit(
+                            game["engine"].play,
+                            game["board"].copy(stack=False),
+                            chess.engine.Limit(time=stockfish_time_limit),
+                        ): game
+                        for game in stockfish_turn_games
+                    }
 
-                    if batch_games is model_turn_games:
-                        moves = batched_player.best_moves(
-                            [game["board"] for game in batch_games],
-                            [game["state"] for game in batch_games],
-                        )
-                        for game, move in zip(batch_games, moves):
-                            if move is None or move not in game["board"].legal_moves:
-                                move = next(iter(game["board"].legal_moves), None)
-                            if move is None:
-                                game["ply_count"] = max_half_moves
-                                continue
-                            game["board"].push(move)
-                            batched_player.on_move_played(game["state"], move)
-                            game["ply_count"] += 1
-                    else:
-                        futures = {
-                            executor.submit(
-                                game["engine"].play,
-                                game["board"].copy(stack=False),
-                                chess.engine.Limit(time=stockfish_time_limit),
-                            ): game
-                            for game in batch_games
-                        }
-                        for future in as_completed(futures):
-                            game = futures[future]
-                            try:
-                                result = future.result()
-                                move = result.move
-                            except Exception as exc:
-                                self._log_limited(
-                                    "stockfish_batch_play_fail",
-                                    f"  Warning: Stockfish move failed at level {game['level']}: {exc}",
-                                )
-                                move = None
-                            if move is None or move not in game["board"].legal_moves:
-                                game["ply_count"] = max_half_moves
-                                continue
-                            game["board"].push(move)
-                            batched_player.on_move_played(game["state"], move)
-                            game["ply_count"] += 1
+                if model_turn_games:
+                    model_t0 = time.perf_counter()
+                    moves = batched_player.best_moves(
+                        [game["board"] for game in model_turn_games],
+                        [game["state"] for game in model_turn_games],
+                    )
+                    model_move_time_s += time.perf_counter() - model_t0
+                    model_move_calls += 1
+                    model_move_positions += len(model_turn_games)
+                    for game, move in zip(model_turn_games, moves):
+                        if move is None or move not in game["board"].legal_moves:
+                            move = next(iter(game["board"].legal_moves), None)
+                        if move is None:
+                            game["ply_count"] = max_half_moves
+                            continue
+                        game["board"].push(move)
+                        batched_player.on_move_played(game["state"], move)
+                        game["ply_count"] += 1
+
+                if stockfish_futures:
+                    for future in as_completed(stockfish_futures):
+                        game = stockfish_futures[future]
+                        try:
+                            result = future.result()
+                            move = result.move
+                        except Exception as exc:
+                            self._log_limited(
+                                "stockfish_batch_play_fail",
+                                f"  Warning: Stockfish move failed at level {game['level']}: {exc}",
+                            )
+                            move = None
+                        if move is None or move not in game["board"].legal_moves:
+                            game["ply_count"] = max_half_moves
+                            continue
+                        game["board"].push(move)
+                        batched_player.on_move_played(game["state"], move)
+                        game["ply_count"] += 1
+                    stockfish_move_time_s += time.perf_counter() - stockfish_t0
 
                 finished_games: list[dict] = []
                 still_active = []
@@ -1311,6 +1321,14 @@ class EloEstimator:
                     launch_next_game(idle_engines.pop())
         finally:
             executor.shutdown(wait=True, cancel_futures=False)
+
+        if model_move_calls > 0:
+            avg_model_batch = float(model_move_positions) / float(model_move_calls)
+            print(
+                "  Info: Elo model batching: "
+                f"avg_batch={avg_model_batch:.1f}, calls={model_move_calls}, "
+                f"model_time={model_move_time_s:.1f}s, stockfish_wait={stockfish_move_time_s:.1f}s"
+            )
 
         return all_opponent_elos, all_scores
 

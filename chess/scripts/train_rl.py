@@ -736,18 +736,26 @@ def play_games_parallel_mcts(
     if device_type == 'cpu':
         num_workers = min(int(num_workers), max_cpu_sane_workers)
     else:
-        num_workers = min(int(num_workers), max_cpu_sane_workers)
-        # On GPU, cap workers by available GPUs and configurable workers-per-GPU.
-        # MCTS has heavy CPU-side tree logic, so >1 worker per GPU can improve
-        # utilization by overlapping tree expansion with batched inference.
-        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        if num_gpus > 0:
-            workers_per_gpu_raw = rl_cfg.get('self_play_workers_per_gpu', 1)
+        central_inference_requested = bool(rl_cfg.get('self_play_central_inference_enabled', False))
+        if central_inference_requested:
             try:
-                workers_per_gpu = max(1, int(workers_per_gpu_raw))
+                worker_cap_multiplier = max(
+                    1.0,
+                    float(rl_cfg.get('self_play_worker_cap_multiplier', 1.0)),
+                )
             except Exception:
-                workers_per_gpu = 1
-            num_workers = min(num_workers, num_gpus * workers_per_gpu)
+                worker_cap_multiplier = 1.0
+            max_cpu_sane_workers = max(
+                max_cpu_sane_workers,
+                int(math.ceil(mp.cpu_count() * worker_cap_multiplier)),
+            )
+        num_workers = min(int(num_workers), max_cpu_sane_workers)
+        if not central_inference_requested:
+            # Without central inference, each worker owns a GPU model/context.
+            # Keep the default conservative; users can still set self_play_workers explicitly.
+            num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            if num_gpus > 0 and isinstance(rl_cfg.get('self_play_workers', 4), str):
+                num_workers = min(num_workers, num_gpus)
     
     num_workers = max(1, num_workers)
 
@@ -824,13 +832,21 @@ def play_games_parallel_mcts(
     if not _SELFPLAY_CONFIG_PRINTED:
         _SELFPLAY_CONFIG_PRINTED = True
         gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        wpg = rl_cfg.get('self_play_workers_per_gpu', 1) if device_type == 'cuda' else '-'
         threads = rl_cfg.get('self_play_torch_threads', 1)
         batch_info = f"on  (max {max_batch_games} gier/worker)" if use_batch_selfplay else "off"
         dispatch_chunk_info = (
             str(dynamic_dispatch_chunk_games)
             if dynamic_dispatch_enabled
             else "-"
+        )
+        central_inference_info = (
+            "on"
+            if (
+                device_type == 'cuda'
+                and use_persistent_pool
+                and bool(rl_cfg.get('self_play_central_inference_enabled', False))
+            )
+            else "off"
         )
         max_parallel_games = sum(
             min(max_batch_games if use_batch_selfplay else 1, games)
@@ -855,13 +871,13 @@ def play_games_parallel_mcts(
             "+--------------------------+-------------------------+",
             f"|  Urzadzenie              |  {device_type:<25} |",
             f"|  GPU dostepne            |  {gpus:<25} |",
-            f"|  Workerow per GPU        |  {str(wpg):<25} |",
             f"|  Workerow lacznie        |  {len(worker_specs):<25} |",
             f"|  Watkow per worker       |  {str(threads):<25} |",
             f"|  Gier per iteracje       |  {num_games:<25} |",
             f"|  Gier per worker         |  {w_games:<25} |",
             f"|  Batch self-play         |  {batch_info:<25} |",
             f"|  Chunk dispatch          |  {dispatch_chunk_info:<25} |",
+            f"|  Central inference       |  {central_inference_info:<25} |",
             f"|  Gier rownolegle max     |  {max_parallel_games:<25} |",
             f"|  Symulacje MCTS          |  {rl_cfg['mcts_simulations']:<25} |",
             f"|  Rozmiar batcha MCTS     |  {rl_cfg.get('mcts_batch_size', 32):<25} |",
@@ -1596,8 +1612,16 @@ def main():
         config = yaml.safe_load(f)
 
     debug_cfg = config.get('debug', {}) or {}
-    profile_training_enabled = bool(debug_cfg.get('profile_training', False))
-    log_gpu_memory_enabled = bool(debug_cfg.get('log_gpu_memory', False))
+    rl_debug_cfg = debug_cfg.get('rl', {}) or {}
+    if not isinstance(rl_debug_cfg, dict):
+        rl_debug_cfg = {}
+    debug_enabled = bool(debug_cfg.get('enabled', False))
+    profile_training_enabled = bool(
+        debug_enabled and rl_debug_cfg.get('profile_training', debug_cfg.get('profile_training', False))
+    )
+    log_gpu_memory_enabled = bool(
+        debug_enabled and rl_debug_cfg.get('log_gpu_memory', debug_cfg.get('log_gpu_memory', False))
+    )
 
     try:
         syzygy_bootstrap = ensure_syzygy_tables(config, chess_dir=script_dir.parent, logger=print)
@@ -2065,6 +2089,7 @@ def main():
         f"absolute={config['reinforcement_learning'].get('mcts_fpu_absolute', None)})"
     )
     print(f"   - Persistent self-play workers: {config['reinforcement_learning'].get('persistent_self_play_workers', True)}")
+    print(f"   - Central inference server: {config['reinforcement_learning'].get('self_play_central_inference_enabled', False)}")
     print(f"   - Stream self-play to replay: {config['reinforcement_learning'].get('self_play_stream_to_replay', True)}")
     if bool(config['reinforcement_learning'].get('self_play_opponent_pool_enabled', False)):
         print(

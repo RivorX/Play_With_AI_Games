@@ -203,10 +203,21 @@ reinforcement_learning:
   # Self-Play Runtime
   # ---------------------------
   self_play_device: "cuda"      # cpu | cuda | auto (auto uses GPU if available)
-  self_play_workers: auto       # 0/auto = cpu_count - 1, or set explicit number
-  self_play_workers_per_gpu: 10  # Better throughput on 1x RTX 5060 Ti + Ryzen 7500F; fewer workers means less GPU/context fragmentation
+  self_play_workers: 16         # Total self-play worker processes; central inference uses one GPU server, so this is not per-GPU
+  self_play_worker_cap_multiplier: 1.7 # Allow CPU oversubscription because workers block on central inference
   self_play_torch_threads: 1    # Keep 1 thread per worker; Python MCTS already fans out across many processes
   self_play_use_compile: true   # Self-play workers: torch.compile(mode=default) on CUDA; guarded so Windows workers don't compile/cache concurrently
+  self_play_central_inference_enabled: true   # Use one GPU inference server for persistent self-play workers; workers keep MCTS trees on CPU
+  self_play_central_inference_use_compile: true # Compile the single central GPU model; warmup happens before workers start
+  self_play_central_inference_compile_warmup_batches: [1, 32, 128, 256] # Pre-warm common dynamic batch sizes outside self-play
+  self_play_compile_reset_dynamo: false # Keep compiled graphs cached inside the persistent central inference process
+  self_play_central_inference_flush_ms: 1.0   # Very low latency; central forward is fast and workers should wait less
+  self_play_central_inference_max_batch_size: 256 # Upper batch cap for the central inference server
+  self_play_central_inference_timeout_s: 0    # 0 = wait indefinitely for queued GPU inference; positive value = watchdog timeout
+  self_play_central_inference_load_timeout_s: 300 # Parent waits for central model load before dispatching workers
+  self_play_central_inference_cudnn_benchmark: false # Variable MCTS batch sizes make cuDNN autotune re-benchmark too often
+  self_play_central_inference_cache_enabled: false # Raw position hashing is usually slower than useful during self-play
+  self_play_central_inference_cache_entries: 4096 # Per-model LRU cache entries inside the central inference server
   persistent_self_play_workers: true  # Keep self-play workers alive across RL iterations
   self_play_stream_to_replay: true    # Stream worker results into replay buffer to reduce parent RAM peak
   self_play_queue_transport: true     # For persistent workers + stream_to_replay: send packed batches over mp queue instead of writing them to disk
@@ -219,7 +230,7 @@ reinforcement_learning:
   # Self-Play Game Flow
   # ---------------------------
   use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
-  max_batch_games_per_worker: 32     # Larger active pools improve MCTS inference batch size when games split across opponent models
+  max_batch_games_per_worker: 20     # With 16 central-inference workers, keep active games/RAM near the old 10x32 profile
   self_play_dispatch_chunk_games: 96 # Requested chunk cap; runtime caps it by games/worker so large chunks do not starve workers
   self_play_max_moves: 190          # Shorter cap: cut low-value sterile games earlier instead of harvesting many doomed draw samples
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
@@ -412,6 +423,7 @@ reinforcement_learning:
   # Evaluation & Promotion
   # ---------------------------
   eval_games: 100            # Fallback total games when staged eval is disabled
+  eval_batch_games: 32       # Active MCTS eval games searched together in one process (raises GPU batch utilization)
   eval_mcts_simulations_multiplier: 2.5  # Eval uses base mcts_simulations * this multiplier (1.0 = same search budget as self-play base)
   eval_max_moves: 320        # Align eval with self-play so results are not dominated by ultra-long unresolved games
   eval_auto_claim_draw: true
@@ -536,9 +548,9 @@ elo_estimation:
   final_rl_games_per_level: 24   # Final RL Elo can be slower/more stable than periodic checks
   final_rl_stockfish_time_limit: 0.20  # Keep final RL Elo closer to the previous baseline
   final_rl_max_moves: 150      # Final RL Elo keeps the normal move horizon
-  final_rl_workers: 6          # Better CPU saturation for final Elo with 2-thread Stockfish workers
-  final_rl_stockfish_threads: 2  # Stronger per-game Stockfish search in final RL Elo
-  final_rl_stockfish_hash_mb: 64  # More cache is reasonable when fewer final Elo workers are active
+  final_rl_workers: 12         # More active final Elo games keeps model-side MCTS batches useful
+  final_rl_stockfish_threads: 1  # Throughput-oriented final Elo: many 1-thread engines plus batched model MCTS
+  final_rl_stockfish_hash_mb: 32  # Keep total Stockfish hash reasonable with 12 parallel engines
   
   # MCTS options (for stronger but slower play)
   # NOTE: IL training forces this to false (raw net only for speed).
@@ -558,9 +570,20 @@ elo_estimation:
 # ------------------------------------------------------------------------------
 debug:
   enabled: true                    # Master switch for debug mode
-  profile_training: true            # Time breakdown per epoch
-  log_gpu_memory: true              # GPU memory usage
-  print_batch0_diagnostics: false   # Print batch-0 target stats + WDL samples
+
+  # Imitation Learning diagnostics
+  il:
+    profile_training: true          # Time breakdown per epoch
+    log_gpu_memory: true            # GPU memory usage
+    print_batch0_diagnostics: false # Print batch-0 target stats + WDL samples
+
+  # Reinforcement Learning diagnostics
+  rl:
+    profile_training: true          # Iteration/self-play/train/eval timing breakdown
+    log_gpu_memory: true            # GPU memory usage around RL iterations
+    central_inference:
+      verbose: false                # Per-request/heartbeat logs; summaries still go to console, RL.csv and PNG
+      stall_warning_s: 15           # When verbose=true, print if a worker waits this long for central inference
 
 
 # ------------------------------------------------------------------------------

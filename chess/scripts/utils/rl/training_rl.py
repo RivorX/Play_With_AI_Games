@@ -18,7 +18,7 @@ from tqdm import tqdm
 project_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(project_root))
 
-from src.batch_selfplay import BatchMCTS, select_move_by_visits, _SELFPLAY_OPENING_LINES
+from src.batch_selfplay import MultiGameBatchMCTS, select_move_by_visits, _SELFPLAY_OPENING_LINES
 from src.data import board_to_tensor, move_to_index
 from src.model import ChessNet
 from src.utils.data_helpers import ACTION_SIZE, build_hflip_inverse_index_map
@@ -56,6 +56,19 @@ def _resolve_eval_workers(config, device, num_games):
         workers = 1
 
     return max(1, min(int(num_games), workers))
+
+
+def _resolve_eval_batch_games(config, num_games):
+    rl_cfg = config.get("reinforcement_learning", {})
+    raw_value = rl_cfg.get(
+        "eval_batch_games",
+        rl_cfg.get("max_batch_games_per_worker", 16),
+    )
+    try:
+        value = int(raw_value)
+    except Exception:
+        value = 16
+    return max(1, min(int(num_games), value))
 
 
 def _terminate_eval_processes(processes, timeout_s=0.5):
@@ -194,6 +207,34 @@ def _apply_opening_prefix_for_eval(board, opening_prefix, mcts_white, mcts_black
         mcts_black.update_history(board)
         mcts_white.advance_root(move)
         mcts_black.advance_root(move)
+        board.push(move)
+        applied += 1
+    return applied
+
+
+def _append_eval_history(board_history, board, config):
+    board_history.append(_encode_eval_history_entry(board))
+    max_history = int(config.get("model", {}).get("history_positions", 0) or 0) + 10
+    if len(board_history) > max_history:
+        del board_history[:-max_history]
+
+
+def _apply_opening_prefix_for_batched_eval(board, board_history, opening_prefix, config):
+    if not opening_prefix:
+        return 0
+
+    applied = 0
+    for uci in opening_prefix:
+        if board.is_game_over(claim_draw=False):
+            break
+        try:
+            move = chess.Move.from_uci(uci)
+        except Exception:
+            break
+        if move not in board.legal_moves:
+            break
+
+        _append_eval_history(board_history, board, config)
         board.push(move)
         applied += 1
     return applied
@@ -380,6 +421,194 @@ def _evaluate_single_game(
     return result, (result == "*")
 
 
+def _advance_eval_root(root, move):
+    if root is None:
+        return None, False
+    child = root.get_child_for_move(move)
+    if child is None:
+        return None, False
+    _ = child.board
+    child.parent = None
+    child.parent_edge_index = -1
+    return child, True
+
+
+def _evaluate_games_batched(
+    model1,
+    model2,
+    config,
+    device,
+    game_indices,
+    use_fixed_openings=None,
+    progress_callback=None,
+):
+    game_indices = list(game_indices or [])
+    if not game_indices:
+        return _build_eval_stats(0, 0, 0, 0, 0)
+
+    mcts1 = MultiGameBatchMCTS(model1, config, device)
+    mcts2 = MultiGameBatchMCTS(model2, config, device)
+    sims = _resolve_eval_mcts_simulations(config)
+    max_moves = _resolve_eval_max_moves(config)
+    auto_claim_draw = _resolve_eval_auto_claim_draw(config)
+    claim_draw_after_moves = _resolve_eval_claim_draw_after_moves(config)
+    claim_repetition_after_moves = _resolve_eval_claim_repetition_after_moves(config)
+    active_limit = _resolve_eval_batch_games(config, len(game_indices))
+
+    wins = 0
+    draws = 0
+    losses = 0
+    unresolved = 0
+    completed = 0
+    cursor = 0
+    active_games = []
+
+    def _new_game_state(game_idx):
+        board = chess.Board()
+        board_history = []
+        opening_prefix = _get_eval_opening_prefix(config, game_idx, enabled_override=use_fixed_openings)
+        move_count = _apply_opening_prefix_for_batched_eval(board, board_history, opening_prefix, config)
+        return {
+            "game_idx": int(game_idx),
+            "board": board,
+            "board_history": board_history,
+            "move_count": int(move_count),
+            "model1_as_white": bool(int(game_idx) % 2 == 0),
+            "model1_root": None,
+            "model1_synced": False,
+            "model2_root": None,
+            "model2_synced": False,
+            "done": bool(board.is_game_over(claim_draw=False) or move_count >= max_moves),
+            "auto_claim_draw": False,
+        }
+
+    def _fill_active():
+        nonlocal cursor
+        while cursor < len(game_indices) and len(active_games) < active_limit:
+            active_games.append(_new_game_state(game_indices[cursor]))
+            cursor += 1
+
+    def _finish_game(gs):
+        nonlocal wins, draws, losses, unresolved, completed
+        board = gs["board"]
+        if bool(gs.get("auto_claim_draw", False)):
+            result = "1/2-1/2"
+            was_unresolved = False
+        else:
+            result = board.result(claim_draw=False)
+            was_unresolved = (result == "*")
+
+        if was_unresolved:
+            unresolved += 1
+        else:
+            game_wins, game_draws, game_losses = _result_for_model1(
+                bool(gs.get("model1_as_white", False)),
+                result,
+            )
+            wins += game_wins
+            draws += game_draws
+            losses += game_losses
+        completed += 1
+        if progress_callback is not None:
+            progress_callback(1)
+
+    def _claim_draw_if_needed(gs):
+        if not auto_claim_draw:
+            return False
+        board = gs["board"]
+        try:
+            if gs["move_count"] >= claim_repetition_after_moves:
+                claim_threefold = getattr(board, "can_claim_threefold_repetition", None)
+                if callable(claim_threefold) and bool(claim_threefold()):
+                    gs["auto_claim_draw"] = True
+                    return True
+            if gs["move_count"] >= claim_draw_after_moves and board.can_claim_draw():
+                gs["auto_claim_draw"] = True
+                return True
+        except Exception:
+            return False
+        return False
+
+    _fill_active()
+    while active_games:
+        model1_indices = []
+        model2_indices = []
+        for idx, gs in enumerate(active_games):
+            if gs["done"]:
+                continue
+            board = gs["board"]
+            if board.is_game_over(claim_draw=False) or gs["move_count"] >= max_moves:
+                gs["done"] = True
+                continue
+            model1_turn = bool(board.turn == chess.WHITE) == bool(gs["model1_as_white"])
+            if model1_turn:
+                model1_indices.append(idx)
+            else:
+                model2_indices.append(idx)
+
+        visit_counts_by_index = {}
+
+        def _run_group(indices, mcts, root_key, synced_key):
+            if not indices:
+                return
+            group_states = []
+            for idx in indices:
+                gs = active_games[idx]
+                group_states.append([
+                    gs["board"],
+                    gs.get(root_key),
+                    bool(gs.get(synced_key, False)),
+                    gs["board_history"],
+                ])
+            visit_counts_group = mcts.search_many(
+                group_states,
+                num_simulations=sims,
+                add_root_noise=False,
+            )
+            for idx, local_state, visit_counts in zip(indices, group_states, visit_counts_group):
+                gs = active_games[idx]
+                gs[root_key] = local_state[1]
+                gs[synced_key] = bool(local_state[2])
+                visit_counts_by_index[idx] = visit_counts
+
+        _run_group(model1_indices, mcts1, "model1_root", "model1_synced")
+        _run_group(model2_indices, mcts2, "model2_root", "model2_synced")
+
+        for idx, gs in enumerate(active_games):
+            if gs["done"]:
+                continue
+            board = gs["board"]
+            visit_counts = visit_counts_by_index.get(idx)
+            if not visit_counts:
+                gs["done"] = True
+                continue
+            move, _ = select_move_by_visits(visit_counts, temperature=0)
+
+            _append_eval_history(gs["board_history"], board, config)
+            gs["model1_root"], gs["model1_synced"] = _advance_eval_root(gs.get("model1_root"), move)
+            gs["model2_root"], gs["model2_synced"] = _advance_eval_root(gs.get("model2_root"), move)
+            board.push(move)
+            gs["move_count"] += 1
+
+            if (
+                board.is_game_over(claim_draw=False)
+                or gs["move_count"] >= max_moves
+                or _claim_draw_if_needed(gs)
+            ):
+                gs["done"] = True
+
+        next_active = []
+        for gs in active_games:
+            if gs["done"]:
+                _finish_game(gs)
+            else:
+                next_active.append(gs)
+        active_games = next_active
+        _fill_active()
+
+    return _build_eval_stats(wins, draws, losses, unresolved, len(game_indices))
+
+
 def _result_for_model1(model1_as_white, result):
     if result == "1/2-1/2":
         return 0, 1, 0
@@ -411,52 +640,28 @@ def _eval_worker(rank, model1_state, model2_state, config, device_str, game_indi
         model1.eval()
         model2.eval()
 
-        mcts1 = BatchMCTS(model1, worker_config, device)
-        mcts2 = BatchMCTS(model2, worker_config, device)
-
-        wins = 0
-        draws = 0
-        losses = 0
-        unresolved = 0
-        sims = _resolve_eval_mcts_simulations(worker_config)
-        max_moves = _resolve_eval_max_moves(worker_config)
-        auto_claim_draw = _resolve_eval_auto_claim_draw(worker_config)
-        claim_draw_after_moves = _resolve_eval_claim_draw_after_moves(worker_config)
-        claim_repetition_after_moves = _resolve_eval_claim_repetition_after_moves(worker_config)
-
-        for game_idx in game_indices:
-            model1_as_white = (game_idx % 2 == 0)
-            white_mcts = mcts1 if model1_as_white else mcts2
-            black_mcts = mcts2 if model1_as_white else mcts1
-            opening_prefix = _get_eval_opening_prefix(worker_config, game_idx, enabled_override=use_fixed_openings)
-            result, was_unresolved = _evaluate_single_game(
-                white_mcts,
-                black_mcts,
-                sims,
-                max_moves,
-                auto_claim_draw,
-                claim_draw_after_moves,
-                claim_repetition_after_moves=claim_repetition_after_moves,
-                opening_prefix=opening_prefix,
-            )
-            if was_unresolved:
-                unresolved += 1
-                result_queue.put({"type": "progress", "rank": rank, "completed": 1})
-                continue
-            game_wins, game_draws, game_losses = _result_for_model1(model1_as_white, result)
-            wins += game_wins
-            draws += game_draws
-            losses += game_losses
-            result_queue.put({"type": "progress", "rank": rank, "completed": 1})
+        stats = _evaluate_games_batched(
+            model1,
+            model2,
+            worker_config,
+            device,
+            game_indices,
+            use_fixed_openings=use_fixed_openings,
+            progress_callback=lambda completed: result_queue.put({
+                "type": "progress",
+                "rank": rank,
+                "completed": int(completed),
+            }),
+        )
 
         result_queue.put(
             {
                 "type": "result",
                 "rank": rank,
-                "wins": wins,
-                "draws": draws,
-                "losses": losses,
-                "unresolved": unresolved,
+                "wins": int(stats.get("wins", 0)),
+                "draws": int(stats.get("draws", 0)),
+                "losses": int(stats.get("losses", 0)),
+                "unresolved": int(stats.get("unresolved", 0)),
             }
         )
     except KeyboardInterrupt:
@@ -652,52 +857,27 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
 def evaluate_models(model1, model2, config, device, num_games=100, game_index_offset=0, use_fixed_openings=None):
     workers = _resolve_eval_workers(config, device, num_games)
     if workers <= 1:
-        mcts1 = BatchMCTS(model1, config, device)
-        mcts2 = BatchMCTS(model2, config, device)
-
-        wins = 0
-        draws = 0
-        losses = 0
-        unresolved = 0
-        sims = _resolve_eval_mcts_simulations(config)
         max_moves = _resolve_eval_max_moves(config)
-        auto_claim_draw = _resolve_eval_auto_claim_draw(config)
-        claim_draw_after_moves = _resolve_eval_claim_draw_after_moves(config)
-        claim_repetition_after_moves = _resolve_eval_claim_repetition_after_moves(config)
-
+        game_indices = list(range(game_index_offset, game_index_offset + num_games))
         eval_bar = tqdm(total=num_games, desc="Eval vs best", unit="game")
         try:
-            for game_idx in range(game_index_offset, game_index_offset + num_games):
-                model1_as_white = (game_idx % 2 == 0)
-                white_mcts = mcts1 if model1_as_white else mcts2
-                black_mcts = mcts2 if model1_as_white else mcts1
-                opening_prefix = _get_eval_opening_prefix(config, game_idx, enabled_override=use_fixed_openings)
-                result, was_unresolved = _evaluate_single_game(
-                    white_mcts,
-                    black_mcts,
-                    sims,
-                    max_moves,
-                    auto_claim_draw,
-                    claim_draw_after_moves,
-                    claim_repetition_after_moves=claim_repetition_after_moves,
-                    opening_prefix=opening_prefix,
-                )
-                if was_unresolved:
-                    unresolved += 1
-                    eval_bar.update(1)
-                    continue
-                game_wins, game_draws, game_losses = _result_for_model1(model1_as_white, result)
-                wins += game_wins
-                draws += game_draws
-                losses += game_losses
-                eval_bar.update(1)
+            stats = _evaluate_games_batched(
+                model1,
+                model2,
+                config,
+                device,
+                game_indices,
+                use_fixed_openings=use_fixed_openings,
+                progress_callback=lambda completed: eval_bar.update(int(completed)),
+            )
         finally:
             eval_bar.close()
 
+        unresolved = int((stats or {}).get("unresolved", 0))
         if unresolved > 0:
             _print_eval_unresolved("Eval", unresolved, num_games, max_moves)
 
-        return _build_eval_stats(wins, draws, losses, unresolved, num_games)
+        return stats
 
     model1_state = _snapshot_state_dict_cpu_shared(model1)
     model2_state = _snapshot_state_dict_cpu_shared(model2)

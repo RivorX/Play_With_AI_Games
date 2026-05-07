@@ -36,6 +36,24 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
     move_selection_time = max(0.0, float(selfplay_profile.get("move_selection_time", 0.0) or 0.0))
     adjudication_time = max(0.0, float(selfplay_profile.get("adjudication_time", 0.0) or 0.0))
     syzygy_time = max(0.0, float(selfplay_profile.get("syzygy_time", 0.0) or 0.0))
+    central_requests = int(selfplay_profile.get("mcts_central_inference_requests", 0) or 0)
+    central_batch_items = int(selfplay_profile.get("mcts_central_inference_server_batch_items", 0) or 0)
+    central_remote_wait_time = max(
+        0.0,
+        float(selfplay_profile.get("mcts_central_inference_remote_wait_time", 0.0) or 0.0),
+    )
+    central_server_queue_wait_time = max(
+        0.0,
+        float(selfplay_profile.get("mcts_central_inference_server_queue_wait_time", 0.0) or 0.0),
+    )
+    central_server_forward_time = max(
+        0.0,
+        float(selfplay_profile.get("mcts_central_inference_server_forward_time", 0.0) or 0.0),
+    )
+    central_server_total_time = max(
+        0.0,
+        float(selfplay_profile.get("mcts_central_inference_server_total_time", 0.0) or 0.0),
+    )
 
     batch_expand_capped = min(batch_expand_time, search_many_time)
     nn_inference_capped = min(nn_inference_time, batch_expand_capped)
@@ -170,3 +188,19 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
     print(f"   Sekcja C: Queue/IPC ({queue_wait_total_s:.2f}s lacznego czekania):")
     print(f"   {'queue_wait_time_ms':<24} {float(selfplay_profile.get('queue_wait_time_ms', 0.0) or 0.0):7.2f} ms/event")
     print(f"   {'queue_wait_events':<24} {int(selfplay_profile.get('queue_wait_events', 0) or 0)}")
+    if central_requests > 0:
+        central_avg_batch = float(central_batch_items / central_requests)
+        central_remote_ms = 1000.0 * central_remote_wait_time / max(1, central_requests)
+        central_queue_ms = 1000.0 * central_server_queue_wait_time / max(1, central_requests)
+        central_forward_ms = 1000.0 * central_server_forward_time / max(1, central_requests)
+        central_total_ms = 1000.0 * central_server_total_time / max(1, central_requests)
+        central_queue_share = 100.0 * central_server_queue_wait_time / max(1e-8, central_remote_wait_time)
+        central_forward_share = 100.0 * central_server_forward_time / max(1e-8, central_remote_wait_time)
+        print("")
+        print("   Sekcja D: Central inference server (srednie na request):")
+        print(f"   {'central_requests':<32} {central_requests}")
+        print(f"   {'central_avg_batch':<32} {central_avg_batch:7.2f} pos/batch")
+        print(f"   {'worker_remote_wait':<32} {central_remote_ms:7.2f} ms/request")
+        print(f"   {'server_queue_wait':<32} {central_queue_ms:7.2f} ms/request ({central_queue_share:5.1f}% remote_wait)")
+        print(f"   {'server_forward':<32} {central_forward_ms:7.2f} ms/request ({central_forward_share:5.1f}% remote_wait)")
+        print(f"   {'server_total':<32} {central_total_ms:7.2f} ms/request")

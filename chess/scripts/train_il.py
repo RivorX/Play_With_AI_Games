@@ -84,7 +84,11 @@ def main():
     model_version = config.get('model', {}).get('version', 'v?.?')
     model_file_tag = build_model_file_tag(config)
     model_architecture = build_model_architecture_metadata(config)
-    debug_enabled = config.get('debug', {}).get('enabled', False)
+    debug_cfg = config.get('debug', {}) or {}
+    il_debug_cfg = debug_cfg.get('il', {}) or {}
+    if not isinstance(il_debug_cfg, dict):
+        il_debug_cfg = {}
+    debug_enabled = bool(debug_cfg.get('enabled', False))
 
     # Default to compact model logging in IL unless debug mode is enabled.
     config.setdefault('model', {})
@@ -239,11 +243,11 @@ def main():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         debug_log_file = debug_dir / f"training_profile_{timestamp}.txt"
 
-        profile_debug_enabled = bool(config['debug'].get('profile_training', False))
+        profile_debug_enabled = bool(il_debug_cfg.get('profile_training', debug_cfg.get('profile_training', False)))
         profile_mode_label = "every epoch" if profile_debug_enabled else "first epoch of each training phase"
         print(
             f"Debug mode: profile={profile_debug_enabled}, "
-            f"gpu_mem_log={config['debug'].get('log_gpu_memory', False)}, "
+            f"gpu_mem_log={il_debug_cfg.get('log_gpu_memory', debug_cfg.get('log_gpu_memory', False))}, "
             f"timing={profile_mode_label}, "
             f"log={debug_log_file}"
         )
@@ -714,7 +718,7 @@ def main():
     )
     if debug_enabled:
         print("Debug profiling is active")
-    profile_enabled = bool(debug_enabled and config.get('debug', {}).get('profile_training', False))
+    profile_enabled = bool(debug_enabled and il_debug_cfg.get('profile_training', debug_cfg.get('profile_training', False)))
     profiled_phase_keys = set()
 
     def _profile_phase_key(epoch_idx):
@@ -1165,7 +1169,7 @@ def main():
                             grad_msg += f", missing_sample={missing_grad_names[:4]}"
                         print(grad_msg)
 
-                    if config.get('debug', {}).get('log_gpu_memory', False):
+                    if il_debug_cfg.get('log_gpu_memory', debug_cfg.get('log_gpu_memory', False)):
                         mem_msg = (
                             f"[DEBUG] Epoch {epoch + 1} GPU: "
                             f"peak_alloc={train_profile.get('peak_allocated_mb', 0.0):.1f}MB, "
@@ -1186,7 +1190,7 @@ def main():
                                     f"grad_params={grad_diag.get('grad_params', 0):,}/{grad_diag.get('trainable_params', 0):,}, "
                                     f"missing_sample={grad_diag.get('missing_grad_names', [])[:8]}\n"
                                 )
-                            if config.get('debug', {}).get('log_gpu_memory', False):
+                            if il_debug_cfg.get('log_gpu_memory', debug_cfg.get('log_gpu_memory', False)):
                                 f.write(
                                     f"[DEBUG] Epoch {epoch + 1} GPU: "
                                     f"peak_alloc={train_profile.get('peak_allocated_mb', 0.0):.1f}MB, "

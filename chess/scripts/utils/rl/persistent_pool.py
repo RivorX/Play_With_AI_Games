@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.multiprocessing as mp
 
-from src.batch_selfplay import persistent_selfplay_worker
+from src.batch_selfplay import persistent_selfplay_worker, central_inference_server
 
 WORKER_INTERRUPT_EXIT_CODE = 130
 _SELFPLAY_POOL = None
@@ -25,13 +25,33 @@ class _PersistentSelfPlayPool:
         self.result_queue = self.mp_ctx.Queue()
         self.task_queues = {}
         self.processes = {}
+        rl_cfg = config.get('reinforcement_learning', {})
+        self.central_inference_enabled = bool(
+            rl_cfg.get('self_play_central_inference_enabled', False)
+            and device_type == 'cuda'
+            and torch.cuda.is_available()
+        )
+        self.inference_request_queue = self.mp_ctx.Queue() if self.central_inference_enabled else None
+        self.inference_control_queue = self.mp_ctx.Queue() if self.central_inference_enabled else None
+        self.inference_response_receivers = {}
+        self.inference_response_senders = {}
+        self.inference_process = None
+        self._central_task_id = None
+        self._central_loaded_labels = set()
         self.started = False
 
     def matches(self, worker_specs, device_type, temp_dir):
+        rl_cfg = self.config.get('reinforcement_learning', {})
+        wanted_central = bool(
+            rl_cfg.get('self_play_central_inference_enabled', False)
+            and device_type == 'cuda'
+            and torch.cuda.is_available()
+        )
         return (
             self.worker_specs == list(worker_specs)
             and self.device_type == device_type
             and self.temp_dir == Path(temp_dir)
+            and self.central_inference_enabled == wanted_central
         )
 
     def start(self):
@@ -39,12 +59,42 @@ class _PersistentSelfPlayPool:
             return
 
         gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if self.central_inference_enabled:
+            for rank, _ in self.worker_specs:
+                recv_conn, send_conn = self.mp_ctx.Pipe(duplex=False)
+                self.inference_response_receivers[int(rank)] = recv_conn
+                self.inference_response_senders[int(rank)] = send_conn
+            self.inference_process = self.mp_ctx.Process(
+                target=central_inference_server,
+                args=(
+                    self.config,
+                    0,
+                    self.inference_request_queue,
+                    self.inference_response_senders,
+                    self.inference_control_queue,
+                ),
+            )
+            self.inference_process.daemon = True
+            self.inference_process.start()
+
         for rank, _ in self.worker_specs:
-            device_id = rank % gpu_count if self.device_type == 'cuda' and gpu_count > 0 else 'cpu'
+            device_id = (
+                'cpu'
+                if self.central_inference_enabled
+                else (rank % gpu_count if self.device_type == 'cuda' and gpu_count > 0 else 'cpu')
+            )
             task_queue = self.mp_ctx.Queue()
             process = self.mp_ctx.Process(
                 target=persistent_selfplay_worker,
-                args=(rank, self.config, device_id, task_queue, self.result_queue),
+                args=(
+                    rank,
+                    self.config,
+                    device_id,
+                    task_queue,
+                    self.result_queue,
+                    self.inference_request_queue,
+                    self.inference_response_receivers.get(int(rank)),
+                ),
             )
             process.daemon = True
             process.start()
@@ -52,6 +102,55 @@ class _PersistentSelfPlayPool:
             self.processes[rank] = process
 
         self.started = True
+
+    def _prepare_central_inference_models(self, task_id, model_state, model_state_path, opponent_payload):
+        if not self.central_inference_enabled or self.inference_request_queue is None:
+            return
+        task_id = str(task_id)
+        clear = task_id != self._central_task_id
+        if clear:
+            self._central_task_id = task_id
+            self._central_loaded_labels = set()
+
+        models_to_load = []
+        if "learner" not in self._central_loaded_labels:
+            models_to_load.append({
+                "label": "learner",
+                "state": model_state,
+                "state_path": str(model_state_path) if model_state is None and model_state_path is not None else None,
+            })
+            self._central_loaded_labels.add("learner")
+
+        for entry in list((opponent_payload or {}).get("pool_entries", []) or []):
+            label = str((entry or {}).get("label") or "current")
+            if label == "current" or label in self._central_loaded_labels:
+                continue
+            state = (entry or {}).get("state")
+            if state is None:
+                continue
+            models_to_load.append({"label": label, "state": state, "state_path": None})
+            self._central_loaded_labels.add(label)
+
+        if models_to_load or clear:
+            self.inference_request_queue.put({
+                "cmd": "load_models",
+                "task_id": task_id,
+                "clear": bool(clear),
+                "models": models_to_load,
+            })
+            timeout_s = float(self.config.get('reinforcement_learning', {}).get('self_play_central_inference_load_timeout_s', 300.0))
+            import time
+            end_time = time.time() + max(1.0, timeout_s)
+            while True:
+                remaining = max(0.01, end_time - time.time())
+                if time.time() >= end_time:
+                    raise TimeoutError(f"Central inference did not acknowledge model load for task {task_id}.")
+                try:
+                    message = self.inference_control_queue.get(timeout=min(remaining, 1.0))
+                except Exception:
+                    continue
+                if message.get("type") == "models_loaded" and str(message.get("task_id")) == task_id:
+                    break
 
     def _prepare_task_files(self, rank, task_id):
         result_file = self.temp_dir / f"worker_{rank}_{task_id}.pkl"
@@ -66,6 +165,20 @@ class _PersistentSelfPlayPool:
             pass
         return result_file, progress_file
 
+    def _worker_opponent_payload(self, opponent_payload):
+        if not self.central_inference_enabled:
+            return opponent_payload or {}
+        payload = opponent_payload or {}
+        return {
+            "label": payload.get("label", "current"),
+            "plan_labels": list(payload.get("plan_labels", []) or []),
+            "pool_entries": [
+                {"label": str((entry or {}).get("label") or "current")}
+                for entry in list(payload.get("pool_entries", []) or [])
+                if str((entry or {}).get("label") or "current") != "current"
+            ],
+        }
+
     def dispatch_task(
         self,
         rank,
@@ -78,12 +191,15 @@ class _PersistentSelfPlayPool:
         stream_results_to_queue=False,
     ):
         result_file, progress_file = self._prepare_task_files(rank, task_id)
+        self._prepare_central_inference_models(task_id, model_state, model_state_path, opponent_payload)
+        worker_model_state = None if self.central_inference_enabled else model_state
+        worker_opponent_payload = self._worker_opponent_payload(opponent_payload)
         self.task_queues[rank].put({
             'cmd': 'play',
             'task_id': task_id,
-            'model_state': model_state,
+            'model_state': worker_model_state,
             'model_state_path': str(model_state_path),
-            'opponent_payload': opponent_payload or {},
+            'opponent_payload': worker_opponent_payload,
             'num_games': int(num_games),
             'result_file_path': str(result_file),
             'mcts_temperature': temperature,
@@ -132,8 +248,16 @@ class _PersistentSelfPlayPool:
                 task_queue.put({'cmd': 'stop'})
             except Exception:
                 pass
+        if self.inference_request_queue is not None:
+            try:
+                self.inference_request_queue.put({'cmd': 'stop'})
+            except Exception:
+                pass
 
-        _terminate_workers(list(self.processes.values()), timeout_s=timeout_s)
+        all_processes = list(self.processes.values())
+        if self.inference_process is not None:
+            all_processes.append(self.inference_process)
+        _terminate_workers(all_processes, timeout_s=timeout_s)
 
         for task_queue in self.task_queues.values():
             try:
@@ -144,9 +268,29 @@ class _PersistentSelfPlayPool:
             self.result_queue.close()
         except Exception:
             pass
+        try:
+            if self.inference_request_queue is not None:
+                self.inference_request_queue.close()
+        except Exception:
+            pass
+        try:
+            if self.inference_control_queue is not None:
+                self.inference_control_queue.close()
+        except Exception:
+            pass
+        for response_conn in list(self.inference_response_receivers.values()) + list(self.inference_response_senders.values()):
+            try:
+                response_conn.close()
+            except Exception:
+                pass
 
         self.task_queues.clear()
         self.processes.clear()
+        self.inference_response_receivers.clear()
+        self.inference_response_senders.clear()
+        self.inference_process = None
+        self._central_task_id = None
+        self._central_loaded_labels = set()
         self.started = False
 
 

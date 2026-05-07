@@ -16,6 +16,9 @@ import math
 import pickle
 import time
 import logging
+import queue
+import hashlib
+from collections import OrderedDict
 from pathlib import Path
 from src.data import board_to_tensor, move_to_index
 
@@ -33,6 +36,29 @@ _PIECE_VALUES = {
 _SYZYGY_ORACLE_CACHE = {}
 _SELFPLAY_COMPILE_LOCKFILE = "selfplay_torch_compile.lock"
 _DEFAULT_REPLAY_MAX_POLICY_TARGETS = 256
+
+
+def _debug_scope(config, name):
+    root = config.get('debug', {}) or {}
+    if not isinstance(root, dict):
+        return {}, {}, False
+    scoped = root.get(name, {}) or {}
+    if not isinstance(scoped, dict):
+        scoped = {}
+    return root, scoped, bool(root.get('enabled', False))
+
+
+def _debug_bool(config, scope_name, key, default=False):
+    root, scoped, enabled = _debug_scope(config, scope_name)
+    return bool(enabled and scoped.get(key, root.get(key, default)))
+
+
+def _debug_nested(config, scope_name, nested_name):
+    root, scoped, enabled = _debug_scope(config, scope_name)
+    nested = scoped.get(nested_name, {}) or {}
+    if not isinstance(nested, dict):
+        nested = {}
+    return root, nested, enabled
 
 
 class _InductorSMWarningFilter(logging.Filter):
@@ -267,10 +293,11 @@ def _maybe_compile_selfplay_model(model, config, device, rank, model_label="lear
     use_bfloat16 = bool(config.get('hardware', {}).get('use_bfloat16', False))
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
 
-    try:
-        torch._dynamo.reset()
-    except Exception:
-        pass
+    if bool(rl_cfg.get('self_play_compile_reset_dynamo', False)):
+        try:
+            torch._dynamo.reset()
+        except Exception:
+            pass
 
     try:
         def _compile_and_warmup(target_model):
@@ -920,7 +947,7 @@ class MultiGameBatchMCTS:
             and self.device.type == 'cuda'
             and torch.cuda.is_available()
         )
-        self.profile_enabled = bool(config.get('debug', {}).get('profile_training', False))
+        self.profile_enabled = _debug_bool(config, 'rl', 'profile_training', False)
         self._profile_stats = {}
 
         self._tactical_capture_enabled = (
@@ -1786,6 +1813,21 @@ class MultiGameBatchMCTS:
             if h2d_end is not None:
                 h2d_end.record()
 
+            legal_index_matrix = None
+            if max_legal_count > 0:
+                legal_pack_t0 = time.perf_counter() if self.profile_enabled else None
+                legal_index_matrix = self._get_legal_index_scratch(
+                    len(non_terminal_nodes),
+                    max_legal_count,
+                )
+                legal_index_matrix.fill(0)
+                for row_idx, legal_indices in enumerate(legal_indices_per_node):
+                    legal_count = legal_counts[row_idx]
+                    if legal_count:
+                        legal_index_matrix[row_idx, :legal_count] = legal_indices
+                if self.profile_enabled:
+                    self._profile_add('batch_expand_legal_index_pack_time', time.perf_counter() - legal_pack_t0)
+
             inference_t0 = time.perf_counter() if self.profile_enabled else None
             h2d_legal_start = None
             h2d_legal_end = None
@@ -1797,20 +1839,27 @@ class MultiGameBatchMCTS:
             forward_end = _cuda_event()
             if forward_start is not None:
                 forward_start.record()
+            model_kwargs = {'apply_log_softmax': False}
+            if (
+                legal_index_matrix is not None
+                and bool(getattr(self.model, 'supports_remote_legal_gather', False))
+            ):
+                model_kwargs['legal_index_matrix'] = legal_index_matrix
             with torch.inference_mode():
                 if self.use_amp:
                     with torch.autocast(device_type='cuda', dtype=self.amp_dtype):
                         policy_logits_batch, values_batch = self.model(
                             board_tensors,
-                            apply_log_softmax=False,
+                            **model_kwargs,
                         )
                 else:
                     policy_logits_batch, values_batch = self.model(
                         board_tensors,
-                        apply_log_softmax=False,
+                        **model_kwargs,
                     )
                 if forward_end is not None:
                     forward_end.record()
+                compact_policy_response = bool(getattr(self.model, 'last_response_compact_policy', False))
                 
                 if values_batch.dim() == 2 and values_batch.shape[1] == 3:
                     wdl_start = _cuda_event()
@@ -1824,42 +1873,35 @@ class MultiGameBatchMCTS:
 
                 # Gather only legal move logits on GPU before transferring to CPU.
                 if max_legal_count > 0:
-                    legal_pack_t0 = time.perf_counter() if self.profile_enabled else None
-                    legal_index_matrix = self._get_legal_index_scratch(
-                        len(non_terminal_nodes),
-                        max_legal_count,
-                    )
-                    legal_index_matrix.fill(0)
-                    for row_idx, legal_indices in enumerate(legal_indices_per_node):
-                        legal_count = legal_counts[row_idx]
-                        if legal_count:
-                            legal_index_matrix[row_idx, :legal_count] = legal_indices
-                    if self.profile_enabled:
-                        self._profile_add('batch_expand_legal_index_pack_time', time.perf_counter() - legal_pack_t0)
-                    h2d_legal_start = _cuda_event()
-                    h2d_legal_end = _cuda_event()
-                    if h2d_legal_start is not None:
-                        h2d_legal_start.record()
-                    legal_index_tensor = self._get_legal_index_source_tensor(legal_index_matrix).to(
-                        self.device,
-                        non_blocking=True,
-                    )
-                    if h2d_legal_end is not None:
-                        h2d_legal_end.record()
-                    gather_start = _cuda_event()
-                    gather_end = _cuda_event()
-                    if gather_start is not None:
-                        gather_start.record()
-                    legal_logits_batch = torch.gather(policy_logits_batch, 1, legal_index_tensor)
-                    if gather_end is not None:
-                        gather_end.record()
-                    d2h_legal_start = _cuda_event()
-                    d2h_legal_end = _cuda_event()
-                    if d2h_legal_start is not None:
-                        d2h_legal_start.record()
-                    legal_logits_batch = legal_logits_batch.to(dtype=torch.float16).cpu().numpy()
-                    if d2h_legal_end is not None:
-                        d2h_legal_end.record()
+                    if compact_policy_response:
+                        legal_logits_batch = policy_logits_batch.to(dtype=torch.float16).cpu().numpy()
+                        d2h_legal_start = None
+                        d2h_legal_end = None
+                    else:
+                        h2d_legal_start = _cuda_event()
+                        h2d_legal_end = _cuda_event()
+                        if h2d_legal_start is not None:
+                            h2d_legal_start.record()
+                        legal_index_tensor = self._get_legal_index_source_tensor(legal_index_matrix).to(
+                            self.device,
+                            non_blocking=True,
+                        )
+                        if h2d_legal_end is not None:
+                            h2d_legal_end.record()
+                        gather_start = _cuda_event()
+                        gather_end = _cuda_event()
+                        if gather_start is not None:
+                            gather_start.record()
+                        legal_logits_batch = torch.gather(policy_logits_batch, 1, legal_index_tensor)
+                        if gather_end is not None:
+                            gather_end.record()
+                        d2h_legal_start = _cuda_event()
+                        d2h_legal_end = _cuda_event()
+                        if d2h_legal_start is not None:
+                            d2h_legal_start.record()
+                        legal_logits_batch = legal_logits_batch.to(dtype=torch.float16).cpu().numpy()
+                        if d2h_legal_end is not None:
+                            d2h_legal_end.record()
                 else:
                     legal_logits_batch = None
                     d2h_legal_start = None
@@ -1876,6 +1918,26 @@ class MultiGameBatchMCTS:
                 self._profile_inc('nn_inference_calls', 1)
                 self._profile_inc('nn_inference_batch_items', batch_n)
                 self._profile_inc('nn_legal_move_items', sum(legal_counts))
+                server_batch_size = int(getattr(self.model, 'last_server_batch_size', 0) or 0)
+                if server_batch_size > 0:
+                    self._profile_inc('central_inference_requests', 1)
+                    self._profile_inc('central_inference_server_batch_items', server_batch_size)
+                    self._profile_add(
+                        'central_inference_remote_wait_time',
+                        float(getattr(self.model, 'last_remote_wait_s', 0.0) or 0.0),
+                    )
+                    self._profile_add(
+                        'central_inference_server_queue_wait_time',
+                        float(getattr(self.model, 'last_server_queue_wait_s', 0.0) or 0.0),
+                    )
+                    self._profile_add(
+                        'central_inference_server_total_time',
+                        float(getattr(self.model, 'last_server_total_s', 0.0) or 0.0),
+                    )
+                    self._profile_add(
+                        'central_inference_server_forward_time',
+                        float(getattr(self.model, 'last_server_forward_s', 0.0) or 0.0),
+                    )
                 if use_cuda_stage_timing:
                     torch.cuda.synchronize(self.device)
 
@@ -2133,7 +2195,7 @@ class BatchSelfPlayMCTSBatch:
         self.value_target_root_blend_power = float(
             rl_cfg.get('value_target_root_blend_power', 1.5)
         )
-        self.profile_enabled = bool(self.config.get('debug', {}).get('profile_training', False))
+        self.profile_enabled = _debug_bool(self.config, 'rl', 'profile_training', False)
         self._profile_stats = {}
         self.reset_profile_stats()
 
@@ -2190,6 +2252,12 @@ class BatchSelfPlayMCTSBatch:
         nn_gpu_postprocess_time = float(aggregated.get('learner_mcts_nn_gpu_postprocess_time', 0.0))
         nn_d2h_time = float(aggregated.get('learner_mcts_nn_d2h_time', 0.0))
         nn_legal_move_items = int(aggregated.get('learner_mcts_nn_legal_move_items', 0) or 0)
+        central_requests = int(aggregated.get('learner_mcts_central_inference_requests', 0) or 0)
+        central_batch_items = int(aggregated.get('learner_mcts_central_inference_server_batch_items', 0) or 0)
+        central_remote_wait_time = float(aggregated.get('learner_mcts_central_inference_remote_wait_time', 0.0) or 0.0)
+        central_server_queue_wait_time = float(aggregated.get('learner_mcts_central_inference_server_queue_wait_time', 0.0) or 0.0)
+        central_server_total_time = float(aggregated.get('learner_mcts_central_inference_server_total_time', 0.0) or 0.0)
+        central_server_forward_time = float(aggregated.get('learner_mcts_central_inference_server_forward_time', 0.0) or 0.0)
         for label in self.opponent_mcts_by_label.keys():
             prefix = f"opponent_mcts_{label}_"
             search_many_time += float(aggregated.get(prefix + 'search_many_time', 0.0))
@@ -2203,6 +2271,12 @@ class BatchSelfPlayMCTSBatch:
             nn_gpu_postprocess_time += float(aggregated.get(prefix + 'nn_gpu_postprocess_time', 0.0))
             nn_d2h_time += float(aggregated.get(prefix + 'nn_d2h_time', 0.0))
             nn_legal_move_items += int(aggregated.get(prefix + 'nn_legal_move_items', 0) or 0)
+            central_requests += int(aggregated.get(prefix + 'central_inference_requests', 0) or 0)
+            central_batch_items += int(aggregated.get(prefix + 'central_inference_server_batch_items', 0) or 0)
+            central_remote_wait_time += float(aggregated.get(prefix + 'central_inference_remote_wait_time', 0.0) or 0.0)
+            central_server_queue_wait_time += float(aggregated.get(prefix + 'central_inference_server_queue_wait_time', 0.0) or 0.0)
+            central_server_total_time += float(aggregated.get(prefix + 'central_inference_server_total_time', 0.0) or 0.0)
+            central_server_forward_time += float(aggregated.get(prefix + 'central_inference_server_forward_time', 0.0) or 0.0)
         aggregated['mcts_search_many_time'] = float(search_many_time)
         aggregated['mcts_batch_expand_eval_time'] = float(batch_expand_time)
         aggregated['mcts_board_to_tensor_time'] = float(board_tensor_time)
@@ -2214,6 +2288,12 @@ class BatchSelfPlayMCTSBatch:
         aggregated['mcts_nn_gpu_postprocess_time'] = float(nn_gpu_postprocess_time)
         aggregated['mcts_nn_d2h_time'] = float(nn_d2h_time)
         aggregated['mcts_nn_legal_move_items'] = int(nn_legal_move_items)
+        aggregated['mcts_central_inference_requests'] = int(central_requests)
+        aggregated['mcts_central_inference_server_batch_items'] = int(central_batch_items)
+        aggregated['mcts_central_inference_remote_wait_time'] = float(central_remote_wait_time)
+        aggregated['mcts_central_inference_server_queue_wait_time'] = float(central_server_queue_wait_time)
+        aggregated['mcts_central_inference_server_total_time'] = float(central_server_total_time)
+        aggregated['mcts_central_inference_server_forward_time'] = float(central_server_forward_time)
         extra_mcts_time_metrics = [
             'search_root_setup_time',
             'search_selection_time',
@@ -2234,6 +2314,21 @@ class BatchSelfPlayMCTSBatch:
                 total += float(aggregated.get(f'opponent_mcts_{label}_{metric}', 0.0) or 0.0)
             aggregated[f'mcts_{metric}'] = float(total)
         aggregated['average_batch_size'] = float(nn_batch_items / nn_calls) if nn_calls > 0 else 0.0
+        aggregated['central_average_batch_size'] = (
+            float(central_batch_items / central_requests) if central_requests > 0 else 0.0
+        )
+        aggregated['central_remote_wait_ms_per_request'] = (
+            1000.0 * float(central_remote_wait_time / central_requests) if central_requests > 0 else 0.0
+        )
+        aggregated['central_server_queue_wait_ms_per_request'] = (
+            1000.0 * float(central_server_queue_wait_time / central_requests) if central_requests > 0 else 0.0
+        )
+        aggregated['central_server_forward_ms_per_request'] = (
+            1000.0 * float(central_server_forward_time / central_requests) if central_requests > 0 else 0.0
+        )
+        aggregated['central_server_total_ms_per_request'] = (
+            1000.0 * float(central_server_total_time / central_requests) if central_requests > 0 else 0.0
+        )
         aggregated['average_legal_moves_per_position'] = (
             float(nn_legal_move_items / nn_batch_items) if nn_batch_items > 0 else 0.0
         )
@@ -3509,6 +3604,609 @@ def _load_worker_model_state(model, model_state, rank):
         )
 
 
+class _RemoteInferenceModel:
+    """Small model-like proxy used by MCTS workers with central GPU inference."""
+
+    def __init__(self, model_label, request_queue, response_queue, worker_rank, timeout_s=120.0, stall_warning_s=60.0, debug_enabled=False):
+        self.model_label = str(model_label or "learner")
+        self.request_queue = request_queue
+        self.response_queue = response_queue
+        self.worker_rank = int(worker_rank)
+        timeout_s = float(timeout_s)
+        self.timeout_s = None if timeout_s <= 0.0 else max(1.0, timeout_s)
+        self.stall_warning_s = max(0.0, float(stall_warning_s))
+        self.debug_enabled = bool(debug_enabled)
+        self._request_counter = 0
+        self._training = False
+        self.last_server_batch_size = 0
+        self._printed_first_request = False
+        self._printed_first_response = False
+        self.supports_remote_legal_gather = True
+        self.last_response_compact_policy = False
+        self.last_remote_wait_s = 0.0
+        self.last_server_queue_wait_s = 0.0
+        self.last_server_total_s = 0.0
+        self.last_server_forward_s = 0.0
+
+    @property
+    def training(self):
+        return self._training
+
+    def eval(self):
+        self._training = False
+        return self
+
+    def train(self, mode=True):
+        self._training = bool(mode)
+        return self
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def _receive_response(self, wait_s):
+        if hasattr(self.response_queue, "poll") and hasattr(self.response_queue, "recv"):
+            if not self.response_queue.poll(wait_s):
+                raise queue.Empty()
+            return self.response_queue.recv()
+        return self.response_queue.get(timeout=wait_s)
+
+    def _ts(self):
+        return time.strftime("%H:%M:%S")
+
+    def __call__(self, board_tensors, apply_log_softmax=False, legal_index_matrix=None, **_kwargs):
+        if apply_log_softmax:
+            raise ValueError("Remote inference proxy only supports raw policy logits.")
+        self._request_counter += 1
+        request_id = f"{os.getpid()}_{id(self)}_{self._request_counter}"
+        if isinstance(board_tensors, torch.Tensor):
+            boards_np = board_tensors.detach().to('cpu', dtype=torch.float32).contiguous().numpy()
+        else:
+            boards_np = np.asarray(board_tensors, dtype=np.float32)
+        request = {
+            "cmd": "infer",
+            "rank": self.worker_rank,
+            "request_id": request_id,
+            "model_label": self.model_label,
+            "boards": boards_np,
+        }
+        if legal_index_matrix is not None:
+            request["legal_index_matrix"] = np.asarray(legal_index_matrix, dtype=np.int64)
+        request["queued_at"] = time.time()
+        self.request_queue.put(request)
+        if self.debug_enabled and not self._printed_first_request:
+            self._printed_first_request = True
+            print(
+                f"[{self._ts()}] Central inference: worker {self.worker_rank} sent first "
+                f"{self.model_label} request ({int(boards_np.shape[0])} positions).",
+                flush=True,
+            )
+        started_at = time.time()
+        deadline = None if self.timeout_s is None else started_at + self.timeout_s
+        next_warning_at = (
+            started_at + self.stall_warning_s
+            if self.stall_warning_s > 0.0
+            else None
+        )
+        while True:
+            now = time.time()
+            if deadline is not None:
+                remaining = deadline - now
+                if remaining <= 0:
+                    raise TimeoutError(f"Central inference timed out for model '{self.model_label}'.")
+                wait_s = min(max(remaining, 0.01), 1.0)
+            else:
+                wait_s = 1.0
+            if self.debug_enabled and next_warning_at is not None and now >= next_warning_at:
+                waited_s = now - started_at
+                print(
+                    f"[{self._ts()}] Central inference: worker {self.worker_rank} still waiting "
+                    f"{waited_s:.0f}s for model '{self.model_label}'.",
+                    flush=True,
+                )
+                next_warning_at = now + self.stall_warning_s
+            try:
+                response = self._receive_response(wait_s)
+            except queue.Empty:
+                continue
+            if response.get("request_id") != request_id:
+                raise RuntimeError(
+                    "Central inference response routing failed: "
+                    f"worker {self.worker_rank} received response for another request."
+                )
+            if not response.get("ok", False):
+                raise RuntimeError(response.get("error", "central inference failed"))
+            self.last_remote_wait_s = time.time() - started_at
+            self.last_server_batch_size = int(response.get("server_batch_size", 0) or 0)
+            self.last_response_compact_policy = bool(response.get("compact_policy", False))
+            self.last_server_queue_wait_s = float(response.get("server_queue_wait_s", 0.0) or 0.0)
+            self.last_server_total_s = float(response.get("server_total_time_s", 0.0) or 0.0)
+            self.last_server_forward_s = float(response.get("server_forward_time_s", 0.0) or 0.0)
+            if self.debug_enabled and not self._printed_first_response:
+                self._printed_first_response = True
+                print(
+                    f"[{self._ts()}] Central inference: worker {self.worker_rank} received first "
+                    f"{self.model_label} response (server_batch={self.last_server_batch_size}).",
+                    flush=True,
+                )
+            policy = torch.from_numpy(np.asarray(response["policy_logits"], dtype=np.float32))
+            value = torch.from_numpy(np.asarray(response["value_logits"], dtype=np.float32))
+            return policy, value
+
+
+def central_inference_server(config, device_id, request_queue, response_queues, control_queue=None):
+    """Own GPU inference and batch requests coming from self-play workers."""
+    rl_cfg = config.get('reinforcement_learning', {})
+    _, central_debug_cfg, debug_root_enabled = _debug_nested(config, 'rl', 'central_inference')
+    max_batch = max(1, int(rl_cfg.get('self_play_central_inference_max_batch_size', rl_cfg.get('mcts_batch_size', 256))))
+    flush_ms = max(0.0, float(rl_cfg.get('self_play_central_inference_flush_ms', 5.0)))
+    debug_enabled = bool(
+        debug_root_enabled and central_debug_cfg.get(
+            'verbose',
+            rl_cfg.get('self_play_central_inference_debug', False),
+        )
+    )
+    cache_enabled = bool(rl_cfg.get('self_play_central_inference_cache_enabled', True))
+    cache_max_entries = max(0, int(rl_cfg.get('self_play_central_inference_cache_entries', 4096)))
+    central_use_compile = bool(rl_cfg.get('self_play_central_inference_use_compile', False))
+
+    try:
+        device = _configure_selfplay_worker_runtime(config, device_id)
+        if device.type == 'cuda':
+            torch.backends.cudnn.benchmark = bool(
+                rl_cfg.get('self_play_central_inference_cudnn_benchmark', False)
+            )
+        models = {}
+        caches = {}
+        compiled_base_models = {}
+        compiled_wrappers = {}
+
+        def _cache_key(model_label, board_np):
+            digest = hashlib.blake2b(np.ascontiguousarray(board_np).view(np.uint8), digest_size=16).digest()
+            return (str(model_label), digest)
+
+        def _ts():
+            return time.strftime("%H:%M:%S")
+
+        print(
+            f"[{_ts()}] Central inference: server ready on {device} "
+            f"(max_batch={max_batch}, flush={flush_ms:.1f}ms, "
+            f"compile={'on' if central_use_compile else 'off'}, "
+            f"cudnn.benchmark={torch.backends.cudnn.benchmark if device.type == 'cuda' else 'n/a'}).",
+            flush=True,
+        )
+
+        def _warmup_central_model(model, label):
+            if not central_use_compile or device.type != 'cuda':
+                return None
+            raw_batches = rl_cfg.get('self_play_central_inference_compile_warmup_batches', [1, 32, 128, max_batch])
+            try:
+                warmup_batches = [
+                    max(1, int(batch_size))
+                    for batch_size in list(raw_batches or [])
+                ]
+            except Exception:
+                warmup_batches = [1, 32, 128, max_batch]
+            warmup_batches = sorted({batch_size for batch_size in warmup_batches if batch_size > 0})
+            if not warmup_batches:
+                return None
+            history_positions = int(config.get('model', {}).get('history_positions', 0) or 0)
+            input_planes = 16 * (1 + history_positions)
+            use_amp = bool(config.get('hardware', {}).get('use_amp', False))
+            amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
+            if debug_enabled:
+                print(
+                    f"[{_ts()}] Central inference: warming compiled model '{label}' "
+                    f"for batches={warmup_batches}...",
+                    flush=True,
+                )
+            warmup_t0 = time.perf_counter()
+            with torch.inference_mode():
+                for batch_size in warmup_batches:
+                    dummy_input = torch.zeros(
+                        batch_size,
+                        input_planes,
+                        8,
+                        8,
+                        device=device,
+                        dtype=torch.float32,
+                    ).to(memory_format=torch.channels_last)
+                    with torch.autocast(device_type='cuda', enabled=use_amp, dtype=amp_dtype):
+                        model(dummy_input, apply_log_softmax=False)
+                    torch.cuda.synchronize(device)
+            warmup_s = time.perf_counter() - warmup_t0
+            if debug_enabled:
+                print(
+                    f"[{_ts()}] Central inference: warmup for '{label}' done "
+                    f"in {warmup_s:.2f}s.",
+                    flush=True,
+                )
+            return warmup_s
+
+        def _load_model(label, state):
+            label = str(label or "learner")
+            load_info = {
+                "label": label,
+                "compiled": bool(central_use_compile),
+                "reused": False,
+                "warmup_s": None,
+            }
+            if debug_enabled:
+                print(f"[{_ts()}] Central inference: loading model '{label}' on {device}...", flush=True)
+            if central_use_compile:
+                if label in compiled_wrappers and label in compiled_base_models:
+                    base_model = compiled_base_models[label]
+                    _load_worker_model_state(base_model, state, rank=-1)
+                    base_model.eval()
+                    model = compiled_wrappers[label]
+                    load_info["reused"] = True
+                    if debug_enabled:
+                        print(f"[{_ts()}] Central inference: reused compiled model '{label}'.", flush=True)
+                else:
+                    base_model = _build_selfplay_worker_model(config, device)
+                    _load_worker_model_state(base_model, state, rank=-1)
+                    base_model.eval()
+                    model = _maybe_compile_selfplay_model(
+                        base_model,
+                        config,
+                        device,
+                        rank=999,
+                        model_label=f"central:{label}",
+                    )
+                    load_info["warmup_s"] = _warmup_central_model(model, label)
+                    compiled_base_models[label] = base_model
+                    compiled_wrappers[label] = model
+            else:
+                model = _build_selfplay_worker_model(config, device)
+                _load_worker_model_state(model, state, rank=-1)
+                model.eval()
+            models[label] = model
+            caches[label] = OrderedDict()
+            if debug_enabled:
+                print(f"[{_ts()}] Central inference: model '{label}' ready.", flush=True)
+            return load_info
+
+        def _response_queue_for(req):
+            if isinstance(response_queues, dict):
+                rank = int(req.get("rank", -1))
+                response_queue = response_queues.get(rank)
+                if response_queue is None:
+                    raise RuntimeError(f"Central inference has no response channel for worker {rank}.")
+                return response_queue
+            return response_queues
+
+        def _send_response(response_channel, response):
+            if hasattr(response_channel, "send"):
+                response_channel.send(response)
+            else:
+                response_channel.put(response)
+
+        def _put_response(req, payload):
+            response = {
+                "request_id": req.get("request_id"),
+                "rank": int(req.get("rank", -1)),
+            }
+            response.update(payload)
+            _send_response(_response_queue_for(req), response)
+
+        def _infer_group(model_label, requests):
+            group_t0 = time.perf_counter()
+            concat_time = 0.0
+            h2d_time = 0.0
+            forward_time = 0.0
+            d2h_time = 0.0
+            send_time = 0.0
+            model_label = str(model_label)
+            model = models.get(model_label)
+            if model is None:
+                raise RuntimeError(f"Central inference has no model loaded for label '{model_label}'.")
+
+            concat_t0 = time.perf_counter()
+            board_batches = [np.asarray(req["boards"], dtype=np.float32) for req in requests]
+            batch_sizes = [int(batch.shape[0]) for batch in board_batches]
+            boards = np.concatenate(board_batches, axis=0)
+            total_n = int(boards.shape[0])
+            response_started_at = time.time()
+            queue_waits = [
+                max(0.0, response_started_at - float(req.get("queued_at", response_started_at) or response_started_at))
+                for req in requests
+            ]
+            legal_index_batches = []
+            compact_policy = all(req.get("legal_index_matrix") is not None for req in requests)
+            max_legal_cols = 0
+            if compact_policy:
+                for req, batch_size in zip(requests, batch_sizes):
+                    legal_idx = np.asarray(req.get("legal_index_matrix"), dtype=np.int64)
+                    if legal_idx.ndim != 2 or int(legal_idx.shape[0]) != batch_size:
+                        compact_policy = False
+                        legal_index_batches = []
+                        break
+                    legal_index_batches.append(legal_idx)
+                    max_legal_cols = max(max_legal_cols, int(legal_idx.shape[1]))
+            if compact_policy and max_legal_cols > 0:
+                legal_indices = np.zeros((total_n, max_legal_cols), dtype=np.int64)
+                cursor = 0
+                for legal_idx, batch_size in zip(legal_index_batches, batch_sizes):
+                    legal_indices[cursor:cursor + batch_size, :legal_idx.shape[1]] = legal_idx
+                    cursor += batch_size
+            else:
+                compact_policy = False
+                legal_indices = None
+            concat_time += time.perf_counter() - concat_t0
+            policy_out = [None] * total_n
+            value_out = [None] * total_n
+            uncached_indices = []
+            uncached_boards = []
+            cache = caches.setdefault(model_label, OrderedDict())
+            use_cache_for_group = bool(cache_enabled and cache_max_entries > 0 and not compact_policy)
+
+            for idx in range(total_n):
+                key = _cache_key(model_label, boards[idx]) if use_cache_for_group else None
+                if key is not None and key in cache:
+                    policy_np, value_np = cache.pop(key)
+                    cache[key] = (policy_np, value_np)
+                    policy_out[idx] = policy_np
+                    value_out[idx] = value_np
+                else:
+                    uncached_indices.append(idx)
+                    uncached_boards.append(boards[idx])
+
+            if uncached_boards:
+                h2d_t0 = time.perf_counter()
+                tensor = torch.from_numpy(np.stack(uncached_boards, axis=0)).to(
+                    device,
+                    memory_format=torch.channels_last,
+                    non_blocking=True,
+                )
+                legal_index_tensor = None
+                if compact_policy:
+                    uncached_legal_indices = legal_indices[np.asarray(uncached_indices, dtype=np.int64)]
+                    legal_index_tensor = torch.from_numpy(uncached_legal_indices).to(device, non_blocking=True)
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                h2d_time += time.perf_counter() - h2d_t0
+                with torch.inference_mode():
+                    use_amp = bool(config.get('hardware', {}).get('use_amp', False) and device.type == 'cuda')
+                    amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
+                    forward_t0 = time.perf_counter()
+                    if use_amp and device.type == 'cuda':
+                        with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                            policy_logits, value_logits = model(tensor, apply_log_softmax=False)
+                    else:
+                        policy_logits, value_logits = model(tensor, apply_log_softmax=False)
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize(device)
+                    forward_time += time.perf_counter() - forward_t0
+                    d2h_t0 = time.perf_counter()
+                    if compact_policy and legal_index_tensor is not None:
+                        policy_logits = torch.gather(policy_logits, 1, legal_index_tensor)
+                    policy_np_batch = policy_logits.to(dtype=torch.float16).cpu().numpy()
+                    value_np_batch = value_logits.float().cpu().numpy()
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize(device)
+                    d2h_time += time.perf_counter() - d2h_t0
+                for local_idx, global_idx in enumerate(uncached_indices):
+                    policy_np = policy_np_batch[local_idx]
+                    value_np = value_np_batch[local_idx]
+                    policy_out[global_idx] = policy_np
+                    value_out[global_idx] = value_np
+                    if use_cache_for_group:
+                        key = _cache_key(model_label, boards[global_idx])
+                        cache[key] = (policy_np, value_np)
+                        while len(cache) > cache_max_entries:
+                            cache.popitem(last=False)
+
+            cursor = 0
+            for req_idx, (req, batch_size) in enumerate(zip(requests, batch_sizes)):
+                policy_slice = np.stack(policy_out[cursor:cursor + batch_size], axis=0)
+                value_slice = np.stack(value_out[cursor:cursor + batch_size], axis=0)
+                cursor += batch_size
+                send_t0 = time.perf_counter()
+                _put_response(req, {
+                    "ok": True,
+                    "policy_logits": policy_slice,
+                    "value_logits": value_slice,
+                    "server_batch_size": total_n,
+                    "compact_policy": bool(compact_policy),
+                    "server_queue_wait_s": float(queue_waits[req_idx]) if req_idx < len(queue_waits) else 0.0,
+                    "server_total_time_s": float(time.perf_counter() - group_t0),
+                    "server_forward_time_s": float(forward_time),
+                })
+                send_time += time.perf_counter() - send_t0
+            return {
+                "total_time": time.perf_counter() - group_t0,
+                "concat_time": concat_time,
+                "h2d_time": h2d_time,
+                "forward_time": forward_time,
+                "d2h_time": d2h_time,
+                "send_time": send_time,
+                "compact_policy": bool(compact_policy),
+                "positions": int(total_n),
+                "requests": int(len(requests)),
+            }
+
+        pending = []
+        pending_started_at = None
+        first_infer_seen = False
+        processed_requests = 0
+        processed_positions = 0
+        last_debug_print = time.perf_counter()
+        last_batch_positions = 0
+        last_batch_time_s = 0.0
+        last_stage_stats = {}
+        interval_infer_time = 0.0
+        interval_idle_wait_time = 0.0
+        interval_batch_wait_time = 0.0
+        interval_batches = 0
+
+        def _handle_request_item(item):
+            nonlocal first_infer_seen, pending_started_at
+            cmd = item.get("cmd")
+            if cmd == "stop":
+                return "stop"
+            if cmd == "load_models":
+                task_id = item.get("task_id")
+                if bool(item.get("clear", False)):
+                    models.clear()
+                    caches.clear()
+                loaded_models = []
+                load_t0 = time.perf_counter()
+                for entry in list(item.get("models", []) or []):
+                    state = entry.get("state")
+                    state_path = entry.get("state_path")
+                    if state is None and state_path:
+                        state = torch.load(state_path, map_location='cpu')
+                    if state is not None:
+                        loaded_models.append(_load_model(entry.get("label", "learner"), state))
+                if loaded_models:
+                    def _format_loaded_model(info):
+                        label = str(info.get("label", "model"))
+                        if info.get("reused"):
+                            return f"{label}(reused)"
+                        warmup_s = info.get("warmup_s")
+                        if warmup_s is not None:
+                            return f"{label}(warmup {float(warmup_s):.2f}s)"
+                        if info.get("compiled"):
+                            return f"{label}(compiled)"
+                        return label
+
+                    model_summary = ", ".join(_format_loaded_model(info) for info in loaded_models)
+                    print(
+                        f"[{_ts()}] Central inference: models ready on {device}: "
+                        f"{model_summary} ({time.perf_counter() - load_t0:.2f}s).",
+                        flush=True,
+                    )
+                if control_queue is not None:
+                    control_queue.put({
+                        "type": "models_loaded",
+                        "task_id": task_id,
+                        "labels": sorted(models.keys()),
+                    })
+                return "control"
+            if cmd == "infer":
+                if pending_started_at is None:
+                    pending_started_at = time.perf_counter()
+                if debug_enabled and not first_infer_seen:
+                    first_infer_seen = True
+                    print(
+                        f"[{_ts()}] Central inference: received first inference request "
+                        f"from worker {int(item.get('rank', -1))} "
+                        f"({int(np.asarray(item.get('boards')).shape[0])} positions).",
+                        flush=True,
+                    )
+                pending.append(item)
+                return "infer"
+            return "ignored"
+
+        while True:
+            if pending_started_at is None:
+                timeout_s = max(0.001, flush_ms / 1000.0)
+            else:
+                elapsed_s = time.perf_counter() - pending_started_at
+                timeout_s = max(0.0, (flush_ms / 1000.0) - elapsed_s)
+            get_t0 = time.perf_counter()
+            try:
+                item = request_queue.get(timeout=max(0.001, timeout_s))
+            except queue.Empty:
+                item = None
+            get_wait_s = time.perf_counter() - get_t0
+            if pending_started_at is None:
+                interval_idle_wait_time += get_wait_s
+            else:
+                interval_batch_wait_time += get_wait_s
+
+            if item is not None:
+                item_status = _handle_request_item(item)
+                if item_status == "stop":
+                    break
+                if item_status == "control":
+                    continue
+
+            while pending and sum(int(np.asarray(req.get("boards")).shape[0]) for req in pending) < max_batch:
+                try:
+                    drained_item = request_queue.get_nowait()
+                except queue.Empty:
+                    break
+                item_status = _handle_request_item(drained_item)
+                if item_status == "stop":
+                    return
+                if item_status == "control":
+                    continue
+
+            pending_items = sum(int(np.asarray(req.get("boards")).shape[0]) for req in pending)
+            should_flush = (
+                pending
+                and (
+                    pending_items >= max_batch
+                    or (
+                        pending_started_at is not None
+                        and (time.perf_counter() - pending_started_at) >= (flush_ms / 1000.0)
+                    )
+                    or item is None
+                )
+            )
+            if not should_flush:
+                continue
+
+            grouped = {}
+            for req in pending:
+                grouped.setdefault(str(req.get("model_label", "learner")), []).append(req)
+            pending = []
+            pending_started_at = None
+            for model_label, requests in grouped.items():
+                try:
+                    infer_t0 = time.perf_counter()
+                    stage_stats = _infer_group(model_label, requests)
+                    last_batch_time_s = time.perf_counter() - infer_t0
+                    last_batch_positions = int(stage_stats.get("positions", 0) or 0)
+                    last_stage_stats = dict(stage_stats)
+                    interval_infer_time += last_batch_time_s
+                    interval_batches += 1
+                    processed_requests += len(requests)
+                    processed_positions += last_batch_positions
+                except Exception as exc:
+                    for req in requests:
+                        _put_response(req, {
+                            "ok": False,
+                            "error": str(exc),
+                        })
+            if debug_enabled and (time.perf_counter() - last_debug_print) >= 5.0:
+                interval_s = max(1e-9, time.perf_counter() - last_debug_print)
+                last_debug_print = time.perf_counter()
+                pos_per_s = (
+                    float(last_batch_positions) / max(1e-9, float(last_batch_time_s))
+                    if last_batch_positions > 0
+                    else 0.0
+                )
+                active_pct = 100.0 * float(interval_infer_time) / interval_s
+                idle_pct = 100.0 * float(interval_idle_wait_time) / interval_s
+                batch_wait_pct = 100.0 * float(interval_batch_wait_time) / interval_s
+                print(
+                    f"[{_ts()}] Central inference: heartbeat "
+                    f"requests={processed_requests}, positions={processed_positions}, "
+                    f"last_batch={last_batch_positions} pos/{last_batch_time_s:.3f}s "
+                    f"({pos_per_s:.1f} pos/s), "
+                    f"server_active={active_pct:.1f}%, idle_no_requests={idle_pct:.1f}%, "
+                    f"batch_wait={batch_wait_pct:.1f}%, batches={interval_batches}, "
+                    f"compact={bool(last_stage_stats.get('compact_policy', False))}, "
+                    f"h2d={float(last_stage_stats.get('h2d_time', 0.0)):.3f}s, "
+                    f"fwd={float(last_stage_stats.get('forward_time', 0.0)):.3f}s, "
+                    f"d2h={float(last_stage_stats.get('d2h_time', 0.0)):.3f}s, "
+                    f"send={float(last_stage_stats.get('send_time', 0.0)):.3f}s, "
+                    f"last_flush_models={len(grouped)}, pending={len(pending)}.",
+                    flush=True,
+                )
+                interval_infer_time = 0.0
+                interval_idle_wait_time = 0.0
+                interval_batch_wait_time = 0.0
+                interval_batches = 0
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"Central inference server failed: {exc}")
+        import traceback
+        traceback.print_exc()
+
+
 def _create_selfplay_engine(
     model,
     config,
@@ -3707,7 +4405,15 @@ def _play_games_with_engine(
     return total_positions, total_games
 
 
-def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue):
+def persistent_selfplay_worker(
+    rank,
+    config,
+    device_id,
+    task_queue,
+    result_queue,
+    inference_request_queue=None,
+    inference_response_queue=None,
+):
     """
     Persistent worker for self-play on Windows.
 
@@ -3722,13 +4428,39 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
         device = _configure_selfplay_worker_runtime(config, device_id)
         wlog(f"Persistent worker started on {device}")
 
-        model = _build_selfplay_worker_model(config, device)
-        inference_model = _maybe_compile_selfplay_model(
-            model,
-            config,
-            device,
-            rank,
-            model_label="learner",
+        central_inference_enabled = inference_request_queue is not None and inference_response_queue is not None
+        _, central_debug_cfg, debug_root_enabled = _debug_nested(config, 'rl', 'central_inference')
+        central_debug_enabled = bool(
+            debug_root_enabled and central_debug_cfg.get(
+                'verbose',
+                rl_cfg.get('self_play_central_inference_debug', False),
+            )
+        )
+        central_stall_warning_s = float(
+            central_debug_cfg.get(
+                'stall_warning_s',
+                rl_cfg.get('self_play_central_inference_stall_warning_s', 60.0),
+            )
+        )
+        model = None if central_inference_enabled else _build_selfplay_worker_model(config, device)
+        inference_model = (
+            _RemoteInferenceModel(
+                "learner",
+                inference_request_queue,
+                inference_response_queue,
+                worker_rank=rank,
+                timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 120.0)),
+                stall_warning_s=central_stall_warning_s,
+                debug_enabled=central_debug_enabled,
+            )
+            if central_inference_enabled
+            else _maybe_compile_selfplay_model(
+                model,
+                config,
+                device,
+                rank,
+                model_label="learner",
+            )
         )
         opponent_model = None
         engine = None
@@ -3742,12 +4474,24 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
 
             result_file_path = task['result_file_path']
             try:
-                if task.get('model_state') is not None:
-                    model_state = task['model_state']
-                else:
-                    model_state = torch.load(task['model_state_path'], map_location='cpu')
-                _load_worker_model_state(model, model_state, rank)
-                model.eval()
+                if central_inference_enabled and central_debug_enabled:
+                    opponent_payload_preview = task.get('opponent_payload') or {}
+                    preview_labels = sorted({
+                        str((entry or {}).get('label') or 'current')
+                        for entry in list(opponent_payload_preview.get('pool_entries', []) or [])
+                    })
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] Worker {rank}: central task started "
+                        f"games={int(task['num_games'])}, opponent_models={preview_labels or ['current']}.",
+                        flush=True,
+                    )
+                if not central_inference_enabled:
+                    if task.get('model_state') is not None:
+                        model_state = task['model_state']
+                    else:
+                        model_state = torch.load(task['model_state_path'], map_location='cpu')
+                    _load_worker_model_state(model, model_state, rank)
+                    model.eval()
 
                 opponent_payload = task.get('opponent_payload') or {}
                 opponent_plan_labels = list(opponent_payload.get('plan_labels', []) or [])
@@ -3758,18 +4502,31 @@ def persistent_selfplay_worker(rank, config, device_id, task_queue, result_queue
                 for entry in opponent_pool_entries:
                     entry_label = str((entry or {}).get('label') or 'current')
                     entry_state = (entry or {}).get('state')
-                    if entry_state is None or entry_label == 'current':
+                    if entry_label == 'current':
                         continue
-                    pooled_model = _build_selfplay_worker_model(config, device)
-                    _load_worker_model_state(pooled_model, entry_state, rank)
-                    pooled_model.eval()
-                    pooled_model = _maybe_compile_selfplay_model(
-                        pooled_model,
-                        config,
-                        device,
-                        rank,
-                        model_label=f"opponent:{entry_label}",
-                    )
+                    if central_inference_enabled:
+                        pooled_model = _RemoteInferenceModel(
+                            entry_label,
+                            inference_request_queue,
+                            inference_response_queue,
+                            worker_rank=rank,
+                            timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 120.0)),
+                            stall_warning_s=central_stall_warning_s,
+                            debug_enabled=central_debug_enabled,
+                        )
+                    else:
+                        if entry_state is None:
+                            continue
+                        pooled_model = _build_selfplay_worker_model(config, device)
+                        _load_worker_model_state(pooled_model, entry_state, rank)
+                        pooled_model.eval()
+                        pooled_model = _maybe_compile_selfplay_model(
+                            pooled_model,
+                            config,
+                            device,
+                            rank,
+                            model_label=f"opponent:{entry_label}",
+                        )
                     opponent_models_by_label[entry_label] = pooled_model
                     if opponent_model is None:
                         opponent_model = pooled_model

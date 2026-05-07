@@ -125,6 +125,11 @@ class TrainingLogger:
                     'data_collection_time_s',
                     'avg_game_length',
                     'mcts_avg_batch_size',
+                    'mcts_central_avg_batch_size',
+                    'central_remote_wait_ms_per_request',
+                    'central_server_queue_wait_ms_per_request',
+                    'central_server_forward_ms_per_request',
+                    'central_server_total_ms_per_request',
                     'mcts_gpu_utilization_pct',
                     'mcts_inference_ms_per_position',
                     'mcts_inference_ms_per_batch',
@@ -274,6 +279,11 @@ class TrainingLogger:
             '' if data_collection_time is None else data_collection_time,
             '' if avg_game_length is None else avg_game_length,
             _value('average_batch_size'),
+            _value('central_average_batch_size'),
+            _value('central_remote_wait_ms_per_request'),
+            _value('central_server_queue_wait_ms_per_request'),
+            _value('central_server_forward_ms_per_request'),
+            _value('central_server_total_ms_per_request'),
             _value('gpu_utilization_pct'),
             _value('inference_time_per_position_ms'),
             _value('inference_time_per_batch_ms'),
@@ -318,7 +328,7 @@ class TrainingLogger:
                 ys.append(y)
             return xs, ys
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+        fig, axes = plt.subplots(3, 2, figsize=(14, 11))
         fig.suptitle('RL Performance', fontsize=16, fontweight='bold')
 
         ax = axes[0, 0]
@@ -348,7 +358,10 @@ class TrainingLogger:
         ax = axes[1, 0]
         xs, ys = _series('mcts_avg_batch_size')
         if xs:
-            ax.plot(xs, ys, 'co-', linewidth=2, markersize=5, label='Avg batch')
+            ax.plot(xs, ys, 'co-', linewidth=2, markersize=5, label='Worker avg batch')
+        xs_c, ys_c = _series('mcts_central_avg_batch_size')
+        if xs_c:
+            ax.plot(xs_c, ys_c, color='tab:green', marker='^', linestyle='-', linewidth=2, markersize=5, label='Central avg batch')
         ax.set_title('MCTS Inference Batch')
         ax.set_xlabel('Iteration')
         ax.set_ylabel('batch items')
@@ -373,7 +386,38 @@ class TrainingLogger:
         ax.set_ylim(0, 100)
         ax.grid(True, alpha=0.3)
 
-        fig.subplots_adjust(left=0.07, right=0.96, bottom=0.08, top=0.9, hspace=0.32, wspace=0.28)
+        ax = axes[2, 0]
+        for column, label, style in [
+            ('central_remote_wait_ms_per_request', 'worker wait', 'ro-'),
+            ('central_server_queue_wait_ms_per_request', 'server queue', 'co--'),
+            ('central_server_forward_ms_per_request', 'server forward', 'go-'),
+            ('central_server_total_ms_per_request', 'server total', 'mo--'),
+        ]:
+            xs, ys = _series(column)
+            if xs:
+                ax.plot(xs, ys, style, linewidth=1.6, markersize=4, label=label)
+        ax.set_title('Central Inference Latency')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('ms / request')
+        ax.grid(True, alpha=0.3)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc='best')
+
+        ax = axes[2, 1]
+        xs, ys = _series('queue_wait_time_ms')
+        if xs:
+            ax.plot(xs, ys, color='tab:red', marker='o', linestyle='-', linewidth=1.8, markersize=5, label='result queue wait')
+        xs2, ys2 = _series('mcts_inference_ms_per_batch')
+        if xs2:
+            ax.plot(xs2, ys2, color='tab:blue', marker='s', linestyle='--', linewidth=1.8, markersize=5, label='MCTS inference ms/batch')
+        ax.set_title('Queue / Inference Wait')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('ms')
+        ax.grid(True, alpha=0.3)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc='best')
+
+        fig.subplots_adjust(left=0.07, right=0.96, bottom=0.07, top=0.92, hspace=0.42, wspace=0.28)
         fig.savefig(self.performance_plot_path, dpi=150)
         plt.close(fig)
 
