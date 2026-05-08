@@ -18,7 +18,13 @@ from tqdm import tqdm
 project_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(project_root))
 
-from src.batch_selfplay import MultiGameBatchMCTS, select_move_by_visits, _SELFPLAY_OPENING_LINES
+from src.batch_selfplay import (
+    MultiGameBatchMCTS,
+    select_move_by_visits,
+    _SELFPLAY_OPENING_LINES,
+    _RemoteInferenceModel,
+    central_inference_server,
+)
 from src.data import board_to_tensor, move_to_index
 from src.model import ChessNet
 from src.utils.data_helpers import ACTION_SIZE, build_hflip_inverse_index_map
@@ -37,15 +43,33 @@ def _snapshot_state_dict_cpu_shared(model):
     return snapshot
 
 
+def _eval_uses_central_inference(config, device):
+    rl_cfg = config.get("reinforcement_learning", {})
+    enabled = rl_cfg.get(
+        "eval_central_inference_enabled",
+        rl_cfg.get("self_play_central_inference_enabled", False),
+    )
+    return bool(enabled and device.type == "cuda" and torch.cuda.is_available())
+
+
 def _resolve_eval_workers(config, device, num_games):
     rl_cfg = config.get("reinforcement_learning", {})
     raw_workers = rl_cfg.get("eval_workers", None)
+    auto_workers = raw_workers is None or str(raw_workers).strip().lower() in {"auto", "automatic", "0"}
 
-    if raw_workers is None:
-        if device.type == "cuda":
-            # Eval loads full models + MCTS state per worker, so CUDA eval is
-            # much more memory-sensitive than self-play. Default to a single
-            # worker on GPU unless the user explicitly opts into more.
+    if auto_workers:
+        if _eval_uses_central_inference(config, device):
+            # CPU workers own MCTS trees, central GPU server owns inference.
+            # This mirrors RL self-play and keeps eval from becoming one-core.
+            reserve_threads = max(0, int(rl_cfg.get("eval_cpu_threads_to_reserve", 0) or 0))
+            cpu_budget = max(1, (os.cpu_count() or 2) - reserve_threads)
+            raw_workers = min(
+                int(rl_cfg.get("self_play_workers", cpu_budget) or cpu_budget),
+                cpu_budget,
+            )
+        elif device.type == "cuda":
+            # Without central inference each eval worker would load full CUDA
+            # models, so keep the old memory-safe default.
             raw_workers = 1
         else:
             raw_workers = max(1, (os.cpu_count() or 2) - 1)
@@ -56,6 +80,55 @@ def _resolve_eval_workers(config, device, num_games):
         workers = 1
 
     return max(1, min(int(num_games), workers))
+
+
+def _build_eval_central_server_config(config):
+    """Project eval-specific central inference knobs onto the shared server keys."""
+    server_config = dict(config)
+    rl_cfg = dict(config.get("reinforcement_learning", {}))
+    mappings = {
+        "eval_central_inference_flush_ms": "self_play_central_inference_flush_ms",
+        "eval_central_inference_max_batch_size": "self_play_central_inference_max_batch_size",
+        "eval_central_inference_transport_dtype": "self_play_central_inference_transport_dtype",
+        "eval_central_inference_use_compile": "self_play_central_inference_use_compile",
+        "eval_central_inference_compile_warmup_batches": "self_play_central_inference_compile_warmup_batches",
+        "eval_central_inference_cudnn_benchmark": "self_play_central_inference_cudnn_benchmark",
+        "eval_central_inference_cache_enabled": "self_play_central_inference_cache_enabled",
+        "eval_central_inference_cache_entries": "self_play_central_inference_cache_entries",
+    }
+    for eval_key, server_key in mappings.items():
+        if eval_key in rl_cfg:
+            rl_cfg[server_key] = rl_cfg[eval_key]
+    server_config["reinforcement_learning"] = rl_cfg
+    return server_config
+
+
+def _resolve_eval_central_server_count(config, workers):
+    rl_cfg = config.get("reinforcement_learning", {})
+    raw_value = rl_cfg.get("eval_central_inference_servers", "auto")
+    if str(raw_value).strip().lower() not in {"auto", "automatic"}:
+        try:
+            return max(1, int(raw_value))
+        except Exception:
+            return 1
+
+    workers = max(1, int(workers))
+    target_workers = max(3, int(rl_cfg.get("eval_central_inference_auto_workers_per_server", 6) or 6))
+    min_servers = max(1, int(rl_cfg.get("eval_central_inference_auto_min_servers", 1) or 1))
+    max_servers = max(min_servers, int(rl_cfg.get("eval_central_inference_auto_max_servers", 3) or 3))
+    by_workers = max(1, (workers + target_workers - 1) // target_workers)
+    by_vram = max_servers
+    try:
+        total_gib = float(torch.cuda.get_device_properties(0).total_memory) / float(1024 ** 3)
+        if total_gib < 10.0:
+            by_vram = 1
+        elif total_gib < 14.0:
+            by_vram = min(by_vram, 2)
+        elif total_gib < 24.0:
+            by_vram = min(by_vram, 3)
+    except Exception:
+        by_vram = min(by_vram, 2)
+    return max(1, min(max(min_servers, by_workers), max_servers, by_vram))
 
 
 def _resolve_eval_batch_games(config, num_games):
@@ -670,6 +743,268 @@ def _eval_worker(rank, model1_state, model2_state, config, device_str, game_indi
         result_queue.put({"type": "error", "rank": rank, "error": str(exc)})
 
 
+def _eval_central_worker(rank, config, game_indices, request_queue, response_receiver, result_queue, use_fixed_openings=None):
+    try:
+        rl_cfg = config.get("reinforcement_learning", {})
+        torch_threads = max(1, int(rl_cfg.get("eval_torch_threads", rl_cfg.get("self_play_torch_threads", 1)) or 1))
+        with contextlib.suppress(Exception):
+            torch.set_num_threads(torch_threads)
+        with contextlib.suppress(Exception):
+            torch.set_num_interop_threads(1)
+
+        timeout_s = float(rl_cfg.get(
+            "eval_central_inference_timeout_s",
+            rl_cfg.get("self_play_central_inference_timeout_s", 0),
+        ) or 0)
+        stall_warning_s = float(rl_cfg.get(
+            "eval_central_inference_stall_warning_s",
+            rl_cfg.get("self_play_central_inference_stall_warning_s", 15),
+        ) or 0)
+        transport_dtype = str(rl_cfg.get(
+            "eval_central_inference_transport_dtype",
+            rl_cfg.get("self_play_central_inference_transport_dtype", "float16"),
+        ) or "float16")
+        debug_enabled = bool(rl_cfg.get("eval_central_inference_debug", False))
+
+        model1 = _RemoteInferenceModel(
+            "eval_model1",
+            request_queue,
+            response_receiver,
+            worker_rank=int(rank),
+            timeout_s=timeout_s,
+            stall_warning_s=stall_warning_s,
+            debug_enabled=debug_enabled,
+            transport_dtype=transport_dtype,
+        )
+        model2 = _RemoteInferenceModel(
+            "eval_model2",
+            request_queue,
+            response_receiver,
+            worker_rank=int(rank),
+            timeout_s=timeout_s,
+            stall_warning_s=stall_warning_s,
+            debug_enabled=debug_enabled,
+            transport_dtype=transport_dtype,
+        )
+
+        stats = _evaluate_games_batched(
+            model1,
+            model2,
+            config,
+            torch.device("cpu"),
+            game_indices,
+            use_fixed_openings=use_fixed_openings,
+            progress_callback=lambda completed: result_queue.put({
+                "type": "progress",
+                "rank": rank,
+                "completed": int(completed),
+            }),
+        )
+
+        result_queue.put(
+            {
+                "type": "result",
+                "rank": rank,
+                "wins": int(stats.get("wins", 0)),
+                "draws": int(stats.get("draws", 0)),
+                "losses": int(stats.get("losses", 0)),
+                "unresolved": int(stats.get("unresolved", 0)),
+            }
+        )
+    except KeyboardInterrupt:
+        result_queue.put({"type": "interrupt", "rank": rank})
+    except Exception as exc:
+        result_queue.put({"type": "error", "rank": rank, "error": str(exc)})
+
+
+def _evaluate_models_with_central_inference(
+    model1,
+    model2,
+    config,
+    device,
+    num_games,
+    game_index_offset=0,
+    use_fixed_openings=None,
+):
+    workers = _resolve_eval_workers(config, device, num_games)
+    server_count = _resolve_eval_central_server_count(config, workers)
+    rl_cfg = config.get("reinforcement_learning", {})
+    server_config = _build_eval_central_server_config(config)
+    max_moves = _resolve_eval_max_moves(config)
+    ctx = mp.get_context("spawn")
+
+    result_queue = ctx.Queue()
+    request_queues = [ctx.Queue() for _ in range(server_count)]
+    control_queues = [ctx.Queue() for _ in range(server_count)]
+    server_response_senders = [dict() for _ in range(server_count)]
+    worker_response_receivers = {}
+    worker_server_idx = {}
+
+    game_indices_per_worker = [[] for _ in range(workers)]
+    for offset, game_idx in enumerate(range(game_index_offset, game_index_offset + num_games)):
+        game_indices_per_worker[offset % workers].append(game_idx)
+
+    active_worker_ranks = [
+        rank for rank, game_indices in enumerate(game_indices_per_worker)
+        if game_indices
+    ]
+    for rank in active_worker_ranks:
+        server_idx = int(rank) % int(server_count)
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        worker_response_receivers[rank] = recv_conn
+        server_response_senders[server_idx][rank] = send_conn
+        worker_server_idx[rank] = server_idx
+
+    model1_state = _snapshot_state_dict_cpu_shared(model1)
+    model2_state = _snapshot_state_dict_cpu_shared(model2)
+
+    server_processes = []
+    worker_processes = []
+    task_id = f"eval_{os.getpid()}_{id(model1)}_{game_index_offset}_{num_games}"
+    try:
+        for server_idx in range(server_count):
+            proc = ctx.Process(
+                target=central_inference_server,
+                args=(
+                    server_config,
+                    0,
+                    request_queues[server_idx],
+                    server_response_senders[server_idx],
+                    control_queues[server_idx],
+                ),
+            )
+            proc.daemon = True
+            proc.start()
+            server_processes.append(proc)
+
+        load_timeout_s = float(rl_cfg.get(
+            "eval_central_inference_load_timeout_s",
+            rl_cfg.get("self_play_central_inference_load_timeout_s", 300),
+        ) or 300)
+        for request_queue in request_queues:
+            request_queue.put({
+                "cmd": "load_models",
+                "task_id": task_id,
+                "clear": True,
+                "models": [
+                    {"label": "eval_model1", "state": model1_state, "state_path": None},
+                    {"label": "eval_model2", "state": model2_state, "state_path": None},
+                ],
+            })
+        import time
+        deadline = time.time() + max(1.0, load_timeout_s)
+        pending_servers = set(range(server_count))
+        while pending_servers:
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    "Eval central inference did not acknowledge model load "
+                    f"from servers {sorted(pending_servers)}."
+                )
+            for server_idx in list(pending_servers):
+                try:
+                    message = control_queues[server_idx].get(timeout=0.25)
+                except Exception:
+                    continue
+                if message.get("type") == "models_loaded" and str(message.get("task_id")) == task_id:
+                    pending_servers.discard(server_idx)
+
+        print(
+            "Eval central inference: "
+            f"workers={len(active_worker_ranks)}, servers={server_count}, "
+            f"batch_games={_resolve_eval_batch_games(config, num_games)}, "
+            f"sims={_resolve_eval_mcts_simulations(config)}"
+        )
+
+        for rank in active_worker_ranks:
+            proc = ctx.Process(
+                target=_eval_central_worker,
+                args=(
+                    rank,
+                    config,
+                    game_indices_per_worker[rank],
+                    request_queues[worker_server_idx[rank]],
+                    worker_response_receivers[rank],
+                    result_queue,
+                    use_fixed_openings,
+                ),
+            )
+            proc.daemon = True
+            proc.start()
+            worker_processes.append(proc)
+
+        wins = 0
+        draws = 0
+        losses = 0
+        unresolved = 0
+        completed = 0
+        finished_workers = 0
+        eval_bar = tqdm(total=num_games, desc="Eval vs best", unit="game")
+        worker_error = None
+        try:
+            while finished_workers < len(worker_processes):
+                try:
+                    message = result_queue.get(timeout=1.0)
+                except Exception:
+                    dead_workers = [
+                        proc.exitcode for proc in worker_processes
+                        if proc is not None and not proc.is_alive() and proc.exitcode not in (0, None)
+                    ]
+                    dead_servers = [
+                        proc.exitcode for proc in server_processes
+                        if proc is not None and not proc.is_alive() and proc.exitcode not in (0, None)
+                    ]
+                    if dead_workers:
+                        worker_error = f"eval worker exited unexpectedly: exitcodes={dead_workers}"
+                        _terminate_eval_processes(worker_processes)
+                        break
+                    if dead_servers:
+                        worker_error = f"eval central inference server exited unexpectedly: exitcodes={dead_servers}"
+                        _terminate_eval_processes(worker_processes)
+                        break
+                    continue
+                message_type = message.get("type")
+                if message_type == "progress":
+                    completed += int(message.get("completed", 0))
+                    eval_bar.n = min(num_games, completed)
+                    eval_bar.refresh()
+                elif message_type == "result":
+                    wins += int(message.get("wins", 0))
+                    draws += int(message.get("draws", 0))
+                    losses += int(message.get("losses", 0))
+                    unresolved += int(message.get("unresolved", 0))
+                    finished_workers += 1
+                elif message_type == "interrupt":
+                    raise KeyboardInterrupt
+                elif message_type == "error":
+                    worker_error = str(message.get("error", "unknown error"))
+                    _terminate_eval_processes(worker_processes)
+                    break
+        finally:
+            eval_bar.close()
+
+        if worker_error is not None:
+            raise RuntimeError(f"Eval worker failed: {worker_error}")
+        if unresolved > 0:
+            _print_eval_unresolved("Eval", unresolved, num_games, max_moves)
+        return _build_eval_stats(wins, draws, losses, unresolved, num_games)
+    finally:
+        _terminate_eval_processes(worker_processes)
+        for request_queue in request_queues:
+            with contextlib.suppress(Exception):
+                request_queue.put({"cmd": "stop"})
+        _terminate_eval_processes(server_processes, timeout_s=1.0)
+        for queue_obj in list(request_queues) + list(control_queues) + [result_queue]:
+            with contextlib.suppress(Exception):
+                queue_obj.close()
+        for recv_conn in worker_response_receivers.values():
+            with contextlib.suppress(Exception):
+                recv_conn.close()
+        for sender_map in server_response_senders:
+            for send_conn in sender_map.values():
+                with contextlib.suppress(Exception):
+                    send_conn.close()
+
+
 def _get_hflip_inverse_index_map():
     global _HFLIP_INV_INDEX_MAP
     if _HFLIP_INV_INDEX_MAP is not None:
@@ -855,6 +1190,19 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
 
 
 def evaluate_models(model1, model2, config, device, num_games=100, game_index_offset=0, use_fixed_openings=None):
+    rl_cfg = config.get("reinforcement_learning", {})
+    central_min_games = max(1, int(rl_cfg.get("eval_central_inference_min_games", 2) or 2))
+    if _eval_uses_central_inference(config, device) and int(num_games) >= central_min_games:
+        return _evaluate_models_with_central_inference(
+            model1,
+            model2,
+            config,
+            device,
+            int(num_games),
+            game_index_offset=game_index_offset,
+            use_fixed_openings=use_fixed_openings,
+        )
+
     workers = _resolve_eval_workers(config, device, num_games)
     if workers <= 1:
         max_moves = _resolve_eval_max_moves(config)

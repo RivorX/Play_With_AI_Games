@@ -71,6 +71,11 @@ class TrainingLogger:
                     'selfplay_auto_draw_rate',
                     'selfplay_truncated_rate', 'selfplay_decisive_avg_length',
                     'selfplay_curriculum_dropped_positions', 'selfplay_cap_dropped_positions',
+                    'replay_decisive_fraction', 'replay_draw_fraction',
+                    'policy_weight_mean', 'policy_weight_low_fraction',
+                    'policy_target_len_mean',
+                    'mcts_prior_agreement_rate', 'mcts_prior_changed_rate',
+                    'mcts_changed_to_lower_q_rate', 'mcts_q_delta_mean',
                     'adaptive_temp_adjustment', 'adaptive_temp_threshold',
                     'estimated_elo',
                 ]
@@ -105,16 +110,14 @@ class TrainingLogger:
         self.estimated_elos = []  # (epoch, elo) tuples
         
         if mode == "rl":
-            self.performance_dir = self.log_dir / "performance"
-            self.performance_dir.mkdir(parents=True, exist_ok=True)
-            self.performance_log_path = self.performance_dir / "RL.csv"
-            self.performance_plot_path = self.performance_dir / "RL.png"
-            for old_log_path in list(self.performance_dir.glob("*.log")) + list(self.performance_dir.glob("*.csv")):
-                if old_log_path != self.performance_log_path:
-                    try:
-                        old_log_path.unlink()
-                    except OSError:
-                        pass
+            self.details_dir = self.log_dir / "details"
+            self.details_dir.mkdir(parents=True, exist_ok=True)
+            self.details_prefix = self.csv_path.stem
+            self.performance_dir = self.details_dir
+            self.performance_log_path = self.details_dir / f"{self.details_prefix}_performance.csv"
+            self.performance_plot_path = self.details_dir / f"{self.details_prefix}_performance.png"
+            self.data_quality_log_path = self.details_dir / f"{self.details_prefix}_data_quality.csv"
+            self.data_quality_plot_path = self.details_dir / f"{self.details_prefix}_data_quality.png"
             with open(self.performance_log_path, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
@@ -145,11 +148,52 @@ class TrainingLogger:
                     'mcts_avg_legal_moves_per_position',
                     'queue_wait_time_ms',
                 ])
-            try:
-                if self.performance_plot_path.exists():
-                    self.performance_plot_path.unlink()
-            except OSError:
-                pass
+            with open(self.data_quality_log_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'iteration',
+                    'timestamp',
+                    'positions_added',
+                    'replay_size',
+                    'replay_capacity',
+                    'replay_fill_rate',
+                    'replay_decisive_fraction',
+                    'replay_draw_fraction',
+                    'replay_value_mean',
+                    'replay_value_std',
+                    'replay_recent_decisive_fraction',
+                    'replay_recent_draw_fraction',
+                    'replay_recent_value_mean',
+                    'replay_recent_value_std',
+                    'policy_weight_mean',
+                    'policy_weight_p10',
+                    'policy_weight_low_fraction',
+                    'policy_target_len_mean',
+                    'policy_target_len_p90',
+                    'policy_target_entropy_mean',
+                    'policy_target_top1_prob_mean',
+                    'importance_mean',
+                    'importance_p90',
+                    'selfplay_completed_games',
+                    'selfplay_draw_rate',
+                    'selfplay_decisive_rate',
+                    'selfplay_truncated_rate',
+                    'selfplay_auto_draw_rate',
+                    'selfplay_avg_game_value',
+                    'selfplay_value_std',
+                    'mcts_avg_sims',
+                    'mcts_p10_sims',
+                    'mcts_adaptive_stop_rate',
+                    'mcts_prior_agreement_rate',
+                    'mcts_prior_changed_rate',
+                    'mcts_changed_to_lower_q_rate',
+                    'mcts_q_delta_mean',
+                    'mcts_policy_kl_mean',
+                    'mcts_prior_top_visit_prob_mean',
+                    'mcts_top_prior_prob_mean',
+                    'train_policy_entropy',
+                    'train_target_value_std',
+                ])
             self.win_rates = []
             self.true_win_rates = []
             self.no_mcts_score_rates = []
@@ -163,9 +207,13 @@ class TrainingLogger:
             self.adaptive_temp_adjustments = []
             self.adaptive_temp_thresholds = []
         else:
+            self.details_dir = None
+            self.details_prefix = None
             self.performance_dir = None
             self.performance_log_path = None
             self.performance_plot_path = None
+            self.data_quality_log_path = None
+            self.data_quality_plot_path = None
 
         # Optional run context shown in plot header (e.g. startup mode/resume/transfer info).
         self.run_context_text = None
@@ -181,6 +229,7 @@ class TrainingLogger:
         print(f"Logging to: {self.csv_path}")
         if self.mode == "rl":
             print(f"RL performance log: {self.performance_log_path}")
+            print(f"RL data-quality log: {self.data_quality_log_path}")
 
     def set_run_context(self, text):
         """Set optional short context displayed on generated PNG plots."""
@@ -340,7 +389,7 @@ class TrainingLogger:
             csv.writer(f).writerow(row)
 
     def plot_rl_performance(self):
-        """Generate a performance plot from logs/performance/RL.csv."""
+        """Generate a performance plot from this run's RL details CSV."""
         if self.mode != "rl" or self.performance_log_path is None:
             return
         if not self.performance_log_path.exists():
@@ -480,6 +529,212 @@ class TrainingLogger:
 
         fig.subplots_adjust(left=0.07, right=0.96, bottom=0.07, top=0.92, hspace=0.42, wspace=0.28)
         fig.savefig(self.performance_plot_path, dpi=150)
+        plt.close(fig)
+
+    def log_rl_data_quality(
+        self,
+        iteration,
+        *,
+        positions_added=None,
+        replay_stats=None,
+        selfplay_stats=None,
+        train_policy_entropy=None,
+        train_target_value_std=None,
+    ):
+        """Append detailed RL data-quality metrics for this run."""
+        if self.mode != "rl" or self.data_quality_log_path is None:
+            return
+        replay_stats = dict(replay_stats or {})
+        selfplay_stats = dict(selfplay_stats or {})
+
+        def _value(mapping, key, default=''):
+            value = mapping.get(key, default)
+            return default if value is None else value
+
+        row = [
+            int(iteration),
+            datetime.now().isoformat(timespec='seconds'),
+            '' if positions_added is None else positions_added,
+            _value(replay_stats, 'size'),
+            _value(replay_stats, 'capacity'),
+            _value(replay_stats, 'fill_rate'),
+            _value(replay_stats, 'decisive_fraction'),
+            _value(replay_stats, 'draw_fraction'),
+            _value(replay_stats, 'value_mean'),
+            _value(replay_stats, 'value_std'),
+            _value(replay_stats, 'recent_decisive_fraction'),
+            _value(replay_stats, 'recent_draw_fraction'),
+            _value(replay_stats, 'recent_value_mean'),
+            _value(replay_stats, 'recent_value_std'),
+            _value(replay_stats, 'policy_weight_mean'),
+            _value(replay_stats, 'policy_weight_p10'),
+            _value(replay_stats, 'policy_weight_low_fraction'),
+            _value(replay_stats, 'policy_target_len_mean'),
+            _value(replay_stats, 'policy_target_len_p90'),
+            _value(replay_stats, 'policy_target_entropy_mean'),
+            _value(replay_stats, 'policy_target_top1_prob_mean'),
+            _value(replay_stats, 'importance_mean'),
+            _value(replay_stats, 'importance_p90'),
+            _value(selfplay_stats, 'completed_games'),
+            _value(selfplay_stats, 'completed_draw_rate'),
+            _value(selfplay_stats, 'decisive_rate'),
+            _value(selfplay_stats, 'truncated_rate'),
+            _value(selfplay_stats, 'auto_draw_rate'),
+            _value(selfplay_stats, 'avg_game_value'),
+            _value(selfplay_stats, 'value_std'),
+            _value(selfplay_stats, 'search_simulations_used_avg'),
+            _value(selfplay_stats, 'search_simulations_used_p10'),
+            _value(selfplay_stats, 'adaptive_stop_rate'),
+            _value(selfplay_stats, 'mcts_prior_agreement_rate'),
+            _value(selfplay_stats, 'mcts_prior_changed_rate'),
+            _value(selfplay_stats, 'mcts_changed_to_lower_q_rate'),
+            _value(selfplay_stats, 'mcts_q_delta_mean'),
+            _value(selfplay_stats, 'mcts_policy_kl_mean'),
+            _value(selfplay_stats, 'mcts_prior_top_visit_prob_mean'),
+            _value(selfplay_stats, 'mcts_top_prior_prob_mean'),
+            '' if train_policy_entropy is None else train_policy_entropy,
+            '' if train_target_value_std is None else train_target_value_std,
+        ]
+        with open(self.data_quality_log_path, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+
+    def plot_rl_data_quality(self):
+        """Generate a data-quality plot from this run's RL details CSV."""
+        if self.mode != "rl" or self.data_quality_log_path is None:
+            return
+        if not self.data_quality_log_path.exists():
+            return
+
+        try:
+            with open(self.data_quality_log_path, 'r', newline='') as f:
+                rows = list(csv.DictReader(f))
+        except OSError:
+            return
+        if not rows:
+            return
+
+        def _series(column):
+            xs = []
+            ys = []
+            for row in rows:
+                try:
+                    x = int(float(row.get('iteration', '')))
+                    raw = row.get(column, '')
+                    if raw is None or raw == '':
+                        continue
+                    y = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                xs.append(x)
+                ys.append(y)
+            return xs, ys
+
+        fig, axes = plt.subplots(3, 2, figsize=(14, 11))
+        fig.suptitle('RL Data Quality', fontsize=16, fontweight='bold')
+
+        ax = axes[0, 0]
+        for column, label, style in [
+            ('selfplay_decisive_rate', 'self-play decisive', 'go-'),
+            ('selfplay_draw_rate', 'self-play draw', 'bo-'),
+            ('selfplay_truncated_rate', 'truncated', 'ro--'),
+            ('replay_decisive_fraction', 'replay decisive', 'g^:'),
+            ('replay_draw_fraction', 'replay draw', 'b^:'),
+        ]:
+            xs, ys = _series(column)
+            if xs:
+                ax.plot(xs, ys, style, linewidth=1.7, markersize=4, label=label)
+        ax.set_title('Outcome Mix')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('fraction')
+        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+        ax.grid(True, alpha=0.3)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc='best', fontsize=8)
+
+        ax = axes[0, 1]
+        for column, label, style in [
+            ('policy_weight_mean', 'policy weight mean', 'ko-'),
+            ('policy_weight_p10', 'policy weight p10', 'ro--'),
+            ('policy_weight_low_fraction', 'low weight share', 'mo:'),
+            ('mcts_adaptive_stop_rate', 'early-stop share', 'co-'),
+            ('mcts_prior_changed_rate', 'MCTS changed prior top', 'b^:'),
+            ('mcts_changed_to_lower_q_rate', 'changed to lower Q', 'r^:'),
+        ]:
+            xs, ys = _series(column)
+            if xs:
+                ax.plot(xs, ys, style, linewidth=1.7, markersize=4, label=label)
+        ax.set_title('Search Target Confidence')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('fraction')
+        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+        ax.grid(True, alpha=0.3)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc='best', fontsize=8)
+
+        ax = axes[1, 0]
+        for column, label, style in [
+            ('policy_target_len_mean', 'target moves mean', 'bo-'),
+            ('policy_target_len_p90', 'target moves p90', 'co--'),
+        ]:
+            xs, ys = _series(column)
+            if xs:
+                ax.plot(xs, ys, style, linewidth=1.8, markersize=4, label=label)
+        ax.set_title('Policy Target Width')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('moves / position')
+        ax.grid(True, alpha=0.3)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc='best', fontsize=8)
+
+        ax = axes[1, 1]
+        for column, label, style in [
+            ('policy_target_entropy_mean', 'target entropy', 'mo-'),
+            ('policy_target_top1_prob_mean', 'top-1 probability', 'go--'),
+            ('train_policy_entropy', 'model entropy', 'ko:'),
+            ('mcts_prior_agreement_rate', 'MCTS/prior agreement', 'c^:'),
+        ]:
+            xs, ys = _series(column)
+            if xs:
+                ax.plot(xs, ys, style, linewidth=1.7, markersize=4, label=label)
+        ax.set_title('Policy Distribution Shape')
+        ax.set_xlabel('Iteration')
+        ax.grid(True, alpha=0.3)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc='best', fontsize=8)
+
+        ax = axes[2, 0]
+        for column, label, style in [
+            ('selfplay_avg_game_value', 'self-play value mean', 'bo-'),
+            ('selfplay_value_std', 'self-play value std', 'co--'),
+            ('replay_value_std', 'replay value std', 'go-'),
+            ('train_target_value_std', 'train target std', 'ko:'),
+        ]:
+            xs, ys = _series(column)
+            if xs:
+                ax.plot(xs, ys, style, linewidth=1.7, markersize=4, label=label)
+        ax.set_title('Value Signal')
+        ax.set_xlabel('Iteration')
+        ax.grid(True, alpha=0.3)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc='best', fontsize=8)
+
+        ax = axes[2, 1]
+        for column, label, style in [
+            ('replay_fill_rate', 'replay fill', 'ko-'),
+            ('importance_mean', 'importance mean', 'go-'),
+            ('importance_p90', 'importance p90', 'ro--'),
+        ]:
+            xs, ys = _series(column)
+            if xs:
+                ax.plot(xs, ys, style, linewidth=1.7, markersize=4, label=label)
+        ax.set_title('Replay Shape')
+        ax.set_xlabel('Iteration')
+        ax.grid(True, alpha=0.3)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc='best', fontsize=8)
+
+        fig.subplots_adjust(left=0.07, right=0.96, bottom=0.07, top=0.92, hspace=0.42, wspace=0.28)
+        fig.savefig(self.data_quality_plot_path, dpi=150)
         plt.close(fig)
 
     def record_estimated_elo(self, iteration, estimated_elo, update_csv=True):
@@ -1005,6 +1260,15 @@ class TrainingLogger:
                     kwargs.get('selfplay_decisive_avg_length', ''),
                     kwargs.get('selfplay_curriculum_dropped_positions', ''),
                     kwargs.get('selfplay_cap_dropped_positions', ''),
+                    kwargs.get('replay_decisive_fraction', ''),
+                    kwargs.get('replay_draw_fraction', ''),
+                    kwargs.get('policy_weight_mean', ''),
+                    kwargs.get('policy_weight_low_fraction', ''),
+                    kwargs.get('policy_target_len_mean', ''),
+                    kwargs.get('mcts_prior_agreement_rate', ''),
+                    kwargs.get('mcts_prior_changed_rate', ''),
+                    kwargs.get('mcts_changed_to_lower_q_rate', ''),
+                    kwargs.get('mcts_q_delta_mean', ''),
                     kwargs.get('adaptive_temp_adjustment', ''),
                     kwargs.get('adaptive_temp_threshold', ''),
                 ]

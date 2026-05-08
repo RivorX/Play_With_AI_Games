@@ -21,6 +21,7 @@ import hashlib
 from collections import OrderedDict
 from pathlib import Path
 from src.data import board_to_tensor, move_to_index
+from src.utils.data_helpers import _move_to_index_cached
 
 
 _EMPTY_HISTORY_TENSOR = np.zeros((16, 8, 8), dtype=np.float32)
@@ -398,6 +399,22 @@ _SELFPLAY_SELFPLAY_OPENING_LINES = _SELFPLAY_OPENING_LINES + _SELFPLAY_SHARP_OPE
 class MCTSEdgeStats:
     """Compact array-backed storage for all child-edge statistics of one node."""
 
+    __slots__ = (
+        "moves",
+        "nodes",
+        "priors",
+        "base_priors",
+        "visit_counts",
+        "total_counts",
+        "value_sums",
+        "virtual_losses",
+        "virtual_losses_f32",
+        "explored_flags",
+        "selection_scores",
+        "ucb_buffer",
+        "_move_to_child",
+    )
+
     def __init__(self):
         self.moves = ()
         self.nodes = []
@@ -481,6 +498,27 @@ class MCTSEdgeStats:
 
 class MCTSNode:
     """Node in the MCTS tree."""
+
+    __slots__ = (
+        "_board",
+        "parent",
+        "move",
+        "prior",
+        "base_prior",
+        "edges",
+        "parent_edge_index",
+        "_root_visit_count",
+        "_root_value_sum",
+        "expanded",
+        "_root_virtual_loss",
+        "_root_is_explored",
+        "_explored_prior_sum",
+        "_position_key_cache",
+        "_is_game_over",
+        "_board_tensor",
+        "_legal_moves",
+        "_legal_indices",
+    )
 
     def __init__(self, board=None, parent=None, move=None, prior=0.0, copy_board=True):
         if board is not None:
@@ -620,6 +658,10 @@ class MCTSNode:
     def expand_children(self, legal_moves, legal_priors):
         self.edges.reset(legal_moves, legal_priors)
         self.expanded = True
+        self._board_tensor = None
+        self._legal_moves = None
+        self._legal_indices = None
+        self._position_key_cache = None
 
     def iter_child_nodes(self):
         return self.edges.iter_nodes()
@@ -637,9 +679,19 @@ class MCTSNode:
 
     def get_legal_moves_and_indices(self):
         if self._legal_moves is None or self._legal_indices is None:
-            legal_moves = tuple(self.board.legal_moves)
+            board = self.board
+            is_black_turn = board.turn == chess.BLACK
+            legal_moves = tuple(board.legal_moves)
             legal_indices = np.fromiter(
-                (move_to_index(move, self.board) for move in legal_moves),
+                (
+                    _move_to_index_cached(
+                        move.from_square,
+                        move.to_square,
+                        move.promotion or 0,
+                        is_black_turn,
+                    )
+                    for move in legal_moves
+                ),
                 dtype=np.int32,
                 count=len(legal_moves),
             )
@@ -900,9 +952,17 @@ class MultiGameBatchMCTS:
 
         # History configuration (POV)
         self.history_positions = config['model'].get('history_positions', 0)
+        self.history_storage_dtype = (
+            np.float16
+            if bool(config['reinforcement_learning'].get('self_play_history_fp16', True))
+            else np.float32
+        )
 
         # Tree reuse
         self.reuse_tree = config['reinforcement_learning'].get('mcts_reuse_tree', True)
+        self.cache_node_tensors = bool(
+            config['reinforcement_learning'].get('mcts_cache_node_tensors', False)
+        )
 
         # Dirichlet noise params
         self.dirichlet_alpha = config['reinforcement_learning'].get('mcts_dirichlet_alpha', 0.3)
@@ -934,7 +994,7 @@ class MultiGameBatchMCTS:
         # Inference optimization (AMP on GPU)
         self.use_amp = config.get('hardware', {}).get('use_amp', False) and self.device.type == 'cuda'
         self.amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
-        self._empty_history_tensor = np.zeros((16, 8, 8), dtype=np.float32)
+        self._empty_history_tensor = _EMPTY_HISTORY_TENSOR
         self._board_planes = int(self._empty_history_tensor.shape[0])
         self._history_planes = int(self.history_positions) * self._board_planes
         self._input_planes = self._board_planes + self._history_planes
@@ -1025,15 +1085,16 @@ class MultiGameBatchMCTS:
         if not isinstance(board_obj, chess.Board):
             raise TypeError(f"Unsupported history entry type: {type(board_or_fen)}")
 
+        storage_dtype = self.history_storage_dtype
         if not self.profile_enabled:
             return (
-                board_to_tensor(board_obj, flip_perspective=False),
-                board_to_tensor(board_obj, flip_perspective=True),
+                board_to_tensor(board_obj, flip_perspective=False).astype(storage_dtype, copy=False),
+                board_to_tensor(board_obj, flip_perspective=True).astype(storage_dtype, copy=False),
             )
 
         t0 = time.perf_counter()
-        white_tensor = board_to_tensor(board_obj, flip_perspective=False)
-        black_tensor = board_to_tensor(board_obj, flip_perspective=True)
+        white_tensor = board_to_tensor(board_obj, flip_perspective=False).astype(storage_dtype, copy=False)
+        black_tensor = board_to_tensor(board_obj, flip_perspective=True).astype(storage_dtype, copy=False)
         self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
         self._profile_inc('board_to_tensor_calls', 2)
         return (white_tensor, black_tensor)
@@ -1083,6 +1144,15 @@ class MultiGameBatchMCTS:
         return np.concatenate(history_tensors, axis=0)
 
     def _current_tensor_for_node(self, node):
+        if not self.cache_node_tensors:
+            if not self.profile_enabled:
+                return board_to_tensor(node.board)
+            t0 = time.perf_counter()
+            tensor = board_to_tensor(node.board)
+            self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
+            self._profile_inc('board_to_tensor_calls', 1)
+            return tensor
+
         cached = getattr(node, "_board_tensor", None)
         if cached is None:
             if not self.profile_enabled:
@@ -1095,11 +1165,12 @@ class MultiGameBatchMCTS:
             node._board_tensor = cached
         return cached
 
-    def _get_legal_index_scratch(self, batch_size, max_legal_count):
-        key = (int(batch_size), int(max_legal_count))
+    def _get_legal_index_scratch(self, batch_size, max_legal_count, dtype=np.int64):
+        dtype = np.dtype(dtype)
+        key = (int(batch_size), int(max_legal_count), dtype.str)
         scratch = self._legal_index_scratch.get(key)
         if scratch is None:
-            scratch = np.empty((batch_size, max_legal_count), dtype=np.int64)
+            scratch = np.empty((batch_size, max_legal_count), dtype=dtype)
             self._legal_index_scratch[key] = scratch
         return scratch
 
@@ -1335,6 +1406,13 @@ class MultiGameBatchMCTS:
             'top_visit_prob': 0.0,
             'visit_gap': 0.0,
             'visit_entropy': 1.0,
+            'prior_mcts_agree': None,
+            'prior_top_visit_prob': None,
+            'prior_top_visit_rank': None,
+            'mcts_top_prior_prob': None,
+            'mcts_q_delta': None,
+            'mcts_changed_to_lower_q': None,
+            'mcts_policy_kl': None,
             'root_value': 0.0,
             'root_child_q_value': 0.0,
             'root_blended_value': 0.0,
@@ -1387,6 +1465,39 @@ class MultiGameBatchMCTS:
         summary['top_visit_prob'] = top / total
         summary['visit_gap'] = max(0.0, (top - second) / total)
         summary['visit_entropy'] = float(max(0.0, min(1.0, entropy)))
+
+        all_visits = root.edges.visit_counts.astype(np.float32, copy=False)
+        priors = root.edges.base_priors.astype(np.float32, copy=False)
+        prior_total = float(priors.sum())
+        if all_visits.size > 0 and priors.size == all_visits.size and prior_total > 0.0:
+            prior_probs = priors / prior_total
+            visit_probs = all_visits / max(1e-8, float(all_visits.sum()))
+            prior_top_idx = int(np.argmax(prior_probs))
+            mcts_top_idx = int(np.argmax(all_visits))
+            summary['prior_mcts_agree'] = 1.0 if prior_top_idx == mcts_top_idx else 0.0
+            summary['prior_top_visit_prob'] = float(visit_probs[prior_top_idx])
+            summary['mcts_top_prior_prob'] = float(prior_probs[mcts_top_idx])
+            rank_order = np.argsort(-all_visits)
+            rank_matches = np.where(rank_order == prior_top_idx)[0]
+            if rank_matches.size > 0:
+                summary['prior_top_visit_rank'] = int(rank_matches[0]) + 1
+            active = all_visits > 0.0
+            if active.any():
+                kl_terms = visit_probs[active] * (
+                    np.log(np.clip(visit_probs[active], 1e-12, 1.0))
+                    - np.log(np.clip(prior_probs[active], 1e-12, 1.0))
+                )
+                summary['mcts_policy_kl'] = float(max(0.0, float(kl_terms.sum())))
+            if all_visits[prior_top_idx] > 0.0 and all_visits[mcts_top_idx] > 0.0:
+                prior_q = -float(root.edges.value_sums[prior_top_idx]) / max(1.0, float(all_visits[prior_top_idx]))
+                mcts_q = -float(root.edges.value_sums[mcts_top_idx]) / max(1.0, float(all_visits[mcts_top_idx]))
+                q_delta = float(max(-2.0, min(2.0, mcts_q - prior_q)))
+                summary['mcts_q_delta'] = q_delta
+                summary['mcts_changed_to_lower_q'] = (
+                    1.0
+                    if prior_top_idx != mcts_top_idx and q_delta < -0.02
+                    else 0.0
+                )
         return summary
 
     def _adaptive_search_minimum_for_root(self, root):
@@ -1801,17 +1912,21 @@ class MultiGameBatchMCTS:
                     return None
                 return torch.cuda.Event(enable_timing=True)
 
+            remote_legal_gather = bool(getattr(self.model, 'supports_remote_legal_gather', False))
             h2d_start = _cuda_event()
             h2d_end = _cuda_event()
-            if h2d_start is not None:
-                h2d_start.record()
-            board_tensors = self._get_board_input_source_tensor(boards_np).to(
-                self.device,
-                memory_format=torch.channels_last,
-                non_blocking=True,
-            )
-            if h2d_end is not None:
-                h2d_end.record()
+            if remote_legal_gather:
+                board_tensors = boards_np
+            else:
+                if h2d_start is not None:
+                    h2d_start.record()
+                board_tensors = self._get_board_input_source_tensor(boards_np).to(
+                    self.device,
+                    memory_format=torch.channels_last,
+                    non_blocking=True,
+                )
+                if h2d_end is not None:
+                    h2d_end.record()
 
             legal_index_matrix = None
             if max_legal_count > 0:
@@ -1819,6 +1934,7 @@ class MultiGameBatchMCTS:
                 legal_index_matrix = self._get_legal_index_scratch(
                     len(non_terminal_nodes),
                     max_legal_count,
+                    dtype=np.int16 if remote_legal_gather else np.int64,
                 )
                 legal_index_matrix.fill(0)
                 for row_idx, legal_indices in enumerate(legal_indices_per_node):
@@ -1842,7 +1958,7 @@ class MultiGameBatchMCTS:
             model_kwargs = {'apply_log_softmax': False}
             if (
                 legal_index_matrix is not None
-                and bool(getattr(self.model, 'supports_remote_legal_gather', False))
+                and remote_legal_gather
             ):
                 model_kwargs['legal_index_matrix'] = legal_index_matrix
             with torch.inference_mode():
@@ -2811,6 +2927,8 @@ class BatchSelfPlayMCTSBatch:
                 history_positions=history_positions,
                 empty_history_tensor=_EMPTY_HISTORY_TENSOR,
             )
+            if board_tensor_np.dtype != np.float32:
+                board_tensor_np = board_tensor_np.astype(np.float32, copy=False)
             board_tensor = torch.from_numpy(board_tensor_np)
             positions.append((
                 board_tensor,
@@ -3195,6 +3313,43 @@ class BatchSelfPlayMCTSBatch:
             'stopped_early': 0,
             'stop_reasons': {},
         }
+        target_quality = {
+            'samples': 0,
+            'changed': 0,
+            'agreement_sum': 0.0,
+            'prior_top_visit_prob_sum': 0.0,
+            'mcts_top_prior_prob_sum': 0.0,
+            'policy_kl_sum': 0.0,
+            'q_comparable': 0,
+            'q_delta_sum': 0.0,
+            'changed_to_lower_q': 0,
+        }
+
+        def _accumulate_target_quality(search_metadata):
+            if not isinstance(search_metadata, dict):
+                return
+            agree = search_metadata.get('prior_mcts_agree', None)
+            if agree is None:
+                return
+            target_quality['samples'] += 1
+            agree_value = float(agree)
+            target_quality['agreement_sum'] += agree_value
+            if agree_value < 0.5:
+                target_quality['changed'] += 1
+            for meta_key, sum_key in [
+                ('prior_top_visit_prob', 'prior_top_visit_prob_sum'),
+                ('mcts_top_prior_prob', 'mcts_top_prior_prob_sum'),
+                ('mcts_policy_kl', 'policy_kl_sum'),
+            ]:
+                value = search_metadata.get(meta_key, None)
+                if value is not None:
+                    target_quality[sum_key] += float(value)
+            q_delta = search_metadata.get('mcts_q_delta', None)
+            if q_delta is not None:
+                target_quality['q_comparable'] += 1
+                target_quality['q_delta_sum'] += float(q_delta)
+                if float(search_metadata.get('mcts_changed_to_lower_q') or 0.0) > 0.5:
+                    target_quality['changed_to_lower_q'] += 1
 
         while len(completed_game_states) < total_games_to_play:
             active_indices = []
@@ -3334,6 +3489,7 @@ class BatchSelfPlayMCTSBatch:
                     importance_score = self._compute_position_importance(board, move, visit_counts, root)
                     root_value = 0.0
                     policy_weight = float(search_metadata.get('policy_weight', 1.0)) if isinstance(search_metadata, dict) else 1.0
+                    _accumulate_target_quality(search_metadata)
                     if root is not None:
                         root_visits = int(getattr(root, 'visit_count', 0) or 0)
                         if root_visits > 0:
@@ -3516,6 +3672,8 @@ class BatchSelfPlayMCTSBatch:
             source_label = 'mixed'
         elif len(opponent_source_counts) == 1:
             source_label = next(iter(opponent_source_counts.keys()))
+        target_quality_samples = int(target_quality['samples'])
+        target_quality_q_samples = int(target_quality['q_comparable'])
         return positions, game_lengths, {
             'total_games': int(len(completed_game_states)),
             'truncated_games': int(truncated_games),
@@ -3530,6 +3688,50 @@ class BatchSelfPlayMCTSBatch:
             'search_simulations_used_samples': list(search_stats['samples_list']),
             'adaptive_stopped_early': int(search_stats['stopped_early']),
             'adaptive_stop_reasons': dict(search_stats['stop_reasons']),
+            'mcts_prior_agreement_samples': target_quality_samples,
+            'mcts_prior_agreement_sum': float(target_quality['agreement_sum']),
+            'mcts_prior_changed_count': int(target_quality['changed']),
+            'mcts_prior_agreement_rate': (
+                float(target_quality['agreement_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_prior_changed_rate': (
+                float(target_quality['changed']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_prior_top_visit_prob_sum': float(target_quality['prior_top_visit_prob_sum']),
+            'mcts_prior_top_visit_prob_mean': (
+                float(target_quality['prior_top_visit_prob_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_top_prior_prob_sum': float(target_quality['mcts_top_prior_prob_sum']),
+            'mcts_top_prior_prob_mean': (
+                float(target_quality['mcts_top_prior_prob_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_policy_kl_sum': float(target_quality['policy_kl_sum']),
+            'mcts_policy_kl_mean': (
+                float(target_quality['policy_kl_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_q_delta_samples': target_quality_q_samples,
+            'mcts_q_delta_sum': float(target_quality['q_delta_sum']),
+            'mcts_q_delta_mean': (
+                float(target_quality['q_delta_sum']) / float(target_quality_q_samples)
+                if target_quality_q_samples > 0
+                else 0.0
+            ),
+            'mcts_changed_to_lower_q_count': int(target_quality['changed_to_lower_q']),
+            'mcts_changed_to_lower_q_rate': (
+                float(target_quality['changed_to_lower_q']) / float(target_quality_q_samples)
+                if target_quality_q_samples > 0
+                else 0.0
+            ),
             'resigned_games': int(resigned_games),
             'completed_length_sum': int(completed_length_sum),
             'truncated_length_sum': int(truncated_length_sum),
@@ -4133,7 +4335,11 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
         interval_batches = 0
 
         def _request_positions(req):
-            return int(np.asarray(req.get("boards")).shape[0])
+            boards = req.get("boards")
+            shape = getattr(boards, "shape", None)
+            if shape:
+                return int(shape[0])
+            return int(np.asarray(boards).shape[0])
 
         def _handle_request_item(item):
             nonlocal first_infer_seen, pending_started_at, pending_positions

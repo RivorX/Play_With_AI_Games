@@ -37,7 +37,9 @@ def _resolve_central_inference_server_count(config, worker_specs, device_type):
     )
     by_workers = max(1, (worker_count + target_workers_per_server - 1) // target_workers_per_server)
 
+    min_auto = max(1, int(rl_cfg.get('self_play_central_inference_auto_min_servers', 1) or 1))
     max_auto = max(1, int(rl_cfg.get('self_play_central_inference_auto_max_servers', 4) or 4))
+    max_auto = max(min_auto, max_auto)
     by_vram = max_auto
     try:
         total_gib = float(torch.cuda.get_device_properties(0).total_memory) / float(1024 ** 3)
@@ -50,7 +52,8 @@ def _resolve_central_inference_server_count(config, worker_specs, device_type):
     except Exception:
         by_vram = min(by_vram, 2)
 
-    return max(1, min(by_workers, by_vram, max_auto))
+    desired = max(by_workers, min_auto)
+    return max(1, min(desired, by_vram, max_auto))
 
 
 class _PersistentSelfPlayPool:

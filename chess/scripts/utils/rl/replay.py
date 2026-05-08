@@ -512,5 +512,89 @@ class ReplayBuffer:
         self._scratch = {}
         return True
 
+    def quality_stats(self, recent_window_fraction=None):
+        """Return cheap aggregate stats describing replay target quality."""
+        stats = {
+            "size": int(self.size),
+            "capacity": int(self.max_size),
+            "fill_rate": float(self.size) / float(max(1, self.max_size)),
+        }
+        if self.size <= 0 or self._boards is None:
+            return stats
+
+        values = self._values[:self.size].reshape(-1).float()
+        policy_lengths = self._policy_lengths[:self.size].to(dtype=torch.float32)
+        policy_weights = self._policy_sample_weights[:self.size].float()
+        importance = self._importance[:self.size].float()
+        decisive_mask = torch.abs(values) > float(self.decisive_value_epsilon)
+        draw_mask = ~decisive_mask
+
+        def _safe_mean(tensor):
+            if tensor.numel() <= 0:
+                return 0.0
+            return float(tensor.mean().item())
+
+        def _safe_std(tensor):
+            if tensor.numel() <= 0:
+                return 0.0
+            return float(tensor.std(unbiased=False).item())
+
+        def _safe_quantile(tensor, q):
+            if tensor.numel() <= 0:
+                return 0.0
+            try:
+                return float(torch.quantile(tensor.float(), float(q)).item())
+            except Exception:
+                return float(np.quantile(tensor.float().cpu().numpy(), float(q)))
+
+        stats.update({
+            "decisive_fraction": float(decisive_mask.float().mean().item()),
+            "draw_fraction": float(draw_mask.float().mean().item()),
+            "value_mean": _safe_mean(values),
+            "value_std": _safe_std(values),
+            "policy_weight_mean": _safe_mean(policy_weights),
+            "policy_weight_p10": _safe_quantile(policy_weights, 0.10),
+            "policy_weight_low_fraction": float((policy_weights < 0.75).float().mean().item()),
+            "policy_target_len_mean": _safe_mean(policy_lengths),
+            "policy_target_len_p90": _safe_quantile(policy_lengths, 0.90),
+            "importance_mean": _safe_mean(importance),
+            "importance_p90": _safe_quantile(importance, 0.90),
+        })
+
+        policy_values = self._policy_values[:self.size].float()
+        if policy_values.numel() > 0:
+            valid_mask = self._policy_indices[:self.size] >= 0
+            probs = torch.where(valid_mask, torch.clamp(policy_values, min=0.0), torch.zeros_like(policy_values))
+            entropy = -(probs * torch.log(torch.clamp(probs, min=1e-12))).sum(dim=1)
+            top1 = probs.max(dim=1).values
+            non_empty = policy_lengths > 0
+            stats["policy_target_entropy_mean"] = _safe_mean(entropy[non_empty])
+            stats["policy_target_top1_prob_mean"] = _safe_mean(top1[non_empty])
+        else:
+            stats["policy_target_entropy_mean"] = 0.0
+            stats["policy_target_top1_prob_mean"] = 0.0
+
+        recent_fraction = (
+            self.recent_window_fraction
+            if recent_window_fraction is None
+            else max(0.01, min(1.0, float(recent_window_fraction)))
+        )
+        recent_count = max(1, int(round(float(self.size) * float(recent_fraction))))
+        recent_indices = self._ordered_indices_oldest_to_newest()[-recent_count:]
+        if recent_indices.size > 0:
+            idx = torch.as_tensor(recent_indices, dtype=torch.long)
+            recent_values = self._values[idx].reshape(-1).float()
+            recent_decisive = torch.abs(recent_values) > float(self.decisive_value_epsilon)
+            recent_weights = self._policy_sample_weights[idx].float()
+            stats.update({
+                "recent_count": int(recent_indices.size),
+                "recent_decisive_fraction": float(recent_decisive.float().mean().item()),
+                "recent_draw_fraction": float((~recent_decisive).float().mean().item()),
+                "recent_value_mean": _safe_mean(recent_values),
+                "recent_value_std": _safe_std(recent_values),
+                "recent_policy_weight_mean": _safe_mean(recent_weights),
+            })
+        return stats
+
     def __len__(self):
         return self.size

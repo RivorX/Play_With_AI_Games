@@ -209,7 +209,8 @@ reinforcement_learning:
   self_play_use_compile: true   # Self-play workers: torch.compile(mode=default) on CUDA; guarded so Windows workers don't compile/cache concurrently
   self_play_central_inference_enabled: true   # Use one GPU inference server for persistent self-play workers; workers keep MCTS trees on CPU
   self_play_central_inference_servers: auto # auto = shard workers across a safe number of GPU inference servers
-  self_play_central_inference_auto_workers_per_server: 10 # Auto target; 18 workers -> 2 CIL servers on your current setup
+  self_play_central_inference_auto_min_servers: 3 # Your 16GB GPU has enough headroom; start at 3 unless VRAM safety cap lowers it
+  self_play_central_inference_auto_workers_per_server: 6 # Auto target; 18 workers -> 3 CIL servers when VRAM allows it
   self_play_central_inference_auto_max_servers: 4 # Upper safety cap for auto CIL sharding
   self_play_central_inference_use_compile: true # Compile the single central GPU model; warmup happens before workers start
   self_play_central_inference_compile_warmup_batches: [1, 32, 128, 256] # Pre-warm common dynamic batch sizes outside self-play
@@ -234,7 +235,7 @@ reinforcement_learning:
   # Self-Play Game Flow
   # ---------------------------
   use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
-  max_batch_games_per_worker: 18     # Keep total active games/RAM near 16x20 while giving CPU more worker processes
+  max_batch_games_per_worker: 30     # Keep total active games/RAM near 16x20 while giving CPU more worker processes
   self_play_dispatch_chunk_games: 96 # Requested chunk cap; runtime caps it by games/worker so large chunks do not starve workers
   self_play_max_moves: 190          # Shorter cap: cut low-value sterile games earlier instead of harvesting many doomed draw samples
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
@@ -336,6 +337,8 @@ reinforcement_learning:
   mcts_simulations: 160     # Higher search pressure so RL learns from targets that more clearly improve over the IL prior
   mcts_batch_size: 192        # Lower search-batch latency; central inference already recovers GPU batching across workers
   mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
+  mcts_cache_node_tensors: false # Keep per-worker RAM lower; central inference rebuilds leaf tensors in batch anyway
+  self_play_history_fp16: true # Store active game history in fp16 inside workers; replay tensors are still emitted as fp32
   mcts_c_puct: 1.15          # Move back toward healthier exploration; too-low PUCT was over-trusting the current policy
   mcts_dynamic_c_puct: true  # MuZero-style dynamic exploration scaling by parent visits
   mcts_c_puct_base: 12000    # Slightly slower scaling keeps exploration healthier over a 96-sim search budget
@@ -427,13 +430,32 @@ reinforcement_learning:
   # Evaluation & Promotion
   # ---------------------------
   eval_games: 100            # Fallback total games when staged eval is disabled
-  eval_batch_games: 32       # Active MCTS eval games searched together in one process (raises GPU batch utilization)
+  eval_workers: auto         # MCTS eval uses all logical CPU threads plus central GPU inference
+  eval_cpu_threads_to_reserve: 0
+  eval_torch_threads: 1
+  eval_batch_games: 16       # Active MCTS eval games searched together inside each worker
+  eval_central_inference_enabled: true
+  eval_central_inference_min_games: 2
+  eval_central_inference_servers: auto
+  eval_central_inference_auto_min_servers: 2
+  eval_central_inference_auto_workers_per_server: 6
+  eval_central_inference_auto_max_servers: 3
+  eval_central_inference_flush_ms: 2.0
+  eval_central_inference_max_batch_size: 256
+  eval_central_inference_transport_dtype: "float16"
+  eval_central_inference_timeout_s: 0
+  eval_central_inference_stall_warning_s: 15
+  eval_central_inference_load_timeout_s: 300
+  eval_central_inference_use_compile: true
+  eval_central_inference_compile_warmup_batches: [1, 32, 128, 256]
+  eval_central_inference_cudnn_benchmark: false
+  eval_central_inference_cache_enabled: false
   eval_mcts_simulations_multiplier: 2.5  # Eval uses base mcts_simulations * this multiplier (1.0 = same search budget as self-play base)
   eval_max_moves: 320        # Align eval with self-play so results are not dominated by ultra-long unresolved games
   eval_auto_claim_draw: true
   eval_claim_repetition_after_moves: 70
   eval_claim_draw_after_moves: 180  # Generic claimable draws after ~70 full moves
-  eval_every: 3              # Slightly faster feedback loop while iterating toward surpassing IL
+  eval_every: 1              # Slightly faster feedback loop while iterating toward surpassing IL
   eval_no_mcts_enabled: true  # Extra policy-only evaluation: no MCTS, does not affect best-model promotion
   eval_no_mcts_every: 1       # Run the no-MCTS eval every RL iteration
   eval_no_mcts_games: 100       # Cheap raw-policy signal every iteration without slowing RL too much

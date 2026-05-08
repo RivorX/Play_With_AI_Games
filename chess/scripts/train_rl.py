@@ -848,8 +848,18 @@ def play_games_parallel_mcts(
         if central_inference_enabled:
             central_servers = _resolve_central_inference_server_count(config, worker_specs, device_type)
             raw_central_servers = str(rl_cfg.get('self_play_central_inference_servers', 'auto'))
-            auto_suffix = " auto" if raw_central_servers.strip().lower() in {'auto', 'automatic'} else ""
+            is_auto_cil = raw_central_servers.strip().lower() in {'auto', 'automatic'}
+            auto_suffix = " auto" if is_auto_cil else ""
             central_inference_info = f"on  ({central_servers} server{'y' if central_servers != 1 else ''}{auto_suffix})"
+            if is_auto_cil:
+                print(
+                    "Central inference auto: "
+                    f"workers={len(worker_specs)}, "
+                    f"target_workers_per_server={int(rl_cfg.get('self_play_central_inference_auto_workers_per_server', 10) or 10)}, "
+                    f"min={int(rl_cfg.get('self_play_central_inference_auto_min_servers', 1) or 1)}, "
+                    f"max={int(rl_cfg.get('self_play_central_inference_auto_max_servers', 4) or 4)}, "
+                    f"resolved={central_servers}"
+                )
         max_parallel_games = sum(
             min(max_batch_games if use_batch_selfplay else 1, games)
             for _, games in worker_specs
@@ -923,6 +933,7 @@ def play_games_parallel_mcts(
     queue_wait_total_s = 0.0
     queue_wait_events = 0
     queue_profile_stats = {}
+    queue_mcts_quality_stats = defaultdict(float)
     queue_opponent_source_games = defaultdict(int)
     queue_opponent_source_results = defaultdict(lambda: {"wins": 0, "draws": 0, "losses": 0, "games": 0})
     selfplay_pool = None
@@ -936,6 +947,21 @@ def play_games_parallel_mcts(
                 target[str(key)] = int(target.get(str(key), 0)) + int(value)
             else:
                 target[str(key)] = float(target.get(str(key), 0.0)) + float(value)
+
+    def _accumulate_mcts_quality_stats(target, source):
+        source = dict(source or {})
+        for key in [
+            'mcts_prior_agreement_samples',
+            'mcts_prior_agreement_sum',
+            'mcts_prior_changed_count',
+            'mcts_prior_top_visit_prob_sum',
+            'mcts_top_prior_prob_sum',
+            'mcts_policy_kl_sum',
+            'mcts_q_delta_samples',
+            'mcts_q_delta_sum',
+            'mcts_changed_to_lower_q_count',
+        ]:
+            target[key] = float(target.get(key, 0.0)) + float(source.get(key, 0.0) or 0.0)
 
     try:
         if use_persistent_pool:
@@ -1165,6 +1191,7 @@ def play_games_parallel_mcts(
                                     queue_adaptive_stop_reasons[reason] = (
                                         int(queue_adaptive_stop_reasons.get(reason, 0)) + int(count)
                                     )
+                                _accumulate_mcts_quality_stats(queue_mcts_quality_stats, chunk_stats)
                                 _accumulate_profile_stats(queue_profile_stats, chunk_stats.get('profile', {}) or {})
                                 source_counts = dict(chunk_stats.get('opponent_source_counts', {}) or {})
                                 if source_counts:
@@ -1314,6 +1341,7 @@ def play_games_parallel_mcts(
     total_adaptive_stopped_early = queue_adaptive_stopped_early if use_queue_transport else 0
     total_adaptive_stop_reasons = dict(queue_adaptive_stop_reasons) if use_queue_transport else {}
     total_profile_stats = dict(queue_profile_stats) if use_queue_transport else {}
+    total_mcts_quality_stats = dict(queue_mcts_quality_stats) if use_queue_transport else defaultdict(float)
     if use_queue_transport:
         avg_queue_wait_ms = 1000.0 * float(queue_wait_total_s) / float(max(1, queue_wait_events))
         total_profile_stats['queue_wait_time_ms'] = float(avg_queue_wait_ms)
@@ -1386,6 +1414,7 @@ def play_games_parallel_mcts(
                                 total_adaptive_stop_reasons[reason] = (
                                     int(total_adaptive_stop_reasons.get(reason, 0)) + int(count)
                                 )
+                            _accumulate_mcts_quality_stats(total_mcts_quality_stats, stats or {})
                             _accumulate_profile_stats(total_profile_stats, (stats or {}).get('profile', {}) or {})
                             source_counts = dict((stats or {}).get('opponent_source_counts', {}) or {})
                             if source_counts:
@@ -1544,6 +1573,8 @@ def play_games_parallel_mcts(
     avg_game_value = (total_value_sum / total_value_count) if total_value_count > 0 else 0.0
     value_var = (total_value_sq_sum / total_value_count) - (avg_game_value ** 2) if total_value_count > 0 else 0.0
     value_std = math.sqrt(max(0.0, value_var))
+    mcts_quality_samples = int(float(total_mcts_quality_stats.get('mcts_prior_agreement_samples', 0.0) or 0.0))
+    mcts_q_delta_samples = int(float(total_mcts_quality_stats.get('mcts_q_delta_samples', 0.0) or 0.0))
     selfplay_stats = {
         'startup_time': float(selfplay_startup_time),
         'completed_games': int(completed_games),
@@ -1573,6 +1604,43 @@ def play_games_parallel_mcts(
         'adaptive_stopped_early': int(total_adaptive_stopped_early),
         'adaptive_stop_rate': float(total_adaptive_stopped_early) / float(total_search_samples) if total_search_samples > 0 else 0.0,
         'adaptive_stop_reasons': dict(total_adaptive_stop_reasons),
+        'mcts_prior_agreement_samples': int(mcts_quality_samples),
+        'mcts_prior_agreement_rate': (
+            float(total_mcts_quality_stats.get('mcts_prior_agreement_sum', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_prior_changed_rate': (
+            float(total_mcts_quality_stats.get('mcts_prior_changed_count', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_prior_top_visit_prob_mean': (
+            float(total_mcts_quality_stats.get('mcts_prior_top_visit_prob_sum', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_top_prior_prob_mean': (
+            float(total_mcts_quality_stats.get('mcts_top_prior_prob_sum', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_policy_kl_mean': (
+            float(total_mcts_quality_stats.get('mcts_policy_kl_sum', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_q_delta_samples': int(mcts_q_delta_samples),
+        'mcts_q_delta_mean': (
+            float(total_mcts_quality_stats.get('mcts_q_delta_sum', 0.0) or 0.0) / float(mcts_q_delta_samples)
+            if mcts_q_delta_samples > 0
+            else 0.0
+        ),
+        'mcts_changed_to_lower_q_rate': (
+            float(total_mcts_quality_stats.get('mcts_changed_to_lower_q_count', 0.0) or 0.0) / float(mcts_q_delta_samples)
+            if mcts_q_delta_samples > 0
+            else 0.0
+        ),
         'opponent_results': {
             str(label): {
                 'wins': int((stats or {}).get('wins', 0)),
@@ -2140,6 +2208,7 @@ def main():
         )
         logger.plot()
         logger.plot_rl_performance()
+        logger.plot_rl_data_quality()
         return
 
     base_mcts_temperature_threshold = int(rl_cfg.get('mcts_temperature_threshold', 16))
@@ -2370,6 +2439,9 @@ def main():
                     )
              
             print(f"Replay buffer: {len(replay_buffer)}/{replay_buffer.max_size} positions (+{positions_added})")
+            replay_quality_stats = replay_buffer.quality_stats(
+                recent_window_fraction=config['reinforcement_learning'].get('replay_recent_window_fraction', None)
+            )
             print(
                 f"Self-play stats: draw_rate={float((selfplay_stats or {}).get('completed_draw_rate', 0.0)):.2%}, "
                 f"avg_value={float((selfplay_stats or {}).get('avg_game_value', 0.0)):.3f}, "
@@ -2381,6 +2453,15 @@ def main():
                 f"early={100.0 * float((selfplay_stats or {}).get('adaptive_stop_rate', 0.0)):.1f}%, "
                 f"samples={int((selfplay_stats or {}).get('search_samples', 0))}"
             )
+            if int((selfplay_stats or {}).get('mcts_prior_agreement_samples', 0) or 0) > 0:
+                print(
+                    "MCTS vs prior: "
+                    f"agree={float((selfplay_stats or {}).get('mcts_prior_agreement_rate', 0.0)):.2%}, "
+                    f"changed={float((selfplay_stats or {}).get('mcts_prior_changed_rate', 0.0)):.2%}, "
+                    f"lowerQ={float((selfplay_stats or {}).get('mcts_changed_to_lower_q_rate', 0.0)):.2%}, "
+                    f"q_delta={float((selfplay_stats or {}).get('mcts_q_delta_mean', 0.0)):+.3f}, "
+                    f"KL={float((selfplay_stats or {}).get('mcts_policy_kl_mean', 0.0)):.3f}"
+                )
             adaptive_stop_reasons = dict((selfplay_stats or {}).get('adaptive_stop_reasons', {}) or {})
             if adaptive_stop_reasons:
                 reason_text = ", ".join(
@@ -2703,6 +2784,15 @@ def main():
                     selfplay_decisive_avg_length=(selfplay_stats or {}).get('decisive_avg_length', None),
                     selfplay_curriculum_dropped_positions=(selfplay_stats or {}).get('curriculum_dropped_positions', None),
                     selfplay_cap_dropped_positions=(selfplay_stats or {}).get('cap_dropped_positions', None),
+                    replay_decisive_fraction=replay_quality_stats.get('decisive_fraction', None),
+                    replay_draw_fraction=replay_quality_stats.get('draw_fraction', None),
+                    policy_weight_mean=replay_quality_stats.get('policy_weight_mean', None),
+                    policy_weight_low_fraction=replay_quality_stats.get('policy_weight_low_fraction', None),
+                    policy_target_len_mean=replay_quality_stats.get('policy_target_len_mean', None),
+                    mcts_prior_agreement_rate=(selfplay_stats or {}).get('mcts_prior_agreement_rate', None),
+                    mcts_prior_changed_rate=(selfplay_stats or {}).get('mcts_prior_changed_rate', None),
+                    mcts_changed_to_lower_q_rate=(selfplay_stats or {}).get('mcts_changed_to_lower_q_rate', None),
+                    mcts_q_delta_mean=(selfplay_stats or {}).get('mcts_q_delta_mean', None),
                     adaptive_temp_adjustment=temp_debug.get('adjustment', None),
                     adaptive_temp_threshold=current_temp_threshold,
                 )
@@ -2778,6 +2868,7 @@ def main():
                     )
                     logger.plot()
                     logger.plot_rl_performance()
+                    logger.plot_rl_data_quality()
                     _finish_stage('eval_log')
                     _emit_iteration_profile()
                     break
@@ -2817,6 +2908,15 @@ def main():
                     selfplay_decisive_avg_length=(selfplay_stats or {}).get('decisive_avg_length', None),
                     selfplay_curriculum_dropped_positions=(selfplay_stats or {}).get('curriculum_dropped_positions', None),
                     selfplay_cap_dropped_positions=(selfplay_stats or {}).get('cap_dropped_positions', None),
+                    replay_decisive_fraction=replay_quality_stats.get('decisive_fraction', None),
+                    replay_draw_fraction=replay_quality_stats.get('draw_fraction', None),
+                    policy_weight_mean=replay_quality_stats.get('policy_weight_mean', None),
+                    policy_weight_low_fraction=replay_quality_stats.get('policy_weight_low_fraction', None),
+                    policy_target_len_mean=replay_quality_stats.get('policy_target_len_mean', None),
+                    mcts_prior_agreement_rate=(selfplay_stats or {}).get('mcts_prior_agreement_rate', None),
+                    mcts_prior_changed_rate=(selfplay_stats or {}).get('mcts_prior_changed_rate', None),
+                    mcts_changed_to_lower_q_rate=(selfplay_stats or {}).get('mcts_changed_to_lower_q_rate', None),
+                    mcts_q_delta_mean=(selfplay_stats or {}).get('mcts_q_delta_mean', None),
                     adaptive_temp_adjustment=temp_debug.get('adjustment', None),
                     adaptive_temp_threshold=current_temp_threshold,
                 )
@@ -2832,6 +2932,7 @@ def main():
 
             logger.plot()
             logger.plot_rl_performance()
+            logger.plot_rl_data_quality()
 
             latest_metadata = {
                 'win_rate': true_win_rate,
@@ -2879,7 +2980,16 @@ def main():
                 avg_game_length=avg_game_length,
                 profile=performance_profile,
             )
+            logger.log_rl_data_quality(
+                iteration + 1,
+                positions_added=positions_added,
+                replay_stats=replay_quality_stats,
+                selfplay_stats=selfplay_stats,
+                train_policy_entropy=avg_policy_entropy,
+                train_target_value_std=avg_target_value_std,
+            )
             logger.plot_rl_performance()
+            logger.plot_rl_data_quality()
             _emit_iteration_profile()
     except RLTrainingInterrupted as exc:
         training_interrupted = True
@@ -2903,6 +3013,7 @@ def main():
 
     logger.plot()
     logger.plot_rl_performance()
+    logger.plot_rl_data_quality()
     if training_interrupted:
         _handle_graceful_interrupt(logger=logger, stage=interrupted_stage)
         return
