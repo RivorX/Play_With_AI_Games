@@ -121,14 +121,19 @@ class TrainingLogger:
                     'iteration',
                     'timestamp',
                     'positions_per_sec',
+                    'iteration_total_time_s',
                     'selfplay_time_s',
                     'data_collection_time_s',
                     'avg_game_length',
                     'mcts_avg_batch_size',
                     'mcts_central_avg_batch_size',
                     'central_remote_wait_ms_per_request',
+                    'central_request_put_ms_per_request',
                     'central_server_queue_wait_ms_per_request',
+                    'central_server_concat_ms_per_request',
+                    'central_server_h2d_ms_per_request',
                     'central_server_forward_ms_per_request',
+                    'central_server_d2h_ms_per_request',
                     'central_server_total_ms_per_request',
                     'mcts_gpu_utilization_pct',
                     'mcts_inference_ms_per_position',
@@ -257,6 +262,7 @@ class TrainingLogger:
         self,
         iteration,
         positions_per_sec=None,
+        iteration_total_time=None,
         selfplay_time=None,
         data_collection_time=None,
         avg_game_length=None,
@@ -267,6 +273,37 @@ class TrainingLogger:
             return
         profile = dict(profile or {})
 
+        def _float_or_none(value):
+            try:
+                if value is None or value == '':
+                    return None
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _int_or_none(value):
+            try:
+                if value is None or value == '':
+                    return None
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        nn_calls = _int_or_none(profile.get('mcts_nn_inference_calls'))
+        nn_items = _int_or_none(profile.get('mcts_nn_inference_batch_items'))
+        if nn_calls and nn_calls > 0 and nn_items is not None:
+            profile['average_batch_size'] = float(nn_items) / float(nn_calls)
+
+        central_requests = _int_or_none(profile.get('mcts_central_inference_requests'))
+        central_items = _int_or_none(profile.get('mcts_central_inference_server_batch_items'))
+        if central_requests and central_requests > 0 and central_items is not None:
+            profile['central_average_batch_size'] = float(central_items) / float(central_requests)
+
+        search_time = _float_or_none(profile.get('mcts_search_many_time'))
+        nn_time = _float_or_none(profile.get('mcts_nn_inference_time'))
+        if search_time and search_time > 0.0 and nn_time is not None:
+            profile['gpu_utilization_pct'] = max(0.0, min(100.0, 100.0 * float(nn_time) / float(search_time)))
+
         def _value(key, default=''):
             value = profile.get(key, default)
             return default if value is None else value
@@ -275,14 +312,19 @@ class TrainingLogger:
             int(iteration),
             datetime.now().isoformat(timespec='seconds'),
             '' if positions_per_sec is None else positions_per_sec,
+            '' if iteration_total_time is None else iteration_total_time,
             '' if selfplay_time is None else selfplay_time,
             '' if data_collection_time is None else data_collection_time,
             '' if avg_game_length is None else avg_game_length,
             _value('average_batch_size'),
             _value('central_average_batch_size'),
             _value('central_remote_wait_ms_per_request'),
+            _value('central_request_put_ms_per_request'),
             _value('central_server_queue_wait_ms_per_request'),
+            _value('central_server_concat_ms_per_request'),
+            _value('central_server_h2d_ms_per_request'),
             _value('central_server_forward_ms_per_request'),
+            _value('central_server_d2h_ms_per_request'),
             _value('central_server_total_ms_per_request'),
             _value('gpu_utilization_pct'),
             _value('inference_time_per_position_ms'),
@@ -342,6 +384,7 @@ class TrainingLogger:
 
         ax = axes[0, 1]
         for column, label, style in [
+            ('iteration_total_time_s', 'Iteration total', 'ko-'),
             ('selfplay_time_s', 'Self-play', 'ro-'),
             ('data_collection_time_s', 'Collection', 'go-'),
             ('mcts_search_many_time_s', 'MCTS search_many', 'mo--'),
@@ -378,6 +421,20 @@ class TrainingLogger:
 
         ax = axes[1, 1]
         xs, ys = _series('mcts_gpu_utilization_pct')
+        if ys and any(float(y) > 100.0 for y in ys):
+            xs = []
+            ys = []
+            for row in rows:
+                try:
+                    iteration = int(float(row.get('iteration', '')))
+                    nn_time = float(row.get('mcts_nn_inference_time_s', '') or 0.0)
+                    search_time = float(row.get('mcts_search_many_time_s', '') or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if search_time <= 0.0:
+                    continue
+                xs.append(iteration)
+                ys.append(max(0.0, min(100.0, 100.0 * nn_time / search_time)))
         if xs:
             ax.plot(xs, ys, 'yo-', linewidth=2, markersize=5)
         ax.set_title('MCTS GPU Utilization Proxy')
@@ -389,8 +446,12 @@ class TrainingLogger:
         ax = axes[2, 0]
         for column, label, style in [
             ('central_remote_wait_ms_per_request', 'worker wait', 'ro-'),
+            ('central_request_put_ms_per_request', 'queue put', 'ko:'),
             ('central_server_queue_wait_ms_per_request', 'server queue', 'co--'),
+            ('central_server_concat_ms_per_request', 'concat/ipc', 'bo:'),
+            ('central_server_h2d_ms_per_request', 'h2d', 'yo:'),
             ('central_server_forward_ms_per_request', 'server forward', 'go-'),
+            ('central_server_d2h_ms_per_request', 'd2h', 'ko:'),
             ('central_server_total_ms_per_request', 'server total', 'mo--'),
         ]:
             xs, ys = _series(column)

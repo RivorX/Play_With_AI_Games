@@ -15,6 +15,44 @@ from src.batch_selfplay import persistent_selfplay_worker, central_inference_ser
 WORKER_INTERRUPT_EXIT_CODE = 130
 _SELFPLAY_POOL = None
 
+
+def _resolve_central_inference_server_count(config, worker_specs, device_type):
+    rl_cfg = config.get('reinforcement_learning', {})
+    central_enabled = bool(
+        rl_cfg.get('self_play_central_inference_enabled', False)
+        and device_type == 'cuda'
+        and torch.cuda.is_available()
+    )
+    if not central_enabled:
+        return 0
+
+    raw_value = rl_cfg.get('self_play_central_inference_servers', 'auto')
+    if str(raw_value).strip().lower() not in {'auto', 'automatic'}:
+        return max(1, int(raw_value or 1))
+
+    worker_count = max(1, len(list(worker_specs)))
+    target_workers_per_server = max(
+        4,
+        int(rl_cfg.get('self_play_central_inference_auto_workers_per_server', 10) or 10),
+    )
+    by_workers = max(1, (worker_count + target_workers_per_server - 1) // target_workers_per_server)
+
+    max_auto = max(1, int(rl_cfg.get('self_play_central_inference_auto_max_servers', 4) or 4))
+    by_vram = max_auto
+    try:
+        total_gib = float(torch.cuda.get_device_properties(0).total_memory) / float(1024 ** 3)
+        if total_gib < 10.0:
+            by_vram = 1
+        elif total_gib < 14.0:
+            by_vram = min(by_vram, 2)
+        elif total_gib < 24.0:
+            by_vram = min(by_vram, 3)
+    except Exception:
+        by_vram = min(by_vram, 2)
+
+    return max(1, min(by_workers, by_vram, max_auto))
+
+
 class _PersistentSelfPlayPool:
     def __init__(self, config, worker_specs, device_type, temp_dir):
         self.config = config
@@ -31,10 +69,22 @@ class _PersistentSelfPlayPool:
             and device_type == 'cuda'
             and torch.cuda.is_available()
         )
-        self.inference_request_queue = self.mp_ctx.Queue() if self.central_inference_enabled else None
-        self.inference_control_queue = self.mp_ctx.Queue() if self.central_inference_enabled else None
+        self.central_inference_server_count = _resolve_central_inference_server_count(
+            config,
+            self.worker_specs,
+            device_type,
+        )
+        self.inference_request_queues = [
+            self.mp_ctx.Queue() for _ in range(self.central_inference_server_count)
+        ]
+        self.inference_control_queues = [
+            self.mp_ctx.Queue() for _ in range(self.central_inference_server_count)
+        ]
+        self.inference_request_queue = self.inference_request_queues[0] if self.inference_request_queues else None
+        self.inference_control_queue = self.inference_control_queues[0] if self.inference_control_queues else None
         self.inference_response_receivers = {}
         self.inference_response_senders = {}
+        self.inference_processes = []
         self.inference_process = None
         self._central_task_id = None
         self._central_loaded_labels = set()
@@ -47,11 +97,13 @@ class _PersistentSelfPlayPool:
             and device_type == 'cuda'
             and torch.cuda.is_available()
         )
+        wanted_servers = _resolve_central_inference_server_count(self.config, worker_specs, device_type)
         return (
             self.worker_specs == list(worker_specs)
             and self.device_type == device_type
             and self.temp_dir == Path(temp_dir)
             and self.central_inference_enabled == wanted_central
+            and self.central_inference_server_count == wanted_servers
         )
 
     def start(self):
@@ -64,20 +116,28 @@ class _PersistentSelfPlayPool:
                 recv_conn, send_conn = self.mp_ctx.Pipe(duplex=False)
                 self.inference_response_receivers[int(rank)] = recv_conn
                 self.inference_response_senders[int(rank)] = send_conn
-            self.inference_process = self.mp_ctx.Process(
-                target=central_inference_server,
-                args=(
-                    self.config,
-                    0,
-                    self.inference_request_queue,
-                    self.inference_response_senders,
-                    self.inference_control_queue,
-                ),
-            )
-            self.inference_process.daemon = True
-            self.inference_process.start()
+            for server_idx in range(self.central_inference_server_count):
+                inference_process = self.mp_ctx.Process(
+                    target=central_inference_server,
+                    args=(
+                        self.config,
+                        0,
+                        self.inference_request_queues[server_idx],
+                        self.inference_response_senders,
+                        self.inference_control_queues[server_idx],
+                    ),
+                )
+                inference_process.daemon = True
+                inference_process.start()
+                self.inference_processes.append(inference_process)
+            self.inference_process = self.inference_processes[0] if self.inference_processes else None
 
         for rank, _ in self.worker_specs:
+            inference_server_idx = (
+                int(rank) % self.central_inference_server_count
+                if self.central_inference_enabled and self.central_inference_server_count > 0
+                else 0
+            )
             device_id = (
                 'cpu'
                 if self.central_inference_enabled
@@ -92,7 +152,11 @@ class _PersistentSelfPlayPool:
                     device_id,
                     task_queue,
                     self.result_queue,
-                    self.inference_request_queue,
+                    (
+                        self.inference_request_queues[inference_server_idx]
+                        if self.central_inference_enabled
+                        else None
+                    ),
                     self.inference_response_receivers.get(int(rank)),
                 ),
             )
@@ -104,7 +168,7 @@ class _PersistentSelfPlayPool:
         self.started = True
 
     def _prepare_central_inference_models(self, task_id, model_state, model_state_path, opponent_payload):
-        if not self.central_inference_enabled or self.inference_request_queue is None:
+        if not self.central_inference_enabled or not self.inference_request_queues:
             return
         task_id = str(task_id)
         clear = task_id != self._central_task_id
@@ -132,25 +196,31 @@ class _PersistentSelfPlayPool:
             self._central_loaded_labels.add(label)
 
         if models_to_load or clear:
-            self.inference_request_queue.put({
-                "cmd": "load_models",
-                "task_id": task_id,
-                "clear": bool(clear),
-                "models": models_to_load,
-            })
+            for request_queue in self.inference_request_queues:
+                request_queue.put({
+                    "cmd": "load_models",
+                    "task_id": task_id,
+                    "clear": bool(clear),
+                    "models": models_to_load,
+                })
             timeout_s = float(self.config.get('reinforcement_learning', {}).get('self_play_central_inference_load_timeout_s', 300.0))
             import time
             end_time = time.time() + max(1.0, timeout_s)
-            while True:
-                remaining = max(0.01, end_time - time.time())
+            pending_servers = set(range(len(self.inference_control_queues)))
+            while pending_servers:
                 if time.time() >= end_time:
-                    raise TimeoutError(f"Central inference did not acknowledge model load for task {task_id}.")
-                try:
-                    message = self.inference_control_queue.get(timeout=min(remaining, 1.0))
-                except Exception:
-                    continue
-                if message.get("type") == "models_loaded" and str(message.get("task_id")) == task_id:
-                    break
+                    raise TimeoutError(
+                        f"Central inference did not acknowledge model load for task {task_id} "
+                        f"from servers {sorted(pending_servers)}."
+                    )
+                for server_idx in list(pending_servers):
+                    remaining = max(0.01, end_time - time.time())
+                    try:
+                        message = self.inference_control_queues[server_idx].get(timeout=min(remaining, 0.25))
+                    except Exception:
+                        continue
+                    if message.get("type") == "models_loaded" and str(message.get("task_id")) == task_id:
+                        pending_servers.discard(server_idx)
 
     def _prepare_task_files(self, rank, task_id):
         result_file = self.temp_dir / f"worker_{rank}_{task_id}.pkl"
@@ -248,15 +318,14 @@ class _PersistentSelfPlayPool:
                 task_queue.put({'cmd': 'stop'})
             except Exception:
                 pass
-        if self.inference_request_queue is not None:
+        for request_queue in self.inference_request_queues:
             try:
-                self.inference_request_queue.put({'cmd': 'stop'})
+                request_queue.put({'cmd': 'stop'})
             except Exception:
                 pass
 
         all_processes = list(self.processes.values())
-        if self.inference_process is not None:
-            all_processes.append(self.inference_process)
+        all_processes.extend(self.inference_processes)
         _terminate_workers(all_processes, timeout_s=timeout_s)
 
         for task_queue in self.task_queues.values():
@@ -269,13 +338,13 @@ class _PersistentSelfPlayPool:
         except Exception:
             pass
         try:
-            if self.inference_request_queue is not None:
-                self.inference_request_queue.close()
+            for request_queue in self.inference_request_queues:
+                request_queue.close()
         except Exception:
             pass
         try:
-            if self.inference_control_queue is not None:
-                self.inference_control_queue.close()
+            for control_queue in self.inference_control_queues:
+                control_queue.close()
         except Exception:
             pass
         for response_conn in list(self.inference_response_receivers.values()) + list(self.inference_response_senders.values()):
@@ -288,6 +357,11 @@ class _PersistentSelfPlayPool:
         self.processes.clear()
         self.inference_response_receivers.clear()
         self.inference_response_senders.clear()
+        self.inference_request_queues = []
+        self.inference_control_queues = []
+        self.inference_request_queue = None
+        self.inference_control_queue = None
+        self.inference_processes = []
         self.inference_process = None
         self._central_task_id = None
         self._central_loaded_labels = set()

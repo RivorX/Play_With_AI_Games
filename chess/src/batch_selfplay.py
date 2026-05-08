@@ -1927,6 +1927,10 @@ class MultiGameBatchMCTS:
                         float(getattr(self.model, 'last_remote_wait_s', 0.0) or 0.0),
                     )
                     self._profile_add(
+                        'central_inference_request_put_time',
+                        float(getattr(self.model, 'last_request_put_s', 0.0) or 0.0),
+                    )
+                    self._profile_add(
                         'central_inference_server_queue_wait_time',
                         float(getattr(self.model, 'last_server_queue_wait_s', 0.0) or 0.0),
                     )
@@ -1935,8 +1939,20 @@ class MultiGameBatchMCTS:
                         float(getattr(self.model, 'last_server_total_s', 0.0) or 0.0),
                     )
                     self._profile_add(
+                        'central_inference_server_concat_time',
+                        float(getattr(self.model, 'last_server_concat_s', 0.0) or 0.0),
+                    )
+                    self._profile_add(
+                        'central_inference_server_h2d_time',
+                        float(getattr(self.model, 'last_server_h2d_s', 0.0) or 0.0),
+                    )
+                    self._profile_add(
                         'central_inference_server_forward_time',
                         float(getattr(self.model, 'last_server_forward_s', 0.0) or 0.0),
+                    )
+                    self._profile_add(
+                        'central_inference_server_d2h_time',
+                        float(getattr(self.model, 'last_server_d2h_s', 0.0) or 0.0),
                     )
                 if use_cuda_stage_timing:
                     torch.cuda.synchronize(self.device)
@@ -2254,10 +2270,14 @@ class BatchSelfPlayMCTSBatch:
         nn_legal_move_items = int(aggregated.get('learner_mcts_nn_legal_move_items', 0) or 0)
         central_requests = int(aggregated.get('learner_mcts_central_inference_requests', 0) or 0)
         central_batch_items = int(aggregated.get('learner_mcts_central_inference_server_batch_items', 0) or 0)
+        central_request_put_time = float(aggregated.get('learner_mcts_central_inference_request_put_time', 0.0) or 0.0)
         central_remote_wait_time = float(aggregated.get('learner_mcts_central_inference_remote_wait_time', 0.0) or 0.0)
         central_server_queue_wait_time = float(aggregated.get('learner_mcts_central_inference_server_queue_wait_time', 0.0) or 0.0)
         central_server_total_time = float(aggregated.get('learner_mcts_central_inference_server_total_time', 0.0) or 0.0)
+        central_server_concat_time = float(aggregated.get('learner_mcts_central_inference_server_concat_time', 0.0) or 0.0)
+        central_server_h2d_time = float(aggregated.get('learner_mcts_central_inference_server_h2d_time', 0.0) or 0.0)
         central_server_forward_time = float(aggregated.get('learner_mcts_central_inference_server_forward_time', 0.0) or 0.0)
+        central_server_d2h_time = float(aggregated.get('learner_mcts_central_inference_server_d2h_time', 0.0) or 0.0)
         for label in self.opponent_mcts_by_label.keys():
             prefix = f"opponent_mcts_{label}_"
             search_many_time += float(aggregated.get(prefix + 'search_many_time', 0.0))
@@ -2273,10 +2293,14 @@ class BatchSelfPlayMCTSBatch:
             nn_legal_move_items += int(aggregated.get(prefix + 'nn_legal_move_items', 0) or 0)
             central_requests += int(aggregated.get(prefix + 'central_inference_requests', 0) or 0)
             central_batch_items += int(aggregated.get(prefix + 'central_inference_server_batch_items', 0) or 0)
+            central_request_put_time += float(aggregated.get(prefix + 'central_inference_request_put_time', 0.0) or 0.0)
             central_remote_wait_time += float(aggregated.get(prefix + 'central_inference_remote_wait_time', 0.0) or 0.0)
             central_server_queue_wait_time += float(aggregated.get(prefix + 'central_inference_server_queue_wait_time', 0.0) or 0.0)
             central_server_total_time += float(aggregated.get(prefix + 'central_inference_server_total_time', 0.0) or 0.0)
+            central_server_concat_time += float(aggregated.get(prefix + 'central_inference_server_concat_time', 0.0) or 0.0)
+            central_server_h2d_time += float(aggregated.get(prefix + 'central_inference_server_h2d_time', 0.0) or 0.0)
             central_server_forward_time += float(aggregated.get(prefix + 'central_inference_server_forward_time', 0.0) or 0.0)
+            central_server_d2h_time += float(aggregated.get(prefix + 'central_inference_server_d2h_time', 0.0) or 0.0)
         aggregated['mcts_search_many_time'] = float(search_many_time)
         aggregated['mcts_batch_expand_eval_time'] = float(batch_expand_time)
         aggregated['mcts_board_to_tensor_time'] = float(board_tensor_time)
@@ -2290,10 +2314,14 @@ class BatchSelfPlayMCTSBatch:
         aggregated['mcts_nn_legal_move_items'] = int(nn_legal_move_items)
         aggregated['mcts_central_inference_requests'] = int(central_requests)
         aggregated['mcts_central_inference_server_batch_items'] = int(central_batch_items)
+        aggregated['mcts_central_inference_request_put_time'] = float(central_request_put_time)
         aggregated['mcts_central_inference_remote_wait_time'] = float(central_remote_wait_time)
         aggregated['mcts_central_inference_server_queue_wait_time'] = float(central_server_queue_wait_time)
         aggregated['mcts_central_inference_server_total_time'] = float(central_server_total_time)
+        aggregated['mcts_central_inference_server_concat_time'] = float(central_server_concat_time)
+        aggregated['mcts_central_inference_server_h2d_time'] = float(central_server_h2d_time)
         aggregated['mcts_central_inference_server_forward_time'] = float(central_server_forward_time)
+        aggregated['mcts_central_inference_server_d2h_time'] = float(central_server_d2h_time)
         extra_mcts_time_metrics = [
             'search_root_setup_time',
             'search_selection_time',
@@ -2320,11 +2348,23 @@ class BatchSelfPlayMCTSBatch:
         aggregated['central_remote_wait_ms_per_request'] = (
             1000.0 * float(central_remote_wait_time / central_requests) if central_requests > 0 else 0.0
         )
+        aggregated['central_request_put_ms_per_request'] = (
+            1000.0 * float(central_request_put_time / central_requests) if central_requests > 0 else 0.0
+        )
         aggregated['central_server_queue_wait_ms_per_request'] = (
             1000.0 * float(central_server_queue_wait_time / central_requests) if central_requests > 0 else 0.0
         )
         aggregated['central_server_forward_ms_per_request'] = (
             1000.0 * float(central_server_forward_time / central_requests) if central_requests > 0 else 0.0
+        )
+        aggregated['central_server_h2d_ms_per_request'] = (
+            1000.0 * float(central_server_h2d_time / central_requests) if central_requests > 0 else 0.0
+        )
+        aggregated['central_server_d2h_ms_per_request'] = (
+            1000.0 * float(central_server_d2h_time / central_requests) if central_requests > 0 else 0.0
+        )
+        aggregated['central_server_concat_ms_per_request'] = (
+            1000.0 * float(central_server_concat_time / central_requests) if central_requests > 0 else 0.0
         )
         aggregated['central_server_total_ms_per_request'] = (
             1000.0 * float(central_server_total_time / central_requests) if central_requests > 0 else 0.0
@@ -3607,7 +3647,17 @@ def _load_worker_model_state(model, model_state, rank):
 class _RemoteInferenceModel:
     """Small model-like proxy used by MCTS workers with central GPU inference."""
 
-    def __init__(self, model_label, request_queue, response_queue, worker_rank, timeout_s=120.0, stall_warning_s=60.0, debug_enabled=False):
+    def __init__(
+        self,
+        model_label,
+        request_queue,
+        response_queue,
+        worker_rank,
+        timeout_s=120.0,
+        stall_warning_s=60.0,
+        debug_enabled=False,
+        transport_dtype="float16",
+    ):
         self.model_label = str(model_label or "learner")
         self.request_queue = request_queue
         self.response_queue = response_queue
@@ -3623,10 +3673,19 @@ class _RemoteInferenceModel:
         self._printed_first_response = False
         self.supports_remote_legal_gather = True
         self.last_response_compact_policy = False
+        self.last_request_put_s = 0.0
         self.last_remote_wait_s = 0.0
         self.last_server_queue_wait_s = 0.0
         self.last_server_total_s = 0.0
+        self.last_server_concat_s = 0.0
+        self.last_server_h2d_s = 0.0
         self.last_server_forward_s = 0.0
+        self.last_server_d2h_s = 0.0
+        self.last_server_send_s = 0.0
+        transport_dtype = str(transport_dtype or "float16").lower()
+        self.transport_dtype = "float32" if transport_dtype in {"float32", "fp32"} else "float16"
+        self._transport_torch_dtype = torch.float32 if self.transport_dtype == "float32" else torch.float16
+        self._transport_np_dtype = np.float32 if self.transport_dtype == "float32" else np.float16
 
     @property
     def training(self):
@@ -3659,9 +3718,9 @@ class _RemoteInferenceModel:
         self._request_counter += 1
         request_id = f"{os.getpid()}_{id(self)}_{self._request_counter}"
         if isinstance(board_tensors, torch.Tensor):
-            boards_np = board_tensors.detach().to('cpu', dtype=torch.float32).contiguous().numpy()
+            boards_np = board_tensors.detach().to('cpu', dtype=self._transport_torch_dtype).contiguous().numpy()
         else:
-            boards_np = np.asarray(board_tensors, dtype=np.float32)
+            boards_np = np.asarray(board_tensors, dtype=self._transport_np_dtype)
         request = {
             "cmd": "infer",
             "rank": self.worker_rank,
@@ -3670,9 +3729,12 @@ class _RemoteInferenceModel:
             "boards": boards_np,
         }
         if legal_index_matrix is not None:
-            request["legal_index_matrix"] = np.asarray(legal_index_matrix, dtype=np.int64)
+            request["legal_index_matrix"] = np.asarray(legal_index_matrix, dtype=np.int16)
+        request["transport_dtype"] = self.transport_dtype
         request["queued_at"] = time.time()
+        put_t0 = time.perf_counter()
         self.request_queue.put(request)
+        self.last_request_put_s = time.perf_counter() - put_t0
         if self.debug_enabled and not self._printed_first_request:
             self._printed_first_request = True
             print(
@@ -3720,7 +3782,11 @@ class _RemoteInferenceModel:
             self.last_response_compact_policy = bool(response.get("compact_policy", False))
             self.last_server_queue_wait_s = float(response.get("server_queue_wait_s", 0.0) or 0.0)
             self.last_server_total_s = float(response.get("server_total_time_s", 0.0) or 0.0)
+            self.last_server_concat_s = float(response.get("server_concat_time_s", 0.0) or 0.0)
+            self.last_server_h2d_s = float(response.get("server_h2d_time_s", 0.0) or 0.0)
             self.last_server_forward_s = float(response.get("server_forward_time_s", 0.0) or 0.0)
+            self.last_server_d2h_s = float(response.get("server_d2h_time_s", 0.0) or 0.0)
+            self.last_server_send_s = float(response.get("server_send_time_s", 0.0) or 0.0)
             if self.debug_enabled and not self._printed_first_response:
                 self._printed_first_response = True
                 print(
@@ -3748,6 +3814,8 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
     cache_enabled = bool(rl_cfg.get('self_play_central_inference_cache_enabled', True))
     cache_max_entries = max(0, int(rl_cfg.get('self_play_central_inference_cache_entries', 4096)))
     central_use_compile = bool(rl_cfg.get('self_play_central_inference_use_compile', False))
+    transport_dtype = str(rl_cfg.get('self_play_central_inference_transport_dtype', 'float16') or 'float16').lower()
+    transport_np_dtype = np.float32 if transport_dtype in {'float32', 'fp32'} else np.float16
 
     try:
         device = _configure_selfplay_worker_runtime(config, device_id)
@@ -3769,7 +3837,8 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
 
         print(
             f"[{_ts()}] Central inference: server ready on {device} "
-            f"(max_batch={max_batch}, flush={flush_ms:.1f}ms, "
+            f"(pid={os.getpid()}, max_batch={max_batch}, flush={flush_ms:.1f}ms, "
+            f"transport={transport_np_dtype.__name__}, "
             f"compile={'on' if central_use_compile else 'off'}, "
             f"cudnn.benchmark={torch.backends.cudnn.benchmark if device.type == 'cuda' else 'n/a'}).",
             flush=True,
@@ -3793,6 +3862,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
             input_planes = 16 * (1 + history_positions)
             use_amp = bool(config.get('hardware', {}).get('use_amp', False))
             amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
+            dummy_dtype = torch.float16 if use_amp and transport_np_dtype == np.float16 else torch.float32
             if debug_enabled:
                 print(
                     f"[{_ts()}] Central inference: warming compiled model '{label}' "
@@ -3808,7 +3878,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                         8,
                         8,
                         device=device,
-                        dtype=torch.float32,
+                        dtype=dummy_dtype,
                     ).to(memory_format=torch.channels_last)
                     with torch.autocast(device_type='cuda', enabled=use_amp, dtype=amp_dtype):
                         model(dummy_input, apply_log_softmax=False)
@@ -3901,7 +3971,10 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                 raise RuntimeError(f"Central inference has no model loaded for label '{model_label}'.")
 
             concat_t0 = time.perf_counter()
-            board_batches = [np.asarray(req["boards"], dtype=np.float32) for req in requests]
+            use_amp = bool(config.get('hardware', {}).get('use_amp', False) and device.type == 'cuda')
+            amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
+            input_np_dtype = transport_np_dtype if use_amp else np.float32
+            board_batches = [np.asarray(req["boards"], dtype=input_np_dtype) for req in requests]
             batch_sizes = [int(batch.shape[0]) for batch in board_batches]
             boards = np.concatenate(board_batches, axis=0)
             total_n = int(boards.shape[0])
@@ -3932,41 +4005,50 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                 compact_policy = False
                 legal_indices = None
             concat_time += time.perf_counter() - concat_t0
-            policy_out = [None] * total_n
-            value_out = [None] * total_n
-            uncached_indices = []
-            uncached_boards = []
             cache = caches.setdefault(model_label, OrderedDict())
             use_cache_for_group = bool(cache_enabled and cache_max_entries > 0 and not compact_policy)
 
-            for idx in range(total_n):
-                key = _cache_key(model_label, boards[idx]) if use_cache_for_group else None
-                if key is not None and key in cache:
-                    policy_np, value_np = cache.pop(key)
-                    cache[key] = (policy_np, value_np)
-                    policy_out[idx] = policy_np
-                    value_out[idx] = value_np
-                else:
-                    uncached_indices.append(idx)
-                    uncached_boards.append(boards[idx])
+            policy_out = None
+            value_out = None
+            uncached_indices = None
+            uncached_boards = boards
+            if use_cache_for_group:
+                policy_out = [None] * total_n
+                value_out = [None] * total_n
+                uncached_indices = []
+                uncached_board_list = []
+                for idx in range(total_n):
+                    key = _cache_key(model_label, boards[idx])
+                    if key in cache:
+                        policy_np, value_np = cache.pop(key)
+                        cache[key] = (policy_np, value_np)
+                        policy_out[idx] = policy_np
+                        value_out[idx] = value_np
+                    else:
+                        uncached_indices.append(idx)
+                        uncached_board_list.append(boards[idx])
+                uncached_boards = np.stack(uncached_board_list, axis=0) if uncached_board_list else None
 
-            if uncached_boards:
+            policy_np_direct = None
+            value_np_direct = None
+            if uncached_boards is not None and int(uncached_boards.shape[0]) > 0:
                 h2d_t0 = time.perf_counter()
-                tensor = torch.from_numpy(np.stack(uncached_boards, axis=0)).to(
+                tensor = torch.from_numpy(uncached_boards).to(
                     device,
                     memory_format=torch.channels_last,
                     non_blocking=True,
                 )
                 legal_index_tensor = None
                 if compact_policy:
-                    uncached_legal_indices = legal_indices[np.asarray(uncached_indices, dtype=np.int64)]
+                    if use_cache_for_group:
+                        uncached_legal_indices = legal_indices[np.asarray(uncached_indices, dtype=np.int64)]
+                    else:
+                        uncached_legal_indices = legal_indices
                     legal_index_tensor = torch.from_numpy(uncached_legal_indices).to(device, non_blocking=True)
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
                 h2d_time += time.perf_counter() - h2d_t0
                 with torch.inference_mode():
-                    use_amp = bool(config.get('hardware', {}).get('use_amp', False) and device.type == 'cuda')
-                    amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
                     forward_t0 = time.perf_counter()
                     if use_amp and device.type == 'cuda':
                         with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -3984,21 +4066,28 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                     if device.type == 'cuda':
                         torch.cuda.synchronize(device)
                     d2h_time += time.perf_counter() - d2h_t0
-                for local_idx, global_idx in enumerate(uncached_indices):
-                    policy_np = policy_np_batch[local_idx]
-                    value_np = value_np_batch[local_idx]
-                    policy_out[global_idx] = policy_np
-                    value_out[global_idx] = value_np
-                    if use_cache_for_group:
+                if use_cache_for_group:
+                    for local_idx, global_idx in enumerate(uncached_indices):
+                        policy_np = policy_np_batch[local_idx]
+                        value_np = value_np_batch[local_idx]
+                        policy_out[global_idx] = policy_np
+                        value_out[global_idx] = value_np
                         key = _cache_key(model_label, boards[global_idx])
                         cache[key] = (policy_np, value_np)
                         while len(cache) > cache_max_entries:
                             cache.popitem(last=False)
+                else:
+                    policy_np_direct = policy_np_batch
+                    value_np_direct = value_np_batch
 
             cursor = 0
             for req_idx, (req, batch_size) in enumerate(zip(requests, batch_sizes)):
-                policy_slice = np.stack(policy_out[cursor:cursor + batch_size], axis=0)
-                value_slice = np.stack(value_out[cursor:cursor + batch_size], axis=0)
+                if use_cache_for_group:
+                    policy_slice = np.stack(policy_out[cursor:cursor + batch_size], axis=0)
+                    value_slice = np.stack(value_out[cursor:cursor + batch_size], axis=0)
+                else:
+                    policy_slice = policy_np_direct[cursor:cursor + batch_size]
+                    value_slice = value_np_direct[cursor:cursor + batch_size]
                 cursor += batch_size
                 send_t0 = time.perf_counter()
                 _put_response(req, {
@@ -4009,7 +4098,11 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                     "compact_policy": bool(compact_policy),
                     "server_queue_wait_s": float(queue_waits[req_idx]) if req_idx < len(queue_waits) else 0.0,
                     "server_total_time_s": float(time.perf_counter() - group_t0),
+                    "server_concat_time_s": float(concat_time),
+                    "server_h2d_time_s": float(h2d_time),
                     "server_forward_time_s": float(forward_time),
+                    "server_d2h_time_s": float(d2h_time),
+                    "server_send_time_s": float(send_time),
                 })
                 send_time += time.perf_counter() - send_t0
             return {
@@ -4025,6 +4118,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
             }
 
         pending = []
+        pending_positions = 0
         pending_started_at = None
         first_infer_seen = False
         processed_requests = 0
@@ -4038,8 +4132,11 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
         interval_batch_wait_time = 0.0
         interval_batches = 0
 
+        def _request_positions(req):
+            return int(np.asarray(req.get("boards")).shape[0])
+
         def _handle_request_item(item):
-            nonlocal first_infer_seen, pending_started_at
+            nonlocal first_infer_seen, pending_started_at, pending_positions
             cmd = item.get("cmd")
             if cmd == "stop":
                 return "stop"
@@ -4085,15 +4182,17 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
             if cmd == "infer":
                 if pending_started_at is None:
                     pending_started_at = time.perf_counter()
+                item_positions = _request_positions(item)
                 if debug_enabled and not first_infer_seen:
                     first_infer_seen = True
                     print(
                         f"[{_ts()}] Central inference: received first inference request "
                         f"from worker {int(item.get('rank', -1))} "
-                        f"({int(np.asarray(item.get('boards')).shape[0])} positions).",
+                        f"({item_positions} positions).",
                         flush=True,
                     )
                 pending.append(item)
+                pending_positions += item_positions
                 return "infer"
             return "ignored"
 
@@ -4121,7 +4220,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                 if item_status == "control":
                     continue
 
-            while pending and sum(int(np.asarray(req.get("boards")).shape[0]) for req in pending) < max_batch:
+            while pending and pending_positions < max_batch:
                 try:
                     drained_item = request_queue.get_nowait()
                 except queue.Empty:
@@ -4132,11 +4231,10 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                 if item_status == "control":
                     continue
 
-            pending_items = sum(int(np.asarray(req.get("boards")).shape[0]) for req in pending)
             should_flush = (
                 pending
                 and (
-                    pending_items >= max_batch
+                    pending_positions >= max_batch
                     or (
                         pending_started_at is not None
                         and (time.perf_counter() - pending_started_at) >= (flush_ms / 1000.0)
@@ -4151,8 +4249,14 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
             for req in pending:
                 grouped.setdefault(str(req.get("model_label", "learner")), []).append(req)
             pending = []
+            pending_positions = 0
             pending_started_at = None
-            for model_label, requests in grouped.items():
+            grouped_items = sorted(
+                grouped.items(),
+                key=lambda item_pair: sum(_request_positions(req) for req in item_pair[1]),
+                reverse=True,
+            )
+            for model_label, requests in grouped_items:
                 try:
                     infer_t0 = time.perf_counter()
                     stage_stats = _infer_group(model_label, requests)
@@ -4442,6 +4546,9 @@ def persistent_selfplay_worker(
                 rl_cfg.get('self_play_central_inference_stall_warning_s', 60.0),
             )
         )
+        central_transport_dtype = str(
+            rl_cfg.get('self_play_central_inference_transport_dtype', 'float16') or 'float16'
+        )
         model = None if central_inference_enabled else _build_selfplay_worker_model(config, device)
         inference_model = (
             _RemoteInferenceModel(
@@ -4452,6 +4559,7 @@ def persistent_selfplay_worker(
                 timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 120.0)),
                 stall_warning_s=central_stall_warning_s,
                 debug_enabled=central_debug_enabled,
+                transport_dtype=central_transport_dtype,
             )
             if central_inference_enabled
             else _maybe_compile_selfplay_model(
@@ -4513,6 +4621,7 @@ def persistent_selfplay_worker(
                             timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 120.0)),
                             stall_warning_s=central_stall_warning_s,
                             debug_enabled=central_debug_enabled,
+                            transport_dtype=central_transport_dtype,
                         )
                     else:
                         if entry_state is None:

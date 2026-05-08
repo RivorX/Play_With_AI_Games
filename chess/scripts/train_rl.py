@@ -95,6 +95,7 @@ from utils.rl.opponent_scheduler import (
     _update_adaptive_opponent_scheduler,
 )
 from utils.rl.persistent_pool import (
+    _resolve_central_inference_server_count,
     get_or_create_selfplay_pool,
     _shutdown_selfplay_pool,
     _terminate_process_tree,
@@ -564,7 +565,6 @@ def _handle_graceful_interrupt(logger=None, stage=None):
     if logger is not None:
         try:
             logger.plot()
-            logger.plot_rl_performance()
         except Exception:
             pass
     cleanup_interrupted_log_csv(_LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG, "RL")
@@ -839,15 +839,17 @@ def play_games_parallel_mcts(
             if dynamic_dispatch_enabled
             else "-"
         )
-        central_inference_info = (
-            "on"
-            if (
-                device_type == 'cuda'
-                and use_persistent_pool
-                and bool(rl_cfg.get('self_play_central_inference_enabled', False))
-            )
-            else "off"
+        central_inference_enabled = (
+            device_type == 'cuda'
+            and use_persistent_pool
+            and bool(rl_cfg.get('self_play_central_inference_enabled', False))
         )
+        central_inference_info = "off"
+        if central_inference_enabled:
+            central_servers = _resolve_central_inference_server_count(config, worker_specs, device_type)
+            raw_central_servers = str(rl_cfg.get('self_play_central_inference_servers', 'auto'))
+            auto_suffix = " auto" if raw_central_servers.strip().lower() in {'auto', 'automatic'} else ""
+            central_inference_info = f"on  ({central_servers} server{'y' if central_servers != 1 else ''}{auto_suffix})"
         max_parallel_games = sum(
             min(max_batch_games if use_batch_selfplay else 1, games)
             for _, games in worker_specs
@@ -2314,6 +2316,7 @@ def main():
             best_model_state_for_selfplay = None
             if bool(rl_cfg.get('self_play_opponent_pool_enabled', False)):
                 best_model_state_for_selfplay = _snapshot_model_state_cpu(best_model, share_memory=True)
+            performance_profile = {}
             positions, positions_added, avg_game_length, positions_per_sec, selfplay_time, collection_time, selfplay_stats = \
                 play_games_parallel_mcts(
                     model,
@@ -2397,14 +2400,7 @@ def main():
             selfplay_profile = dict((selfplay_stats or {}).get('profile', {}) or {})
             if profile_training_enabled and selfplay_profile:
                 print_selfplay_profiler(selfplay_profile, selfplay_time)
-            logger.log_rl_performance(
-                iteration + 1,
-                positions_per_sec=positions_per_sec,
-                selfplay_time=selfplay_time,
-                data_collection_time=collection_time,
-                avg_game_length=avg_game_length,
-                profile=selfplay_profile,
-            )
+            performance_profile = dict(selfplay_profile)
             adaptive_opponent_scheduler_state, observed_scores = _update_adaptive_opponent_scheduler(
                 rl_cfg,
                 adaptive_opponent_scheduler_state,
@@ -2873,6 +2869,17 @@ def main():
             _finish_stage('checkpoint')
             gc.collect()
             _finish_stage('gc')
+            iteration_total_time_s = time.perf_counter() - iteration_start_time
+            logger.log_rl_performance(
+                iteration + 1,
+                positions_per_sec=positions_per_sec,
+                iteration_total_time=iteration_total_time_s,
+                selfplay_time=selfplay_time,
+                data_collection_time=collection_time,
+                avg_game_length=avg_game_length,
+                profile=performance_profile,
+            )
+            logger.plot_rl_performance()
             _emit_iteration_profile()
     except RLTrainingInterrupted as exc:
         training_interrupted = True

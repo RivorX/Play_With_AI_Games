@@ -195,7 +195,7 @@ reinforcement_learning:
   # ---------------------------
   # Core RL Loop
   # ---------------------------
-  version: "rl7"             # RL run/version tag added to RL log filenames
+  version: "rl8"             # RL run/version tag added to RL log filenames
   iterations: 40                # Total RL iterations
   games_per_iteration: 600      # Enough signal per iteration without stretching self-play too long
 
@@ -203,16 +203,20 @@ reinforcement_learning:
   # Self-Play Runtime
   # ---------------------------
   self_play_device: "cuda"      # cpu | cuda | auto (auto uses GPU if available)
-  self_play_workers: 16         # Total self-play worker processes; central inference uses one GPU server, so this is not per-GPU
+  self_play_workers: 18         # Total self-play worker processes; central inference uses one GPU server, so this is not per-GPU
   self_play_worker_cap_multiplier: 1.7 # Allow CPU oversubscription because workers block on central inference
   self_play_torch_threads: 1    # Keep 1 thread per worker; Python MCTS already fans out across many processes
   self_play_use_compile: true   # Self-play workers: torch.compile(mode=default) on CUDA; guarded so Windows workers don't compile/cache concurrently
   self_play_central_inference_enabled: true   # Use one GPU inference server for persistent self-play workers; workers keep MCTS trees on CPU
+  self_play_central_inference_servers: auto # auto = shard workers across a safe number of GPU inference servers
+  self_play_central_inference_auto_workers_per_server: 10 # Auto target; 18 workers -> 2 CIL servers on your current setup
+  self_play_central_inference_auto_max_servers: 4 # Upper safety cap for auto CIL sharding
   self_play_central_inference_use_compile: true # Compile the single central GPU model; warmup happens before workers start
   self_play_central_inference_compile_warmup_batches: [1, 32, 128, 256] # Pre-warm common dynamic batch sizes outside self-play
   self_play_compile_reset_dynamo: false # Keep compiled graphs cached inside the persistent central inference process
-  self_play_central_inference_flush_ms: 1.0   # Very low latency; central forward is fast and workers should wait less
-  self_play_central_inference_max_batch_size: 256 # Upper batch cap for the central inference server
+  self_play_central_inference_flush_ms: 2.0   # Small coalescing window; two servers reduce queueing while preserving useful batch sizes
+  self_play_central_inference_max_batch_size: 256 # Larger per-server batches improve GPU efficiency with sharded CIL
+  self_play_central_inference_transport_dtype: "float16" # Halve IPC payloads; board planes are binary/small and CUDA inference runs under AMP
   self_play_central_inference_timeout_s: 0    # 0 = wait indefinitely for queued GPU inference; positive value = watchdog timeout
   self_play_central_inference_load_timeout_s: 300 # Parent waits for central model load before dispatching workers
   self_play_central_inference_cudnn_benchmark: false # Variable MCTS batch sizes make cuDNN autotune re-benchmark too often
@@ -230,7 +234,7 @@ reinforcement_learning:
   # Self-Play Game Flow
   # ---------------------------
   use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
-  max_batch_games_per_worker: 20     # With 16 central-inference workers, keep active games/RAM near the old 10x32 profile
+  max_batch_games_per_worker: 18     # Keep total active games/RAM near 16x20 while giving CPU more worker processes
   self_play_dispatch_chunk_games: 96 # Requested chunk cap; runtime caps it by games/worker so large chunks do not starve workers
   self_play_max_moves: 190          # Shorter cap: cut low-value sterile games earlier instead of harvesting many doomed draw samples
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
@@ -330,7 +334,7 @@ reinforcement_learning:
   # MCTS Search
   # ---------------------------
   mcts_simulations: 160     # Higher search pressure so RL learns from targets that more clearly improve over the IL prior
-  mcts_batch_size: 256        # Match the heavier search budget without overfragmenting GPU inference
+  mcts_batch_size: 192        # Lower search-batch latency; central inference already recovers GPU batching across workers
   mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
   mcts_c_puct: 1.15          # Move back toward healthier exploration; too-low PUCT was over-trusting the current policy
   mcts_dynamic_c_puct: true  # MuZero-style dynamic exploration scaling by parent visits
