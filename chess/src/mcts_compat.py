@@ -73,9 +73,7 @@ class BatchMCTS:
             self._root_synced = False
             return
         _ = child.board
-        child.parent = None
-        child.parent_edge_index = -1
-        self.root = child
+        self.root = child.detach_as_root()
         self._root_synced = True
 
     def update_history(self, board):

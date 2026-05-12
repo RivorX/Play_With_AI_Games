@@ -528,9 +528,7 @@ class _BatchedModelPlayer:
             state["_root_synced"] = False
             return
         _ = child.board
-        child.parent = None
-        child.parent_edge_index = -1
-        state["root"] = child
+        state["root"] = child.detach_as_root()
         state["_root_synced"] = True
 
 

@@ -501,9 +501,7 @@ def _advance_eval_root(root, move):
     if child is None:
         return None, False
     _ = child.board
-    child.parent = None
-    child.parent_edge_index = -1
-    return child, True
+    return child.detach_as_root(), True
 
 
 def _evaluate_games_batched(
@@ -632,6 +630,7 @@ def _evaluate_games_batched(
                     gs.get(root_key),
                     bool(gs.get(synced_key, False)),
                     gs["board_history"],
+                    int(gs.get("move_count", 0) or 0),
                 ])
             visit_counts_group = mcts.search_many(
                 group_states,
@@ -1107,6 +1106,36 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
             gathered_log_probs = torch.gather(policy_pred, 1, safe_indices)
             gathered_log_probs = torch.where(effective_policy_mask, gathered_log_probs, torch.zeros_like(gathered_log_probs))
             policy_loss = -(policy_values * gathered_log_probs).sum(dim=1)
+            rl_cfg = config.get("reinforcement_learning", {})
+            if bool(rl_cfg.get("policy_target_confidence_weighting_enabled", False)):
+                valid_targets = torch.where(
+                    effective_policy_mask,
+                    torch.clamp(policy_values, min=0.0),
+                    torch.zeros_like(policy_values),
+                )
+                target_mass = valid_targets.sum(dim=1).clamp_min(1e-8)
+                normalized_targets = valid_targets / target_mass.unsqueeze(1)
+                target_lengths = effective_policy_mask.sum(dim=1).to(dtype=policy_loss.dtype)
+                target_entropy = -(
+                    normalized_targets
+                    * torch.log(torch.clamp(normalized_targets, min=1e-12))
+                ).sum(dim=1)
+                max_entropy = torch.log(torch.clamp(target_lengths, min=2.0))
+                entropy_confidence = 1.0 - torch.clamp(target_entropy / max_entropy, 0.0, 1.0)
+                top1_confidence = normalized_targets.max(dim=1).values.to(dtype=policy_loss.dtype)
+                confidence = torch.maximum(entropy_confidence, top1_confidence)
+                confidence_power = max(
+                    0.05,
+                    float(rl_cfg.get("policy_target_confidence_power", 1.0)),
+                )
+                if confidence_power != 1.0:
+                    confidence = torch.pow(torch.clamp(confidence, min=0.0), confidence_power)
+                min_weight = max(
+                    0.0,
+                    min(1.0, float(rl_cfg.get("policy_target_confidence_min_weight", 0.35))),
+                )
+                confidence_weight = min_weight + (1.0 - min_weight) * confidence
+                policy_loss = policy_loss * confidence_weight.to(dtype=policy_loss.dtype)
             policy_loss = policy_loss * policy_sample_weights.to(dtype=policy_loss.dtype)
 
         if value_pred.dim() == 2 and value_pred.size(1) == 3:

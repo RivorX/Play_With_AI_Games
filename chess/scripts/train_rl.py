@@ -93,6 +93,7 @@ from utils.rl.opponent_scheduler import (
     _safe_score_rate,
     _build_selfplay_opponent_assignments,
     _update_adaptive_opponent_scheduler,
+    refresh_recent_pool_debug_after_selfplay,
 )
 from utils.rl.persistent_pool import (
     _resolve_central_inference_server_count,
@@ -117,6 +118,24 @@ from utils.shared.syzygy_manager import ensure_syzygy_tables, describe_syzygy_st
 _LAST_RUN_LOG_CSV = None
 _LAST_RUN_LOG_PNG = None
 _SELFPLAY_CONFIG_PRINTED = False
+
+
+def _format_optional_percent(value, decimals=1):
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.{int(decimals)}%}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _format_optional_float(value, decimals=2):
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.{int(decimals)}f}"
+    except (TypeError, ValueError):
+        return "n/a"
 
 
 def _print_console_block(unicode_lines, ascii_lines=None):
@@ -871,9 +890,9 @@ def play_games_parallel_mcts(
             for entry in opponent_debug.get("selected_recent_pool", []):
                 selected_recent_parts.append(
                     f"{entry.get('label')}("
-                    f"score={float(entry.get('avg_score') or 0.0):.1%}, "
-                    f"draw={float(entry.get('avg_draw_rate') or 0.0):.1%}, "
-                    f"sel={float(entry.get('selection_score') or 0.0):.2f})"
+                    f"score={_format_optional_percent(entry.get('avg_score'))}, "
+                    f"draw={_format_optional_percent(entry.get('avg_draw_rate'))}, "
+                    f"sel={_format_optional_float(entry.get('selection_score'))})"
                 )
             print("Selected recent pool: " + ", ".join(selected_recent_parts))
 
@@ -926,6 +945,8 @@ def play_games_parallel_mcts(
     queue_total_value_count = 0
     queue_total_resigned_games = 0
     queue_search_simulations_used_sum = 0
+    queue_search_simulations_budget_sum = 0
+    queue_search_extra_budget_samples = 0
     queue_search_samples = 0
     queue_search_simulations_used_samples = []
     queue_adaptive_stopped_early = 0
@@ -1183,6 +1204,8 @@ def play_games_parallel_mcts(
                                 queue_total_cap_dropped_positions += int(chunk_stats.get('cap_dropped_positions', 0))
                                 queue_total_resigned_games += int(chunk_stats.get('resigned_games', 0))
                                 queue_search_simulations_used_sum += int(chunk_stats.get('search_simulations_used_sum', 0))
+                                queue_search_simulations_budget_sum += int(chunk_stats.get('search_simulations_budget_sum', 0))
+                                queue_search_extra_budget_samples += int(chunk_stats.get('search_extra_budget_samples', 0))
                                 queue_search_samples += int(chunk_stats.get('search_samples', 0))
                                 queue_search_simulations_used_samples.extend(list(chunk_stats.get('search_simulations_used_samples', []) or []))
                                 queue_adaptive_stopped_early += int(chunk_stats.get('adaptive_stopped_early', 0))
@@ -1336,6 +1359,8 @@ def play_games_parallel_mcts(
     total_value_count = queue_total_value_count if use_queue_transport else 0
     total_resigned_games = queue_total_resigned_games if use_queue_transport else 0
     total_search_simulations_used_sum = queue_search_simulations_used_sum if use_queue_transport else 0
+    total_search_simulations_budget_sum = queue_search_simulations_budget_sum if use_queue_transport else 0
+    total_search_extra_budget_samples = queue_search_extra_budget_samples if use_queue_transport else 0
     total_search_samples = queue_search_samples if use_queue_transport else 0
     total_search_simulations_used_samples = list(queue_search_simulations_used_samples) if use_queue_transport else []
     total_adaptive_stopped_early = queue_adaptive_stopped_early if use_queue_transport else 0
@@ -1406,6 +1431,8 @@ def play_games_parallel_mcts(
                             total_cap_dropped_positions += int((stats or {}).get('cap_dropped_positions', 0))
                             total_resigned_games += int((stats or {}).get('resigned_games', 0))
                             total_search_simulations_used_sum += int((stats or {}).get('search_simulations_used_sum', 0))
+                            total_search_simulations_budget_sum += int((stats or {}).get('search_simulations_budget_sum', 0))
+                            total_search_extra_budget_samples += int((stats or {}).get('search_extra_budget_samples', 0))
                             total_search_samples += int((stats or {}).get('search_samples', 0))
                             total_search_simulations_used_samples.extend(list((stats or {}).get('search_simulations_used_samples', []) or []))
                             total_adaptive_stopped_early += int((stats or {}).get('adaptive_stopped_early', 0))
@@ -1599,7 +1626,10 @@ def play_games_parallel_mcts(
         'cap_dropped_positions': int(total_cap_dropped_positions),
         'resigned_games': int(total_resigned_games),
         'search_simulations_used_avg': float(total_search_simulations_used_sum) / float(total_search_samples) if total_search_samples > 0 else 0.0,
+        'search_simulations_budget_avg': float(total_search_simulations_budget_sum) / float(total_search_samples) if total_search_samples > 0 else 0.0,
         'search_simulations_used_p10': float(np.percentile(np.asarray(total_search_simulations_used_samples, dtype=np.float32), 10)) if total_search_simulations_used_samples else 0.0,
+        'search_extra_budget_rate': float(total_search_extra_budget_samples) / float(total_search_samples) if total_search_samples > 0 else 0.0,
+        'search_extra_budget_samples': int(total_search_extra_budget_samples),
         'search_samples': int(total_search_samples),
         'adaptive_stopped_early': int(total_adaptive_stopped_early),
         'adaptive_stop_rate': float(total_adaptive_stopped_early) / float(total_search_samples) if total_search_samples > 0 else 0.0,
@@ -2057,6 +2087,18 @@ def main():
         quality_value_bonus=float(
             config['reinforcement_learning'].get('replay_quality_value_bonus', 0.0)
         ),
+        value_balanced_sampling_fraction=float(
+            config['reinforcement_learning'].get('replay_value_balanced_sampling_fraction', 0.0)
+        ),
+        value_balance_epsilon=float(
+            config['reinforcement_learning'].get(
+                'replay_value_balance_epsilon',
+                config['reinforcement_learning'].get('replay_decisive_value_epsilon', 0.05),
+            )
+        ),
+        weighted_sampling_power=float(
+            config['reinforcement_learning'].get('replay_weighted_sampling_power', 1.0)
+        ),
         resize_preserve_decisive_fraction=float(
             config['reinforcement_learning'].get('replay_resize_preserve_decisive_fraction', 0.0)
         ),
@@ -2449,7 +2491,9 @@ def main():
             )
             print(
                 f"MCTS sims: avg={float((selfplay_stats or {}).get('search_simulations_used_avg', 0.0)):.1f}, "
+                f"budget={float((selfplay_stats or {}).get('search_simulations_budget_avg', 0.0)):.1f}, "
                 f"p10={float((selfplay_stats or {}).get('search_simulations_used_p10', 0.0)):.1f}, "
+                f"extra={100.0 * float((selfplay_stats or {}).get('search_extra_budget_rate', 0.0)):.1f}%, "
                 f"early={100.0 * float((selfplay_stats or {}).get('adaptive_stop_rate', 0.0)):.1f}%, "
                 f"samples={int((selfplay_stats or {}).get('search_samples', 0))}"
             )
@@ -2496,13 +2540,19 @@ def main():
                 print(f"Adaptive opponent scores: {', '.join(observed_parts)}")
             opponent_debug = dict((selfplay_stats or {}).get('opponent_debug', {}) or {})
             selected_recent_pool = list(opponent_debug.get('selected_recent_pool', []) or [])
+            selected_recent_pool = refresh_recent_pool_debug_after_selfplay(
+                rl_cfg,
+                selected_recent_pool,
+                adaptive_opponent_scheduler_state,
+                (selfplay_stats or {}).get('opponent_results', {}),
+            )
             if selected_recent_pool:
                 selected_parts = [
                     (
                         f"{str(entry.get('label', 'recent'))}:"
-                        f"score={float(entry.get('avg_score') or 0.0):.1%},"
-                        f"draw={float(entry.get('avg_draw_rate') or 0.0):.1%},"
-                        f"sel={float(entry.get('selection_score') or 0.0):.2f}"
+                        f"score={_format_optional_percent(entry.get('avg_score'))},"
+                        f"draw={_format_optional_percent(entry.get('avg_draw_rate'))},"
+                        f"sel={_format_optional_float(entry.get('selection_score'))}"
                     )
                     for entry in selected_recent_pool
                 ]

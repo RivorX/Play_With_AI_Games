@@ -195,7 +195,7 @@ reinforcement_learning:
   # ---------------------------
   # Core RL Loop
   # ---------------------------
-  version: "rl8"             # RL run/version tag added to RL log filenames
+  version: "rl9"             # RL run/version tag added to RL log filenames
   iterations: 40                # Total RL iterations
   games_per_iteration: 600      # Enough signal per iteration without stretching self-play too long
 
@@ -267,9 +267,9 @@ reinforcement_learning:
   self_play_opening_diversity_min_plies: 2    # Let sharp curated lines branch early
   self_play_opening_diversity_max_plies: 8    # Allow enough depth to land in asymmetrical structures
   self_play_opponent_pool_enabled: true       # Mix current-vs-current with frozen opponents instead of only mirror self-play
-  self_play_opponent_current_fraction: 0.50   # Keep a large current-vs-current slice so recent snapshots cannot dominate the run
-  self_play_opponent_best_fraction: 0.15      # Keep a steady best-model anchor in the pool
-  self_play_opponent_recent_fraction: 0.35    # Cap recent-snapshot pressure to avoid echo-chamber training
+  self_play_opponent_current_fraction: 0.45   # Keep mirror self-play, but leave enough room for best-model correction
+  self_play_opponent_best_fraction: 0.30      # Stronger best anchor: current was drifting while training mostly on its own losses
+  self_play_opponent_recent_fraction: 0.25    # Cap recent-snapshot pressure to avoid echo-chamber training
   self_play_recent_snapshots_to_keep: 10       # Keep a wider recent window, then let the smart selector choose the actually useful opponents
   self_play_recent_candidate_pool_size: 3     # Fewer simultaneous frozen recent models reduces MCTS batch fragmentation
   self_play_recent_recency_bias: 0.35         # Prefer fresher snapshots, but still let matchup quality dominate the selection
@@ -287,7 +287,7 @@ reinforcement_learning:
   self_play_opponent_adaptive_max_factor: 1.40 # Also do not over-spike one opponent source
   self_play_opponent_current_min_fraction: 0.20 # Let the scheduler reduce mirror self-play harder when it becomes too draw-heavy
   self_play_opponent_current_max_fraction: 0.55 # Also cap mirror self-play so adaptive weighting cannot drift back into draw spam
-  self_play_opponent_best_min_fraction: 0.15    # Adaptive scheduler may not drop best-model games below this share when best exists
+  self_play_opponent_best_min_fraction: 0.25    # Adaptive scheduler may not drop best-model games below this share when best exists
   self_play_opponent_recent_max_fraction: 0.40  # Adaptive scheduler may not assign more than this share to all recent snapshots
   self_play_recent_latest_cap_count: 2          # Treat the newest N recent snapshots as one capped echo-chamber bucket
   self_play_recent_latest_max_fraction: 0.35    # Newest recent snapshots may not exceed this share of all self-play games
@@ -299,6 +299,9 @@ reinforcement_learning:
   self_play_opponent_target_draw_rate: 0.35     # Prefer matchups that stay meaningfully decisive instead of settling into draw-heavy shells
   self_play_opponent_draw_band: 0.10            # React sooner once an opponent source starts producing too many draws
   self_play_opponent_draw_penalty_min_factor: 0.45 # Penalize draw-heavy opponent sources more aggressively while still keeping some diversity
+  self_play_store_frozen_best_positions: true   # Distill best-model MCTS replies too, not only learner moves from lost games
+  self_play_store_frozen_recent_positions: false # Recent snapshots are less trustworthy teachers; keep them as opponents only
+  self_play_frozen_opponent_policy_weight: 0.65  # Best replies teach policy, but should not overpower current self-play targets
 
   # ---------------------------
   # Replay Shaping
@@ -347,6 +350,7 @@ reinforcement_learning:
   mcts_use_fpu: true         # First Play Urgency: non-visited moves get parent-aware prior value
   mcts_fpu_reduction: 0.12   # Reduce FPU from parent value to encourage some exploration of unvisited moves (0.0 = no reduction, 1.0 = zero FPU)
   mcts_fpu_absolute: null    # null = adaptive parent-Q FPU, float = fixed FPU value in [-1, 1]
+  mcts_q_value_scale: 0.60   # Dampen noisy value/Q during selection so search cannot overrule a decent policy too easily
   mcts_root_value_q_blend: 0.35 # Blend root value with visit-weighted child Q for less noisy value targets at small sim budgets
   mcts_temperature: 0.65      # Sharper visit sampling produces better policy targets once the search is strong enough
   mcts_temperature_threshold: 12  # Quicker shift toward deterministic play helps convert advantages instead of drifting
@@ -370,6 +374,12 @@ reinforcement_learning:
   mcts_adaptive_search_locked_margin: 2         # Stop when the runner-up cannot realistically catch the leader with remaining sims
   mcts_adaptive_search_max_entropy: 0.62        # Prevent early stop when root policy is still broad/uncertain
   mcts_adaptive_search_low_branching_confidence_delta: 0.06 # Slightly relax confidence gates when there are only a few legal moves
+  mcts_adaptive_search_late_budget_enabled: true # Adaptive search first chooses per-position budget, then early-stops inside that budget
+  mcts_adaptive_search_late_after_ply: 60        # Later middlegame/endgame roots are more target-sensitive than opening roots
+  mcts_adaptive_search_late_min_multiplier: 0.60 # Late roots must use at least this share of their active MCTS budget (160 -> 96)
+  mcts_adaptive_search_late_extra_fraction: 0.25 # Deterministically sample this share of late roots for a larger search cap
+  mcts_adaptive_search_late_extra_multiplier: 1.5 # 160 base -> 240 cap for sampled late roots
+  mcts_adaptive_search_late_extra_max_multiplier: 1.60 # Hard cap as a multiplier of active MCTS budget (160 -> 256)
   mcts_adaptive_policy_weight_min_fraction: 0.75 # Legacy knob; policy targets now use continuous used/budget weighting
   policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
   policy_target_pruning_keep_top_n: 8           # Always keep a broader top slice so uncertain positions retain more searched alternatives
@@ -377,6 +387,13 @@ reinforcement_learning:
   policy_target_pruning_min_prob: 0.005         # Still trim only the weakest tail; low-probability tactical moves can survive if search supports them
   policy_target_pruning_min_fraction_of_max: 0.05 # Keep moves that are closer to the best visit count instead of over-sharpening the target
   policy_target_pruning_keep_mass: 0.96         # Preserve more of the MCTS distribution when many moves are similarly plausible
+  policy_target_sharpening_enabled: true        # Gently sharpen only flat MCTS targets before they enter replay
+  policy_target_sharpening_power: 1.35          # Conservative power; avoids turning uncertain searches into one-hot labels
+  policy_target_sharpening_min_top1: 0.55       # Leave already-confident targets unchanged
+  policy_target_quality_weighting_enabled: true # Downweight flat/ambiguous targets at storage time, not only during training
+  policy_target_quality_min_weight: 0.35        # Ambiguous targets still teach, but cannot dominate policy gradients
+  policy_target_quality_entropy_threshold: 0.72 # Normalized entropy above this starts reducing target authority
+  policy_target_quality_top1_threshold: 0.50    # Top move below this starts reducing target authority
   
   # ---------------------------
   # Optimizer & Training
@@ -398,8 +415,11 @@ reinforcement_learning:
   replay_max_policy_targets: 28 # Hard cap for stored policy support; keeps replay/queue tensors aligned with pruning and cuts RAM
   replay_decisive_sampling_fraction: 0.22   # Keep a small decisive bias, but avoid oversampling mostly losing decisive positions
   replay_decisive_value_epsilon: 0.05       # Treat |value| > epsilon as decisive for replay sampling
+  replay_value_balanced_sampling_fraction: 0.20 # Reserve part of each batch for win/draw/loss-balanced targets so one recent value sign cannot dominate
+  replay_value_balance_epsilon: 0.05        # Values inside +/-epsilon count as neutral for balanced replay sampling
   replay_hard_negative_sampling_fraction: 0.10  # Keep some tactical focus, but stop over-concentrating batches on noisy tails
   replay_hard_negative_min_importance: 1.35    # Threshold for positions to count as "hard" in replay sampling
+  replay_weighted_sampling_power: 0.65      # Soften importance-weighted replay; <1 reduces the effect of tiny score differences
   replay_recent_sampling_fraction: 0.35       # Heavier recent slice so updates follow current opponent/policy regime faster
   replay_recent_window_fraction: 0.30         # Define "recent" as the newest ~30% of the replay buffer
   replay_quality_sampling_fraction: 0.18      # Separate from hard negatives: sample positions that look globally high-quality, not only hard/noisy
@@ -420,6 +440,9 @@ reinforcement_learning:
   
   # Entropy regularization
   entropy_weight: 0.0003      # Keep some policy spread, but do not push late self-play back toward drawish entropy
+  policy_target_confidence_weighting_enabled: true # Downweight flat MCTS policy targets instead of treating tiny visit differences as equally authoritative
+  policy_target_confidence_min_weight: 0.45 # Keep every target useful, but let confident targets carry more of the policy gradient
+  policy_target_confidence_power: 1.0       # Higher sharpens the preference for confident targets; lower is more uniform
   
   # Data augmentation
   use_augmentation: true
@@ -450,12 +473,12 @@ reinforcement_learning:
   eval_central_inference_compile_warmup_batches: [1, 32, 128, 256]
   eval_central_inference_cudnn_benchmark: false
   eval_central_inference_cache_enabled: false
-  eval_mcts_simulations_multiplier: 2.5  # Eval uses base mcts_simulations * this multiplier (1.0 = same search budget as self-play base)
+  eval_mcts_simulations_multiplier: 1.5  # Eval should test the search regime we train, not amplify an immature value head with very deep search
   eval_max_moves: 320        # Align eval with self-play so results are not dominated by ultra-long unresolved games
   eval_auto_claim_draw: true
   eval_claim_repetition_after_moves: 70
   eval_claim_draw_after_moves: 180  # Generic claimable draws after ~70 full moves
-  eval_every: 1              # Slightly faster feedback loop while iterating toward surpassing IL
+  eval_every: 2              # Slightly faster feedback loop while iterating toward surpassing IL
   eval_no_mcts_enabled: true  # Extra policy-only evaluation: no MCTS, does not affect best-model promotion
   eval_no_mcts_every: 1       # Run the no-MCTS eval every RL iteration
   eval_no_mcts_games: 100       # Cheap raw-policy signal every iteration without slowing RL too much

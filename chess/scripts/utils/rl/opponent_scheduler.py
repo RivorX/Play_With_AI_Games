@@ -601,6 +601,115 @@ def _update_adaptive_opponent_scheduler(rl_cfg, scheduler_state, opponent_result
     return state, observed_scores
 
 
+def _observed_result_metrics(opponent_results, label):
+    stats = dict((opponent_results or {}).get(str(label), {}) or {})
+    games = int(stats.get("games", 0) or 0)
+    if games <= 0:
+        return None, None, None
+    score_rate = _safe_score_rate(
+        stats.get("wins", 0),
+        stats.get("draws", 0),
+        stats.get("losses", 0),
+    )
+    draw_rate = _safe_draw_rate(
+        stats.get("wins", 0),
+        stats.get("draws", 0),
+        stats.get("losses", 0),
+    )
+    return score_rate, draw_rate, games
+
+
+def refresh_recent_pool_debug_after_selfplay(
+    rl_cfg,
+    selected_recent_pool,
+    scheduler_state,
+    opponent_results,
+):
+    """Refresh recent-pool debug rows with the just-finished self-play results."""
+    selected_recent_pool = list(selected_recent_pool or [])
+    if not selected_recent_pool:
+        return []
+
+    scheduler_state = dict(scheduler_state or {})
+    exact_score_history = scheduler_state.get("score_history_exact", {}) or {}
+    exact_draw_history = scheduler_state.get("draw_history_exact", {}) or {}
+    exact_games_history = scheduler_state.get("games_history_exact", {}) or {}
+
+    target_score = float(rl_cfg.get('self_play_opponent_adaptive_target_score', 0.50))
+    band = max(0.05, float(rl_cfg.get('self_play_opponent_adaptive_band', 0.15)))
+    recent_recency_bias = max(0.0, float(rl_cfg.get('self_play_recent_recency_bias', 0.35)))
+    recent_min_games_for_confidence = max(
+        1.0,
+        float(rl_cfg.get('self_play_recent_confidence_games', 24)),
+    )
+    recent_uncertainty_bonus = max(
+        0.0,
+        min(0.5, float(rl_cfg.get('self_play_recent_uncertainty_bonus', 0.15))),
+    )
+    recent_in_band_boost = max(
+        1.0,
+        float(rl_cfg.get('self_play_recent_in_band_boost', 1.10)),
+    )
+    recent_min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_recent_min_score', 0.0))))
+    recent_max_score = max(recent_min_score, min(1.0, float(rl_cfg.get('self_play_opponent_recent_max_score', 1.0))))
+    target_draw_rate = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_target_draw_rate', 0.45))))
+    draw_band = max(0.01, float(rl_cfg.get('self_play_opponent_draw_band', 0.20)))
+    draw_penalty_min_factor = max(0.20, min(1.0, float(rl_cfg.get('self_play_opponent_draw_penalty_min_factor', 0.70))))
+
+    refreshed = []
+    for entry in selected_recent_pool:
+        entry = dict(entry or {})
+        label = str(entry.get("label", ""))
+        observed_score, observed_draw, observed_games = _observed_result_metrics(opponent_results, label)
+
+        avg_score = observed_score
+        if avg_score is None:
+            avg_score = _average_score_from_history(exact_score_history.get(label, []) or [])
+        avg_draw_rate = observed_draw
+        if avg_draw_rate is None:
+            avg_draw_rate = _average_score_from_history(exact_draw_history.get(label, []) or [])
+        avg_games = observed_games
+        if avg_games is None:
+            avg_games = _average_score_from_history(exact_games_history.get(label, []) or [])
+
+        in_band = True
+        if avg_score is not None and (avg_score < recent_min_score or avg_score > recent_max_score):
+            in_band = False
+        draw_penalty = _draw_heaviness_penalty(
+            avg_draw_rate,
+            target_draw_rate,
+            draw_band,
+            draw_penalty_min_factor,
+        )
+        confidence = 0.0
+        if avg_games is not None:
+            confidence = min(1.0, float(avg_games) / recent_min_games_for_confidence)
+        uncertainty_bonus = (1.0 - confidence) * recent_uncertainty_bonus
+        match_quality = _score_closeness(avg_score, target_score, band)
+        if in_band:
+            match_quality = min(1.0, match_quality * recent_in_band_boost)
+        recency_bias = float(entry.get("recency_bias", 0.0) or 0.0)
+        selection_score = float(
+            (
+                (1.0 - recent_recency_bias) * match_quality
+                + recent_recency_bias * recency_bias
+                + uncertainty_bonus
+            )
+            * draw_penalty
+        )
+
+        entry["avg_score"] = avg_score
+        entry["avg_draw_rate"] = avg_draw_rate
+        entry["avg_games"] = avg_games
+        entry["selection_score"] = selection_score
+        entry["draw_penalty"] = float(draw_penalty)
+        entry["in_band"] = bool(in_band)
+        entry["observed_games"] = int(observed_games or 0)
+        refreshed.append(entry)
+
+    return refreshed
+
+
 def _build_selfplay_opponent_assignments(
     rl_cfg,
     worker_specs,

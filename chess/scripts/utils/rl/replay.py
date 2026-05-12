@@ -28,6 +28,9 @@ class ReplayBuffer:
         quality_sampling_fraction=0.0,
         quality_min_importance=0.0,
         quality_value_bonus=0.0,
+        value_balanced_sampling_fraction=0.0,
+        value_balance_epsilon=None,
+        weighted_sampling_power=1.0,
         resize_preserve_decisive_fraction=0.0,
         resize_preserve_decisive_min_count=0,
     ):
@@ -43,6 +46,16 @@ class ReplayBuffer:
         self.quality_sampling_fraction = max(0.0, min(1.0, float(quality_sampling_fraction)))
         self.quality_min_importance = max(0.0, float(quality_min_importance))
         self.quality_value_bonus = max(0.0, float(quality_value_bonus))
+        self.value_balanced_sampling_fraction = max(
+            0.0,
+            min(1.0, float(value_balanced_sampling_fraction)),
+        )
+        self.value_balance_epsilon = (
+            self.decisive_value_epsilon
+            if value_balance_epsilon is None
+            else max(0.0, float(value_balance_epsilon))
+        )
+        self.weighted_sampling_power = max(0.05, min(2.0, float(weighted_sampling_power)))
         self.resize_preserve_decisive_fraction = max(
             0.0,
             min(1.0, float(resize_preserve_decisive_fraction)),
@@ -333,8 +346,7 @@ class ReplayBuffer:
         keep_positions.sort()
         return ordered_indices[keep_positions]
 
-    @staticmethod
-    def _sample_without_replacement(indices, take, weights=None):
+    def _sample_without_replacement(self, indices, take, weights=None):
         indices = np.asarray(indices, dtype=np.int64)
         take = int(take)
         if take <= 0 or indices.size <= 0:
@@ -347,11 +359,68 @@ class ReplayBuffer:
             weights = np.asarray(weights, dtype=np.float64).reshape(-1)
             if weights.size == indices.size:
                 weights = np.clip(weights, 0.0, None)
+                if self.weighted_sampling_power != 1.0:
+                    weights = np.power(weights, self.weighted_sampling_power)
                 total = float(weights.sum())
                 if total > 0.0 and np.isfinite(total):
                     probs = weights / total
 
         return np.random.choice(indices, take, replace=False, p=probs)
+
+    def _append_selected(self, chosen_parts, selected):
+        selected = np.asarray(selected, dtype=np.int64)
+        if selected.size <= 0:
+            chosen = np.concatenate(chosen_parts) if chosen_parts else np.empty(0, dtype=np.int64)
+            return chosen
+        chosen_parts.append(selected)
+        return np.concatenate(chosen_parts)
+
+    def _sample_value_balanced_indices(self, all_indices, chosen, values_np, target_count):
+        target_count = int(target_count)
+        if target_count <= 0:
+            return np.empty(0, dtype=np.int64)
+
+        eps = float(self.value_balance_epsilon)
+        buckets = [
+            all_indices[values_np > eps],
+            all_indices[np.abs(values_np) <= eps],
+            all_indices[values_np < -eps],
+        ]
+        buckets = [
+            np.setdiff1d(bucket, chosen, assume_unique=False)
+            for bucket in buckets
+        ]
+
+        selected_parts = []
+        selected = np.empty(0, dtype=np.int64)
+        base_take = max(1, target_count // 3)
+        bucket_order = sorted(range(3), key=lambda idx: int(buckets[idx].size))
+
+        for bucket_idx in bucket_order:
+            if selected.size >= target_count:
+                break
+            bucket = buckets[bucket_idx]
+            take = min(int(bucket.size), base_take, target_count - int(selected.size))
+            picked = self._sample_without_replacement(bucket, take)
+            if picked.size > 0:
+                selected_parts.append(picked)
+                selected = np.concatenate(selected_parts)
+
+        if selected.size < target_count:
+            remaining_pool = np.setdiff1d(
+                np.concatenate(buckets) if buckets else np.empty(0, dtype=np.int64),
+                selected,
+                assume_unique=False,
+            )
+            extra = self._sample_without_replacement(
+                remaining_pool,
+                min(target_count - int(selected.size), int(remaining_pool.size)),
+            )
+            if extra.size > 0:
+                selected_parts.append(extra)
+                selected = np.concatenate(selected_parts)
+
+        return selected[:target_count]
 
     def _sample_indices_with_biases(self, batch_size):
         if self.size <= 0:
@@ -366,10 +435,23 @@ class ReplayBuffer:
         def _remaining_slots():
             return max(0, int(batch_size) - int(chosen.size))
 
+        if self.value_balanced_sampling_fraction > 0.0:
+            balanced_take = min(
+                _remaining_slots(),
+                int(round(batch_size * self.value_balanced_sampling_fraction)),
+            )
+            balanced_selected = self._sample_value_balanced_indices(
+                all_indices,
+                chosen,
+                values_np,
+                balanced_take,
+            )
+            chosen = self._append_selected(chosen_parts, balanced_selected)
+
         if self.recent_sampling_fraction > 0.0:
             ordered_indices = self._ordered_indices_oldest_to_newest()
             recent_window = max(1, int(round(float(self.size) * self.recent_window_fraction)))
-            recent_pool = ordered_indices[-recent_window:]
+            recent_pool = np.setdiff1d(ordered_indices[-recent_window:], chosen, assume_unique=False)
             recent_take = min(
                 _remaining_slots(),
                 int(round(batch_size * self.recent_sampling_fraction)),
@@ -377,9 +459,7 @@ class ReplayBuffer:
             recent_take = max(0, recent_take)
             if recent_pool.size > 0 and recent_take > 0:
                 recent_selected = self._sample_without_replacement(recent_pool, recent_take)
-                if recent_selected.size > 0:
-                    chosen_parts.append(recent_selected)
-                    chosen = np.concatenate(chosen_parts)
+                chosen = self._append_selected(chosen_parts, recent_selected)
 
         if self.hard_negative_sampling_fraction > 0.0:
             importance = self._importance[:self.size].cpu().numpy()
@@ -397,9 +477,7 @@ class ReplayBuffer:
                     hard_take,
                     weights=hard_weights,
                 )
-                if hard_selected.size > 0:
-                    chosen_parts.append(hard_selected)
-                    chosen = np.concatenate(chosen_parts)
+                chosen = self._append_selected(chosen_parts, hard_selected)
 
         decisive_mask = torch.abs(values.float()) > self.decisive_value_epsilon
         decisive_indices = torch.nonzero(decisive_mask, as_tuple=False).reshape(-1).cpu().numpy()
@@ -423,9 +501,7 @@ class ReplayBuffer:
                     quality_take,
                     weights=quality_weights,
                 )
-                if quality_selected.size > 0:
-                    chosen_parts.append(quality_selected)
-                    chosen = np.concatenate(chosen_parts)
+                chosen = self._append_selected(chosen_parts, quality_selected)
 
         if self.decisive_sampling_fraction > 0.0 and decisive_indices.size > 0:
             target_decisive = min(
@@ -436,11 +512,17 @@ class ReplayBuffer:
             remaining_decisive_pool = np.setdiff1d(decisive_indices, chosen, assume_unique=False)
             decisive_take = min(int(remaining_decisive_pool.size), target_decisive)
             decisive_selected = self._sample_without_replacement(remaining_decisive_pool, decisive_take)
-            if decisive_selected.size > 0:
-                chosen_parts.append(decisive_selected)
-                chosen = np.concatenate(chosen_parts)
+            chosen = self._append_selected(chosen_parts, decisive_selected)
 
         indices = np.concatenate(chosen_parts) if chosen_parts else np.empty(0, dtype=np.int64)
+        if indices.size < batch_size:
+            remaining_pool = np.setdiff1d(all_indices, indices, assume_unique=False)
+            fill = self._sample_without_replacement(
+                remaining_pool,
+                min(int(batch_size) - int(indices.size), int(remaining_pool.size)),
+            )
+            if fill.size > 0:
+                indices = np.concatenate([indices, fill])
         if indices.size > batch_size:
             indices = indices[:batch_size]
         np.random.shuffle(indices)
@@ -528,6 +610,9 @@ class ReplayBuffer:
         importance = self._importance[:self.size].float()
         decisive_mask = torch.abs(values) > float(self.decisive_value_epsilon)
         draw_mask = ~decisive_mask
+        positive_mask = values > float(self.value_balance_epsilon)
+        negative_mask = values < -float(self.value_balance_epsilon)
+        neutral_mask = ~(positive_mask | negative_mask)
 
         def _safe_mean(tensor):
             if tensor.numel() <= 0:
@@ -552,6 +637,9 @@ class ReplayBuffer:
             "draw_fraction": float(draw_mask.float().mean().item()),
             "value_mean": _safe_mean(values),
             "value_std": _safe_std(values),
+            "value_positive_fraction": float(positive_mask.float().mean().item()),
+            "value_neutral_fraction": float(neutral_mask.float().mean().item()),
+            "value_negative_fraction": float(negative_mask.float().mean().item()),
             "policy_weight_mean": _safe_mean(policy_weights),
             "policy_weight_p10": _safe_quantile(policy_weights, 0.10),
             "policy_weight_low_fraction": float((policy_weights < 0.75).float().mean().item()),
@@ -585,6 +673,9 @@ class ReplayBuffer:
             idx = torch.as_tensor(recent_indices, dtype=torch.long)
             recent_values = self._values[idx].reshape(-1).float()
             recent_decisive = torch.abs(recent_values) > float(self.decisive_value_epsilon)
+            recent_positive = recent_values > float(self.value_balance_epsilon)
+            recent_negative = recent_values < -float(self.value_balance_epsilon)
+            recent_neutral = ~(recent_positive | recent_negative)
             recent_weights = self._policy_sample_weights[idx].float()
             stats.update({
                 "recent_count": int(recent_indices.size),
@@ -592,6 +683,9 @@ class ReplayBuffer:
                 "recent_draw_fraction": float((~recent_decisive).float().mean().item()),
                 "recent_value_mean": _safe_mean(recent_values),
                 "recent_value_std": _safe_std(recent_values),
+                "recent_value_positive_fraction": float(recent_positive.float().mean().item()),
+                "recent_value_neutral_fraction": float(recent_neutral.float().mean().item()),
+                "recent_value_negative_fraction": float(recent_negative.float().mean().item()),
                 "recent_policy_weight_mean": _safe_mean(recent_weights),
             })
         return stats
