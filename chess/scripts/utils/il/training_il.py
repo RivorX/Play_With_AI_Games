@@ -106,6 +106,8 @@ def train_epoch_il(
     use_amp = config['hardware'].get('use_amp', True)
     amp_dtype = torch.bfloat16 if config['hardware'].get('use_bfloat16', False) else torch.float16
     non_blocking = bool(non_blocking_transfer and device.type == 'cuda')
+    metrics_interval = max(1, int(config['imitation_learning'].get('train_metrics_interval', 1)))
+    progress_interval = max(1, int(config.get('logging', {}).get('print_every', 10)))
     for batch_idx, batch_data in enumerate(pbar):
         if profile_enabled:
             _sync()
@@ -161,7 +163,7 @@ def train_epoch_il(
         
         with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
             # Forward pass
-            policy_pred, value_pred = model(boards)
+            policy_pred, value_pred = model(boards, apply_log_softmax=False)
             
             # đź†• v4.3: Compute loss using CombinedLoss
             # Pack predictions and targets for CombinedLoss
@@ -261,32 +263,36 @@ def train_epoch_il(
             timers['optim'] += time.perf_counter() - t0
             t0 = time.perf_counter()
         
-        # Update metrics
-        # Note: metrics_calc.update() auto-handles WDL predictions
-        metrics_calc.update(
-            policy_pred,
-            value_pred,
-            moves,
-            outcomes,
-            move_indices=move_indices,
-            total_moves=total_moves,
-            value_weight_min=config['imitation_learning'].get('value_move_weight_min', 0.1),
-            value_weight_min_total_moves=config['imitation_learning'].get('value_move_weight_min_total_moves', 40),
-            value_max_moves=config['data'].get('max_moves_per_game', 200),
-            value_use_game_length=config['imitation_learning'].get('value_move_weight_use_game_length', False),
-        )
+        # Update train metrics on a configurable sample of batches. Validation
+        # still computes full metrics; this keeps the hot training loop lighter.
+        if batch_idx % metrics_interval == 0 or batch_idx == len(train_loader) - 1:
+            metrics_calc.update(
+                policy_pred,
+                value_pred,
+                moves,
+                outcomes,
+                move_indices=move_indices,
+                total_moves=total_moves,
+                value_weight_min=config['imitation_learning'].get('value_move_weight_min', 0.1),
+                value_weight_min_total_moves=config['imitation_learning'].get('value_move_weight_min_total_moves', 40),
+                value_max_moves=config['data'].get('max_moves_per_game', 200),
+                value_use_game_length=config['imitation_learning'].get('value_move_weight_use_game_length', False),
+                policy_is_logits=True,
+            )
         
         # Accumulate losses
         total_loss += loss_dict['total']
         total_policy_loss += loss_dict['policy']
         total_value_loss += loss_dict['value']
         
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': f'{total_loss / (batch_idx + 1):.4f}',
-            'policy': f'{total_policy_loss / (batch_idx + 1):.4f}',
-            'value': f'{total_value_loss / (batch_idx + 1):.4f}',
-        })
+        # Update progress bar less often; formatting and terminal writes are
+        # surprisingly expensive with very large IL batches.
+        if batch_idx % progress_interval == 0 or batch_idx == len(train_loader) - 1:
+            pbar.set_postfix({
+                'loss': f'{total_loss / (batch_idx + 1):.4f}',
+                'policy': f'{total_policy_loss / (batch_idx + 1):.4f}',
+                'value': f'{total_value_loss / (batch_idx + 1):.4f}',
+            })
 
         if profile_enabled:
             _sync()
@@ -390,7 +396,7 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
                 total_moves = total_moves.to(device, non_blocking=non_blocking)
             
             with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                policy_pred, value_pred = model(boards)
+                policy_pred, value_pred = model(boards, apply_log_softmax=False)
                 
                 predictions = {
                     'policy': policy_pred,
@@ -423,6 +429,7 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
                 value_weight_min_total_moves=config['imitation_learning'].get('value_move_weight_min_total_moves', 40),
                 value_max_moves=config['data'].get('max_moves_per_game', 200),
                 value_use_game_length=config['imitation_learning'].get('value_move_weight_use_game_length', False),
+                policy_is_logits=True,
             )
     
     n = len(val_loader)

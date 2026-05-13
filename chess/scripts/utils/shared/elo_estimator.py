@@ -18,6 +18,7 @@ import stat
 import threading
 import time
 import zipfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -1175,7 +1176,7 @@ class EloEstimator:
         for _ in range(max(1, workers)):
             idle_engines.append(self._open_stockfish_engine(stockfish_path))
 
-        pending_tasks = list(tasks)
+        pending_tasks = deque(tasks)
         active_games: list[dict] = []
         model_move_calls = 0
         model_move_positions = 0
@@ -1193,7 +1194,7 @@ class EloEstimator:
 
         def launch_next_game(engine: chess.engine.SimpleEngine):
             while pending_tasks and not self._is_cancelled():
-                level, _, model_is_white = pending_tasks.pop(0)
+                level, _, model_is_white = pending_tasks.popleft()
                 try:
                     self._configure_stockfish_engine(engine, level)
                 except Exception as exc:

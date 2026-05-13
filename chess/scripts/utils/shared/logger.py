@@ -46,7 +46,15 @@ class TrainingLogger:
                     'val_value_mae', 'val_value_mae_weighted',
                     'val_value_wdl_acc', 'val_value_wdl_ce',
                     # 🆕 Elo estimation
-                    'estimated_elo'
+                    'estimated_elo',
+                    'train_val_loss_gap',
+                    'policy_top1_gap',
+                    'policy_top3_gap',
+                    'value_mae_gap',
+                    'value_wdl_acc_gap',
+                    'best_val_loss_so_far',
+                    'best_val_policy_top1_so_far',
+                    'best_val_value_mae_so_far',
                 ]
             
             else:  # RL mode
@@ -108,6 +116,7 @@ class TrainingLogger:
         
         # 🆕 Elo estimation storage
         self.estimated_elos = []  # (epoch, elo) tuples
+        self.best_final_elo_info = None  # (epoch, elo) for exact final best-model Elo
         
         if mode == "rl":
             self.details_dir = self.log_dir / "details"
@@ -227,6 +236,9 @@ class TrainingLogger:
 
         # Optional run context shown in plot header (e.g. startup mode/resume/transfer info).
         self.run_context_text = None
+        self.plot_smoothing_enabled = False
+        self.plot_smoothing_alpha = 0.35
+        self.plot_smoothing_min_points = 5
         # Optional notes shown in summary panel (e.g. final SWA metrics).
         self.final_notes = []
         # Optional epoch markers drawn on IL Elo chart (e.g. SWA final epoch).
@@ -248,6 +260,20 @@ class TrainingLogger:
             return
         text = str(text).strip()
         self.run_context_text = text if text else None
+
+    def set_plot_smoothing(self, enabled=True, alpha=0.35, min_points=5):
+        """Configure light EMA smoothing for plot lines."""
+        self.plot_smoothing_enabled = bool(enabled)
+        try:
+            alpha = float(alpha)
+        except (TypeError, ValueError):
+            alpha = 0.35
+        self.plot_smoothing_alpha = min(1.0, max(0.05, alpha))
+        try:
+            min_points = int(min_points)
+        except (TypeError, ValueError):
+            min_points = 5
+        self.plot_smoothing_min_points = max(3, min_points)
 
     def _build_plot_suptitle(self, base_title, wrap_width=88):
         """Build a wrapped suptitle to avoid huge plot bounding boxes."""
@@ -854,6 +880,18 @@ class TrainingLogger:
         # Also persist to CSV and in-memory estimated_elos list.
         self.record_estimated_elo(epoch, elo, update_csv=True)
 
+    def record_best_final_elo(self, epoch, elo):
+        """Store exact final best-model Elo for the IL summary and Elo panel."""
+        if self.mode != "il":
+            return
+        try:
+            epoch = int(epoch)
+            elo = float(elo)
+        except (TypeError, ValueError):
+            return
+        self.best_final_elo_info = (epoch, elo)
+        self.record_estimated_elo(epoch, elo, update_csv=True)
+
     def record_swa_metrics(self, val_loss=None, top1=None, top3=None,
                             mae=None, mae_weighted=None,
                             val_policy_loss=None, val_value_loss=None,
@@ -1024,6 +1062,7 @@ class TrainingLogger:
 
         # Determine SWA epoch to exclude from the regular line
         swa_epoch = int(self.swa_elo_info[0]) if self.swa_elo_info else None
+        swa_elo_value = float(self.swa_elo_info[1]) if self.swa_elo_info else None
 
         if has_elos:
             visible_elos = self.estimated_elos
@@ -1038,7 +1077,12 @@ class TrainingLogger:
             # Plot regular elo line (exclude SWA point so it gets its own marker)
             regular_elos = [
                 (ep, val) for ep, val in visible_elos
-                if swa_epoch is None or int(ep) != swa_epoch
+                if (
+                    swa_epoch is None
+                    or int(ep) != swa_epoch
+                    or swa_elo_value is None
+                    or abs(float(val) - swa_elo_value) > 0.5
+                )
             ]
             if regular_elos:
                 elo_epochs, elo_vals = zip(*regular_elos)
@@ -1088,6 +1132,28 @@ class TrainingLogger:
                                 shrinkB=12),
             )
 
+        if self.best_final_elo_info:
+            best_ep, best_elo = self.best_final_elo_info
+            ax.plot(
+                best_ep, best_elo,
+                marker='D', markersize=9,
+                color='#2563EB', markeredgecolor='#1E3A8A', markeredgewidth=1.2,
+                linestyle='None',
+                label=f'Best final ({int(round(best_elo))})',
+                zorder=6,
+            )
+            ax.annotate(
+                f'Best\n{int(round(best_elo))}',
+                xy=(best_ep, best_elo),
+                xytext=(8, -22),
+                textcoords='offset points',
+                fontsize=8,
+                color='#1E3A8A',
+                fontweight='bold',
+                arrowprops=dict(arrowstyle='->', color='#1E3A8A', lw=1.1,
+                                shrinkB=6),
+            )
+
         if has_markers:
             for marker_epoch, marker_label in self.elo_epoch_markers:
                 # Skip SWA marker vertical line — the gold star already marks it
@@ -1133,6 +1199,10 @@ class TrainingLogger:
                 sw_ep = int(self.swa_elo_info[0])
                 if x_min <= sw_ep and sw_ep >= x_max - 1:
                     x_max = sw_ep + max(2, int((x_max - x_min) * 0.08) + 1)
+            if self.best_final_elo_info:
+                best_ep = int(self.best_final_elo_info[0])
+                if x_min <= best_ep and best_ep >= x_max - 1:
+                    x_max = best_ep + max(2, int((x_max - x_min) * 0.08) + 1)
             ax.set_xlim(x_min, x_max)
 
         ax.legend(fontsize=8, loc='lower right')
@@ -1188,7 +1258,59 @@ class TrainingLogger:
                         estimated_elo = None
                 else:
                     row.append('')
-                
+
+                def _metric_value(metrics, key):
+                    if not metrics:
+                        return None
+                    value = metrics.get(key)
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        return None
+                    return None if value != value else value
+
+                def _loss_value(losses, key):
+                    if not losses:
+                        return None
+                    value = losses.get(key)
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        return None
+                    return None if value != value else value
+
+                def _gap(val_value, train_value):
+                    if val_value is None or train_value is None:
+                        return ''
+                    return val_value - train_value
+
+                current_val_loss = _loss_value(val_losses, 'total')
+                current_val_top1 = _metric_value(val_metrics, 'policy_top1_acc')
+                current_val_mae = _metric_value(val_metrics, 'value_mae')
+                if current_val_loss is not None:
+                    best_val_loss_so_far = min(self.val_losses + [current_val_loss]) if self.val_losses else current_val_loss
+                else:
+                    best_val_loss_so_far = min(self.val_losses) if self.val_losses else ''
+                if current_val_top1 is not None:
+                    best_val_top1_so_far = max(self.val_policy_top1 + [current_val_top1]) if self.val_policy_top1 else current_val_top1
+                else:
+                    best_val_top1_so_far = max(self.val_policy_top1) if self.val_policy_top1 else ''
+                if current_val_mae is not None:
+                    best_val_mae_so_far = min(self.val_value_mae + [current_val_mae]) if self.val_value_mae else current_val_mae
+                else:
+                    best_val_mae_so_far = min(self.val_value_mae) if self.val_value_mae else ''
+
+                row.extend([
+                    _gap(_loss_value(val_losses, 'total'), _loss_value(train_losses, 'total')),
+                    _gap(_metric_value(val_metrics, 'policy_top1_acc'), _metric_value(train_metrics, 'policy_top1_acc')),
+                    _gap(_metric_value(val_metrics, 'policy_top3_acc'), _metric_value(train_metrics, 'policy_top3_acc')),
+                    _gap(_metric_value(val_metrics, 'value_mae'), _metric_value(train_metrics, 'value_mae')),
+                    _gap(_metric_value(val_metrics, 'value_wdl_acc'), _metric_value(train_metrics, 'value_wdl_acc')),
+                    best_val_loss_so_far,
+                    best_val_top1_so_far,
+                    best_val_mae_so_far,
+                ])
+
                 # Store for plotting
                 self.iterations.append(iteration)
                 self.train_losses.append(train_losses['total'])
@@ -1382,7 +1504,7 @@ class TrainingLogger:
 
         # ── Find best model (min val_loss) ───────────────────────────────
         best_idx = min(range(len(self.val_losses)), key=lambda i: self.val_losses[i])
-        best_epoch = self.iterations[best_idx]
+        best_epoch = self.val_iterations[best_idx] if best_idx < len(self.val_iterations) else self.iterations[best_idx]
 
         def _at(lst, idx):
             return lst[idx] if lst and idx < len(lst) else None
@@ -1398,9 +1520,17 @@ class TrainingLogger:
         }
         # Elo closest to best_epoch (excluding SWA entry)
         swa_ep = int(self.swa_elo_info[0]) if self.swa_elo_info else None
+        swa_elo_value = float(self.swa_elo_info[1]) if self.swa_elo_info else None
         regular_elos = [(ep, v) for ep, v in self.estimated_elos
-                        if swa_ep is None or int(ep) != swa_ep]
-        if regular_elos:
+                        if (
+                            swa_ep is None
+                            or int(ep) != swa_ep
+                            or swa_elo_value is None
+                            or abs(float(v) - swa_elo_value) > 0.5
+                        )]
+        if self.best_final_elo_info:
+            best['elo'] = float(self.best_final_elo_info[1])
+        elif regular_elos:
             _, best['elo'] = min(regular_elos, key=lambda p: abs(int(p[0]) - best_epoch))
         else:
             best['elo'] = None
@@ -1526,155 +1656,252 @@ class TrainingLogger:
 
     def _plot_il(self):
         """Plot IL training progress"""
-        fig, axes = plt.subplots(5, 2, figsize=(15, 22))
-        
+        fig, axes = plt.subplots(4, 3, figsize=(21, 18))
+        fig.patch.set_facecolor('#F7F8FA')
+
         if self.run_context_text:
             fig.suptitle(
                 self._build_plot_suptitle("IL Training Progress"),
-                fontsize=14,
+                fontsize=15,
                 fontweight='bold',
                 y=0.985,
             )
         else:
-            fig.suptitle('IL Training Progress', fontsize=16, fontweight='bold', y=0.985)
-        
+            fig.suptitle('IL Training Progress', fontsize=18, fontweight='bold', y=0.985)
+
         val_epochs = self.val_iterations if self.val_iterations else []
-        
-        # ============================================================
-        # ROW 1: LOSSES
-        # ============================================================
-        
-        # Total Loss
+
+        colors = {
+            'train': '#2563EB',
+            'val': '#DC2626',
+            'policy': '#0F766E',
+            'value': '#7C3AED',
+            'gap': '#EA580C',
+            'lr': '#475569',
+            'elo': '#16A34A',
+            'muted': '#64748B',
+        }
+
+        def _style_axis(ax, title, ylabel=None, percent=False):
+            ax.set_facecolor('#FFFFFF')
+            ax.set_title(title, fontsize=11, fontweight='bold', loc='left', pad=8)
+            ax.set_xlabel('Epoch')
+            if ylabel:
+                ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.22, linewidth=0.8)
+            for spine in ax.spines.values():
+                spine.set_alpha(0.18)
+            if percent:
+                ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+
+        def _smooth_values(ys):
+            if not self.plot_smoothing_enabled or len(ys) < self.plot_smoothing_min_points:
+                return ys
+            smoothed = []
+            prev = None
+            alpha = float(self.plot_smoothing_alpha)
+            for value in ys:
+                try:
+                    current = float(value)
+                except (TypeError, ValueError):
+                    smoothed.append(value)
+                    continue
+                if prev is None:
+                    prev = current
+                else:
+                    prev = alpha * current + (1.0 - alpha) * prev
+                smoothed.append(prev)
+            return smoothed
+
+        def _plot_line(ax, xs, ys, label, color, style='-', marker=None, linewidth=2.0, alpha=0.95):
+            if not xs or not ys:
+                return
+            ys_to_plot = _smooth_values(list(ys))
+            marker_to_plot = None if self.plot_smoothing_enabled else marker
+            ax.plot(
+                xs,
+                ys_to_plot,
+                linestyle=style,
+                marker=marker_to_plot,
+                color=color,
+                label=label,
+                linewidth=linewidth,
+                markersize=4 if marker_to_plot else 0,
+                alpha=alpha,
+            )
+
+        def _epoch_map(series):
+            return {int(ep): value for ep, value in zip(self.iterations, series)}
+
+        def _val_gap(train_series, val_series):
+            train_by_epoch = _epoch_map(train_series)
+            xs, ys = [], []
+            for ep, val in zip(val_epochs, val_series):
+                try:
+                    ep_i = int(ep)
+                    train_val = train_by_epoch[ep_i]
+                    xs.append(ep)
+                    ys.append(float(val) - float(train_val))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return xs, ys
+
+        def _best_epoch_and_value(xs, ys, mode='min'):
+            if not xs or not ys:
+                return None, None
+            pairs = list(zip(xs, ys))
+            if mode == 'max':
+                return max(pairs, key=lambda item: item[1])
+            return min(pairs, key=lambda item: item[1])
+
+        def _mark_best(ax, xs, ys, mode='min', label='best'):
+            ep, val = _best_epoch_and_value(xs, ys, mode=mode)
+            if ep is None:
+                return
+            ax.scatter([ep], [val], s=42, color='#111827', zorder=5)
+            try:
+                place_left = float(ep) >= max(float(x) for x in xs) - 0.1
+            except (TypeError, ValueError):
+                place_left = False
+            ax.annotate(
+                f"{label}: {val:.4f}" if abs(float(val)) < 10 else f"{label}: {val:.0f}",
+                xy=(ep, val),
+                xytext=(-8, 7) if place_left else (7, 7),
+                textcoords='offset points',
+                fontsize=8,
+                color='#111827',
+                ha='right' if place_left else 'left',
+                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#CBD5E1', alpha=0.9),
+            )
+
+        # Row 1: loss and LR
         ax = axes[0, 0]
-        ax.plot(self.iterations, self.train_losses, 'b-', label='Train Loss', linewidth=2)
-        if self.val_losses:
-            ax.plot(val_epochs, self.val_losses, 'r-', label='Val Loss', linewidth=2)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Loss')
-        ax.set_title('Total Loss')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Policy Loss
+        _plot_line(ax, self.iterations, self.train_losses, 'Train', colors['train'])
+        _plot_line(ax, val_epochs, self.val_losses, 'Val', colors['val'], marker='o')
+        _mark_best(ax, val_epochs, self.val_losses, mode='min', label='best val')
+        _style_axis(ax, 'Total Loss + Learning Rate', 'Loss')
+        if self.iterations:
+            ax_lr = ax.twinx()
+            lr_values = []
+            try:
+                with open(self.csv_path, 'r', newline='') as f:
+                    for row in csv.DictReader(f):
+                        try:
+                            if str(row.get('epoch', '')).strip().upper() == 'SWA':
+                                continue
+                            lr_values.append(float(row.get('learning_rate', '')))
+                        except (TypeError, ValueError):
+                            lr_values.append(None)
+            except Exception:
+                lr_values = []
+            if lr_values and len(lr_values) == len(self.iterations):
+                xs = [x for x, lr in zip(self.iterations, lr_values) if lr is not None]
+                ys = [lr for lr in lr_values if lr is not None]
+                if xs:
+                    ax_lr.plot(xs, ys, color=colors['lr'], linestyle=':', linewidth=1.8, label='LR')
+                    ax_lr.set_ylabel('LR')
+                    ax_lr.tick_params(axis='y', labelcolor=colors['lr'])
+                    ax_lr.spines['right'].set_alpha(0.18)
+        ax.legend(fontsize=8, loc='best')
+
         ax = axes[0, 1]
-        ax.plot(self.iterations, self.train_policy_losses, 'b-', label='Train Policy', linewidth=2)
-        if self.val_policy_losses:
-            ax.plot(val_epochs, self.val_policy_losses, 'r-', label='Val Policy', linewidth=2)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Policy Loss')
-        ax.set_title('Policy Loss')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # ============================================================
-        # ROW 2: METRICS
-        # ============================================================
-        
-        # Policy Accuracy
-        ax = axes[1, 0]
-        if self.train_policy_top1:
-            ax.plot(self.iterations, self.train_policy_top1, 'b-', label='Train Top-1', linewidth=2)
-            ax.plot(self.iterations, self.train_policy_top3, 'b--', label='Train Top-3', linewidth=2, alpha=0.7)
-        if self.val_policy_top1:
-            ax.plot(val_epochs, self.val_policy_top1, 'r-', label='Val Top-1', linewidth=2)
-            ax.plot(val_epochs, self.val_policy_top3, 'r--', label='Val Top-3', linewidth=2, alpha=0.7)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Accuracy')
-        ax.set_title('Policy Accuracy')
-        ax.set_ylim([0, 1])
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Value MAE
-        ax = axes[1, 1]
-        if self.train_value_mae:
-            ax.plot(self.iterations, self.train_value_mae, 'b-', label='Train MAE', linewidth=2, alpha=0.75, zorder=2)
-        if self.train_value_mae_weighted:
-            ax.plot(self.iterations, self.train_value_mae_weighted, 'b--', label='Train MAE (weighted)', linewidth=2, alpha=0.6, zorder=2)
-        if self.val_value_mae:
-            ax.plot(val_epochs, self.val_value_mae, 'r-', label='Val MAE', linewidth=2.5, zorder=3)
-        if self.val_value_mae_weighted:
-            ax.plot(val_epochs, self.val_value_mae_weighted, 'r--', label='Val MAE (weighted)', linewidth=2, alpha=0.85, zorder=3)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('MAE')
-        ax.set_title('Value MAE')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # ============================================================
-        # ROW 3: COMPARISON
-        # ============================================================
-        
-        # Value Loss
-        ax = axes[2, 0]
-        ax.plot(self.iterations, self.train_value_losses, 'b-', label='Train Value', linewidth=2)
-        if self.val_value_losses:
-            ax.plot(val_epochs, self.val_value_losses, 'r-', label='Val Value', linewidth=2)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Value Loss')
-        ax.set_title('Value Loss')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Loss Comparison
-        ax = axes[2, 1]
-        if self.val_losses:
-            ax.plot(self.iterations, self.train_losses, 'b-', label='Train Total', linewidth=2, alpha=0.7)
-            ax.plot(val_epochs, self.val_losses, 'r-', label='Val Total', linewidth=2, alpha=0.7)
-            ax.plot(self.iterations, self.train_policy_losses, 'b--', label='Train Policy', linewidth=1.5, alpha=0.5)
-            ax.plot(val_epochs, self.val_policy_losses, 'r--', label='Val Policy', linewidth=1.5, alpha=0.5)
-            ax.plot(self.iterations, self.train_value_losses, 'b:', label='Train Value', linewidth=1.5, alpha=0.5)
-            ax.plot(val_epochs, self.val_value_losses, 'r:', label='Val Value', linewidth=1.5, alpha=0.5)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Loss')
-        ax.set_title('All Losses Comparison')
+        _plot_line(ax, self.iterations, self.train_policy_losses, 'Train Policy', colors['train'])
+        _plot_line(ax, val_epochs, self.val_policy_losses, 'Val Policy', colors['val'], marker='o')
+        _mark_best(ax, val_epochs, self.val_policy_losses, mode='min', label='best')
+        _style_axis(ax, 'Policy Loss', 'Loss')
         ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-        
-        # ============================================================
-        # ROW 4: WDL METRICS
-        # ============================================================
-        
-        # WDL Accuracy
-        ax = axes[3, 0]
-        if self.train_value_wdl_acc:
-            ax.plot(self.iterations, self.train_value_wdl_acc, 'b-', label='Train WDL Acc', linewidth=2)
-        if self.val_value_wdl_acc:
-            ax.plot(val_epochs, self.val_value_wdl_acc, 'r-', label='Val WDL Acc', linewidth=2)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Accuracy')
-        ax.set_title('Value WDL Accuracy')
+
+        ax = axes[0, 2]
+        _plot_line(ax, self.iterations, self.train_value_losses, 'Train Value', colors['train'])
+        _plot_line(ax, val_epochs, self.val_value_losses, 'Val Value', colors['val'], marker='o')
+        _mark_best(ax, val_epochs, self.val_value_losses, mode='min', label='best')
+        _style_axis(ax, 'Value Loss', 'Loss')
+        ax.legend(fontsize=8)
+
+        # Row 2: policy and value quality
+        ax = axes[1, 0]
+        _plot_line(ax, self.iterations, self.train_policy_top1, 'Train Top-1', colors['train'])
+        _plot_line(ax, self.iterations, self.train_policy_top3, 'Train Top-3', colors['train'], style='--', alpha=0.65)
+        _plot_line(ax, val_epochs, self.val_policy_top1, 'Val Top-1', colors['val'], marker='o')
+        _plot_line(ax, val_epochs, self.val_policy_top3, 'Val Top-3', colors['val'], style='--', marker='o', alpha=0.75)
+        _mark_best(ax, val_epochs, self.val_policy_top1, mode='max', label='best top1')
+        _style_axis(ax, 'Policy Accuracy', 'Accuracy', percent=True)
+        ax.set_ylim([0, 1])
+        ax.legend(fontsize=8)
+
+        ax = axes[1, 1]
+        _plot_line(ax, self.iterations, self.train_value_mae, 'Train MAE', colors['train'])
+        _plot_line(ax, self.iterations, self.train_value_mae_weighted, 'Train Weighted', colors['train'], style='--', alpha=0.6)
+        _plot_line(ax, val_epochs, self.val_value_mae, 'Val MAE', colors['val'], marker='o')
+        _plot_line(ax, val_epochs, self.val_value_mae_weighted, 'Val Weighted', colors['val'], style='--', marker='o', alpha=0.75)
+        _mark_best(ax, val_epochs, self.val_value_mae, mode='min', label='best mae')
+        _style_axis(ax, 'Value Scalar MAE', 'MAE')
+        ax.legend(fontsize=8)
+
+        ax = axes[1, 2]
+        _plot_line(ax, self.iterations, self.train_value_wdl_acc, 'Train WDL Acc', colors['train'])
+        _plot_line(ax, val_epochs, self.val_value_wdl_acc, 'Val WDL Acc', colors['val'], marker='o')
+        _mark_best(ax, val_epochs, self.val_value_wdl_acc, mode='max', label='best')
+        _style_axis(ax, 'WDL Accuracy', 'Accuracy', percent=True)
         ax.set_ylim([0, 1])
         if self.train_value_wdl_acc or self.val_value_wdl_acc:
-            ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # WDL Cross-Entropy
-        ax = axes[3, 1]
-        if self.train_value_wdl_ce:
-            ax.plot(self.iterations, self.train_value_wdl_ce, 'b-', label='Train WDL CE', linewidth=2)
-        if self.val_value_wdl_ce:
-            ax.plot(val_epochs, self.val_value_wdl_ce, 'r-', label='Val WDL CE', linewidth=2)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('CE')
-        ax.set_title('Value WDL Cross-Entropy')
+            ax.legend(fontsize=8)
+
+        # Row 3: diagnostics and gaps
+        ax = axes[2, 0]
+        gap_xs, gap_ys = _val_gap(self.train_losses, self.val_losses)
+        _plot_line(ax, gap_xs, gap_ys, 'Val - Train Loss', colors['gap'], marker='o')
+        ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.2)
+        _style_axis(ax, 'Generalization Gap: Loss', 'Gap')
+        if gap_xs:
+            ax.legend(fontsize=8)
+
+        ax = axes[2, 1]
+        gap_xs, top1_gap = _val_gap(self.train_policy_top1, self.val_policy_top1)
+        _, top3_gap = _val_gap(self.train_policy_top3, self.val_policy_top3)
+        _plot_line(ax, gap_xs, top1_gap, 'Top-1 gap', colors['gap'], marker='o')
+        _plot_line(ax, gap_xs, top3_gap, 'Top-3 gap', '#F59E0B', style='--', marker='o', alpha=0.85)
+        ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.2)
+        _style_axis(ax, 'Generalization Gap: Policy', 'Val - Train', percent=True)
+        if gap_xs:
+            ax.legend(fontsize=8)
+
+        ax = axes[2, 2]
+        gap_xs, mae_gap = _val_gap(self.train_value_mae, self.val_value_mae)
+        _, wdl_gap = _val_gap(self.train_value_wdl_acc, self.val_value_wdl_acc)
+        _plot_line(ax, gap_xs, mae_gap, 'MAE gap', colors['gap'], marker='o')
+        ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.2)
+        _style_axis(ax, 'Generalization Gap: Value', 'Val - Train MAE')
+        ax2 = ax.twinx()
+        _plot_line(ax2, gap_xs, wdl_gap, 'WDL acc gap', '#0891B2', style='--', marker='o', alpha=0.75)
+        ax2.set_ylabel('Val - Train WDL Acc')
+        ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+        ax2.tick_params(axis='y', labelcolor='#0891B2')
+        ax2.spines['right'].set_alpha(0.18)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            ax.legend(lines + lines2, labels + labels2, fontsize=8, loc='best')
+
+        # Row 4: WDL CE, Elo, summary
+        ax = axes[3, 0]
+        _plot_line(ax, self.iterations, self.train_value_wdl_ce, 'Train WDL CE', colors['train'])
+        _plot_line(ax, val_epochs, self.val_value_wdl_ce, 'Val WDL CE', colors['val'], marker='o')
+        _mark_best(ax, val_epochs, self.val_value_wdl_ce, mode='min', label='best')
+        _style_axis(ax, 'Value WDL Cross-Entropy', 'CE')
         if self.train_value_wdl_ce or self.val_value_wdl_ce:
-            ax.legend()
-        ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8)
 
-        # ============================================================
-        # ROW 5: ELO ESTIMATION + SUMMARY
-        # ============================================================
-        ax = axes[4, 0]
+        ax = axes[3, 1]
         self._plot_il_elo_panel(ax)
-        
-        ax = axes[4, 1]
-        self._plot_il_summary_panel(ax)
-    
+        ax.set_facecolor('#FFFFFF')
 
-        fig.subplots_adjust(left=0.07, right=0.98, bottom=0.04, top=0.94, hspace=0.42, wspace=0.28)
+        ax = axes[3, 2]
+        self._plot_il_summary_panel(ax)
+
+        fig.subplots_adjust(left=0.055, right=0.985, bottom=0.045, top=0.925, hspace=0.45, wspace=0.28)
         fig.savefig(self.plot_path, dpi=150)
-        plt.close()
+        plt.close(fig)
         
         print(f"Plot saved to: {self.plot_path}")
     

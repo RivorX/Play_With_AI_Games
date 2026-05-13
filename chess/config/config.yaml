@@ -79,7 +79,7 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v7.6"
+  version: "v8"
   # Base architecture
   num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
   filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
@@ -87,11 +87,11 @@ model:
   # 1x1 conv (C -> policy_head_channels) + BN + ReLU + 1x1 conv (policy_head_channels -> 73 planes)
   # logits are reshaped to ACTION_SIZE (4672) in from_square-major order
   policy_head_channels: 128     # Policy head intermediate filters
-  value_head_filters: 128       # Value head filters 
-  value_hidden_dim: 512         # Value head hidden dimension 
-  dropout: 0.2                  # Dropout rate 
+  value_head_filters: 192       # Wider value head; cheap extra capacity for MCTS value calibration
+  value_hidden_dim: 1024        # Value head hidden dimension 
+  dropout: 0.15                 # Value-head dropout; lower improves scalar value calibration for MCTS
 
-  history_positions: 4       # Number of past positions to include (0 = current only, 4 = current + 3 history)
+  history_positions: 4       # Number of past positions to include (0 = current only, current + 4 history)
   
   # Advanced features
   use_se_blocks: true           # Squeeze-and-Excitation channel attention
@@ -139,19 +139,26 @@ imitation_learning:
 
   # Training hyperparameters (used directly in config mode, and as fallback defaults)
   batch_size: 9216           # Batch size
+  eval_batch_size: 0         # 0 = derive from train batch using eval_batch_size_multiplier
+  eval_batch_size_multiplier: 1.0 # Eval has no backward pass, so it can use a larger batch
   learning_rate: 0.001       # Base/fallback LR (used for config mode and LR-test fallback)
 
   # Advanced training hyperparameters
-  value_head_lr_factor: 1.0  # Value head LR multiplier (1.0 = full LR)
-  epochs: 30                 # Maximum training epochs
+  value_head_lr_factor: 1.25 # Value head LR multiplier; value needs extra adaptation for MCTS usefulness
+  epochs: 50                 # Maximum training epochs
   weight_decay: 0.002        # L2 regularization (10x stronger for value head)
   grad_clip: 1.0             # Gradient clipping threshold
   
-  # 🆕 Stochastic Weight Averaging (SWA) for better generalization
+  # Stochastic Weight Averaging (SWA) for better generalization
   use_swa: true              # Enable SWA (averages weights from multiple epochs)
-  swa_start_epoch: 14        # Start SWA after this epoch
-  swa_auto_start: true       # Auto-start SWA earlier when transfer warmup/unfreeze suggests it
+  swa_auto_start: true       # Auto-start SWA from validation plateau instead of a fixed early epoch
+  swa_auto_min_epoch: 24     # Never start SWA before this epoch in new/resume training
+  swa_auto_plateau_patience: 3 # Start after N evals without meaningful val-loss improvement
+  swa_auto_min_delta: 0.0015 # Meaningful val-loss improvement threshold for SWA plateau detection
   swa_transfer_unfreeze_offset: 2  # In transfer mode: start SWA N epoch(s) after first fully unfrozen epoch
+  swa_anneal_epochs: 12      # Number of epochs SWALR uses to anneal from current LR to swa_lr
+  swa_stop_after_anneal_no_improve: true # Once SWA LR anneal is done, stop on the first eval without meaningful improvement
+  swa_stop_after_anneal_grace_evals: 1 # Number of post-anneal no-improve evals allowed before stopping
   swa_lr_mode: "auto"        # auto | manual
   swa_lr: 0.00005            # Used only when swa_lr_mode=manual
   swa_lr_ratio: 0.12         # Auto mode: target fraction of effective LR around SWA start
@@ -163,11 +170,13 @@ imitation_learning:
   warmup_pct: 0.05           # Warmup fraction of epochs (e.g., 0.02-0.05)
   min_lr_ratio: 0.005        # Min LR = base_lr * ratio
   
-  # 🆕 v4.3: WDL-specific options
+  # v4.3: WDL-specific options
   wdl_label_smoothing: 0.01  # Smoothing for value head (WDL is more sensitive to overconfidence)
   # Loss weights
   policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 0.5     # Value loss weight (balanced with policy)
+  value_loss_weight: 0.75    # Stronger value supervision; policy was ahead of value for MCTS use
+  value_scalar_aux_loss_weight: 0.25 # Extra SmoothL1 on W-L scalar to improve search calibration
+  train_metrics_interval: 2  # Compute expensive train top-k/softmax metrics every N batches; val metrics remain full
   # 🆕 WDL value weighting by move index (later positions = stronger signal)
   value_move_weighting: true
   value_move_weight_min: 0.1
@@ -548,7 +557,14 @@ hardware:
   use_bfloat16: true         # bfloat16 instead of float16 (better range)
   num_workers: 5             # CPU workers for data loading
   prefetch_factor: 1         # DataLoader prefetch factor
+  train_prefetch_factor: 1   # Keep one prepared batch per train worker to reduce RAM/pagefile pressure
+  val_prefetch_factor: 1     # One queued val batch per worker; raise to 2 only if RAM/pagefile stays calm
   pin_memory: true           # Faster GPU data transfer
+  val_pin_memory: true       # Validation still benefits from pinned transfer
+  persistent_workers: true   # Keep train workers alive between epochs
+  val_persistent_workers: false # Do not keep validation workers resident between evals
+  dataloader_index_mmap: true # Store sampled index arrays as .npy mmap so workers share them
+  dataloader_numpy_shuffle: true # Compact shuffle permutation; avoids huge Python int lists
   use_compile: true          # torch.compile: fuse Conv+BN+ReLU kernels (~3x speedup)
 
 
@@ -559,6 +575,9 @@ logging:
   log_level: "INFO"          # DEBUG, INFO, WARNING, ERROR
   tensorboard: true          # Enable TensorBoard logging
   print_every: 10            # Print stats every N batches
+  il_plot_smoothing_enabled: true # Light EMA smoothing for IL PNG curves; exact best/SWA markers stay raw
+  il_plot_smoothing_alpha: 0.35   # Higher = follows raw curve more closely, lower = smoother
+  il_plot_smoothing_min_points: 5 # Do not smooth very short runs
 
 
 # ------------------------------------------------------------------------------
@@ -567,6 +586,24 @@ logging:
 elo_estimation:
   enabled: true                # Enable Elo estimation during training
   eval_every: 2                # Estimate Elo every N epochs (expensive, don't run every epoch)
+  il_eval_every: 2             # IL periodic Elo cadence
+  il_games_per_level: 12       # Fast IL trend check: 5 levels x 12 = 60 games
+  il_levels: [1320, 1500, 1700, 1900, 2100]  # Narrower periodic IL ladder for speed
+  il_stockfish_time_limit: 0.10 # Fast periodic IL Elo; use manual eval for precise final numbers
+  il_max_moves: 120            # Shorter periodic IL games avoid slow low-signal endings
+  il_workers: 0                # Auto worker count, capped by training-priority settings
+  il_stockfish_threads: 1      # Throughput-oriented periodic IL Elo
+  il_stockfish_hash_mb: 32     # Keep total background hash modest
+  final_on_il_shutdown: true   # In IL: after normal end or first Ctrl+C, run precise final Elo for best IL and SWA; Ctrl+C during it cancels the check
+  final_il_games_per_level: 24 # Final IL Elo is slower/more stable than periodic checks; runs for best_model_il and SWA
+  final_il_levels: [1320, 1400, 1500, 1600, 1700, 1850, 2000, 2200]
+  final_il_stockfish_time_limit: 0.20
+  final_il_max_moves: 150
+  final_il_workers: 12
+  final_il_stockfish_threads: 1
+  final_il_stockfish_hash_mb: 32
+  final_il_use_mcts: false     # Keep IL final Elo as raw-net strength; enable manually only when you want slow search strength
+  final_il_mcts_simulations: 160
   rl_every_n_evals: 3          # In RL: run Stockfish Elo every Nth model-vs-best evaluation
   rl_min_score_rate_for_stockfish: 0.50     # Gate periodic Stockfish Elo by score rate vs current best
   rl_min_true_win_rate_for_stockfish: 0.02  # Also require at least a small decisive edge before paying for Elo
@@ -623,8 +660,10 @@ debug:
   # Imitation Learning diagnostics
   il:
     profile_training: true          # Time breakdown per epoch
+    print_profile_to_console: false # Keep epoch timing tables in logs/debug only
     log_gpu_memory: true            # GPU memory usage
     print_batch0_diagnostics: false # Print batch-0 target stats + WDL samples
+    print_wdl_loss_diagnostics: false # Print one-time WDL class distribution from loss
 
   # Reinforcement Learning diagnostics
   rl:

@@ -660,10 +660,12 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
                 model.load_state_dict(normalized_model_state)
                 print("Resume: model state loaded")
                 start_epoch = int(checkpoint.get("epoch", -1)) + 1
+                optimizer_state_loaded = False
 
                 if "optimizer_state_dict" in checkpoint:
                     try:
                         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                        optimizer_state_loaded = True
                         print("Resume: optimizer state loaded")
                     except Exception as exc:
                         print(f"WARNING: Failed to load optimizer state ({exc}). Using fresh optimizer.")
@@ -671,11 +673,14 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
                     print("WARNING: Resume checkpoint has no optimizer state.")
 
                 if scheduler is not None and "scheduler_state_dict" in checkpoint:
-                    try:
-                        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-                        print("Resume: scheduler state loaded")
-                    except Exception as exc:
-                        print(f"WARNING: Failed to load scheduler state ({exc}).")
+                    if optimizer_state_loaded:
+                        try:
+                            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                            print("Resume: scheduler state loaded")
+                        except Exception as exc:
+                            print(f"WARNING: Failed to load scheduler state ({exc}).")
+                    else:
+                        print("Resume: scheduler state skipped because optimizer state was not loaded.")
 
                 if scaler is not None and "scaler_state_dict" in checkpoint:
                     try:

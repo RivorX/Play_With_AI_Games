@@ -164,12 +164,20 @@ class CombinedLoss(nn.Module):
         
         # Loss functions
         label_smoothing = config['imitation_learning'].get('label_smoothing', 0.1)
-        self.policy_loss_fn = LabelSmoothingNLLLoss(smoothing=label_smoothing)
+        self.policy_label_smoothing = float(label_smoothing)
         
         # 🆕 WDL loss for value head
         wdl_smoothing = config['imitation_learning'].get('wdl_label_smoothing', 0.0)
-        debug_enabled = config.get('debug', {}).get('enabled', False)
-        self.value_loss_fn = WDLLoss(label_smoothing=wdl_smoothing, debug=debug_enabled)
+        debug_cfg = config.get('debug', {}) or {}
+        il_debug_cfg = debug_cfg.get('il', {}) or {}
+        if not isinstance(il_debug_cfg, dict):
+            il_debug_cfg = {}
+        wdl_loss_diagnostics = bool(il_debug_cfg.get('print_wdl_loss_diagnostics', False))
+        self.value_loss_fn = WDLLoss(label_smoothing=wdl_smoothing, debug=wdl_loss_diagnostics)
+        self.value_scalar_aux_loss_weight = max(
+            0.0,
+            float(config['imitation_learning'].get('value_scalar_aux_loss_weight', 0.0)),
+        )
 
         # ?? Value loss weighting by move index (later positions = stronger signal)
         self.value_move_weighting = config['imitation_learning'].get('value_move_weighting', True)
@@ -184,7 +192,7 @@ class CombinedLoss(nn.Module):
         
         Args:
             predictions: dict with model outputs:
-                - 'policy': (B, ACTION_SIZE) log probabilities
+                - 'policy': (B, ACTION_SIZE) raw policy logits
                 - 'value': (B, 3) WDL logits
             
             targets: dict with ground truth:
@@ -198,9 +206,10 @@ class CombinedLoss(nn.Module):
         """
 
         # Policy loss
-        policy_loss = self.policy_loss_fn(
+        policy_loss = F.cross_entropy(
             predictions['policy'], 
-            targets['moves']
+            targets['moves'],
+            label_smoothing=self.policy_label_smoothing,
         )
         
         # ?? Value loss (WDL) - handles both (B,) and (B, 1) targets
@@ -240,11 +249,36 @@ class CombinedLoss(nn.Module):
                     reduction='none'
                 )
             value_loss = (value_losses * weights).mean()
+            if self.value_scalar_aux_loss_weight > 0.0:
+                wdl_probs = torch.softmax(predictions['value'], dim=1)
+                value_scalar = self.value_loss_fn.wdl_to_scalar(wdl_probs)
+                target_values = targets['values']
+                if target_values.dim() > 1:
+                    target_values = target_values.squeeze(-1)
+                scalar_losses = F.smooth_l1_loss(
+                    value_scalar,
+                    target_values.to(dtype=value_scalar.dtype),
+                    reduction='none',
+                    beta=0.25,
+                )
+                value_loss = value_loss + self.value_scalar_aux_loss_weight * (scalar_losses * weights).mean()
         else:
             value_loss = self.value_loss_fn(
                 predictions['value'],
                 targets['values']
             )
+            if self.value_scalar_aux_loss_weight > 0.0:
+                wdl_probs = torch.softmax(predictions['value'], dim=1)
+                value_scalar = self.value_loss_fn.wdl_to_scalar(wdl_probs)
+                target_values = targets['values']
+                if target_values.dim() > 1:
+                    target_values = target_values.squeeze(-1)
+                scalar_loss = F.smooth_l1_loss(
+                    value_scalar,
+                    target_values.to(dtype=value_scalar.dtype),
+                    beta=0.25,
+                )
+                value_loss = value_loss + self.value_scalar_aux_loss_weight * scalar_loss
 
         # Combine
         total_loss = (

@@ -241,6 +241,8 @@ class ILEloCoordinator:
 
         print("\n     Estimating Elo (vs Stockfish)...")
         elo_result = estimate_model_elo(self.model, self.config, self.device, self.elo_config)
+        if elo_result.get("cancelled"):
+            raise KeyboardInterrupt
         estimated_elo = elo_result.get("estimated_elo")
         if estimated_elo is not None:
             print(f"     Estimated Elo: {estimated_elo}")

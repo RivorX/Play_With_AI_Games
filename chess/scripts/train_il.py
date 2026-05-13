@@ -23,6 +23,7 @@ import sys
 import time
 import math
 import shutil
+import threading
 from pathlib import Path
 import numpy as np
 import gc
@@ -33,6 +34,7 @@ sys.path.insert(0, str(script_dir.parent))
 
 from src.model import (
     ChessNet,
+    load_model,
     save_checkpoint,
 )
 from src.data import process_pgn_files, create_dataloaders
@@ -62,6 +64,7 @@ from utils.shared.runtime_helpers import (
     cleanup_interrupted_log_csv,
     run_with_optional_stdout_suppression,
 )
+from utils.shared.elo_estimator import estimate_model_elo
 from utils.shared.model_view import (
     print_active_model_summary,
     print_status_table,
@@ -71,6 +74,218 @@ from utils.shared.model_view import (
 
 _LAST_RUN_LOG_CSV = None
 _LAST_RUN_LOG_PNG = None
+
+
+def _pct(part, total):
+    total = float(total or 0.0)
+    if total <= 0.0:
+        return 0.0
+    return 100.0 * float(part or 0.0) / total
+
+
+def _format_duration(seconds):
+    seconds = float(seconds or 0.0)
+    if seconds >= 60.0:
+        minutes = int(seconds // 60)
+        return f"{minutes}m {seconds - minutes * 60:04.1f}s"
+    return f"{seconds:.2f}s"
+
+
+def _format_il_epoch_profile(
+    epoch_num,
+    phase_key,
+    train_profile,
+    train_time,
+    eval_time,
+    other_time,
+    epoch_total_time,
+    train_samples,
+    val_samples,
+):
+    epoch_total_time = max(0.0, float(epoch_total_time or 0.0))
+    train_time = max(0.0, float(train_time or 0.0))
+    eval_time = max(0.0, float(eval_time or 0.0))
+    other_time = max(0.0, float(other_time or 0.0))
+    train_profile = train_profile or {}
+    train_total = max(0.0, float(train_profile.get('total', train_time) or train_time))
+    batches = int(train_profile.get('batches', 0) or 0)
+
+    lines = [
+        f"[IL PROFILE] Epoch {epoch_num} [{phase_key}]",
+        (
+            f"  total={_format_duration(epoch_total_time)} | "
+            f"train={_format_duration(train_total)} ({_pct(train_total, epoch_total_time):.1f}%) | "
+            f"eval={_format_duration(eval_time)} ({_pct(eval_time, epoch_total_time):.1f}%) | "
+            f"other={_format_duration(other_time)} ({_pct(other_time, epoch_total_time):.1f}%)"
+        ),
+    ]
+
+    if train_samples and train_total > 0.0:
+        lines.append(f"  train throughput: {train_samples / train_total:,.0f} pos/s")
+    if val_samples and eval_time > 0.0:
+        lines.append(f"  eval throughput:  {val_samples / eval_time:,.0f} pos/s")
+
+    header = f"  {'stage':<18} {'time':>10} {'epoch%':>8} {'train%':>8} {'ms/batch':>10}"
+    lines.append(header)
+    lines.append(f"  {'-' * 18} {'-' * 10} {'-' * 8} {'-' * 8} {'-' * 10}")
+
+    def add_row(label, seconds, train_part=True):
+        seconds = max(0.0, float(seconds or 0.0))
+        train_pct = f"{_pct(seconds, train_total):7.1f}%" if train_part and train_total > 0.0 else "       -"
+        ms_batch = f"{(seconds * 1000.0 / batches):9.1f}" if train_part and batches > 0 else "        -"
+        lines.append(
+            f"  {label:<18} {_format_duration(seconds):>10} "
+            f"{_pct(seconds, epoch_total_time):7.1f}% {train_pct} {ms_batch}"
+        )
+
+    if train_profile:
+        add_row("data loading", train_profile.get('data', 0.0))
+        add_row("forward", train_profile.get('forward', 0.0))
+        add_row("backward", train_profile.get('backward', 0.0))
+        add_row("optimizer", train_profile.get('optim', 0.0))
+        add_row("train metrics", train_profile.get('metrics', 0.0))
+    else:
+        add_row("train total", train_time)
+
+    add_row("validation", eval_time, train_part=False)
+    add_row("other/log/save", other_time, train_part=False)
+    return lines
+
+
+def _emit_il_profile(lines, debug_log_file=None, print_to_console=False):
+    if print_to_console:
+        for line in lines:
+            print(line)
+    if debug_log_file is not None:
+        with open(debug_log_file, 'a', encoding='utf-8') as f:
+            f.write("\n".join(lines) + "\n")
+
+
+def _apply_il_elo_overrides(elo_config):
+    """Apply IL-specific Elo overrides onto the shared Elo config."""
+    if not isinstance(elo_config, dict):
+        return {}
+    resolved = dict(elo_config)
+    override_map = {
+        'il_eval_every': 'eval_every',
+        'il_levels': 'levels',
+        'il_games_per_level': 'games_per_level',
+        'il_stockfish_time_limit': 'stockfish_time_limit',
+        'il_max_moves': 'max_moves',
+        'il_workers': 'workers',
+        'il_stockfish_threads': 'stockfish_threads',
+        'il_stockfish_hash_mb': 'stockfish_hash_mb',
+        'il_async_device': 'async_device',
+        'il_free_threads_utilization': 'free_threads_utilization',
+    }
+    for source_key, target_key in override_map.items():
+        if source_key in resolved:
+            resolved[target_key] = resolved[source_key]
+    return resolved
+
+
+def _build_il_final_elo_config(elo_config):
+    """Build the slower, more stable final IL Elo config from shared settings."""
+    if not isinstance(elo_config, dict):
+        return {}
+
+    resolved = dict(elo_config)
+    override_map = {
+        'final_il_levels': 'levels',
+        'final_il_games_per_level': 'games_per_level',
+        'final_il_stockfish_time_limit': 'stockfish_time_limit',
+        'final_il_max_moves': 'max_moves',
+        'final_il_workers': 'workers',
+        'final_il_stockfish_threads': 'stockfish_threads',
+        'final_il_stockfish_hash_mb': 'stockfish_hash_mb',
+        'final_il_use_mcts': 'use_mcts',
+        'final_il_mcts_simulations': 'mcts_simulations',
+    }
+    for source_key, target_key in override_map.items():
+        if source_key in resolved:
+            resolved[target_key] = resolved[source_key]
+
+    # Final IL evaluation runs after training has stopped, so it should use the
+    # full CPU budget instead of reserving threads for DataLoader workers.
+    resolved['prioritize_training'] = False
+    resolved['reserve_dataloader_workers'] = False
+    resolved['free_threads_utilization'] = 1.0
+    resolved['stockfish_priority'] = 'normal'
+    resolved['progress_bar'] = 'always'
+    resolved['auto_worker_reserve_cpus'] = 0
+    resolved['use_mcts'] = bool(resolved.get('use_mcts', False))
+    return resolved
+
+
+def _run_il_final_elo(model, config, device, elo_config, logger, epoch_num, model_label, marker_label, interrupted=False):
+    """Run a blocking final IL Elo check; Ctrl+C cancels only this check."""
+    if not isinstance(elo_config, dict) or not elo_config.get("enabled", False):
+        return {"skipped": True}
+
+    timing_label = "after Ctrl+C" if interrupted else "at training end"
+    print(f"\nFinal IL Elo check {timing_label} ({model_label}). Press Ctrl+C to cancel this check.")
+    stop_event = threading.Event()
+    was_training = bool(getattr(model, "training", False))
+    try:
+        model.eval()
+        elo_result = estimate_model_elo(
+            model,
+            config,
+            device,
+            elo_config,
+            stop_event=stop_event,
+        )
+    except KeyboardInterrupt:
+        stop_event.set()
+        print("\nCtrl+C detected. Final IL Elo check cancelled.")
+        return {"cancelled": True}
+    finally:
+        if was_training:
+            model.train()
+
+    if elo_result.get("cancelled"):
+        print("Final IL Elo check cancelled.")
+        return elo_result
+
+    estimated_elo = elo_result.get("estimated_elo")
+    if estimated_elo is not None:
+        logger.record_estimated_elo(epoch_num, estimated_elo, update_csv=True)
+        logger.add_elo_epoch_marker(epoch_num, marker_label)
+        print(f"Final IL Estimated Elo ({model_label}): {int(round(float(estimated_elo)))}")
+        for lvl, res in sorted(elo_result.get("results", {}).items()):
+            score_str = f"W{res['wins']}/D{res['draws']}/L{res['losses']}"
+            print(f"  vs SF {lvl}: {score_str} (score: {res['score']:.0%})")
+        print(f"  time {elo_result['total_time']:.1f}s ({elo_result['total_games']} games)")
+    elif elo_result.get("error"):
+        print(f"Final IL Elo check failed: {elo_result.get('error')}")
+    elif not elo_result.get("skipped"):
+        print("Final IL Elo check: inconclusive")
+
+    return elo_result
+
+
+def _load_il_model_for_final_elo(checkpoint_path, config, device, fallback_model=None):
+    """Load a checkpoint for final Elo, falling back to the live model if needed."""
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        if fallback_model is not None:
+            print(f"Final IL Elo: checkpoint missing ({checkpoint_path.name}); using current in-memory model.")
+            return fallback_model, "current model"
+        print(f"Final IL Elo skipped: checkpoint missing ({checkpoint_path})")
+        return None, None
+    try:
+        model = load_model(str(checkpoint_path), config, device, strict=True)
+        model.eval()
+        return model, checkpoint_path.name
+    except Exception as exc:
+        if fallback_model is not None:
+            print(
+                f"Final IL Elo: failed to load {checkpoint_path.name} ({exc}); "
+                "using current in-memory model."
+            )
+            return fallback_model, "current model"
+        print(f"Final IL Elo skipped: failed to load {checkpoint_path.name} ({exc})")
+        return None, None
 
 
 def main():
@@ -297,11 +512,18 @@ def main():
         experiment_name=f"il_training_{model_version}",
         mode="il",
     )
+    logging_cfg = config.get('logging', {}) or {}
+    logger.set_plot_smoothing(
+        enabled=logging_cfg.get('il_plot_smoothing_enabled', True),
+        alpha=logging_cfg.get('il_plot_smoothing_alpha', 0.35),
+        min_points=logging_cfg.get('il_plot_smoothing_min_points', 5),
+    )
     global _LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG
     _LAST_RUN_LOG_CSV = logger.csv_path
     _LAST_RUN_LOG_PNG = logger.plot_path
     
-    # 🆕 Per-layer learning rates - value head with lower LR to prevent overfitting
+    # Per-head learning rates. Value head can use a multiplier to tune calibration
+    # separately from the shared trunk/policy path.
     value_head_lr_factor = config['imitation_learning'].get('value_head_lr_factor', 1.0)
     base_lr = config['imitation_learning']['learning_rate']
 
@@ -626,13 +848,30 @@ def main():
     use_swa = config['imitation_learning'].get('use_swa', False)
     swa_model = None
     swa_scheduler = None
-    swa_start = int(config['imitation_learning'].get('swa_start_epoch', 15))
     swa_auto_start = bool(config['imitation_learning'].get('swa_auto_start', True))
+    swa_start = total_epochs + 1 if swa_auto_start else int(config['imitation_learning'].get('swa_start_epoch', total_epochs + 1))
+    swa_auto_min_epoch = int(config['imitation_learning'].get('swa_auto_min_epoch', swa_start))
+    swa_auto_min_epoch = max(1, swa_auto_min_epoch)
+    swa_auto_plateau_patience = int(config['imitation_learning'].get('swa_auto_plateau_patience', 3))
+    swa_auto_plateau_patience = max(1, swa_auto_plateau_patience)
+    swa_auto_min_delta = float(config['imitation_learning'].get('swa_auto_min_delta', min_delta if 'min_delta' in locals() else 0.001))
+    swa_auto_min_delta = max(0.0, swa_auto_min_delta)
     swa_transfer_unfreeze_offset = int(
         config['imitation_learning'].get('swa_transfer_unfreeze_offset', 1)
     )
     swa_transfer_unfreeze_offset = max(0, swa_transfer_unfreeze_offset)
+    swa_anneal_epochs = max(1, int(config['imitation_learning'].get('swa_anneal_epochs', 10)))
+    swa_stop_after_anneal_no_improve = bool(
+        config['imitation_learning'].get('swa_stop_after_anneal_no_improve', True)
+    )
+    swa_stop_after_anneal_grace_evals = max(
+        1,
+        int(config['imitation_learning'].get('swa_stop_after_anneal_grace_evals', 1)),
+    )
     swa_start_reason = "config"
+    swa_best_val_loss = None
+    swa_plateau_counter = 0
+    swa_post_anneal_no_improve_evals = 0
     non_blocking_transfers = bool(
         config.get('hardware', {}).get('non_blocking_transfers', True)
         and device.type == 'cuda'
@@ -648,7 +887,7 @@ def main():
                 f"(first_full_epoch={first_full_unfrozen_epoch}, offset={swa_transfer_unfreeze_offset})"
             )
 
-    def _resolve_swa_lr():
+    def _resolve_swa_lr(start_epoch_for_lr=None):
         il_cfg_local = config['imitation_learning']
         swa_lr_mode = str(il_cfg_local.get('swa_lr_mode', 'auto')).strip().lower()
         manual_swa_lr = float(il_cfg_local.get('swa_lr', 0.0005))
@@ -659,7 +898,8 @@ def main():
             return manual_swa_lr, f"manual(config={manual_swa_lr:.6f})"
 
         effective_base_lr = float(transfer_post_unfreeze_lr or base_lr)
-        swa_epoch_idx = max(0, min(total_epochs - 1, int(swa_start) - 1))
+        resolved_start_epoch = int(start_epoch_for_lr or swa_start)
+        swa_epoch_idx = max(0, min(total_epochs - 1, resolved_start_epoch - 1))
         lr_factor_at_swa = float(_lr_lambda(swa_epoch_idx))
         effective_lr_at_swa = effective_base_lr * lr_factor_at_swa
 
@@ -696,14 +936,46 @@ def main():
 
     if use_swa:
         swa_model = torch.optim.swa_utils.AveragedModel(model)
-        swa_lr, swa_lr_reason = _resolve_swa_lr()
-        swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=swa_lr)
+        swa_lr, swa_lr_reason = _resolve_swa_lr(swa_start)
         print(
-            f"SWA enabled: start_epoch={swa_start} (inclusive), "
-            f"swa_lr={swa_lr:.6f}, source={swa_start_reason}, lr_source={swa_lr_reason}"
+            f"SWA enabled: planned_start={'auto' if swa_auto_start else swa_start}, auto_start={'on' if swa_auto_start else 'off'}, "
+            f"auto_min_epoch={swa_auto_min_epoch}, plateau_patience={swa_auto_plateau_patience}, "
+            f"anneal_epochs={swa_anneal_epochs}, planned_swa_lr={swa_lr:.6f}, "
+            f"stop_after_anneal_no_improve={'on' if swa_stop_after_anneal_no_improve else 'off'}, "
+            f"source={swa_start_reason}, lr_source={swa_lr_reason}"
         )
     else:
         swa_lr = float(config['imitation_learning'].get('swa_lr', 0.0005))
+        swa_lr_reason = "disabled"
+
+    def _activate_swa_if_due(current_epoch_num, reason):
+        nonlocal swa_scheduler, swa_lr, swa_lr_reason, swa_start, swa_start_reason
+        if not use_swa or swa_model is None or swa_scheduler is not None:
+            return False
+        if int(current_epoch_num) < int(swa_start):
+            return False
+
+        swa_start = int(current_epoch_num)
+        swa_start_reason = str(reason)
+        swa_lr, swa_lr_reason = _resolve_swa_lr(swa_start)
+        swa_scheduler = torch.optim.swa_utils.SWALR(
+            optimizer,
+            swa_lr=swa_lr,
+            anneal_epochs=swa_anneal_epochs,
+        )
+        print(
+            f"SWA activated at epoch {swa_start}: "
+            f"swa_lr={swa_lr:.6f}, anneal_epochs={swa_anneal_epochs}, "
+            f"source={swa_start_reason}, lr_source={swa_lr_reason}"
+        )
+        if debug_log_file is not None:
+            with open(debug_log_file, 'a', encoding='utf-8') as f:
+                f.write(
+                    f"SWA activated at epoch {swa_start}: "
+                    f"swa_lr={swa_lr:.6f}, anneal_epochs={swa_anneal_epochs}, "
+                    f"source={swa_start_reason}, lr_source={swa_lr_reason}\n"
+                )
+        return True
     print(f"Non-blocking transfers: {'enabled' if non_blocking_transfers else 'disabled'}")
 
     # Training loop
@@ -764,10 +1036,15 @@ def main():
                 "running without freeze."
             )
     elo_config = config.get("elo_estimation", {})
-    elo_config_il = dict(elo_config)
+    elo_config_il = _apply_il_elo_overrides(elo_config)
     if elo_config_il.get("use_mcts", False):
         print("Note: IL forces elo_estimation.use_mcts=False for speed.")
     elo_config_il["use_mcts"] = False
+    final_elo_config_il = _build_il_final_elo_config(elo_config)
+    final_il_elo_enabled = bool(
+        final_elo_config_il.get("enabled", False)
+        and final_elo_config_il.get("final_on_il_shutdown", True)
+    )
 
     elo_coordinator = ILEloCoordinator(
         model=model,
@@ -777,6 +1054,14 @@ def main():
         logger=logger,
     )
     elo_coordinator.print_startup_summary()
+    if final_il_elo_enabled:
+        print(
+            "Elo final (IL): enabled for best_model_il and SWA, "
+            f"levels={final_elo_config_il.get('levels')}, "
+            f"games/level={final_elo_config_il.get('games_per_level')}, "
+            f"time={float(final_elo_config_il.get('stockfish_time_limit', 0.0)):.2f}s, "
+            f"mcts={bool(final_elo_config_il.get('use_mcts', False))}"
+        )
 
     # torch.compile: fuses Conv+BN+ReLU kernels → fewer GPU kernel launches.
     # For transfer warmup we compile the frozen model first, then re-compile the
@@ -784,6 +1069,20 @@ def main():
     _use_compile = config['hardware'].get('use_compile', False)
     eager_model = model
     _compile_strategy = None
+
+    def _compile_warmup_batch_sizes():
+        sizes = []
+        for loader in (train_loader, val_loader):
+            batch_size = getattr(loader, "batch_size", None)
+            try:
+                batch_size = int(batch_size)
+            except (TypeError, ValueError):
+                batch_size = 0
+            if batch_size > 0 and batch_size not in sizes:
+                sizes.append(batch_size)
+        if not sizes:
+            sizes.append(1)
+        return sizes
 
     def _maybe_compile_model(current_model, reason_label="startup"):
         if not _use_compile:
@@ -815,19 +1114,22 @@ def main():
                         _compiled = torch.compile(current_model, backend=backend_or_mode, dynamic=True)
                     except TypeError:
                         _compiled = torch.compile(current_model, backend=backend_or_mode)
-                # Próbny forward — wymusza kompilację i łapie TritonMissing / inne błędy
-                _dummy = torch.zeros(
-                    1, expected_input_planes, 8, 8,
-                    device=device,
-                    dtype=torch.float32,
-                ).to(memory_format=torch.channels_last)
+                # Compile/warm up with the real train/eval batch sizes. This
+                # avoids paying the first large-batch graph/autotune cost inside
+                # the epoch after compiling only a tiny batch=1 probe.
                 with torch.no_grad():
                     with torch.amp.autocast(
                         "cuda",
                         enabled=amp_enabled_for_compile,
                         dtype=amp_dtype_for_compile,
                     ):
-                        _compiled(_dummy)
+                        for warmup_batch_size in _compile_warmup_batch_sizes():
+                            _dummy = torch.zeros(
+                                warmup_batch_size, expected_input_planes, 8, 8,
+                                device=device,
+                                dtype=torch.float32,
+                            ).to(memory_format=torch.channels_last)
+                            _compiled(_dummy, apply_log_softmax=False)
                 return _compiled
             except Exception as _e:
                 print(f"  ✗ {'mode=' + backend_or_mode if is_mode else 'backend=' + backend_or_mode}: {type(_e).__name__}: {_e}")
@@ -854,7 +1156,8 @@ def main():
                 return _compiled_model
             print("  ⚠️ Zapamiętana konfiguracja torch.compile nie powiodła się, fallback do pełnego testu.")
 
-        print(f"torch.compile: testowanie dostępnych backendów ({reason_label})...")
+        warmup_sizes = ", ".join(str(size) for size in _compile_warmup_batch_sizes())
+        print(f"torch.compile: testowanie dostępnych backendów ({reason_label}, warmup_batches=[{warmup_sizes}])...")
         _compiled_model = None
 
         # 1. Inductor default (wymaga Triton — najlepszy wynik)
@@ -940,9 +1243,15 @@ def main():
                         swa_model = torch.optim.swa_utils.AveragedModel(model)
                         if swa_model_state is not None:
                             swa_model.load_state_dict(swa_model_state)
-                        swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=swa_lr)
                         if swa_scheduler_state is not None:
+                            swa_scheduler = torch.optim.swa_utils.SWALR(
+                                optimizer,
+                                swa_lr=swa_lr,
+                                anneal_epochs=swa_anneal_epochs,
+                            )
                             swa_scheduler.load_state_dict(swa_scheduler_state)
+                        else:
+                            swa_scheduler = None
 
                     elo_coordinator.model = model
                     gc.collect()
@@ -976,8 +1285,10 @@ def main():
             if profile_this_epoch and device.type == 'cuda':
                 torch.cuda.synchronize()
             train_start_time = time.perf_counter()
+            if use_swa and swa_scheduler is None and (epoch + 1) >= int(swa_start):
+                _activate_swa_if_due(epoch + 1, swa_start_reason)
             use_swa_scheduler_this_epoch = bool(
-                use_swa and swa_scheduler is not None and (epoch + 1) >= int(swa_start)
+                use_swa and swa_scheduler is not None
             )
             train_losses, train_metrics, train_profile = train_epoch_il(
                 model,
@@ -1109,6 +1420,45 @@ def main():
                     patience_counter += 1
                     print(f"No improvement. Patience: {patience_counter}/{max_patience}")
 
+                if use_swa and swa_stop_after_anneal_no_improve and swa_scheduler is not None:
+                    swa_anneal_complete_epoch = int(swa_start) + int(swa_anneal_epochs) - 1
+                    if (epoch + 1) >= swa_anneal_complete_epoch:
+                        if improvement > min_delta:
+                            swa_post_anneal_no_improve_evals = 0
+                        else:
+                            swa_post_anneal_no_improve_evals += 1
+                            print(
+                                "SWA anneal complete and validation did not improve: "
+                                f"{swa_post_anneal_no_improve_evals}/"
+                                f"{swa_stop_after_anneal_grace_evals} post-anneal eval(s)."
+                            )
+                            if swa_post_anneal_no_improve_evals >= swa_stop_after_anneal_grace_evals:
+                                print("\nSWA post-anneal stop triggered.")
+                                print(f"Best validation loss: {best_val_loss:.4f}")
+                                should_stop = True
+
+                if use_swa and swa_auto_start and swa_scheduler is None:
+                    current_val_loss = float(val_losses['total'])
+                    if swa_best_val_loss is None or (swa_best_val_loss - current_val_loss) > swa_auto_min_delta:
+                        swa_best_val_loss = current_val_loss
+                        swa_plateau_counter = 0
+                    else:
+                        swa_plateau_counter += 1
+
+                    if (epoch + 1) >= swa_auto_min_epoch and swa_plateau_counter >= swa_auto_plateau_patience:
+                        next_epoch = min(total_epochs, epoch + 2)
+                        if next_epoch < swa_start:
+                            swa_start = next_epoch
+                            swa_start_reason = (
+                                f"auto-plateau(best={swa_best_val_loss:.4f}, "
+                                f"patience={swa_plateau_counter}/{swa_auto_plateau_patience}, "
+                                f"min_delta={swa_auto_min_delta:g})"
+                            )
+                            print(f"SWA auto-start scheduled for epoch {swa_start}: {swa_start_reason}")
+                            if debug_log_file is not None:
+                                with open(debug_log_file, 'a', encoding='utf-8') as f:
+                                    f.write(f"SWA auto-start scheduled for epoch {swa_start}: {swa_start_reason}\n")
+
                 # Early stopping
                 if patience_counter >= max_patience:
                     print(f"\n🛑 Early stopping triggered!")
@@ -1133,29 +1483,22 @@ def main():
                     torch.cuda.synchronize()
                 epoch_total_time = time.perf_counter() - epoch_start_time
                 other_time = max(0.0, epoch_total_time - train_time - eval_time)
-                if train_profile is not None:
-                    batches = max(1, train_profile['batches'])
-                    profile_msg = (
-                        f"[PROFILE] Epoch {epoch + 1} [{phase_key}]: "
-                        f"data={train_profile['data']:.2f}s ({train_profile['data']*1000/batches:.1f}ms/b), "
-                        f"fwd={train_profile['forward']:.2f}s ({train_profile['forward']*1000/batches:.1f}ms/b), "
-                        f"bwd={train_profile['backward']:.2f}s ({train_profile['backward']*1000/batches:.1f}ms/b), "
-                        f"optim={train_profile['optim']:.2f}s ({train_profile['optim']*1000/batches:.1f}ms/b), "
-                        f"metrics={train_profile['metrics']:.2f}s ({train_profile['metrics']*1000/batches:.1f}ms/b), "
-                        f"train_total={train_profile['total']:.2f}s, "
-                        f"eval={eval_time:.2f}s, "
-                        f"other={other_time:.2f}s, "
-                        f"epoch_total={epoch_total_time:.2f}s"
-                    )
-                else:
-                    profile_msg = (
-                        f"[PROFILE] Epoch {epoch + 1} [{phase_key}]: "
-                        f"train={train_time:.2f}s, "
-                        f"eval={eval_time:.2f}s, "
-                        f"other={other_time:.2f}s, "
-                        f"total={epoch_total_time:.2f}s"
-                    )
-                print(profile_msg)
+                profile_lines = _format_il_epoch_profile(
+                    epoch + 1,
+                    phase_key,
+                    train_profile,
+                    train_time,
+                    eval_time,
+                    other_time,
+                    epoch_total_time,
+                    len(train_loader.dataset),
+                    len(val_loader.dataset) if eval_time > 0.0 else 0,
+                )
+                _emit_il_profile(
+                    profile_lines,
+                    debug_log_file=debug_log_file,
+                    print_to_console=bool(il_debug_cfg.get('print_profile_to_console', False)),
+                )
                 if debug_enabled and train_profile is not None:
                     grad_diag = train_profile.get('grad_diag') or {}
                     if grad_diag:
@@ -1181,7 +1524,6 @@ def main():
 
                     if debug_log_file is not None:
                         with open(debug_log_file, 'a', encoding='utf-8') as f:
-                            f.write(profile_msg + "\n")
                             grad_diag = train_profile.get('grad_diag') or {}
                             if grad_diag:
                                 f.write(
@@ -1198,9 +1540,6 @@ def main():
                                     f"curr_alloc={train_profile.get('current_allocated_mb', 0.0):.1f}MB, "
                                     f"curr_reserved={train_profile.get('current_reserved_mb', 0.0):.1f}MB\n"
                                 )
-                if debug_log_file is not None:
-                    with open(debug_log_file, 'a', encoding='utf-8') as f:
-                        f.write(profile_msg + "\n")
 
             # Save one rolling checkpoint per version for exact resume.
             model_to_save = model
@@ -1286,29 +1625,36 @@ def main():
     logger.plot()
 
     # Finalize SWA at training end and also on interrupt (if SWA has updates).
-    swa_final_result = finalize_swa_model(
-        final_epoch_idx=last_epoch_idx,
-        interrupted=training_interrupted,
-        use_swa=use_swa,
-        swa_model=swa_model,
-        use_amp=use_amp,
-        use_bfloat16=use_bfloat16,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        config=config,
-        device=device,
-        best_model_path=best_model_path,
-        swa_start=swa_start,
-        history_positions=history_positions,
-        expected_input_planes=expected_input_planes,
-        stride=stride,
-        model_version=model_version,
-        start_mode=start_mode,
-        best_val_loss=best_val_loss,
-        evaluate_il_fn=evaluate_il,
-        elo_config=elo_config_il,
-        model_architecture=model_architecture,
-    )
+    swa_elo_stop_event = threading.Event()
+    try:
+        swa_final_result = finalize_swa_model(
+            final_epoch_idx=last_epoch_idx,
+            interrupted=training_interrupted,
+            use_swa=use_swa,
+            swa_model=swa_model,
+            use_amp=use_amp,
+            use_bfloat16=use_bfloat16,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=config,
+            device=device,
+            best_model_path=best_model_path,
+            swa_start=swa_start,
+            history_positions=history_positions,
+            expected_input_planes=expected_input_planes,
+            stride=stride,
+            model_version=model_version,
+            start_mode=start_mode,
+            best_val_loss=best_val_loss,
+            evaluate_il_fn=evaluate_il,
+            elo_config=final_elo_config_il if final_il_elo_enabled else None,
+            elo_stop_event=swa_elo_stop_event,
+            model_architecture=model_architecture,
+        )
+    except KeyboardInterrupt:
+        swa_elo_stop_event.set()
+        print("\nSecond Ctrl+C detected. Final SWA/Elo step cancelled.")
+        swa_final_result = {"finalized": False, "elo_cancelled": True}
 
     final_epoch_num = max(1, last_epoch_idx + 1)
     swa_was_active = bool(use_swa and final_epoch_num >= int(swa_start))
@@ -1359,7 +1705,63 @@ def main():
         logger.append_final_note(f"SWA final: not saved (epoch {final_epoch_num})")
         logger.plot()
 
+    final_best_elo_result = {}
+    if final_il_elo_enabled and not swa_final_result.get("elo_cancelled"):
+        best_elo_model, best_elo_label = _load_il_model_for_final_elo(
+            best_model_path,
+            config,
+            device,
+            fallback_model=model,
+        )
+        if best_elo_model is not None:
+            best_checkpoint_loaded = best_elo_label != "current model"
+            final_model_label = f"best IL: {best_elo_label}" if best_checkpoint_loaded else "current model"
+            final_marker_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
+            final_note_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
+            final_best_elo_result = _run_il_final_elo(
+                model=best_elo_model,
+                config=config,
+                device=device,
+                elo_config=final_elo_config_il,
+                logger=logger,
+                epoch_num=final_epoch_num,
+                model_label=final_model_label,
+                marker_label=final_marker_label,
+                interrupted=training_interrupted,
+            )
+            if final_best_elo_result.get("estimated_elo") is not None:
+                if best_checkpoint_loaded:
+                    logger.record_best_final_elo(
+                        final_epoch_num,
+                        final_best_elo_result.get("estimated_elo"),
+                    )
+                logger.append_final_note(
+                    f"{final_note_label}: {int(round(float(final_best_elo_result['estimated_elo'])))}"
+                )
+                logger.plot()
+
     if training_interrupted:
+        if not swa_final_result.get("elo_cancelled") and swa_final_result.get("estimated_elo") is None:
+            final_elo_result = final_best_elo_result or {}
+            ran_current_final_elo = False
+            if final_elo_result.get("estimated_elo") is None and not final_elo_result.get("cancelled"):
+                ran_current_final_elo = True
+                final_elo_result = _run_il_final_elo(
+                    model=model,
+                    config=config,
+                    device=device,
+                    elo_config=final_elo_config_il,
+                    logger=logger,
+                    epoch_num=final_epoch_num,
+                    model_label="current model",
+                    marker_label="Ctrl+C final Elo",
+                    interrupted=True,
+                )
+            if ran_current_final_elo and final_elo_result.get("estimated_elo") is not None:
+                logger.append_final_note(
+                    f"Ctrl+C final Elo: {int(round(float(final_elo_result['estimated_elo'])))}"
+                )
+                logger.plot()
         cleanup_interrupted_log_csv(_LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG, "IL")
         print("IL training stopped gracefully.")
         return

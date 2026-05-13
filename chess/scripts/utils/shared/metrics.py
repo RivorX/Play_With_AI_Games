@@ -45,12 +45,12 @@ class MetricsCalculator:
     def update(self, policy_pred, value_pred, target_move, target_value, legal_moves_mask=None,
                move_indices=None, total_moves=None, value_weight_min=0.1,
                value_weight_min_total_moves=40, value_max_moves=200,
-               value_use_game_length=False):
+               value_use_game_length=False, policy_is_logits=False):
         """
         Update metrics with batch predictions
         
         Args:
-            policy_pred: Policy logits (B, action_size) - log probabilities
+            policy_pred: Policy logits or log-probabilities (B, action_size)
             value_pred: Value predictions (B, 3) - WDL logits OR (B, 1) - scalar
             target_move: Target move indices (B,)
             target_value: Target values (B, 1) or (B,) - scalar values
@@ -59,8 +59,9 @@ class MetricsCalculator:
         batch_size = policy_pred.size(0)
         self.total_samples += batch_size
         
-        # Convert log probs to probs
-        policy_probs = torch.exp(policy_pred)
+        # Convert policy scores to probabilities only for confidence/coverage.
+        # Top-k is invariant to logits vs log-probabilities.
+        policy_probs = torch.softmax(policy_pred, dim=1) if policy_is_logits else torch.exp(policy_pred)
         
         # ============================================================
         # POLICY ACCURACY (Top-1, Top-3, Top-5)

@@ -344,6 +344,7 @@ def finalize_swa_model(
     best_val_loss,
     evaluate_il_fn,
     elo_config=None,
+    elo_stop_event=None,
     model_architecture=None,
 ):
     """Finalize SWA model with BN refresh, optional Elo, and save best_model_il_swa.pt."""
@@ -359,6 +360,7 @@ def finalize_swa_model(
         "val_wdl_ce": None,
         "estimated_elo": None,
         "estimated_elo_epoch": None,
+        "elo_cancelled": False,
         "model_path": None,
     }
     if not use_swa or swa_model is None:
@@ -441,25 +443,36 @@ def finalize_swa_model(
 
     if isinstance(elo_config, dict) and elo_config.get("enabled", False):
         print("Estimating SWA Elo (separate final check)...")
-        elo_result = estimate_model_elo(
-            swa_model.module,
-            config,
-            device,
-            elo_config,
-        )
-        swa_elo = elo_result.get("estimated_elo")
-        if swa_elo is not None:
-            result["estimated_elo"] = float(swa_elo)
-            result["estimated_elo_epoch"] = int(epoch_to_store + 1)
-            print(f"SWA Estimated Elo: {int(round(float(swa_elo)))}")
-            for lvl, res in sorted(elo_result.get("results", {}).items()):
-                score_str = f"W{res['wins']}/D{res['draws']}/L{res['losses']}"
-                print(f"  vs SF {lvl}: {score_str} (score: {res['score']:.0%})")
-            print(f"  time {elo_result['total_time']:.1f}s ({elo_result['total_games']} games)")
-        elif elo_result.get("error"):
-            print(f"SWA Elo estimation failed: {elo_result.get('error')}")
-        elif not elo_result.get("skipped"):
-            print("SWA Elo estimation: inconclusive")
+        try:
+            elo_result = estimate_model_elo(
+                swa_model.module,
+                config,
+                device,
+                elo_config,
+                stop_event=elo_stop_event,
+            )
+        except KeyboardInterrupt:
+            if elo_stop_event is not None:
+                elo_stop_event.set()
+            elo_result = {"cancelled": True}
+
+        if elo_result.get("cancelled"):
+            result["elo_cancelled"] = True
+            print("SWA Elo estimation cancelled.")
+        else:
+            swa_elo = elo_result.get("estimated_elo")
+            if swa_elo is not None:
+                result["estimated_elo"] = float(swa_elo)
+                result["estimated_elo_epoch"] = int(epoch_to_store + 1)
+                print(f"SWA Estimated Elo: {int(round(float(swa_elo)))}")
+                for lvl, res in sorted(elo_result.get("results", {}).items()):
+                    score_str = f"W{res['wins']}/D{res['draws']}/L{res['losses']}"
+                    print(f"  vs SF {lvl}: {score_str} (score: {res['score']:.0%})")
+                print(f"  time {elo_result['total_time']:.1f}s ({elo_result['total_games']} games)")
+            elif elo_result.get("error"):
+                print(f"SWA Elo estimation failed: {elo_result.get('error')}")
+            elif not elo_result.get("skipped"):
+                print("SWA Elo estimation: inconclusive")
 
     metadata = {
         "swa_enabled": True,

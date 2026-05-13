@@ -535,7 +535,7 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
         with torch.enable_grad():
             probe_optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                policy_pred, value_pred = model(boards)
+                policy_pred, value_pred = model(boards, apply_log_softmax=False)
 
                 predictions = {
                     "policy": policy_pred,
@@ -902,7 +902,7 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
 
                     optimizer.zero_grad(set_to_none=True)
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                        policy_pred, value_pred = model(boards)
+                        policy_pred, value_pred = model(boards, apply_log_softmax=False)
 
                         predictions = {
                             "policy": policy_pred,
