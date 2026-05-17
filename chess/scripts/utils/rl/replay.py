@@ -71,7 +71,11 @@ class ReplayBuffer:
         self._policy_lengths = None
         self._importance = None
         self._policy_sample_weights = None
+        self._insertion_iterations = None
         self._scratch = {}
+        self.current_iteration = 0
+        self.last_sample_age_stats = {}
+        self.last_sample_ages = np.empty(0, dtype=np.float32)
 
     def _ordered_indices_oldest_to_newest(self):
         if self.size <= 0:
@@ -110,6 +114,13 @@ class ReplayBuffer:
         self._policy_lengths = torch.zeros((self.max_size,), dtype=torch.int16)
         self._importance = torch.zeros((self.max_size,), dtype=torch.float32)
         self._policy_sample_weights = torch.ones((self.max_size,), dtype=torch.float32)
+        self._insertion_iterations = torch.zeros((self.max_size,), dtype=torch.int32)
+
+    def set_current_iteration(self, iteration):
+        try:
+            self.current_iteration = max(0, int(iteration))
+        except Exception:
+            self.current_iteration = 0
 
     def _get_scratch_batch(self, batch_size, max_len):
         key = (int(batch_size), int(max_len))
@@ -171,6 +182,7 @@ class ReplayBuffer:
         self._policy_lengths[slot] = count
         self._importance[slot] = float(importance)
         self._policy_sample_weights[slot] = float(policy_weight)
+        self._insertion_iterations[slot] = int(self.current_iteration)
 
     def _build_batch_from_indices(self, indices):
         idx = torch.as_tensor(indices, dtype=torch.long)
@@ -263,6 +275,7 @@ class ReplayBuffer:
             self._policy_lengths[dst_slice].copy_(policy_lengths[src_slice])
             self._importance[dst_slice].copy_(importance_scores[src_slice])
             self._policy_sample_weights[dst_slice].copy_(policy_weights[src_slice])
+            self._insertion_iterations[dst_slice].fill_(int(self.current_iteration))
 
             self.position = (dst_start + count) % self.max_size
             self.size = min(self.size + count, self.max_size)
@@ -533,7 +546,30 @@ class ReplayBuffer:
             raise ValueError("Cannot sample from an empty replay buffer.")
         batch_size = max(1, min(int(batch_size), int(self.size)))
         indices = self._sample_indices_with_biases(batch_size)
+        self._record_sample_age_stats(indices)
         return self._build_batch_from_indices(indices)
+
+    def _record_sample_age_stats(self, indices):
+        if self._insertion_iterations is None:
+            self.last_sample_ages = np.empty(0, dtype=np.float32)
+            self.last_sample_age_stats = {}
+            return
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.size <= 0:
+            self.last_sample_ages = np.empty(0, dtype=np.float32)
+            self.last_sample_age_stats = {}
+            return
+
+        idx = torch.as_tensor(indices, dtype=torch.long)
+        inserted = self._insertion_iterations[idx].to(dtype=torch.float32).cpu().numpy()
+        ages = np.maximum(0.0, float(self.current_iteration) - inserted).astype(np.float32, copy=False)
+        self.last_sample_ages = ages
+        self.last_sample_age_stats = {
+            "avg": float(np.mean(ages)),
+            "p10": float(np.percentile(ages, 10)),
+            "p50": float(np.percentile(ages, 50)),
+            "p90": float(np.percentile(ages, 90)),
+        }
 
     def resize(self, new_max_size):
         new_max_size = max(1, int(new_max_size))
@@ -558,6 +594,7 @@ class ReplayBuffer:
         old_policy_lengths = self._policy_lengths
         old_importance = self._importance
         old_policy_sample_weights = self._policy_sample_weights
+        old_insertion_iterations = self._insertion_iterations
 
         board_shape = tuple(old_boards.shape[1:])
         board_dtype = old_boards.dtype
@@ -578,6 +615,7 @@ class ReplayBuffer:
         self._policy_lengths = torch.zeros((self.max_size,), dtype=old_policy_lengths.dtype)
         self._importance = torch.zeros((self.max_size,), dtype=old_importance.dtype)
         self._policy_sample_weights = torch.ones((self.max_size,), dtype=old_policy_sample_weights.dtype)
+        self._insertion_iterations = torch.zeros((self.max_size,), dtype=old_insertion_iterations.dtype)
 
         if keep_size > 0:
             idx = torch.as_tensor(keep_indices, dtype=torch.long)
@@ -588,6 +626,7 @@ class ReplayBuffer:
             self._policy_lengths[:keep_size].copy_(old_policy_lengths[idx])
             self._importance[:keep_size].copy_(old_importance[idx])
             self._policy_sample_weights[:keep_size].copy_(old_policy_sample_weights[idx])
+            self._insertion_iterations[:keep_size].copy_(old_insertion_iterations[idx])
 
         self.size = keep_size
         self.position = 0 if keep_size >= self.max_size else keep_size
@@ -656,11 +695,22 @@ class ReplayBuffer:
             entropy = -(probs * torch.log(torch.clamp(probs, min=1e-12))).sum(dim=1)
             top1 = probs.max(dim=1).values
             non_empty = policy_lengths > 0
+            topk_count = min(3, int(probs.shape[1])) if probs.dim() == 2 else 0
+            top3 = (
+                torch.topk(probs, k=topk_count, dim=1).values.sum(dim=1)
+                if topk_count > 0
+                else torch.zeros_like(top1)
+            )
+            entropy_mean = _safe_mean(entropy[non_empty])
             stats["policy_target_entropy_mean"] = _safe_mean(entropy[non_empty])
             stats["policy_target_top1_prob_mean"] = _safe_mean(top1[non_empty])
+            stats["policy_target_top3_prob_mean"] = _safe_mean(top3[non_empty])
+            stats["policy_target_effective_moves"] = float(np.exp(entropy_mean)) if entropy_mean > 0.0 else 0.0
         else:
             stats["policy_target_entropy_mean"] = 0.0
             stats["policy_target_top1_prob_mean"] = 0.0
+            stats["policy_target_top3_prob_mean"] = 0.0
+            stats["policy_target_effective_moves"] = 0.0
 
         recent_fraction = (
             self.recent_window_fraction

@@ -5,7 +5,7 @@ Unified training logger for both IL and RL training
 import csv
 import textwrap
 import matplotlib.pyplot as plt
-from matplotlib.ticker import PercentFormatter
+from matplotlib.ticker import MaxNLocator, PercentFormatter
 from datetime import datetime
 from pathlib import Path
 
@@ -59,9 +59,11 @@ class TrainingLogger:
             
             else:  # RL mode
                 header = [
-                    'iteration', 'avg_loss', 'policy_loss', 'value_loss',
+                    'iteration', 'avg_loss', 'policy_loss', 'value_loss', 'learning_rate',
+                    'value_loss_weight', 'mcts_q_value_scale', 'value_guard_streak', 'mcts_no_mcts_gap',
                     'score_rate', 'buffer_size', 'avg_game_length', 'temperature', 'beta',
-                    'true_win_rate', 'eval_wins', 'eval_draws', 'eval_losses', 'eval_unresolved',
+                    'true_win_rate', 'eval_stage', 'eval_games',
+                    'eval_wins', 'eval_draws', 'eval_losses', 'eval_unresolved',
                     'no_mcts_score_rate', 'no_mcts_win_rate',
                     'no_mcts_draw_rate', 'no_mcts_loss_rate',
                     'no_mcts_wins', 'no_mcts_draws', 'no_mcts_losses', 'no_mcts_unresolved',
@@ -70,22 +72,15 @@ class TrainingLogger:
                     'policy_top1_acc', 'policy_top3_acc',
                     'value_mae', 'value_mae_weighted',
                     'value_wdl_acc', 'value_wdl_ce',
-                    # 🧠 RL stability telemetry
-                    'completed_draw_rate', 'dynamic_uniform_fraction',
-                    'priority_age_decay_lambda', 'avg_sample_age',
+                    # 🧠 RL headline telemetry
+                    'completed_draw_rate',
                     'avg_game_value', 'value_std',
                     'policy_entropy', 'value_pred_std',
-                    'selfplay_decisive_games', 'selfplay_decisive_rate',
-                    'selfplay_auto_draw_rate',
-                    'selfplay_truncated_rate', 'selfplay_decisive_avg_length',
-                    'selfplay_curriculum_dropped_positions', 'selfplay_cap_dropped_positions',
-                    'replay_decisive_fraction', 'replay_draw_fraction',
-                    'policy_weight_mean', 'policy_weight_low_fraction',
-                    'policy_target_len_mean',
-                    'mcts_prior_agreement_rate', 'mcts_prior_changed_rate',
-                    'mcts_changed_to_lower_q_rate', 'mcts_q_delta_mean',
+                    'selfplay_decisive_rate', 'selfplay_auto_draw_rate',
+                    'selfplay_truncated_rate',
                     'adaptive_temp_adjustment', 'adaptive_temp_threshold',
-                    'estimated_elo',
+                    'rl_best_model',
+                    'estimated_elo', 'estimated_elo_nn', 'estimated_elo_mcts', 'estimated_elo_mcts_simulations',
                 ]
             
             writer.writerow(header)
@@ -127,36 +122,63 @@ class TrainingLogger:
             self.performance_plot_path = self.details_dir / f"{self.details_prefix}_performance.png"
             self.data_quality_log_path = self.details_dir / f"{self.details_prefix}_data_quality.csv"
             self.data_quality_plot_path = self.details_dir / f"{self.details_prefix}_data_quality.png"
+            self.debug_training_profile_dir = self.log_dir / "debug" / "training_profile"
+            self.debug_training_profile_dir.mkdir(parents=True, exist_ok=True)
+            self.latest_training_profile_path = self.debug_training_profile_dir / "rl_latest_training_profile.csv"
+            for stale_profile in self.debug_training_profile_dir.glob("rl_*training_profile*.csv"):
+                if stale_profile != self.latest_training_profile_path:
+                    try:
+                        stale_profile.unlink()
+                    except OSError:
+                        pass
+            performance_header = [
+                'iteration',
+                'timestamp',
+                'positions_per_sec',
+                'iteration_total_time_s',
+                'stage_setup_pct',
+                'stage_selfplay_pct',
+                'stage_replay_pct',
+                'stage_train_pct',
+                'stage_eval_log_pct',
+                'stage_checkpoint_pct',
+                'stage_gc_pct',
+                'stage_setup_time_s',
+                'stage_selfplay_time_s',
+                'stage_replay_time_s',
+                'stage_train_time_s',
+                'stage_eval_log_time_s',
+                'stage_checkpoint_time_s',
+                'stage_gc_time_s',
+                'selfplay_time_s',
+                'data_collection_time_s',
+                'avg_game_length',
+                'mcts_avg_batch_size',
+                'mcts_central_avg_batch_size',
+                'central_remote_wait_ms_per_request',
+                'central_request_put_ms_per_request',
+                'central_server_queue_wait_ms_per_request',
+                'central_server_concat_ms_per_request',
+                'central_server_h2d_ms_per_request',
+                'central_server_forward_ms_per_request',
+                'central_server_d2h_ms_per_request',
+                'central_server_total_ms_per_request',
+                'mcts_gpu_utilization_pct',
+                'mcts_inference_ms_per_position',
+                'mcts_inference_ms_per_batch',
+                'mcts_search_many_time_s',
+                'mcts_nn_inference_time_s',
+                'mcts_nn_inference_calls',
+                'mcts_nn_inference_batch_items',
+                'mcts_avg_legal_moves_per_position',
+                'queue_wait_time_ms',
+            ]
             with open(self.performance_log_path, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    'iteration',
-                    'timestamp',
-                    'positions_per_sec',
-                    'iteration_total_time_s',
-                    'selfplay_time_s',
-                    'data_collection_time_s',
-                    'avg_game_length',
-                    'mcts_avg_batch_size',
-                    'mcts_central_avg_batch_size',
-                    'central_remote_wait_ms_per_request',
-                    'central_request_put_ms_per_request',
-                    'central_server_queue_wait_ms_per_request',
-                    'central_server_concat_ms_per_request',
-                    'central_server_h2d_ms_per_request',
-                    'central_server_forward_ms_per_request',
-                    'central_server_d2h_ms_per_request',
-                    'central_server_total_ms_per_request',
-                    'mcts_gpu_utilization_pct',
-                    'mcts_inference_ms_per_position',
-                    'mcts_inference_ms_per_batch',
-                    'mcts_search_many_time_s',
-                    'mcts_nn_inference_time_s',
-                    'mcts_nn_inference_calls',
-                    'mcts_nn_inference_batch_items',
-                    'mcts_avg_legal_moves_per_position',
-                    'queue_wait_time_ms',
-                ])
+                writer.writerow(performance_header)
+            with open(self.latest_training_profile_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(performance_header)
             with open(self.data_quality_log_path, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
@@ -187,10 +209,19 @@ class TrainingLogger:
                     'policy_target_len_p90',
                     'policy_target_entropy_mean',
                     'policy_target_top1_prob_mean',
+                    'policy_target_top3_prob_mean',
+                    'policy_target_effective_moves',
                     'importance_mean',
                     'importance_p90',
+                    'sample_age_avg',
+                    'sample_age_p10',
+                    'sample_age_p50',
+                    'sample_age_p90',
+                    'sample_age_new_fraction',
+                    'sample_age_le1_fraction',
                     'selfplay_completed_games',
                     'selfplay_draw_rate',
+                    'replay_vs_selfplay_draw_gap',
                     'selfplay_decisive_rate',
                     'selfplay_truncated_rate',
                     'selfplay_auto_draw_rate',
@@ -207,6 +238,9 @@ class TrainingLogger:
                     'mcts_q_delta_samples',
                     'mcts_changed_to_lower_q_rate',
                     'mcts_q_delta_mean',
+                    'mcts_q_delta_p10',
+                    'mcts_q_delta_p50',
+                    'mcts_q_delta_p90',
                     'mcts_policy_kl_mean',
                     'mcts_prior_top_visit_prob_mean',
                     'mcts_top_prior_prob_mean',
@@ -352,11 +386,13 @@ class TrainingLogger:
         data_collection_time=None,
         avg_game_length=None,
         profile=None,
+        stage_times=None,
     ):
         """Append RL speed/profile metrics to the single latest performance log."""
         if self.mode != "rl" or self.performance_log_path is None:
             return
         profile = dict(profile or {})
+        stage_times = dict(stage_times or {})
 
         def _float_or_none(value):
             try:
@@ -393,11 +429,33 @@ class TrainingLogger:
             value = profile.get(key, default)
             return default if value is None else value
 
+        iteration_total_float = _float_or_none(iteration_total_time)
+
+        def _stage_pct(key):
+            stage_value = _float_or_none(stage_times.get(key))
+            if stage_value is None or iteration_total_float is None or iteration_total_float <= 0.0:
+                return ''
+            return float(stage_value) / float(iteration_total_float)
+
         row = [
             int(iteration),
             datetime.now().isoformat(timespec='seconds'),
             '' if positions_per_sec is None else positions_per_sec,
             '' if iteration_total_time is None else iteration_total_time,
+            _stage_pct('setup'),
+            _stage_pct('selfplay'),
+            _stage_pct('replay'),
+            _stage_pct('train'),
+            _stage_pct('eval_log'),
+            _stage_pct('checkpoint'),
+            _stage_pct('gc'),
+            stage_times.get('setup', ''),
+            stage_times.get('selfplay', ''),
+            stage_times.get('replay', ''),
+            stage_times.get('train', ''),
+            stage_times.get('eval_log', ''),
+            stage_times.get('checkpoint', ''),
+            stage_times.get('gc', ''),
             '' if selfplay_time is None else selfplay_time,
             '' if data_collection_time is None else data_collection_time,
             '' if avg_game_length is None else avg_game_length,
@@ -423,6 +481,10 @@ class TrainingLogger:
         ]
         with open(self.performance_log_path, 'a', newline='') as f:
             csv.writer(f).writerow(row)
+        latest_path = getattr(self, 'latest_training_profile_path', None)
+        if latest_path is not None:
+            with open(latest_path, 'a', newline='') as f:
+                csv.writer(f).writerow(row)
 
     def plot_rl_performance(self):
         """Generate a performance plot from this run's RL details CSV."""
@@ -455,54 +517,82 @@ class TrainingLogger:
                 ys.append(y)
             return xs, ys
 
-        fig, axes = plt.subplots(3, 2, figsize=(14, 11))
-        fig.suptitle('RL Performance', fontsize=16, fontweight='bold')
+        fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+        fig.patch.set_facecolor('#F7F8FA')
+        fig.suptitle('RL Performance Details', fontsize=17, fontweight='bold', y=0.97)
 
-        ax = axes[0, 0]
-        xs, ys = _series('positions_per_sec')
-        if xs:
-            ax.plot(xs, ys, 'bo-', linewidth=2, markersize=5)
-        ax.set_title('Positions / sec')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('positions/s')
-        ax.grid(True, alpha=0.3)
+        colors = {
+            'green': '#16A34A',
+            'blue': '#2563EB',
+            'purple': '#7C3AED',
+            'red': '#DC2626',
+            'orange': '#EA580C',
+            'cyan': '#0891B2',
+            'slate': '#475569',
+            'black': '#111827',
+        }
 
-        ax = axes[0, 1]
-        for column, label, style in [
-            ('iteration_total_time_s', 'Iteration total', 'ko-'),
-            ('selfplay_time_s', 'Self-play', 'ro-'),
-            ('data_collection_time_s', 'Collection', 'go-'),
-            ('mcts_search_many_time_s', 'MCTS search_many', 'mo--'),
-        ]:
+        def _style_axis(ax, title, ylabel=None):
+            ax.set_facecolor('#FFFFFF')
+            ax.set_title(title, fontsize=11, fontweight='bold', loc='left', pad=8)
+            ax.set_xlabel('Iteration')
+            if ylabel:
+                ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.22, linewidth=0.8)
+            for spine in ax.spines.values():
+                spine.set_alpha(0.18)
+
+        def _plot(ax, column, label, color, style='-', marker='o', linewidth=2.0, alpha=0.95):
             xs, ys = _series(column)
             if xs:
-                ax.plot(xs, ys, style, linewidth=1.8, markersize=5, label=label)
-        ax.set_title('Runtime')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('seconds')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+                ax.plot(xs, ys, linestyle=style, marker=marker, linewidth=linewidth, markersize=4, color=color, alpha=alpha, label=label)
+            return xs, ys
+
+        def _latest(column):
+            for row in reversed(rows):
+                raw = row.get(column, '')
+                if raw not in ('', None):
+                    try:
+                        return float(raw)
+                    except (TypeError, ValueError):
+                        return raw
+            return None
+
+        ax = axes[0, 0]
+        _plot(ax, 'positions_per_sec', 'Positions/s', colors['green'])
+        _plot(ax, 'mcts_central_avg_batch_size', 'Central avg batch', colors['purple'], style='--', marker='s')
+        _style_axis(ax, 'Throughput', 'rate / batch')
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=8, loc='best')
+
+        ax = axes[0, 1]
+        for column, label, color, style in [
+            ('iteration_total_time_s', 'Iteration total', colors['black'], '-'),
+            ('stage_selfplay_time_s', 'Self-play stage', colors['red'], '--'),
+            ('stage_train_time_s', 'Train stage', colors['blue'], ':'),
+            ('stage_eval_log_time_s', 'Eval/log stage', colors['orange'], '-.'),
+            ('selfplay_time_s', 'Self-play total', colors['purple'], '--'),
+            ('data_collection_time_s', 'Collection', colors['green'], ':'),
+        ]:
+            _plot(ax, column, label, color, style=style, marker=None, linewidth=1.9, alpha=0.88)
+        _style_axis(ax, 'Runtime Breakdown', 'seconds')
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=8, loc='best')
 
         ax = axes[1, 0]
-        xs, ys = _series('mcts_avg_batch_size')
-        if xs:
-            ax.plot(xs, ys, 'co-', linewidth=2, markersize=5, label='Worker avg batch')
-        xs_c, ys_c = _series('mcts_central_avg_batch_size')
-        if xs_c:
-            ax.plot(xs_c, ys_c, color='tab:green', marker='^', linestyle='-', linewidth=2, markersize=5, label='Central avg batch')
-        ax.set_title('MCTS Inference Batch')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('batch items')
-        ax.grid(True, alpha=0.3)
+        _plot(ax, 'mcts_avg_batch_size', 'Worker avg batch', colors['cyan'])
+        _plot(ax, 'mcts_central_avg_batch_size', 'Central avg batch', colors['green'], marker='^')
+        _style_axis(ax, 'MCTS Batch Efficiency', 'batch items')
         ax2 = ax.twinx()
         xs2, ys2 = _series('mcts_inference_ms_per_position')
         if xs2:
-            ax2.plot(xs2, ys2, color='tab:orange', marker='s', linestyle='--', linewidth=1.8, label='ms/position')
+            ax2.plot(xs2, ys2, color=colors['orange'], marker='s', linestyle='--', linewidth=1.8, markersize=4, label='ms/position')
         ax2.set_ylabel('ms / position')
+        ax2.spines['right'].set_alpha(0.18)
         lines, labels = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         if lines or lines2:
-            ax.legend(lines + lines2, labels + labels2, loc='best')
+            ax.legend(lines + lines2, labels + labels2, fontsize=8, loc='best')
 
         ax = axes[1, 1]
         xs, ys = _series('mcts_gpu_utilization_pct')
@@ -521,49 +611,55 @@ class TrainingLogger:
                 xs.append(iteration)
                 ys.append(max(0.0, min(100.0, 100.0 * nn_time / search_time)))
         if xs:
-            ax.plot(xs, ys, 'yo-', linewidth=2, markersize=5)
-        ax.set_title('MCTS GPU Utilization Proxy')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('percent')
+            ax.plot(xs, ys, color=colors['orange'], marker='o', linewidth=2, markersize=4)
+        _style_axis(ax, 'MCTS GPU Utilization Proxy', 'percent')
         ax.set_ylim(0, 100)
-        ax.grid(True, alpha=0.3)
+        ax.yaxis.set_major_formatter(PercentFormatter(100.0))
 
         ax = axes[2, 0]
-        for column, label, style in [
-            ('central_remote_wait_ms_per_request', 'worker wait', 'ro-'),
-            ('central_request_put_ms_per_request', 'queue put', 'ko:'),
-            ('central_server_queue_wait_ms_per_request', 'server queue', 'co--'),
-            ('central_server_concat_ms_per_request', 'concat/ipc', 'bo:'),
-            ('central_server_h2d_ms_per_request', 'h2d', 'yo:'),
-            ('central_server_forward_ms_per_request', 'server forward', 'go-'),
-            ('central_server_d2h_ms_per_request', 'd2h', 'ko:'),
-            ('central_server_total_ms_per_request', 'server total', 'mo--'),
+        for column, label, color, style in [
+            ('central_remote_wait_ms_per_request', 'worker wait', colors['red'], '-'),
+            ('central_server_queue_wait_ms_per_request', 'server queue', colors['cyan'], '--'),
+            ('central_server_forward_ms_per_request', 'server forward', colors['green'], '-'),
+            ('central_server_total_ms_per_request', 'server total', colors['purple'], '--'),
+            ('central_server_h2d_ms_per_request', 'h2d', colors['orange'], ':'),
+            ('central_server_d2h_ms_per_request', 'd2h', colors['slate'], ':'),
         ]:
-            xs, ys = _series(column)
-            if xs:
-                ax.plot(xs, ys, style, linewidth=1.6, markersize=4, label=label)
-        ax.set_title('Central Inference Latency')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('ms / request')
-        ax.grid(True, alpha=0.3)
+            _plot(ax, column, label, color, style=style, marker=None, linewidth=1.7, alpha=0.9)
+        _style_axis(ax, 'Central Inference Latency', 'ms / request')
         if ax.get_legend_handles_labels()[0]:
-            ax.legend(loc='best')
+            ax.legend(fontsize=8, loc='best')
 
         ax = axes[2, 1]
-        xs, ys = _series('queue_wait_time_ms')
-        if xs:
-            ax.plot(xs, ys, color='tab:red', marker='o', linestyle='-', linewidth=1.8, markersize=5, label='result queue wait')
-        xs2, ys2 = _series('mcts_inference_ms_per_batch')
-        if xs2:
-            ax.plot(xs2, ys2, color='tab:blue', marker='s', linestyle='--', linewidth=1.8, markersize=5, label='MCTS inference ms/batch')
-        ax.set_title('Queue / Inference Wait')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('ms')
-        ax.grid(True, alpha=0.3)
-        if ax.get_legend_handles_labels()[0]:
-            ax.legend(loc='best')
+        ax.axis('off')
+        latest_lines = ["Latest Performance", ""]
+        for column, label, fmt in [
+            ('positions_per_sec', 'Positions/s', '{:.1f}'),
+            ('iteration_total_time_s', 'Iter total', '{:.1f}s'),
+            ('stage_selfplay_time_s', 'Self-play', '{:.1f}s'),
+            ('stage_train_time_s', 'Train', '{:.1f}s'),
+            ('stage_selfplay_pct', 'Self-play %', '{:.1%}'),
+            ('stage_train_pct', 'Train %', '{:.1%}'),
+            ('stage_eval_log_pct', 'Eval/log %', '{:.1%}'),
+            ('mcts_central_avg_batch_size', 'Central batch', '{:.1f}'),
+            ('central_server_forward_ms_per_request', 'Forward', '{:.2f}ms'),
+            ('central_server_total_ms_per_request', 'Server total', '{:.2f}ms'),
+        ]:
+            value = _latest(column)
+            if isinstance(value, (int, float)):
+                latest_lines.append(f"{label}: {fmt.format(value)}")
+        ax.set_title('Summary', fontsize=11, fontweight='bold', loc='left', pad=8)
+        ax.text(
+            0.04,
+            0.52,
+            "\n".join(latest_lines),
+            fontsize=11,
+            family='monospace',
+            verticalalignment='center',
+            bbox=dict(boxstyle='round,pad=0.55', fc='white', ec='#CBD5E1', alpha=0.95),
+        )
 
-        fig.subplots_adjust(left=0.07, right=0.96, bottom=0.07, top=0.92, hspace=0.42, wspace=0.28)
+        fig.subplots_adjust(left=0.06, right=0.97, bottom=0.06, top=0.92, hspace=0.42, wspace=0.28)
         fig.savefig(self.performance_plot_path, dpi=150)
         plt.close(fig)
 
@@ -586,6 +682,13 @@ class TrainingLogger:
         def _value(mapping, key, default=''):
             value = mapping.get(key, default)
             return default if value is None else value
+
+        replay_draw = _value(replay_stats, 'draw_fraction', None)
+        selfplay_draw = _value(selfplay_stats, 'completed_draw_rate', None)
+        try:
+            replay_vs_selfplay_draw_gap = float(replay_draw) - float(selfplay_draw)
+        except (TypeError, ValueError):
+            replay_vs_selfplay_draw_gap = ''
 
         row = [
             int(iteration),
@@ -615,10 +718,19 @@ class TrainingLogger:
             _value(replay_stats, 'policy_target_len_p90'),
             _value(replay_stats, 'policy_target_entropy_mean'),
             _value(replay_stats, 'policy_target_top1_prob_mean'),
+            _value(replay_stats, 'policy_target_top3_prob_mean'),
+            _value(replay_stats, 'policy_target_effective_moves'),
             _value(replay_stats, 'importance_mean'),
             _value(replay_stats, 'importance_p90'),
+            _value(replay_stats, 'sample_age_avg'),
+            _value(replay_stats, 'sample_age_p10'),
+            _value(replay_stats, 'sample_age_p50'),
+            _value(replay_stats, 'sample_age_p90'),
+            _value(replay_stats, 'sample_age_new_fraction'),
+            _value(replay_stats, 'sample_age_le1_fraction'),
             _value(selfplay_stats, 'completed_games'),
             _value(selfplay_stats, 'completed_draw_rate'),
+            replay_vs_selfplay_draw_gap,
             _value(selfplay_stats, 'decisive_rate'),
             _value(selfplay_stats, 'truncated_rate'),
             _value(selfplay_stats, 'auto_draw_rate'),
@@ -635,6 +747,9 @@ class TrainingLogger:
             _value(selfplay_stats, 'mcts_q_delta_samples'),
             _value(selfplay_stats, 'mcts_changed_to_lower_q_rate'),
             _value(selfplay_stats, 'mcts_q_delta_mean'),
+            _value(selfplay_stats, 'mcts_q_delta_p10'),
+            _value(selfplay_stats, 'mcts_q_delta_p50'),
+            _value(selfplay_stats, 'mcts_q_delta_p90'),
             _value(selfplay_stats, 'mcts_policy_kl_mean'),
             _value(selfplay_stats, 'mcts_prior_top_visit_prob_mean'),
             _value(selfplay_stats, 'mcts_top_prior_prob_mean'),
@@ -675,112 +790,239 @@ class TrainingLogger:
                 ys.append(y)
             return xs, ys
 
-        fig, axes = plt.subplots(3, 2, figsize=(14, 11))
-        fig.suptitle('RL Data Quality', fontsize=16, fontweight='bold')
+        fig, axes = plt.subplots(3, 3, figsize=(20, 13.5))
+        fig.patch.set_facecolor('#F7F8FA')
+        fig.suptitle('RL Data Quality Details', fontsize=17, fontweight='bold', y=0.97)
 
-        ax = axes[0, 0]
-        for column, label, style in [
-            ('selfplay_decisive_rate', 'self-play decisive', 'go-'),
-            ('selfplay_draw_rate', 'self-play draw', 'bo-'),
-            ('selfplay_truncated_rate', 'truncated', 'ro--'),
-            ('replay_decisive_fraction', 'replay decisive', 'g^:'),
-            ('replay_draw_fraction', 'replay draw', 'b^:'),
-        ]:
+        colors = {
+            'green': '#16A34A',
+            'blue': '#2563EB',
+            'purple': '#7C3AED',
+            'red': '#DC2626',
+            'orange': '#EA580C',
+            'cyan': '#0891B2',
+            'slate': '#475569',
+            'black': '#111827',
+            'pink': '#DB2777',
+        }
+
+        def _style_axis(ax, title, ylabel=None, percent=False):
+            ax.set_facecolor('#FFFFFF')
+            ax.set_title(title, fontsize=11, fontweight='bold', loc='left', pad=8)
+            ax.set_xlabel('Iteration')
+            if ylabel:
+                ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.22, linewidth=0.8)
+            for spine in ax.spines.values():
+                spine.set_alpha(0.18)
+            if percent:
+                ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+
+        def _plot(ax, column, label, color, style='-', marker=None, linewidth=2.0, alpha=0.95):
             xs, ys = _series(column)
             if xs:
-                ax.plot(xs, ys, style, linewidth=1.7, markersize=4, label=label)
-        ax.set_title('Outcome Mix')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('fraction')
-        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-        ax.grid(True, alpha=0.3)
+                ax.plot(xs, ys, linestyle=style, marker=marker, linewidth=linewidth, markersize=4 if marker else 0, color=color, alpha=alpha, label=label)
+            return xs, ys
+
+        def _set_tight_ylim(ax, values, *, min_pad=0.01, center_zero=False):
+            values = [float(v) for v in values if v is not None]
+            if not values:
+                return
+            y_min = min(values)
+            y_max = max(values)
+            if center_zero:
+                span = max(abs(y_min), abs(y_max), min_pad)
+                ax.set_ylim(-span * 1.18, span * 1.18)
+                return
+            pad = max(min_pad, (y_max - y_min) * 0.18)
+            ax.set_ylim(y_min - pad, y_max + pad)
+
+        def _latest(column):
+            for row in reversed(rows):
+                raw = row.get(column, '')
+                if raw not in ('', None):
+                    try:
+                        return float(raw)
+                    except (TypeError, ValueError):
+                        return raw
+            return None
+
+        ax = axes[0, 0]
+        for column, label, color, style in [
+            ('selfplay_decisive_rate', 'Self-play decisive', colors['green'], '-'),
+            ('selfplay_draw_rate', 'Self-play draw', colors['cyan'], '-'),
+            ('replay_decisive_fraction', 'Replay decisive', colors['slate'], '--'),
+            ('replay_draw_fraction', 'Replay draw', colors['blue'], '--'),
+            ('selfplay_truncated_rate', 'Truncated', colors['red'], ':'),
+        ]:
+            _plot(ax, column, label, color, style=style)
+        _style_axis(ax, 'Outcome Mix', 'rate', percent=True)
+        ax.set_ylim([0, 1])
         if ax.get_legend_handles_labels()[0]:
             ax.legend(loc='best', fontsize=8)
 
         ax = axes[0, 1]
-        for column, label, style in [
-            ('policy_weight_mean', 'policy weight mean', 'ko-'),
-            ('policy_weight_p10', 'policy weight p10', 'ro--'),
-            ('policy_weight_low_fraction', 'low weight share', 'mo:'),
-            ('mcts_adaptive_stop_rate', 'early-stop share', 'co-'),
-            ('mcts_prior_changed_rate', 'MCTS changed prior top', 'b^:'),
-            ('mcts_changed_to_lower_q_rate', 'changed to lower Q', 'r^:'),
+        for column, label, color, style in [
+            ('sample_age_avg', 'Avg age', colors['purple'], '-'),
+            ('sample_age_p50', 'p50', '#A855F7', '--'),
+            ('sample_age_p90', 'p90', '#6D28D9', ':'),
         ]:
-            xs, ys = _series(column)
-            if xs:
-                ax.plot(xs, ys, style, linewidth=1.7, markersize=4, label=label)
-        ax.set_title('Search Target Confidence')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('fraction')
-        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-        ax.grid(True, alpha=0.3)
-        if ax.get_legend_handles_labels()[0]:
-            ax.legend(loc='best', fontsize=8)
+            _plot(ax, column, label, color, style=style)
+        _style_axis(ax, 'Replay Sample Age', 'iterations old')
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = [], []
+        frac_new_xs, _ = _series('sample_age_new_fraction')
+        frac_le1_xs, _ = _series('sample_age_le1_fraction')
+        if frac_new_xs or frac_le1_xs:
+            ax2 = ax.twinx()
+            _plot(ax2, 'sample_age_new_fraction', 'age=0', colors['orange'], style='--', linewidth=1.7)
+            _plot(ax2, 'sample_age_le1_fraction', 'age<=1', colors['green'], style=':', linewidth=1.8)
+            ax2.set_ylabel('batch fraction')
+            ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+            ax2.set_ylim([0, 1])
+            ax2.spines['right'].set_alpha(0.18)
+            lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            ax.legend(lines + lines2, labels + labels2, loc='best', fontsize=8)
 
         ax = axes[1, 0]
-        for column, label, style in [
-            ('policy_target_len_mean', 'target moves mean', 'bo-'),
-            ('policy_target_len_p90', 'target moves p90', 'co--'),
+        for column, label, color, style in [
+            ('replay_value_positive_fraction', 'Replay win-ish', colors['green'], '-'),
+            ('replay_value_neutral_fraction', 'Replay neutral', colors['cyan'], '-'),
+            ('replay_value_negative_fraction', 'Replay loss-ish', colors['red'], '-'),
+            ('recent_value_neutral_fraction', 'Recent neutral', colors['slate'], '--'),
         ]:
-            xs, ys = _series(column)
-            if xs:
-                ax.plot(xs, ys, style, linewidth=1.8, markersize=4, label=label)
-        ax.set_title('Policy Target Width')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('moves / position')
-        ax.grid(True, alpha=0.3)
+            _plot(ax, column, label, color, style=style)
+        _style_axis(ax, 'Replay Value Balance', 'fraction', percent=True)
+        ax.set_ylim([0, 1])
         if ax.get_legend_handles_labels()[0]:
             ax.legend(loc='best', fontsize=8)
 
         ax = axes[1, 1]
-        for column, label, style in [
-            ('policy_target_entropy_mean', 'target entropy', 'mo-'),
-            ('policy_target_top1_prob_mean', 'top-1 probability', 'go--'),
-            ('train_policy_entropy', 'model entropy', 'ko:'),
-            ('mcts_prior_agreement_rate', 'MCTS/prior agreement', 'c^:'),
-        ]:
-            xs, ys = _series(column)
-            if xs:
-                ax.plot(xs, ys, style, linewidth=1.7, markersize=4, label=label)
-        ax.set_title('Policy Distribution Shape')
-        ax.set_xlabel('Iteration')
-        ax.grid(True, alpha=0.3)
-        if ax.get_legend_handles_labels()[0]:
-            ax.legend(loc='best', fontsize=8)
+        _plot(ax, 'policy_target_entropy_mean', 'Target entropy', colors['purple'], style='-')
+        _plot(ax, 'train_policy_entropy', 'Model entropy', colors['black'], style=':')
+        _plot(ax, 'policy_target_effective_moves', 'Effective moves', colors['orange'], style='-.')
+        _style_axis(ax, 'Policy Distribution Shape')
+        ax2 = ax.twinx()
+        _plot(ax2, 'policy_target_top1_prob_mean', 'Target top-1', colors['green'], style='--')
+        _plot(ax2, 'policy_target_top3_prob_mean', 'Target top-3', colors['cyan'], style='-.')
+        ax2.set_ylabel('probability')
+        ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+        ax2.spines['right'].set_alpha(0.18)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            ax.legend(lines + lines2, labels + labels2, loc='best', fontsize=8)
 
         ax = axes[2, 0]
-        for column, label, style in [
-            ('selfplay_avg_game_value', 'self-play value mean', 'bo-'),
-            ('selfplay_value_std', 'self-play value std', 'co--'),
-            ('replay_value_std', 'replay value std', 'go-'),
-            ('train_target_value_std', 'train target std', 'ko:'),
-        ]:
-            xs, ys = _series(column)
-            if xs:
-                ax.plot(xs, ys, style, linewidth=1.7, markersize=4, label=label)
-        ax.set_title('Value Signal')
-        ax.set_xlabel('Iteration')
-        ax.grid(True, alpha=0.3)
-        if ax.get_legend_handles_labels()[0]:
-            ax.legend(loc='best', fontsize=8)
+        _, target_len_mean = _plot(ax, 'policy_target_len_mean', 'Target moves mean', colors['blue'], style='-')
+        _, target_len_p90 = _plot(ax, 'policy_target_len_p90', 'Target moves p90', colors['cyan'], style='--')
+        _style_axis(ax, 'Policy Target Width / Weight', 'target moves')
+        _set_tight_ylim(ax, list(target_len_mean) + list(target_len_p90), min_pad=0.15)
+        ax2 = ax.twinx()
+        _, weight_mean = _plot(ax2, 'policy_weight_mean', 'Policy weight mean', colors['slate'], style=':', linewidth=2.0)
+        _, weight_p10 = _plot(ax2, 'policy_weight_p10', 'Policy weight p10', colors['red'], style='-.', linewidth=2.0)
+        _set_tight_ylim(ax2, list(weight_mean) + list(weight_p10), min_pad=0.03)
+        ax2.set_ylabel('policy weight')
+        ax2.spines['right'].set_alpha(0.18)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            ax.legend(lines + lines2, labels + labels2, loc='best', fontsize=8)
 
         ax = axes[2, 1]
-        for column, label, style in [
-            ('replay_fill_rate', 'replay fill', 'ko-'),
-            ('importance_mean', 'importance mean', 'go-'),
-            ('importance_p90', 'importance p90', 'ro--'),
+        for column, label, color, style in [
+            ('mcts_prior_agreement_rate', 'Prior agreement', colors['purple'], '-'),
+            ('mcts_prior_changed_rate', 'Changed top move', colors['orange'], '--'),
+            ('mcts_changed_to_lower_q_rate', 'Changed to lower Q', colors['red'], ':'),
+            ('mcts_adaptive_stop_rate', 'Adaptive stop', colors['cyan'], '-.'),
         ]:
-            xs, ys = _series(column)
-            if xs:
-                ax.plot(xs, ys, style, linewidth=1.7, markersize=4, label=label)
-        ax.set_title('Replay Shape')
-        ax.set_xlabel('Iteration')
-        ax.grid(True, alpha=0.3)
-        if ax.get_legend_handles_labels()[0]:
-            ax.legend(loc='best', fontsize=8)
+            _plot(ax, column, label, color, style=style)
+        _style_axis(ax, 'MCTS Search Behavior', 'rate', percent=True)
+        ax.set_ylim([0, 1])
+        q_lines = []
+        for _, values in [_series('mcts_q_delta_p10'), _series('mcts_q_delta_p50'), _series('mcts_q_delta_p90')]:
+            q_lines.extend(values)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = [], []
+        if q_lines:
+            ax2 = ax.twinx()
+            _plot(ax2, 'mcts_q_delta_p10', 'qΔ p10', colors['slate'], style=':', linewidth=1.5)
+            _plot(ax2, 'mcts_q_delta_p50', 'qΔ p50', colors['black'], style='--', linewidth=1.6)
+            _plot(ax2, 'mcts_q_delta_p90', 'qΔ p90', colors['green'], style='-.', linewidth=1.6)
+            _set_tight_ylim(ax2, q_lines, min_pad=0.005, center_zero=True)
+            ax2.set_ylabel('Q delta')
+            ax2.spines['right'].set_alpha(0.18)
+            lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            ax.legend(lines + lines2, labels + labels2, loc='best', fontsize=8)
 
-        fig.subplots_adjust(left=0.07, right=0.96, bottom=0.07, top=0.92, hspace=0.42, wspace=0.28)
-        fig.savefig(self.data_quality_plot_path, dpi=150)
+        ax = axes[0, 2]
+        _, value_mean = _plot(ax, 'selfplay_avg_game_value', 'Self-play value mean', colors['blue'], style='-')
+        ax.axhline(0.0, color=colors['slate'], linestyle=':', linewidth=1.0, alpha=0.65)
+        _style_axis(ax, 'Value Signal', 'mean value')
+        _set_tight_ylim(ax, value_mean, min_pad=0.01, center_zero=True)
+        ax2 = ax.twinx()
+        _, selfplay_std = _plot(ax2, 'selfplay_value_std', 'Self-play value std', colors['cyan'], style='--')
+        _, replay_std = _plot(ax2, 'replay_value_std', 'Replay value std', colors['green'], style='-')
+        _, train_std = _plot(ax2, 'train_target_value_std', 'Train target std', colors['black'], style=':')
+        _set_tight_ylim(ax2, list(selfplay_std) + list(replay_std) + list(train_std), min_pad=0.01)
+        ax2.set_ylabel('value std')
+        ax2.spines['right'].set_alpha(0.18)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            ax.legend(lines + lines2, labels + labels2, loc='best', fontsize=8)
+
+        ax = axes[1, 2]
+        ax2 = ax.twinx()
+        _plot(ax, 'replay_size', 'Replay size', colors['black'])
+        ax2_xs, ax2_ys = _series('replay_capacity')
+        if ax2_xs:
+            ax2.plot(ax2_xs, ax2_ys, color=colors['purple'], linestyle=':', linewidth=1.8, label='Capacity')
+        added_xs, added_ys = _series('positions_added')
+        if added_xs:
+            ax2.plot(added_xs, added_ys, color=colors['blue'], linestyle='--', linewidth=1.8, label='Positions added')
+        _style_axis(ax, 'Replay Size / Capacity', 'stored positions')
+        ax2.set_ylabel('capacity / added')
+        ax2.spines['right'].set_alpha(0.18)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            ax.legend(lines + lines2, labels + labels2, loc='best', fontsize=8)
+
+        ax = axes[2, 2]
+        ax.axis('off')
+        latest_lines = ["Latest Data Quality", ""]
+        for column, label, fmt in [
+            ('selfplay_draw_rate', 'Self-play draw', '{:.2%}'),
+            ('replay_draw_fraction', 'Replay draw', '{:.2%}'),
+            ('replay_vs_selfplay_draw_gap', 'Replay draw gap', '{:+.2%}'),
+            ('sample_age_avg', 'Avg sample age', '{:.2f}'),
+            ('sample_age_le1_fraction', 'Age <= 1', '{:.2%}'),
+            ('sample_age_p90', 'p90 sample age', '{:.1f}'),
+            ('policy_target_top1_prob_mean', 'Target top-1', '{:.2%}'),
+            ('policy_target_effective_moves', 'Effective moves', '{:.2f}'),
+            ('mcts_prior_changed_rate', 'MCTS changed', '{:.2%}'),
+            ('mcts_q_delta_p50', 'Q delta p50', '{:+.4f}'),
+            ('mcts_changed_to_lower_q_rate', 'Lower-Q changes', '{:.3%}'),
+        ]:
+            value = _latest(column)
+            if isinstance(value, (int, float)):
+                latest_lines.append(f"{label}: {fmt.format(value)}")
+        ax.set_title('Summary', fontsize=11, fontweight='bold', loc='left', pad=8)
+        ax.text(
+            0.04,
+            0.52,
+            "\n".join(latest_lines),
+            fontsize=11,
+            family='monospace',
+            verticalalignment='center',
+            bbox=dict(boxstyle='round,pad=0.55', fc='white', ec='#CBD5E1', alpha=0.95),
+        )
+
+        fig.subplots_adjust(left=0.055, right=0.945, bottom=0.065, top=0.90, hspace=0.48, wspace=0.42)
+        fig.savefig(self.data_quality_plot_path, dpi=150, bbox_inches='tight', pad_inches=0.18)
         plt.close(fig)
 
     def record_estimated_elo(self, iteration, estimated_elo, update_csv=True):
@@ -839,6 +1081,135 @@ class TrainingLogger:
         except Exception:
             # CSV backfill is best-effort only.
             pass
+
+    def record_estimated_elo_mode(self, iteration, estimated_elo, *, mode="nn", simulations=0, update_csv=True):
+        """Backfill mode-specific Elo columns in RL CSV."""
+        if self.mode != "rl" or estimated_elo is None:
+            return
+        try:
+            iteration = int(iteration)
+            elo_value = int(round(float(estimated_elo)))
+        except (TypeError, ValueError):
+            return
+        mode = "mcts" if str(mode).lower() == "mcts" else "nn"
+        if update_csv and self.csv_path.exists():
+            try:
+                with open(self.csv_path, 'r', newline='') as f:
+                    rows = list(csv.reader(f))
+                if not rows:
+                    return
+                header = list(rows[0])
+                for col in ('estimated_elo_nn', 'estimated_elo_mcts', 'estimated_elo_mcts_simulations'):
+                    if col not in header:
+                        header.append(col)
+                        for row in rows[1:]:
+                            row.append('')
+                target_col = 'estimated_elo_mcts' if mode == "mcts" else 'estimated_elo_nn'
+                target_idx = header.index(target_col)
+                sims_idx = header.index('estimated_elo_mcts_simulations')
+                iter_col = 'iteration' if 'iteration' in header else 'epoch'
+                iter_idx = header.index(iter_col)
+                for row in rows[1:]:
+                    while len(row) < len(header):
+                        row.append('')
+                    try:
+                        row_it = int(float(row[iter_idx]))
+                    except (TypeError, ValueError):
+                        continue
+                    if row_it == iteration:
+                        row[target_idx] = str(elo_value)
+                        if mode == "mcts":
+                            try:
+                                row[sims_idx] = str(int(simulations or 0))
+                            except (TypeError, ValueError):
+                                row[sims_idx] = ''
+                with open(self.csv_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(header)
+                    writer.writerows(rows[1:])
+            except Exception:
+                pass
+
+    def record_rl_model_info_elo(
+        self,
+        iteration=0,
+        *,
+        elo_nn=None,
+        elo_mcts=None,
+        mcts_simulations=None,
+    ):
+        """Seed RL Elo plot from checkpoint metadata, usually the IL init model."""
+        if self.mode != "rl" or self.csv_path is None:
+            return
+
+        try:
+            iteration = int(iteration)
+        except (TypeError, ValueError):
+            iteration = 0
+
+        def _clean_elo(value):
+            try:
+                return int(round(float(value)))
+            except (TypeError, ValueError):
+                return None
+
+        elo_nn = _clean_elo(elo_nn)
+        elo_mcts = _clean_elo(elo_mcts)
+        try:
+            mcts_simulations = int(mcts_simulations) if mcts_simulations not in (None, '') else None
+        except (TypeError, ValueError):
+            mcts_simulations = None
+        if elo_nn is None and elo_mcts is None:
+            return
+
+        try:
+            with open(self.csv_path, 'r', newline='') as f:
+                rows = list(csv.reader(f))
+            if not rows:
+                return
+            header = list(rows[0])
+            for col in ('estimated_elo', 'estimated_elo_nn', 'estimated_elo_mcts', 'estimated_elo_mcts_simulations'):
+                if col not in header:
+                    header.append(col)
+                    for row in rows[1:]:
+                        row.append('')
+
+            iter_col = 'iteration' if 'iteration' in header else 'epoch'
+            iter_idx = header.index(iter_col)
+            target_row = None
+            for row in rows[1:]:
+                while len(row) < len(header):
+                    row.append('')
+                try:
+                    if int(float(row[iter_idx])) == iteration:
+                        target_row = row
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if target_row is None:
+                target_row = [''] * len(header)
+                target_row[iter_idx] = str(iteration)
+                rows.insert(1, target_row)
+
+            display_elo = elo_mcts if elo_mcts is not None else elo_nn
+            target_row[header.index('estimated_elo')] = str(display_elo)
+            if elo_nn is not None:
+                target_row[header.index('estimated_elo_nn')] = str(elo_nn)
+            if elo_mcts is not None:
+                target_row[header.index('estimated_elo_mcts')] = str(elo_mcts)
+            if mcts_simulations is not None:
+                target_row[header.index('estimated_elo_mcts_simulations')] = str(mcts_simulations)
+
+            rows[0] = header
+            with open(self.csv_path, 'w', newline='') as f:
+                csv.writer(f).writerows(rows)
+        except Exception:
+            return
+
+        if elo_mcts is not None:
+            self.record_estimated_elo(iteration, elo_mcts, update_csv=False)
+        elif elo_nn is not None:
+            self.record_estimated_elo(iteration, elo_nn, update_csv=False)
 
     def get_latest_estimated_elo(self):
         """Return latest known Elo value or None."""
@@ -1352,17 +1723,33 @@ class TrainingLogger:
                     self.record_estimated_elo(iteration, estimated_elo, update_csv=False)
             
             else:  # RL mode
+                mcts_no_mcts_gap = kwargs.get('mcts_no_mcts_gap', '')
+                if mcts_no_mcts_gap == '':
+                    try:
+                        score = kwargs.get('score_rate', kwargs.get('win_rate', ''))
+                        no_mcts_score = kwargs.get('no_mcts_score_rate', '')
+                        if score not in ('', None) and no_mcts_score not in ('', None):
+                            mcts_no_mcts_gap = float(score) - float(no_mcts_score)
+                    except (TypeError, ValueError):
+                        mcts_no_mcts_gap = ''
                 row = [
                     iteration,
                     kwargs.get('avg_loss', ''),
                     kwargs.get('policy_loss', ''),
                     kwargs.get('value_loss', ''),
+                    kwargs.get('learning_rate', kwargs.get('lr', '')),
+                    kwargs.get('value_loss_weight', ''),
+                    kwargs.get('mcts_q_value_scale', ''),
+                    kwargs.get('value_guard_streak', ''),
+                    mcts_no_mcts_gap,
                     kwargs.get('score_rate', kwargs.get('win_rate', '')),
                     kwargs.get('buffer_size', ''),
                     kwargs.get('avg_game_length', ''),
                     kwargs.get('temperature', ''),
                     kwargs.get('beta', ''),
                     kwargs.get('true_win_rate', ''),
+                    kwargs.get('eval_stage', ''),
+                    kwargs.get('eval_games', ''),
                     kwargs.get('eval_wins', ''),
                     kwargs.get('eval_draws', ''),
                     kwargs.get('eval_losses', ''),
@@ -1388,31 +1775,16 @@ class TrainingLogger:
                     train_metrics.get('value_wdl_acc', '') if train_metrics else '',
                     train_metrics.get('value_wdl_ce', '') if train_metrics else '',
                     kwargs.get('completed_draw_rate', ''),
-                    kwargs.get('dynamic_uniform_fraction', ''),
-                    kwargs.get('priority_age_decay_lambda', ''),
-                    kwargs.get('avg_sample_age', ''),
                     kwargs.get('avg_game_value', ''),
                     kwargs.get('value_std', ''),
                     kwargs.get('policy_entropy', ''),
                     kwargs.get('value_pred_std', ''),
-                    kwargs.get('selfplay_decisive_games', ''),
                     kwargs.get('selfplay_decisive_rate', ''),
                     kwargs.get('selfplay_auto_draw_rate', ''),
                     kwargs.get('selfplay_truncated_rate', ''),
-                    kwargs.get('selfplay_decisive_avg_length', ''),
-                    kwargs.get('selfplay_curriculum_dropped_positions', ''),
-                    kwargs.get('selfplay_cap_dropped_positions', ''),
-                    kwargs.get('replay_decisive_fraction', ''),
-                    kwargs.get('replay_draw_fraction', ''),
-                    kwargs.get('policy_weight_mean', ''),
-                    kwargs.get('policy_weight_low_fraction', ''),
-                    kwargs.get('policy_target_len_mean', ''),
-                    kwargs.get('mcts_prior_agreement_rate', ''),
-                    kwargs.get('mcts_prior_changed_rate', ''),
-                    kwargs.get('mcts_changed_to_lower_q_rate', ''),
-                    kwargs.get('mcts_q_delta_mean', ''),
                     kwargs.get('adaptive_temp_adjustment', ''),
                     kwargs.get('adaptive_temp_threshold', ''),
+                    1 if bool(kwargs.get('rl_best_model', False)) else '',
                 ]
 
                 if estimated_elo is not None:
@@ -1423,7 +1795,12 @@ class TrainingLogger:
                         estimated_elo = None
                 else:
                     row.append('')
-                
+                row.extend([
+                    kwargs.get('estimated_elo_nn', ''),
+                    kwargs.get('estimated_elo_mcts', ''),
+                    kwargs.get('estimated_elo_mcts_simulations', ''),
+                ])
+                 
                 # Store for plotting
                 self.iterations.append(iteration)
                 if 'avg_loss' in kwargs:
@@ -1656,7 +2033,7 @@ class TrainingLogger:
 
     def _plot_il(self):
         """Plot IL training progress"""
-        fig, axes = plt.subplots(4, 3, figsize=(21, 18))
+        fig, axes = plt.subplots(4, 3, figsize=(19, 16))
         fig.patch.set_facecolor('#F7F8FA')
 
         if self.run_context_text:
@@ -1907,188 +2284,487 @@ class TrainingLogger:
     
     def _plot_rl(self):
         """Plot RL training progress"""
-        fig, axes = plt.subplots(3, 3, figsize=(18, 14))
+        rows = []
+        try:
+            with open(self.csv_path, 'r', newline='') as f:
+                rows = list(csv.DictReader(f))
+        except OSError:
+            rows = []
+
+        def _series(column):
+            xs, ys = [], []
+            for row in rows:
+                try:
+                    iteration = int(float(row.get('iteration', '')))
+                    raw = row.get(column, '')
+                    if raw is None or raw == '':
+                        continue
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                xs.append(iteration)
+                ys.append(value)
+            return xs, ys
+
+        def _latest(column):
+            for row in reversed(rows):
+                raw = row.get(column, '')
+                if raw is None or raw == '':
+                    continue
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    return raw
+            return None
+
+        fig, axes = plt.subplots(4, 3, figsize=(19, 16))
+        fig.patch.set_facecolor('#F7F8FA')
         if self.run_context_text:
             fig.suptitle(
                 self._build_plot_suptitle("RL Training Progress"),
-                fontsize=14,
+                fontsize=15,
                 fontweight='bold',
-                y=0.98,
+                y=0.985,
             )
         else:
-            fig.suptitle('RL Training Progress', fontsize=16, fontweight='bold', y=0.98)
-        
-        # Row 1: Losses
-        ax = axes[0, 0]
-        ax.plot(self.iterations, self.train_losses, 'b-', label='Total Loss', linewidth=2)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Loss')
-        ax.set_title('Total Loss')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        ax = axes[0, 1]
-        ax.plot(self.iterations, self.train_policy_losses, 'g-', label='Policy Loss', linewidth=2)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Policy Loss')
-        ax.set_title('Policy Loss')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        ax = axes[0, 2]
-        ax.plot(self.iterations, self.train_value_losses, 'r-', label='Value Loss', linewidth=2)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Value Loss')
-        ax.set_title('Value Loss')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Row 2: Metrics
-        ax = axes[1, 0]
-        if self.train_policy_top1:
-            ax.plot(self.iterations, self.train_policy_top1, 'b-', label='Top-1', linewidth=2)
-            ax.plot(self.iterations, self.train_policy_top3, 'b--', label='Top-3', linewidth=2, alpha=0.7)
+            fig.suptitle('RL Training Progress', fontsize=18, fontweight='bold', y=0.985)
+
+        colors = {
+            'total': '#2563EB',
+            'policy': '#0F766E',
+            'value': '#7C3AED',
+            'eval': '#DC2626',
+            'nomcts': '#EA580C',
+            'draw': '#0891B2',
+            'replay': '#475569',
+            'mcts': '#9333EA',
+            'muted': '#64748B',
+            'good': '#16A34A',
+            'lr': '#475569',
+        }
+
+        def _style_axis(ax, title, ylabel=None, percent=False):
+            ax.set_facecolor('#FFFFFF')
+            ax.set_title(title, fontsize=11, fontweight='bold', loc='left', pad=8)
             ax.set_xlabel('Iteration')
-            ax.set_ylabel('Accuracy')
-            ax.set_title('Policy Accuracy')
-            ax.set_ylim([0, 1])
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        
-        ax = axes[1, 1]
-        if self.train_value_mae:
-            ax.plot(self.iterations, self.train_value_mae, 'r-', label='Value MAE', linewidth=2)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('MAE')
-        ax.set_title('Value MAE')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        ax = axes[1, 2]
-        if self.win_rates or self.no_mcts_score_rates or self.anchor_score_rates:
-            if self.win_rates:
-                win_iters, win_vals = zip(*self.win_rates)
-                ax.plot(win_iters, win_vals, 'mo-', label='MCTS Score Rate', linewidth=2, markersize=8)
-            if self.true_win_rates:
-                true_iters, true_vals = zip(*self.true_win_rates)
-                ax.plot(true_iters, true_vals, 'co-', label='MCTS Win Rate', linewidth=1.5, markersize=6)
-            if self.no_mcts_score_rates:
-                no_mcts_iters, no_mcts_vals = zip(*self.no_mcts_score_rates)
-                ax.plot(
-                    no_mcts_iters,
-                    no_mcts_vals,
-                    color='tab:purple',
-                    marker='s',
+            if ylabel:
+                ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.22, linewidth=0.8)
+            for spine in ax.spines.values():
+                spine.set_alpha(0.18)
+            if percent:
+                ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+
+        def _smooth_values(ys):
+            if not self.plot_smoothing_enabled or len(ys) < self.plot_smoothing_min_points:
+                return ys
+            smoothed = []
+            prev = None
+            alpha = float(self.plot_smoothing_alpha)
+            for value in ys:
+                try:
+                    current = float(value)
+                except (TypeError, ValueError):
+                    smoothed.append(value)
+                    continue
+                prev = current if prev is None else alpha * current + (1.0 - alpha) * prev
+                smoothed.append(prev)
+            return smoothed
+
+        def _plot_line(ax, xs, ys, label, color, style='-', marker=None, linewidth=2.0, alpha=0.95, smooth=None):
+            if not xs or not ys:
+                return
+            marker_to_plot = marker
+            use_smooth = self.plot_smoothing_enabled if smooth is None else bool(smooth)
+            if use_smooth and len(xs) >= self.plot_smoothing_min_points:
+                marker_to_plot = None
+            ax.plot(
+                xs,
+                _smooth_values(list(ys)) if use_smooth else list(ys),
+                linestyle=style,
+                marker=marker_to_plot,
+                color=color,
+                label=label,
+                linewidth=linewidth,
+                markersize=4 if marker_to_plot else 0,
+                alpha=alpha,
+            )
+
+        def _draw_rl_best_boundaries(ax):
+            markers = list(self.rl_best_model_markers or [])
+            if not markers:
+                for row in rows:
+                    try:
+                        iteration = int(float(row.get('iteration', '')))
+                    except (TypeError, ValueError):
+                        continue
+                    raw_marker = str(row.get('rl_best_model', '') or '').strip().lower()
+                    if raw_marker in {'1', 'true', 'yes', 'y'}:
+                        markers.append((iteration, f"RL best {iteration}"))
+                if not markers:
+                    for row in rows:
+                        try:
+                            iteration = int(float(row.get('iteration', '')))
+                            score = float(row.get('score_rate', ''))
+                            true_win = float(row.get('true_win_rate', '0') or 0.0)
+                        except (TypeError, ValueError):
+                            continue
+                        if score >= 0.55 and true_win >= 0.0:
+                            markers.append((iteration, f"RL best {iteration}"))
+            if not markers:
+                return
+            y_min, y_max = ax.get_ylim()
+            label_added = False
+            for marker_iter, marker_text in markers:
+                try:
+                    x = float(marker_iter) + 0.5
+                except (TypeError, ValueError):
+                    continue
+                ax.axvline(
+                    x=x,
+                    color='#6B7280',
                     linestyle='--',
-                    label='No-MCTS Score Rate',
-                    linewidth=2,
-                    markersize=6,
+                    linewidth=1.2,
+                    alpha=0.70,
+                    label='New best model' if not label_added else None,
+                    zorder=1,
                 )
-            if self.no_mcts_true_win_rates:
-                no_mcts_win_iters, no_mcts_win_vals = zip(*self.no_mcts_true_win_rates)
-                ax.plot(
-                    no_mcts_win_iters,
-                    no_mcts_win_vals,
-                    color='tab:cyan',
-                    marker='s',
-                    linestyle=':',
-                    label='No-MCTS Win Rate',
-                    linewidth=1.8,
-                    markersize=5,
+                ax.text(
+                    x,
+                    y_max - (y_max - y_min) * 0.04,
+                    str(marker_text or 'New best'),
+                    rotation=90,
+                    va='top',
+                    ha='right',
+                    fontsize=7,
+                    color='#4B5563',
+                    alpha=0.85,
                 )
-            if self.anchor_score_rates:
-                anchor_iters, anchor_vals = zip(*self.anchor_score_rates)
-                ax.plot(anchor_iters, anchor_vals, 'yo-', label='Anchor Score Rate', linewidth=2, markersize=7)
-            if self.anchor_true_win_rates:
-                anchor_true_iters, anchor_true_vals = zip(*self.anchor_true_win_rates)
-                ax.plot(anchor_true_iters, anchor_true_vals, 'ko--', label='Anchor True Win Rate', linewidth=1.5, markersize=5, alpha=0.85)
-            if self.rl_best_model_markers:
-                marker_label_added = False
-                for marker_iter, marker_text in self.rl_best_model_markers:
-                    ax.axvline(
-                        x=int(marker_iter),
-                        color='gray',
-                        linestyle='-',
-                        linewidth=1.4,
-                        alpha=0.45,
-                        label='RL best replaced' if not marker_label_added else None,
-                    )
-                    marker_label_added = True
-                    y_text = 0.96
-                    ax.text(
-                        int(marker_iter),
-                        y_text,
-                        str(marker_text),
-                        rotation=90,
-                        va='top',
-                        ha='right',
-                        fontsize=8,
-                        color='dimgray',
-                        alpha=0.85,
-                    )
-            ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
-            ax.axhline(y=0.55, color='green', linestyle='--', alpha=0.5)
-            ax.set_xlabel('Iteration')
-            ax.set_ylabel('Percent')
-            ax.set_title('Eval Score/Win Rate vs Best')
+                label_added = True
+
+        def _plot_column(ax, column, label, color, style='-', marker=None, linewidth=2.0, alpha=0.95, smooth=None):
+            xs, ys = _series(column)
+            _plot_line(ax, xs, ys, label, color, style=style, marker=marker, linewidth=linewidth, alpha=alpha, smooth=smooth)
+            return xs, ys
+
+        def _mark_best(ax, xs, ys, mode='max', label='best'):
+            if not xs or not ys:
+                return
+            x, y = (max if mode == 'max' else min)(zip(xs, ys), key=lambda item: item[1])
+            ax.scatter([x], [y], s=42, color='#111827', zorder=5)
+            ax.annotate(
+                f"{label}: {y:.2%}" if abs(float(y)) <= 1.5 else f"{label}: {y:.4f}",
+                xy=(x, y),
+                xytext=(7, 7),
+                textcoords='offset points',
+                fontsize=8,
+                color='#111827',
+                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#CBD5E1', alpha=0.9),
+            )
+
+        ax = axes[0, 0]
+        _plot_line(ax, self.iterations, self.train_policy_losses, 'Policy', colors['policy'], linewidth=2.1)
+        _plot_line(ax, self.iterations, self.train_value_losses, 'Value', colors['value'], style='--', linewidth=2.1, alpha=0.88)
+        _style_axis(ax, 'Policy / Value Losses', 'Policy / Value loss')
+        ax_total = ax.twinx()
+        _plot_line(ax_total, self.iterations, self.train_losses, 'Total', colors['total'], style=':', linewidth=2.2, alpha=0.9)
+        ax_total.set_ylabel('Total loss')
+        ax_total.tick_params(axis='y', labelcolor=colors['total'])
+        ax_total.spines['right'].set_alpha(0.18)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax_total.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, fontsize=8, loc='best')
+
+        ax = axes[0, 1]
+        _plot_line(ax, self.iterations, self.train_policy_top1, 'Top-1', colors['policy'])
+        _plot_line(ax, self.iterations, self.train_policy_top3, 'Top-3', colors['policy'], style='--', alpha=0.65)
+        _style_axis(ax, 'Policy Accuracy', 'Accuracy', percent=True)
+        policy_values = [
+            float(v)
+            for v in list(self.train_policy_top1) + list(self.train_policy_top3)
+            if v is not None
+        ]
+        if policy_values:
+            y_min = max(0.0, min(policy_values))
+            y_max = min(1.0, max(policy_values))
+            pad = max(0.01, (y_max - y_min) * 0.18)
+            ax.set_ylim(max(0.0, y_min - pad), min(1.0, y_max + pad))
+        else:
             ax.set_ylim([0, 1])
-            ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        
-        # Row 3: Additional
+        ax.legend(fontsize=8, loc='best')
+
+        ax = axes[0, 2]
+        _plot_line(ax, self.iterations, self.train_value_mae, 'Value MAE', colors['value'])
+        _plot_line(ax, self.iterations, self.train_value_wdl_acc, 'WDL Acc', colors['good'], style='--', alpha=0.82)
+        _style_axis(ax, 'Value Quality', 'MAE / Accuracy')
+        ax2 = ax.twinx()
+        _plot_column(ax2, 'value_pred_std', 'Pred std', '#DB2777', style=':', linewidth=1.8)
+        _plot_column(ax2, 'value_std', 'Target/game std', '#475569', style='-.', linewidth=1.6, alpha=0.8)
+        ax2.set_ylabel('Std')
+        ax2.spines['right'].set_alpha(0.18)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, fontsize=8, loc='best')
+
+        ax = axes[1, 0]
+        mcts_xs, mcts_ys = _plot_column(ax, 'score_rate', 'MCTS score', colors['eval'], marker='o', smooth=True)
+        _plot_column(ax, 'true_win_rate', 'MCTS win', colors['eval'], style=':', marker='o', alpha=0.75, smooth=True)
+        no_xs, no_ys = _plot_column(ax, 'no_mcts_score_rate', 'No-MCTS score', colors['nomcts'], style='--', marker='s', smooth=True)
+        _plot_column(ax, 'no_mcts_win_rate', 'No-MCTS win', '#F59E0B', style=':', marker='s', alpha=0.75, smooth=True)
+        ax.axhline(0.5, color=colors['muted'], linestyle=':', linewidth=1.2)
+        _mark_best(ax, mcts_xs, mcts_ys, mode='max', label='best MCTS')
+        _mark_best(ax, no_xs, no_ys, mode='max', label='best no-MCTS')
+        _style_axis(ax, 'Current vs Best: MCTS / No-MCTS', 'Score rate', percent=True)
+        ax.set_ylim([0, 1])
+        _draw_rl_best_boundaries(ax)
+        ax.legend(fontsize=8, loc='best')
+
+        ax = axes[1, 1]
+        gap_xs, gap_ys = _series('mcts_no_mcts_gap')
+        if not gap_xs:
+            gap_xs, gap_ys = [], []
+            for row in rows:
+                try:
+                    iteration = int(float(row.get('iteration', '')))
+                    mcts = row.get('score_rate', '')
+                    no_mcts = row.get('no_mcts_score_rate', '')
+                    if mcts in ('', None) or no_mcts in ('', None):
+                        continue
+                    gap_xs.append(iteration)
+                    gap_ys.append(float(mcts) - float(no_mcts))
+                except (TypeError, ValueError):
+                    continue
+        _plot_line(ax, gap_xs, gap_ys, 'MCTS - No-MCTS', colors['eval'], marker='o')
+        ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.2)
+        ax.axhline(0.05, color=colors['good'], linestyle=':', linewidth=1.0, alpha=0.55)
+        _style_axis(ax, 'MCTS Gap vs No-MCTS', 'Score delta')
+        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+        ax.legend(fontsize=8, loc='best')
+
+        ax = axes[1, 2]
+        anchor_xs, anchor_ys = _plot_column(ax, 'anchor_score_rate', 'vs Anchor/IL score', colors['mcts'], style='--', marker='s', alpha=0.92, smooth=True)
+        _plot_column(ax, 'anchor_true_win_rate', 'vs Anchor true win', '#6D28D9', style=':', marker='s', alpha=0.75, smooth=True)
+        ax.axhline(0.5, color=colors['muted'], linestyle=':', linewidth=1.2)
+        ax.axhline(0.55, color=colors['good'], linestyle=':', linewidth=1.0, alpha=0.55)
+        _mark_best(ax, anchor_xs, anchor_ys, mode='max', label='best')
+        _style_axis(ax, 'Current vs IL Anchor', 'Score rate', percent=True)
+        ax.set_ylim([0, 1])
+        _draw_rl_best_boundaries(ax)
+        ax.legend(fontsize=8, loc='best')
+
         ax = axes[2, 0]
+        nn_elo_xs, nn_elo_ys = _series('estimated_elo_nn')
+        mcts_elo_xs, mcts_elo_ys = _series('estimated_elo_mcts')
+        if not nn_elo_xs and not mcts_elo_xs:
+            elo_xs, elo_ys = _series('estimated_elo')
+            if not elo_xs and self.estimated_elos:
+                elo_xs, elo_ys = zip(*self.estimated_elos)
+                elo_xs, elo_ys = list(elo_xs), list(elo_ys)
+            _plot_line(ax, elo_xs, elo_ys, 'Estimated Elo', '#059669', marker='o', linewidth=2.2)
+            plotted_elo_points = list(zip(elo_xs, elo_ys))
+        else:
+            _plot_line(ax, nn_elo_xs, nn_elo_ys, 'Raw NN Elo', '#2563EB', marker='o', linewidth=2.2)
+            sims_xs, sims_ys = _series('estimated_elo_mcts_simulations')
+            sims_by_iter = {int(x): int(round(float(y))) for x, y in zip(sims_xs, sims_ys)}
+            mcts_label = 'MCTS Elo'
+            if sims_by_iter:
+                unique_sims = sorted(set(sims_by_iter.values()))
+                if len(unique_sims) == 1:
+                    mcts_label = f"MCTS Elo ({unique_sims[0]} sims)"
+                else:
+                    mcts_label = "MCTS Elo (sims marked)"
+            _plot_line(ax, mcts_elo_xs, mcts_elo_ys, mcts_label, '#059669', marker='s', linewidth=2.2)
+            for x, y in zip(mcts_elo_xs, mcts_elo_ys):
+                sims = sims_by_iter.get(int(x))
+                if sims:
+                    ax.annotate(
+                        f"{sims}",
+                        xy=(x, y),
+                        xytext=(5, -10),
+                        textcoords='offset points',
+                        fontsize=7,
+                        color='#047857',
+                    )
+            plotted_elo_points = list(zip(nn_elo_xs, nn_elo_ys)) + list(zip(mcts_elo_xs, mcts_elo_ys))
+        if plotted_elo_points:
+            x, y = max(plotted_elo_points, key=lambda item: item[1])
+            ax.scatter([x], [y], s=42, color='#111827', zorder=5)
+            ax.annotate(
+                f"best Elo: {int(round(float(y)))}",
+                xy=(x, y),
+                xytext=(7, 7),
+                textcoords='offset points',
+                fontsize=8,
+                color='#111827',
+                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#CBD5E1', alpha=0.9),
+            )
+        _style_axis(ax, 'Estimated Elo', 'Elo')
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        if not plotted_elo_points:
+            ax.text(
+                0.5,
+                0.5,
+                'No Elo estimates yet',
+                transform=ax.transAxes,
+                ha='center',
+                va='center',
+                fontsize=10,
+                color=colors['muted'],
+            )
+        ax.legend(fontsize=8, loc='best')
+
+        ax = axes[2, 1]
+        _plot_column(ax, 'completed_draw_rate', 'Self-play draw', colors['draw'])
+        _plot_column(ax, 'selfplay_decisive_rate', 'Self-play decisive', colors['good'], style='--')
+        _plot_column(ax, 'selfplay_auto_draw_rate', 'Auto draw', '#0284C7', style=':', alpha=0.82)
+        _style_axis(ax, 'Self-Play Outcomes', 'Rate', percent=True)
+        ax.set_ylim([0, 1])
+        ax.legend(fontsize=8, loc='best')
+
+        ax = axes[2, 2]
+        _plot_column(ax, 'policy_entropy', 'Policy entropy', colors['policy'])
+        _style_axis(ax, 'Training Signal Stability', 'Policy entropy')
+        ax2 = ax.twinx()
+        _, pred_std_values = _plot_column(ax2, 'value_pred_std', 'Value pred std', '#DB2777', style='--', alpha=0.95, linewidth=2.0)
+        _, target_std_values = _plot_column(ax2, 'value_std', 'Target/game std', '#64748B', style=':', alpha=0.95, linewidth=2.1)
+        std_values = list(pred_std_values) + list(target_std_values)
+        if std_values:
+            std_min = min(std_values)
+            std_max = max(std_values)
+            pad = max(0.01, (std_max - std_min) * 0.18)
+            ax2.set_ylim(std_min - pad, std_max + pad)
+        ax2.set_ylabel('Value std')
+        ax2.tick_params(axis='y', labelcolor='#64748B')
+        ax2.spines['right'].set_alpha(0.18)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, fontsize=8, loc='best')
+
+        ax = axes[3, 0]
         if self.temperatures:
             temp_iters, temp_vals = zip(*self.temperatures)
-            ax.plot(temp_iters, temp_vals, 'orange', linewidth=2, label='Applied Temperature')
-            if self.adaptive_temp_adjustments:
-                adj_iters, adj_vals = zip(*self.adaptive_temp_adjustments)
-                ax.plot(adj_iters, adj_vals, color='tab:red', linestyle='--', linewidth=1.5, label='Adaptive Adjustment')
-            ax.set_xlabel('Iteration')
-            ax.set_ylabel('Temperature')
-            ax.set_title('Applied Temperature Schedule')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        
-        ax = axes[2, 1]
-        ax.plot(self.iterations, self.train_losses, 'b-', label='Total', linewidth=2, alpha=0.7)
-        ax.plot(self.iterations, self.train_policy_losses, 'g--', label='Policy', linewidth=1.5, alpha=0.7)
-        ax.plot(self.iterations, self.train_value_losses, 'r--', label='Value', linewidth=1.5, alpha=0.7)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Loss')
-        ax.set_title('All Losses Comparison')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Summary
-        ax = axes[2, 2]
+            _plot_line(ax, temp_iters, temp_vals, 'Temperature', '#F97316')
+        if self.adaptive_temp_adjustments:
+            adj_iters, adj_vals = zip(*self.adaptive_temp_adjustments)
+            _plot_line(ax, adj_iters, adj_vals, 'Adaptive adjustment', colors['eval'], style='--', alpha=0.82)
+        _style_axis(ax, 'Temperature / Exploration', 'Value')
+        lr_xs, lr_ys = _series('learning_rate')
+        lines2, labels2 = [], []
+        if lr_xs:
+            ax_lr = ax.twinx()
+            ax_lr.plot(
+                lr_xs,
+                lr_ys,
+                color=colors['lr'],
+                linestyle=':',
+                marker='.',
+                linewidth=1.9,
+                markersize=4,
+                label='LR',
+                zorder=4,
+            )
+            ax_lr.set_ylabel('LR')
+            lr_top = max(float(y) for y in lr_ys if y is not None)
+            ax_lr.set_ylim(0.0, lr_top * 1.05 if lr_top > 0.0 else 1.0)
+            ax_lr.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+            ax_lr.tick_params(axis='y', labelcolor=colors['lr'])
+            ax_lr.spines['right'].set_alpha(0.18)
+            lines2, labels2 = ax_lr.get_legend_handles_labels()
+        lines, labels = ax.get_legend_handles_labels()
+        if lines or lines2:
+            ax.legend(lines + lines2, labels + labels2, fontsize=8, loc='best')
+
+        ax = axes[3, 1]
+        _plot_column(ax, 'mcts_q_value_scale', 'MCTS Q scale', colors['mcts'], marker='o')
+        _plot_column(ax, 'value_loss_weight', 'Value loss weight', colors['value'], style='--', marker='s', alpha=0.84)
+        _style_axis(ax, 'Search / Value Control', 'Weight')
+        ax.legend(fontsize=8, loc='best')
+
+        ax = axes[3, 2]
         ax.axis('off')
         if len(self.iterations) > 0:
-            summary_lines = ["Latest Metrics:", ""]
-            if self.train_policy_top1:
-                summary_lines.append(f"Policy Top-1: {self.train_policy_top1[-1]:.2%}")
-            if self.train_policy_top3:
-                summary_lines.append(f"Policy Top-3: {self.train_policy_top3[-1]:.2%}")
-            if self.train_value_mae:
-                summary_lines.append(f"Value MAE: {self.train_value_mae[-1]:.4f}")
-            if self.train_value_wdl_acc:
-                summary_lines.append(f"WDL Acc: {self.train_value_wdl_acc[-1]:.2%}")
-            if self.train_value_wdl_ce:
-                summary_lines.append(f"WDL CE: {self.train_value_wdl_ce[-1]:.4f}")
-            if self.train_losses:
-                summary_lines.append(f"Total Loss: {self.train_losses[-1]:.4f}")
-            if self.no_mcts_score_rates:
-                summary_lines.append(f"No-MCTS Score: {self.no_mcts_score_rates[-1][1]:.2%}")
-            if self.no_mcts_true_win_rates:
-                summary_lines.append(f"No-MCTS Win: {self.no_mcts_true_win_rates[-1][1]:.2%}")
-            if self.rl_best_model_markers:
-                summary_lines.append(f"RL best replaced: iter {self.rl_best_model_markers[-1][0]}")
-            summary_text = "\n".join(summary_lines)
-            ax.text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
-                   verticalalignment='center')
-        
-        fig.subplots_adjust(left=0.07, right=0.98, bottom=0.06, top=0.92, hspace=0.38, wspace=0.28)
+            latest_mcts = _latest('score_rate')
+            latest_no_mcts = _latest('no_mcts_score_rate')
+            gap = (
+                float(latest_mcts) - float(latest_no_mcts)
+                if isinstance(latest_mcts, (int, float)) and isinstance(latest_no_mcts, (int, float))
+                else None
+            )
+            ax.set_title('Summary', fontsize=11, fontweight='bold', loc='left', pad=8)
+
+            def _fmt(value, mode='float'):
+                if value is None:
+                    return '-'
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    return str(value)
+                if mode == 'pct':
+                    return f"{value:.2%}"
+                if mode == 'signed_pct':
+                    return f"{value:+.2%}"
+                if mode == 'lr':
+                    return f"{value:.2e}"
+                if mode == 'temp':
+                    return f"{value:.3f}"
+                if mode == 'int':
+                    return f"{int(round(value))}"
+                return f"{value:.4f}"
+
+            latest_loss = self.train_losses[-1] if self.train_losses else None
+            latest_value_loss = self.train_value_losses[-1] if self.train_value_losses else None
+            latest_value_mae = self.train_value_mae[-1] if self.train_value_mae else None
+            latest_policy_top1 = self.train_policy_top1[-1] if self.train_policy_top1 else None
+            latest_anchor = _latest('anchor_score_rate')
+            latest_elo_nn = _latest('estimated_elo_nn')
+            latest_elo_mcts = _latest('estimated_elo_mcts')
+            latest_mcts_sims = _latest('estimated_elo_mcts_simulations')
+            latest_elo = latest_elo_mcts if latest_elo_mcts is not None else _latest('estimated_elo')
+            if latest_elo is None and self.estimated_elos:
+                latest_elo = self.estimated_elos[-1][1]
+            mcts_elo_label = 'MCTS Elo'
+            if latest_mcts_sims is not None:
+                mcts_elo_label = f"MCTS Elo ({int(round(float(latest_mcts_sims)))} sims)"
+            summary_rows = [
+                ['Training', 'Loss', _fmt(latest_loss)],
+                ['', 'Value loss', _fmt(latest_value_loss)],
+                ['', 'Value MAE', _fmt(latest_value_mae)],
+                ['', 'Policy top-1', _fmt(latest_policy_top1, 'pct')],
+                ['Eval', 'MCTS score', _fmt(latest_mcts, 'pct')],
+                ['', 'No-MCTS score', _fmt(latest_no_mcts, 'pct')],
+                ['', 'MCTS gap', _fmt(gap, 'signed_pct')],
+                ['', 'Anchor score', _fmt(latest_anchor, 'pct')],
+                ['', 'Raw NN Elo', _fmt(latest_elo_nn, 'int')],
+                ['', mcts_elo_label, _fmt(latest_elo_mcts, 'int')],
+                ['Control', 'Self-play draw', _fmt(_latest('completed_draw_rate'), 'pct')],
+                ['', 'Temperature', _fmt(_latest('temperature'), 'temp')],
+                ['', 'MCTS Q scale', _fmt(_latest('mcts_q_value_scale'), 'temp')],
+                ['', 'Value weight', _fmt(_latest('value_loss_weight'), 'temp')],
+            ]
+            table = ax.table(
+                cellText=summary_rows,
+                colLabels=['Group', 'Metric', 'Value'],
+                colWidths=[0.25, 0.43, 0.32],
+                bbox=[0.02, 0.04, 0.96, 0.86],
+                cellLoc='left',
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            for (row, col), cell in table.get_celld().items():
+                cell.set_edgecolor('#CBD5E1')
+                cell.set_linewidth(0.65)
+                if row == 0:
+                    cell.set_facecolor('#E2E8F0')
+                    cell.set_text_props(weight='bold', color='#111827')
+                    continue
+                cell.set_facecolor('#FFFFFF' if row % 2 else '#F8FAFC')
+                if col == 0 and summary_rows[row - 1][0]:
+                    cell.set_text_props(weight='bold', color='#111827')
+                elif col == 2:
+                    cell.set_text_props(color='#111827')
+
+        fig.subplots_adjust(left=0.055, right=0.985, bottom=0.045, top=0.935, hspace=0.48, wspace=0.34)
         fig.savefig(self.plot_path, dpi=150)
-        plt.close()
+        plt.close(fig)
         
         print(f"Plot saved to: {self.plot_path}")

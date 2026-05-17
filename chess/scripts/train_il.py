@@ -65,6 +65,7 @@ from utils.shared.runtime_helpers import (
     run_with_optional_stdout_suppression,
 )
 from utils.shared.elo_estimator import estimate_model_elo
+from utils.shared.model_catalog import persist_checkpoint_elo_metadata
 from utils.shared.model_view import (
     print_active_model_summary,
     print_status_table,
@@ -217,7 +218,26 @@ def _build_il_final_elo_config(elo_config):
     return resolved
 
 
-def _run_il_final_elo(model, config, device, elo_config, logger, epoch_num, model_label, marker_label, interrupted=False):
+def _build_il_final_elo_configs(elo_config):
+    raw_cfg = _build_il_final_elo_config(elo_config)
+    mcts_cfg = dict(raw_cfg)
+    raw_cfg['use_mcts'] = False
+    mcts_cfg['use_mcts'] = True
+    return raw_cfg, mcts_cfg
+
+
+def _run_il_final_elo(
+    model,
+    config,
+    device,
+    elo_config,
+    logger,
+    epoch_num,
+    model_label,
+    marker_label,
+    interrupted=False,
+    checkpoint_path=None,
+):
     """Run a blocking final IL Elo check; Ctrl+C cancels only this check."""
     if not isinstance(elo_config, dict) or not elo_config.get("enabled", False):
         return {"skipped": True}
@@ -251,11 +271,34 @@ def _run_il_final_elo(model, config, device, elo_config, logger, epoch_num, mode
     if estimated_elo is not None:
         logger.record_estimated_elo(epoch_num, estimated_elo, update_csv=True)
         logger.add_elo_epoch_marker(epoch_num, marker_label)
-        print(f"Final IL Estimated Elo ({model_label}): {int(round(float(estimated_elo)))}")
+        use_mcts = bool(elo_config.get("use_mcts", False))
+        simulations = int(elo_config.get("mcts_simulations", 0) or 0)
+        mode_label = f"MCTS {simulations} sims" if use_mcts else "raw NN"
+        print(f"Final IL Estimated Elo ({model_label}, {mode_label}): {int(round(float(estimated_elo)))}")
+        if elo_result.get("elo_std_error") is not None:
+            ci = elo_result.get("elo_ci95")
+            ci_str = f", 95% CI {ci[0]}-{ci[1]}" if isinstance(ci, list) and len(ci) == 2 else ""
+            ladder = "adaptive" if elo_result.get("adaptive") else "fixed"
+            print(f"  uncertainty: ±{elo_result['elo_std_error']} Elo SE{ci_str} ({ladder} ladder)")
         for lvl, res in sorted(elo_result.get("results", {}).items()):
             score_str = f"W{res['wins']}/D{res['draws']}/L{res['losses']}"
-            print(f"  vs SF {lvl}: {score_str} (score: {res['score']:.0%})")
+            games = int(res.get("games", res["wins"] + res["draws"] + res["losses"]) or 0)
+            print(f"  vs SF {lvl}: {score_str} (score: {res['score']:.0%}, n={games})")
         print(f"  time {elo_result['total_time']:.1f}s ({elo_result['total_games']} games)")
+        if checkpoint_path is not None:
+            ok, error = persist_checkpoint_elo_metadata(
+                checkpoint_path,
+                estimated_elo,
+                levels=list(elo_config.get("levels", [])),
+                games_per_level=int(elo_config.get("games_per_level", 0) or 0),
+                use_mcts=use_mcts,
+                simulations=simulations,
+                sf_time=float(elo_config.get("stockfish_time_limit", 0.0) or 0.0),
+                source="il_final_elo",
+                elo_result=elo_result,
+            )
+            if not ok and error:
+                print(f"Final IL Elo metadata save failed: {error}")
     elif elo_result.get("error"):
         print(f"Final IL Elo check failed: {elo_result.get('error')}")
     elif not elo_result.get("skipped"):
@@ -451,12 +494,24 @@ def main():
     )
 
     if debug_enabled:
-        debug_dir = logs_dir / "debug"
+        debug_dir = logs_dir / "debug" / "training_profile"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        debug_log_file = debug_dir / f"training_profile_{timestamp}.txt"
+        debug_log_file = debug_dir / "il_latest_training_profile.txt"
+        for stale_profile in debug_dir.glob("il_*training_profile*.txt"):
+            if stale_profile != debug_log_file:
+                try:
+                    stale_profile.unlink()
+                except OSError:
+                    pass
+        legacy_debug_dir = logs_dir / "debug"
+        for stale_profile in legacy_debug_dir.glob("training_profile_*.txt"):
+            try:
+                stale_profile.unlink()
+            except OSError:
+                pass
 
         profile_debug_enabled = bool(il_debug_cfg.get('profile_training', debug_cfg.get('profile_training', False)))
         profile_mode_label = "every epoch" if profile_debug_enabled else "first epoch of each training phase"
@@ -1040,7 +1095,7 @@ def main():
     if elo_config_il.get("use_mcts", False):
         print("Note: IL forces elo_estimation.use_mcts=False for speed.")
     elo_config_il["use_mcts"] = False
-    final_elo_config_il = _build_il_final_elo_config(elo_config)
+    final_elo_config_il, final_elo_config_il_mcts = _build_il_final_elo_configs(elo_config)
     final_il_elo_enabled = bool(
         final_elo_config_il.get("enabled", False)
         and final_elo_config_il.get("final_on_il_shutdown", True)
@@ -1056,11 +1111,11 @@ def main():
     elo_coordinator.print_startup_summary()
     if final_il_elo_enabled:
         print(
-            "Elo final (IL): enabled for best_model_il and SWA, "
+            "Elo final (IL): enabled for best_model_il and SWA, raw NN + MCTS, "
             f"levels={final_elo_config_il.get('levels')}, "
             f"games/level={final_elo_config_il.get('games_per_level')}, "
             f"time={float(final_elo_config_il.get('stockfish_time_limit', 0.0)):.2f}s, "
-            f"mcts={bool(final_elo_config_il.get('use_mcts', False))}"
+            f"mcts_sims={int(final_elo_config_il_mcts.get('mcts_simulations', 0) or 0)}"
         )
 
     # torch.compile: fuses Conv+BN+ReLU kernels → fewer GPU kernel launches.
@@ -1718,27 +1773,42 @@ def main():
             final_model_label = f"best IL: {best_elo_label}" if best_checkpoint_loaded else "current model"
             final_marker_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
             final_note_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
-            final_best_elo_result = _run_il_final_elo(
-                model=best_elo_model,
-                config=config,
-                device=device,
-                elo_config=final_elo_config_il,
-                logger=logger,
-                epoch_num=final_epoch_num,
-                model_label=final_model_label,
-                marker_label=final_marker_label,
-                interrupted=training_interrupted,
-            )
-            if final_best_elo_result.get("estimated_elo") is not None:
-                if best_checkpoint_loaded:
-                    logger.record_best_final_elo(
-                        final_epoch_num,
-                        final_best_elo_result.get("estimated_elo"),
-                    )
-                logger.append_final_note(
-                    f"{final_note_label}: {int(round(float(final_best_elo_result['estimated_elo'])))}"
+            final_best_elo_results = []
+            for mode_cfg, mode_suffix in (
+                (final_elo_config_il, "NN"),
+                (final_elo_config_il_mcts, "MCTS"),
+            ):
+                mode_marker = f"{final_marker_label} {mode_suffix}"
+                final_best_elo_result = _run_il_final_elo(
+                    model=best_elo_model,
+                    config=config,
+                    device=device,
+                    elo_config=mode_cfg,
+                    logger=logger,
+                    epoch_num=final_epoch_num,
+                    model_label=f"{final_model_label} {mode_suffix}",
+                    marker_label=mode_marker,
+                    interrupted=training_interrupted,
+                    checkpoint_path=best_model_path if best_checkpoint_loaded else None,
                 )
-                logger.plot()
+                final_best_elo_results.append(final_best_elo_result)
+                if final_best_elo_result.get("cancelled"):
+                    break
+                if final_best_elo_result.get("estimated_elo") is not None:
+                    if best_checkpoint_loaded and mode_suffix == "NN":
+                        logger.record_best_final_elo(
+                            final_epoch_num,
+                            final_best_elo_result.get("estimated_elo"),
+                        )
+                    logger.append_final_note(
+                        f"{final_note_label} {mode_suffix}: "
+                        f"{int(round(float(final_best_elo_result['estimated_elo'])))}"
+                    )
+                    logger.plot()
+            final_best_elo_result = next(
+                (r for r in final_best_elo_results if r.get("estimated_elo") is not None),
+                final_best_elo_results[-1] if final_best_elo_results else {},
+            )
 
     if training_interrupted:
         if not swa_final_result.get("elo_cancelled") and swa_final_result.get("estimated_elo") is None:
@@ -1746,16 +1816,28 @@ def main():
             ran_current_final_elo = False
             if final_elo_result.get("estimated_elo") is None and not final_elo_result.get("cancelled"):
                 ran_current_final_elo = True
-                final_elo_result = _run_il_final_elo(
-                    model=model,
-                    config=config,
-                    device=device,
-                    elo_config=final_elo_config_il,
-                    logger=logger,
-                    epoch_num=final_epoch_num,
-                    model_label="current model",
-                    marker_label="Ctrl+C final Elo",
-                    interrupted=True,
+                current_results = []
+                for mode_cfg, mode_suffix in (
+                    (final_elo_config_il, "NN"),
+                    (final_elo_config_il_mcts, "MCTS"),
+                ):
+                    final_elo_result = _run_il_final_elo(
+                        model=model,
+                        config=config,
+                        device=device,
+                        elo_config=mode_cfg,
+                        logger=logger,
+                        epoch_num=final_epoch_num,
+                        model_label=f"current model {mode_suffix}",
+                        marker_label=f"Ctrl+C final Elo {mode_suffix}",
+                        interrupted=True,
+                    )
+                    current_results.append(final_elo_result)
+                    if final_elo_result.get("cancelled"):
+                        break
+                final_elo_result = next(
+                    (r for r in current_results if r.get("estimated_elo") is not None),
+                    current_results[-1] if current_results else {},
                 )
             if ran_current_final_elo and final_elo_result.get("estimated_elo") is not None:
                 logger.append_final_note(

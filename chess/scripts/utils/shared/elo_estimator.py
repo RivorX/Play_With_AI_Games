@@ -10,6 +10,7 @@ Auto-downloads Stockfish if not found on the system.
 
 import contextlib
 import io
+import math
 import os
 import platform
 import subprocess
@@ -37,6 +38,7 @@ except ImportError:
 # Imports are resolved at runtime (script_dir-based sys.path setup in train_il.py)
 from src.utils.data_helpers import board_to_tensor, move_to_index
 from src.batch_selfplay import MCTS, MultiGameBatchMCTS, select_move_by_visits
+from utils.shared.central_inference_session import CentralInferenceSession, snapshot_model_state_cpu
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +88,34 @@ def _available_cpu_count() -> int:
             pass
 
     return max(1, int(os.cpu_count() or 1))
+
+
+def _format_worker_game_counts(counts: list[int]) -> str:
+    if not counts:
+        return "none"
+
+    total = int(sum(counts))
+    active_counts = [int(count) for count in counts if int(count) > 0]
+    active = len(active_counts)
+    if active_counts:
+        avg_games = total / max(1, active)
+        min_games = min(active_counts)
+        max_games = max(active_counts)
+    else:
+        avg_games = 0.0
+        min_games = 0
+        max_games = 0
+
+    preview_limit = 32
+    preview_parts = [f"w{idx:02d}={int(count)}" for idx, count in enumerate(counts[:preview_limit])]
+    if len(counts) > preview_limit:
+        preview_parts.append(f"...+{len(counts) - preview_limit} workers")
+
+    return (
+        f"total={total}, active={active}/{len(counts)}, "
+        f"avg={avg_games:.1f}, min={min_games}, max={max_games}, "
+        f"counts=[{', '.join(preview_parts)}]"
+    )
 
 
 def _get_stockfish_download_info() -> tuple[str, str]:
@@ -264,6 +294,20 @@ def _performance_rating(opponent_elos: list[float], scores: list[float]) -> floa
         else:
             hi = mid
     return (lo + hi) / 2.0
+
+
+def _elo_standard_error(opponent_elos: list[float], estimated_elo: float | None) -> float | None:
+    """Approximate rating standard error from logistic Fisher information."""
+    if estimated_elo is None or not opponent_elos:
+        return None
+    scale = math.log(10.0) / 400.0
+    info = 0.0
+    for opp in opponent_elos:
+        p = _expected_score(float(estimated_elo), float(opp))
+        info += (scale * scale) * max(1e-6, p * (1.0 - p))
+    if info <= 0.0:
+        return None
+    return 1.0 / math.sqrt(info)
 
 
 # ---------------------------------------------------------------------------
@@ -564,9 +608,19 @@ class EloEstimator:
         self._thread_local = threading.local()
         self._worker_engines: list[chess.engine.SimpleEngine] = []
         self._worker_engines_lock = threading.Lock()
+        self._central_inference_session = None
+        self._local_cancel_event = threading.Event()
+        self._printed_central_mcts_clients = False
+        self._last_elo_batch_stats: dict | None = None
 
     def _is_cancelled(self) -> bool:
-        return self.stop_event is not None and self.stop_event.is_set()
+        return self._local_cancel_event.is_set() or (self.stop_event is not None and self.stop_event.is_set())
+
+    def _request_cancel(self):
+        self._local_cancel_event.set()
+        if self.stop_event is not None:
+            with contextlib.suppress(Exception):
+                self.stop_event.set()
 
     def _log_limited(self, key: str, message: str):
         """Log noisy worker errors with suppression after N repeats."""
@@ -687,6 +741,187 @@ class EloEstimator:
         effective = min(effective, max(1, int(total_games)))
         return max(1, effective)
 
+    def _start_central_inference_for_elo(self, workers: int):
+        if self._central_inference_session is not None:
+            return self._central_inference_session
+        session = CentralInferenceSession(
+            config=self.config,
+            device=self.device,
+            workers=workers,
+            model_state=snapshot_model_state_cpu(self.model),
+            options=self.elo_config,
+            option_prefix="eval_elo",
+            model_label="learner",
+            rank_base=730000,
+        )
+        session.start()
+        self._central_inference_session = session
+        print(f"  Info: Elo central inference: {session.describe()}")
+        return session
+
+    def _stop_central_inference_for_elo(self):
+        session = self._central_inference_session
+        self._central_inference_session = None
+        if session is not None:
+            session.close()
+
+    def _build_central_remote_model_for_thread(self):
+        session = self._central_inference_session
+        if not session:
+            return None
+        return session.remote_model_for_current_thread()
+
+    def _resolve_central_client_groups(self, workers: int, task_count: int) -> tuple[int, list[int]]:
+        workers = max(1, int(workers))
+        task_count = max(1, int(task_count))
+        raw_groups = self.elo_config.get("eval_elo_central_client_groups", "auto")
+        if isinstance(raw_groups, str) and raw_groups.strip().lower() == "auto":
+            target_groups = max(1, int(self.elo_config.get("eval_elo_central_target_client_groups", 4) or 4))
+            min_groups = max(1, int(self.elo_config.get("eval_elo_central_min_client_groups", 3) or 3))
+            max_groups = max(min_groups, int(self.elo_config.get("eval_elo_central_max_client_groups", 5) or 5))
+            group_count = max(min_groups, min(max_groups, target_groups, workers, task_count))
+        else:
+            try:
+                group_count = max(1, int(raw_groups))
+            except (TypeError, ValueError):
+                group_count = max(1, min(4, workers, task_count))
+        group_count = max(1, min(workers, task_count, group_count))
+        base = workers // group_count
+        extra = workers % group_count
+        group_workers = [base + (1 if idx < extra else 0) for idx in range(group_count)]
+        return group_count, group_workers
+
+    @staticmethod
+    def _merge_batched_stats(stats_items: list[dict]) -> dict:
+        merged = {
+            "model_move_calls": 0,
+            "model_move_positions": 0,
+            "model_move_time_s": 0.0,
+            "stockfish_move_time_s": 0.0,
+            "worker_game_counts": [],
+        }
+        for stats in stats_items:
+            merged["model_move_calls"] += int(stats.get("model_move_calls", 0) or 0)
+            merged["model_move_positions"] += int(stats.get("model_move_positions", 0) or 0)
+            merged["model_move_time_s"] += float(stats.get("model_move_time_s", 0.0) or 0.0)
+            merged["stockfish_move_time_s"] += float(stats.get("stockfish_move_time_s", 0.0) or 0.0)
+            merged["worker_game_counts"].extend(list(stats.get("worker_game_counts", []) or []))
+        return merged
+
+    def _estimate_central_batched_groups(
+        self,
+        tasks: list[tuple[int, int, bool]],
+        workers: int,
+        simulations: int,
+        stockfish_time_limit: float,
+        max_moves: int,
+        stockfish_path: str,
+        progress_bar,
+    ) -> tuple[list[float], list[float]]:
+        group_count, group_workers = self._resolve_central_client_groups(workers, len(tasks))
+        games_per_worker_chunk = max(
+            1,
+            int(self.elo_config.get("eval_elo_central_games_per_worker_chunk", 20) or 20),
+        )
+        pending_tasks = deque(tasks)
+        pending_lock = threading.Lock()
+
+        if not self._printed_central_mcts_clients:
+            self._printed_central_mcts_clients = True
+            print(
+                "  Info: Elo central MCTS clients: "
+                f"groups={group_count}, stockfish_workers={workers}, "
+                f"active_games/client={group_workers}, "
+                f"games/worker_chunk={games_per_worker_chunk}"
+            )
+
+        all_opponent_elos: list[float] = []
+        all_scores: list[float] = []
+        stats_items: list[dict] = []
+
+        def _next_chunk(group_worker_count: int):
+            chunk_size = max(1, int(group_worker_count) * games_per_worker_chunk)
+            chunk = []
+            with pending_lock:
+                while pending_tasks and len(chunk) < chunk_size:
+                    chunk.append(pending_tasks.popleft())
+            return chunk
+
+        def _run_group(group_idx: int):
+            remote_model = self._build_central_remote_model_for_thread()
+            if remote_model is None:
+                raise RuntimeError("Central inference session is not available for Elo MCTS group.")
+            group_elos: list[float] = []
+            group_scores: list[float] = []
+            group_stats_items: list[dict] = []
+            while not self._is_cancelled():
+                chunk = _next_chunk(group_workers[group_idx])
+                if not chunk:
+                    break
+                chunk_stats = {}
+                elos, scores = self._estimate_batched_games(
+                    tasks=chunk,
+                    workers=min(group_workers[group_idx], len(chunk)),
+                    use_mcts=True,
+                    simulations=simulations,
+                    stockfish_time_limit=stockfish_time_limit,
+                    max_moves=max_moves,
+                    stockfish_path=stockfish_path,
+                    progress_bar=progress_bar,
+                    model_override=remote_model,
+                    device_override=torch.device("cpu"),
+                    stats_out=chunk_stats,
+                )
+                group_elos.extend(elos)
+                group_scores.extend(scores)
+                group_stats_items.append(chunk_stats)
+            return group_elos, group_scores, self._merge_batched_stats(group_stats_items)
+
+        executor = ThreadPoolExecutor(max_workers=group_count)
+        futures = []
+        try:
+            futures = [executor.submit(_run_group, idx) for idx in range(group_count)]
+            for future in as_completed(futures):
+                if self._is_cancelled():
+                    break
+                elos, scores, group_stats = future.result()
+                all_opponent_elos.extend(elos)
+                all_scores.extend(scores)
+                stats_items.append(group_stats)
+        except KeyboardInterrupt:
+            self._request_cancel()
+            for future in futures:
+                future.cancel()
+            self._close_worker_engines()
+            raise
+        finally:
+            cancelled = self._is_cancelled()
+            if cancelled:
+                for future in futures:
+                    future.cancel()
+                self._close_worker_engines()
+                self._stop_central_inference_for_elo()
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True, cancel_futures=False)
+
+        merged_stats = self._merge_batched_stats(stats_items)
+        calls = int(merged_stats.get("model_move_calls", 0) or 0)
+        positions = int(merged_stats.get("model_move_positions", 0) or 0)
+        if calls > 0:
+            avg_batch = float(positions) / float(calls)
+            print(
+                "  Info: Elo model batching: "
+                f"avg_batch={avg_batch:.1f}, calls={calls}, "
+                f"model_time={float(merged_stats.get('model_move_time_s', 0.0)):.1f}s, "
+                f"stockfish_wait={float(merged_stats.get('stockfish_move_time_s', 0.0)):.1f}s"
+            )
+        worker_counts = list(merged_stats.get("worker_game_counts", []) or [])
+        self._last_elo_batch_stats = dict(merged_stats)
+        if sum(worker_counts) > 0 and bool(self.elo_config.get("elo_verbose_worker_stats", False)):
+            print(f"  Info: Elo games/worker: {_format_worker_game_counts(worker_counts)}")
+        return all_opponent_elos, all_scores
+
     def _register_worker_engine(self, engine: chess.engine.SimpleEngine):
         with self._worker_engines_lock:
             self._worker_engines.append(engine)
@@ -782,7 +1017,11 @@ class EloEstimator:
 
         engine = self._open_stockfish_engine(stockfish_path)
         self._configure_stockfish_engine(engine, level=1320)
-        player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
+        central_model = self._build_central_remote_model_for_thread() if use_mcts else None
+        if central_model is not None:
+            player = _ModelPlayer(central_model, self.config, torch.device("cpu"), use_mcts, simulations)
+        else:
+            player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
 
         worker = {
             "engine": engine,
@@ -802,6 +1041,265 @@ class EloEstimator:
         if result == "0-1":
             return 0.0 if model_is_white else 1.0
         return 0.5
+
+    @staticmethod
+    def _build_level_tasks(level: int, start_game_idx: int, count: int) -> list[tuple[int, int, bool]]:
+        tasks: list[tuple[int, int, bool]] = []
+        for offset in range(max(0, int(count))):
+            game_idx = int(start_game_idx) + offset
+            tasks.append((int(level), game_idx, (game_idx % 2 == 0)))
+        return tasks
+
+    @staticmethod
+    def _summarize_scores(scores: list[float]) -> dict:
+        wins = sum(1 for s in scores if s == 1.0)
+        draws = sum(1 for s in scores if s == 0.5)
+        losses = sum(1 for s in scores if s == 0.0)
+        total = wins + draws + losses
+        score_pct = (wins + 0.5 * draws) / total if total else 0.0
+        return {"wins": wins, "draws": draws, "losses": losses, "score": score_pct, "total": total}
+
+    @staticmethod
+    def _extend_progress_total(progress_bar, count: int, *, cap: int | None = None, phase: str | None = None):
+        if progress_bar is None or count <= 0:
+            return
+        progress_bar.total = int(progress_bar.total or 0) + int(count)
+        postfix = {}
+        if cap is not None and cap > 0:
+            postfix["cap"] = int(cap)
+        if phase:
+            postfix["phase"] = str(phase)
+        if postfix:
+            progress_bar.set_postfix(postfix, refresh=False)
+        progress_bar.refresh()
+
+    @staticmethod
+    def _interleaved_ladder_order(levels: list[int]) -> list[int]:
+        """Probe low/high/mid levels in one wave so adaptive Elo still fills workers."""
+        values = [int(level) for level in levels]
+        n = len(values)
+        if n <= 2:
+            return values
+        mid = n // 2
+        indices: list[int] = []
+        seen: set[int] = set()
+        for offset in range(n):
+            candidates = [offset, n - 1 - offset, mid + offset, mid - offset]
+            for idx in candidates:
+                if 0 <= idx < n and idx not in seen:
+                    seen.add(idx)
+                    indices.append(idx)
+            if len(indices) >= n:
+                break
+        return [values[idx] for idx in indices]
+
+    def _run_task_batch(
+        self,
+        *,
+        tasks: list[tuple[int, int, bool]],
+        workers: int,
+        use_mcts: bool,
+        simulations: int,
+        stockfish_time_limit: float,
+        max_moves: int,
+        resolved_path: str,
+        batch_model_moves: bool,
+        central_inference_enabled: bool,
+        progress_bar,
+    ) -> tuple[list[float], list[float], bool]:
+        """Run an already chosen list of Elo games through the shared executor."""
+        all_opponent_elos: list[float] = []
+        all_scores: list[float] = []
+        interrupted_by_user = False
+
+        if not tasks:
+            return all_opponent_elos, all_scores, interrupted_by_user
+
+        if central_inference_enabled:
+            try:
+                all_opponent_elos, all_scores = self._estimate_central_batched_groups(
+                    tasks=tasks,
+                    workers=workers,
+                    simulations=simulations,
+                    stockfish_time_limit=stockfish_time_limit,
+                    max_moves=max_moves,
+                    stockfish_path=resolved_path,
+                    progress_bar=progress_bar,
+                )
+            except KeyboardInterrupt:
+                interrupted_by_user = True
+                self._request_cancel()
+                print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
+            finally:
+                self._close_worker_engines()
+        elif batch_model_moves and workers > 1:
+            try:
+                all_opponent_elos, all_scores = self._estimate_batched_games(
+                    tasks=tasks,
+                    workers=workers,
+                    use_mcts=use_mcts,
+                    simulations=simulations,
+                    stockfish_time_limit=stockfish_time_limit,
+                    max_moves=max_moves,
+                    stockfish_path=resolved_path,
+                    progress_bar=progress_bar,
+                )
+            except KeyboardInterrupt:
+                interrupted_by_user = True
+                self._request_cancel()
+                print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
+            finally:
+                self._close_worker_engines()
+        elif workers > 1:
+            parallel_thread_slots: dict[int, int] = {}
+            parallel_game_counts: list[int] = []
+
+            def _record_parallel_thread_game(thread_id: int):
+                slot = parallel_thread_slots.get(thread_id)
+                if slot is None:
+                    slot = len(parallel_game_counts)
+                    parallel_thread_slots[thread_id] = slot
+                    parallel_game_counts.append(0)
+                parallel_game_counts[slot] += 1
+
+            def _run_parallel_game(
+                level: int,
+                model_is_white: bool,
+                use_mcts: bool,
+                simulations: int,
+                stockfish_time_limit: float,
+                max_moves: int,
+                resolved_path: str,
+            ):
+                result = self._play_single_game_worker(
+                    level,
+                    model_is_white,
+                    use_mcts,
+                    simulations,
+                    stockfish_time_limit,
+                    max_moves,
+                    resolved_path,
+                )
+                return result, threading.get_ident()
+
+            executor = ThreadPoolExecutor(max_workers=workers)
+            futures = {}
+            try:
+                for level, game_idx, model_is_white in tasks:
+                    if self._is_cancelled():
+                        break
+                    future = executor.submit(
+                        _run_parallel_game,
+                        level,
+                        model_is_white,
+                        use_mcts,
+                        simulations,
+                        stockfish_time_limit,
+                        max_moves,
+                        resolved_path,
+                    )
+                    futures[future] = (level, game_idx)
+
+                try:
+                    for future in as_completed(futures):
+                        if self._is_cancelled():
+                            break
+                        level, _ = futures[future]
+                        try:
+                            result, thread_id = future.result()
+                            _record_parallel_thread_game(int(thread_id))
+                            if result is None:
+                                if progress_bar is not None:
+                                    progress_bar.update(1)
+                                continue
+                            all_opponent_elos.append(float(level))
+                            all_scores.append(float(result))
+                        except Exception as exc:
+                            self._log_limited("parallel_game_fail", f"  Warning: game at level {level} failed: {exc}")
+                            all_opponent_elos.append(float(level))
+                            all_scores.append(0.0)
+                        finally:
+                            if progress_bar is not None:
+                                progress_bar.update(1)
+                except KeyboardInterrupt:
+                    interrupted_by_user = True
+                    self._request_cancel()
+                    print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
+            finally:
+                cancelled = self._is_cancelled() or interrupted_by_user
+                if cancelled:
+                    for future in futures:
+                        future.cancel()
+                    self._close_worker_engines()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    self._close_worker_engines()
+                else:
+                    executor.shutdown(wait=True, cancel_futures=False)
+                self._close_worker_engines()
+                self._last_elo_batch_stats = {"worker_game_counts": list(parallel_game_counts)}
+                if sum(parallel_game_counts) > 0 and bool(self.elo_config.get("elo_verbose_worker_stats", False)):
+                    print(f"  Info: Elo games/worker: {_format_worker_game_counts(parallel_game_counts)}")
+        else:
+            player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
+            engine = chess.engine.SimpleEngine.popen_uci(
+                resolved_path,
+                **self._stockfish_popen_kwargs(),
+            )
+            try:
+                try:
+                    last_level = None
+                    for level, game_idx, model_is_white in tasks:
+                        if self._is_cancelled():
+                            break
+                        if level != last_level:
+                            self._configure_stockfish_engine(engine, level)
+                            last_level = level
+                        result = self._play_game(
+                            engine,
+                            player,
+                            model_is_white,
+                            stockfish_time_limit,
+                            max_moves,
+                        )
+                        if result is not None:
+                            all_opponent_elos.append(float(level))
+                            all_scores.append(float(result))
+                        if progress_bar is not None:
+                            progress_bar.update(1)
+                except KeyboardInterrupt:
+                    interrupted_by_user = True
+                    self._request_cancel()
+                    print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
+            finally:
+                self._force_close_engine(engine)
+
+        return all_opponent_elos, all_scores, interrupted_by_user
+
+    def _print_elo_completion_summary(self, result: dict, *, use_mcts: bool):
+        if not bool(self.elo_config.get("elo_print_completion_summary", True)):
+            return
+        total_games = int(result.get("total_games", 0) or 0)
+        elapsed = float(result.get("total_time", 0.0) or 0.0)
+        rate = (float(total_games) / elapsed) if elapsed > 0.0 else 0.0
+        ladder = "adaptive" if result.get("adaptive") else "fixed"
+        print(
+            f"  Elo done: {total_games} games in {elapsed:.1f}s "
+            f"({rate:.2f} games/s, {ladder})"
+        )
+        stats = self._last_elo_batch_stats or {}
+        calls = int(stats.get("model_move_calls", 0) or 0)
+        positions = int(stats.get("model_move_positions", 0) or 0)
+        if use_mcts and calls > 0:
+            avg_batch = float(positions) / float(calls)
+            print(
+                "  Elo model batching: "
+                f"avg_batch={avg_batch:.1f}, calls={calls}, "
+                f"model_time={float(stats.get('model_move_time_s', 0.0) or 0.0):.1f}s, "
+                f"stockfish_wait={float(stats.get('stockfish_move_time_s', 0.0) or 0.0):.1f}s"
+            )
+        worker_counts = list(stats.get("worker_game_counts", []) or [])
+        if worker_counts and bool(self.elo_config.get("elo_print_worker_summary", False)):
+            print(f"  Elo workers: {_format_worker_game_counts(worker_counts)}")
 
     # -----------------------------------------------------------------------
     # Public API
@@ -824,6 +1322,8 @@ class EloEstimator:
         if levels is None:
             levels = [1000, 1300, 1600, 1900, 2200]
 
+        self._local_cancel_event.clear()
+        self._printed_central_mcts_clients = False
         self.model.eval()
         if self._is_cancelled():
             return {
@@ -894,25 +1394,57 @@ class EloEstimator:
         all_scores: list[float] = []
         results_per_level: dict[int, dict] = {}
 
-        tasks = []
-        for level in levels:
-            for game_idx in range(games_per_level):
-                model_is_white = (game_idx % 2 == 0)
-                tasks.append((level, game_idx, model_is_white))
+        adaptive_enabled = bool(self.elo_config.get("adaptive_ladder_enabled", False))
+        requested_total_games = int(len(levels) * max(1, int(games_per_level)))
+        max_total_games = requested_total_games
+        if adaptive_enabled:
+            try:
+                max_total_games = int(self.elo_config.get("adaptive_max_total_games", requested_total_games) or requested_total_games)
+            except (TypeError, ValueError):
+                max_total_games = requested_total_games
+            max_total_games = max(1, min(requested_total_games, max_total_games))
 
-        workers = self._resolve_workers(workers, total_games=len(tasks))
+        workers = self._resolve_workers(workers, total_games=max_total_games)
         batch_model_moves = bool(self.elo_config.get("batch_model_moves", True))
+        if not use_mcts:
+            # Raw NN inference is usually much cheaper than the Stockfish move.
+            # Running full games per worker avoids the per-ply batch barrier.
+            batch_model_moves = bool(self.elo_config.get("batch_raw_model_moves", batch_model_moves))
+        central_inference_enabled = bool(
+            use_mcts
+            and workers > 1
+            and self.device.type == "cuda"
+            and self.elo_config.get("eval_elo_central_inference_enabled", False)
+            and int(simulations) >= int(self.elo_config.get("eval_elo_central_inference_min_simulations", 256) or 256)
+        )
+        if central_inference_enabled:
+            # Central inference batches across independent MCTS workers. Keeping
+            # the single-process batched MCTS path would serialize search again.
+            batch_model_moves = False
         print(f"  Info: Elo workers resolved to {workers} (available_cpu={_available_cpu_count()}).")
         print(
             "  Info: Stockfish config: "
             f"threads={self._resolve_stockfish_threads()}, "
             f"hash={self._resolve_stockfish_hash_mb()} MB, "
             f"time_limit={float(stockfish_time_limit):.3f}s, "
-            f"games={len(tasks)}"
+            f"games={'adaptive <= ' if adaptive_enabled else ''}{max_total_games}"
         )
+        if adaptive_enabled:
+            print(
+                "  Info: Adaptive Elo ladder enabled: "
+                f"levels={levels}, max_games={max_total_games}, "
+                f"probe={int(self.elo_config.get('adaptive_probe_games_per_level', 8) or 8)}, "
+                f"focus<= {int(self.elo_config.get('adaptive_focus_games_per_level', games_per_level) or games_per_level)}/level"
+            )
         if batch_model_moves and workers > 1:
             model_path = "batched_mcts" if use_mcts else "batched_raw"
             print(f"  Info: Elo model path: {model_path} (shared batch scheduling enabled).")
+        elif workers > 1:
+            if central_inference_enabled:
+                model_path = "batched_mcts_central"
+            else:
+                model_path = "parallel_mcts" if use_mcts else "parallel_raw"
+            print(f"  Info: Elo model path: {model_path} (independent game workers).")
         if self._is_cancelled():
             return {
                 "estimated_elo": None,
@@ -934,130 +1466,199 @@ class EloEstimator:
         progress_bar = None
         if show_progress:
             progress_bar = tqdm(
-                total=len(tasks),
-                desc="Elo games",
+                total=0 if adaptive_enabled else max_total_games,
+                desc="Elo adaptive" if adaptive_enabled else "Elo games",
                 unit="game",
                 dynamic_ncols=True,
                 leave=True,
+                smoothing=0.05,
+                mininterval=0.5,
+                delay=0.5,
+                bar_format=(
+                    "{desc}: {percentage:3.0f}%|{bar:34}| "
+                    "{n_fmt}/{total_fmt} {unit} "
+                    "[{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+                ),
             )
 
         interrupted_by_user = False
+        played_by_level: dict[int, int] = {int(level): 0 for level in levels}
+        scores_by_level: dict[int, list[float]] = {int(level): [] for level in levels}
+
+        def _run_selected_tasks(tasks: list[tuple[int, int, bool]], phase: str = "") -> bool:
+            nonlocal interrupted_by_user
+            if not tasks:
+                return False
+            if adaptive_enabled:
+                self._extend_progress_total(progress_bar, len(tasks), cap=max_total_games, phase=phase)
+            elif progress_bar is not None and phase:
+                progress_bar.set_postfix({"phase": phase}, refresh=False)
+            batch_elos, batch_scores, batch_interrupted = self._run_task_batch(
+                tasks=tasks,
+                workers=min(workers, max(1, len(tasks))),
+                use_mcts=use_mcts,
+                simulations=simulations,
+                stockfish_time_limit=stockfish_time_limit,
+                max_moves=max_moves,
+                resolved_path=resolved_path,
+                batch_model_moves=batch_model_moves,
+                central_inference_enabled=central_inference_enabled,
+                progress_bar=progress_bar,
+            )
+            interrupted_by_user = interrupted_by_user or batch_interrupted
+            for level_f, score in zip(batch_elos, batch_scores):
+                level = int(level_f)
+                all_opponent_elos.append(float(level_f))
+                all_scores.append(float(score))
+                played_by_level[level] = int(played_by_level.get(level, 0)) + 1
+                scores_by_level.setdefault(level, []).append(float(score))
+            return batch_interrupted or self._is_cancelled()
 
         try:
-            if batch_model_moves and workers > 1:
+            if central_inference_enabled:
+                self._start_central_inference_for_elo(workers)
+            if adaptive_enabled:
+                probe_games = max(2, int(self.elo_config.get("adaptive_probe_games_per_level", 8) or 8))
+                probe_games = min(max(1, int(games_per_level)), probe_games)
+                focus_games = max(probe_games, int(self.elo_config.get("adaptive_focus_games_per_level", games_per_level) or games_per_level))
+                focus_games = min(max(1, int(games_per_level)), focus_games)
+                extra_round = max(2, int(self.elo_config.get("adaptive_extra_games_per_level", 8) or 8))
+                high_skip = float(self.elo_config.get("adaptive_skip_high_score", 0.92) or 0.92)
+                low_stop = float(self.elo_config.get("adaptive_stop_low_score", 0.08) or 0.08)
+                focus_min = float(self.elo_config.get("adaptive_focus_min_score", 0.20) or 0.20)
+                focus_max = float(self.elo_config.get("adaptive_focus_max_score", 0.80) or 0.80)
+                target_focus = max(1, int(self.elo_config.get("adaptive_target_focus_levels", 4) or 4))
+                min_batch_games_raw = self.elo_config.get("adaptive_min_batch_games", 0)
                 try:
-                    all_opponent_elos, all_scores = self._estimate_batched_games(
-                        tasks=tasks,
-                        workers=workers,
-                        use_mcts=use_mcts,
-                        simulations=simulations,
-                        stockfish_time_limit=stockfish_time_limit,
-                        max_moves=max_moves,
-                        stockfish_path=resolved_path,
-                        progress_bar=progress_bar,
-                    )
-                except KeyboardInterrupt:
-                    interrupted_by_user = True
-                    if self.stop_event is not None:
-                        with contextlib.suppress(Exception):
-                            self.stop_event.set()
-                    print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
-                finally:
-                    self._close_worker_engines()
-            elif workers > 1:
-                executor = ThreadPoolExecutor(max_workers=workers)
-                futures = {}
-                try:
-                    for level, game_idx, model_is_white in tasks:
-                        if self._is_cancelled():
-                            break
-                        future = executor.submit(
-                            self._play_single_game_worker,
-                            level,
-                            model_is_white,
-                            use_mcts,
-                            simulations,
-                            stockfish_time_limit,
-                            max_moves,
-                            resolved_path,
-                        )
-                        futures[future] = (level, game_idx)
-
-                    try:
-                        for future in as_completed(futures):
-                            if self._is_cancelled():
-                                break
-                            level, _ = futures[future]
-                            try:
-                                result = future.result()
-                                if result is None:
-                                    if progress_bar is not None:
-                                        progress_bar.update(1)
-                                    continue
-                                all_opponent_elos.append(float(level))
-                                all_scores.append(float(result))
-                            except Exception as exc:
-                                self._log_limited("parallel_game_fail", f"  Warning: game at level {level} failed: {exc}")
-                                all_opponent_elos.append(float(level))
-                                all_scores.append(0.0)
-                            finally:
-                                if progress_bar is not None:
-                                    progress_bar.update(1)
-                    except KeyboardInterrupt:
-                        interrupted_by_user = True
-                        if self.stop_event is not None:
-                            with contextlib.suppress(Exception):
-                                self.stop_event.set()
-                        print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
-                finally:
-                    cancelled = self._is_cancelled() or interrupted_by_user
-                    if cancelled:
-                        for future in futures:
-                            future.cancel()
-                        self._close_worker_engines()
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        self._close_worker_engines()
-                    else:
-                        executor.shutdown(wait=True, cancel_futures=False)
-                    self._close_worker_engines()
-            else:
-                player = _ModelPlayer(self.model, self.config, self.device, use_mcts, simulations)
-                engine = chess.engine.SimpleEngine.popen_uci(
-                    resolved_path,
-                    **self._stockfish_popen_kwargs(),
+                    min_batch_games = int(min_batch_games_raw or 0)
+                except (TypeError, ValueError):
+                    min_batch_games = 0
+                if min_batch_games <= 0:
+                    min_batch_games = max(int(workers) * 2, probe_games * 3)
+                min_batch_games = max(probe_games, min(max_total_games, min_batch_games))
+                probe_levels_per_wave = max(
+                    1,
+                    min(len(levels), int(math.ceil(float(min_batch_games) / float(max(1, probe_games))))),
                 )
-                try:
-                    try:
-                        for level in levels:
-                            if self._is_cancelled():
-                                break
-                            self._configure_stockfish_engine(engine, level)
-                            for game_idx in range(games_per_level):
-                                if self._is_cancelled():
-                                    break
-                                model_is_white = (game_idx % 2 == 0)
-                                result = self._play_game(
-                                    engine,
-                                    player,
-                                    model_is_white,
-                                    stockfish_time_limit,
-                                    max_moves,
-                                )
-                                if result is not None:
-                                    all_opponent_elos.append(float(level))
-                                    all_scores.append(float(result))
-                                if progress_bar is not None:
-                                    progress_bar.update(1)
-                    except KeyboardInterrupt:
-                        interrupted_by_user = True
-                        if self.stop_event is not None:
-                            with contextlib.suppress(Exception):
-                                self.stop_event.set()
-                        print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
-                finally:
-                    self._force_close_engine(engine)
+                total_scheduled = 0
+
+                probe_order = self._interleaved_ladder_order(levels)
+                if bool(self.elo_config.get("elo_verbose_adaptive", False)):
+                    print(
+                        "  Adaptive probe waves: "
+                        f"levels/wave={probe_levels_per_wave}, min_batch_games={min_batch_games}, "
+                        f"order={probe_order[:min(len(probe_order), probe_levels_per_wave * 2)]}"
+                        f"{'...' if len(probe_order) > probe_levels_per_wave * 2 else ''}"
+                    )
+                stop_after_wave = False
+                for wave_start in range(0, len(probe_order), probe_levels_per_wave):
+                    if self._is_cancelled() or total_scheduled >= max_total_games or stop_after_wave:
+                        break
+                    wave_levels = probe_order[wave_start: wave_start + probe_levels_per_wave]
+                    tasks = []
+                    for level in wave_levels:
+                        games_to_add = min(probe_games, max_total_games - total_scheduled - len(tasks))
+                        if games_to_add <= 0:
+                            break
+                        tasks.extend(self._build_level_tasks(level, played_by_level.get(level, 0), games_to_add))
+                    total_scheduled += len(tasks)
+                    if _run_selected_tasks(tasks, phase="probe"):
+                        break
+                    for level in wave_levels:
+                        summary = self._summarize_scores(scores_by_level.get(int(level), []))
+                        if summary["total"] <= 0:
+                            continue
+                        if bool(self.elo_config.get("elo_verbose_adaptive", False)):
+                            print(
+                                f"  Adaptive probe vs SF {level}: "
+                                f"W{summary['wins']}/D{summary['draws']}/L{summary['losses']} "
+                                f"({summary['score']:.0%})"
+                            )
+                        if summary["score"] >= high_skip and bool(self.elo_config.get("elo_verbose_adaptive", False)):
+                            print(f"  Adaptive ladder: SF {level} is saturated (score >= {high_skip:.0%}); probing higher.")
+
+                    # Keep the old "do not waste games far above a clearly too-strong
+                    # level" behavior, but only after the current CPU-filling wave.
+                    for level in sorted(wave_levels):
+                        summary = self._summarize_scores(scores_by_level.get(int(level), []))
+                        if summary["total"] > 0 and summary["score"] <= low_stop:
+                            if bool(self.elo_config.get("elo_verbose_adaptive", False)):
+                                print(f"  Adaptive ladder: stopping above {level} after this wave (score <= {low_stop:.0%}).")
+                            stop_after_wave = True
+                            break
+
+                candidate_levels = [
+                    int(level)
+                    for level in levels
+                    if played_by_level.get(int(level), 0) > 0
+                ]
+                focus_levels = [
+                    level
+                    for level in candidate_levels
+                    if focus_min <= self._summarize_scores(scores_by_level.get(level, []))["score"] <= focus_max
+                ]
+                focus_levels = sorted(
+                    focus_levels,
+                    key=lambda lvl: abs(self._summarize_scores(scores_by_level.get(lvl, []))["score"] - 0.5),
+                )
+                if len(focus_levels) < target_focus:
+                    extras = sorted(
+                        (level for level in candidate_levels if level not in focus_levels),
+                        key=lambda lvl: (
+                            abs(self._summarize_scores(scores_by_level.get(lvl, []))["score"] - 0.5),
+                            -lvl if self._summarize_scores(scores_by_level.get(lvl, []))["score"] >= 0.5 else lvl,
+                        ),
+                    )
+                    focus_levels.extend(extras[: max(0, target_focus - len(focus_levels))])
+                focus_levels = focus_levels[:target_focus]
+
+                if focus_levels and bool(self.elo_config.get("elo_verbose_adaptive", False)):
+                    print(f"  Adaptive focus levels: {focus_levels}")
+                while (
+                    not self._is_cancelled()
+                    and total_scheduled < max_total_games
+                    and any(played_by_level.get(level, 0) < focus_games for level in focus_levels)
+                ):
+                    tasks = []
+                    for level in focus_levels:
+                        if total_scheduled + len(tasks) >= max_total_games:
+                            break
+                        if played_by_level.get(level, 0) >= focus_games:
+                            continue
+                        remaining_level = focus_games - int(played_by_level.get(level, 0))
+                        games_to_add = min(extra_round, remaining_level, max_total_games - total_scheduled - len(tasks))
+                        if games_to_add <= 0:
+                            continue
+                        tasks.extend(self._build_level_tasks(level, played_by_level.get(level, 0), games_to_add))
+                    if not tasks:
+                        break
+                    total_scheduled += len(tasks)
+                    if _run_selected_tasks(tasks, phase="focus"):
+                        break
+                    if len(tasks) < min_batch_games:
+                        # Final partial focus wave; no need to spin another tiny wave
+                        # unless some level still has meaningful capacity and budget.
+                        if not any(played_by_level.get(level, 0) < focus_games for level in focus_levels):
+                            break
+                for level in focus_levels:
+                    if bool(self.elo_config.get("elo_verbose_adaptive", False)):
+                        summary = self._summarize_scores(scores_by_level.get(level, []))
+                        print(
+                            f"  Adaptive focus vs SF {level}: "
+                            f"W{summary['wins']}/D{summary['draws']}/L{summary['losses']} "
+                            f"({summary['score']:.0%}, games={summary['total']})"
+                        )
+            else:
+                tasks = []
+                for level in levels:
+                    tasks.extend(self._build_level_tasks(level, 0, games_per_level))
+                _run_selected_tasks(tasks, phase="fixed")
         finally:
+            self._stop_central_inference_for_elo()
             if progress_bar is not None:
+                if adaptive_enabled:
+                    progress_bar.total = progress_bar.n
+                    progress_bar.refresh()
                 progress_bar.close()
 
         if interrupted_by_user:
@@ -1085,22 +1686,39 @@ class EloEstimator:
             losses = sum(1 for s in level_scores if s == 0.0)
             total = wins + draws + losses
             score_pct = (wins + 0.5 * draws) / total if total else 0.0
+            if adaptive_enabled and total <= 0:
+                continue
             results_per_level[level] = {
                 "wins": wins,
                 "draws": draws,
                 "losses": losses,
                 "score": score_pct,
+                "games": total,
             }
 
         elapsed = time.perf_counter() - t0
         estimated_elo = _performance_rating(all_opponent_elos, all_scores)
+        elo_se = _elo_standard_error(all_opponent_elos, estimated_elo)
+        elo_ci95 = None
+        if estimated_elo is not None and elo_se is not None:
+            elo_ci95 = [round(estimated_elo - 1.96 * elo_se), round(estimated_elo + 1.96 * elo_se)]
 
-        return {
+        result = {
             "estimated_elo": round(estimated_elo) if estimated_elo is not None else None,
             "results": results_per_level,
             "total_games": len(all_scores),
             "total_time": elapsed,
+            "adaptive": adaptive_enabled,
+            "levels_requested": [int(x) for x in levels],
+            "games_per_level_requested": int(games_per_level),
+            "actual_games_per_level": {int(k): int(v) for k, v in played_by_level.items() if int(v) > 0},
         }
+        if elo_se is not None:
+            result["elo_std_error"] = round(float(elo_se), 1)
+        if elo_ci95 is not None:
+            result["elo_ci95"] = elo_ci95
+        self._print_elo_completion_summary(result, use_mcts=use_mcts)
+        return result
     # -----------------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------------
@@ -1159,22 +1777,27 @@ class EloEstimator:
         max_moves: int,
         stockfish_path: str,
         progress_bar,
+        model_override=None,
+        device_override=None,
+        stats_out: dict | None = None,
     ) -> tuple[list[float], list[float]]:
         all_opponent_elos: list[float] = []
         all_scores: list[float] = []
         max_half_moves = max(1, int(max_moves)) * 2
 
         batched_player = _BatchedModelPlayer(
-            self.model,
+            model_override if model_override is not None else self.model,
             self.config,
-            self.device,
+            device_override if device_override is not None else self.device,
             use_mcts=use_mcts,
             simulations=simulations,
         )
 
-        idle_engines: list[chess.engine.SimpleEngine] = []
-        for _ in range(max(1, workers)):
-            idle_engines.append(self._open_stockfish_engine(stockfish_path))
+        worker_slots = max(1, workers)
+        worker_game_counts = [0 for _ in range(worker_slots)]
+        idle_engines: list[tuple[int, chess.engine.SimpleEngine]] = []
+        for worker_slot in range(worker_slots):
+            idle_engines.append((worker_slot, self._open_stockfish_engine(stockfish_path)))
 
         pending_tasks = deque(tasks)
         active_games: list[dict] = []
@@ -1188,11 +1811,14 @@ class EloEstimator:
                 score = self._score_game_result(game["board"], bool(game["model_is_white"]))
             all_opponent_elos.append(float(game["level"]))
             all_scores.append(float(score))
-            idle_engines.append(game["engine"])
+            worker_slot = int(game.get("worker_slot", -1))
+            if 0 <= worker_slot < len(worker_game_counts):
+                worker_game_counts[worker_slot] += 1
+            idle_engines.append((worker_slot, game["engine"]))
             if progress_bar is not None:
                 progress_bar.update(1)
 
-        def launch_next_game(engine: chess.engine.SimpleEngine):
+        def launch_next_game(worker_slot: int, engine: chess.engine.SimpleEngine):
             while pending_tasks and not self._is_cancelled():
                 level, _, model_is_white = pending_tasks.popleft()
                 try:
@@ -1204,6 +1830,8 @@ class EloEstimator:
                     )
                     all_opponent_elos.append(float(level))
                     all_scores.append(0.0)
+                    if 0 <= worker_slot < len(worker_game_counts):
+                        worker_game_counts[worker_slot] += 1
                     if progress_bar is not None:
                         progress_bar.update(1)
                     self._force_close_engine(engine)
@@ -1219,14 +1847,16 @@ class EloEstimator:
                         "board": chess.Board(),
                         "state": state,
                         "engine": engine,
+                        "worker_slot": int(worker_slot),
                         "ply_count": 0,
                     }
                 )
                 return
-            idle_engines.append(engine)
+            idle_engines.append((worker_slot, engine))
 
         while idle_engines and pending_tasks and not self._is_cancelled():
-            launch_next_game(idle_engines.pop())
+            worker_slot, engine = idle_engines.pop()
+            launch_next_game(worker_slot, engine)
 
         executor = ThreadPoolExecutor(max_workers=max(1, workers))
         try:
@@ -1240,7 +1870,8 @@ class EloEstimator:
                 active_games = still_active
 
                 while idle_engines and pending_tasks and not self._is_cancelled():
-                    launch_next_game(idle_engines.pop())
+                    worker_slot, engine = idle_engines.pop()
+                    launch_next_game(worker_slot, engine)
                 if not active_games or self._is_cancelled():
                     continue
 
@@ -1317,17 +1948,46 @@ class EloEstimator:
                     finalize_game(game)
 
                 while idle_engines and pending_tasks and not self._is_cancelled():
-                    launch_next_game(idle_engines.pop())
+                    worker_slot, engine = idle_engines.pop()
+                    launch_next_game(worker_slot, engine)
         finally:
-            executor.shutdown(wait=True, cancel_futures=False)
+            if self._is_cancelled():
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True, cancel_futures=False)
 
-        if model_move_calls > 0:
+        if stats_out is not None:
+            stats_out["model_move_calls"] = int(model_move_calls)
+            stats_out["model_move_positions"] = int(model_move_positions)
+            stats_out["model_move_time_s"] = float(model_move_time_s)
+            stats_out["stockfish_move_time_s"] = float(stockfish_move_time_s)
+            stats_out["worker_game_counts"] = list(worker_game_counts)
+        else:
+            self._last_elo_batch_stats = {
+                "model_move_calls": int(model_move_calls),
+                "model_move_positions": int(model_move_positions),
+                "model_move_time_s": float(model_move_time_s),
+                "stockfish_move_time_s": float(stockfish_move_time_s),
+                "worker_game_counts": list(worker_game_counts),
+            }
+
+        if (
+            model_move_calls > 0
+            and stats_out is None
+            and bool(self.elo_config.get("elo_verbose_batch_stats", False))
+        ):
             avg_model_batch = float(model_move_positions) / float(model_move_calls)
             print(
                 "  Info: Elo model batching: "
                 f"avg_batch={avg_model_batch:.1f}, calls={model_move_calls}, "
                 f"model_time={model_move_time_s:.1f}s, stockfish_wait={stockfish_move_time_s:.1f}s"
             )
+        if (
+            sum(worker_game_counts) > 0
+            and stats_out is None
+            and bool(self.elo_config.get("elo_verbose_worker_stats", False))
+        ):
+            print(f"  Info: Elo games/worker: {_format_worker_game_counts(worker_game_counts)}")
 
         return all_opponent_elos, all_scores
 

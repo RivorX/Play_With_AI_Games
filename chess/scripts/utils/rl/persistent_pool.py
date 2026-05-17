@@ -128,6 +128,7 @@ class _PersistentSelfPlayPool:
                         self.inference_request_queues[server_idx],
                         self.inference_response_senders,
                         self.inference_control_queues[server_idx],
+                        9000 + (int(os.getpid()) % 100000) * 10 + int(server_idx),
                     ),
                 )
                 inference_process.daemon = True
@@ -259,6 +260,7 @@ class _PersistentSelfPlayPool:
         model_state_path,
         temperature,
         num_games,
+        q_value_scale=None,
         opponent_payload=None,
         model_state=None,
         stream_results_to_queue=False,
@@ -276,6 +278,7 @@ class _PersistentSelfPlayPool:
             'num_games': int(num_games),
             'result_file_path': str(result_file),
             'mcts_temperature': temperature,
+            'mcts_q_value_scale': q_value_scale,
             'stream_results_to_queue': bool(stream_results_to_queue),
         })
         return result_file, progress_file
@@ -285,6 +288,7 @@ class _PersistentSelfPlayPool:
         task_id,
         model_state_path,
         temperature,
+        q_value_scale=None,
         worker_model_state_paths=None,
         worker_opponent_payloads=None,
         model_state=None,
@@ -302,6 +306,7 @@ class _PersistentSelfPlayPool:
                 task_id=task_id,
                 model_state_path=worker_model_state_paths.get(rank, model_state_path),
                 temperature=temperature,
+                q_value_scale=q_value_scale,
                 num_games=int(games_for_worker),
                 opponent_payload=opponent_payload,
                 model_state=model_state,

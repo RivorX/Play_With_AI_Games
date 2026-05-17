@@ -64,6 +64,7 @@ import tempfile
 import math
 import queue
 import threading
+from datetime import datetime
 
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
@@ -84,6 +85,7 @@ except ImportError:
 # Import from utils
 from utils.shared.logger import TrainingLogger
 from utils.shared.elo_estimator import estimate_model_elo
+from utils.shared.model_catalog import load_checkpoint_metadata, persist_checkpoint_elo_metadata
 from utils.rl.replay import ReplayBuffer
 from utils.rl.temperature import TemperatureSchedule, AdaptiveTemperatureController
 from utils.rl.training_rl import train_on_batch_rl, evaluate_models, evaluate_models_no_mcts
@@ -299,13 +301,114 @@ def _rl_elo_worker(
         result_queue.put({"iteration": int(iteration_num), "error": str(exc)})
 
 
+def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", elo_result=None):
+    try:
+        elo_value = float(estimated_elo)
+    except (TypeError, ValueError):
+        return {}
+
+    use_mcts = bool((elo_config or {}).get("use_mcts", False))
+    simulations = int((elo_config or {}).get("mcts_simulations", 0) or 0) if use_mcts else 0
+    mode_prefix = "estimated_elo_mcts" if use_mcts else "estimated_elo_nn"
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    settings = {
+        "levels": [int(x) for x in list((elo_config or {}).get("levels", []) or [])],
+        "games_per_level": int((elo_config or {}).get("games_per_level", 0) or 0),
+        "use_mcts": use_mcts,
+        "simulations": simulations,
+        "stockfish_time_limit": float((elo_config or {}).get("stockfish_time_limit", 0.0) or 0.0),
+    }
+    if isinstance(elo_result, dict):
+        settings["adaptive"] = bool(elo_result.get("adaptive", False))
+        actual_games = elo_result.get("actual_games_per_level")
+        if isinstance(actual_games, dict):
+            settings["actual_games_per_level"] = {
+                int(k): int(v) for k, v in actual_games.items()
+            }
+        if elo_result.get("elo_std_error") is not None:
+            settings["elo_std_error"] = float(elo_result.get("elo_std_error"))
+        if elo_result.get("elo_ci95") is not None:
+            settings["elo_ci95"] = list(elo_result.get("elo_ci95") or [])
+    metadata = {
+        mode_prefix: elo_value,
+        f"last_{mode_prefix}": elo_value,
+        f"{mode_prefix}_timestamp": timestamp,
+        f"{mode_prefix}_settings": settings,
+        f"{mode_prefix}_source": str(source),
+        "estimated_elo": elo_value,
+        "last_estimated_elo": elo_value,
+        "estimated_elo_source": str(source),
+        "estimated_elo_timestamp": timestamp,
+        "estimated_elo_settings": settings,
+    }
+    if use_mcts:
+        metadata["estimated_elo_mcts_simulations"] = simulations
+        metadata["estimated_elo_mcts_by_simulations"] = {
+            str(int(simulations)): {
+                "elo": elo_value,
+                "simulations": int(simulations),
+                "timestamp": timestamp,
+                "source": str(source),
+                "settings": settings,
+            }
+        }
+    return metadata
+
+
+def _best_mcts_elo_from_metadata(entry):
+    """Return the preferred MCTS Elo metadata as (elo, simulations)."""
+    if not isinstance(entry, dict):
+        return None, None
+    by_sims = entry.get("elo_mcts_by_simulations") or {}
+    if isinstance(by_sims, dict) and by_sims:
+        try:
+            sims, info = max(by_sims.items(), key=lambda item: int(item[0]))
+            if isinstance(info, dict) and info.get("elo") is not None:
+                return float(info.get("elo")), int(sims)
+        except Exception:
+            pass
+    if entry.get("elo_mcts") is not None:
+        return entry.get("elo_mcts"), entry.get("elo_mcts_simulations")
+    return None, None
+
+
+def _seed_rl_plot_elo_from_checkpoint(logger, checkpoint_path, base_dir=None):
+    """Add iteration-0 Elo to RL plots from the active startup checkpoint metadata."""
+    if logger is None or checkpoint_path is None:
+        return
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        return
+    entry = load_checkpoint_metadata(checkpoint_path, base_dir=base_dir)
+    if entry.get("error"):
+        return
+    elo_nn = entry.get("elo_nn")
+    elo_mcts, mcts_sims = _best_mcts_elo_from_metadata(entry)
+    if elo_nn is None and elo_mcts is None:
+        return
+    logger.record_rl_model_info_elo(
+        0,
+        elo_nn=elo_nn,
+        elo_mcts=elo_mcts,
+        mcts_simulations=mcts_sims,
+    )
+    parts = []
+    if elo_nn is not None:
+        parts.append(f"raw NN {int(round(float(elo_nn)))}")
+    if elo_mcts is not None:
+        sims_text = f"@{int(mcts_sims)}" if mcts_sims is not None else ""
+        parts.append(f"MCTS {int(round(float(elo_mcts)))}{sims_text}")
+    print(f"RL plot Elo baseline from {checkpoint_path.name}: {', '.join(parts)}")
+
+
 class RLEloCoordinator:
-    def __init__(self, model, config, device, logger):
+    def __init__(self, model, config, device, logger, checkpoint_targets=None):
         self.model = model
         self.config = config
         self.device = device
         self.logger = logger
         self.elo_config = dict(config.get("elo_estimation", {}) or {})
+        self.checkpoint_targets = [Path(p) for p in list(checkpoint_targets or []) if p is not None]
         self.enabled = bool(self.elo_config.get("enabled", False))
         self.every_n_evals = max(1, int(self.elo_config.get("rl_every_n_evals", 3)))
         self.final_on_shutdown = bool(self.elo_config.get("final_on_rl_shutdown", True))
@@ -331,7 +434,21 @@ class RLEloCoordinator:
             self.eval_device = torch.device("cpu")
         self.eval_counter = 0
         self.last_elo_iteration = None
+        self.last_elo_metadata = {}
         self.interrupted_during_elo = False
+        self.final_requires_il_anchor_improvement = bool(
+            self.elo_config.get("final_rl_require_il_anchor_improvement", True)
+        )
+        self.final_il_anchor_min_score_rate = float(
+            self.elo_config.get("final_rl_il_anchor_min_score_rate", 0.50)
+        )
+        self.final_il_anchor_min_true_win_rate = float(
+            self.elo_config.get("final_rl_il_anchor_min_true_win_rate", 0.0)
+        )
+        self.il_anchor_surpassed = False
+        self.best_il_anchor_score_rate = None
+        self.best_il_anchor_true_win_rate = None
+        self.best_il_anchor_iteration = None
 
     def print_startup_summary(self):
         if not self.enabled:
@@ -339,7 +456,7 @@ class RLEloCoordinator:
         final_use_mcts = self.elo_config.get("final_rl_use_mcts", self.elo_config.get("use_mcts", False))
         final_sims = self.elo_config.get("final_rl_mcts_simulations", self.elo_config.get("mcts_simulations", 100))
         print(
-            f"Elo eval (RL): every {self.every_n_evals} eval(s) vs Stockfish, "
+            "Elo eval (RL): promoted best models only vs Stockfish, "
             f"sync_device={self.eval_device.type}, final_on_shutdown={self.final_on_shutdown}, "
             f"mcts={self.elo_config.get('use_mcts', False)}, "
             f"min_score_rate={self.min_score_rate_for_stockfish:.0%}, "
@@ -350,7 +467,42 @@ class RLEloCoordinator:
                 f"Elo final (RL): use_mcts={bool(final_use_mcts)}, "
                 f"mcts_simulations={int(final_sims)}"
             )
+            if self.final_requires_il_anchor_improvement:
+                print(
+                    "Elo final (RL): gated until RL beats IL anchor "
+                    f"(score>{self.final_il_anchor_min_score_rate:.0%}, "
+                    f"true_win>={self.final_il_anchor_min_true_win_rate:.0%})."
+                )
+            if bool(final_use_mcts):
+                print("Elo final (RL): raw NN Elo will run before MCTS Elo and both will be saved.")
             print("Elo final (RL): after Ctrl+C, one shutdown Elo runs; press Ctrl+C again to cancel it.")
+
+    def observe_il_anchor_eval(self, iteration_num, score_rate=None, true_win_rate=None):
+        if score_rate is None:
+            return
+        try:
+            score = float(score_rate)
+        except (TypeError, ValueError):
+            return
+        try:
+            true_win = float(true_win_rate) if true_win_rate is not None else 0.0
+        except (TypeError, ValueError):
+            true_win = 0.0
+        if self.best_il_anchor_score_rate is None or score > float(self.best_il_anchor_score_rate):
+            self.best_il_anchor_score_rate = score
+            self.best_il_anchor_true_win_rate = true_win
+            self.best_il_anchor_iteration = int(iteration_num)
+        if (
+            score > self.final_il_anchor_min_score_rate
+            and true_win >= self.final_il_anchor_min_true_win_rate
+        ):
+            if not self.il_anchor_surpassed:
+                print(
+                    "Final Elo gate opened: RL beat IL anchor "
+                    f"at iteration {int(iteration_num)} "
+                    f"(score={score:.2%}, true_win={true_win:.2%})."
+                )
+            self.il_anchor_surpassed = True
 
     def maybe_evaluate(self, iteration_num, score_rate=None, true_win_rate=None):
         if not self.enabled:
@@ -377,24 +529,84 @@ class RLEloCoordinator:
             return None
         return self._run_estimate(iteration_num, reason_label=f"iteration {iteration_num}")
 
+    def evaluate_promoted_best(self, iteration_num):
+        if not self.enabled:
+            return None
+        print("Promoted best model: running Stockfish Elo for raw NN and MCTS.")
+        results = []
+        raw_result = self._run_estimate(
+            iteration_num,
+            reason_label=f"promoted best raw NN {iteration_num}",
+            final_override=True,
+            force_use_mcts=False,
+            persist_checkpoints=False,
+            source_override="rl_promoted_elo",
+        )
+        results.append(raw_result)
+        if self.interrupted_during_elo:
+            return next((r for r in reversed(results) if r is not None), None)
+
+        promoted_use_mcts = bool(
+            self.elo_config.get(
+                "rl_promoted_use_mcts",
+                self.elo_config.get("final_rl_use_mcts", self.elo_config.get("use_mcts", False)),
+            )
+        )
+        if promoted_use_mcts:
+            mcts_result = self._run_estimate(
+                iteration_num,
+                reason_label=f"promoted best MCTS {iteration_num}",
+                final_override=True,
+                force_use_mcts=True,
+                persist_checkpoints=False,
+                source_override="rl_promoted_elo",
+            )
+            results.append(mcts_result)
+        return next((r for r in reversed(results) if r is not None), None)
+
     def final_evaluate(self, iteration_num, interrupted=False):
         if not self.enabled or not self.final_on_shutdown:
             return None
         if interrupted and self.interrupted_during_elo:
             print("Skipping final Elo: shutdown was triggered during a Stockfish evaluation.")
             return None
-        if self.last_elo_iteration == int(iteration_num):
-            final_use_mcts = bool(self.elo_config.get("final_rl_use_mcts", self.elo_config.get("use_mcts", False)))
-            regular_use_mcts = bool(self.elo_config.get("use_mcts", False))
-            final_sims = int(self.elo_config.get("final_rl_mcts_simulations", self.elo_config.get("mcts_simulations", 100)))
-            regular_sims = int(self.elo_config.get("mcts_simulations", 100))
-            if final_use_mcts == regular_use_mcts and final_sims == regular_sims:
-                print(f"Final Elo skipped: iteration {iteration_num} was already evaluated vs Stockfish.")
-                return self.logger.get_latest_estimated_elo()
+        if self.final_requires_il_anchor_improvement and not self.il_anchor_surpassed:
+            if self.best_il_anchor_score_rate is None:
+                print("Skipping final Elo: RL never had an IL-anchor evaluation in this run.")
+            else:
+                print(
+                    "Skipping final Elo: no RL model beat IL anchor yet "
+                    f"(best anchor score={self.best_il_anchor_score_rate:.2%} "
+                    f"at iteration {self.best_il_anchor_iteration}, "
+                    f"required >{self.final_il_anchor_min_score_rate:.0%})."
+                )
+            return None
+        final_use_mcts = bool(self.elo_config.get("final_rl_use_mcts", self.elo_config.get("use_mcts", False)))
+        if final_use_mcts:
+            results = []
+            nn_result = self._run_estimate(
+                iteration_num,
+                reason_label=("shutdown raw NN" if interrupted else "final raw NN"),
+                final_override=True,
+                force_use_mcts=False,
+            )
+            results.append(nn_result)
+            if self.interrupted_during_elo:
+                return next((r for r in reversed(results) if r is not None), None)
+            mcts_result = self._run_estimate(
+                iteration_num,
+                reason_label=("shutdown MCTS" if interrupted else "final MCTS"),
+                final_override=True,
+                force_use_mcts=True,
+            )
+            results.append(mcts_result)
+            return next((r for r in reversed(results) if r is not None), None)
+
         return self._run_estimate(
             iteration_num,
-            reason_label="shutdown" if interrupted else "final",
+            reason_label="shutdown raw NN" if interrupted else "final raw NN",
             final_override=True,
+            force_use_mcts=False,
         )
 
     def _run_estimate_subprocess(self, iteration_num, elo_config, interrupt_message):
@@ -450,7 +662,15 @@ class RLEloCoordinator:
             with contextlib.suppress(Exception):
                 result_queue.close()
 
-    def _run_estimate(self, iteration_num, reason_label, final_override=False):
+    def _run_estimate(
+        self,
+        iteration_num,
+        reason_label,
+        final_override=False,
+        force_use_mcts=None,
+        persist_checkpoints=None,
+        source_override=None,
+    ):
         elo_config = dict(self.elo_config)
         # RL Elo is synchronous: training is paused while Stockfish runs, so
         # do not keep "training-friendly" CPU reservations that were intended
@@ -505,9 +725,38 @@ class RLEloCoordinator:
                 elo_config["stockfish_threads"] = int(self.elo_config.get("final_rl_stockfish_threads"))
             if "final_rl_stockfish_hash_mb" in self.elo_config:
                 elo_config["stockfish_hash_mb"] = int(self.elo_config.get("final_rl_stockfish_hash_mb"))
+            if force_use_mcts is not None:
+                elo_config["use_mcts"] = bool(force_use_mcts)
+            use_mcts_for_elo = bool(elo_config.get("use_mcts", False))
+            if use_mcts_for_elo:
+                multiplier_key = "final_rl_mcts_worker_multiplier"
+                fallback_key = "eval_elo_mcts_worker_multiplier"
+            else:
+                multiplier_key = "final_rl_raw_worker_multiplier"
+                fallback_key = "eval_elo_raw_worker_multiplier"
+            try:
+                worker_multiplier = float(
+                    self.elo_config.get(
+                        multiplier_key,
+                        self.elo_config.get(fallback_key, 1.0),
+                    )
+                    or 1.0
+                )
+            except (TypeError, ValueError):
+                worker_multiplier = 1.0
+            if worker_multiplier > 1.0:
+                try:
+                    stockfish_threads = max(1, int(elo_config.get("stockfish_threads", 1) or 1))
+                except (TypeError, ValueError):
+                    stockfish_threads = 1
+                cpu_total = max(1, int(os.cpu_count() or 1))
+                scaled_workers = max(1, int(math.ceil((cpu_total * worker_multiplier) / stockfish_threads)))
+                current_workers = int(elo_config.get("workers", 0) or 0)
+                if scaled_workers > current_workers:
+                    elo_config["workers"] = scaled_workers
 
         print(f"\nEstimating Elo vs Stockfish ({reason_label})...")
-        if interrupted := bool(final_override and reason_label == "shutdown"):
+        if interrupted := bool(final_override and str(reason_label).startswith("shutdown")):
             print("Training stop requested by user. Running one final Elo estimate; press Ctrl+C again to cancel.")
         max_attempts = 1
         elo_result = None
@@ -561,16 +810,61 @@ class RLEloCoordinator:
         estimated_elo = elo_result.get("estimated_elo")
         if estimated_elo is not None:
             self.last_elo_iteration = int(iteration_num)
+            source = str(source_override or ("rl_final_elo" if final_override else "rl_periodic_elo"))
+            self.last_elo_metadata.update(
+                _build_elo_checkpoint_metadata(
+                    estimated_elo,
+                    elo_config,
+                    source=source,
+                    elo_result=elo_result,
+                )
+            )
             self.logger.record_estimated_elo(iteration_num, estimated_elo, update_csv=True)
+            self.logger.record_estimated_elo_mode(
+                iteration_num,
+                estimated_elo,
+                mode="mcts" if bool(elo_config.get("use_mcts", False)) else "nn",
+                simulations=int(elo_config.get("mcts_simulations", 0) or 0),
+                update_csv=True,
+            )
             print(f"Estimated Elo: {estimated_elo}")
+            if elo_result.get("elo_std_error") is not None:
+                ci = elo_result.get("elo_ci95")
+                ci_str = f", 95% CI {ci[0]}-{ci[1]}" if isinstance(ci, list) and len(ci) == 2 else ""
+                ladder = "adaptive" if elo_result.get("adaptive") else "fixed"
+                print(f"  uncertainty: ±{elo_result['elo_std_error']} Elo SE{ci_str} ({ladder} ladder)")
             for lvl, res in sorted(elo_result.get("results", {}).items()):
                 score_str = f"W{res['wins']}/D{res['draws']}/L{res['losses']}"
-                print(f"  vs SF {lvl}: {score_str} (score: {res['score']:.0%})")
+                games = int(res.get("games", res["wins"] + res["draws"] + res["losses"]) or 0)
+                print(f"  vs SF {lvl}: {score_str} (score: {res['score']:.0%}, n={games})")
             print(f"  time {elo_result.get('total_time', 0.0):.1f}s ({elo_result.get('total_games', 0)} games)")
+            should_persist = bool(final_override) if persist_checkpoints is None else bool(persist_checkpoints)
+            if should_persist:
+                for checkpoint_path in self.checkpoint_targets:
+                    ok, error = persist_checkpoint_elo_metadata(
+                        checkpoint_path,
+                        estimated_elo,
+                        levels=list(elo_config.get("levels", []) or []),
+                        games_per_level=int(elo_config.get("games_per_level", 0) or 0),
+                        use_mcts=bool(elo_config.get("use_mcts", False)),
+                        simulations=int(elo_config.get("mcts_simulations", 0) or 0),
+                        sf_time=float(elo_config.get("stockfish_time_limit", 0.0) or 0.0),
+                        source=source,
+                        elo_result=elo_result,
+                    )
+                    if ok:
+                        print(f"  Saved Elo metadata into: {checkpoint_path.name}")
+                    elif error:
+                        print(f"  Elo metadata save failed for {checkpoint_path.name}: {error}")
         elif not elo_result.get("skipped"):
             print("Elo estimation: inconclusive")
 
         return estimated_elo
+
+    def metadata_for_iteration(self, iteration_num):
+        if self.last_elo_iteration == int(iteration_num):
+            return dict(self.last_elo_metadata or {})
+        return {}
 
 
 class RLTrainingInterrupted(Exception):
@@ -971,6 +1265,9 @@ def play_games_parallel_mcts(
 
     def _accumulate_mcts_quality_stats(target, source):
         source = dict(source or {})
+        if source.get('mcts_q_delta_values') is not None:
+            values = target.setdefault('mcts_q_delta_values', [])
+            values.extend(list(source.get('mcts_q_delta_values') or []))
         for key in [
             'mcts_prior_agreement_samples',
             'mcts_prior_agreement_sum',
@@ -1035,6 +1332,7 @@ def play_games_parallel_mcts(
                         model_state_path=model_state_path,
                         model_state=model_state_cpu,
                         temperature=rl_cfg.get('mcts_temperature'),
+                        q_value_scale=rl_cfg.get('mcts_q_value_scale'),
                         num_games=chunk_games,
                         opponent_payload=payload,
                         stream_results_to_queue=use_queue_transport,
@@ -1059,6 +1357,7 @@ def play_games_parallel_mcts(
                     model_state_path=model_state_path,
                     model_state=model_state_cpu,
                     temperature=rl_cfg.get('mcts_temperature'),
+                    q_value_scale=rl_cfg.get('mcts_q_value_scale'),
                     worker_model_state_paths={},
                     worker_opponent_payloads=opponent_assignments,
                     stream_results_to_queue=use_queue_transport,
@@ -1602,6 +1901,7 @@ def play_games_parallel_mcts(
     value_std = math.sqrt(max(0.0, value_var))
     mcts_quality_samples = int(float(total_mcts_quality_stats.get('mcts_prior_agreement_samples', 0.0) or 0.0))
     mcts_q_delta_samples = int(float(total_mcts_quality_stats.get('mcts_q_delta_samples', 0.0) or 0.0))
+    mcts_q_delta_values = list(total_mcts_quality_stats.get('mcts_q_delta_values', []) or [])
     selfplay_stats = {
         'startup_time': float(selfplay_startup_time),
         'completed_games': int(completed_games),
@@ -1664,6 +1964,21 @@ def play_games_parallel_mcts(
         'mcts_q_delta_mean': (
             float(total_mcts_quality_stats.get('mcts_q_delta_sum', 0.0) or 0.0) / float(mcts_q_delta_samples)
             if mcts_q_delta_samples > 0
+            else 0.0
+        ),
+        'mcts_q_delta_p10': (
+            float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 10))
+            if mcts_q_delta_values
+            else 0.0
+        ),
+        'mcts_q_delta_p50': (
+            float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 50))
+            if mcts_q_delta_values
+            else 0.0
+        ),
+        'mcts_q_delta_p90': (
+            float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 90))
+            if mcts_q_delta_values
             else 0.0
         ),
         'mcts_changed_to_lower_q_rate': (
@@ -1917,6 +2232,7 @@ def main():
         config=config,
         device=device,
         logger=logger,
+        checkpoint_targets=[latest_checkpoint_path],
     )
     elo_coordinator.print_startup_summary()
 
@@ -1945,6 +2261,7 @@ def main():
     transfer_match_ratio = startup_state.get("transfer_match_ratio")
     new_init_mode = startup_state.get("new_init_mode", startup_plan.get("new_init_mode", "default"))
     selected_entry = startup_plan.get("selected_entry") or {}
+    selected_checkpoint_path = startup_state.get("selected_checkpoint")
 
     if start_mode == "new":
         if new_init_mode == "select" and selected_checkpoint_label:
@@ -1968,6 +2285,21 @@ def main():
         device=device,
         selected_entry=selected_entry,
     )
+
+    elo_seed_checkpoint_path = None
+    if start_mode == "new":
+        if new_init_mode == "select" and selected_checkpoint_path is not None:
+            elo_seed_checkpoint_path = selected_checkpoint_path
+        elif new_init_mode == "default":
+            elo_seed_checkpoint_path = rl_init_checkpoint_path
+    elif start_mode in {"resume", "transfer"} and selected_checkpoint_path is not None:
+        elo_seed_checkpoint_path = selected_checkpoint_path
+    if elo_seed_checkpoint_path is not None:
+        _seed_rl_plot_elo_from_checkpoint(
+            logger,
+            elo_seed_checkpoint_path,
+            base_dir=models_dir,
+        )
 
     if start_mode == "new":
         run_context = "startup: new RL training"
@@ -2142,7 +2474,11 @@ def main():
     min_lr_ratio = float(config['reinforcement_learning'].get('min_lr_ratio', 0.25))
     warmup_pct = max(0.0, min(1.0, warmup_pct))
     min_lr_ratio = max(0.0, min(1.0, min_lr_ratio))
-    warmup_iters = max(1, int(round(total_iterations * warmup_pct)))
+    warmup_iters = int(math.ceil(total_iterations * warmup_pct)) if warmup_pct > 0.0 else 0
+    if use_lr_schedule and warmup_pct > 0.0 and total_iterations > 1:
+        # Need at least two scheduled points so one logged iteration is visibly below base LR.
+        warmup_iters = max(2, warmup_iters)
+    warmup_iters = min(max(0, warmup_iters), max(1, total_iterations))
 
     def _compute_lr(iter_idx):
         if not use_lr_schedule:
@@ -2174,6 +2510,34 @@ def main():
 
         progress = max(0.0, min(1.0, iter_idx / max(1, total_iterations - 1)))
         return start_w + (end_w - start_w) * progress
+
+    def _compute_mcts_q_value_scale(iter_idx, value_guard_streak=0, eval_stagnated=False):
+        rl_cfg_local = config.get('reinforcement_learning', {})
+        fallback = max(0.0, float(rl_cfg_local.get('mcts_q_value_scale', 1.0)))
+        schedule = rl_cfg_local.get('mcts_q_value_scale_schedule', None)
+        if not isinstance(schedule, dict) or not bool(schedule.get('enabled', False)):
+            return fallback
+
+        try:
+            start = float(schedule.get('start', fallback))
+            end = float(schedule.get('end', fallback))
+            power = max(0.1, float(schedule.get('power', 1.0)))
+            min_scale = max(0.0, float(schedule.get('min', min(start, end))))
+            max_scale = max(min_scale, float(schedule.get('max', max(start, end))))
+        except Exception:
+            return fallback
+
+        progress = max(0.0, min(1.0, iter_idx / max(1, total_iterations - 1)))
+        shaped_progress = progress ** power
+        scale = start + (end - start) * shaped_progress
+
+        if int(value_guard_streak or 0) > 0:
+            guard_scale = max(0.0, float(schedule.get('value_guard_scale', 1.0)))
+            scale *= guard_scale ** int(value_guard_streak)
+        if bool(eval_stagnated):
+            scale *= max(0.0, float(schedule.get('eval_stagnation_scale', 1.0)))
+
+        return max(min_scale, min(max_scale, float(scale)))
 
     if use_lr_schedule:
         print(
@@ -2305,6 +2669,7 @@ def main():
             print(f"\n{'='*70}")
             print(f"Iteration {iteration + 1}/{total_iterations}")
             print('='*70)
+            replay_buffer.set_current_iteration(iteration + 1)
             iteration_profile_printed = False
             iteration_stage_times = {}
             iteration_start_time = time.perf_counter()
@@ -2365,6 +2730,11 @@ def main():
                 value_guard_streak=value_guard_poor_eval_streak,
             )
             current_dirichlet_weight = base_mcts_dirichlet_weight
+            eval_stagnated = (
+                last_eval_score_rate_for_guard is not None
+                and prev_eval_score_rate_for_temp is not None
+                and float(last_eval_score_rate_for_guard) <= float(prev_eval_score_rate_for_temp) + 0.005
+            )
             if adaptive_dirichlet_enabled:
                 if prev_completed_draw_rate is not None:
                     draw_excess = max(0.0, float(prev_completed_draw_rate) - adaptive_draw_target)
@@ -2374,16 +2744,17 @@ def main():
                         current_dirichlet_weight *= max(0.0, target_scale)
                 if value_guard_poor_eval_streak > 0:
                     current_dirichlet_weight *= adaptive_dirichlet_value_guard_scale ** int(value_guard_poor_eval_streak)
-                if (
-                    last_eval_score_rate_for_guard is not None
-                    and prev_eval_score_rate_for_temp is not None
-                    and float(last_eval_score_rate_for_guard) <= float(prev_eval_score_rate_for_temp) + 0.005
-                ):
+                if eval_stagnated:
                     current_dirichlet_weight *= adaptive_dirichlet_eval_scale
                 current_dirichlet_weight = max(
                     adaptive_dirichlet_min_weight,
                     min(base_mcts_dirichlet_weight, float(current_dirichlet_weight)),
                 )
+            current_mcts_q_value_scale = _compute_mcts_q_value_scale(
+                iteration,
+                value_guard_streak=value_guard_poor_eval_streak,
+                eval_stagnated=eval_stagnated,
+            )
             print(f"Temperature: {current_temp:.2f}")
             if temp_debug.get("enabled", False):
                 print(
@@ -2398,9 +2769,11 @@ def main():
                     "   Adaptive dirichlet: "
                     f"base={base_mcts_dirichlet_weight:.3f}, current={current_dirichlet_weight:.3f}"
                 )
+            print(f"MCTS Q scale: {current_mcts_q_value_scale:.3f}")
             config['reinforcement_learning']['mcts_temperature'] = current_temp
             config['reinforcement_learning']['mcts_dirichlet_weight'] = current_dirichlet_weight
             config['reinforcement_learning']['mcts_temperature_threshold'] = current_temp_threshold
+            config['reinforcement_learning']['mcts_q_value_scale'] = current_mcts_q_value_scale
             
             if use_lr_schedule:
                 print(f"LR: {current_lr:.2e}")
@@ -2564,6 +2937,12 @@ def main():
             avg_policy_entropy = 0.0
             avg_value_pred_std = 0.0
             avg_target_value_std = 0.0
+            sample_age_avg = None
+            sample_age_p10 = None
+            sample_age_p50 = None
+            sample_age_p90 = None
+            sample_age_new_fraction = None
+            sample_age_le1_fraction = None
             
             # Training with metrics
             replay_size = len(replay_buffer)
@@ -2577,6 +2956,7 @@ def main():
                 total_policy_entropy = 0
                 total_value_pred_std = 0
                 total_target_value_std = 0
+                sample_age_batches = []
                 
                 # đź“Š Initialize metrics calculator
                 metrics_calc = MetricsCalculator()
@@ -2595,6 +2975,9 @@ def main():
                 ):
                     current_batch_size = batch_sizes[batch_idx % len(batch_sizes)]
                     batch = replay_buffer.sample(current_batch_size)
+                    last_sample_ages = getattr(replay_buffer, 'last_sample_ages', None)
+                    if last_sample_ages is not None and getattr(last_sample_ages, "size", 0) > 0:
+                        sample_age_batches.append(last_sample_ages.copy())
                     loss, policy_loss, value_loss, policy_entropy, value_pred_std, target_value_std = train_on_batch_rl(
                         model,
                         optimizer,
@@ -2618,6 +3001,14 @@ def main():
                 avg_policy_entropy = total_policy_entropy / total_train_steps
                 avg_value_pred_std = total_value_pred_std / total_train_steps
                 avg_target_value_std = total_target_value_std / total_train_steps
+                if sample_age_batches:
+                    sample_ages = np.concatenate(sample_age_batches).astype(np.float32, copy=False)
+                    sample_age_avg = float(np.mean(sample_ages))
+                    sample_age_p10 = float(np.percentile(sample_ages, 10))
+                    sample_age_p50 = float(np.percentile(sample_ages, 50))
+                    sample_age_p90 = float(np.percentile(sample_ages, 90))
+                    sample_age_new_fraction = float(np.mean(sample_ages <= 0.0))
+                    sample_age_le1_fraction = float(np.mean(sample_ages <= 1.0))
                 
                 # đź“Š Compute metrics
                 train_metrics = metrics_calc.compute()
@@ -2631,17 +3022,33 @@ def main():
                     f"Pred value std: {avg_value_pred_std:.4f}, "
                     f"Target value std: {avg_target_value_std:.4f}"
                 )
+                if sample_age_avg is not None:
+                    print(
+                        "Replay sample age: "
+                        f"avg={sample_age_avg:.2f}, p10={sample_age_p10:.2f}, "
+                        f"p50={sample_age_p50:.2f}, p90={sample_age_p90:.2f}, "
+                        f"new={sample_age_new_fraction:.1%}, <=1={sample_age_le1_fraction:.1%}"
+                    )
                 current_train_mae = float(train_metrics.get('value_mae', 0.0) or 0.0)
                 if current_train_mae > 0.0:
                     value_guard_recent_mae.append(current_train_mae)
             else:
                 avg_loss = avg_policy = avg_value = 0
                 train_metrics = {}
+            if sample_age_avg is not None:
+                replay_quality_stats['sample_age_avg'] = sample_age_avg
+                replay_quality_stats['sample_age_p10'] = sample_age_p10
+                replay_quality_stats['sample_age_p50'] = sample_age_p50
+                replay_quality_stats['sample_age_p90'] = sample_age_p90
+                replay_quality_stats['sample_age_new_fraction'] = sample_age_new_fraction
+                replay_quality_stats['sample_age_le1_fraction'] = sample_age_le1_fraction
             _finish_stage('train')
              
             # Evaluation
             score_rate = None
             true_win_rate = None
+            eval_stage = None
+            eval_games_total = None
             eval_wins = eval_draws = eval_losses = eval_unresolved = None
             anchor_score_rate = None
             anchor_true_win_rate = None
@@ -2716,25 +3123,31 @@ def main():
                             game_index_offset=eval_stage1_games,
                         )
                         eval_stats = _combine_eval_stats(eval_stage1_stats, eval_stage2_stats)
+                        eval_stage = "stage1+stage2"
                     else:
                         print("Stage 2 skipped: stage-1 edge not strong enough.")
                         eval_stats = eval_stage1_stats
+                        eval_stage = "stage1"
                 else:
                     eval_stats = evaluate_models(
                         model, best_model, config, device,
                         config['reinforcement_learning']['eval_games']
                     )
+                    eval_stage = "full"
                 score_rate = float((eval_stats or {}).get('score_rate', 0.0))
                 true_win_rate = float((eval_stats or {}).get('win_rate', 0.0))
+                eval_games_total = int((eval_stats or {}).get('num_games', 0) or 0)
                 eval_wins = int((eval_stats or {}).get('wins', 0))
                 eval_draws = int((eval_stats or {}).get('draws', 0))
                 eval_losses = int((eval_stats or {}).get('losses', 0))
                 eval_unresolved = int((eval_stats or {}).get('unresolved', 0))
-                print(f"Score rate vs best: {score_rate:.2%}")
+                stage_suffix = f" [{eval_stage}, {eval_games_total} games]" if eval_stage else ""
+                print(f"Score rate vs best: {score_rate:.2%}{stage_suffix}")
                 print(
                     f"Eval vs best W/D/L: {eval_wins}/{eval_draws}/{eval_losses} "
                     f"(true win rate: {true_win_rate:.2%}, unresolved draws at cap: {eval_unresolved})"
                 )
+                is_new_best_candidate = score_rate >= score_rate_threshold and true_win_rate >= true_win_rate_threshold
                 if bool(rl_cfg.get('value_guard_enabled', True)):
                     mae_tol = max(0.0, float(rl_cfg.get('value_guard_mae_increase_tolerance', 0.01)))
                     min_score_gain = float(rl_cfg.get('value_guard_min_score_gain', 0.005))
@@ -2756,11 +3169,23 @@ def main():
                         value_guard_poor_eval_streak = 0
                     prev_eval_score_rate_for_temp = last_eval_score_rate_for_guard
                     last_eval_score_rate_for_guard = float(score_rate)
-                if anchor_model_available and anchor_model is not None and _should_run_anchor_eval(iteration + 1, rl_cfg):
-                    if not anchor_eval_unlocked:
-                        print("Anchor eval skipped: locked until first true-win promotion vs best.")
-                    elif _models_have_identical_state(best_model, anchor_model):
-                        print("Anchor eval skipped: current best still matches IL-best.")
+                if (
+                    is_new_best_candidate
+                    and anchor_model_available
+                    and anchor_model is not None
+                    and _should_run_anchor_eval(iteration + 1, rl_cfg)
+                ):
+                    if _models_have_identical_state(best_model, anchor_model):
+                        anchor_score_rate = score_rate
+                        anchor_true_win_rate = true_win_rate
+                        anchor_wins = eval_wins
+                        anchor_draws = eval_draws
+                        anchor_losses = eval_losses
+                        print(
+                            "Anchor eval reused: current best is IL-best, "
+                            f"so eval vs best is also vs anchor (score: {anchor_score_rate:.2%}, "
+                            f"true win rate: {anchor_true_win_rate:.2%})."
+                        )
                     else:
                         print(f"Anchor eval vs IL-best ({int(rl_cfg.get('anchor_eval_games', 40))} games)...")
                         anchor_stats = evaluate_models(
@@ -2780,11 +3205,15 @@ def main():
                             f"Anchor W/D/L: {anchor_wins}/{anchor_draws}/{anchor_losses} "
                             f"(score: {anchor_score_rate:.2%}, true win rate: {anchor_true_win_rate:.2%})"
                         )
-                estimated_elo = elo_coordinator.maybe_evaluate(
-                    iteration + 1,
-                    score_rate=score_rate,
-                    true_win_rate=true_win_rate,
-                )
+                if anchor_score_rate is not None:
+                    elo_coordinator.observe_il_anchor_eval(
+                        iteration + 1,
+                        score_rate=anchor_score_rate,
+                        true_win_rate=anchor_true_win_rate,
+                    )
+                estimated_elo = None
+                if is_new_best_candidate:
+                    estimated_elo = elo_coordinator.evaluate_promoted_best(iteration + 1)
                 
                 # Log with all metrics
                 logger.log(
@@ -2794,9 +3223,20 @@ def main():
                     avg_loss=avg_loss,
                     policy_loss=avg_policy,
                     value_loss=avg_value,
+                    learning_rate=current_lr,
+                    value_loss_weight=current_value_loss_weight,
+                    mcts_q_value_scale=current_mcts_q_value_scale,
+                    value_guard_streak=value_guard_poor_eval_streak,
+                    mcts_no_mcts_gap=(
+                        float(score_rate) - float(no_mcts_score_rate)
+                        if no_mcts_score_rate is not None
+                        else None
+                    ),
                     score_rate=score_rate,
                     win_rate=true_win_rate,
                     true_win_rate=true_win_rate,
+                    eval_stage=eval_stage,
+                    eval_games=eval_games_total,
                     eval_wins=eval_wins,
                     eval_draws=eval_draws,
                     eval_losses=eval_losses,
@@ -2822,7 +3262,10 @@ def main():
                     completed_draw_rate=(selfplay_stats or {}).get('completed_draw_rate', None),
                     dynamic_uniform_fraction=None,
                     priority_age_decay_lambda=None,
-                    avg_sample_age=None,
+                    avg_sample_age=sample_age_avg,
+                    sample_age_p10=sample_age_p10,
+                    sample_age_p50=sample_age_p50,
+                    sample_age_p90=sample_age_p90,
                     avg_game_value=(selfplay_stats or {}).get('avg_game_value', None),
                     value_std=(selfplay_stats or {}).get('value_std', None),
                     policy_entropy=avg_policy_entropy,
@@ -2845,9 +3288,10 @@ def main():
                     mcts_q_delta_mean=(selfplay_stats or {}).get('mcts_q_delta_mean', None),
                     adaptive_temp_adjustment=temp_debug.get('adjustment', None),
                     adaptive_temp_threshold=current_temp_threshold,
+                    rl_best_model=is_new_best_candidate,
                 )
                 last_logged_iteration = iteration + 1
-                if score_rate >= score_rate_threshold and true_win_rate >= true_win_rate_threshold:
+                if is_new_best_candidate:
                     print("New best model!")
                     logger.add_rl_best_model_marker(
                         iteration + 1,
@@ -2859,20 +3303,22 @@ def main():
                         anchor_eval_unlocked = True
                     
                     model_to_save = model
+                    best_metadata = {
+                        'win_rate': true_win_rate,
+                        'score_rate': score_rate,
+                        'eval_true_win_rate': true_win_rate,
+                        'policy_loss': avg_policy,
+                        'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
+                        'value_mae': train_metrics.get('value_mae', 0),
+                        'version': model_version,
+                        'startup_mode': start_mode,
+                        'model_architecture': model_architecture,
+                    }
+                    best_metadata.update(elo_coordinator.metadata_for_iteration(iteration + 1))
                     save_checkpoint(
                         model_to_save, None, iteration, avg_loss,
                         str(best_model_rl_path),
-                        {
-                            'win_rate': true_win_rate,
-                            'score_rate': score_rate,
-                            'eval_true_win_rate': true_win_rate,
-                            'policy_loss': avg_policy,
-                            'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
-                            'value_mae': train_metrics.get('value_mae', 0),
-                            'version': model_version,
-                            'startup_mode': start_mode,
-                            'model_architecture': model_architecture,
-                        },
+                        best_metadata,
                         save_optimizer=False,
                         save_dtype=torch.bfloat16 if use_bfloat16 else None
                     )
@@ -2930,6 +3376,10 @@ def main():
                     avg_loss=avg_loss,
                     policy_loss=avg_policy,
                     value_loss=avg_value,
+                    learning_rate=current_lr,
+                    value_loss_weight=current_value_loss_weight,
+                    mcts_q_value_scale=current_mcts_q_value_scale,
+                    value_guard_streak=value_guard_poor_eval_streak,
                     buffer_size=len(replay_buffer),
                     avg_game_length=avg_game_length,
                     no_mcts_score_rate=no_mcts_score_rate,
@@ -2946,7 +3396,10 @@ def main():
                     completed_draw_rate=(selfplay_stats or {}).get('completed_draw_rate', None),
                     dynamic_uniform_fraction=None,
                     priority_age_decay_lambda=None,
-                    avg_sample_age=None,
+                    avg_sample_age=sample_age_avg,
+                    sample_age_p10=sample_age_p10,
+                    sample_age_p50=sample_age_p50,
+                    sample_age_p90=sample_age_p90,
                     avg_game_value=(selfplay_stats or {}).get('avg_game_value', None),
                     value_std=(selfplay_stats or {}).get('value_std', None),
                     policy_entropy=avg_policy_entropy,
@@ -2999,7 +3452,12 @@ def main():
                 'version': model_version,
                 'startup_mode': start_mode,
                 'model_architecture': model_architecture,
+                'rl_surpassed_il_anchor': bool(elo_coordinator.il_anchor_surpassed),
+                'rl_best_il_anchor_score_rate': elo_coordinator.best_il_anchor_score_rate,
+                'rl_best_il_anchor_true_win_rate': elo_coordinator.best_il_anchor_true_win_rate,
+                'rl_best_il_anchor_iteration': elo_coordinator.best_il_anchor_iteration,
             }
+            latest_metadata.update(elo_coordinator.metadata_for_iteration(iteration + 1))
             save_checkpoint(
                 model,
                 optimizer,
@@ -3029,6 +3487,7 @@ def main():
                 data_collection_time=collection_time,
                 avg_game_length=avg_game_length,
                 profile=performance_profile,
+                stage_times=iteration_stage_times if profile_training_enabled else None,
             )
             logger.log_rl_data_quality(
                 iteration + 1,

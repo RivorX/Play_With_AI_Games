@@ -160,9 +160,15 @@ class ILEloCoordinator:
                 if estimated_elo is not None:
                     self.logger.record_estimated_elo(result_epoch, estimated_elo, update_csv=True)
                     print(f"     [async] Epoch {result_epoch} Estimated Elo: {estimated_elo}")
+                    if elo_result.get("elo_std_error") is not None:
+                        ci = elo_result.get("elo_ci95")
+                        ci_str = f", 95% CI {ci[0]}-{ci[1]}" if isinstance(ci, list) and len(ci) == 2 else ""
+                        ladder = "adaptive" if elo_result.get("adaptive") else "fixed"
+                        print(f"       uncertainty: ±{elo_result['elo_std_error']} Elo SE{ci_str} ({ladder} ladder)")
                     for lvl, res in sorted(elo_result.get("results", {}).items()):
                         score_str = f"W{res['wins']}/D{res['draws']}/L{res['losses']}"
-                        print(f"       vs SF {lvl}: {score_str} (score: {res['score']:.0%})")
+                        games = int(res.get("games", res["wins"] + res["draws"] + res["losses"]) or 0)
+                        print(f"       vs SF {lvl}: {score_str} (score: {res['score']:.0%}, n={games})")
                     print(f"       time {elo_result['total_time']:.1f}s ({elo_result['total_games']} games)")
                     any_new_elo = True
                 elif "error" not in elo_result and not elo_result.get("skipped"):
@@ -246,9 +252,15 @@ class ILEloCoordinator:
         estimated_elo = elo_result.get("estimated_elo")
         if estimated_elo is not None:
             print(f"     Estimated Elo: {estimated_elo}")
+            if elo_result.get("elo_std_error") is not None:
+                ci = elo_result.get("elo_ci95")
+                ci_str = f", 95% CI {ci[0]}-{ci[1]}" if isinstance(ci, list) and len(ci) == 2 else ""
+                ladder = "adaptive" if elo_result.get("adaptive") else "fixed"
+                print(f"       uncertainty: ±{elo_result['elo_std_error']} Elo SE{ci_str} ({ladder} ladder)")
             for lvl, res in sorted(elo_result.get("results", {}).items()):
                 score_str = f"W{res['wins']}/D{res['draws']}/L{res['losses']}"
-                print(f"       vs SF {lvl}: {score_str} (score: {res['score']:.0%})")
+                games = int(res.get("games", res["wins"] + res["draws"] + res["losses"]) or 0)
+                print(f"       vs SF {lvl}: {score_str} (score: {res['score']:.0%}, n={games})")
             print(f"       time {elo_result['total_time']:.1f}s ({elo_result['total_games']} games)")
         elif "error" not in elo_result and not elo_result.get("skipped"):
             print("     Elo estimation: inconclusive")

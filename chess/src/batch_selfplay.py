@@ -912,9 +912,22 @@ class MultiGameBatchMCTS:
             0.0,
             float(config['reinforcement_learning'].get('mcts_q_value_scale', 1.0)),
         )
-        self.root_value_q_blend = max(
+        self.q_centered = bool(config['reinforcement_learning'].get('mcts_q_centered', False))
+        self.q_min_child_visits = max(
             0.0,
-            min(1.0, float(config['reinforcement_learning'].get('mcts_root_value_q_blend', 0.35))),
+            float(config['reinforcement_learning'].get('mcts_q_min_child_visits', 0.0)),
+        )
+        self.q_parent_visit_warmup = max(
+            1.0,
+            float(config['reinforcement_learning'].get('mcts_q_parent_visit_warmup', 1.0)),
+        )
+        self.q_tanh_scale = max(
+            0.0,
+            float(config['reinforcement_learning'].get('mcts_q_tanh_scale', 0.0)),
+        )
+        self.q_max_abs = max(
+            0.0,
+            float(config['reinforcement_learning'].get('mcts_q_max_abs', 0.0)),
         )
         self.eval_batch_size = config['reinforcement_learning'].get('mcts_batch_size', 32)
         self.adaptive_search_enabled = bool(
@@ -1185,6 +1198,68 @@ class MultiGameBatchMCTS:
 
         return np.concatenate(history_tensors, axis=0)
 
+    def _history_tensor_for_entry(self, entry, use_black_pov):
+        if self._is_encoded_history_entry(entry):
+            return entry[1] if use_black_pov else entry[0]
+
+        if isinstance(entry, chess.Board):
+            if not self.profile_enabled:
+                return board_to_tensor(entry, flip_perspective=use_black_pov).astype(
+                    self.history_storage_dtype,
+                    copy=False,
+                )
+            t0 = time.perf_counter()
+            tensor = board_to_tensor(entry, flip_perspective=use_black_pov).astype(
+                self.history_storage_dtype,
+                copy=False,
+            )
+            self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
+            self._profile_inc('board_to_tensor_calls', 1)
+            return tensor
+
+        encoded = self._encode_history_entry(entry)
+        return encoded[1] if use_black_pov else encoded[0]
+
+    def _collect_node_history_entries(self, node, board_history):
+        """
+        Return the last history positions for a search leaf.
+
+        board_history contains real-game positions before the current root.
+        For deeper MCTS leaves, parent nodes represent the simulated positions
+        immediately before the leaf and must be part of the NN history planes.
+        """
+        if self.history_positions <= 0:
+            return []
+
+        simulated_history = []
+        ancestor = node.parent
+        while ancestor is not None and len(simulated_history) < self.history_positions:
+            simulated_history.append(ancestor.board)
+            ancestor = ancestor.parent
+        if simulated_history:
+            simulated_history.reverse()
+
+        keep_from_game = max(0, int(self.history_positions) - len(simulated_history))
+        real_history = list(board_history[-keep_from_game:]) if board_history and keep_from_game > 0 else []
+        return real_history + simulated_history
+
+    def _build_history_prefix_for_node(self, node, board_history):
+        if self.history_positions <= 0:
+            return None
+
+        use_black_pov = (node.board.turn == chess.BLACK)
+        history_entries = self._collect_node_history_entries(node, board_history)
+        history_tensors = [
+            self._history_tensor_for_entry(entry, use_black_pov)
+            for entry in history_entries
+        ]
+
+        pad_count = max(0, int(self.history_positions) - len(history_tensors))
+        if pad_count:
+            history_tensors = [self._empty_history_tensor] * pad_count + history_tensors
+
+        return np.concatenate(history_tensors, axis=0) if history_tensors else None
+
     def _current_tensor_for_node(self, node):
         if not self.cache_node_tensors:
             if not self.profile_enabled:
@@ -1403,7 +1478,33 @@ class MultiGameBatchMCTS:
             q_values[explored_mask] = (
                 -edges.value_sums[explored_mask] - edges.virtual_losses_f32[explored_mask]
             ) / cv[explored_mask]
-        if self.q_value_scale != 1.0:
+        if self.q_value_scale <= 0.0:
+            q_values.fill(0.0)
+        elif self.q_centered:
+            transformed_q = q_values
+            transformed_q.fill(0.0)
+            stable_mask = explored_mask
+            if self.q_min_child_visits > 0.0:
+                stable_mask = explored_mask & (cv >= float(self.q_min_child_visits))
+            if stable_mask.any():
+                stable_q = (
+                    -edges.value_sums[stable_mask] - edges.virtual_losses_f32[stable_mask]
+                ) / cv[stable_mask]
+                stable_counts = cv[stable_mask]
+                q_center = float(np.average(stable_q, weights=np.maximum(stable_counts, 1.0)))
+                centered_q = stable_q - q_center
+                if self.q_tanh_scale > 0.0:
+                    centered_q = np.tanh(centered_q / float(self.q_tanh_scale))
+                parent_gate = min(1.0, float(parent_visits) / float(self.q_parent_visit_warmup))
+                if self.q_min_child_visits > 0.0:
+                    visit_gate = np.minimum(1.0, stable_counts / float(self.q_min_child_visits))
+                else:
+                    visit_gate = 1.0
+                centered_q = centered_q * float(self.q_value_scale) * float(parent_gate) * visit_gate
+                if self.q_max_abs > 0.0:
+                    centered_q = np.clip(centered_q, -float(self.q_max_abs), float(self.q_max_abs))
+                transformed_q[stable_mask] = centered_q.astype(np.float32, copy=False)
+        elif self.q_value_scale != 1.0:
             q_values *= float(self.q_value_scale)
 
         u_values = edges.ucb_buffer
@@ -1458,8 +1559,6 @@ class MultiGameBatchMCTS:
             'mcts_changed_to_lower_q': None,
             'mcts_policy_kl': None,
             'root_value': 0.0,
-            'root_child_q_value': 0.0,
-            'root_blended_value': 0.0,
             'stopped_early': used < budget,
             'adaptive_stop_reason': 'budget' if used >= budget else 'unknown',
             'policy_weight': float(max(0.0, min(1.0, used / float(budget)))),
@@ -1479,23 +1578,7 @@ class MultiGameBatchMCTS:
             root_value = float(root.value_sum / max(1, root_visits))
             root_value = float(max(-1.0, min(1.0, root_value)))
 
-        visited_mask = root.edges.visit_counts > 0
-        child_q_value = root_value
-        if visited_mask.any():
-            child_visits = root.edges.visit_counts[visited_mask].astype(np.float32, copy=False)
-            child_value_sums = root.edges.value_sums[visited_mask].astype(np.float32, copy=False)
-            child_total = float(child_visits.sum())
-            if child_total > 0.0:
-                # Child values are stored from child perspective; negate to get
-                # the root player's expected value for those moves.
-                child_q_value = float((-child_value_sums).sum() / child_total)
-                child_q_value = float(max(-1.0, min(1.0, child_q_value)))
-
-        q_blend = float(self.root_value_q_blend)
-        blended_value = (1.0 - q_blend) * root_value + q_blend * child_q_value
         summary['root_value'] = root_value
-        summary['root_child_q_value'] = child_q_value
-        summary['root_blended_value'] = float(max(-1.0, min(1.0, blended_value)))
 
         visits.sort()
         top = float(visits[-1])
@@ -1977,27 +2060,15 @@ class MultiGameBatchMCTS:
         if non_terminal_nodes:
             history_prefix_cache = {}
 
-            def _get_history_prefix_for_game(game_idx, turn):
+            def _get_history_prefix_for_node(game_idx, node):
                 if self.history_positions <= 0:
                     return None
 
-                cache_key = (int(game_idx), bool(turn == chess.BLACK))
+                cache_key = (int(game_idx), id(node))
                 if cache_key in history_prefix_cache:
                     return history_prefix_cache[cache_key]
 
-                encoded_history = board_histories[game_idx]
-                use_black_pov = (turn == chess.BLACK)
-                history_slice = encoded_history[-self.history_positions:] if encoded_history else []
-                history_tensors = [
-                    encoded[1] if use_black_pov else encoded[0]
-                    for encoded in history_slice
-                ]
-
-                pad_count = max(0, self.history_positions - len(history_tensors))
-                if pad_count:
-                    history_tensors = [self._empty_history_tensor] * pad_count + history_tensors
-
-                cached = np.concatenate(history_tensors, axis=0) if history_tensors else None
+                cached = self._build_history_prefix_for_node(node, board_histories[game_idx])
                 history_prefix_cache[cache_key] = cached
                 return cached
 
@@ -2022,7 +2093,7 @@ class MultiGameBatchMCTS:
             for row_idx, (node, gi) in enumerate(zip(non_terminal_nodes, non_terminal_game_indices)):
                 current_tensor = self._current_tensor_for_node(node)
                 history_t0 = time.perf_counter() if self.profile_enabled else None
-                history_prefix = _get_history_prefix_for_game(gi, node.board.turn)
+                history_prefix = _get_history_prefix_for_node(gi, node)
                 if self.profile_enabled:
                     self._profile_add('batch_expand_history_time', time.perf_counter() - history_t0)
                 input_pack_t0 = time.perf_counter() if self.profile_enabled else None
@@ -2483,18 +2554,6 @@ class BatchSelfPlayMCTSBatch:
         )
         self.value_target_min_scale = float(
             rl_cfg.get('value_target_min_scale', 0.25)
-        )
-        self.value_target_root_blend_enabled = bool(
-            rl_cfg.get('value_target_root_blend_enabled', True)
-        )
-        self.value_target_root_blend_start = float(
-            rl_cfg.get('value_target_root_blend_start', 0.75)
-        )
-        self.value_target_root_blend_end = float(
-            rl_cfg.get('value_target_root_blend_end', 0.15)
-        )
-        self.value_target_root_blend_power = float(
-            rl_cfg.get('value_target_root_blend_power', 1.5)
         )
         self.profile_enabled = _debug_bool(self.config, 'rl', 'profile_training', False)
         self._profile_stats = {}
@@ -3059,7 +3118,6 @@ class BatchSelfPlayMCTSBatch:
         history_entry = gs['game_history'][int(history_idx)]
         history_count, policy_indices, policy_values, turn = history_entry[:4]
         importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
-        root_value = float(history_entry[5]) if len(history_entry) > 5 else 0.0
         policy_weight = float(history_entry[6]) if len(history_entry) > 6 else 1.0
 
         if outcome == 0.0:
@@ -3072,23 +3130,6 @@ class BatchSelfPlayMCTSBatch:
             )
             signed_outcome = outcome if turn == chess.WHITE else -outcome
             value = float(signed_outcome * temporal_scale)
-
-        # Keep draw targets centered at zero. Blending search value into draws
-        # makes neutral outcomes inherit noisy non-zero labels and weakens the
-        # intended zero-sum calibration of the value target.
-        if self.value_target_root_blend_enabled and total_history > 0 and outcome != 0.0:
-            progress = float(history_idx) / float(max(1, total_history - 1))
-            blend_progress = progress ** max(0.1, self.value_target_root_blend_power)
-            search_weight = (
-                self.value_target_root_blend_start
-                + (self.value_target_root_blend_end - self.value_target_root_blend_start) * blend_progress
-            )
-            search_weight = float(min(1.0, max(0.0, search_weight)))
-            blended_root_value = float(max(-1.0, min(1.0, root_value)))
-            value = float(
-                search_weight * blended_root_value
-                + (1.0 - search_weight) * value
-            )
 
         return {
             'history_idx': int(history_idx),
@@ -3365,6 +3406,7 @@ class BatchSelfPlayMCTSBatch:
             'mcts_policy_kl_sum': 0.0,
             'mcts_q_delta_samples': 0.0,
             'mcts_q_delta_sum': 0.0,
+            'mcts_q_delta_values': [],
             'mcts_changed_to_lower_q_count': 0.0,
         }
         opponent_source_counts = {}
@@ -3400,7 +3442,10 @@ class BatchSelfPlayMCTSBatch:
         for reason, count in dict(batch_stats.get('adaptive_stop_reasons', {}) or {}).items():
             adaptive_stop_reasons[str(reason)] = int(adaptive_stop_reasons.get(str(reason), 0)) + int(count)
         for key in total_mcts_quality_stats:
-            total_mcts_quality_stats[key] += float(batch_stats.get(key, 0.0) or 0.0)
+            if key == 'mcts_q_delta_values':
+                total_mcts_quality_stats[key].extend(list(batch_stats.get(key, []) or []))
+            else:
+                total_mcts_quality_stats[key] += float(batch_stats.get(key, 0.0) or 0.0)
         for label, count in dict(batch_stats.get('opponent_source_counts', {}) or {}).items():
             opponent_source_counts[str(label)] = int(opponent_source_counts.get(str(label), 0)) + int(count)
         for label, stats in dict(batch_stats.get('opponent_source_results', {}) or {}).items():
@@ -3431,6 +3476,7 @@ class BatchSelfPlayMCTSBatch:
         )
         mcts_quality_samples = int(total_mcts_quality_stats['mcts_prior_agreement_samples'])
         mcts_q_delta_samples = int(total_mcts_quality_stats['mcts_q_delta_samples'])
+        mcts_q_delta_values = list(total_mcts_quality_stats.get('mcts_q_delta_values', []) or [])
         self.last_selfplay_stats = {
             'truncated_games': total_truncated_games,
             'completed_games': max(0, total_games - total_truncated_games),
@@ -3512,6 +3558,21 @@ class BatchSelfPlayMCTSBatch:
             'mcts_q_delta_mean': (
                 float(total_mcts_quality_stats['mcts_q_delta_sum']) / float(mcts_q_delta_samples)
                 if mcts_q_delta_samples > 0
+                else 0.0
+            ),
+            'mcts_q_delta_p10': (
+                float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 10))
+                if mcts_q_delta_values
+                else 0.0
+            ),
+            'mcts_q_delta_p50': (
+                float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 50))
+                if mcts_q_delta_values
+                else 0.0
+            ),
+            'mcts_q_delta_p90': (
+                float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 90))
+                if mcts_q_delta_values
                 else 0.0
             ),
             'mcts_changed_to_lower_q_count': int(total_mcts_quality_stats['mcts_changed_to_lower_q_count']),
@@ -3645,6 +3706,7 @@ class BatchSelfPlayMCTSBatch:
             'policy_kl_sum': 0.0,
             'q_comparable': 0,
             'q_delta_sum': 0.0,
+            'q_delta_values': [],
             'changed_to_lower_q': 0,
         }
 
@@ -3670,7 +3732,9 @@ class BatchSelfPlayMCTSBatch:
             q_delta = search_metadata.get('mcts_q_delta', None)
             if q_delta is not None:
                 target_quality['q_comparable'] += 1
-                target_quality['q_delta_sum'] += float(q_delta)
+                q_delta_value = float(q_delta)
+                target_quality['q_delta_sum'] += q_delta_value
+                target_quality['q_delta_values'].append(q_delta_value)
                 if float(search_metadata.get('mcts_changed_to_lower_q') or 0.0) > 0.5:
                     target_quality['changed_to_lower_q'] += 1
 
@@ -3831,11 +3895,6 @@ class BatchSelfPlayMCTSBatch:
                         root_visits = int(getattr(root, 'visit_count', 0) or 0)
                         if root_visits > 0:
                             root_value = float(root.value_sum / max(1, root_visits))
-                    if isinstance(search_metadata, dict) and 'root_blended_value' in search_metadata:
-                        try:
-                            root_value = float(search_metadata.get('root_blended_value', root_value))
-                        except Exception:
-                            pass
                     gs['game_history'].append((
                         history_count,
                         policy_indices,
@@ -4063,9 +4122,25 @@ class BatchSelfPlayMCTSBatch:
             ),
             'mcts_q_delta_samples': target_quality_q_samples,
             'mcts_q_delta_sum': float(target_quality['q_delta_sum']),
+            'mcts_q_delta_values': list(target_quality.get('q_delta_values', []) or []),
             'mcts_q_delta_mean': (
                 float(target_quality['q_delta_sum']) / float(target_quality_q_samples)
                 if target_quality_q_samples > 0
+                else 0.0
+            ),
+            'mcts_q_delta_p10': (
+                float(np.percentile(np.asarray(target_quality.get('q_delta_values', []), dtype=np.float32), 10))
+                if target_quality.get('q_delta_values')
+                else 0.0
+            ),
+            'mcts_q_delta_p50': (
+                float(np.percentile(np.asarray(target_quality.get('q_delta_values', []), dtype=np.float32), 50))
+                if target_quality.get('q_delta_values')
+                else 0.0
+            ),
+            'mcts_q_delta_p90': (
+                float(np.percentile(np.asarray(target_quality.get('q_delta_values', []), dtype=np.float32), 90))
+                if target_quality.get('q_delta_values')
                 else 0.0
             ),
             'mcts_changed_to_lower_q_count': int(target_quality['changed_to_lower_q']),
@@ -4343,7 +4418,7 @@ class _RemoteInferenceModel:
             return policy, value
 
 
-def central_inference_server(config, device_id, request_queue, response_queues, control_queue=None):
+def central_inference_server(config, device_id, request_queue, response_queues, control_queue=None, server_rank=None):
     """Own GPU inference and batch requests coming from self-play workers."""
     rl_cfg = config.get('reinforcement_learning', {})
     _, central_debug_cfg, debug_root_enabled = _debug_nested(config, 'rl', 'central_inference')
@@ -4363,6 +4438,10 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
 
     try:
         device = _configure_selfplay_worker_runtime(config, device_id)
+        try:
+            compile_rank = int(server_rank)
+        except Exception:
+            compile_rank = 900000 + int(os.getpid())
         if device.type == 'cuda':
             torch.backends.cudnn.benchmark = bool(
                 rl_cfg.get('self_play_central_inference_cudnn_benchmark', False)
@@ -4381,7 +4460,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
 
         print(
             f"[{_ts()}] Central inference: server ready on {device} "
-            f"(pid={os.getpid()}, max_batch={max_batch}, flush={flush_ms:.1f}ms, "
+            f"(pid={os.getpid()}, compile_rank={compile_rank}, max_batch={max_batch}, flush={flush_ms:.1f}ms, "
             f"transport={transport_np_dtype.__name__}, "
             f"compile={'on' if central_use_compile else 'off'}, "
             f"cudnn.benchmark={torch.backends.cudnn.benchmark if device.type == 'cuda' else 'n/a'}).",
@@ -4463,12 +4542,15 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                         base_model,
                         config,
                         device,
-                        rank=999,
+                        rank=compile_rank,
                         model_label=f"central:{label}",
                     )
-                    load_info["warmup_s"] = _warmup_central_model(model, label)
                     compiled_base_models[label] = base_model
-                    compiled_wrappers[label] = model
+                    if model is not base_model:
+                        load_info["warmup_s"] = _warmup_central_model(model, label)
+                        compiled_wrappers[label] = model
+                    else:
+                        load_info["compiled"] = False
             else:
                 model = _build_selfplay_worker_model(config, device)
                 _load_worker_model_state(model, state, rank=-1)
@@ -5204,6 +5286,14 @@ def persistent_selfplay_worker(
 
                 if hasattr(engine, 'temperature') and task.get('mcts_temperature') is not None:
                     engine.temperature = float(task['mcts_temperature'])
+                if task.get('mcts_q_value_scale') is not None:
+                    q_value_scale = max(0.0, float(task['mcts_q_value_scale']))
+                    opponent_mcts = list(
+                        (getattr(engine, 'opponent_mcts_by_label', {}) or {}).values()
+                    )
+                    for mcts_obj in [getattr(engine, 'mcts', None)] + opponent_mcts:
+                        if mcts_obj is not None and hasattr(mcts_obj, 'q_value_scale'):
+                            mcts_obj.q_value_scale = q_value_scale
 
                 total_positions, total_games = _play_games_with_engine(
                     rank,
