@@ -204,9 +204,9 @@ reinforcement_learning:
   # ---------------------------
   # Core RL Loop
   # ---------------------------
-  version: "rl10"                # RL run/version tag added to RL log filenames
-  iterations: 20                # Total RL iterations
-  games_per_iteration: 600      # Enough signal per iteration without stretching self-play too long
+  version: "rl12"                # RL run/version tag added to RL log filenames
+  iterations: 30                # Total RL iterations
+  games_per_iteration: 300      # Enough signal per iteration without stretching self-play too long
 
   # ---------------------------
   # Self-Play Runtime
@@ -218,9 +218,9 @@ reinforcement_learning:
   self_play_use_compile: true   # Self-play workers: torch.compile(mode=default) on CUDA; guarded so Windows workers don't compile/cache concurrently
   self_play_central_inference_enabled: true   # Use one GPU inference server for persistent self-play workers; workers keep MCTS trees on CPU
   self_play_central_inference_servers: auto # auto = shard workers across a safe number of GPU inference servers
-  self_play_central_inference_auto_min_servers: 3 # Your 16GB GPU has enough headroom; start at 3 unless VRAM safety cap lowers it
-  self_play_central_inference_auto_workers_per_server: 6 # Auto target; 18 workers -> 3 CIL servers when VRAM allows it
-  self_play_central_inference_auto_max_servers: 4 # Upper safety cap for auto CIL sharding
+  self_play_central_inference_auto_min_servers: 2 # Fewer GPU server processes reduce context switching on one GPU
+  self_play_central_inference_auto_workers_per_server: 9 # 18 workers -> 2 larger CIL servers with better per-server batching
+  self_play_central_inference_auto_max_servers: 2 # Keep self-play on two CIL processes unless explicitly retuned
   self_play_central_inference_use_compile: true # Compile the single central GPU model; warmup happens before workers start
   self_play_central_inference_compile_warmup_batches: [1, 32, 128, 256] # Pre-warm common dynamic batch sizes outside self-play
   self_play_compile_reset_dynamo: false # Keep compiled graphs cached inside the persistent central inference process
@@ -246,10 +246,10 @@ reinforcement_learning:
   use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
   max_batch_games_per_worker: 30     # Keep total active games/RAM near 16x20 while giving CPU more worker processes
   self_play_dispatch_chunk_games: 96 # Requested chunk cap; runtime caps it by games/worker so large chunks do not starve workers
-  self_play_max_moves: 190          # Shorter cap: cut low-value sterile games earlier instead of harvesting many doomed draw samples
+  self_play_max_moves: 190          # Hard cap in plies; keep speed while draw claims below decide only clearly claimable games
   self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
-  self_play_claim_repetition_after_moves: 40  # Claim sterile repetition earlier to reduce low-signal looping positions
-  self_play_claim_draw_after_moves: 85  # End generic claimable draws sooner before they flood replay with redundant samples
+  self_play_claim_repetition_after_moves: 64  # Plies before claiming repetition; avoid ending useful middlegame cycles too early
+  self_play_claim_draw_after_moves: 120 # Plies before generic claimable draws; lets more value targets resolve naturally
   self_play_adjudication_enabled: false  # Disabled by default: self-generated terminal labels were destabilizing value training
   self_play_adjudication_min_moves: 70   # Start a bit earlier so clearly won games convert before drifting into long drawish tails
   self_play_adjudication_threshold: 0.82 # Slightly more eager conversion of stable winning positions into decisive outcomes
@@ -276,11 +276,12 @@ reinforcement_learning:
   self_play_opening_diversity_min_plies: 2    # Let sharp curated lines branch early
   self_play_opening_diversity_max_plies: 8    # Allow enough depth to land in asymmetrical structures
   self_play_opponent_pool_enabled: true       # Mix current-vs-current with frozen opponents instead of only mirror self-play
-  self_play_opponent_current_fraction: 0.45   # Keep mirror self-play, but leave enough room for best-model correction
+  self_play_opponent_current_fraction: 0.50   # More current-model games improve central inference batching and policy uptake
   self_play_opponent_best_fraction: 0.30      # Stronger best anchor: current was drifting while training mostly on its own losses
-  self_play_opponent_recent_fraction: 0.25    # Cap recent-snapshot pressure to avoid echo-chamber training
+  self_play_opponent_recent_fraction: 0.20    # Keep recent pressure, but reduce model-label fragmentation in central inference
+  self_play_opponent_anchor_fraction: 0.06    # After RL first beats IL-anchor, keep a small IL-best opponent stream for stability
   self_play_recent_snapshots_to_keep: 10       # Keep a wider recent window, then let the smart selector choose the actually useful opponents
-  self_play_recent_candidate_pool_size: 3     # Fewer simultaneous frozen recent models reduces MCTS batch fragmentation
+  self_play_recent_candidate_pool_size: 2     # Fewer simultaneous frozen recent models reduces MCTS batch fragmentation
   self_play_recent_recency_bias: 0.35         # Prefer fresher snapshots, but still let matchup quality dominate the selection
   self_play_recent_confidence_games: 24       # Avg games needed before a recent snapshot score is treated as high-confidence
   self_play_recent_uncertainty_bonus: 0.15    # Small exploration bonus for newer/under-tested recent snapshots
@@ -303,6 +304,7 @@ reinforcement_learning:
   self_play_opponent_min_score: 0.28            # Avoid opponent buckets that are so hard they mostly generate hopeless targets
   self_play_opponent_max_score: 0.72            # Avoid buckets that are so easy they stop challenging the policy
   self_play_opponent_best_min_score: 0.00       # Keep best-opponent channel alive even when it is temporarily hard
+  self_play_opponent_anchor_min_score: 0.00     # Keep the IL-anchor channel alive once unlocked; it is a stability reference
   self_play_opponent_recent_min_score: 0.32     # Recent snapshots should usually be in the learnable band
   self_play_opponent_recent_max_score: 0.68     # Also skip recent snapshots that have become too easy
   self_play_opponent_target_draw_rate: 0.35     # Prefer matchups that stay meaningfully decisive instead of settling into draw-heavy shells
@@ -351,29 +353,40 @@ reinforcement_learning:
   mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
   mcts_cache_node_tensors: false # Keep per-worker RAM lower; central inference rebuilds leaf tensors in batch anyway
   self_play_history_fp16: true # Store active game history in fp16 inside workers; replay tensors are still emitted as fp32
-  mcts_c_puct: 1.15          # Move back toward healthier exploration; too-low PUCT was over-trusting the current policy
-  mcts_dynamic_c_puct: true  # MuZero-style dynamic exploration scaling by parent visits
-  mcts_c_puct_base: 12000    # Slightly slower scaling keeps exploration healthier over a 96-sim search budget
-  mcts_c_puct_init: 1.05     # Reduce policy lock-in early in the search
-  mcts_c_puct_max: 1.8       # Let dynamic PUCT breathe a bit more at higher visit counts
-  mcts_use_fpu: true         # First Play Urgency: non-visited moves get parent-aware prior value
+  mcts_c_puct_base: 10000    # Let c_puct grow a little sooner at 160-320 simulations
+  mcts_c_puct_init: 1.30     # More root exploration; the old 1.05 kept search too close to the policy prior
+  mcts_c_puct_max: 2.2       # Let dynamic PUCT breathe at higher visit counts
+  mcts_use_fpu: true         # First Play Urgency baseline for unvisited/low-visit children
   mcts_fpu_reduction: 0.12   # Used only when mcts_fpu_absolute is null
-  mcts_fpu_absolute: 0.0     # Do not seed unvisited moves with noisy parent value; let priors handle first exploration
-  mcts_q_value_scale: 0.20   # Cautious fallback; Q is now centered, visit-gated and capped before entering UCB
+  mcts_fpu_absolute: 0.0     # Neutral unvisited Q; avoids punishing exploration while value is still calibrating
+  mcts_q_value_scale: 0.0    # Bootstrap phase: train value first, then let schedule introduce Q into MCTS
   mcts_q_value_scale_schedule:
     enabled: true
-    start: 0.05              # Early RL: almost pure policy/PUCT, matching the successful q=0 ablation
-    end: 0.35                # Later RL: let value help, but keep it below the policy prior's authority
-    power: 1.35              # Slow early ramp, faster after value has seen cleaner replay
-    min: 0.0
-    max: 0.45
-    value_guard_scale: 0.70  # Reduce Q trust hard when value guard detects poor value/eval behavior
-    eval_stagnation_scale: 0.85 # Nudge Q trust down when eval stops improving
+    warmup_iterations: 6     # First RL iterations train value, but MCTS selection stays policy/PUCT-only
+    start: 0.015            # After warmup, give calibrated value a small but real voice in search
+    end: 0.15               # Later RL: useful Q signal, but below the range that made MCTS overrule the prior too hard
+    power: 1.20             # Slower early ramp; MCTS must prove value helps before Q becomes strong
+    value_guard_scale: 0.65  # Reduce Q trust hard when value guard detects poor value/eval behavior
+    eval_stagnation_scale: 0.80 # Nudge Q trust down when eval stops improving
+    dynamic_trust_enabled: true # Long-term controller: trust value more only when value/eval metrics are healthy
+    trust_initial: 0.70       # Start cautious; a good MAE alone is not proof that Q improves play
+    trust_min: 0.35
+    trust_max: 0.90
+    trust_step_up: 0.03
+    trust_step_down: 0.18
+    trust_bad_eval_cooldown: 2 # After a bad MCTS-vs-no-MCTS eval, do not recover trust from value-only metrics
+    trust_good_mae: 0.45
+    trust_bad_mae: 0.52
+    trust_good_std_ratio: 0.62 # pred_value_std / target_value_std; value should not stay too flat
+    trust_bad_std_ratio: 0.50
+    trust_good_mcts_gap: 0.06  # MCTS score - no-MCTS score; require a real edge before raising Q trust
+    trust_bad_mcts_gap: -0.02  # Any clear MCTS regression should reduce Q trust quickly
+    trust_anchor_drop_tolerance: 0.02
   mcts_q_centered: true      # Use Q as relative sibling preference, not as poorly calibrated absolute value
-  mcts_q_min_child_visits: 8 # Ignore most Q signal until a child has enough visits to reduce leaf noise
-  mcts_q_parent_visit_warmup: 96 # Fade Q in over the root/search budget instead of using it from visit 1
-  mcts_q_tanh_scale: 0.35    # Robustly squash extreme value estimates before scaling
-  mcts_q_max_abs: 0.18       # Final per-edge Q contribution cap inside UCB
+  mcts_q_min_child_visits: 2 # Let Q help after a child has minimal evidence; 8 visits made low-prior moves circularly unable to recover
+  mcts_q_parent_visit_warmup: 40 # Fade Q in after early exploration instead of waiting for most of the root budget
+  mcts_q_tanh_scale: 0.45    # Smoothly squash value differences without turning most deltas into the same saturated bonus
+  mcts_q_max_abs: 0.10       # Final per-edge Q contribution cap inside UCB; small enough to avoid old value-dominance failures
   mcts_temperature: 0.65      # Sharper visit sampling produces better policy targets once the search is strong enough
   mcts_temperature_threshold: 12  # Quicker shift toward deterministic play helps convert advantages instead of drifting
   mcts_dirichlet_alpha: 0.3  # Standard rzędu szachowego
@@ -384,38 +397,37 @@ reinforcement_learning:
   mcts_tactical_check_bonus: 0.06     # Checks are often tactically forcing
   mcts_tactical_promotion_bonus: 0.12 # Promotions are rare and critical
   mcts_tactical_recapture_bonus: 0.08 # Helps short tactical recapture sequences
-  mcts_adaptive_search_enabled: true            # Stop self-play search early when the root move distribution is already confident instead of using a random playout cap
-  mcts_adaptive_search_min_simulations: 64      # Require a fuller low-budget search before adaptive early-stop can fire
+  mcts_adaptive_search_enabled: true            # Training/self-play only; eval/promotions/Elo always use full-budget MCTS
+  mcts_adaptive_search_min_simulations: 96      # Stronger absolute early-stop floor; RL targets need enough visits before policy is trusted
   mcts_adaptive_search_check_interval: 16       # Check adaptive stop in coarser chunks to avoid spending CPU on root stats every tiny MCTS step
   mcts_adaptive_search_low_branching_moves: 6   # Positions with few legal moves need less proof before early-stop can trigger
-  mcts_adaptive_search_low_branching_min_simulations: 16 # Lower floor for simple low-branching positions
   mcts_adaptive_search_endgame_piece_count: 10  # Small endgames often become search-stable quickly, especially with Syzygy support nearby
-  mcts_adaptive_search_endgame_min_simulations: 24 # Lower floor for small endgames that are not tablebase-resolved yet
-  mcts_adaptive_search_top_visit_confidence: 0.68 # Early-stop when the best move owns a clear root-visit majority
-  mcts_adaptive_search_visit_gap: 0.16          # Also require a useful lead over the runner-up move
-  mcts_adaptive_search_locked_margin: 2         # Stop when the runner-up cannot realistically catch the leader with remaining sims
-  mcts_adaptive_search_max_entropy: 0.62        # Prevent early stop when root policy is still broad/uncertain
-  mcts_adaptive_search_low_branching_confidence_delta: 0.06 # Slightly relax confidence gates when there are only a few legal moves
-  mcts_adaptive_search_late_budget_enabled: true # Adaptive search first chooses per-position budget, then early-stops inside that budget
+  mcts_adaptive_search_top_visit_confidence: 0.72 # Early-stop only when the best move owns a clearer root-visit majority
+  mcts_adaptive_search_visit_gap: 0.20          # Require a stronger lead over the runner-up move
+  mcts_adaptive_search_max_entropy: 0.55        # Prevent early stop when root visits are still broad/uncertain
+  mcts_adaptive_search_min_budget_fraction: 0.86 # Normal roots should spend most of the active budget before accepting a policy target
+  mcts_adaptive_search_min_explored_prior_mass: 0.95 # Visit nearly all meaningful model-prior mass before accepting the target
+  mcts_adaptive_search_min_visited_moves: 5      # Avoid stopping before MCTS has compared several plausible moves
   mcts_adaptive_search_late_after_ply: 60        # Later middlegame/endgame roots are more target-sensitive than opening roots
-  mcts_adaptive_search_late_min_multiplier: 0.60 # Late roots must use at least this share of their active MCTS budget (160 -> 96)
   mcts_adaptive_search_late_extra_fraction: 0.25 # Deterministically sample this share of late roots for a larger search cap
   mcts_adaptive_search_late_extra_multiplier: 1.5 # 160 base -> 240 cap for sampled late roots
-  mcts_adaptive_search_late_extra_max_multiplier: 1.60 # Hard cap as a multiplier of active MCTS budget (160 -> 256)
-  mcts_adaptive_policy_weight_min_fraction: 0.75 # Legacy knob; policy targets now use continuous used/budget weighting
   policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
   policy_target_pruning_keep_top_n: 8           # Always keep a broader top slice so uncertain positions retain more searched alternatives
   policy_target_pruning_max_moves: 28           # Let wider post-search support reach the learner before pruning the long tail
   policy_target_pruning_min_prob: 0.005         # Still trim only the weakest tail; low-probability tactical moves can survive if search supports them
   policy_target_pruning_min_fraction_of_max: 0.05 # Keep moves that are closer to the best visit count instead of over-sharpening the target
   policy_target_pruning_keep_mass: 0.96         # Preserve more of the MCTS distribution when many moves are similarly plausible
-  policy_target_sharpening_enabled: true        # Gently sharpen only flat MCTS targets before they enter replay
-  policy_target_sharpening_power: 1.35          # Conservative power; avoids turning uncertain searches into one-hot labels
-  policy_target_sharpening_min_top1: 0.55       # Leave already-confident targets unchanged
   policy_target_quality_weighting_enabled: true # Downweight flat/ambiguous targets at storage time, not only during training
   policy_target_quality_min_weight: 0.35        # Ambiguous targets still teach, but cannot dominate policy gradients
   policy_target_quality_entropy_threshold: 0.72 # Normalized entropy above this starts reducing target authority
   policy_target_quality_top1_threshold: 0.50    # Top move below this starts reducing target authority
+  policy_target_search_discovery_weighting_enabled: true # Boost targets where MCTS found a better top move than the raw prior
+  policy_target_search_discovery_min_q_delta: 0.04       # Require the searched top move to have meaningfully better Q than the prior top
+  policy_target_search_discovery_q_delta_ref: 0.30       # Q delta that earns the full Q-based replay boost
+  policy_target_search_discovery_bonus: 0.25             # Base policy-weight bonus when search changes the top move
+  policy_target_search_discovery_q_bonus: 0.35           # Extra bonus from positive Q delta
+  policy_target_search_discovery_rank_bonus: 0.18        # Extra bonus when the prior top drops below rank 2 in visits
+  policy_target_search_discovery_max_weight: 1.70        # Faster policy uptake for clean MCTS discoveries, still capped against rare noise
   
   # ---------------------------
   # Optimizer & Training
@@ -424,7 +436,7 @@ reinforcement_learning:
   learning_rate: 0.0002      # Fallback base LR when RL auto-tune cache is unavailable
   weight_decay: 0.05         # L2 regularization (AdamW)
   grad_clip: 0.5             # Gradient clipping
-  train_epochs_per_iteration: 3  # Fewer passes per iteration to reduce overfitting to stale replay slices
+  train_epochs_per_iteration: 4  # More policy/value updates per self-play batch so useful MCTS shifts converge within fewer iterations
 
   # Replay buffer sizing:
   # Capacity now bootstraps small and then auto-resizes from observed positions/iteration.
@@ -508,8 +520,9 @@ reinforcement_learning:
   eval_staged_enabled: true   # true = two-stage eval vs best: short MCTS screen first, then extra MCTS games only if stage 1 looks promising
   eval_stage1_games: 100      # Stage 1 uses the normal eval MCTS path too; this is the cheap first sample
   eval_stage2_games: 200      # Stage 2 adds this many more MCTS games and combines them with stage 1 for the final eval result
-  eval_stage2_gate_score_rate: 0.52  # Run stage 2 only if stage 1 score_rate reaches at least this threshold
+  eval_stage2_gate_score_rate: 0.45  # Run stage 2 if stage 1 score_rate reaches at least this threshold
   eval_stage2_gate_true_win_rate: 0.02  # Also require a small decisive edge in stage 1 to avoid paying for stage 2 on drawish noise
+  eval_mcts_after_q_warmup_extra_iterations: 2 # During value bootstrap, skip expensive MCTS/anchor/Elo eval until Q has been unfrozen for a couple iterations
   eval_fixed_openings_enabled: true
   eval_fixed_openings_max_plies: 6
   early_stop_enabled: true
@@ -518,6 +531,9 @@ reinforcement_learning:
   early_stop_min_true_win_improvement: 0.005 # Or at least +0.5pp true-win improvement
   score_rate_threshold: 0.55    # Promote best model only if score vs current best is clearly positive
   true_win_rate_threshold: 0.02 # Also require some real decisive edge, not only draw-heavy scoring
+  promotion_require_anchor_non_regression: true # A new RL best must not regress vs the original IL anchor when that anchor is available
+  promotion_anchor_min_score_rate: 0.50         # Non-regression vs IL anchor: at least equal score
+  promotion_anchor_min_true_win_rate: 0.00      # Optional decisive-win floor vs IL anchor
   anchor_eval_enabled: true
   anchor_eval_every: 1          # Run anchor eval on every RL evaluation cycle
   anchor_eval_games: 100
@@ -528,22 +544,20 @@ reinforcement_learning:
   # Loss Weights
   # ---------------------------
   policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 0.65    # Give value more influence now that replay keeps more draw/neutral calibration
-  value_aux_scalar_loss_weight: 0.25  # Extra scalar consistency term on (P(win)-P(loss)); helps prevent value collapse toward perpetual draws
-  # Value loss weight schedule - moderate pressure after replay target cleanup
+  value_loss_weight: 0.85    # Value still gets priority, but not enough to starve policy/prior learning
+  value_aux_scalar_loss_weight: 0.25  # Extra scalar consistency term on (P(win)-P(loss)); keep it moderate to avoid overpowering policy
+  # Value bootstrap: early supervision, then taper once Q starts entering MCTS.
   value_loss_weight_schedule:
-    start: 0.60
+    start: 1.00
     end: 0.75
+    power: 0.80
   value_guard_enabled: true
   value_guard_mae_window: 3
   value_guard_patience: 1
   value_guard_mae_increase_tolerance: 0.006
   value_guard_min_score_gain: 0.005
-  value_guard_scale: 0.75
-  value_guard_min_weight: 0.50
-  value_target_noise_std: 0.0
-  value_target_temporal_decay: 0.993   # Carry final outcomes farther back so early/midgame value targets stay informative
-  value_target_min_scale: 0.25         # Keep a stronger minimum supervision signal for early positions
+  value_guard_scale: 0.90
+  value_guard_min_weight: 0.70
   adaptive_dirichlet_enabled: true       # Reduce root noise when self-play turns too draw-heavy or eval stagnates
   adaptive_dirichlet_min_weight: 0.015   # Keep a small amount of root noise for exploration even under heavy draw pressure
   adaptive_dirichlet_draw_scale: 0.65    # Cut root noise harder when completed draw rate drifts above target
@@ -606,7 +620,7 @@ elo_estimation:
   final_on_il_shutdown: true   # In IL: after normal end or first Ctrl+C, run precise final Elo for best IL and SWA; Ctrl+C during it cancels the check
   final_il_games_per_level: 40 # Final IL Elo is slower/more stable; adaptive ladder focuses only informative levels
   final_il_levels: [1320, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 2100, 2200, 2300, 2400, 2600, 2800]
-  final_il_stockfish_time_limit: 0.20
+  final_il_stockfish_time_limit: 0.10
   final_il_max_moves: 150
   final_il_workers: 12
   final_il_stockfish_threads: 1
@@ -616,10 +630,6 @@ elo_estimation:
   rl_every_n_evals: 3          # In RL: run Stockfish Elo every Nth model-vs-best evaluation
   rl_min_score_rate_for_stockfish: 0.50     # Gate periodic Stockfish Elo by score rate vs current best
   rl_min_true_win_rate_for_stockfish: 0.02  # Also require at least a small decisive edge before paying for Elo
-  final_on_rl_shutdown: true   # In RL: run one final Elo test on normal end and after Ctrl+C training stop; press Ctrl+C again during that Elo to cancel it
-  final_rl_require_il_anchor_improvement: true # Run RL final Elo only after RL has beaten the IL anchor at least once
-  final_rl_il_anchor_min_score_rate: 0.50      # "Beaten IL anchor" means score strictly above this value
-  final_rl_il_anchor_min_true_win_rate: 0.00   # Optional decisive-win floor for the final Elo gate
   stockfish_path: "stockfish"  # Path to Stockfish binary (or just "stockfish" if on PATH)
   workers: 0                   # Parallel game workers (0/auto = use full available CPU budget, adjusted by stockfish_threads in RL)
   prioritize_training: true    # Keep IL training/data-loading responsive while Elo runs
@@ -632,8 +642,7 @@ elo_estimation:
   eval_elo_stockfish_priority: "normal" # Standalone eval_elo.py is foreground/user-visible, so do not background Stockfish
   eval_elo_raw_worker_multiplier: 2.0 # Standalone raw NN auto-workers can oversubscribe CPUs because the NN side is very cheap
   eval_elo_mcts_worker_multiplier: 1.5 # Standalone MCTS Elo benefits from more active games because the model side is batched
-  eval_elo_central_inference_enabled: true # Deep MCTS Elo can use RL-style central GPU inference with independent MCTS clients
-  eval_elo_central_inference_min_simulations: 256 # For 100-200 sims, classic batched_mcts is faster because it keeps larger model batches
+  eval_elo_central_inference_enabled: true # MCTS Elo uses RL-style central GPU inference with independent MCTS clients
   eval_elo_central_inference_servers: "auto" # auto ~= workers / target_workers_per_server
   eval_elo_central_inference_auto_workers_per_server: 10
   eval_elo_central_inference_auto_min_servers: 1
@@ -647,17 +656,15 @@ elo_estimation:
   eval_elo_central_inference_transport_dtype: "float16"
   eval_elo_central_inference_use_compile: false # Keep manual Elo stable; enable only after torch.compile cache is healthy
   eval_elo_central_inference_cache_enabled: false
-  eval_elo_central_inference_timeout_s: 180.0
+  eval_elo_central_inference_timeout_s: 0 # 0 = wait indefinitely; contention should slow Elo/MCTS, not abort inference
   stockfish_threads: 1         # Threads per Stockfish process; tune together with workers (e.g. 12x1, 6x2, 4x3)
   stockfish_hash_mb: 64        # Hash MB per Stockfish process; total RAM ~= workers * hash_mb plus engine overhead
   max_error_logs_per_type: 8   # Suppress repeated Stockfish error spam after N logs
-  cancel_shutdown_wait_s: 0.0  # After Ctrl+C, do not wait for graceful unwind; cancel shutdown Elo immediately
   elo_verbose_adaptive: false   # Keep Elo progress readable; final table still shows per-level W/D/L
   elo_verbose_worker_stats: false
   elo_verbose_batch_stats: false
   elo_print_completion_summary: true
   elo_print_worker_summary: false
-  
   games_per_level: 40          # Max games per informative Elo level; adaptive ladder probes/skips obvious levels
   levels: [1320, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 2100, 2200, 2300, 2400, 2600, 2800]
   stockfish_time_limit: 0.1    # Seconds per Stockfish move (lower = faster but weaker play)
@@ -665,21 +672,23 @@ elo_estimation:
   adaptive_ladder_enabled: true # Probe from weakest Stockfish upward, then spend games only near the useful Elo bracket
   adaptive_probe_games_per_level: 8
   adaptive_min_batch_games: 32  # Adaptive Elo schedules multi-level waves so central MCTS keeps CPU/GPU fed
-  adaptive_focus_games_per_level: 32
+  adaptive_focus_games_per_level: 24
   adaptive_extra_games_per_level: 8
-  adaptive_target_focus_levels: 4
+  adaptive_target_focus_levels: 3
   adaptive_focus_min_score: 0.20
   adaptive_focus_max_score: 0.80
   adaptive_skip_high_score: 0.92
   adaptive_stop_low_score: 0.08
-  adaptive_max_total_games: 192
+  adaptive_max_total_games: 160
+  adaptive_target_standard_error: 45.0 # Stop adaptive Elo focus once the estimate is precise enough for training decisions
+  adaptive_min_games_for_se_stop: 80    # Avoid stopping from a lucky tiny probe sample
   rl_games_per_level: 24       # Periodic RL uses same adaptive ladder with a lower cap than final/manual checks
   rl_stockfish_time_limit: 0.10  # Faster periodic RL Elo; keep constant across runs for comparability
   rl_max_moves: 120            # Shorter periodic RL Elo games to avoid very long low-signal endings
   rl_workers: 12               # Fill the CPU budget during periodic RL Elo
   rl_stockfish_threads: 1      # Throughput-oriented periodic RL Elo: many 1-thread engines
   rl_stockfish_hash_mb: 32     # Enough cache for short time controls without wasting RAM
-  final_rl_games_per_level: 40   # Final RL Elo can be slower/more stable; adaptive focuses the game budget
+  final_rl_games_per_level: 24   # Promoted RL Elo stays accurate by focusing useful levels, not saturated extremes
   final_rl_levels: [1320, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 2100, 2200, 2300, 2400, 2600, 2800]
   final_rl_stockfish_time_limit: 0.20  # Keep final RL Elo closer to the previous baseline
   final_rl_max_moves: 150      # Final RL Elo keeps the normal move horizon
@@ -719,8 +728,8 @@ debug:
 
   # Reinforcement Learning diagnostics
   rl:
-    profile_training: true          # Iteration/self-play/train/eval timing breakdown
-    log_gpu_memory: true            # GPU memory usage around RL iterations
+    profile_training: false         # Iteration/self-play/train/eval timing breakdown
+    log_gpu_memory: false           # GPU memory usage around RL iterations
     central_inference:
       verbose: false                # Per-request/heartbeat logs; summaries still go to console, RL.csv and PNG
       stall_warning_s: 15           # When verbose=true, print if a worker waits this long for central inference

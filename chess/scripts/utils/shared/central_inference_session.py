@@ -63,6 +63,13 @@ class CentralInferenceSession:
     def _option(self, suffix: str, default=None):
         return self.options.get(self._key(suffix), default)
 
+    def _float_option(self, suffix: str, default: float) -> float:
+        raw_value = self._option(suffix, default)
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            return float(default)
+
     def resolve_server_count(self) -> int:
         raw_value = self._option("central_inference_servers", "auto")
         if isinstance(raw_value, str) and raw_value.strip().lower() == "auto":
@@ -163,6 +170,7 @@ class CentralInferenceSession:
 
         timeout_s = float(self._option("central_inference_load_timeout_s", 180.0) or 180.0)
         deadline = time.time() + max(5.0, timeout_s)
+        load_messages = []
         for control_queue in control_queues:
             while True:
                 remaining = deadline - time.time()
@@ -173,6 +181,7 @@ class CentralInferenceSession:
                 except queue.Empty:
                     continue
                 if message and message.get("type") == "models_loaded" and message.get("task_id") == task_id:
+                    load_messages.append(dict(message))
                     break
 
         self._thread_ranks = {}
@@ -185,6 +194,7 @@ class CentralInferenceSession:
             "rank_to_server": rank_to_server,
             "processes": processes,
             "server_config": server_config,
+            "load_messages": load_messages,
         }
         return self
 
@@ -259,8 +269,8 @@ class CentralInferenceSession:
             self._session["request_queues"][server_idx],
             self._session["response_queues_by_rank"][rank],
             rank,
-            timeout_s=float(self._option("central_inference_timeout_s", 180.0) or 180.0),
-            stall_warning_s=float(self._option("central_inference_stall_warning_s", 60.0) or 60.0),
+            timeout_s=self._float_option("central_inference_timeout_s", 0.0),
+            stall_warning_s=self._float_option("central_inference_stall_warning_s", 60.0),
             debug_enabled=bool(self._option("central_inference_debug", False)),
             transport_dtype=str(self._option("central_inference_transport_dtype", "float16") or "float16"),
         )
@@ -271,10 +281,33 @@ class CentralInferenceSession:
             return "not started"
         server_config = session.get("server_config", {}) or {}
         rl_cfg = server_config.get("reinforcement_learning", {}) or {}
+        load_messages = list(session.get("load_messages", []) or [])
+        load_times = [
+            float(message.get("load_s", 0.0) or 0.0)
+            for message in load_messages
+            if message.get("load_s") is not None
+        ]
+        model_summary = next(
+            (str(message.get("model_summary")) for message in load_messages if message.get("model_summary")),
+            "",
+        )
+        pid_summary = ",".join(
+            str(int(message.get("pid")))
+            for message in load_messages
+            if message.get("pid") is not None
+        )
+        load_summary = ""
+        if model_summary:
+            load_summary += f", {model_summary}"
+        if load_times:
+            load_summary += f", load={max(load_times):.2f}s"
+        if pid_summary:
+            load_summary += f", pids={pid_summary}"
         return (
             f"servers={int(session.get('server_count', 0) or 0)}, "
             f"workers={self.workers}, "
             f"target_workers/server={self._option('central_inference_auto_workers_per_server', 10)}, "
             f"max_batch={rl_cfg.get('self_play_central_inference_max_batch_size')}, "
             f"flush={rl_cfg.get('self_play_central_inference_flush_ms')}ms"
+            f"{load_summary}"
         )

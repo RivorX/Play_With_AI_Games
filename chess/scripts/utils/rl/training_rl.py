@@ -103,6 +103,19 @@ def _build_eval_central_server_config(config):
     return server_config
 
 
+def _build_eval_mcts_config(config):
+    """Use deterministic full-budget MCTS for eval/promotion games.
+
+    Self-play may use adaptive early-stop to save time, but eval should not
+    silently shorten search because that makes model comparisons noisier.
+    """
+    eval_config = dict(config)
+    rl_cfg = dict(config.get("reinforcement_learning", {}))
+    rl_cfg["mcts_adaptive_search_enabled"] = False
+    eval_config["reinforcement_learning"] = rl_cfg
+    return eval_config
+
+
 def _resolve_eval_central_server_count(config, workers):
     rl_cfg = config.get("reinforcement_learning", {})
     raw_value = rl_cfg.get("eval_central_inference_servers", "auto")
@@ -894,6 +907,7 @@ def _evaluate_models_with_central_inference(
         import time
         deadline = time.time() + max(1.0, load_timeout_s)
         pending_servers = set(range(server_count))
+        load_messages = []
         while pending_servers:
             if time.time() >= deadline:
                 raise TimeoutError(
@@ -906,13 +920,34 @@ def _evaluate_models_with_central_inference(
                 except Exception:
                     continue
                 if message.get("type") == "models_loaded" and str(message.get("task_id")) == task_id:
+                    load_messages.append(dict(message))
                     pending_servers.discard(server_idx)
 
+        load_times = [
+            float(message.get("load_s", 0.0) or 0.0)
+            for message in load_messages
+            if message.get("load_s") is not None
+        ]
+        model_summary = next(
+            (str(message.get("model_summary")) for message in load_messages if message.get("model_summary")),
+            "models ready",
+        )
+        pid_summary = ",".join(
+            str(int(message.get("pid")))
+            for message in load_messages
+            if message.get("pid") is not None
+        )
+        load_summary = f", {model_summary}"
+        if load_times:
+            load_summary += f", load={max(load_times):.2f}s"
+        if pid_summary:
+            load_summary += f", pids={pid_summary}"
         print(
             "Eval central inference: "
             f"workers={len(active_worker_ranks)}, servers={server_count}, "
             f"batch_games={_resolve_eval_batch_games(config, num_games)}, "
             f"sims={_resolve_eval_mcts_simulations(config)}"
+            f"{load_summary}"
         )
 
         for rank in active_worker_ranks:
@@ -1060,6 +1095,23 @@ def _maybe_augment_batch(boards, policy_indices, policy_values, policy_mask, con
     return boards, policy_indices, policy_values, policy_mask
 
 
+def _final_outcome_targets(value_targets, epsilon=1e-6):
+    """Map RL value targets to final W/D/L outcomes from the side-to-move POV."""
+    target = value_targets.view(-1)
+    return torch.where(
+        torch.abs(target) <= float(epsilon),
+        torch.zeros_like(target),
+        torch.sign(target),
+    )
+
+
+def _wdl_targets_from_final_outcome(target_scalar):
+    target_win = (target_scalar > 0.0).to(dtype=target_scalar.dtype)
+    target_draw = (target_scalar == 0.0).to(dtype=target_scalar.dtype)
+    target_loss = (target_scalar < 0.0).to(dtype=target_scalar.dtype)
+    return torch.stack((target_win, target_draw, target_loss), dim=1)
+
+
 def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_calc=None, value_weight_override=None):
     boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights = batch
     if config["reinforcement_learning"].get("replay_fp16", False):
@@ -1077,14 +1129,6 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
     value_targets = value_targets.to(device, non_blocking=True)
     policy_sample_weights = policy_sample_weights.to(device, non_blocking=True)
     effective_policy_mask = policy_mask & (policy_sample_weights.unsqueeze(1) > 0)
-
-    value_target_noise_std = float(config.get("reinforcement_learning", {}).get("value_target_noise_std", 0.0))
-    if value_target_noise_std > 0:
-        value_targets = torch.clamp(
-            value_targets + torch.randn_like(value_targets) * value_target_noise_std,
-            min=-1.0,
-            max=1.0,
-        )
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -1139,14 +1183,11 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
                 policy_loss = policy_loss * confidence_weight.to(dtype=policy_loss.dtype)
             policy_loss = policy_loss * policy_sample_weights.to(dtype=policy_loss.dtype)
 
+        target_scalar = _final_outcome_targets(value_targets)
+        target_value_std = target_scalar.std(unbiased=False)
+
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
-            target_scalar = value_targets.squeeze()
-            target_value_std = target_scalar.std(unbiased=False)
-            target_win = torch.clamp(target_scalar, min=0.0, max=1.0)
-            target_loss = torch.clamp(-target_scalar, min=0.0, max=1.0)
-            target_draw = torch.clamp(1.0 - torch.abs(target_scalar), min=0.0, max=1.0)
-            target_wdl = torch.stack((target_win, target_draw, target_loss), dim=1)
-            target_wdl = target_wdl / target_wdl.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            target_wdl = _wdl_targets_from_final_outcome(target_scalar)
 
             value_log_probs = F.log_softmax(value_pred, dim=1)
             value_ce_loss = -(target_wdl * value_log_probs).sum(dim=1)
@@ -1162,8 +1203,6 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
             value_scalar_detached = value_scalar.detach()
             value_pred_std = value_scalar_detached.std(unbiased=False)
         else:
-            target_scalar = value_targets.squeeze()
-            target_value_std = target_scalar.std(unbiased=False)
             value_loss = (value_pred.squeeze() - target_scalar) ** 2
             value_pred_std = value_pred.detach().squeeze().std(unbiased=False)
 
@@ -1207,7 +1246,7 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
             else:
                 best_sparse_idx = policy_values.argmax(dim=1, keepdim=True)
                 target_moves = torch.gather(policy_indices.long(), 1, best_sparse_idx).squeeze(1)
-            metrics_calc.update(policy_pred, value_pred, target_moves, value_targets.unsqueeze(1))
+            metrics_calc.update(policy_pred, value_pred, target_moves, target_scalar.unsqueeze(1))
 
     return (
         loss.item(),
@@ -1220,6 +1259,7 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
 
 
 def evaluate_models(model1, model2, config, device, num_games=100, game_index_offset=0, use_fixed_openings=None):
+    config = _build_eval_mcts_config(config)
     rl_cfg = config.get("reinforcement_learning", {})
     central_min_games = max(1, int(rl_cfg.get("eval_central_inference_min_games", 2) or 2))
     if _eval_uses_central_inference(config, device) and int(num_games) >= central_min_games:

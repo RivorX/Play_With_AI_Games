@@ -238,18 +238,22 @@ def _canonicalize_opponent_bucket(label):
         return "recent"
     if normalized == "best":
         return "best"
+    if normalized == "anchor":
+        return "anchor"
     return "current"
 
 
 def _build_selfplay_opponent_candidates(
     rl_cfg,
     best_model_state=None,
+    anchor_model_state=None,
     recent_snapshot_pool=None,
     scheduler_state=None,
 ):
     current_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_current_fraction', 0.4)))
     best_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_best_fraction', 0.3)))
     recent_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_recent_fraction', 0.3)))
+    anchor_fraction = max(0.0, float(rl_cfg.get('self_play_opponent_anchor_fraction', 0.0)))
     recent_snapshot_pool = list(recent_snapshot_pool or [])
     scheduler_state = dict(scheduler_state or {})
     adaptive_enabled = bool(rl_cfg.get('self_play_opponent_adaptive_enabled', False))
@@ -261,6 +265,7 @@ def _build_selfplay_opponent_candidates(
     min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_min_score', 0.0))))
     max_score = max(min_score, min(1.0, float(rl_cfg.get('self_play_opponent_max_score', 1.0))))
     best_min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_best_min_score', min_score))))
+    anchor_min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_anchor_min_score', min_score))))
     recent_min_score = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_recent_min_score', min_score))))
     recent_max_score = max(recent_min_score, min(1.0, float(rl_cfg.get('self_play_opponent_recent_max_score', max_score))))
     recent_candidate_limit = max(1, int(rl_cfg.get('self_play_recent_candidate_pool_size', 4)))
@@ -314,12 +319,38 @@ def _build_selfplay_opponent_candidates(
                 "state": best_model_state,
             },
         })
+    if anchor_model_state is not None and anchor_fraction > 0.0:
+        anchor_factor = 1.0
+        if adaptive_enabled:
+            anchor_factor = _adaptive_factor_from_history(
+                exact_score_history.get("anchor", []) or [],
+                target_score,
+                band,
+                min_factor,
+                max_factor,
+            )
+        anchor_factor *= _draw_heaviness_penalty(
+            _average_score_from_history(exact_draw_history.get("anchor", []) or []),
+            target_draw_rate,
+            draw_band,
+            draw_penalty_min_factor,
+        )
+        candidates.append({
+            "label": "anchor",
+            "weight": float(anchor_fraction * anchor_factor),
+            "payload": {
+                "label": "anchor",
+                "state": anchor_model_state,
+            },
+        })
     if recent_snapshot_pool and recent_fraction > 0.0:
         recent_count = max(1, len(recent_snapshot_pool))
         recent_entries_all = []
         dedup_states = []
         if best_model_state is not None:
             dedup_states.append(best_model_state)
+        if anchor_model_state is not None:
+            dedup_states.append(anchor_model_state)
         for idx, recent_entry in enumerate(recent_snapshot_pool):
             recent_state = recent_entry.get("state")
             if recent_state is None:
@@ -404,6 +435,10 @@ def _build_selfplay_opponent_candidates(
         if label == "best":
             avg_score = _average_score_from_history(exact_score_history.get("best", []) or [])
             if avg_score is not None and avg_score < best_min_score:
+                continue
+        elif label == "anchor":
+            avg_score = _average_score_from_history(exact_score_history.get("anchor", []) or [])
+            if avg_score is not None and avg_score < anchor_min_score:
                 continue
         elif label != "current":
             bucket_history = scheduler_state.get("bucket_score_history", {}) or {}
@@ -714,6 +749,7 @@ def _build_selfplay_opponent_assignments(
     rl_cfg,
     worker_specs,
     best_model_state=None,
+    anchor_model_state=None,
     recent_snapshot_pool=None,
     adaptive_scheduler_state=None,
 ):
@@ -724,6 +760,7 @@ def _build_selfplay_opponent_assignments(
     candidates = _build_selfplay_opponent_candidates(
         rl_cfg,
         best_model_state=best_model_state,
+        anchor_model_state=anchor_model_state,
         recent_snapshot_pool=recent_snapshot_pool,
         scheduler_state=adaptive_scheduler_state,
     )
@@ -823,6 +860,21 @@ def _build_selfplay_opponent_assignments(
                 plan_labels.append(best_label)
                 pool_entries[best_label] = best_state
                 assigned_counts[best_label] += 1
+                continue
+            if bucket_label == "anchor":
+                anchor_payload = payloads_by_label.get("anchor") or {}
+                anchor_label = str(anchor_payload.get("label", "anchor"))
+                anchor_state = anchor_payload.get("state")
+                if anchor_state is None:
+                    plan_labels.append("current")
+                    assigned_counts["current"] += 1
+                    debug_info["model_fallbacks"][anchor_label] = (
+                        int(debug_info["model_fallbacks"].get(anchor_label, 0)) + 1
+                    )
+                    continue
+                plan_labels.append(anchor_label)
+                pool_entries[anchor_label] = anchor_state
+                assigned_counts[anchor_label] += 1
                 continue
             if bucket_label == "recent" and recent_entries:
                 if recent_label_cursor < len(recent_label_plan):

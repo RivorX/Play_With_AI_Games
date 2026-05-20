@@ -880,7 +880,7 @@ def extract_positions_from_game_worker(args):
     - NO embedded history in binary format
     - Stores GameID, MoveIdx, and MoveTarget for training
     - MoveTarget is the LABEL for the network to predict
-    - WDL-only mode: temporal discounting disabled (clean ±1.0 targets)
+    - WDL-only mode: clean final +/-1.0/0.0 targets from side-to-move POV
     
     🔧 FIXED BINARY FORMAT:
     [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)]
@@ -894,7 +894,7 @@ def extract_positions_from_game_worker(args):
     from src.utils.data_helpers import (
         move_to_index,
         pack_position_data,
-        compute_discounted_outcome  # 🆕 v4.3: Temporal discounting
+        compute_discounted_outcome
     )
     
     try:
@@ -920,7 +920,7 @@ def extract_positions_from_game_worker(args):
         board = chess.Board()
         result = game_data['result']
         
-        # 🆕 v4.3: Calculate total moves for temporal discounting
+        # Kept for API compatibility; WDL target is not temporally discounted.
         total_moves = len(moves)
         
         positions = []

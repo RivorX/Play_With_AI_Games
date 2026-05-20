@@ -37,6 +37,43 @@ _PIECE_VALUES = {
 _SYZYGY_ORACLE_CACHE = {}
 _SELFPLAY_COMPILE_LOCKFILE = "selfplay_torch_compile.lock"
 _DEFAULT_REPLAY_MAX_POLICY_TARGETS = 256
+_ADAPTIVE_LOW_BRANCHING_MIN_FRACTION = 0.50
+_ADAPTIVE_LOW_BRANCHING_BUDGET_FRACTION = 0.62
+_ADAPTIVE_LOW_BRANCHING_PRIOR_MASS = 0.85
+_ADAPTIVE_ENDGAME_MIN_FRACTION = 2.0 / 3.0
+_ADAPTIVE_ENDGAME_BUDGET_FRACTION = 0.58
+_ADAPTIVE_LATE_MIN_MULTIPLIER = 0.75
+_ADAPTIVE_LATE_EXTRA_MAX_MULTIPLIER = 1.60
+_ADAPTIVE_LOCKED_MARGIN = 8
+_Q_DELTA_HIST_MIN = -2.0
+_Q_DELTA_HIST_MAX = 2.0
+_Q_DELTA_HIST_BINS = 200
+
+
+def _q_delta_histogram(values):
+    if not values:
+        return [0] * _Q_DELTA_HIST_BINS
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.size <= 0:
+        return [0] * _Q_DELTA_HIST_BINS
+    arr = arr[np.isfinite(arr)]
+    if arr.size <= 0:
+        return [0] * _Q_DELTA_HIST_BINS
+    arr = np.clip(arr, _Q_DELTA_HIST_MIN, _Q_DELTA_HIST_MAX)
+    hist, _ = np.histogram(arr, bins=_Q_DELTA_HIST_BINS, range=(_Q_DELTA_HIST_MIN, _Q_DELTA_HIST_MAX))
+    return [int(v) for v in hist.tolist()]
+
+
+def _q_delta_percentile_from_histogram(hist, percentile):
+    counts = np.asarray(hist or [], dtype=np.float64)
+    if counts.size <= 0 or float(counts.sum()) <= 0.0:
+        return 0.0
+    total = float(counts.sum())
+    threshold = max(1.0, math.ceil((float(percentile) / 100.0) * total))
+    index = int(np.searchsorted(np.cumsum(counts), threshold, side='left'))
+    index = max(0, min(index, counts.size - 1))
+    width = (_Q_DELTA_HIST_MAX - _Q_DELTA_HIST_MIN) / float(counts.size)
+    return float(_Q_DELTA_HIST_MIN + (index + 0.5) * width)
 
 
 def _debug_scope(config, name):
@@ -891,18 +928,13 @@ class MultiGameBatchMCTS:
         self.model = model
         self.config = config
         self.device = device
-        self.c_puct = config['reinforcement_learning']['mcts_c_puct']
-        self.use_dynamic_c_puct = bool(
-            config['reinforcement_learning'].get('mcts_dynamic_c_puct', True)
-        )
         self.c_puct_base = float(
-            config['reinforcement_learning'].get('mcts_c_puct_base', 19652)
+            config['reinforcement_learning']['mcts_c_puct_base']
         )
         self.c_puct_init = float(
-            config['reinforcement_learning'].get('mcts_c_puct_init', self.c_puct)
+            config['reinforcement_learning']['mcts_c_puct_init']
         )
-        c_puct_max_raw = config['reinforcement_learning'].get('mcts_c_puct_max', None)
-        self.c_puct_max = float(c_puct_max_raw) if c_puct_max_raw is not None else None
+        self.c_puct_max = float(config['reinforcement_learning']['mcts_c_puct_max'])
         self.use_fpu = bool(config['reinforcement_learning'].get('mcts_use_fpu', True))
         self.fpu_reduction = float(
             config['reinforcement_learning'].get('mcts_fpu_reduction', 0.30)
@@ -945,17 +977,9 @@ class MultiGameBatchMCTS:
             2,
             int(config['reinforcement_learning'].get('mcts_adaptive_search_low_branching_moves', 6)),
         )
-        self.adaptive_search_low_branching_min_simulations = max(
-            1,
-            int(config['reinforcement_learning'].get('mcts_adaptive_search_low_branching_min_simulations', 16)),
-        )
         self.adaptive_search_endgame_piece_count = max(
             2,
             int(config['reinforcement_learning'].get('mcts_adaptive_search_endgame_piece_count', 10)),
-        )
-        self.adaptive_search_endgame_min_simulations = max(
-            1,
-            int(config['reinforcement_learning'].get('mcts_adaptive_search_endgame_min_simulations', 24)),
         )
         self.adaptive_search_top_visit_confidence = max(
             0.0,
@@ -965,28 +989,25 @@ class MultiGameBatchMCTS:
             0.0,
             min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_visit_gap', 0.28))),
         )
-        self.adaptive_search_locked_margin = max(
-            0,
-            int(config['reinforcement_learning'].get('mcts_adaptive_search_locked_margin', 2)),
-        )
         self.adaptive_search_max_entropy = max(
             0.0,
             min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_max_entropy', 0.40))),
         )
-        self.adaptive_search_low_branching_confidence_delta = max(
+        self.adaptive_search_min_budget_fraction = max(
             0.0,
-            min(0.5, float(config['reinforcement_learning'].get('mcts_adaptive_search_low_branching_confidence_delta', 0.06))),
+            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_min_budget_fraction', 0.60))),
         )
-        self.adaptive_search_late_budget_enabled = bool(
-            config['reinforcement_learning'].get('mcts_adaptive_search_late_budget_enabled', True)
+        self.adaptive_search_min_explored_prior_mass = max(
+            0.0,
+            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_min_explored_prior_mass', 0.88))),
+        )
+        self.adaptive_search_min_visited_moves = max(
+            1,
+            int(config['reinforcement_learning'].get('mcts_adaptive_search_min_visited_moves', 3)),
         )
         self.adaptive_search_late_after_ply = max(
             0,
             int(config['reinforcement_learning'].get('mcts_adaptive_search_late_after_ply', 60)),
-        )
-        self.adaptive_search_late_min_multiplier = max(
-            0.0,
-            float(config['reinforcement_learning'].get('mcts_adaptive_search_late_min_multiplier', 0.60)),
         )
         self.adaptive_search_late_extra_fraction = max(
             0.0,
@@ -996,15 +1017,6 @@ class MultiGameBatchMCTS:
             1.0,
             float(config['reinforcement_learning'].get('mcts_adaptive_search_late_extra_multiplier', 1.5)),
         )
-        self.adaptive_search_late_extra_max_multiplier = max(
-            1.0,
-            float(config['reinforcement_learning'].get('mcts_adaptive_search_late_extra_max_multiplier', 1.60)),
-        )
-        self.adaptive_policy_weight_min_fraction = max(
-            0.0,
-            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_policy_weight_min_fraction', 0.90))),
-        )
-
         # History configuration (POV)
         self.history_positions = config['model'].get('history_positions', 0)
         self.history_storage_dtype = (
@@ -1062,7 +1074,10 @@ class MultiGameBatchMCTS:
             and self.device.type == 'cuda'
             and torch.cuda.is_available()
         )
-        self.profile_enabled = _debug_bool(config, 'rl', 'profile_training', False)
+        # Keep lightweight performance counters always on so details/performance CSV/PNG
+        # stays useful even when verbose RL debug profiling is disabled.
+        self.profile_enabled = True
+        self.cuda_stage_profile_enabled = _debug_bool(config, 'rl', 'profile_training', False)
         self._profile_stats = {}
 
         self._tactical_capture_enabled = (
@@ -1105,13 +1120,9 @@ class MultiGameBatchMCTS:
         }
 
     def _profile_add(self, key, value):
-        if not self.profile_enabled:
-            return
         self._profile_stats[key] = float(self._profile_stats.get(key, 0.0)) + float(value)
 
     def _profile_inc(self, key, value=1):
-        if not self.profile_enabled:
-            return
         self._profile_stats[key] = int(self._profile_stats.get(key, 0)) + int(value)
 
     def get_profile_stats(self):
@@ -1444,12 +1455,8 @@ class MultiGameBatchMCTS:
         node_virtual_loss = node.virtual_loss
         parent_visits = node_visit_count + node_virtual_loss
         parent_sqrt = math.sqrt(parent_visits + 1)
-        if self.use_dynamic_c_puct:
-            c_puct = math.log((parent_visits + self.c_puct_base + 1.0) / self.c_puct_base) + self.c_puct_init
-            if self.c_puct_max is not None:
-                c_puct = min(c_puct, self.c_puct_max)
-        else:
-            c_puct = self.c_puct
+        c_puct = math.log((parent_visits + self.c_puct_base + 1.0) / self.c_puct_base) + self.c_puct_init
+        c_puct = min(c_puct, self.c_puct_max)
 
         fpu_value = 0.0
         if self.use_fpu:
@@ -1482,7 +1489,11 @@ class MultiGameBatchMCTS:
             q_values.fill(0.0)
         elif self.q_centered:
             transformed_q = q_values
-            transformed_q.fill(0.0)
+            # Keep the configured FPU baseline for unvisited / low-visit
+            # children, then overwrite only stable children with centered Q.
+            # Previously centered-Q mode zeroed the whole vector, which made
+            # mcts_use_fpu effectively meaningless whenever q_centered=true.
+            transformed_q.fill(fpu_value)
             stable_mask = explored_mask
             if self.q_min_child_visits > 0.0:
                 stable_mask = explored_mask & (cv >= float(self.q_min_child_visits))
@@ -1558,6 +1569,10 @@ class MultiGameBatchMCTS:
             'mcts_q_delta': None,
             'mcts_changed_to_lower_q': None,
             'mcts_policy_kl': None,
+            'explored_prior_mass': 0.0,
+            'unexplored_prior_mass': 1.0,
+            'visited_move_count': 0,
+            'legal_move_count': 0,
             'root_value': 0.0,
             'stopped_early': used < budget,
             'adaptive_stop_reason': 'budget' if used >= budget else 'unknown',
@@ -1566,8 +1581,24 @@ class MultiGameBatchMCTS:
         if root is None or not root.expanded or root.edges is None:
             return summary
 
-        visits = root.edges.visit_counts.astype(np.float32, copy=False)
-        visits = visits[visits > 0]
+        all_visits = root.edges.visit_counts.astype(np.float32, copy=False)
+        priors = root.edges.base_priors.astype(np.float32, copy=False)
+        legal_count = int(all_visits.size)
+        visited_mask = all_visits > 0.0
+        visited_count = int(visited_mask.sum())
+        prior_total = float(priors.sum()) if priors.size == all_visits.size else 0.0
+        explored_prior_mass = (
+            float(priors[visited_mask].sum()) / prior_total
+            if prior_total > 0.0 and priors.size == all_visits.size
+            else 0.0
+        )
+        explored_prior_mass = float(max(0.0, min(1.0, explored_prior_mass)))
+        summary['legal_move_count'] = legal_count
+        summary['visited_move_count'] = visited_count
+        summary['explored_prior_mass'] = explored_prior_mass
+        summary['unexplored_prior_mass'] = float(max(0.0, 1.0 - explored_prior_mass))
+
+        visits = all_visits[visited_mask]
         total = float(visits.sum())
         if total <= 0.0:
             return summary
@@ -1593,9 +1624,6 @@ class MultiGameBatchMCTS:
         summary['visit_gap'] = max(0.0, (top - second) / total)
         summary['visit_entropy'] = float(max(0.0, min(1.0, entropy)))
 
-        all_visits = root.edges.visit_counts.astype(np.float32, copy=False)
-        priors = root.edges.base_priors.astype(np.float32, copy=False)
-        prior_total = float(priors.sum())
         if all_visits.size > 0 and priors.size == all_visits.size and prior_total > 0.0:
             prior_probs = priors / prior_total
             visit_probs = all_visits / max(1e-8, float(all_visits.sum()))
@@ -1642,7 +1670,7 @@ class MultiGameBatchMCTS:
 
     def _adaptive_search_budget_for_root(self, root, base_budget, move_count=None):
         base_budget = max(1, int(base_budget))
-        if not self.adaptive_search_enabled or not self.adaptive_search_late_budget_enabled:
+        if not self.adaptive_search_enabled:
             return base_budget, False
 
         ply = 0 if move_count is None else max(0, int(move_count))
@@ -1657,63 +1685,137 @@ class MultiGameBatchMCTS:
 
         boosted = int(round(float(base_budget) * self.adaptive_search_late_extra_multiplier))
         boosted = max(base_budget, boosted)
-        max_boosted = int(round(float(base_budget) * self.adaptive_search_late_extra_max_multiplier))
+        max_boosted = int(round(float(base_budget) * _ADAPTIVE_LATE_EXTRA_MAX_MULTIPLIER))
         boosted = min(boosted, max(base_budget, max_boosted))
         return max(1, boosted), boosted > base_budget
 
     def _late_minimum_for_budget(self, simulation_budget):
         simulation_budget = max(1, int(simulation_budget))
-        if self.adaptive_search_late_min_multiplier <= 0.0:
+        if _ADAPTIVE_LATE_MIN_MULTIPLIER <= 0.0:
             return 1
-        return max(1, int(round(float(simulation_budget) * self.adaptive_search_late_min_multiplier)))
+        return max(1, int(round(float(simulation_budget) * _ADAPTIVE_LATE_MIN_MULTIPLIER)))
 
     def _adaptive_search_minimum_for_root(self, root, simulation_budget=None, move_count=None, extended_budget=False):
-        minimum = int(self.adaptive_search_min_simulations)
-        sim_budget = max(1, int(simulation_budget or minimum))
+        requirements = self._adaptive_search_requirements_for_root(
+            root,
+            simulation_budget=simulation_budget,
+            move_count=move_count,
+            extended_budget=extended_budget,
+        )
+        return int(requirements['minimum'])
 
-        if root is None or not root.expanded or root.edges is None:
-            legal_count = 0
-        else:
-            legal_count = len(root.edges.moves) if root.edges.moves is not None else 0
-        if root is not None and root.expanded and root.edges is not None and legal_count <= 1:
-            return 1
+    def _adaptive_search_confidence_thresholds_for_root(self, root):
+        requirements = self._adaptive_search_requirements_for_root(root)
+        return (
+            float(requirements['top_confidence']),
+            float(requirements['visit_gap']),
+            float(requirements['max_entropy']),
+        )
 
-        if 1 < legal_count <= self.adaptive_search_low_branching_moves:
-            minimum = min(minimum, int(self.adaptive_search_low_branching_min_simulations))
-
+    def _adaptive_search_root_profile(self, root):
+        legal_count = 0
+        piece_count = None
         if root is not None and root.expanded and root.edges is not None:
+            legal_count = len(root.edges.moves) if root.edges.moves is not None else 0
             try:
-                if len(root.board.piece_map()) <= self.adaptive_search_endgame_piece_count:
-                    minimum = min(minimum, int(self.adaptive_search_endgame_min_simulations))
+                piece_count = len(root.board.piece_map())
             except Exception:
-                pass
+                piece_count = None
+        return {
+            'legal_count': int(legal_count),
+            'forced': bool(root is not None and root.expanded and root.edges is not None and legal_count <= 1),
+            'low_branching': bool(1 < legal_count <= self.adaptive_search_low_branching_moves),
+            'endgame': bool(piece_count is not None and piece_count <= self.adaptive_search_endgame_piece_count),
+        }
+
+    def _adaptive_search_requirements_for_root(
+        self,
+        root,
+        simulation_budget=None,
+        move_count=None,
+        extended_budget=False,
+    ):
+        base_minimum = max(1, int(self.adaptive_search_min_simulations))
+        sim_budget = max(1, int(simulation_budget or base_minimum))
+        profile = self._adaptive_search_root_profile(root)
+        legal_count = int(profile['legal_count'])
+
+        if profile['forced']:
+            return {
+                'minimum': 1,
+                'legal_count': legal_count,
+                'required_visited': 1,
+                'required_prior_mass': 0.0,
+                'top_confidence': 0.0,
+                'visit_gap': 0.0,
+                'max_entropy': 1.0,
+                'locked_confidence': 0.0,
+                'locked_gap': 0.0,
+                'locked_entropy': 1.0,
+            }
+
+        minimum = base_minimum
+        budget_fraction = float(self.adaptive_search_min_budget_fraction)
+        required_prior_mass = float(self.adaptive_search_min_explored_prior_mass)
+
+        if profile['low_branching']:
+            minimum = min(minimum, int(round(base_minimum * _ADAPTIVE_LOW_BRANCHING_MIN_FRACTION)))
+            budget_fraction = min(budget_fraction, _ADAPTIVE_LOW_BRANCHING_BUDGET_FRACTION)
+            required_prior_mass = min(required_prior_mass, _ADAPTIVE_LOW_BRANCHING_PRIOR_MASS)
+
+        if profile['endgame']:
+            minimum = min(minimum, int(round(base_minimum * _ADAPTIVE_ENDGAME_MIN_FRACTION)))
+            budget_fraction = min(budget_fraction, _ADAPTIVE_ENDGAME_BUDGET_FRACTION)
+
+        if budget_fraction > 0.0:
+            minimum = max(minimum, int(round(float(sim_budget) * budget_fraction)))
+
         if (
             self.adaptive_search_enabled
-            and self.adaptive_search_late_budget_enabled
             and move_count is not None
             and int(move_count) >= self.adaptive_search_late_after_ply
         ):
             minimum = max(minimum, self._late_minimum_for_budget(sim_budget))
         if extended_budget:
             minimum = max(minimum, self._late_minimum_for_budget(sim_budget))
-        if simulation_budget is not None:
-            minimum = min(sim_budget, minimum)
-        return max(1, int(minimum))
 
-    def _adaptive_search_confidence_thresholds_for_root(self, root):
+        minimum = min(sim_budget, max(1, int(minimum)))
+        required_visited = min(max(1, legal_count), max(1, int(self.adaptive_search_min_visited_moves)))
         top_confidence = float(self.adaptive_search_top_visit_confidence)
         visit_gap = float(self.adaptive_search_visit_gap)
         max_entropy = float(self.adaptive_search_max_entropy)
-        if root is None or not root.expanded or root.edges is None:
-            return top_confidence, visit_gap, max_entropy
 
-        legal_count = len(root.edges.moves) if root.edges.moves is not None else 0
-        if 1 < legal_count <= self.adaptive_search_low_branching_moves:
-            delta = float(self.adaptive_search_low_branching_confidence_delta)
-            top_confidence = max(0.0, top_confidence - delta)
-            visit_gap = max(0.0, visit_gap - delta)
-            max_entropy = min(1.0, max_entropy + delta)
-        return top_confidence, visit_gap, max_entropy
+        return {
+            'minimum': int(minimum),
+            'legal_count': legal_count,
+            'required_visited': int(required_visited),
+            'required_prior_mass': float(max(0.0, min(1.0, required_prior_mass))),
+            'top_confidence': float(max(0.0, min(1.0, top_confidence))),
+            'visit_gap': float(max(0.0, min(1.0, visit_gap))),
+            'max_entropy': float(max(0.0, min(1.0, max_entropy))),
+            'locked_confidence': float(max(0.0, min(1.0, top_confidence - 0.08))),
+            'locked_gap': float(max(0.0, min(1.0, visit_gap * 0.75))),
+            'locked_entropy': float(max(0.0, min(1.0, max_entropy + 0.08))),
+        }
+
+    def _adaptive_search_target_ready(self, root, summary, requirements=None):
+        if root is None or not root.expanded or root.edges is None:
+            return False
+        if requirements is None:
+            requirements = self._adaptive_search_requirements_for_root(root)
+        legal_count = int(requirements.get('legal_count', 0) or 0)
+        if legal_count <= 1:
+            return True
+
+        visited_count = int(summary.get('visited_move_count', 0) or 0)
+        required_visited = int(requirements.get('required_visited', self.adaptive_search_min_visited_moves))
+        if visited_count < required_visited:
+            return False
+
+        if visited_count >= legal_count:
+            return True
+        required_prior_mass = float(requirements.get('required_prior_mass', self.adaptive_search_min_explored_prior_mass))
+        return float(summary.get('explored_prior_mass', 0.0) or 0.0) >= required_prior_mass
 
     def _adaptive_search_stop_reason(
         self,
@@ -1725,19 +1827,22 @@ class MultiGameBatchMCTS:
     ):
         if not self.adaptive_search_enabled:
             return None
-        summary = self._summarize_root_search(root, simulation_budget, initial_root_visits=initial_root_visits)
-        used = int(summary['simulations_used'])
-        if root is None or not root.expanded or root.edges is None:
-            return None
-        legal_count = len(root.edges.moves) if root.edges.moves is not None else 0
-        if legal_count <= 1:
-            return 'forced'
-        if used < self._adaptive_search_minimum_for_root(
+        requirements = self._adaptive_search_requirements_for_root(
             root,
             simulation_budget=simulation_budget,
             move_count=move_count,
             extended_budget=extended_budget,
-        ):
+        )
+        summary = self._summarize_root_search(root, simulation_budget, initial_root_visits=initial_root_visits)
+        used = int(summary['simulations_used'])
+        if root is None or not root.expanded or root.edges is None:
+            return None
+        legal_count = int(requirements.get('legal_count', 0) or 0)
+        if legal_count <= 1:
+            return 'forced'
+        if used < int(requirements['minimum']):
+            return None
+        if not self._adaptive_search_target_ready(root, summary, requirements=requirements):
             return None
 
         visits = root.edges.visit_counts.astype(np.int32, copy=False)
@@ -1747,14 +1852,18 @@ class MultiGameBatchMCTS:
             top = int(visits[-1])
             second = int(visits[-2]) if visits.size > 1 else 0
             remaining = max(0, int(simulation_budget) - used)
-            if (top - second) > (remaining + self.adaptive_search_locked_margin):
+            if (
+                (top - second) > (remaining + _ADAPTIVE_LOCKED_MARGIN)
+                and summary['top_visit_prob'] >= float(requirements['locked_confidence'])
+                and summary['visit_gap'] >= float(requirements['locked_gap'])
+                and summary['visit_entropy'] <= float(requirements['locked_entropy'])
+            ):
                 return 'locked'
 
-        top_confidence, visit_gap, max_entropy = self._adaptive_search_confidence_thresholds_for_root(root)
         if (
-            summary['top_visit_prob'] >= top_confidence
-            and summary['visit_gap'] >= visit_gap
-            and summary['visit_entropy'] <= max_entropy
+            summary['top_visit_prob'] >= float(requirements['top_confidence'])
+            and summary['visit_gap'] >= float(requirements['visit_gap'])
+            and summary['visit_entropy'] <= float(requirements['max_entropy'])
         ):
             return 'confident'
         return None
@@ -1773,7 +1882,7 @@ class MultiGameBatchMCTS:
             if return_search_metadata:
                 return [], []
             return []
-        search_t0 = time.perf_counter() if self.profile_enabled else None
+        search_t0 = time.perf_counter()
 
         game_count = len(game_states)
         boards = [None] * game_count
@@ -2003,9 +2112,8 @@ class MultiGameBatchMCTS:
             search_metadata.append(metadata)
         if self.profile_enabled:
             self._profile_add('search_metadata_time', time.perf_counter() - metadata_t0)
-        if self.profile_enabled:
-            self._profile_add('search_many_time', time.perf_counter() - search_t0)
-            self._profile_inc('search_many_calls', 1)
+        self._profile_add('search_many_time', time.perf_counter() - search_t0)
+        self._profile_inc('search_many_calls', 1)
         if return_search_metadata:
             return result, search_metadata
         return result
@@ -2106,7 +2214,7 @@ class MultiGameBatchMCTS:
                     self._profile_add('batch_expand_input_pack_time', time.perf_counter() - input_pack_t0)
 
             use_cuda_stage_timing = (
-                self.profile_enabled
+                self.cuda_stage_profile_enabled
                 and self.device.type == 'cuda'
                 and torch.cuda.is_available()
             )
@@ -2148,7 +2256,7 @@ class MultiGameBatchMCTS:
                 if self.profile_enabled:
                     self._profile_add('batch_expand_legal_index_pack_time', time.perf_counter() - legal_pack_t0)
 
-            inference_t0 = time.perf_counter() if self.profile_enabled else None
+            inference_t0 = time.perf_counter()
             h2d_legal_start = None
             h2d_legal_end = None
             wdl_start = None
@@ -2233,47 +2341,47 @@ class MultiGameBatchMCTS:
                 values_batch = values_batch.float().cpu().numpy()
                 if d2h_values_end is not None:
                     d2h_values_end.record()
+            self._profile_inc('nn_inference_calls', 1)
+            self._profile_inc('nn_inference_batch_items', batch_n)
+            self._profile_inc('nn_legal_move_items', sum(legal_counts))
+            self._profile_add('nn_inference_time', time.perf_counter() - inference_t0)
+            server_batch_size = int(getattr(self.model, 'last_server_batch_size', 0) or 0)
+            if server_batch_size > 0:
+                self._profile_inc('central_inference_requests', 1)
+                self._profile_inc('central_inference_server_batch_items', server_batch_size)
+                self._profile_add(
+                    'central_inference_remote_wait_time',
+                    float(getattr(self.model, 'last_remote_wait_s', 0.0) or 0.0),
+                )
+                self._profile_add(
+                    'central_inference_request_put_time',
+                    float(getattr(self.model, 'last_request_put_s', 0.0) or 0.0),
+                )
+                self._profile_add(
+                    'central_inference_server_queue_wait_time',
+                    float(getattr(self.model, 'last_server_queue_wait_s', 0.0) or 0.0),
+                )
+                self._profile_add(
+                    'central_inference_server_total_time',
+                    float(getattr(self.model, 'last_server_total_s', 0.0) or 0.0),
+                )
+                self._profile_add(
+                    'central_inference_server_concat_time',
+                    float(getattr(self.model, 'last_server_concat_s', 0.0) or 0.0),
+                )
+                self._profile_add(
+                    'central_inference_server_h2d_time',
+                    float(getattr(self.model, 'last_server_h2d_s', 0.0) or 0.0),
+                )
+                self._profile_add(
+                    'central_inference_server_forward_time',
+                    float(getattr(self.model, 'last_server_forward_s', 0.0) or 0.0),
+                )
+                self._profile_add(
+                    'central_inference_server_d2h_time',
+                    float(getattr(self.model, 'last_server_d2h_s', 0.0) or 0.0),
+                )
             if self.profile_enabled:
-                self._profile_add('nn_inference_time', time.perf_counter() - inference_t0)
-                self._profile_inc('nn_inference_calls', 1)
-                self._profile_inc('nn_inference_batch_items', batch_n)
-                self._profile_inc('nn_legal_move_items', sum(legal_counts))
-                server_batch_size = int(getattr(self.model, 'last_server_batch_size', 0) or 0)
-                if server_batch_size > 0:
-                    self._profile_inc('central_inference_requests', 1)
-                    self._profile_inc('central_inference_server_batch_items', server_batch_size)
-                    self._profile_add(
-                        'central_inference_remote_wait_time',
-                        float(getattr(self.model, 'last_remote_wait_s', 0.0) or 0.0),
-                    )
-                    self._profile_add(
-                        'central_inference_request_put_time',
-                        float(getattr(self.model, 'last_request_put_s', 0.0) or 0.0),
-                    )
-                    self._profile_add(
-                        'central_inference_server_queue_wait_time',
-                        float(getattr(self.model, 'last_server_queue_wait_s', 0.0) or 0.0),
-                    )
-                    self._profile_add(
-                        'central_inference_server_total_time',
-                        float(getattr(self.model, 'last_server_total_s', 0.0) or 0.0),
-                    )
-                    self._profile_add(
-                        'central_inference_server_concat_time',
-                        float(getattr(self.model, 'last_server_concat_s', 0.0) or 0.0),
-                    )
-                    self._profile_add(
-                        'central_inference_server_h2d_time',
-                        float(getattr(self.model, 'last_server_h2d_s', 0.0) or 0.0),
-                    )
-                    self._profile_add(
-                        'central_inference_server_forward_time',
-                        float(getattr(self.model, 'last_server_forward_s', 0.0) or 0.0),
-                    )
-                    self._profile_add(
-                        'central_inference_server_d2h_time',
-                        float(getattr(self.model, 'last_server_d2h_s', 0.0) or 0.0),
-                    )
                 if use_cuda_stage_timing:
                     torch.cuda.synchronize(self.device)
 
@@ -2482,17 +2590,6 @@ class BatchSelfPlayMCTSBatch:
             0.05,
             min(1.0, float(rl_cfg.get('policy_target_pruning_keep_mass', 0.92))),
         )
-        self.policy_target_sharpening_enabled = bool(
-            rl_cfg.get('policy_target_sharpening_enabled', False)
-        )
-        self.policy_target_sharpening_power = max(
-            1.0,
-            float(rl_cfg.get('policy_target_sharpening_power', 1.0)),
-        )
-        self.policy_target_sharpening_min_top1 = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('policy_target_sharpening_min_top1', 0.0))),
-        )
         self.policy_target_quality_weighting_enabled = bool(
             rl_cfg.get('policy_target_quality_weighting_enabled', False)
         )
@@ -2507,6 +2604,32 @@ class BatchSelfPlayMCTSBatch:
         self.policy_target_quality_top1_threshold = max(
             0.0,
             min(1.0, float(rl_cfg.get('policy_target_quality_top1_threshold', 0.48))),
+        )
+        self.policy_target_search_discovery_weighting_enabled = bool(
+            rl_cfg.get('policy_target_search_discovery_weighting_enabled', False)
+        )
+        self.policy_target_search_discovery_min_q_delta = float(
+            rl_cfg.get('policy_target_search_discovery_min_q_delta', 0.04)
+        )
+        self.policy_target_search_discovery_q_delta_ref = max(
+            1e-6,
+            float(rl_cfg.get('policy_target_search_discovery_q_delta_ref', 0.30)),
+        )
+        self.policy_target_search_discovery_bonus = max(
+            0.0,
+            float(rl_cfg.get('policy_target_search_discovery_bonus', 0.20)),
+        )
+        self.policy_target_search_discovery_q_bonus = max(
+            0.0,
+            float(rl_cfg.get('policy_target_search_discovery_q_bonus', 0.30)),
+        )
+        self.policy_target_search_discovery_rank_bonus = max(
+            0.0,
+            float(rl_cfg.get('policy_target_search_discovery_rank_bonus', 0.15)),
+        )
+        self.policy_target_search_discovery_max_weight = max(
+            1.0,
+            float(rl_cfg.get('policy_target_search_discovery_max_weight', 1.55)),
         )
         self.store_frozen_best_positions = bool(
             rl_cfg.get('self_play_store_frozen_best_positions', True)
@@ -2548,14 +2671,9 @@ class BatchSelfPlayMCTSBatch:
         self._games_completed = 0
         self._progress_base = 0
         self._plan_cursor = 0
-        rl_cfg = self.config.get('reinforcement_learning', {})
-        self.value_target_temporal_decay = float(
-            rl_cfg.get('value_target_temporal_decay', 0.992)
-        )
-        self.value_target_min_scale = float(
-            rl_cfg.get('value_target_min_scale', 0.25)
-        )
-        self.profile_enabled = _debug_bool(self.config, 'rl', 'profile_training', False)
+        # Performance CSV/PNG should not depend on debug.rl.profile_training.
+        # That flag controls console/debug verbosity, not collection of cheap counters.
+        self.profile_enabled = True
         self._profile_stats = {}
         self.reset_profile_stats()
 
@@ -2807,32 +2925,43 @@ class BatchSelfPlayMCTSBatch:
         min_weight = float(self.policy_target_quality_min_weight)
         return float(min_weight + (1.0 - min_weight) * confidence)
 
-    def _shape_policy_target_visits(self, visit_counts):
-        if not visit_counts:
-            return visit_counts, 0.0, 1.0, 1.0
+    def _policy_target_search_discovery_weight(self, search_metadata):
+        if not self.policy_target_search_discovery_weighting_enabled:
+            return 1.0
+        if not isinstance(search_metadata, dict):
+            return 1.0
+        try:
+            changed_top = float(search_metadata.get('prior_mcts_agree', 1.0)) < 0.5
+        except (TypeError, ValueError):
+            changed_top = False
+        if not changed_top:
+            return 1.0
 
-        top1, entropy = self._policy_target_quality_from_visits(visit_counts)
-        quality_weight = self._policy_target_quality_weight(top1, entropy)
+        q_delta = search_metadata.get('mcts_q_delta', None)
+        if q_delta is None:
+            return 1.0
+        try:
+            q_delta = float(q_delta)
+        except (TypeError, ValueError):
+            return 1.0
+        if not math.isfinite(q_delta) or q_delta < float(self.policy_target_search_discovery_min_q_delta):
+            return 1.0
 
-        if not self.policy_target_sharpening_enabled:
-            return visit_counts, top1, entropy, quality_weight
+        q_strength = max(0.0, min(1.0, q_delta / float(self.policy_target_search_discovery_q_delta_ref)))
+        rank_strength = 0.0
+        try:
+            prior_rank = int(search_metadata.get('prior_top_visit_rank', 1) or 1)
+            rank_strength = max(0.0, min(1.0, float(prior_rank - 1) / 4.0))
+        except (TypeError, ValueError):
+            rank_strength = 0.0
 
-        power = float(self.policy_target_sharpening_power)
-        if power <= 1.0:
-            return visit_counts, top1, entropy, quality_weight
-        if top1 >= float(self.policy_target_sharpening_min_top1):
-            return visit_counts, top1, entropy, quality_weight
-
-        shaped = {
-            move: float(count) ** power
-            for move, count in visit_counts.items()
-            if float(count) > 0.0
-        }
-        if not shaped:
-            return visit_counts, top1, entropy, quality_weight
-        shaped_top1, shaped_entropy = self._policy_target_quality_from_visits(shaped)
-        shaped_weight = self._policy_target_quality_weight(shaped_top1, shaped_entropy)
-        return shaped, shaped_top1, shaped_entropy, shaped_weight
+        weight = (
+            1.0
+            + float(self.policy_target_search_discovery_bonus)
+            + float(self.policy_target_search_discovery_q_bonus) * q_strength
+            + float(self.policy_target_search_discovery_rank_bonus) * rank_strength
+        )
+        return float(max(1.0, min(float(self.policy_target_search_discovery_max_weight), weight)))
 
     def _should_store_policy_position(self, learner_turn, game_opponent_mcts, opponent_label):
         if learner_turn or game_opponent_mcts is None:
@@ -3114,7 +3243,6 @@ class BatchSelfPlayMCTSBatch:
         outcome,
         draw_value_target=0.0,
     ):
-        total_history = len(gs['game_history'])
         history_entry = gs['game_history'][int(history_idx)]
         history_count, policy_indices, policy_values, turn = history_entry[:4]
         importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
@@ -3123,13 +3251,8 @@ class BatchSelfPlayMCTSBatch:
         if outcome == 0.0:
             value = draw_value_target
         else:
-            remaining_plies = max(0, (total_history - 1) - int(history_idx))
-            temporal_scale = max(
-                self.value_target_min_scale,
-                self.value_target_temporal_decay ** remaining_plies,
-            )
             signed_outcome = outcome if turn == chess.WHITE else -outcome
-            value = float(signed_outcome * temporal_scale)
+            value = float(signed_outcome)
 
         return {
             'history_idx': int(history_idx),
@@ -3301,6 +3424,16 @@ class BatchSelfPlayMCTSBatch:
         gs['_root_synced'] = False
         gs['_opponent_root_synced'] = False
 
+    @staticmethod
+    def _advance_search_root(root, move):
+        if root is None:
+            return None, False
+        child = root.get_child_for_move(move)
+        if child is None:
+            return None, False
+        _ = child.board
+        return child.detach_as_root(), True
+
     def _maybe_finish_with_syzygy(self, gs, board):
         if self.syzygy is None or board.is_game_over(claim_draw=False):
             return None
@@ -3404,10 +3537,21 @@ class BatchSelfPlayMCTSBatch:
             'mcts_prior_top_visit_prob_sum': 0.0,
             'mcts_top_prior_prob_sum': 0.0,
             'mcts_policy_kl_sum': 0.0,
+            'mcts_explored_prior_mass_sum': 0.0,
+            'mcts_visited_move_count_sum': 0.0,
+            'mcts_legal_move_count_sum': 0.0,
             'mcts_q_delta_samples': 0.0,
             'mcts_q_delta_sum': 0.0,
             'mcts_q_delta_values': [],
+            'mcts_q_delta_hist': [0] * _Q_DELTA_HIST_BINS,
             'mcts_changed_to_lower_q_count': 0.0,
+            'mcts_changed_to_higher_q_count': 0.0,
+            'mcts_changed_q_delta_samples': 0.0,
+            'mcts_changed_q_delta_sum': 0.0,
+            'mcts_changed_q_delta_values': [],
+            'mcts_changed_q_delta_hist': [0] * _Q_DELTA_HIST_BINS,
+            'mcts_search_discovery_count': 0.0,
+            'mcts_search_discovery_weight_sum': 0.0,
         }
         opponent_source_counts = {}
         opponent_source_results = {}
@@ -3442,8 +3586,13 @@ class BatchSelfPlayMCTSBatch:
         for reason, count in dict(batch_stats.get('adaptive_stop_reasons', {}) or {}).items():
             adaptive_stop_reasons[str(reason)] = int(adaptive_stop_reasons.get(str(reason), 0)) + int(count)
         for key in total_mcts_quality_stats:
-            if key == 'mcts_q_delta_values':
+            if key in {'mcts_q_delta_values', 'mcts_changed_q_delta_values'}:
                 total_mcts_quality_stats[key].extend(list(batch_stats.get(key, []) or []))
+            elif key in {'mcts_q_delta_hist', 'mcts_changed_q_delta_hist'}:
+                source_hist = list(batch_stats.get(key, []) or [])
+                if len(source_hist) == _Q_DELTA_HIST_BINS:
+                    for idx, count in enumerate(source_hist):
+                        total_mcts_quality_stats[key][idx] += int(count or 0)
             else:
                 total_mcts_quality_stats[key] += float(batch_stats.get(key, 0.0) or 0.0)
         for label, count in dict(batch_stats.get('opponent_source_counts', {}) or {}).items():
@@ -3477,6 +3626,10 @@ class BatchSelfPlayMCTSBatch:
         mcts_quality_samples = int(total_mcts_quality_stats['mcts_prior_agreement_samples'])
         mcts_q_delta_samples = int(total_mcts_quality_stats['mcts_q_delta_samples'])
         mcts_q_delta_values = list(total_mcts_quality_stats.get('mcts_q_delta_values', []) or [])
+        mcts_q_delta_hist = list(total_mcts_quality_stats.get('mcts_q_delta_hist', []) or [])
+        mcts_changed_q_delta_samples = int(total_mcts_quality_stats['mcts_changed_q_delta_samples'])
+        mcts_changed_q_delta_values = list(total_mcts_quality_stats.get('mcts_changed_q_delta_values', []) or [])
+        mcts_changed_q_delta_hist = list(total_mcts_quality_stats.get('mcts_changed_q_delta_hist', []) or [])
         self.last_selfplay_stats = {
             'truncated_games': total_truncated_games,
             'completed_games': max(0, total_games - total_truncated_games),
@@ -3535,6 +3688,18 @@ class BatchSelfPlayMCTSBatch:
                 if mcts_quality_samples > 0
                 else 0.0
             ),
+            'mcts_search_discovery_count': int(total_mcts_quality_stats['mcts_search_discovery_count']),
+            'mcts_search_discovery_rate': (
+                float(total_mcts_quality_stats['mcts_search_discovery_count']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_search_discovery_weight_mean': (
+                float(total_mcts_quality_stats['mcts_search_discovery_weight_sum'])
+                / float(total_mcts_quality_stats['mcts_search_discovery_count'])
+                if int(total_mcts_quality_stats['mcts_search_discovery_count']) > 0
+                else 1.0
+            ),
             'mcts_prior_top_visit_prob_sum': float(total_mcts_quality_stats['mcts_prior_top_visit_prob_sum']),
             'mcts_prior_top_visit_prob_mean': (
                 float(total_mcts_quality_stats['mcts_prior_top_visit_prob_sum']) / float(mcts_quality_samples)
@@ -3553,25 +3718,47 @@ class BatchSelfPlayMCTSBatch:
                 if mcts_quality_samples > 0
                 else 0.0
             ),
+            'mcts_explored_prior_mass_mean': (
+                float(total_mcts_quality_stats['mcts_explored_prior_mass_sum']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_visited_move_count_mean': (
+                float(total_mcts_quality_stats['mcts_visited_move_count_sum']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_legal_move_count_mean': (
+                float(total_mcts_quality_stats['mcts_legal_move_count_sum']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
             'mcts_q_delta_samples': int(mcts_q_delta_samples),
             'mcts_q_delta_sum': float(total_mcts_quality_stats['mcts_q_delta_sum']),
+            'mcts_q_delta_hist': mcts_q_delta_hist,
             'mcts_q_delta_mean': (
                 float(total_mcts_quality_stats['mcts_q_delta_sum']) / float(mcts_q_delta_samples)
                 if mcts_q_delta_samples > 0
                 else 0.0
             ),
             'mcts_q_delta_p10': (
-                float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 10))
+                _q_delta_percentile_from_histogram(mcts_q_delta_hist, 10)
+                if sum(mcts_q_delta_hist or []) > 0
+                else float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 10))
                 if mcts_q_delta_values
                 else 0.0
             ),
             'mcts_q_delta_p50': (
-                float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 50))
+                _q_delta_percentile_from_histogram(mcts_q_delta_hist, 50)
+                if sum(mcts_q_delta_hist or []) > 0
+                else float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 50))
                 if mcts_q_delta_values
                 else 0.0
             ),
             'mcts_q_delta_p90': (
-                float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 90))
+                _q_delta_percentile_from_histogram(mcts_q_delta_hist, 90)
+                if sum(mcts_q_delta_hist or []) > 0
+                else float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 90))
                 if mcts_q_delta_values
                 else 0.0
             ),
@@ -3579,6 +3766,46 @@ class BatchSelfPlayMCTSBatch:
             'mcts_changed_to_lower_q_rate': (
                 float(total_mcts_quality_stats['mcts_changed_to_lower_q_count']) / float(mcts_q_delta_samples)
                 if mcts_q_delta_samples > 0
+                else 0.0
+            ),
+            'mcts_changed_to_higher_q_count': int(total_mcts_quality_stats['mcts_changed_to_higher_q_count']),
+            'mcts_changed_q_delta_samples': int(mcts_changed_q_delta_samples),
+            'mcts_changed_q_delta_sum': float(total_mcts_quality_stats['mcts_changed_q_delta_sum']),
+            'mcts_changed_q_delta_hist': mcts_changed_q_delta_hist,
+            'mcts_changed_q_delta_mean': (
+                float(total_mcts_quality_stats['mcts_changed_q_delta_sum']) / float(mcts_changed_q_delta_samples)
+                if mcts_changed_q_delta_samples > 0
+                else 0.0
+            ),
+            'mcts_changed_q_delta_p10': (
+                _q_delta_percentile_from_histogram(mcts_changed_q_delta_hist, 10)
+                if sum(mcts_changed_q_delta_hist or []) > 0
+                else float(np.percentile(np.asarray(mcts_changed_q_delta_values, dtype=np.float32), 10))
+                if mcts_changed_q_delta_values
+                else 0.0
+            ),
+            'mcts_changed_q_delta_p50': (
+                _q_delta_percentile_from_histogram(mcts_changed_q_delta_hist, 50)
+                if sum(mcts_changed_q_delta_hist or []) > 0
+                else float(np.percentile(np.asarray(mcts_changed_q_delta_values, dtype=np.float32), 50))
+                if mcts_changed_q_delta_values
+                else 0.0
+            ),
+            'mcts_changed_q_delta_p90': (
+                _q_delta_percentile_from_histogram(mcts_changed_q_delta_hist, 90)
+                if sum(mcts_changed_q_delta_hist or []) > 0
+                else float(np.percentile(np.asarray(mcts_changed_q_delta_values, dtype=np.float32), 90))
+                if mcts_changed_q_delta_values
+                else 0.0
+            ),
+            'mcts_changed_to_higher_q_rate': (
+                float(total_mcts_quality_stats['mcts_changed_to_higher_q_count']) / float(mcts_changed_q_delta_samples)
+                if mcts_changed_q_delta_samples > 0
+                else 0.0
+            ),
+            'mcts_changed_to_lower_q_when_changed_rate': (
+                float(total_mcts_quality_stats['mcts_changed_to_lower_q_count']) / float(mcts_changed_q_delta_samples)
+                if mcts_changed_q_delta_samples > 0
                 else 0.0
             ),
             'total_games': int(total_games),
@@ -3704,10 +3931,19 @@ class BatchSelfPlayMCTSBatch:
             'prior_top_visit_prob_sum': 0.0,
             'mcts_top_prior_prob_sum': 0.0,
             'policy_kl_sum': 0.0,
+            'explored_prior_mass_sum': 0.0,
+            'visited_move_count_sum': 0.0,
+            'legal_move_count_sum': 0.0,
             'q_comparable': 0,
             'q_delta_sum': 0.0,
             'q_delta_values': [],
             'changed_to_lower_q': 0,
+            'changed_to_higher_q': 0,
+            'changed_q_comparable': 0,
+            'changed_q_delta_sum': 0.0,
+            'changed_q_delta_values': [],
+            'search_discovery_count': 0,
+            'search_discovery_weight_sum': 0.0,
         }
 
         def _accumulate_target_quality(search_metadata):
@@ -3725,6 +3961,9 @@ class BatchSelfPlayMCTSBatch:
                 ('prior_top_visit_prob', 'prior_top_visit_prob_sum'),
                 ('mcts_top_prior_prob', 'mcts_top_prior_prob_sum'),
                 ('mcts_policy_kl', 'policy_kl_sum'),
+                ('explored_prior_mass', 'explored_prior_mass_sum'),
+                ('visited_move_count', 'visited_move_count_sum'),
+                ('legal_move_count', 'legal_move_count_sum'),
             ]:
                 value = search_metadata.get(meta_key, None)
                 if value is not None:
@@ -3735,8 +3974,14 @@ class BatchSelfPlayMCTSBatch:
                 q_delta_value = float(q_delta)
                 target_quality['q_delta_sum'] += q_delta_value
                 target_quality['q_delta_values'].append(q_delta_value)
-                if float(search_metadata.get('mcts_changed_to_lower_q') or 0.0) > 0.5:
-                    target_quality['changed_to_lower_q'] += 1
+                if agree_value < 0.5:
+                    target_quality['changed_q_comparable'] += 1
+                    target_quality['changed_q_delta_sum'] += q_delta_value
+                    target_quality['changed_q_delta_values'].append(q_delta_value)
+                    if q_delta_value < -0.02:
+                        target_quality['changed_to_lower_q'] += 1
+                    elif q_delta_value > 0.02:
+                        target_quality['changed_to_higher_q'] += 1
 
         while len(completed_game_states) < total_games_to_play:
             active_indices = []
@@ -3881,13 +4126,20 @@ class BatchSelfPlayMCTSBatch:
                 if store_policy_position:
                     policy_t0 = time.perf_counter() if self.profile_enabled else None
                     visit_counts = self._prune_policy_target_visits(visit_counts)
-                    visit_counts, _, _, target_quality_weight = self._shape_policy_target_visits(visit_counts)
+                    top1, entropy = self._policy_target_quality_from_visits(visit_counts)
+                    target_quality_weight = self._policy_target_quality_weight(top1, entropy)
                     policy_indices, policy_values = _build_sparse_policy_target_from_visits(visit_counts, board)
                     history_count = len(gs['board_history'])
                     importance_score = self._compute_position_importance(board, move, visit_counts, root)
                     root_value = 0.0
                     policy_weight = float(search_metadata.get('policy_weight', 1.0)) if isinstance(search_metadata, dict) else 1.0
                     policy_weight *= float(target_quality_weight)
+                    discovery_weight = self._policy_target_search_discovery_weight(search_metadata)
+                    policy_weight *= float(discovery_weight)
+                    if discovery_weight > 1.0:
+                        importance_score *= min(float(discovery_weight), 1.35)
+                        target_quality['search_discovery_count'] += 1
+                        target_quality['search_discovery_weight_sum'] += float(discovery_weight)
                     if not learner_turn and game_opponent_mcts is not None:
                         policy_weight *= float(self.frozen_opponent_policy_weight)
                     _accumulate_target_quality(search_metadata)
@@ -3912,20 +4164,19 @@ class BatchSelfPlayMCTSBatch:
                 # Store cached tensors for both POVs to avoid repeated FEN parse + tensor rebuild.
                 gs['board_history'].append(self.mcts._encode_history_entry(board))
 
-                # Reuse selected subtree directly to skip FEN-matching next turn.
-                if game_opponent_mcts is None and root is not None:
-                    next_root = root.get_child_for_move(move)
-                else:
-                    next_root = None
-                if next_root is not None:
-                    _ = next_root.board
-                    gs[root_key] = next_root.detach_as_root()
-                    gs[synced_key] = True
-                else:
-                    gs['root'] = None
-                    gs['_root_synced'] = False
-                    gs['opponent_root'] = None
-                    gs['_opponent_root_synced'] = False
+                # Keep both side-specific MCTS trees synchronized with the
+                # actual game line. Mixed-opponent self-play otherwise starts
+                # every move from a fresh root and produces noisier targets.
+                for candidate_root_key, candidate_synced_key in [
+                    ('root', '_root_synced'),
+                    ('opponent_root', '_opponent_root_synced'),
+                ]:
+                    next_root, next_synced = self._advance_search_root(
+                        gs.get(candidate_root_key),
+                        move,
+                    )
+                    gs[candidate_root_key] = next_root
+                    gs[candidate_synced_key] = next_synced
 
                 board.push(move)
                 gs['move_count'] += 1
@@ -4068,6 +4319,11 @@ class BatchSelfPlayMCTSBatch:
             source_label = next(iter(opponent_source_counts.keys()))
         target_quality_samples = int(target_quality['samples'])
         target_quality_q_samples = int(target_quality['q_comparable'])
+        target_quality_changed_q_samples = int(target_quality['changed_q_comparable'])
+        q_delta_values = list(target_quality.get('q_delta_values', []) or [])
+        q_delta_hist = _q_delta_histogram(q_delta_values)
+        changed_q_delta_values = list(target_quality.get('changed_q_delta_values', []) or [])
+        changed_q_delta_hist = _q_delta_histogram(changed_q_delta_values)
         return positions, game_lengths, {
             'total_games': int(len(completed_game_states)),
             'truncated_games': int(truncated_games),
@@ -4102,6 +4358,18 @@ class BatchSelfPlayMCTSBatch:
                 if target_quality_samples > 0
                 else 0.0
             ),
+            'mcts_search_discovery_count': int(target_quality['search_discovery_count']),
+            'mcts_search_discovery_weight_sum': float(target_quality['search_discovery_weight_sum']),
+            'mcts_search_discovery_rate': (
+                float(target_quality['search_discovery_count']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_search_discovery_weight_mean': (
+                float(target_quality['search_discovery_weight_sum']) / float(target_quality['search_discovery_count'])
+                if int(target_quality['search_discovery_count']) > 0
+                else 1.0
+            ),
             'mcts_prior_top_visit_prob_sum': float(target_quality['prior_top_visit_prob_sum']),
             'mcts_prior_top_visit_prob_mean': (
                 float(target_quality['prior_top_visit_prob_sum']) / float(target_quality_samples)
@@ -4120,33 +4388,87 @@ class BatchSelfPlayMCTSBatch:
                 if target_quality_samples > 0
                 else 0.0
             ),
+            'mcts_explored_prior_mass_sum': float(target_quality['explored_prior_mass_sum']),
+            'mcts_explored_prior_mass_mean': (
+                float(target_quality['explored_prior_mass_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_visited_move_count_sum': float(target_quality['visited_move_count_sum']),
+            'mcts_visited_move_count_mean': (
+                float(target_quality['visited_move_count_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_legal_move_count_sum': float(target_quality['legal_move_count_sum']),
+            'mcts_legal_move_count_mean': (
+                float(target_quality['legal_move_count_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
             'mcts_q_delta_samples': target_quality_q_samples,
             'mcts_q_delta_sum': float(target_quality['q_delta_sum']),
-            'mcts_q_delta_values': list(target_quality.get('q_delta_values', []) or []),
+            'mcts_q_delta_values': q_delta_values,
+            'mcts_q_delta_hist': q_delta_hist,
             'mcts_q_delta_mean': (
                 float(target_quality['q_delta_sum']) / float(target_quality_q_samples)
                 if target_quality_q_samples > 0
                 else 0.0
             ),
             'mcts_q_delta_p10': (
-                float(np.percentile(np.asarray(target_quality.get('q_delta_values', []), dtype=np.float32), 10))
-                if target_quality.get('q_delta_values')
+                _q_delta_percentile_from_histogram(q_delta_hist, 10)
+                if sum(q_delta_hist or []) > 0
                 else 0.0
             ),
             'mcts_q_delta_p50': (
-                float(np.percentile(np.asarray(target_quality.get('q_delta_values', []), dtype=np.float32), 50))
-                if target_quality.get('q_delta_values')
+                _q_delta_percentile_from_histogram(q_delta_hist, 50)
+                if sum(q_delta_hist or []) > 0
                 else 0.0
             ),
             'mcts_q_delta_p90': (
-                float(np.percentile(np.asarray(target_quality.get('q_delta_values', []), dtype=np.float32), 90))
-                if target_quality.get('q_delta_values')
+                _q_delta_percentile_from_histogram(q_delta_hist, 90)
+                if sum(q_delta_hist or []) > 0
                 else 0.0
             ),
             'mcts_changed_to_lower_q_count': int(target_quality['changed_to_lower_q']),
             'mcts_changed_to_lower_q_rate': (
                 float(target_quality['changed_to_lower_q']) / float(target_quality_q_samples)
                 if target_quality_q_samples > 0
+                else 0.0
+            ),
+            'mcts_changed_to_higher_q_count': int(target_quality['changed_to_higher_q']),
+            'mcts_changed_q_delta_samples': int(target_quality_changed_q_samples),
+            'mcts_changed_q_delta_sum': float(target_quality['changed_q_delta_sum']),
+            'mcts_changed_q_delta_values': changed_q_delta_values,
+            'mcts_changed_q_delta_hist': changed_q_delta_hist,
+            'mcts_changed_q_delta_mean': (
+                float(target_quality['changed_q_delta_sum']) / float(target_quality_changed_q_samples)
+                if target_quality_changed_q_samples > 0
+                else 0.0
+            ),
+            'mcts_changed_q_delta_p10': (
+                _q_delta_percentile_from_histogram(changed_q_delta_hist, 10)
+                if sum(changed_q_delta_hist or []) > 0
+                else 0.0
+            ),
+            'mcts_changed_q_delta_p50': (
+                _q_delta_percentile_from_histogram(changed_q_delta_hist, 50)
+                if sum(changed_q_delta_hist or []) > 0
+                else 0.0
+            ),
+            'mcts_changed_q_delta_p90': (
+                _q_delta_percentile_from_histogram(changed_q_delta_hist, 90)
+                if sum(changed_q_delta_hist or []) > 0
+                else 0.0
+            ),
+            'mcts_changed_to_higher_q_rate': (
+                float(target_quality['changed_to_higher_q']) / float(target_quality_changed_q_samples)
+                if target_quality_changed_q_samples > 0
+                else 0.0
+            ),
+            'mcts_changed_to_lower_q_when_changed_rate': (
+                float(target_quality['changed_to_lower_q']) / float(target_quality_changed_q_samples)
+                if target_quality_changed_q_samples > 0
                 else 0.0
             ),
             'resigned_games': int(resigned_games),
@@ -4337,9 +4659,14 @@ class _RemoteInferenceModel:
         self._request_counter += 1
         request_id = f"{os.getpid()}_{id(self)}_{self._request_counter}"
         if isinstance(board_tensors, torch.Tensor):
-            boards_np = board_tensors.detach().to('cpu', dtype=self._transport_torch_dtype).contiguous().numpy()
+            boards_np = np.array(
+                board_tensors.detach().to('cpu', dtype=self._transport_torch_dtype).contiguous().numpy(),
+                dtype=self._transport_np_dtype,
+                copy=True,
+                order="C",
+            )
         else:
-            boards_np = np.asarray(board_tensors, dtype=self._transport_np_dtype)
+            boards_np = np.array(board_tensors, dtype=self._transport_np_dtype, copy=True, order="C")
         request = {
             "cmd": "infer",
             "rank": self.worker_rank,
@@ -4348,7 +4675,7 @@ class _RemoteInferenceModel:
             "boards": boards_np,
         }
         if legal_index_matrix is not None:
-            request["legal_index_matrix"] = np.asarray(legal_index_matrix, dtype=np.int16)
+            request["legal_index_matrix"] = np.array(legal_index_matrix, dtype=np.int16, copy=True, order="C")
         request["transport_dtype"] = self.transport_dtype
         request["queued_at"] = time.time()
         put_t0 = time.perf_counter()
@@ -4413,8 +4740,9 @@ class _RemoteInferenceModel:
                     f"{self.model_label} response (server_batch={self.last_server_batch_size}).",
                     flush=True,
                 )
-            policy = torch.from_numpy(np.asarray(response["policy_logits"], dtype=np.float32))
-            value = torch.from_numpy(np.asarray(response["value_logits"], dtype=np.float32))
+            policy_dtype = np.float16 if self.last_response_compact_policy else np.float32
+            policy = torch.from_numpy(np.array(response["policy_logits"], dtype=policy_dtype, copy=True, order="C"))
+            value = torch.from_numpy(np.array(response["value_logits"], dtype=np.float32, copy=True, order="C"))
             return policy, value
 
 
@@ -4430,6 +4758,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
             rl_cfg.get('self_play_central_inference_debug', False),
         )
     )
+    quiet_startup = True
     cache_enabled = bool(rl_cfg.get('self_play_central_inference_cache_enabled', True))
     cache_max_entries = max(0, int(rl_cfg.get('self_play_central_inference_cache_entries', 4096)))
     central_use_compile = bool(rl_cfg.get('self_play_central_inference_use_compile', False))
@@ -4458,14 +4787,15 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
         def _ts():
             return time.strftime("%H:%M:%S")
 
-        print(
-            f"[{_ts()}] Central inference: server ready on {device} "
-            f"(pid={os.getpid()}, compile_rank={compile_rank}, max_batch={max_batch}, flush={flush_ms:.1f}ms, "
-            f"transport={transport_np_dtype.__name__}, "
-            f"compile={'on' if central_use_compile else 'off'}, "
-            f"cudnn.benchmark={torch.backends.cudnn.benchmark if device.type == 'cuda' else 'n/a'}).",
-            flush=True,
-        )
+        if not quiet_startup:
+            print(
+                f"[{_ts()}] Central inference: server ready on {device} "
+                f"(pid={os.getpid()}, compile_rank={compile_rank}, max_batch={max_batch}, flush={flush_ms:.1f}ms, "
+                f"transport={transport_np_dtype.__name__}, "
+                f"compile={'on' if central_use_compile else 'off'}, "
+                f"cudnn.benchmark={torch.backends.cudnn.benchmark if device.type == 'cuda' else 'n/a'}).",
+                flush=True,
+            )
 
         def _warmup_central_model(model, label):
             if not central_use_compile or device.type != 'cuda':
@@ -4577,6 +4907,21 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                 response_channel.put(response)
 
         def _put_response(req, payload):
+            if payload.get("ok", False):
+                if "policy_logits" in payload:
+                    payload["policy_logits"] = np.array(
+                        payload["policy_logits"],
+                        dtype=np.float16,
+                        copy=True,
+                        order="C",
+                    )
+                if "value_logits" in payload:
+                    payload["value_logits"] = np.array(
+                        payload["value_logits"],
+                        dtype=np.float32,
+                        copy=True,
+                        order="C",
+                    )
             response = {
                 "request_id": req.get("request_id"),
                 "rank": int(req.get("rank", -1)),
@@ -4687,8 +5032,8 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                     d2h_t0 = time.perf_counter()
                     if compact_policy and legal_index_tensor is not None:
                         policy_logits = torch.gather(policy_logits, 1, legal_index_tensor)
-                    policy_np_batch = policy_logits.to(dtype=torch.float16).cpu().numpy()
-                    value_np_batch = value_logits.float().cpu().numpy()
+                    policy_np_batch = policy_logits.to(dtype=torch.float16).cpu().numpy().copy()
+                    value_np_batch = value_logits.float().cpu().numpy().copy()
                     if device.type == 'cuda':
                         torch.cuda.synchronize(device)
                     d2h_time += time.perf_counter() - d2h_t0
@@ -4797,16 +5142,27 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                         return label
 
                     model_summary = ", ".join(_format_loaded_model(info) for info in loaded_models)
-                    print(
-                        f"[{_ts()}] Central inference: models ready on {device}: "
-                        f"{model_summary} ({time.perf_counter() - load_t0:.2f}s).",
-                        flush=True,
-                    )
+                    if not quiet_startup:
+                        print(
+                            f"[{_ts()}] Central inference: models ready on {device}: "
+                            f"{model_summary} ({time.perf_counter() - load_t0:.2f}s).",
+                            flush=True,
+                        )
                 if control_queue is not None:
                     control_queue.put({
                         "type": "models_loaded",
                         "task_id": task_id,
                         "labels": sorted(models.keys()),
+                        "pid": int(os.getpid()),
+                        "server_rank": int(compile_rank),
+                        "device": str(device),
+                        "max_batch": int(max_batch),
+                        "flush_ms": float(flush_ms),
+                        "transport": str(transport_np_dtype.__name__),
+                        "compile": bool(central_use_compile),
+                        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark) if device.type == 'cuda' else None,
+                        "model_summary": model_summary if loaded_models else "",
+                        "load_s": float(time.perf_counter() - load_t0),
                     })
                 return "control"
             if cmd == "infer":
@@ -5186,7 +5542,7 @@ def persistent_selfplay_worker(
                 inference_request_queue,
                 inference_response_queue,
                 worker_rank=rank,
-                timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 120.0)),
+                timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 0.0)),
                 stall_warning_s=central_stall_warning_s,
                 debug_enabled=central_debug_enabled,
                 transport_dtype=central_transport_dtype,
@@ -5248,7 +5604,7 @@ def persistent_selfplay_worker(
                             inference_request_queue,
                             inference_response_queue,
                             worker_rank=rank,
-                            timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 120.0)),
+                            timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 0.0)),
                             stall_warning_s=central_stall_warning_s,
                             debug_enabled=central_debug_enabled,
                             transport_dtype=central_transport_dtype,

@@ -41,6 +41,15 @@ from src.batch_selfplay import MCTS, MultiGameBatchMCTS, select_move_by_visits
 from utils.shared.central_inference_session import CentralInferenceSession, snapshot_model_state_cpu
 
 
+def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict:
+    """Use deterministic full-budget MCTS for Stockfish Elo checks by default."""
+    eval_config = dict(config)
+    rl_cfg = dict(config.get("reinforcement_learning", {}))
+    rl_cfg["mcts_adaptive_search_enabled"] = False
+    eval_config["reinforcement_learning"] = rl_cfg
+    return eval_config
+
+
 # ---------------------------------------------------------------------------
 # Stockfish auto-download
 # ---------------------------------------------------------------------------
@@ -599,11 +608,11 @@ class EloEstimator:
         elo_config: dict | None = None,
     ):
         self.model = model
-        self.config = config
+        self.elo_config = dict(elo_config or {})
+        self.config = _build_elo_mcts_config(config, self.elo_config)
         self.device = device
         self.stockfish_path = stockfish_path
         self.stop_event = stop_event
-        self.elo_config = dict(elo_config or {})
         self._error_counters: dict[str, int] = {}
         self._thread_local = threading.local()
         self._worker_engines: list[chess.engine.SimpleEngine] = []
@@ -1415,7 +1424,6 @@ class EloEstimator:
             and workers > 1
             and self.device.type == "cuda"
             and self.elo_config.get("eval_elo_central_inference_enabled", False)
-            and int(simulations) >= int(self.elo_config.get("eval_elo_central_inference_min_simulations", 256) or 256)
         )
         if central_inference_enabled:
             # Central inference batches across independent MCTS workers. Keeping
@@ -1430,11 +1438,18 @@ class EloEstimator:
             f"games={'adaptive <= ' if adaptive_enabled else ''}{max_total_games}"
         )
         if adaptive_enabled:
+            adaptive_focus_cap = min(
+                max(1, int(games_per_level)),
+                max(
+                    1,
+                    int(self.elo_config.get("adaptive_focus_games_per_level", games_per_level) or games_per_level),
+                ),
+            )
             print(
                 "  Info: Adaptive Elo ladder enabled: "
                 f"levels={levels}, max_games={max_total_games}, "
                 f"probe={int(self.elo_config.get('adaptive_probe_games_per_level', 8) or 8)}, "
-                f"focus<= {int(self.elo_config.get('adaptive_focus_games_per_level', games_per_level) or games_per_level)}/level"
+                f"focus<= {adaptive_focus_cap}/level"
             )
         if batch_model_moves and workers > 1:
             model_path = "batched_mcts" if use_mcts else "batched_raw"
@@ -1528,6 +1543,12 @@ class EloEstimator:
                 focus_min = float(self.elo_config.get("adaptive_focus_min_score", 0.20) or 0.20)
                 focus_max = float(self.elo_config.get("adaptive_focus_max_score", 0.80) or 0.80)
                 target_focus = max(1, int(self.elo_config.get("adaptive_target_focus_levels", 4) or 4))
+                focus_min_games = min(focus_games, max(probe_games * 2, 16))
+                target_se = float(self.elo_config.get("adaptive_target_standard_error", 0.0) or 0.0)
+                min_games_for_se_stop = max(
+                    probe_games * target_focus,
+                    int(self.elo_config.get("adaptive_min_games_for_se_stop", 0) or 0),
+                )
                 min_batch_games_raw = self.elo_config.get("adaptive_min_batch_games", 0)
                 try:
                     min_batch_games = int(min_batch_games_raw or 0)
@@ -1543,6 +1564,32 @@ class EloEstimator:
                 total_scheduled = 0
 
                 probe_order = self._interleaved_ladder_order(levels)
+
+                def _score_for_level(level: int) -> float:
+                    return float(self._summarize_scores(scores_by_level.get(int(level), []))["score"])
+
+                def _played_candidate_levels() -> list[int]:
+                    return [
+                        int(level)
+                        for level in levels
+                        if played_by_level.get(int(level), 0) > 0
+                    ]
+
+                def _useful_candidate_count() -> int:
+                    count = 0
+                    for level in _played_candidate_levels():
+                        score = _score_for_level(level)
+                        if focus_min <= score <= focus_max:
+                            count += 1
+                    return count
+
+                def _estimate_precise_enough() -> bool:
+                    if target_se <= 0.0 or len(all_scores) < min_games_for_se_stop:
+                        return False
+                    estimated = _performance_rating(all_opponent_elos, all_scores)
+                    se = _elo_standard_error(all_opponent_elos, estimated)
+                    return bool(se is not None and float(se) <= target_se)
+
                 if bool(self.elo_config.get("elo_verbose_adaptive", False)):
                     print(
                         "  Adaptive probe waves: "
@@ -1577,39 +1624,50 @@ class EloEstimator:
                         if summary["score"] >= high_skip and bool(self.elo_config.get("elo_verbose_adaptive", False)):
                             print(f"  Adaptive ladder: SF {level} is saturated (score >= {high_skip:.0%}); probing higher.")
 
-                    # Keep the old "do not waste games far above a clearly too-strong
-                    # level" behavior, but only after the current CPU-filling wave.
+                    # Stop probing above a clearly too-strong level only after we
+                    # already have enough non-saturated candidates. Otherwise the
+                    # first interleaved wave can lock focus onto useless extremes
+                    # such as 1320/2800 and spend most of the budget there.
                     for level in sorted(wave_levels):
                         summary = self._summarize_scores(scores_by_level.get(int(level), []))
                         if summary["total"] > 0 and summary["score"] <= low_stop:
-                            if bool(self.elo_config.get("elo_verbose_adaptive", False)):
-                                print(f"  Adaptive ladder: stopping above {level} after this wave (score <= {low_stop:.0%}).")
-                            stop_after_wave = True
+                            if _useful_candidate_count() >= target_focus:
+                                if bool(self.elo_config.get("elo_verbose_adaptive", False)):
+                                    print(
+                                        f"  Adaptive ladder: stopping above {level} after this wave "
+                                        f"(score <= {low_stop:.0%})."
+                                    )
+                                stop_after_wave = True
                             break
 
-                candidate_levels = [
-                    int(level)
-                    for level in levels
-                    if played_by_level.get(int(level), 0) > 0
-                ]
+                candidate_levels = _played_candidate_levels()
                 focus_levels = [
                     level
                     for level in candidate_levels
-                    if focus_min <= self._summarize_scores(scores_by_level.get(level, []))["score"] <= focus_max
+                    if focus_min <= _score_for_level(level) <= focus_max
                 ]
                 focus_levels = sorted(
                     focus_levels,
-                    key=lambda lvl: abs(self._summarize_scores(scores_by_level.get(lvl, []))["score"] - 0.5),
+                    key=lambda lvl: abs(_score_for_level(lvl) - 0.5),
                 )
                 if len(focus_levels) < target_focus:
                     extras = sorted(
-                        (level for level in candidate_levels if level not in focus_levels),
+                        (
+                            level
+                            for level in candidate_levels
+                            if level not in focus_levels and low_stop < _score_for_level(level) < high_skip
+                        ),
                         key=lambda lvl: (
-                            abs(self._summarize_scores(scores_by_level.get(lvl, []))["score"] - 0.5),
-                            -lvl if self._summarize_scores(scores_by_level.get(lvl, []))["score"] >= 0.5 else lvl,
+                            abs(_score_for_level(lvl) - 0.5),
+                            -lvl if _score_for_level(lvl) >= 0.5 else lvl,
                         ),
                     )
                     focus_levels.extend(extras[: max(0, target_focus - len(focus_levels))])
+                if not focus_levels and candidate_levels:
+                    focus_levels = sorted(
+                        candidate_levels,
+                        key=lambda lvl: abs(_score_for_level(lvl) - 0.5),
+                    )[:1]
                 focus_levels = focus_levels[:target_focus]
 
                 if focus_levels and bool(self.elo_config.get("elo_verbose_adaptive", False)):
@@ -1625,6 +1683,10 @@ class EloEstimator:
                             break
                         if played_by_level.get(level, 0) >= focus_games:
                             continue
+                        if played_by_level.get(level, 0) >= focus_min_games:
+                            score = _score_for_level(level)
+                            if score <= low_stop or score >= high_skip:
+                                continue
                         remaining_level = focus_games - int(played_by_level.get(level, 0))
                         games_to_add = min(extra_round, remaining_level, max_total_games - total_scheduled - len(tasks))
                         if games_to_add <= 0:
@@ -1634,6 +1696,8 @@ class EloEstimator:
                         break
                     total_scheduled += len(tasks)
                     if _run_selected_tasks(tasks, phase="focus"):
+                        break
+                    if _estimate_precise_enough():
                         break
                     if len(tasks) < min_batch_games:
                         # Final partial focus wave; no need to spin another tiny wave

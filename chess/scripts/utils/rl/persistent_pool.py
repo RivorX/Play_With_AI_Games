@@ -211,6 +211,7 @@ class _PersistentSelfPlayPool:
             import time
             end_time = time.time() + max(1.0, timeout_s)
             pending_servers = set(range(len(self.inference_control_queues)))
+            load_messages = []
             while pending_servers:
                 if time.time() >= end_time:
                     raise TimeoutError(
@@ -224,7 +225,30 @@ class _PersistentSelfPlayPool:
                     except Exception:
                         continue
                     if message.get("type") == "models_loaded" and str(message.get("task_id")) == task_id:
+                        load_messages.append(dict(message))
                         pending_servers.discard(server_idx)
+            if load_messages:
+                load_times = [
+                    float(message.get("load_s", 0.0) or 0.0)
+                    for message in load_messages
+                    if message.get("load_s") is not None
+                ]
+                model_summary = next(
+                    (str(message.get("model_summary")) for message in load_messages if message.get("model_summary")),
+                    "models ready",
+                )
+                pid_summary = ",".join(
+                    str(int(message.get("pid")))
+                    for message in load_messages
+                    if message.get("pid") is not None
+                )
+                print(
+                    "Central inference: "
+                    f"servers={len(load_messages)}, {model_summary}"
+                    f"{f', load={max(load_times):.2f}s' if load_times else ''}"
+                    f"{f', pids={pid_summary}' if pid_summary else ''}.",
+                    flush=True,
+                )
 
     def _prepare_task_files(self, rank, task_id):
         result_file = self.temp_dir / f"worker_{rank}_{task_id}.pkl"

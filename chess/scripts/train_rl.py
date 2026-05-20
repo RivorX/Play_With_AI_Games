@@ -10,7 +10,6 @@ NEW Features:
 import os
 import sys
 import signal
-import copy
 import shutil
 import contextlib
 import subprocess
@@ -101,7 +100,6 @@ from utils.rl.persistent_pool import (
     _resolve_central_inference_server_count,
     get_or_create_selfplay_pool,
     _shutdown_selfplay_pool,
-    _terminate_process_tree,
     _terminate_workers,
     _is_interrupt_exit_code,
 )
@@ -120,6 +118,49 @@ from utils.shared.syzygy_manager import ensure_syzygy_tables, describe_syzygy_st
 _LAST_RUN_LOG_CSV = None
 _LAST_RUN_LOG_PNG = None
 _SELFPLAY_CONFIG_PRINTED = False
+_Q_DELTA_HIST_MIN = -2.0
+_Q_DELTA_HIST_MAX = 2.0
+_Q_DELTA_HIST_BINS = 200
+
+
+def _q_delta_histogram(values):
+    if not values:
+        return [0] * _Q_DELTA_HIST_BINS
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.size <= 0:
+        return [0] * _Q_DELTA_HIST_BINS
+    arr = arr[np.isfinite(arr)]
+    if arr.size <= 0:
+        return [0] * _Q_DELTA_HIST_BINS
+    arr = np.clip(arr, _Q_DELTA_HIST_MIN, _Q_DELTA_HIST_MAX)
+    hist, _ = np.histogram(arr, bins=_Q_DELTA_HIST_BINS, range=(_Q_DELTA_HIST_MIN, _Q_DELTA_HIST_MAX))
+    return [int(v) for v in hist.tolist()]
+
+
+def _merge_q_delta_histogram(target, key, source_hist=None, source_values=None):
+    hist = target.setdefault(key, [0] * _Q_DELTA_HIST_BINS)
+    if not isinstance(hist, list) or len(hist) != _Q_DELTA_HIST_BINS:
+        hist = [0] * _Q_DELTA_HIST_BINS
+        target[key] = hist
+    if source_hist is None:
+        source_hist = _q_delta_histogram(source_values or [])
+    source_hist = list(source_hist or [])
+    if len(source_hist) != _Q_DELTA_HIST_BINS:
+        return
+    for idx, count in enumerate(source_hist):
+        hist[idx] += int(count or 0)
+
+
+def _q_delta_percentile_from_histogram(hist, percentile):
+    counts = np.asarray(hist or [], dtype=np.float64)
+    if counts.size <= 0 or float(counts.sum()) <= 0.0:
+        return 0.0
+    total = float(counts.sum())
+    threshold = max(1.0, math.ceil((float(percentile) / 100.0) * total))
+    index = int(np.searchsorted(np.cumsum(counts), threshold, side='left'))
+    index = max(0, min(index, counts.size - 1))
+    width = (_Q_DELTA_HIST_MAX - _Q_DELTA_HIST_MIN) / float(counts.size)
+    return float(_Q_DELTA_HIST_MIN + (index + 0.5) * width)
 
 
 def _format_optional_percent(value, decimals=1):
@@ -254,53 +295,6 @@ def _round_replay_capacity(value, quantum):
     return int(math.ceil(value / quantum) * quantum)
 
 
-def _rl_elo_worker(
-    iteration_num,
-    model_state_cpu,
-    config_snapshot,
-    elo_config_snapshot,
-    worker_device_str,
-    result_queue,
-    cancel_event,
-):
-    try:
-        if cancel_event is not None and cancel_event.is_set():
-            result_queue.put({"iteration": int(iteration_num), "cancelled": True})
-            return
-
-        worker_config = copy.deepcopy(config_snapshot)
-        worker_config.setdefault("model", {})
-        worker_config["model"]["print_summary"] = False
-
-        worker_device = torch.device(worker_device_str)
-        if worker_device.type == "cuda" and not torch.cuda.is_available():
-            worker_device = torch.device("cpu")
-
-        worker_model = ChessNet(worker_config).to(worker_device)
-        worker_model = worker_model.to(memory_format=torch.channels_last)
-        worker_model.load_state_dict(model_state_cpu)
-        worker_model.eval()
-
-        elo_result = estimate_model_elo(
-            worker_model,
-            worker_config,
-            worker_device,
-            elo_config_snapshot,
-            stop_event=cancel_event,
-        )
-        result_queue.put(
-            {
-                "iteration": int(iteration_num),
-                "result": elo_result,
-                "device": worker_device.type,
-            }
-        )
-    except KeyboardInterrupt:
-        result_queue.put({"iteration": int(iteration_num), "cancelled": True})
-    except Exception as exc:
-        result_queue.put({"iteration": int(iteration_num), "error": str(exc)})
-
-
 def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", elo_result=None):
     try:
         elo_value = float(estimated_elo)
@@ -411,7 +405,6 @@ class RLEloCoordinator:
         self.checkpoint_targets = [Path(p) for p in list(checkpoint_targets or []) if p is not None]
         self.enabled = bool(self.elo_config.get("enabled", False))
         self.every_n_evals = max(1, int(self.elo_config.get("rl_every_n_evals", 3)))
-        self.final_on_shutdown = bool(self.elo_config.get("final_on_rl_shutdown", True))
         self.min_score_rate_for_stockfish = float(
             self.elo_config.get("rl_min_score_rate_for_stockfish", 0.50)
         )
@@ -436,15 +429,6 @@ class RLEloCoordinator:
         self.last_elo_iteration = None
         self.last_elo_metadata = {}
         self.interrupted_during_elo = False
-        self.final_requires_il_anchor_improvement = bool(
-            self.elo_config.get("final_rl_require_il_anchor_improvement", True)
-        )
-        self.final_il_anchor_min_score_rate = float(
-            self.elo_config.get("final_rl_il_anchor_min_score_rate", 0.50)
-        )
-        self.final_il_anchor_min_true_win_rate = float(
-            self.elo_config.get("final_rl_il_anchor_min_true_win_rate", 0.0)
-        )
         self.il_anchor_surpassed = False
         self.best_il_anchor_score_rate = None
         self.best_il_anchor_true_win_rate = None
@@ -453,29 +437,13 @@ class RLEloCoordinator:
     def print_startup_summary(self):
         if not self.enabled:
             return
-        final_use_mcts = self.elo_config.get("final_rl_use_mcts", self.elo_config.get("use_mcts", False))
-        final_sims = self.elo_config.get("final_rl_mcts_simulations", self.elo_config.get("mcts_simulations", 100))
         print(
             "Elo eval (RL): promoted best models only vs Stockfish, "
-            f"sync_device={self.eval_device.type}, final_on_shutdown={self.final_on_shutdown}, "
+            f"sync_device={self.eval_device.type}, "
             f"mcts={self.elo_config.get('use_mcts', False)}, "
             f"min_score_rate={self.min_score_rate_for_stockfish:.0%}, "
             f"min_true_win_rate={self.min_true_win_rate_for_stockfish:.0%}"
         )
-        if self.final_on_shutdown:
-            print(
-                f"Elo final (RL): use_mcts={bool(final_use_mcts)}, "
-                f"mcts_simulations={int(final_sims)}"
-            )
-            if self.final_requires_il_anchor_improvement:
-                print(
-                    "Elo final (RL): gated until RL beats IL anchor "
-                    f"(score>{self.final_il_anchor_min_score_rate:.0%}, "
-                    f"true_win>={self.final_il_anchor_min_true_win_rate:.0%})."
-                )
-            if bool(final_use_mcts):
-                print("Elo final (RL): raw NN Elo will run before MCTS Elo and both will be saved.")
-            print("Elo final (RL): after Ctrl+C, one shutdown Elo runs; press Ctrl+C again to cancel it.")
 
     def observe_il_anchor_eval(self, iteration_num, score_rate=None, true_win_rate=None):
         if score_rate is None:
@@ -492,13 +460,10 @@ class RLEloCoordinator:
             self.best_il_anchor_score_rate = score
             self.best_il_anchor_true_win_rate = true_win
             self.best_il_anchor_iteration = int(iteration_num)
-        if (
-            score > self.final_il_anchor_min_score_rate
-            and true_win >= self.final_il_anchor_min_true_win_rate
-        ):
+        if score > 0.50 and true_win >= 0.0:
             if not self.il_anchor_surpassed:
                 print(
-                    "Final Elo gate opened: RL beat IL anchor "
+                    "RL beat IL anchor "
                     f"at iteration {int(iteration_num)} "
                     f"(score={score:.2%}, true_win={true_win:.2%})."
                 )
@@ -564,104 +529,6 @@ class RLEloCoordinator:
             results.append(mcts_result)
         return next((r for r in reversed(results) if r is not None), None)
 
-    def final_evaluate(self, iteration_num, interrupted=False):
-        if not self.enabled or not self.final_on_shutdown:
-            return None
-        if interrupted and self.interrupted_during_elo:
-            print("Skipping final Elo: shutdown was triggered during a Stockfish evaluation.")
-            return None
-        if self.final_requires_il_anchor_improvement and not self.il_anchor_surpassed:
-            if self.best_il_anchor_score_rate is None:
-                print("Skipping final Elo: RL never had an IL-anchor evaluation in this run.")
-            else:
-                print(
-                    "Skipping final Elo: no RL model beat IL anchor yet "
-                    f"(best anchor score={self.best_il_anchor_score_rate:.2%} "
-                    f"at iteration {self.best_il_anchor_iteration}, "
-                    f"required >{self.final_il_anchor_min_score_rate:.0%})."
-                )
-            return None
-        final_use_mcts = bool(self.elo_config.get("final_rl_use_mcts", self.elo_config.get("use_mcts", False)))
-        if final_use_mcts:
-            results = []
-            nn_result = self._run_estimate(
-                iteration_num,
-                reason_label=("shutdown raw NN" if interrupted else "final raw NN"),
-                final_override=True,
-                force_use_mcts=False,
-            )
-            results.append(nn_result)
-            if self.interrupted_during_elo:
-                return next((r for r in reversed(results) if r is not None), None)
-            mcts_result = self._run_estimate(
-                iteration_num,
-                reason_label=("shutdown MCTS" if interrupted else "final MCTS"),
-                final_override=True,
-                force_use_mcts=True,
-            )
-            results.append(mcts_result)
-            return next((r for r in reversed(results) if r is not None), None)
-
-        return self._run_estimate(
-            iteration_num,
-            reason_label="shutdown raw NN" if interrupted else "final raw NN",
-            final_override=True,
-            force_use_mcts=False,
-        )
-
-    def _run_estimate_subprocess(self, iteration_num, elo_config, interrupt_message):
-        mp_ctx = mp.get_context('spawn')
-        result_queue = mp_ctx.Queue()
-        cancel_event = mp_ctx.Event()
-        worker_device = str(self.eval_device.type)
-        model_state_cpu = _snapshot_model_state_cpu(self.model, share_memory=True)
-        process = mp_ctx.Process(
-            target=_rl_elo_worker,
-            args=(
-                int(iteration_num),
-                model_state_cpu,
-                self.config,
-                elo_config,
-                worker_device,
-                result_queue,
-                cancel_event,
-            ),
-        )
-        process.daemon = True
-        process.start()
-
-        try:
-            while True:
-                try:
-                    message = result_queue.get(timeout=0.1)
-                except queue.Empty:
-                    if not process.is_alive():
-                        break
-                    continue
-                if message is None:
-                    continue
-                if int(message.get("iteration", iteration_num)) != int(iteration_num):
-                    continue
-                if message.get("cancelled"):
-                    self.interrupted_during_elo = True
-                    return None
-                if message.get("error"):
-                    print(f"Elo estimation failed: {message['error']}")
-                    return None
-                return (message.get("result") or {})
-        except KeyboardInterrupt:
-            with contextlib.suppress(Exception):
-                cancel_event.set()
-            self.interrupted_during_elo = True
-            print(interrupt_message)
-            # Force-stop worker process tree immediately on user interrupt.
-            _terminate_process_tree(process, timeout_s=0.0)
-            return None
-        finally:
-            _terminate_process_tree(process, timeout_s=0.0)
-            with contextlib.suppress(Exception):
-                result_queue.close()
-
     def _run_estimate(
         self,
         iteration_num,
@@ -699,13 +566,12 @@ class RLEloCoordinator:
             if "rl_stockfish_hash_mb" in self.elo_config:
                 elo_config["stockfish_hash_mb"] = int(self.elo_config.get("rl_stockfish_hash_mb"))
         if final_override:
-            # Final/shutdown Elo runs when training is paused/stopped;
-            # allow full CPU budget for faster estimation.
+            # Promoted-best Elo is blocking/user-visible; allow full CPU budget
+            # so the checkpoint metadata is written quickly and consistently.
             elo_config["prioritize_training"] = False
             elo_config["reserve_dataloader_workers"] = False
             elo_config["free_threads_utilization"] = 1.0
             elo_config["stockfish_priority"] = "normal"
-            # Final estimate is blocking/user-visible, so always show progress.
             elo_config["progress_bar"] = "always"
             if "final_rl_use_mcts" in self.elo_config:
                 elo_config["use_mcts"] = bool(self.elo_config.get("final_rl_use_mcts"))
@@ -756,19 +622,11 @@ class RLEloCoordinator:
                     elo_config["workers"] = scaled_workers
 
         print(f"\nEstimating Elo vs Stockfish ({reason_label})...")
-        if interrupted := bool(final_override and str(reason_label).startswith("shutdown")):
-            print("Training stop requested by user. Running one final Elo estimate; press Ctrl+C again to cancel.")
         max_attempts = 1
         elo_result = None
-        if interrupted:
-            interrupt_message = "\nSecond Ctrl+C detected. Final Elo estimation aborted immediately."
-        else:
-            interrupt_message = "\nCtrl+C detected during Stockfish evaluation. Cancelling evaluation..."
+        interrupt_message = "\nCtrl+C detected during Stockfish evaluation. Cancelling evaluation..."
 
         for attempt_idx in range(max_attempts):
-            if interrupted:
-                elo_result = self._run_estimate_subprocess(iteration_num, elo_config, interrupt_message)
-                break
             elo_cancel_event = threading.Event()
             sigint_state = {"triggered": False}
             try:
@@ -819,7 +677,6 @@ class RLEloCoordinator:
                     elo_result=elo_result,
                 )
             )
-            self.logger.record_estimated_elo(iteration_num, estimated_elo, update_csv=True)
             self.logger.record_estimated_elo_mode(
                 iteration_num,
                 estimated_elo,
@@ -976,6 +833,7 @@ def play_games_parallel_mcts(
     num_games,
     replay_buffer=None,
     best_model_state=None,
+    anchor_model_state=None,
     recent_snapshot_pool=None,
     adaptive_scheduler_state=None,
 ):
@@ -1092,6 +950,7 @@ def play_games_parallel_mcts(
         rl_cfg,
         worker_specs,
         best_model_state=best_model_state,
+        anchor_model_state=anchor_model_state,
         recent_snapshot_pool=recent_snapshot_pool,
         adaptive_scheduler_state=adaptive_scheduler_state,
     )
@@ -1177,7 +1036,7 @@ def play_games_parallel_mcts(
             min(max_batch_games if use_batch_selfplay else 1, games)
             for _, games in worker_specs
         )
-        w_games = f"{base_games}" + (f"  (+1 dla {remainder} workerĂłw)" if remainder else "")
+        w_games = f"{base_games}" + (f"  (+1 dla {remainder} workerów)" if remainder else "")
         print()
         if opponent_debug.get("selected_recent_pool"):
             selected_recent_parts = []
@@ -1268,6 +1127,21 @@ def play_games_parallel_mcts(
         if source.get('mcts_q_delta_values') is not None:
             values = target.setdefault('mcts_q_delta_values', [])
             values.extend(list(source.get('mcts_q_delta_values') or []))
+        if source.get('mcts_changed_q_delta_values') is not None:
+            values = target.setdefault('mcts_changed_q_delta_values', [])
+            values.extend(list(source.get('mcts_changed_q_delta_values') or []))
+        _merge_q_delta_histogram(
+            target,
+            'mcts_q_delta_hist',
+            source.get('mcts_q_delta_hist'),
+            source.get('mcts_q_delta_values'),
+        )
+        _merge_q_delta_histogram(
+            target,
+            'mcts_changed_q_delta_hist',
+            source.get('mcts_changed_q_delta_hist'),
+            source.get('mcts_changed_q_delta_values'),
+        )
         for key in [
             'mcts_prior_agreement_samples',
             'mcts_prior_agreement_sum',
@@ -1275,9 +1149,15 @@ def play_games_parallel_mcts(
             'mcts_prior_top_visit_prob_sum',
             'mcts_top_prior_prob_sum',
             'mcts_policy_kl_sum',
+            'mcts_explored_prior_mass_sum',
+            'mcts_visited_move_count_sum',
+            'mcts_legal_move_count_sum',
             'mcts_q_delta_samples',
             'mcts_q_delta_sum',
             'mcts_changed_to_lower_q_count',
+            'mcts_changed_to_higher_q_count',
+            'mcts_changed_q_delta_samples',
+            'mcts_changed_q_delta_sum',
         ]:
             target[key] = float(target.get(key, 0.0)) + float(source.get(key, 0.0) or 0.0)
 
@@ -1902,6 +1782,14 @@ def play_games_parallel_mcts(
     mcts_quality_samples = int(float(total_mcts_quality_stats.get('mcts_prior_agreement_samples', 0.0) or 0.0))
     mcts_q_delta_samples = int(float(total_mcts_quality_stats.get('mcts_q_delta_samples', 0.0) or 0.0))
     mcts_q_delta_values = list(total_mcts_quality_stats.get('mcts_q_delta_values', []) or [])
+    mcts_q_delta_hist = list(total_mcts_quality_stats.get('mcts_q_delta_hist', []) or [])
+    if sum(int(v or 0) for v in mcts_q_delta_hist) <= 0 and mcts_q_delta_values:
+        mcts_q_delta_hist = _q_delta_histogram(mcts_q_delta_values)
+    mcts_changed_q_delta_samples = int(float(total_mcts_quality_stats.get('mcts_changed_q_delta_samples', 0.0) or 0.0))
+    mcts_changed_q_delta_values = list(total_mcts_quality_stats.get('mcts_changed_q_delta_values', []) or [])
+    mcts_changed_q_delta_hist = list(total_mcts_quality_stats.get('mcts_changed_q_delta_hist', []) or [])
+    if sum(int(v or 0) for v in mcts_changed_q_delta_hist) <= 0 and mcts_changed_q_delta_values:
+        mcts_changed_q_delta_hist = _q_delta_histogram(mcts_changed_q_delta_values)
     selfplay_stats = {
         'startup_time': float(selfplay_startup_time),
         'completed_games': int(completed_games),
@@ -1967,23 +1855,55 @@ def play_games_parallel_mcts(
             else 0.0
         ),
         'mcts_q_delta_p10': (
-            float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 10))
-            if mcts_q_delta_values
+            _q_delta_percentile_from_histogram(mcts_q_delta_hist, 10)
+            if sum(int(v or 0) for v in mcts_q_delta_hist) > 0
             else 0.0
         ),
         'mcts_q_delta_p50': (
-            float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 50))
-            if mcts_q_delta_values
+            _q_delta_percentile_from_histogram(mcts_q_delta_hist, 50)
+            if sum(int(v or 0) for v in mcts_q_delta_hist) > 0
             else 0.0
         ),
         'mcts_q_delta_p90': (
-            float(np.percentile(np.asarray(mcts_q_delta_values, dtype=np.float32), 90))
-            if mcts_q_delta_values
+            _q_delta_percentile_from_histogram(mcts_q_delta_hist, 90)
+            if sum(int(v or 0) for v in mcts_q_delta_hist) > 0
             else 0.0
         ),
         'mcts_changed_to_lower_q_rate': (
             float(total_mcts_quality_stats.get('mcts_changed_to_lower_q_count', 0.0) or 0.0) / float(mcts_q_delta_samples)
             if mcts_q_delta_samples > 0
+            else 0.0
+        ),
+        'mcts_changed_to_higher_q_count': int(total_mcts_quality_stats.get('mcts_changed_to_higher_q_count', 0.0) or 0.0),
+        'mcts_changed_q_delta_samples': int(mcts_changed_q_delta_samples),
+        'mcts_changed_q_delta_mean': (
+            float(total_mcts_quality_stats.get('mcts_changed_q_delta_sum', 0.0) or 0.0) / float(mcts_changed_q_delta_samples)
+            if mcts_changed_q_delta_samples > 0
+            else 0.0
+        ),
+        'mcts_changed_q_delta_p10': (
+            _q_delta_percentile_from_histogram(mcts_changed_q_delta_hist, 10)
+            if sum(int(v or 0) for v in mcts_changed_q_delta_hist) > 0
+            else 0.0
+        ),
+        'mcts_changed_q_delta_p50': (
+            _q_delta_percentile_from_histogram(mcts_changed_q_delta_hist, 50)
+            if sum(int(v or 0) for v in mcts_changed_q_delta_hist) > 0
+            else 0.0
+        ),
+        'mcts_changed_q_delta_p90': (
+            _q_delta_percentile_from_histogram(mcts_changed_q_delta_hist, 90)
+            if sum(int(v or 0) for v in mcts_changed_q_delta_hist) > 0
+            else 0.0
+        ),
+        'mcts_changed_to_higher_q_rate': (
+            float(total_mcts_quality_stats.get('mcts_changed_to_higher_q_count', 0.0) or 0.0) / float(mcts_changed_q_delta_samples)
+            if mcts_changed_q_delta_samples > 0
+            else 0.0
+        ),
+        'mcts_changed_to_lower_q_when_changed_rate': (
+            float(total_mcts_quality_stats.get('mcts_changed_to_lower_q_count', 0.0) or 0.0) / float(mcts_changed_q_delta_samples)
+            if mcts_changed_q_delta_samples > 0
             else 0.0
         ),
         'opponent_results': {
@@ -2502,6 +2422,7 @@ def main():
         try:
             start_w = float(schedule.get('start', default_weight))
             end_w = float(schedule.get('end', default_weight))
+            power = max(0.1, float(schedule.get('power', 1.0)))
         except Exception:
             return default_weight
 
@@ -2509,9 +2430,10 @@ def main():
             return end_w
 
         progress = max(0.0, min(1.0, iter_idx / max(1, total_iterations - 1)))
-        return start_w + (end_w - start_w) * progress
+        shaped_progress = progress ** power
+        return start_w + (end_w - start_w) * shaped_progress
 
-    def _compute_mcts_q_value_scale(iter_idx, value_guard_streak=0, eval_stagnated=False):
+    def _compute_mcts_q_value_scale(iter_idx, value_guard_streak=0, eval_stagnated=False, trust_scale=1.0):
         rl_cfg_local = config.get('reinforcement_learning', {})
         fallback = max(0.0, float(rl_cfg_local.get('mcts_q_value_scale', 1.0)))
         schedule = rl_cfg_local.get('mcts_q_value_scale_schedule', None)
@@ -2522,12 +2444,16 @@ def main():
             start = float(schedule.get('start', fallback))
             end = float(schedule.get('end', fallback))
             power = max(0.1, float(schedule.get('power', 1.0)))
-            min_scale = max(0.0, float(schedule.get('min', min(start, end))))
-            max_scale = max(min_scale, float(schedule.get('max', max(start, end))))
+            warmup_iterations = max(0, int(schedule.get('warmup_iterations', 0) or 0))
         except Exception:
             return fallback
 
-        progress = max(0.0, min(1.0, iter_idx / max(1, total_iterations - 1)))
+        if int(iter_idx) < warmup_iterations:
+            return 0.0
+
+        ramp_total = max(1, total_iterations - max(0, warmup_iterations) - 1)
+        ramp_idx = max(0, int(iter_idx) - max(0, warmup_iterations))
+        progress = max(0.0, min(1.0, ramp_idx / ramp_total))
         shaped_progress = progress ** power
         scale = start + (end - start) * shaped_progress
 
@@ -2537,7 +2463,151 @@ def main():
         if bool(eval_stagnated):
             scale *= max(0.0, float(schedule.get('eval_stagnation_scale', 1.0)))
 
-        return max(min_scale, min(max_scale, float(scale)))
+        scale *= max(0.0, float(trust_scale or 0.0))
+        upper = max(start, end)
+        return max(0.0, min(upper, max(0.0, float(scale))))
+
+    def _make_value_trust_state():
+        schedule = config.get('reinforcement_learning', {}).get('mcts_q_value_scale_schedule', {}) or {}
+        try:
+            initial = float(schedule.get('trust_initial', 1.0) or 1.0)
+            min_trust = float(schedule.get('trust_min', 0.0) or 0.0)
+            max_trust = float(schedule.get('trust_max', 1.0) or 1.0)
+        except Exception:
+            initial, min_trust, max_trust = 1.0, 0.0, 1.0
+        min_trust = max(0.0, min(1.0, min_trust))
+        max_trust = max(min_trust, min(2.0, max_trust))
+        return {
+            'enabled': bool(schedule.get('dynamic_trust_enabled', False)),
+            'scale': max(min_trust, min(max_trust, initial)),
+            'min': min_trust,
+            'max': max_trust,
+            'last_anchor_score': None,
+            'last_reason': 'init',
+            'good_signals': 0,
+            'bad_signals': 0,
+            'bad_eval_cooldown': 0,
+        }
+
+    def _update_value_trust_state(
+        state,
+        *,
+        value_mae=None,
+        pred_value_std=None,
+        target_value_std=None,
+        mcts_score_rate=None,
+        no_mcts_score_rate=None,
+        anchor_score_rate=None,
+        current_q_value_scale=None,
+    ):
+        schedule = config.get('reinforcement_learning', {}).get('mcts_q_value_scale_schedule', {}) or {}
+        if not isinstance(state, dict) or not bool(state.get('enabled', False)):
+            return state
+
+        def _float_or_none(value):
+            try:
+                if value is None or value == "":
+                    return None
+                value = float(value)
+                if not math.isfinite(value):
+                    return None
+                return value
+            except Exception:
+                return None
+
+        scale = float(state.get('scale', 1.0) or 1.0)
+        min_trust = float(state.get('min', 0.0) or 0.0)
+        max_trust = float(state.get('max', 1.0) or 1.0)
+        step_up = max(0.0, float(schedule.get('trust_step_up', 0.06) or 0.06))
+        step_down = max(0.0, float(schedule.get('trust_step_down', 0.12) or 0.12))
+        bad_eval_cooldown_iters = max(0, int(schedule.get('trust_bad_eval_cooldown', 0) or 0))
+        cooldown = max(0, int(state.get('bad_eval_cooldown', 0) or 0))
+        good_signals = 0
+        bad_signals = 0
+        reasons = []
+        q_scale_now = _float_or_none(current_q_value_scale)
+        has_search_eval = (
+            _float_or_none(mcts_score_rate) is not None
+            and _float_or_none(no_mcts_score_rate) is not None
+        )
+
+        mae = _float_or_none(value_mae)
+        if mae is not None:
+            good_mae = float(schedule.get('trust_good_mae', 0.45) or 0.45)
+            bad_mae = float(schedule.get('trust_bad_mae', 0.50) or 0.50)
+            if mae <= good_mae:
+                good_signals += 1
+                reasons.append(f"mae_good={mae:.3f}")
+            elif mae >= bad_mae:
+                bad_signals += 1
+                reasons.append(f"mae_bad={mae:.3f}")
+
+        pred_std = _float_or_none(pred_value_std)
+        target_std = _float_or_none(target_value_std)
+        if pred_std is not None and target_std is not None and target_std > 1e-6:
+            ratio = pred_std / target_std
+            good_ratio = float(schedule.get('trust_good_std_ratio', 0.68) or 0.68)
+            bad_ratio = float(schedule.get('trust_bad_std_ratio', 0.58) or 0.58)
+            if ratio >= good_ratio:
+                good_signals += 1
+                reasons.append(f"std_ratio_good={ratio:.2f}")
+            elif ratio <= bad_ratio:
+                bad_signals += 1
+                reasons.append(f"std_ratio_bad={ratio:.2f}")
+
+        mcts_score = _float_or_none(mcts_score_rate)
+        no_mcts_score = _float_or_none(no_mcts_score_rate)
+        if mcts_score is not None and no_mcts_score is not None:
+            gap = mcts_score - no_mcts_score
+            good_gap = float(schedule.get('trust_good_mcts_gap', 0.03) or 0.03)
+            bad_gap = float(schedule.get('trust_bad_mcts_gap', -0.03) or -0.03)
+            if gap >= good_gap:
+                good_signals += 1
+                reasons.append(f"mcts_gap_good={gap:+.2%}")
+            elif gap <= bad_gap:
+                bad_signals += 1
+                reasons.append(f"mcts_gap_bad={gap:+.2%}")
+                cooldown = max(cooldown, bad_eval_cooldown_iters)
+
+        anchor_score = _float_or_none(anchor_score_rate)
+        last_anchor = _float_or_none(state.get('last_anchor_score', None))
+        if anchor_score is not None:
+            drop_tolerance = max(0.0, float(schedule.get('trust_anchor_drop_tolerance', 0.03) or 0.03))
+            if last_anchor is not None:
+                delta = anchor_score - last_anchor
+                if delta >= drop_tolerance:
+                    good_signals += 1
+                    reasons.append(f"anchor_up={delta:+.2%}")
+                elif delta <= -drop_tolerance:
+                    bad_signals += 1
+                    reasons.append(f"anchor_down={delta:+.2%}")
+            state['last_anchor_score'] = anchor_score
+
+        if q_scale_now is not None and q_scale_now <= 1e-8 and not has_search_eval:
+            reasons.append("warmup_hold")
+        elif not has_search_eval:
+            # Between expensive MCTS evals, value metrics may recover trust a little,
+            # but they should not punish Q trust on their own. Search/eval evidence
+            # is the authoritative signal for reducing value influence.
+            if cooldown > 0:
+                cooldown -= 1
+                reasons.append(f"eval_cooldown={cooldown}")
+            elif good_signals >= 2:
+                scale = min(max_trust, scale + 0.5 * step_up)
+                reasons.append("value_only_recovery")
+            else:
+                reasons.append("awaiting_mcts_eval")
+        elif bad_signals > 0:
+            scale = max(min_trust, scale - step_down * bad_signals)
+        elif good_signals >= 2:
+            scale = min(max_trust, scale + step_up)
+
+        state['scale'] = max(min_trust, min(max_trust, float(scale)))
+        state['good_signals'] = int(good_signals)
+        state['bad_signals'] = int(bad_signals)
+        state['bad_eval_cooldown'] = int(max(0, cooldown))
+        state['last_reason'] = ', '.join(reasons) if reasons else 'hold'
+        return state
 
     if use_lr_schedule:
         print(
@@ -2553,10 +2623,9 @@ def main():
     print(f"   - Batch MCTS: {config['reinforcement_learning'].get('mcts_batch_size', 32)}")
     print(
         "   - Dynamic c_puct: "
-        f"{config['reinforcement_learning'].get('mcts_dynamic_c_puct', True)} "
-        f"(init={float(config['reinforcement_learning'].get('mcts_c_puct_init', config['reinforcement_learning'].get('mcts_c_puct', 1.5))):.2f}, "
-        f"base={int(config['reinforcement_learning'].get('mcts_c_puct_base', 19652))}, "
-        f"max={config['reinforcement_learning'].get('mcts_c_puct_max', None)})"
+        f"init={float(config['reinforcement_learning']['mcts_c_puct_init']):.2f}, "
+        f"base={int(config['reinforcement_learning']['mcts_c_puct_base'])}, "
+        f"max={float(config['reinforcement_learning']['mcts_c_puct_max']):.2f}"
     )
     print(
         "   - FPU: "
@@ -2572,7 +2641,8 @@ def main():
             "   - Opponent pool: "
             f"current={float(config['reinforcement_learning'].get('self_play_opponent_current_fraction', 0.4)):.0%}, "
             f"best={float(config['reinforcement_learning'].get('self_play_opponent_best_fraction', 0.3)):.0%}, "
-            f"recent={float(config['reinforcement_learning'].get('self_play_opponent_recent_fraction', 0.3)):.0%}"
+            f"recent={float(config['reinforcement_learning'].get('self_play_opponent_recent_fraction', 0.3)):.0%}, "
+            f"anchor_after_win={float(config['reinforcement_learning'].get('self_play_opponent_anchor_fraction', 0.0)):.0%}"
         )
         print(
             "   - Recent frozen snapshots: "
@@ -2641,6 +2711,25 @@ def main():
     eval_stage2_games = max(0, int(rl_cfg.get('eval_stage2_games', 0)))
     eval_stage2_gate_score_rate = float(rl_cfg.get('eval_stage2_gate_score_rate', score_rate_threshold))
     eval_stage2_gate_true_win_rate = float(rl_cfg.get('eval_stage2_gate_true_win_rate', true_win_rate_threshold))
+    q_schedule_for_eval = rl_cfg.get('mcts_q_value_scale_schedule', {}) or {}
+    try:
+        q_warmup_iterations = max(0, int(q_schedule_for_eval.get('warmup_iterations', 0) or 0))
+    except Exception:
+        q_warmup_iterations = 0
+    try:
+        mcts_eval_extra_after_q_warmup = max(
+            0,
+            int(rl_cfg.get('eval_mcts_after_q_warmup_extra_iterations', 0) or 0),
+        )
+    except Exception:
+        mcts_eval_extra_after_q_warmup = 0
+    mcts_eval_first_iteration = q_warmup_iterations + mcts_eval_extra_after_q_warmup + 1
+    if q_warmup_iterations > 0 and mcts_eval_extra_after_q_warmup > 0:
+        print(
+            "MCTS eval gate: "
+            f"skip MCTS/anchor/Elo eval through iteration {mcts_eval_first_iteration - 1} "
+            f"(Q warmup={q_warmup_iterations}, extra={mcts_eval_extra_after_q_warmup})."
+        )
     no_mcts_eval_enabled = bool(rl_cfg.get('eval_no_mcts_enabled', True))
     no_mcts_eval_every = max(1, int(rl_cfg.get('eval_no_mcts_every', 1)))
     no_mcts_eval_games = max(1, int(rl_cfg.get('eval_no_mcts_games', 30)))
@@ -2659,6 +2748,14 @@ def main():
     )
     value_guard_poor_eval_streak = 0
     last_eval_score_rate_for_guard = None
+    value_trust_state = _make_value_trust_state()
+    if bool(value_trust_state.get('enabled', False)):
+        print(
+            "Dynamic value trust: "
+            f"initial={float(value_trust_state.get('scale', 1.0)):.2f}, "
+            f"range=[{float(value_trust_state.get('min', 0.0)):.2f}, "
+            f"{float(value_trust_state.get('max', 1.0)):.2f}]"
+        )
 
     training_interrupted = False
     interrupted_stage = None
@@ -2684,8 +2781,6 @@ def main():
 
             def _finish_stage(stage_name):
                 nonlocal iteration_stage_start
-                if not profile_training_enabled:
-                    return
                 _profile_sync()
                 now = time.perf_counter()
                 stage_key = str(stage_name)
@@ -2754,6 +2849,7 @@ def main():
                 iteration,
                 value_guard_streak=value_guard_poor_eval_streak,
                 eval_stagnated=eval_stagnated,
+                trust_scale=float(value_trust_state.get('scale', 1.0) or 1.0),
             )
             print(f"Temperature: {current_temp:.2f}")
             if temp_debug.get("enabled", False):
@@ -2770,6 +2866,12 @@ def main():
                     f"base={base_mcts_dirichlet_weight:.3f}, current={current_dirichlet_weight:.3f}"
                 )
             print(f"MCTS Q scale: {current_mcts_q_value_scale:.3f}")
+            if bool(value_trust_state.get('enabled', False)):
+                print(
+                    "   Value trust: "
+                    f"scale={float(value_trust_state.get('scale', 1.0)):.2f}, "
+                    f"reason={value_trust_state.get('last_reason', 'init')}"
+                )
             config['reinforcement_learning']['mcts_temperature'] = current_temp
             config['reinforcement_learning']['mcts_dirichlet_weight'] = current_dirichlet_weight
             config['reinforcement_learning']['mcts_temperature_threshold'] = current_temp_threshold
@@ -2798,8 +2900,17 @@ def main():
             # Self-play with MCTS
             model.eval()
             best_model_state_for_selfplay = None
+            anchor_model_state_for_selfplay = None
             if bool(rl_cfg.get('self_play_opponent_pool_enabled', False)):
                 best_model_state_for_selfplay = _snapshot_model_state_cpu(best_model, share_memory=True)
+                anchor_unlocked_for_selfplay = bool(
+                    anchor_model_available
+                    and anchor_model is not None
+                    and elo_coordinator.il_anchor_surpassed
+                    and not _models_have_identical_state(best_model, anchor_model)
+                )
+                if anchor_unlocked_for_selfplay:
+                    anchor_model_state_for_selfplay = _snapshot_model_state_cpu(anchor_model, share_memory=True)
             performance_profile = {}
             positions, positions_added, avg_game_length, positions_per_sec, selfplay_time, collection_time, selfplay_stats = \
                 play_games_parallel_mcts(
@@ -2809,21 +2920,21 @@ def main():
                     config['reinforcement_learning']['games_per_iteration'],
                     replay_buffer=replay_buffer,
                     best_model_state=best_model_state_for_selfplay,
+                    anchor_model_state=anchor_model_state_for_selfplay,
                     recent_snapshot_pool=list(recent_selfplay_snapshots),
                     adaptive_scheduler_state=adaptive_opponent_scheduler_state,
                 )
             _finish_stage('selfplay')
-            if profile_training_enabled:
-                startup_time_in_selfplay = max(
-                    0.0,
-                    float((selfplay_stats or {}).get('startup_time', 0.0) or 0.0),
-                )
-                if startup_time_in_selfplay > 0.0:
-                    current_selfplay_stage = max(0.0, float(iteration_stage_times.get('selfplay', 0.0) or 0.0))
-                    transfer_time = min(current_selfplay_stage, startup_time_in_selfplay)
-                    if transfer_time > 0.0:
-                        iteration_stage_times['selfplay'] = float(current_selfplay_stage - transfer_time)
-                        iteration_stage_times['setup'] = float(iteration_stage_times.get('setup', 0.0) or 0.0) + float(transfer_time)
+            startup_time_in_selfplay = max(
+                0.0,
+                float((selfplay_stats or {}).get('startup_time', 0.0) or 0.0),
+            )
+            if startup_time_in_selfplay > 0.0:
+                current_selfplay_stage = max(0.0, float(iteration_stage_times.get('selfplay', 0.0) or 0.0))
+                transfer_time = min(current_selfplay_stage, startup_time_in_selfplay)
+                if transfer_time > 0.0:
+                    iteration_stage_times['selfplay'] = float(current_selfplay_stage - transfer_time)
+                    iteration_stage_times['setup'] = float(iteration_stage_times.get('setup', 0.0) or 0.0) + float(transfer_time)
              
             # Add to replay buffer
             for position in positions:
@@ -2875,9 +2986,12 @@ def main():
                     "MCTS vs prior: "
                     f"agree={float((selfplay_stats or {}).get('mcts_prior_agreement_rate', 0.0)):.2%}, "
                     f"changed={float((selfplay_stats or {}).get('mcts_prior_changed_rate', 0.0)):.2%}, "
-                    f"lowerQ={float((selfplay_stats or {}).get('mcts_changed_to_lower_q_rate', 0.0)):.2%}, "
-                    f"q_delta={float((selfplay_stats or {}).get('mcts_q_delta_mean', 0.0)):+.3f}, "
-                    f"KL={float((selfplay_stats or {}).get('mcts_policy_kl_mean', 0.0)):.3f}"
+                    f"higherQ|chg={float((selfplay_stats or {}).get('mcts_changed_to_higher_q_rate', 0.0)):.2%}, "
+                    f"lowerQ|chg={float((selfplay_stats or {}).get('mcts_changed_to_lower_q_when_changed_rate', 0.0)):.2%}, "
+                    f"q_delta|chg={float((selfplay_stats or {}).get('mcts_changed_q_delta_mean', 0.0)):+.3f}, "
+                    f"KL={float((selfplay_stats or {}).get('mcts_policy_kl_mean', 0.0)):.3f}, "
+                    f"prior_mass={float((selfplay_stats or {}).get('mcts_explored_prior_mass_mean', 0.0)):.1%}, "
+                    f"discovery_boost={float((selfplay_stats or {}).get('mcts_search_discovery_rate', 0.0)):.2%}"
                 )
             adaptive_stop_reasons = dict((selfplay_stats or {}).get('adaptive_stop_reasons', {}) or {})
             if adaptive_stop_reasons:
@@ -3059,7 +3173,15 @@ def main():
             no_mcts_draw_rate = None
             no_mcts_loss_rate = None
             no_mcts_wins = no_mcts_draws = no_mcts_losses = no_mcts_unresolved = None
-            if no_mcts_eval_enabled and ((iteration + 1) % no_mcts_eval_every == 0):
+            should_run_no_mcts_eval = no_mcts_eval_enabled and ((iteration + 1) % no_mcts_eval_every == 0)
+            if should_run_no_mcts_eval and (iteration + 1) < mcts_eval_first_iteration:
+                print(
+                    "Skipping no-MCTS eval during value bootstrap: "
+                    f"iteration {iteration + 1} < first eval {mcts_eval_first_iteration} "
+                    f"(Q scale={current_mcts_q_value_scale:.3f})."
+                )
+                should_run_no_mcts_eval = False
+            if should_run_no_mcts_eval:
                 print(f"Evaluating vs best without MCTS ({no_mcts_eval_games} games)...")
                 model.eval()
                 if device.type == 'cuda' and torch.cuda.is_available():
@@ -3086,7 +3208,15 @@ def main():
                     f"(score: {no_mcts_score_rate:.2%}, true win rate: {no_mcts_true_win_rate:.2%}, "
                     f"unresolved: {no_mcts_unresolved})"
                 )
-            if (iteration + 1) % config['reinforcement_learning']['eval_every'] == 0:
+            should_run_mcts_eval = (iteration + 1) % config['reinforcement_learning']['eval_every'] == 0
+            if should_run_mcts_eval and (iteration + 1) < mcts_eval_first_iteration:
+                print(
+                    "Skipping MCTS eval/promotions during value bootstrap: "
+                    f"iteration {iteration + 1} < first MCTS eval {mcts_eval_first_iteration} "
+                    f"(Q scale={current_mcts_q_value_scale:.3f})."
+                )
+                should_run_mcts_eval = False
+            if should_run_mcts_eval:
                 print("Evaluating vs best...")
                 model.eval()
                 if device.type == 'cuda' and torch.cuda.is_available():
@@ -3148,6 +3278,7 @@ def main():
                     f"(true win rate: {true_win_rate:.2%}, unresolved draws at cap: {eval_unresolved})"
                 )
                 is_new_best_candidate = score_rate >= score_rate_threshold and true_win_rate >= true_win_rate_threshold
+                anchor_gate_enabled = bool(rl_cfg.get('promotion_require_anchor_non_regression', True))
                 if bool(rl_cfg.get('value_guard_enabled', True)):
                     mae_tol = max(0.0, float(rl_cfg.get('value_guard_mae_increase_tolerance', 0.01)))
                     min_score_gain = float(rl_cfg.get('value_guard_min_score_gain', 0.005))
@@ -3170,8 +3301,7 @@ def main():
                     prev_eval_score_rate_for_temp = last_eval_score_rate_for_guard
                     last_eval_score_rate_for_guard = float(score_rate)
                 if (
-                    is_new_best_candidate
-                    and anchor_model_available
+                    anchor_model_available
                     and anchor_model is not None
                     and _should_run_anchor_eval(iteration + 1, rl_cfg)
                 ):
@@ -3211,6 +3341,32 @@ def main():
                         score_rate=anchor_score_rate,
                         true_win_rate=anchor_true_win_rate,
                     )
+                if (
+                    is_new_best_candidate
+                    and anchor_gate_enabled
+                    and anchor_model_available
+                    and anchor_model is not None
+                ):
+                    min_anchor_score = float(rl_cfg.get('promotion_anchor_min_score_rate', 0.50))
+                    min_anchor_true_win = float(rl_cfg.get('promotion_anchor_min_true_win_rate', 0.0))
+                    if anchor_score_rate is None:
+                        is_new_best_candidate = False
+                        print(
+                            "Promotion blocked: IL-anchor non-regression is required, "
+                            "but anchor eval did not produce a score."
+                        )
+                    elif (
+                        float(anchor_score_rate) < min_anchor_score
+                        or float(anchor_true_win_rate or 0.0) < min_anchor_true_win
+                    ):
+                        is_new_best_candidate = False
+                        print(
+                            "Promotion blocked by IL-anchor gate: "
+                            f"anchor score={float(anchor_score_rate):.2%} "
+                            f"(required >= {min_anchor_score:.2%}), "
+                            f"true_win={float(anchor_true_win_rate or 0.0):.2%} "
+                            f"(required >= {min_anchor_true_win:.2%})."
+                        )
                 estimated_elo = None
                 if is_new_best_candidate:
                     estimated_elo = elo_coordinator.evaluate_promoted_best(iteration + 1)
@@ -3219,13 +3375,13 @@ def main():
                 logger.log(
                     iteration + 1,
                     train_metrics=train_metrics,
-                    estimated_elo=estimated_elo,
                     avg_loss=avg_loss,
                     policy_loss=avg_policy,
                     value_loss=avg_value,
                     learning_rate=current_lr,
                     value_loss_weight=current_value_loss_weight,
                     mcts_q_value_scale=current_mcts_q_value_scale,
+                    mcts_q_value_trust=float(value_trust_state.get('scale', 1.0) or 1.0),
                     value_guard_streak=value_guard_poor_eval_streak,
                     mcts_no_mcts_gap=(
                         float(score_rate) - float(no_mcts_score_rate)
@@ -3307,6 +3463,8 @@ def main():
                         'win_rate': true_win_rate,
                         'score_rate': score_rate,
                         'eval_true_win_rate': true_win_rate,
+                        'anchor_score_rate': anchor_score_rate,
+                        'anchor_true_win_rate': anchor_true_win_rate,
                         'policy_loss': avg_policy,
                         'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                         'value_mae': train_metrics.get('value_mae', 0),
@@ -3379,6 +3537,7 @@ def main():
                     learning_rate=current_lr,
                     value_loss_weight=current_value_loss_weight,
                     mcts_q_value_scale=current_mcts_q_value_scale,
+                    mcts_q_value_trust=float(value_trust_state.get('scale', 1.0) or 1.0),
                     value_guard_streak=value_guard_poor_eval_streak,
                     buffer_size=len(replay_buffer),
                     avg_game_length=avg_game_length,
@@ -3424,6 +3583,16 @@ def main():
                     adaptive_temp_threshold=current_temp_threshold,
                 )
                 last_logged_iteration = iteration + 1
+            value_trust_state = _update_value_trust_state(
+                value_trust_state,
+                value_mae=(train_metrics or {}).get('value_mae', None),
+                pred_value_std=avg_value_pred_std,
+                target_value_std=avg_target_value_std,
+                mcts_score_rate=score_rate,
+                no_mcts_score_rate=no_mcts_score_rate,
+                anchor_score_rate=anchor_score_rate,
+                current_q_value_scale=current_mcts_q_value_scale,
+            )
             _finish_stage('eval_log')
 
             if recent_snapshot_keep > 0:
@@ -3487,7 +3656,7 @@ def main():
                 data_collection_time=collection_time,
                 avg_game_length=avg_game_length,
                 profile=performance_profile,
-                stage_times=iteration_stage_times if profile_training_enabled else None,
+                stage_times=iteration_stage_times,
             )
             logger.log_rl_data_quality(
                 iteration + 1,
@@ -3508,17 +3677,6 @@ def main():
         interrupted_stage = "runtime"
     finally:
         _shutdown_selfplay_pool()
-
-    final_elo_iteration = last_logged_iteration
-    if final_elo_iteration is not None:
-        try:
-            elo_coordinator.final_evaluate(final_elo_iteration, interrupted=training_interrupted)
-        except KeyboardInterrupt:
-            training_interrupted = True
-            interrupted_stage = "elo shutdown"
-            print("Final Elo interrupted by user. Shutting down...")
-    elif training_interrupted:
-        print("Final Elo skipped: no completed iteration available to evaluate.")
 
     logger.plot()
     logger.plot_rl_performance()

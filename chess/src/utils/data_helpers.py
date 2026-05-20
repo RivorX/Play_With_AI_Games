@@ -1,10 +1,10 @@
 """
 Data processing helper functions for chess AI
-🆕 v4.3: POV (Point of View) + Dynamic Sliding Window + TEMPORAL DISCOUNTING
+v4.3: POV (Point of View) + Dynamic Sliding Window
 - 🎯 POV: All boards from perspective of current player
 - 🔄 Sliding Window: Dynamic history assembly using mmap
 - 🎮 GameID tracking: Track games for history reconstruction
-- ⚡ TEMPORAL DISCOUNTING: Fixed MAE from 0.8 to ~0.2!
+- Value targets use final W/D/L outcomes from side-to-move POV.
 """
 
 import chess
@@ -19,7 +19,7 @@ from functools import lru_cache
 
 def compute_discounted_outcome(move_idx, total_moves, result, current_turn):
     """
-    Return outcome in WDL-only mode (no temporal discounting).
+    Return final outcome from the side-to-move POV.
 
     Args:
         move_idx: Unused; kept for API stability.
