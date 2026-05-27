@@ -806,6 +806,7 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     policy_lengths = torch.zeros((batch_size,), dtype=torch.int16)
     importance_scores = torch.zeros((batch_size,), dtype=torch.float32)
     policy_weights = torch.ones((batch_size,), dtype=torch.float32)
+    value_weights = torch.ones((batch_size,), dtype=torch.float32)
 
     for row_idx, pos in enumerate(positions):
         _, indices, probs, _ = pos[:4]
@@ -814,6 +815,7 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
             count = min(count, max(1, int(max_policy_targets)))
         importance_scores[row_idx] = float(pos[4]) if len(pos) > 4 else 0.0
         policy_weights[row_idx] = float(pos[5]) if len(pos) > 5 else 1.0
+        value_weights[row_idx] = float(pos[6]) if len(pos) > 6 else 1.0
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -828,6 +830,7 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         'values': values,
         'importance_scores': importance_scores,
         'policy_weights': policy_weights,
+        'value_weights': value_weights,
         'num_positions': batch_size,
     }
 
@@ -928,21 +931,27 @@ class MultiGameBatchMCTS:
         self.model = model
         self.config = config
         self.device = device
+        rl_cfg = config['reinforcement_learning']
+
         self.c_puct_base = float(
-            config['reinforcement_learning']['mcts_c_puct_base']
+            rl_cfg['mcts_c_puct_base']
         )
         self.c_puct_init = float(
-            config['reinforcement_learning']['mcts_c_puct_init']
+            rl_cfg['mcts_c_puct_init']
         )
-        self.c_puct_max = float(config['reinforcement_learning']['mcts_c_puct_max'])
-        self.use_fpu = bool(config['reinforcement_learning'].get('mcts_use_fpu', True))
+        self.c_puct_max = float(rl_cfg['mcts_c_puct_max'])
+        self.use_fpu = bool(rl_cfg.get('mcts_use_fpu', True))
         self.fpu_reduction = float(
-            config['reinforcement_learning'].get('mcts_fpu_reduction', 0.30)
+            rl_cfg.get('mcts_fpu_reduction', 0.30)
         )
-        self.fpu_absolute = config['reinforcement_learning'].get('mcts_fpu_absolute', None)
+        self.fpu_absolute = rl_cfg.get('mcts_fpu_absolute', None)
         self.q_value_scale = max(
             0.0,
             float(config['reinforcement_learning'].get('mcts_q_value_scale', 1.0)),
+        )
+        self.q_selection_weight = max(
+            0.0,
+            float(config['reinforcement_learning'].get('mcts_q_selection_weight', 1.0)),
         )
         self.q_centered = bool(config['reinforcement_learning'].get('mcts_q_centered', False))
         self.q_min_child_visits = max(
@@ -961,61 +970,93 @@ class MultiGameBatchMCTS:
             0.0,
             float(config['reinforcement_learning'].get('mcts_q_max_abs', 0.0)),
         )
+        self.q_min_fullmove = max(
+            1,
+            int(config['reinforcement_learning'].get('mcts_q_min_fullmove', 1)),
+        )
+        self.q_full_weight_fullmove = max(
+            self.q_min_fullmove,
+            int(config['reinforcement_learning'].get('mcts_q_full_weight_fullmove', self.q_min_fullmove)),
+        )
         self.eval_batch_size = config['reinforcement_learning'].get('mcts_batch_size', 32)
         self.adaptive_search_enabled = bool(
-            config['reinforcement_learning'].get('mcts_adaptive_search_enabled', True)
+            rl_cfg.get('mcts_search_early_stop_enabled', True)
         )
         self.adaptive_search_min_simulations = max(
             1,
-            int(config['reinforcement_learning'].get('mcts_adaptive_search_min_simulations', 64)),
+            int(rl_cfg.get('mcts_search_early_stop_min_simulations', 64)),
         )
         self.adaptive_search_check_interval = max(
             1,
-            int(config['reinforcement_learning'].get('mcts_adaptive_search_check_interval', 8)),
+            int(rl_cfg.get('mcts_search_early_stop_check_interval', 8)),
         )
         self.adaptive_search_low_branching_moves = max(
             2,
-            int(config['reinforcement_learning'].get('mcts_adaptive_search_low_branching_moves', 6)),
+            int(rl_cfg.get('mcts_search_simple_position_legal_moves', 6)),
         )
         self.adaptive_search_endgame_piece_count = max(
             2,
-            int(config['reinforcement_learning'].get('mcts_adaptive_search_endgame_piece_count', 10)),
+            int(rl_cfg.get('mcts_search_simple_endgame_piece_count', 10)),
         )
         self.adaptive_search_top_visit_confidence = max(
             0.0,
-            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_top_visit_confidence', 0.84))),
+            min(1.0, float(rl_cfg.get('mcts_search_early_stop_min_top_visit_prob', 0.84))),
         )
         self.adaptive_search_visit_gap = max(
             0.0,
-            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_visit_gap', 0.28))),
+            min(1.0, float(rl_cfg.get('mcts_search_early_stop_min_visit_gap', 0.28))),
         )
         self.adaptive_search_max_entropy = max(
             0.0,
-            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_max_entropy', 0.40))),
+            min(1.0, float(rl_cfg.get('mcts_search_early_stop_max_visit_entropy', 0.40))),
         )
         self.adaptive_search_min_budget_fraction = max(
             0.0,
-            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_min_budget_fraction', 0.60))),
+            min(1.0, float(rl_cfg.get('mcts_search_early_stop_min_budget_fraction', 0.60))),
         )
         self.adaptive_search_min_explored_prior_mass = max(
             0.0,
-            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_min_explored_prior_mass', 0.88))),
+            min(1.0, float(rl_cfg.get('mcts_search_early_stop_min_explored_prior_mass', 0.88))),
         )
         self.adaptive_search_min_visited_moves = max(
             1,
-            int(config['reinforcement_learning'].get('mcts_adaptive_search_min_visited_moves', 3)),
+            int(rl_cfg.get('mcts_search_early_stop_min_visited_moves', 3)),
+        )
+        self.adaptive_search_sensitive_min_budget_fraction = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('mcts_search_sensitive_min_budget_fraction', 0.95))),
+        )
+        self.adaptive_search_sensitive_prior_mass = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('mcts_search_sensitive_min_explored_prior_mass', 0.98))),
+        )
+        self.adaptive_search_sensitive_min_visited_moves = max(
+            1,
+            int(rl_cfg.get('mcts_search_sensitive_min_visited_moves', 7)),
+        )
+        self.adaptive_search_check_extra_multiplier = max(
+            1.0,
+            float(rl_cfg.get('mcts_search_check_budget_multiplier', 1.30)),
+        )
+        self.adaptive_search_tactical_extra_multiplier = max(
+            1.0,
+            float(rl_cfg.get('mcts_search_sharp_tactic_budget_multiplier', 1.12)),
+        )
+        self.adaptive_search_sharp_capture_min_gain = max(
+            0.0,
+            float(rl_cfg.get('mcts_search_sharp_capture_min_gain', 1.0)),
         )
         self.adaptive_search_late_after_ply = max(
             0,
-            int(config['reinforcement_learning'].get('mcts_adaptive_search_late_after_ply', 60)),
+            int(rl_cfg.get('mcts_search_late_extra_after_ply', 60)),
         )
         self.adaptive_search_late_extra_fraction = max(
             0.0,
-            min(1.0, float(config['reinforcement_learning'].get('mcts_adaptive_search_late_extra_fraction', 0.25))),
+            min(1.0, float(rl_cfg.get('mcts_search_late_extra_fraction', 0.25))),
         )
         self.adaptive_search_late_extra_multiplier = max(
             1.0,
-            float(config['reinforcement_learning'].get('mcts_adaptive_search_late_extra_multiplier', 1.5)),
+            float(rl_cfg.get('mcts_search_late_extra_budget_multiplier', 1.5)),
         )
         # History configuration (POV)
         self.history_positions = config['model'].get('history_positions', 0)
@@ -1485,7 +1526,19 @@ class MultiGameBatchMCTS:
             q_values[explored_mask] = (
                 -edges.value_sums[explored_mask] - edges.virtual_losses_f32[explored_mask]
             ) / cv[explored_mask]
-        if self.q_value_scale <= 0.0:
+        effective_q_weight = float(self.q_selection_weight) + float(self.q_value_scale)
+        if effective_q_weight > 0.0 and self.q_min_fullmove > 1:
+            try:
+                fullmove_number = int(getattr(node.board, 'fullmove_number', 1) or 1)
+            except Exception:
+                fullmove_number = 1
+            if fullmove_number < self.q_min_fullmove:
+                effective_q_weight = 0.0
+            elif self.q_full_weight_fullmove > self.q_min_fullmove:
+                phase_span = float(self.q_full_weight_fullmove - self.q_min_fullmove)
+                phase_progress = float(fullmove_number - self.q_min_fullmove) / phase_span
+                effective_q_weight *= max(0.0, min(1.0, phase_progress))
+        if effective_q_weight <= 0.0:
             q_values.fill(0.0)
         elif self.q_centered:
             transformed_q = q_values
@@ -1493,7 +1546,7 @@ class MultiGameBatchMCTS:
             # children, then overwrite only stable children with centered Q.
             # Previously centered-Q mode zeroed the whole vector, which made
             # mcts_use_fpu effectively meaningless whenever q_centered=true.
-            transformed_q.fill(fpu_value)
+            transformed_q.fill(float(fpu_value) * float(effective_q_weight))
             stable_mask = explored_mask
             if self.q_min_child_visits > 0.0:
                 stable_mask = explored_mask & (cv >= float(self.q_min_child_visits))
@@ -1511,12 +1564,12 @@ class MultiGameBatchMCTS:
                     visit_gate = np.minimum(1.0, stable_counts / float(self.q_min_child_visits))
                 else:
                     visit_gate = 1.0
-                centered_q = centered_q * float(self.q_value_scale) * float(parent_gate) * visit_gate
+                centered_q = centered_q * float(effective_q_weight) * float(parent_gate) * visit_gate
                 if self.q_max_abs > 0.0:
                     centered_q = np.clip(centered_q, -float(self.q_max_abs), float(self.q_max_abs))
                 transformed_q[stable_mask] = centered_q.astype(np.float32, copy=False)
-        elif self.q_value_scale != 1.0:
-            q_values *= float(self.q_value_scale)
+        elif effective_q_weight != 1.0:
+            q_values *= float(effective_q_weight)
 
         u_values = edges.ucb_buffer
         np.multiply(edges.priors, c_puct * parent_sqrt, out=u_values)
@@ -1673,18 +1726,28 @@ class MultiGameBatchMCTS:
         if not self.adaptive_search_enabled:
             return base_budget, False
 
+        profile = self._adaptive_search_root_profile(root, move_count=move_count)
+        budget = base_budget
+        extended = False
+        if profile.get('in_check', False):
+            budget = max(budget, int(round(float(base_budget) * self.adaptive_search_check_extra_multiplier)))
+            extended = budget > base_budget
+        elif profile.get('sharp_tactic', False):
+            budget = max(budget, int(round(float(base_budget) * self.adaptive_search_tactical_extra_multiplier)))
+            extended = budget > base_budget
+
         ply = 0 if move_count is None else max(0, int(move_count))
         if ply < self.adaptive_search_late_after_ply:
-            return base_budget, False
+            return max(1, budget), extended
 
         if self.adaptive_search_late_extra_fraction <= 0.0:
-            return base_budget, False
+            return max(1, budget), extended
 
         if self._stable_fraction_for_root(root) >= self.adaptive_search_late_extra_fraction:
-            return base_budget, False
+            return max(1, budget), extended
 
         boosted = int(round(float(base_budget) * self.adaptive_search_late_extra_multiplier))
-        boosted = max(base_budget, boosted)
+        boosted = max(budget, boosted)
         max_boosted = int(round(float(base_budget) * _ADAPTIVE_LATE_EXTRA_MAX_MULTIPLIER))
         boosted = min(boosted, max(base_budget, max_boosted))
         return max(1, boosted), boosted > base_budget
@@ -1712,20 +1775,75 @@ class MultiGameBatchMCTS:
             float(requirements['max_entropy']),
         )
 
-    def _adaptive_search_root_profile(self, root):
+    def _move_is_budget_sensitive_tactic(self, board, move, legal_count=None, move_count=None):
+        if move.promotion is not None:
+            return True
+        is_capture = False
+        try:
+            is_capture = bool(board.is_capture(move))
+            if is_capture:
+                gain = self._captured_piece_value(board, move) - self._moving_piece_value(board, move)
+                if gain >= float(self.adaptive_search_sharp_capture_min_gain):
+                    return True
+        except Exception:
+            pass
+        try:
+            gives_check = bool(self._move_may_give_check_fast(board, move) and board.gives_check(move))
+        except Exception:
+            return False
+        if not gives_check:
+            return False
+        if is_capture:
+            return True
+        if legal_count is not None and int(legal_count) <= max(8, int(self.adaptive_search_low_branching_moves) * 2):
+            return True
+        return bool(move_count is not None and int(move_count) >= int(self.adaptive_search_late_after_ply))
+
+    def _adaptive_search_root_profile(self, root, move_count=None):
         legal_count = 0
         piece_count = None
-        if root is not None and root.expanded and root.edges is not None:
-            legal_count = len(root.edges.moves) if root.edges.moves is not None else 0
+        in_check = False
+        sharp_tactic = False
+        board = None if root is None else getattr(root, 'board', None)
+        if board is not None:
             try:
-                piece_count = len(root.board.piece_map())
+                in_check = bool(board.is_check())
+            except Exception:
+                in_check = False
+            try:
+                piece_count = len(board.piece_map())
             except Exception:
                 piece_count = None
+
+        moves = []
+        if root is not None and root.expanded and root.edges is not None:
+            moves = list(root.edges.moves) if root.edges.moves is not None else []
+        elif board is not None:
+            try:
+                moves = list(board.legal_moves)
+            except Exception:
+                moves = []
+        legal_count = len(moves)
+        if board is not None and moves:
+            try:
+                sharp_tactic = any(
+                    self._move_is_budget_sensitive_tactic(
+                        board,
+                        move,
+                        legal_count=legal_count,
+                        move_count=move_count,
+                    )
+                    for move in moves
+                )
+            except Exception:
+                sharp_tactic = False
         return {
             'legal_count': int(legal_count),
-            'forced': bool(root is not None and root.expanded and root.edges is not None and legal_count <= 1),
+            'forced': bool(legal_count <= 1 and legal_count > 0),
             'low_branching': bool(1 < legal_count <= self.adaptive_search_low_branching_moves),
             'endgame': bool(piece_count is not None and piece_count <= self.adaptive_search_endgame_piece_count),
+            'in_check': bool(in_check),
+            'sharp_tactic': bool(sharp_tactic),
         }
 
     def _adaptive_search_requirements_for_root(
@@ -1737,7 +1855,7 @@ class MultiGameBatchMCTS:
     ):
         base_minimum = max(1, int(self.adaptive_search_min_simulations))
         sim_budget = max(1, int(simulation_budget or base_minimum))
-        profile = self._adaptive_search_root_profile(root)
+        profile = self._adaptive_search_root_profile(root, move_count=move_count)
         legal_count = int(profile['legal_count'])
 
         if profile['forced']:
@@ -1767,6 +1885,10 @@ class MultiGameBatchMCTS:
             minimum = min(minimum, int(round(base_minimum * _ADAPTIVE_ENDGAME_MIN_FRACTION)))
             budget_fraction = min(budget_fraction, _ADAPTIVE_ENDGAME_BUDGET_FRACTION)
 
+        if profile.get('in_check', False) or profile.get('sharp_tactic', False):
+            budget_fraction = max(budget_fraction, float(self.adaptive_search_sensitive_min_budget_fraction))
+            required_prior_mass = max(required_prior_mass, float(self.adaptive_search_sensitive_prior_mass))
+
         if budget_fraction > 0.0:
             minimum = max(minimum, int(round(float(sim_budget) * budget_fraction)))
 
@@ -1780,7 +1902,10 @@ class MultiGameBatchMCTS:
             minimum = max(minimum, self._late_minimum_for_budget(sim_budget))
 
         minimum = min(sim_budget, max(1, int(minimum)))
-        required_visited = min(max(1, legal_count), max(1, int(self.adaptive_search_min_visited_moves)))
+        min_visited = max(1, int(self.adaptive_search_min_visited_moves))
+        if profile.get('in_check', False) or profile.get('sharp_tactic', False):
+            min_visited = max(min_visited, int(self.adaptive_search_sensitive_min_visited_moves))
+        required_visited = min(max(1, legal_count), min_visited)
         top_confidence = float(self.adaptive_search_top_visit_confidence)
         visit_gap = float(self.adaptive_search_visit_gap)
         max_entropy = float(self.adaptive_search_max_entropy)
@@ -2660,6 +2785,21 @@ class BatchSelfPlayMCTSBatch:
             0.0,
             min(1.0, float(rl_cfg.get('replay_importance_top_fraction', 0.70))),
         )
+        self.value_target_weighting_enabled = bool(
+            rl_cfg.get('value_target_weighting_enabled', False)
+        )
+        self.value_target_weight_min = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('value_target_weight_min', 0.35))),
+        )
+        self.value_target_weight_draw_min = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('value_target_weight_draw_min', self.value_target_weight_min))),
+        )
+        self.value_target_weight_power = max(
+            0.1,
+            float(rl_cfg.get('value_target_weight_power', 1.75)),
+        )
         
         self.max_positions_per_game = max(
             0,
@@ -3240,6 +3380,7 @@ class BatchSelfPlayMCTSBatch:
         self,
         gs,
         history_idx,
+        history_len,
         outcome,
         draw_value_target=0.0,
     ):
@@ -3253,6 +3394,7 @@ class BatchSelfPlayMCTSBatch:
         else:
             signed_outcome = outcome if turn == chess.WHITE else -outcome
             value = float(signed_outcome)
+        value_weight = self._value_target_weight(int(history_idx), int(history_len), outcome)
 
         return {
             'history_idx': int(history_idx),
@@ -3263,7 +3405,21 @@ class BatchSelfPlayMCTSBatch:
             'value': value,
             'importance_score': importance_score,
             'policy_weight': policy_weight,
+            'value_weight': value_weight,
         }
+
+    def _value_target_weight(self, history_idx, history_len, outcome):
+        if not self.value_target_weighting_enabled:
+            return 1.0
+        history_len = max(1, int(history_len))
+        progress = max(0.0, min(1.0, (int(history_idx) + 1) / float(history_len)))
+        min_weight = (
+            self.value_target_weight_draw_min
+            if float(outcome) == 0.0
+            else self.value_target_weight_min
+        )
+        shaped = progress ** float(self.value_target_weight_power)
+        return float(min_weight + (1.0 - min_weight) * shaped)
 
     def _compute_position_importance(self, board, move, visit_counts, root):
         importance = 1.0
@@ -3327,6 +3483,7 @@ class BatchSelfPlayMCTSBatch:
             item = self._build_training_position_from_history_entry(
                 gs,
                 candidate['history_idx'],
+                history_len,
                 outcome,
                 draw_value_target=0.0,
             )
@@ -3347,6 +3504,7 @@ class BatchSelfPlayMCTSBatch:
                 torch.tensor([item['value']], dtype=torch.float32),
                 float(item.get('importance_score', 0.0)),
                 float(item.get('policy_weight', 1.0)),
+                float(item.get('value_weight', 1.0)),
             ))
         if self.profile_enabled:
             self._profile_add('policy_target_postgame_time', time.perf_counter() - postgame_t0)
@@ -3528,6 +3686,7 @@ class BatchSelfPlayMCTSBatch:
         total_search_extra_budget_samples = 0
         total_search_samples = 0
         search_simulations_used_samples = []
+        search_simulations_budget_samples = []
         total_adaptive_stopped_early = 0
         adaptive_stop_reasons = {}
         total_mcts_quality_stats = {
@@ -3582,6 +3741,7 @@ class BatchSelfPlayMCTSBatch:
         total_search_extra_budget_samples += int(batch_stats.get('search_extra_budget_samples', 0))
         total_search_samples += int(batch_stats.get('search_samples', 0))
         search_simulations_used_samples.extend(list(batch_stats.get('search_simulations_used_samples', []) or []))
+        search_simulations_budget_samples.extend(list(batch_stats.get('search_simulations_budget_samples', []) or []))
         total_adaptive_stopped_early += int(batch_stats.get('adaptive_stopped_early', 0))
         for reason, count in dict(batch_stats.get('adaptive_stop_reasons', {}) or {}).items():
             adaptive_stop_reasons[str(reason)] = int(adaptive_stop_reasons.get(str(reason), 0)) + int(count)
@@ -3623,6 +3783,15 @@ class BatchSelfPlayMCTSBatch:
             if search_simulations_used_samples
             else 0.0
         )
+        budget_arr = (
+            np.asarray(search_simulations_budget_samples, dtype=np.float32)
+            if search_simulations_budget_samples
+            else None
+        )
+        p10_search_simulations_budget = float(np.percentile(budget_arr, 10)) if budget_arr is not None else 0.0
+        p90_search_simulations_budget = float(np.percentile(budget_arr, 90)) if budget_arr is not None else 0.0
+        min_search_simulations_budget = float(np.min(budget_arr)) if budget_arr is not None else 0.0
+        max_search_simulations_budget = float(np.max(budget_arr)) if budget_arr is not None else 0.0
         mcts_quality_samples = int(total_mcts_quality_stats['mcts_prior_agreement_samples'])
         mcts_q_delta_samples = int(total_mcts_quality_stats['mcts_q_delta_samples'])
         mcts_q_delta_values = list(total_mcts_quality_stats.get('mcts_q_delta_values', []) or [])
@@ -3657,10 +3826,15 @@ class BatchSelfPlayMCTSBatch:
                 if total_search_samples > 0
                 else 0.0
             ),
+            'search_simulations_budget_p10': float(p10_search_simulations_budget),
+            'search_simulations_budget_p90': float(p90_search_simulations_budget),
+            'search_simulations_budget_min': float(min_search_simulations_budget),
+            'search_simulations_budget_max': float(max_search_simulations_budget),
             'search_simulations_used_p10': float(p10_search_simulations_used),
             'search_simulations_used_sum': int(total_search_simulations_used),
             'search_simulations_budget_sum': int(total_search_simulations_budget),
             'search_simulations_used_samples': list(search_simulations_used_samples),
+            'search_simulations_budget_samples': list(search_simulations_budget_samples),
             'search_extra_budget_samples': int(total_search_extra_budget_samples),
             'search_extra_budget_rate': (
                 float(total_search_extra_budget_samples) / float(total_search_samples)
@@ -3921,6 +4095,7 @@ class BatchSelfPlayMCTSBatch:
             'extra_budget_samples': 0,
             'samples': 0,
             'samples_list': [],
+            'budget_samples_list': [],
             'stopped_early': 0,
             'stop_reasons': {},
         }
@@ -3946,7 +4121,7 @@ class BatchSelfPlayMCTSBatch:
             'search_discovery_weight_sum': 0.0,
         }
 
-        def _accumulate_target_quality(search_metadata):
+        def _accumulate_target_quality(search_metadata, visit_counts, root):
             if not isinstance(search_metadata, dict):
                 return
             agree = search_metadata.get('prior_mcts_agree', None)
@@ -3961,13 +4136,30 @@ class BatchSelfPlayMCTSBatch:
                 ('prior_top_visit_prob', 'prior_top_visit_prob_sum'),
                 ('mcts_top_prior_prob', 'mcts_top_prior_prob_sum'),
                 ('mcts_policy_kl', 'policy_kl_sum'),
-                ('explored_prior_mass', 'explored_prior_mass_sum'),
-                ('visited_move_count', 'visited_move_count_sum'),
-                ('legal_move_count', 'legal_move_count_sum'),
             ]:
                 value = search_metadata.get(meta_key, None)
                 if value is not None:
                     target_quality[sum_key] += float(value)
+            if visit_counts:
+                visited_count = sum(1 for count in visit_counts.values() if float(count) > 0.0)
+                legal_count = len(visit_counts)
+                target_quality['visited_move_count_sum'] += float(visited_count)
+                target_quality['legal_move_count_sum'] += float(legal_count)
+                if root is not None and getattr(root, 'expanded', False) and getattr(root, 'edges', None) is not None:
+                    prior_by_move = {
+                        move: float(prior)
+                        for move, prior in zip(root.edges.moves, root.edges.base_priors)
+                    }
+                    prior_total = sum(prior_by_move.values())
+                    if prior_total > 0.0:
+                        explored_prior = sum(
+                            prior_by_move.get(move, 0.0)
+                            for move, count in visit_counts.items()
+                            if float(count) > 0.0
+                        )
+                        target_quality['explored_prior_mass_sum'] += float(
+                            max(0.0, min(1.0, explored_prior / prior_total))
+                        )
             q_delta = search_metadata.get('mcts_q_delta', None)
             if q_delta is not None:
                 target_quality['q_comparable'] += 1
@@ -4021,7 +4213,6 @@ class BatchSelfPlayMCTSBatch:
                 continue
 
             visit_counts_by_index = {}
-            simulations_this_turn = self.num_simulations
 
             def _run_search_for_indices(indices, mcts_ref, root_key, synced_key):
                 if not indices:
@@ -4038,7 +4229,7 @@ class BatchSelfPlayMCTSBatch:
                     ])
                 visit_counts_list_group, search_metadata_group = mcts_ref.search_many(
                     group_states,
-                    num_simulations=simulations_this_turn,
+                    num_simulations=self.num_simulations,
                     add_root_noise=True,
                     return_search_metadata=True,
                 )
@@ -4055,9 +4246,14 @@ class BatchSelfPlayMCTSBatch:
                     used = int(search_metadata.get('simulations_used', 0)) if isinstance(search_metadata, dict) else 0
                     search_stats['sim_used'] += used
                     if isinstance(search_metadata, dict):
-                        search_stats['sim_budget'] += int(search_metadata.get('simulation_budget', simulations_this_turn) or simulations_this_turn)
+                        budget = int(search_metadata.get('simulation_budget', self.num_simulations) or self.num_simulations)
+                        search_stats['sim_budget'] += budget
+                        search_stats['budget_samples_list'].append(budget)
                         if bool(search_metadata.get('simulation_budget_extra', False)):
                             search_stats['extra_budget_samples'] += 1
+                    else:
+                        search_stats['sim_budget'] += int(self.num_simulations)
+                        search_stats['budget_samples_list'].append(int(self.num_simulations))
                     search_stats['samples'] += 1
                     search_stats['samples_list'].append(used)
                     if isinstance(search_metadata, dict):
@@ -4142,7 +4338,7 @@ class BatchSelfPlayMCTSBatch:
                         target_quality['search_discovery_weight_sum'] += float(discovery_weight)
                     if not learner_turn and game_opponent_mcts is not None:
                         policy_weight *= float(self.frozen_opponent_policy_weight)
-                    _accumulate_target_quality(search_metadata)
+                    _accumulate_target_quality(search_metadata, visit_counts, root)
                     if root is not None:
                         root_visits = int(getattr(root, 'visit_count', 0) or 0)
                         if root_visits > 0:
@@ -4337,6 +4533,7 @@ class BatchSelfPlayMCTSBatch:
             'search_simulations_budget_sum': int(search_stats['sim_budget']),
             'search_samples': int(search_stats['samples']),
             'search_simulations_used_samples': list(search_stats['samples_list']),
+            'search_simulations_budget_samples': list(search_stats['budget_samples_list']),
             'search_extra_budget_samples': int(search_stats['extra_budget_samples']),
             'search_extra_budget_rate': (
                 float(search_stats['extra_budget_samples']) / float(search_stats['samples'])
@@ -4717,6 +4914,9 @@ class _RemoteInferenceModel:
             except queue.Empty:
                 continue
             if response.get("request_id") != request_id:
+                response_request_id = str(response.get("request_id") or "")
+                if not response_request_id.startswith(f"{os.getpid()}_"):
+                    continue
                 raise RuntimeError(
                     "Central inference response routing failed: "
                     f"worker {self.worker_rank} received response for another request."
@@ -5650,6 +5850,14 @@ def persistent_selfplay_worker(
                     for mcts_obj in [getattr(engine, 'mcts', None)] + opponent_mcts:
                         if mcts_obj is not None and hasattr(mcts_obj, 'q_value_scale'):
                             mcts_obj.q_value_scale = q_value_scale
+                if task.get('mcts_q_selection_weight') is not None:
+                    q_selection_weight = max(0.0, float(task['mcts_q_selection_weight']))
+                    opponent_mcts = list(
+                        (getattr(engine, 'opponent_mcts_by_label', {}) or {}).values()
+                    )
+                    for mcts_obj in [getattr(engine, 'mcts', None)] + opponent_mcts:
+                        if mcts_obj is not None and hasattr(mcts_obj, 'q_selection_weight'):
+                            mcts_obj.q_selection_weight = q_selection_weight
 
                 total_positions, total_games = _play_games_with_engine(
                     rank,

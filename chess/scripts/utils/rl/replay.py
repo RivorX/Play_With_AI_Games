@@ -71,6 +71,7 @@ class ReplayBuffer:
         self._policy_lengths = None
         self._importance = None
         self._policy_sample_weights = None
+        self._value_sample_weights = None
         self._insertion_iterations = None
         self._scratch = {}
         self.current_iteration = 0
@@ -114,6 +115,7 @@ class ReplayBuffer:
         self._policy_lengths = torch.zeros((self.max_size,), dtype=torch.int16)
         self._importance = torch.zeros((self.max_size,), dtype=torch.float32)
         self._policy_sample_weights = torch.ones((self.max_size,), dtype=torch.float32)
+        self._value_sample_weights = torch.ones((self.max_size,), dtype=torch.float32)
         self._insertion_iterations = torch.zeros((self.max_size,), dtype=torch.int32)
 
     def set_current_iteration(self, iteration):
@@ -139,6 +141,7 @@ class ReplayBuffer:
             "policy_values": torch.zeros((batch_size, max_len), dtype=probs_dtype),
             "policy_mask": torch.zeros((batch_size, max_len), dtype=torch.bool),
             "policy_sample_weights": torch.ones((batch_size,), dtype=torch.float32),
+            "value_sample_weights": torch.ones((batch_size,), dtype=torch.float32),
             "arange": torch.arange(max_len, dtype=torch.int16),
         }
         self._scratch[key] = scratch
@@ -150,6 +153,7 @@ class ReplayBuffer:
         board, policy_indices, policy_values, value = position[:4]
         importance = float(position[4]) if len(position) > 4 else 0.0
         policy_weight = float(position[5]) if len(position) > 5 else 1.0
+        value_weight = float(position[6]) if len(position) > 6 else 1.0
         if self.use_fp16:
             board = board.half().contiguous()
             policy_values = policy_values.half().contiguous()
@@ -161,10 +165,10 @@ class ReplayBuffer:
 
         policy_indices = policy_indices.to(dtype=torch.int16).contiguous()
         value = value.reshape(1).contiguous()
-        return board, policy_indices, policy_values, value, importance, policy_weight
+        return board, policy_indices, policy_values, value, importance, policy_weight, value_weight
 
     def _store_at_slot(self, slot, position):
-        board, policy_indices, policy_values, value, importance, policy_weight = self._normalize_position(position)
+        board, policy_indices, policy_values, value, importance, policy_weight, value_weight = self._normalize_position(position)
 
         count = int(policy_indices.numel())
         if count > self.max_policy_targets:
@@ -182,6 +186,7 @@ class ReplayBuffer:
         self._policy_lengths[slot] = count
         self._importance[slot] = float(importance)
         self._policy_sample_weights[slot] = float(policy_weight)
+        self._value_sample_weights[slot] = float(value_weight)
         self._insertion_iterations[slot] = int(self.current_iteration)
 
     def _build_batch_from_indices(self, indices):
@@ -194,15 +199,17 @@ class ReplayBuffer:
         boards = scratch["boards"]
         values = scratch["values"]
         policy_sample_weights = scratch["policy_sample_weights"]
+        value_sample_weights = scratch["value_sample_weights"]
         boards.copy_(self._boards[idx])
         values.copy_(self._values[idx])
         policy_sample_weights.copy_(self._policy_sample_weights[idx])
+        value_sample_weights.copy_(self._value_sample_weights[idx])
 
         if max_len <= 0:
             policy_indices = scratch["policy_indices"][:, :0]
             policy_values = scratch["policy_values"][:, :0]
             policy_mask = scratch["policy_mask"][:, :0]
-            return boards, policy_indices, policy_values, policy_mask, values, policy_sample_weights
+            return boards, policy_indices, policy_values, policy_mask, values, policy_sample_weights, value_sample_weights
 
         policy_indices = scratch["policy_indices"]
         policy_values = scratch["policy_values"]
@@ -211,7 +218,7 @@ class ReplayBuffer:
         policy_indices.copy_(self._policy_indices[idx, :max_len])
         policy_values.copy_(self._policy_values[idx, :max_len])
         policy_mask.copy_(scratch["arange"].unsqueeze(0) < lengths.unsqueeze(1))
-        return boards, policy_indices, policy_values, policy_mask, values, policy_sample_weights
+        return boards, policy_indices, policy_values, policy_mask, values, policy_sample_weights, value_sample_weights
 
     def add(self, position):
         board = position[0]
@@ -229,6 +236,7 @@ class ReplayBuffer:
         values,
         importance_scores=None,
         policy_weights=None,
+        value_weights=None,
     ):
         if boards is None or int(boards.shape[0]) <= 0:
             return
@@ -247,6 +255,10 @@ class ReplayBuffer:
             policy_weights = torch.ones((int(boards.shape[0]),), dtype=torch.float32)
         else:
             policy_weights = policy_weights.reshape(-1).to(dtype=torch.float32).contiguous()
+        if value_weights is None:
+            value_weights = torch.ones((int(boards.shape[0]),), dtype=torch.float32)
+        else:
+            value_weights = value_weights.reshape(-1).to(dtype=torch.float32).contiguous()
 
         max_len = int(policy_indices.shape[1]) if policy_indices.dim() == 2 else 0
         if max_len > self.max_policy_targets:
@@ -275,6 +287,7 @@ class ReplayBuffer:
             self._policy_lengths[dst_slice].copy_(policy_lengths[src_slice])
             self._importance[dst_slice].copy_(importance_scores[src_slice])
             self._policy_sample_weights[dst_slice].copy_(policy_weights[src_slice])
+            self._value_sample_weights[dst_slice].copy_(value_weights[src_slice])
             self._insertion_iterations[dst_slice].fill_(int(self.current_iteration))
 
             self.position = (dst_start + count) % self.max_size
@@ -594,6 +607,7 @@ class ReplayBuffer:
         old_policy_lengths = self._policy_lengths
         old_importance = self._importance
         old_policy_sample_weights = self._policy_sample_weights
+        old_value_sample_weights = self._value_sample_weights
         old_insertion_iterations = self._insertion_iterations
 
         board_shape = tuple(old_boards.shape[1:])
@@ -615,6 +629,7 @@ class ReplayBuffer:
         self._policy_lengths = torch.zeros((self.max_size,), dtype=old_policy_lengths.dtype)
         self._importance = torch.zeros((self.max_size,), dtype=old_importance.dtype)
         self._policy_sample_weights = torch.ones((self.max_size,), dtype=old_policy_sample_weights.dtype)
+        self._value_sample_weights = torch.ones((self.max_size,), dtype=old_value_sample_weights.dtype)
         self._insertion_iterations = torch.zeros((self.max_size,), dtype=old_insertion_iterations.dtype)
 
         if keep_size > 0:
@@ -626,6 +641,7 @@ class ReplayBuffer:
             self._policy_lengths[:keep_size].copy_(old_policy_lengths[idx])
             self._importance[:keep_size].copy_(old_importance[idx])
             self._policy_sample_weights[:keep_size].copy_(old_policy_sample_weights[idx])
+            self._value_sample_weights[:keep_size].copy_(old_value_sample_weights[idx])
             self._insertion_iterations[:keep_size].copy_(old_insertion_iterations[idx])
 
         self.size = keep_size
@@ -646,6 +662,7 @@ class ReplayBuffer:
         values = self._values[:self.size].reshape(-1).float()
         policy_lengths = self._policy_lengths[:self.size].to(dtype=torch.float32)
         policy_weights = self._policy_sample_weights[:self.size].float()
+        value_weights = self._value_sample_weights[:self.size].float()
         importance = self._importance[:self.size].float()
         decisive_mask = torch.abs(values) > float(self.decisive_value_epsilon)
         draw_mask = ~decisive_mask
@@ -682,6 +699,9 @@ class ReplayBuffer:
             "policy_weight_mean": _safe_mean(policy_weights),
             "policy_weight_p10": _safe_quantile(policy_weights, 0.10),
             "policy_weight_low_fraction": float((policy_weights < 0.75).float().mean().item()),
+            "value_weight_mean": _safe_mean(value_weights),
+            "value_weight_p10": _safe_quantile(value_weights, 0.10),
+            "value_weight_low_fraction": float((value_weights < 0.75).float().mean().item()),
             "policy_target_len_mean": _safe_mean(policy_lengths),
             "policy_target_len_p90": _safe_quantile(policy_lengths, 0.90),
             "importance_mean": _safe_mean(importance),

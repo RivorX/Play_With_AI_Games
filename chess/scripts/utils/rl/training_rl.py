@@ -111,6 +111,7 @@ def _build_eval_mcts_config(config):
     """
     eval_config = dict(config)
     rl_cfg = dict(config.get("reinforcement_learning", {}))
+    rl_cfg["mcts_search_early_stop_enabled"] = False
     rl_cfg["mcts_adaptive_search_enabled"] = False
     eval_config["reinforcement_learning"] = rl_cfg
     return eval_config
@@ -584,6 +585,7 @@ def _evaluate_games_batched(
 
         if was_unresolved:
             unresolved += 1
+            game_wins, game_draws, game_losses, game_unresolved = 0, 0, 0, 1
         else:
             game_wins, game_draws, game_losses = _result_for_model1(
                 bool(gs.get("model1_as_white", False)),
@@ -592,9 +594,17 @@ def _evaluate_games_batched(
             wins += game_wins
             draws += game_draws
             losses += game_losses
+            game_unresolved = 0
         completed += 1
         if progress_callback is not None:
-            progress_callback(1)
+            progress_callback(
+                1,
+                int(gs.get("game_idx", -1)),
+                int(game_wins),
+                int(game_draws),
+                int(game_losses),
+                int(game_unresolved),
+            )
 
     def _claim_draw_if_needed(gs):
         if not auto_claim_draw:
@@ -732,10 +742,15 @@ def _eval_worker(rank, model1_state, model2_state, config, device_str, game_indi
             device,
             game_indices,
             use_fixed_openings=use_fixed_openings,
-            progress_callback=lambda completed: result_queue.put({
+            progress_callback=lambda completed, game_idx=None, wins=0, draws=0, losses=0, unresolved=0: result_queue.put({
                 "type": "progress",
                 "rank": rank,
                 "completed": int(completed),
+                "game_idx": None if game_idx is None else int(game_idx),
+                "wins": int(wins),
+                "draws": int(draws),
+                "losses": int(losses),
+                "unresolved": int(unresolved),
             }),
         )
 
@@ -806,10 +821,15 @@ def _eval_central_worker(rank, config, game_indices, request_queue, response_rec
             torch.device("cpu"),
             game_indices,
             use_fixed_openings=use_fixed_openings,
-            progress_callback=lambda completed: result_queue.put({
+            progress_callback=lambda completed, game_idx=None, wins=0, draws=0, losses=0, unresolved=0: result_queue.put({
                 "type": "progress",
                 "rank": rank,
                 "completed": int(completed),
+                "game_idx": None if game_idx is None else int(game_idx),
+                "wins": int(wins),
+                "draws": int(draws),
+                "losses": int(losses),
+                "unresolved": int(unresolved),
             }),
         )
 
@@ -950,13 +970,26 @@ def _evaluate_models_with_central_inference(
             f"{load_summary}"
         )
 
-        for rank in active_worker_ranks:
+        worker_processes_by_rank = {}
+        restart_counts = {int(rank): 0 for rank in active_worker_ranks}
+        restart_limit = max(0, int(rl_cfg.get("eval_worker_restart_limit", 2) or 0))
+        pending_game_indices_by_rank = {
+            int(rank): list(game_indices_per_worker[int(rank)])
+            for rank in active_worker_ranks
+        }
+        total_game_count_by_rank = {
+            int(rank): len(game_indices_per_worker[int(rank)])
+            for rank in active_worker_ranks
+        }
+        completed_game_indices_by_rank = {int(rank): set() for rank in active_worker_ranks}
+
+        def _start_eval_worker(rank, game_indices):
             proc = ctx.Process(
                 target=_eval_central_worker,
                 args=(
                     rank,
                     config,
-                    game_indices_per_worker[rank],
+                    list(game_indices),
                     request_queues[worker_server_idx[rank]],
                     worker_response_receivers[rank],
                     result_queue,
@@ -965,55 +998,143 @@ def _evaluate_models_with_central_inference(
             )
             proc.daemon = True
             proc.start()
-            worker_processes.append(proc)
+            worker_processes_by_rank[int(rank)] = proc
+            if proc not in worker_processes:
+                worker_processes.append(proc)
+            return proc
+
+        for rank in active_worker_ranks:
+            _start_eval_worker(rank, game_indices_per_worker[rank])
 
         wins = 0
         draws = 0
         losses = 0
         unresolved = 0
         completed = 0
-        finished_workers = 0
+        finished_worker_ranks = set()
         eval_bar = tqdm(total=num_games, desc="Eval vs best", unit="game")
         worker_error = None
         try:
-            while finished_workers < len(worker_processes):
+            while len(finished_worker_ranks) < len(active_worker_ranks):
                 try:
                     message = result_queue.get(timeout=1.0)
                 except Exception:
                     dead_workers = [
-                        proc.exitcode for proc in worker_processes
-                        if proc is not None and not proc.is_alive() and proc.exitcode not in (0, None)
+                        (rank, proc.exitcode)
+                        for rank, proc in list(worker_processes_by_rank.items())
+                        if (
+                            rank not in finished_worker_ranks
+                            and proc is not None
+                            and not proc.is_alive()
+                            and proc.exitcode not in (0, None)
+                        )
                     ]
                     dead_servers = [
                         proc.exitcode for proc in server_processes
                         if proc is not None and not proc.is_alive() and proc.exitcode not in (0, None)
                     ]
                     if dead_workers:
-                        worker_error = f"eval worker exited unexpectedly: exitcodes={dead_workers}"
-                        _terminate_eval_processes(worker_processes)
-                        break
+                        for rank, exitcode in dead_workers:
+                            completed_for_rank = completed_game_indices_by_rank.setdefault(int(rank), set())
+                            remaining = [
+                                int(game_idx)
+                                for game_idx in pending_game_indices_by_rank.get(int(rank), [])
+                                if int(game_idx) not in completed_for_rank
+                            ]
+                            if not remaining:
+                                finished_worker_ranks.add(int(rank))
+                                continue
+                            restart_counts[int(rank)] = int(restart_counts.get(int(rank), 0)) + 1
+                            if restart_counts[int(rank)] > restart_limit:
+                                worker_error = (
+                                    "eval worker exited unexpectedly after "
+                                    f"{restart_limit} restart attempt(s): rank={rank}, "
+                                    f"exitcode={exitcode}, remaining={len(remaining)}"
+                                )
+                                _terminate_eval_processes(list(worker_processes_by_rank.values()))
+                                break
+                            print(
+                                "Warning: eval worker "
+                                f"{rank} exited with code {exitcode}; "
+                                f"completed={len(completed_for_rank)}/"
+                                f"{int(total_game_count_by_rank.get(int(rank), 0))}, "
+                                f"remaining={len(remaining)}, "
+                                f"restart={restart_counts[int(rank)]}/{restart_limit}."
+                            )
+                            old_proc = worker_processes_by_rank.get(int(rank))
+                            if old_proc is not None:
+                                with contextlib.suppress(Exception):
+                                    old_proc.join(timeout=0.2)
+                            pending_game_indices_by_rank[int(rank)] = remaining
+                            _start_eval_worker(int(rank), remaining)
+                        if worker_error is not None:
+                            break
                     if dead_servers:
                         worker_error = f"eval central inference server exited unexpectedly: exitcodes={dead_servers}"
-                        _terminate_eval_processes(worker_processes)
+                        _terminate_eval_processes(list(worker_processes_by_rank.values()))
                         break
                     continue
                 message_type = message.get("type")
                 if message_type == "progress":
-                    completed += int(message.get("completed", 0))
-                    eval_bar.n = min(num_games, completed)
-                    eval_bar.refresh()
+                    rank = int(message.get("rank", -1))
+                    game_idx = message.get("game_idx", None)
+                    counted = False
+                    if game_idx is not None:
+                        try:
+                            game_idx = int(game_idx)
+                        except (TypeError, ValueError):
+                            game_idx = None
+                    if game_idx is not None:
+                        completed_for_rank = completed_game_indices_by_rank.setdefault(rank, set())
+                        if game_idx not in completed_for_rank:
+                            completed_for_rank.add(game_idx)
+                            counted = True
+                    else:
+                        counted = True
+                    if counted:
+                        completed += int(message.get("completed", 0))
+                        wins += int(message.get("wins", 0))
+                        draws += int(message.get("draws", 0))
+                        losses += int(message.get("losses", 0))
+                        unresolved += int(message.get("unresolved", 0))
+                        eval_bar.n = min(num_games, completed)
+                        eval_bar.refresh()
                 elif message_type == "result":
-                    wins += int(message.get("wins", 0))
-                    draws += int(message.get("draws", 0))
-                    losses += int(message.get("losses", 0))
-                    unresolved += int(message.get("unresolved", 0))
-                    finished_workers += 1
+                    rank = int(message.get("rank", -1))
+                    finished_worker_ranks.add(rank)
                 elif message_type == "interrupt":
                     raise KeyboardInterrupt
                 elif message_type == "error":
-                    worker_error = str(message.get("error", "unknown error"))
-                    _terminate_eval_processes(worker_processes)
-                    break
+                    rank = int(message.get("rank", -1))
+                    error_text = str(message.get("error", "unknown error"))
+                    completed_for_rank = completed_game_indices_by_rank.setdefault(rank, set())
+                    remaining = [
+                        int(game_idx)
+                        for game_idx in pending_game_indices_by_rank.get(rank, [])
+                        if int(game_idx) not in completed_for_rank
+                    ]
+                    restart_counts[rank] = int(restart_counts.get(rank, 0)) + 1
+                    if not remaining:
+                        finished_worker_ranks.add(rank)
+                    elif restart_counts[rank] <= restart_limit:
+                        print(
+                            "Warning: eval worker "
+                            f"{rank} reported error; remaining={len(remaining)}, "
+                            f"restart={restart_counts[rank]}/{restart_limit}: {error_text}"
+                        )
+                        old_proc = worker_processes_by_rank.get(rank)
+                        if old_proc is not None:
+                            with contextlib.suppress(Exception):
+                                old_proc.join(timeout=0.2)
+                        pending_game_indices_by_rank[rank] = remaining
+                        _start_eval_worker(rank, remaining)
+                    else:
+                        worker_error = (
+                            "eval worker failed after "
+                            f"{restart_limit} restart attempt(s): rank={rank}, error={error_text}"
+                        )
+                        _terminate_eval_processes(list(worker_processes_by_rank.values()))
+                        break
         finally:
             eval_bar.close()
 
@@ -1112,8 +1233,38 @@ def _wdl_targets_from_final_outcome(target_scalar):
     return torch.stack((target_win, target_draw, target_loss), dim=1)
 
 
-def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_calc=None, value_weight_override=None):
-    boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights = batch
+def _apply_wdl_label_smoothing(target_wdl, smoothing):
+    smoothing = max(0.0, min(0.30, float(smoothing or 0.0)))
+    if smoothing <= 0.0:
+        return target_wdl
+    off_value = smoothing / max(1, target_wdl.size(1) - 1)
+    return target_wdl * (1.0 - smoothing) + (1.0 - target_wdl) * off_value
+
+
+def _weighted_mean(losses, weights):
+    weights = torch.clamp(weights.to(dtype=losses.dtype), min=0.0)
+    weight_total = weights.sum()
+    if float(weight_total.detach().item()) <= 0.0:
+        return losses.mean()
+    return (losses * weights).sum() / weight_total
+
+
+def train_on_batch_rl(
+    model,
+    optimizer,
+    batch,
+    config,
+    device,
+    scaler,
+    metrics_calc=None,
+    value_weight_override=None,
+    policy_weight_override=None,
+):
+    if len(batch) >= 7:
+        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights = batch[:7]
+    else:
+        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights = batch
+        value_sample_weights = torch.ones_like(policy_sample_weights, dtype=torch.float32)
     if config["reinforcement_learning"].get("replay_fp16", False):
         boards = boards.float()
         policy_values = policy_values.float()
@@ -1128,6 +1279,7 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
     policy_mask = policy_mask.to(device, non_blocking=True)
     value_targets = value_targets.to(device, non_blocking=True)
     policy_sample_weights = policy_sample_weights.to(device, non_blocking=True)
+    value_sample_weights = value_sample_weights.to(device, non_blocking=True)
     effective_policy_mask = policy_mask & (policy_sample_weights.unsqueeze(1) > 0)
 
     optimizer.zero_grad(set_to_none=True)
@@ -1187,7 +1339,12 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
         target_value_std = target_scalar.std(unbiased=False)
 
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
+            rl_cfg = config.get("reinforcement_learning", {})
             target_wdl = _wdl_targets_from_final_outcome(target_scalar)
+            target_wdl = _apply_wdl_label_smoothing(
+                target_wdl,
+                rl_cfg.get("value_wdl_label_smoothing", 0.0),
+            )
 
             value_log_probs = F.log_softmax(value_pred, dim=1)
             value_ce_loss = -(target_wdl * value_log_probs).sum(dim=1)
@@ -1214,8 +1371,12 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
                 policy_loss = policy_loss.sum() / policy_weight_total
             else:
                 policy_loss = policy_loss.sum() * 0.0
-        value_loss = value_loss.mean()
-        policy_weight = config["reinforcement_learning"]["policy_loss_weight"]
+        value_loss = _weighted_mean(value_loss, value_sample_weights)
+        policy_weight = (
+            float(config["reinforcement_learning"]["policy_loss_weight"])
+            if policy_weight_override is None
+            else float(policy_weight_override)
+        )
         value_weight = (
             float(config["reinforcement_learning"]["value_loss_weight"])
             if value_weight_override is None
@@ -1246,7 +1407,26 @@ def train_on_batch_rl(model, optimizer, batch, config, device, scaler, metrics_c
             else:
                 best_sparse_idx = policy_values.argmax(dim=1, keepdim=True)
                 target_moves = torch.gather(policy_indices.long(), 1, best_sparse_idx).squeeze(1)
-            metrics_calc.update(policy_pred, value_pred, target_moves, target_scalar.unsqueeze(1))
+            rl_cfg = config.get("reinforcement_learning", {})
+            if boards.dim() >= 4 and boards.size(1) > 15:
+                fullmove_indices = torch.clamp(
+                    torch.round(boards[:, 15, 0, 0].float() * 100.0),
+                    min=1.0,
+                    max=float(rl_cfg.get("value_phase_max_fullmove", 120)),
+                )
+            else:
+                fullmove_indices = None
+            metrics_calc.update(
+                policy_pred,
+                value_pred,
+                target_moves,
+                target_scalar.unsqueeze(1),
+                move_indices=fullmove_indices,
+                value_weight_min=float(rl_cfg.get("value_metric_weight_min", 0.20)),
+                value_max_moves=int(rl_cfg.get("value_metric_max_fullmove", 80)),
+                value_phase_opening_max=int(rl_cfg.get("value_phase_opening_max_fullmove", 12)),
+                value_phase_endgame_min=int(rl_cfg.get("value_phase_endgame_min_fullmove", 40)),
+            )
 
     return (
         loss.item(),
@@ -1286,7 +1466,7 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
                 device,
                 game_indices,
                 use_fixed_openings=use_fixed_openings,
-                progress_callback=lambda completed: eval_bar.update(int(completed)),
+                progress_callback=lambda completed, *args: eval_bar.update(int(completed)),
             )
         finally:
             eval_bar.close()

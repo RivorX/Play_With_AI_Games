@@ -33,6 +33,16 @@ class MetricsCalculator:
         self.value_abs_error_count = 0
         self.value_abs_error_weighted_sum = 0.0
         self.value_abs_error_weighted_denom = 0.0
+        self.value_phase_abs_error_sum = {
+            'opening': 0.0,
+            'middlegame': 0.0,
+            'endgame': 0.0,
+        }
+        self.value_phase_abs_error_count = {
+            'opening': 0,
+            'middlegame': 0,
+            'endgame': 0,
+        }
         self.value_wdl_correct = 0
         self.value_wdl_total = 0
         self.value_wdl_ce_sum = 0.0
@@ -45,6 +55,7 @@ class MetricsCalculator:
     def update(self, policy_pred, value_pred, target_move, target_value, legal_moves_mask=None,
                move_indices=None, total_moves=None, value_weight_min=0.1,
                value_weight_min_total_moves=40, value_max_moves=200,
+               value_phase_opening_max=12, value_phase_endgame_min=40,
                value_use_game_length=False, policy_is_logits=False):
         """
         Update metrics with batch predictions
@@ -86,9 +97,8 @@ class MetricsCalculator:
         # 🆕 Handle WDL predictions by converting to scalar
         # ============================================================
         
-        # Ensure target_value is 1D
-        if target_value.dim() > 1:
-            target_value = target_value.squeeze()
+        # Ensure target_value is 1D without collapsing batch size 1 to a scalar.
+        target_value = target_value.reshape(-1)
 
         # Check if value_pred is WDL (3 logits) or scalar (1 value)
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
@@ -140,6 +150,23 @@ class MetricsCalculator:
             )
             self.value_abs_error_weighted_sum += (value_mae * weights).sum().item()
             self.value_abs_error_weighted_denom += weights.sum().item()
+
+            phase_move_indices = move_indices.float()
+            phase_masks = {
+                'opening': phase_move_indices <= float(value_phase_opening_max),
+                'middlegame': (
+                    (phase_move_indices > float(value_phase_opening_max))
+                    & (phase_move_indices < float(value_phase_endgame_min))
+                ),
+                'endgame': phase_move_indices >= float(value_phase_endgame_min),
+            }
+            for phase_name, phase_mask in phase_masks.items():
+                count = int(phase_mask.sum().item())
+                if count <= 0:
+                    continue
+                phase_errors = value_mae[phase_mask]
+                self.value_phase_abs_error_sum[phase_name] += phase_errors.sum().item()
+                self.value_phase_abs_error_count[phase_name] += count
         
         # ============================================================
         # PREDICTION CONFIDENCE
@@ -188,6 +215,13 @@ class MetricsCalculator:
             'avg_confidence': (self.confidence_sum / self.confidence_count) if self.confidence_count else 0.0,
             'confidence_std': math.sqrt(max(0.0, self.confidence_sq_sum / self.confidence_count - (self.confidence_sum / self.confidence_count) ** 2)) if self.confidence_count else 0.0,
         }
+        for phase_name in ('opening', 'middlegame', 'endgame'):
+            count = self.value_phase_abs_error_count.get(phase_name, 0)
+            metrics[f'value_mae_{phase_name}'] = (
+                self.value_phase_abs_error_sum.get(phase_name, 0.0) / count
+                if count else 0.0
+            )
+            metrics[f'value_samples_{phase_name}'] = count
         
         # Legal move coverage (if available)
         if self.legal_coverages:
@@ -229,8 +263,7 @@ def compute_batch_metrics(policy_pred, value_pred, target_move, target_value):
                        wdl_probs[:, 2] * (-1.0))
         
         # WDL accuracy + CE
-        if target_value.dim() > 1:
-            target_value = target_value.squeeze()
+        target_value = target_value.reshape(-1)
         target_classes = torch.zeros_like(target_value, dtype=torch.long)
         target_classes[target_value > 0.9] = 0
         target_classes[target_value < -0.9] = 2
@@ -243,8 +276,7 @@ def compute_batch_metrics(policy_pred, value_pred, target_move, target_value):
         wdl_acc = 0.0
         wdl_ce = 0.0
     
-    if target_value.dim() > 1:
-        target_value = target_value.squeeze()
+    target_value = target_value.reshape(-1)
     
     value_mae = torch.abs(value_scalar - target_value).mean().item()
     

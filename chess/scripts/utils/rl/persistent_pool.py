@@ -93,6 +93,82 @@ class _PersistentSelfPlayPool:
         self._central_loaded_labels = set()
         self.started = False
 
+    def _worker_runtime_args(self, rank):
+        rank = int(rank)
+        gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        inference_server_idx = (
+            rank % self.central_inference_server_count
+            if self.central_inference_enabled and self.central_inference_server_count > 0
+            else 0
+        )
+        device_id = (
+            'cpu'
+            if self.central_inference_enabled
+            else (rank % gpu_count if self.device_type == 'cuda' and gpu_count > 0 else 'cpu')
+        )
+        inference_request_queue = (
+            self.inference_request_queues[inference_server_idx]
+            if self.central_inference_enabled
+            else None
+        )
+        inference_response_queue = self.inference_response_receivers.get(rank)
+        return device_id, inference_request_queue, inference_response_queue
+
+    def _spawn_worker(self, rank, task_queue=None):
+        rank = int(rank)
+        if task_queue is None:
+            task_queue = self.mp_ctx.Queue()
+        device_id, inference_request_queue, inference_response_queue = self._worker_runtime_args(rank)
+        process = self.mp_ctx.Process(
+            target=persistent_selfplay_worker,
+            args=(
+                rank,
+                self.config,
+                device_id,
+                task_queue,
+                self.result_queue,
+                inference_request_queue,
+                inference_response_queue,
+            ),
+        )
+        process.daemon = True
+        process.start()
+        self.task_queues[rank] = task_queue
+        self.processes[rank] = process
+        return process
+
+    def _drain_worker_responses(self, rank):
+        response_queue = self.inference_response_receivers.get(int(rank))
+        if response_queue is None:
+            return 0
+        drained = 0
+        while True:
+            try:
+                if hasattr(response_queue, "poll") and hasattr(response_queue, "recv"):
+                    if not response_queue.poll(0.0):
+                        break
+                    response_queue.recv()
+                else:
+                    response_queue.get_nowait()
+                drained += 1
+            except Exception:
+                break
+        return drained
+
+    def restart_worker(self, rank):
+        rank = int(rank)
+        old_process = self.processes.get(rank)
+        if old_process is not None:
+            _terminate_process_tree(old_process, timeout_s=0.5)
+        old_queue = self.task_queues.get(rank)
+        if old_queue is not None:
+            try:
+                old_queue.close()
+            except Exception:
+                pass
+        self._drain_worker_responses(rank)
+        return self._spawn_worker(rank)
+
     def matches(self, worker_specs, device_type, temp_dir):
         rl_cfg = self.config.get('reinforcement_learning', {})
         wanted_central = bool(
@@ -113,7 +189,6 @@ class _PersistentSelfPlayPool:
         if self.started:
             return
 
-        gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
         if self.central_inference_enabled:
             for rank, _ in self.worker_specs:
                 recv_conn, send_conn = self.mp_ctx.Pipe(duplex=False)
@@ -137,37 +212,7 @@ class _PersistentSelfPlayPool:
             self.inference_process = self.inference_processes[0] if self.inference_processes else None
 
         for rank, _ in self.worker_specs:
-            inference_server_idx = (
-                int(rank) % self.central_inference_server_count
-                if self.central_inference_enabled and self.central_inference_server_count > 0
-                else 0
-            )
-            device_id = (
-                'cpu'
-                if self.central_inference_enabled
-                else (rank % gpu_count if self.device_type == 'cuda' and gpu_count > 0 else 'cpu')
-            )
-            task_queue = self.mp_ctx.Queue()
-            process = self.mp_ctx.Process(
-                target=persistent_selfplay_worker,
-                args=(
-                    rank,
-                    self.config,
-                    device_id,
-                    task_queue,
-                    self.result_queue,
-                    (
-                        self.inference_request_queues[inference_server_idx]
-                        if self.central_inference_enabled
-                        else None
-                    ),
-                    self.inference_response_receivers.get(int(rank)),
-                ),
-            )
-            process.daemon = True
-            process.start()
-            self.task_queues[rank] = task_queue
-            self.processes[rank] = process
+            self._spawn_worker(rank)
 
         self.started = True
 
@@ -285,6 +330,7 @@ class _PersistentSelfPlayPool:
         temperature,
         num_games,
         q_value_scale=None,
+        q_selection_weight=None,
         opponent_payload=None,
         model_state=None,
         stream_results_to_queue=False,
@@ -303,6 +349,7 @@ class _PersistentSelfPlayPool:
             'result_file_path': str(result_file),
             'mcts_temperature': temperature,
             'mcts_q_value_scale': q_value_scale,
+            'mcts_q_selection_weight': q_selection_weight,
             'stream_results_to_queue': bool(stream_results_to_queue),
         })
         return result_file, progress_file
@@ -313,6 +360,7 @@ class _PersistentSelfPlayPool:
         model_state_path,
         temperature,
         q_value_scale=None,
+        q_selection_weight=None,
         worker_model_state_paths=None,
         worker_opponent_payloads=None,
         model_state=None,
@@ -331,6 +379,7 @@ class _PersistentSelfPlayPool:
                 model_state_path=worker_model_state_paths.get(rank, model_state_path),
                 temperature=temperature,
                 q_value_scale=q_value_scale,
+                q_selection_weight=q_selection_weight,
                 num_games=int(games_for_worker),
                 opponent_payload=opponent_payload,
                 model_state=model_state,

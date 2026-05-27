@@ -435,7 +435,13 @@ def apply_rl_startup_plan(
                 if optimizer is not None:
                     optimizer_state = checkpoint.get("optimizer_state_dict")
                     if isinstance(optimizer_state, dict):
-                        optimizer.load_state_dict(optimizer_state)
+                        try:
+                            optimizer.load_state_dict(optimizer_state)
+                        except ValueError as exc:
+                            print(
+                                "Resume warning: optimizer_state_dict is incompatible with the "
+                                f"current RL optimizer groups; optimizer reset. ({exc})"
+                            )
                     else:
                         print("Resume warning: optimizer_state_dict not found; optimizer reset.")
 

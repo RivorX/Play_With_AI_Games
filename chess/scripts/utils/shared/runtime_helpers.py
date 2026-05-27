@@ -97,13 +97,17 @@ def cleanup_interrupted_log_csv(csv_path, plot_path, mode_label):
     try:
         with open(csv_file, "r", newline="", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
-            for row_idx, row in enumerate(reader):
-                # Skip header row and blank rows.
-                if row_idx == 0:
+            header_seen = False
+            for row in reader:
+                if not row or not any(str(cell).strip() for cell in row):
                     continue
-                if any(str(cell).strip() for cell in row):
-                    has_data_rows = True
-                    break
+                if str(row[0]).strip() == "# config_json":
+                    continue
+                if not header_seen:
+                    header_seen = True
+                    continue
+                has_data_rows = True
+                break
     except Exception:
         # If CSV cannot be parsed, keep previous behavior below.
         has_data_rows = True

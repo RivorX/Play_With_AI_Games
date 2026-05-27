@@ -3,11 +3,53 @@ Unified training logger for both IL and RL training
 """
 
 import csv
+import json
 import textwrap
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator, PercentFormatter
 from datetime import datetime
 from pathlib import Path
+
+
+_CSV_CONFIG_METADATA_KEY = "# config_json"
+
+
+def _json_safe_config(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_config(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _is_config_metadata_row(row):
+    return bool(row) and str(row[0]).strip() == _CSV_CONFIG_METADATA_KEY
+
+
+def _read_csv_rows_preserving_metadata(csv_path):
+    with open(csv_path, 'r', newline='') as f:
+        rows = list(csv.reader(f))
+    metadata_rows = []
+    if rows and _is_config_metadata_row(rows[0]):
+        metadata_rows = [rows[0]]
+        rows = rows[1:]
+    return metadata_rows, rows
+
+
+def _read_csv_dict_rows(csv_path):
+    metadata_rows, rows = _read_csv_rows_preserving_metadata(csv_path)
+    if not rows:
+        return []
+    header = list(rows[0])
+    result = []
+    for raw_row in rows[1:]:
+        row = list(raw_row)
+        if len(row) < len(header):
+            row.extend([''] * (len(header) - len(row)))
+        result.append(dict(zip(header, row[:len(header)])))
+    return result
 
 
 def _legend_display_y(handle):
@@ -62,7 +104,7 @@ class TrainingLogger:
     Supports both IL and RL modes with detailed metrics
     """
     
-    def __init__(self, log_dir, experiment_name="training", mode="il"):
+    def __init__(self, log_dir, experiment_name="training", mode="il", config_snapshot=None):
         """
         Args:
             log_dir: Directory for logs
@@ -107,8 +149,11 @@ class TrainingLogger:
             else:  # RL mode
                 header = [
                     'iteration', 'avg_loss', 'policy_loss', 'value_loss', 'learning_rate',
-                    'value_loss_weight', 'mcts_q_value_scale', 'mcts_q_value_trust',
+                    'value_loss_weight', 'mcts_q_value_scale', 'mcts_q_selection_weight',
+                    'mcts_q_effective_weight', 'mcts_q_value_trust',
                     'value_guard_streak', 'mcts_no_mcts_gap',
+                    'mcts_q_ablation_gap', 'mcts_qoff_score_rate', 'mcts_qoff_win_rate',
+                    'mcts_qoff_draw_rate', 'mcts_qoff_loss_rate', 'mcts_qoff_games',
                     'score_rate', 'buffer_size', 'avg_game_length', 'temperature', 'beta',
                     'true_win_rate', 'eval_stage', 'eval_games',
                     'eval_wins', 'eval_draws', 'eval_losses', 'eval_unresolved',
@@ -120,6 +165,8 @@ class TrainingLogger:
                     'policy_top1_acc', 'policy_top3_acc',
                     'value_mae', 'value_mae_weighted',
                     'value_wdl_acc', 'value_wdl_ce',
+                    'value_mae_opening', 'value_mae_middlegame', 'value_mae_endgame',
+                    'value_samples_opening', 'value_samples_middlegame', 'value_samples_endgame',
                     # 🧠 RL headline telemetry
                     'completed_draw_rate',
                     'avg_game_value', 'value_std',
@@ -130,7 +177,16 @@ class TrainingLogger:
                     'rl_best_model',
                     'estimated_elo_nn', 'estimated_elo_mcts', 'estimated_elo_mcts_simulations',
                 ]
-            
+            if config_snapshot is not None:
+                writer.writerow([
+                    _CSV_CONFIG_METADATA_KEY,
+                    json.dumps(
+                        _json_safe_config(config_snapshot),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(',', ':'),
+                    ),
+                ])
             writer.writerow(header)
         
         # Storage for plotting
@@ -281,6 +337,9 @@ class TrainingLogger:
                     'policy_weight_mean',
                     'policy_weight_p10',
                     'policy_weight_low_fraction',
+                    'value_weight_mean',
+                    'value_weight_p10',
+                    'value_weight_low_fraction',
                     'policy_target_len_mean',
                     'policy_target_len_p90',
                     'policy_target_entropy_mean',
@@ -305,6 +364,10 @@ class TrainingLogger:
                     'selfplay_value_std',
                     'mcts_avg_sims',
                     'mcts_avg_budget',
+                    'mcts_budget_p10',
+                    'mcts_budget_p90',
+                    'mcts_budget_min',
+                    'mcts_budget_max',
                     'mcts_p10_sims',
                     'mcts_extra_budget_rate',
                     'mcts_adaptive_stop_rate',
@@ -334,6 +397,19 @@ class TrainingLogger:
                     'mcts_legal_move_count_mean',
                     'train_policy_entropy',
                     'train_target_value_std',
+                    'train_value_mae',
+                    'train_value_mae_opening',
+                    'train_value_mae_middlegame',
+                    'train_value_mae_endgame',
+                    'train_value_samples_opening',
+                    'train_value_samples_middlegame',
+                    'train_value_samples_endgame',
+                    'eval_mcts_score_rate',
+                    'eval_no_mcts_score_rate',
+                    'eval_mcts_qoff_score_rate',
+                    'eval_mcts_q_ablation_gap',
+                    'eval_mcts_games',
+                    'eval_mcts_qoff_games',
                 ])
             self.win_rates = []
             self.true_win_rates = []
@@ -502,11 +578,34 @@ class TrainingLogger:
         nn_items = _int_or_none(profile.get('mcts_nn_inference_batch_items'))
         if nn_calls and nn_calls > 0 and nn_items is not None:
             profile['average_batch_size'] = float(nn_items) / float(nn_calls)
+            nn_time = _float_or_none(profile.get('mcts_nn_inference_time'))
+            if nn_time is not None:
+                profile['inference_time_per_batch_ms'] = 1000.0 * float(nn_time) / float(nn_calls)
+        if nn_items and nn_items > 0:
+            nn_time = _float_or_none(profile.get('mcts_nn_inference_time'))
+            if nn_time is not None:
+                profile['inference_time_per_position_ms'] = 1000.0 * float(nn_time) / float(nn_items)
+            legal_items = _int_or_none(profile.get('mcts_nn_legal_move_items'))
+            if legal_items is not None:
+                profile['average_legal_moves_per_position'] = float(legal_items) / float(nn_items)
 
         central_requests = _int_or_none(profile.get('mcts_central_inference_requests'))
         central_items = _int_or_none(profile.get('mcts_central_inference_server_batch_items'))
         if central_requests and central_requests > 0 and central_items is not None:
             profile['central_average_batch_size'] = float(central_items) / float(central_requests)
+            for raw_key, avg_key in [
+                ('mcts_central_inference_remote_wait_time', 'central_remote_wait_ms_per_request'),
+                ('mcts_central_inference_request_put_time', 'central_request_put_ms_per_request'),
+                ('mcts_central_inference_server_queue_wait_time', 'central_server_queue_wait_ms_per_request'),
+                ('mcts_central_inference_server_concat_time', 'central_server_concat_ms_per_request'),
+                ('mcts_central_inference_server_h2d_time', 'central_server_h2d_ms_per_request'),
+                ('mcts_central_inference_server_forward_time', 'central_server_forward_ms_per_request'),
+                ('mcts_central_inference_server_d2h_time', 'central_server_d2h_ms_per_request'),
+                ('mcts_central_inference_server_total_time', 'central_server_total_ms_per_request'),
+            ]:
+                raw_value = _float_or_none(profile.get(raw_key))
+                if raw_value is not None:
+                    profile[avg_key] = 1000.0 * float(raw_value) / float(central_requests)
 
         search_time = _float_or_none(profile.get('mcts_search_many_time'))
         nn_time = _float_or_none(profile.get('mcts_nn_inference_time'))
@@ -984,6 +1083,8 @@ class TrainingLogger:
         positions_added=None,
         replay_stats=None,
         selfplay_stats=None,
+        train_metrics=None,
+        eval_stats=None,
         train_policy_entropy=None,
         train_target_value_std=None,
     ):
@@ -992,6 +1093,8 @@ class TrainingLogger:
             return
         replay_stats = dict(replay_stats or {})
         selfplay_stats = dict(selfplay_stats or {})
+        train_metrics = dict(train_metrics or {})
+        eval_stats = dict(eval_stats or {})
 
         def _value(mapping, key, default=''):
             value = mapping.get(key, default)
@@ -1028,6 +1131,9 @@ class TrainingLogger:
             _value(replay_stats, 'policy_weight_mean'),
             _value(replay_stats, 'policy_weight_p10'),
             _value(replay_stats, 'policy_weight_low_fraction'),
+            _value(replay_stats, 'value_weight_mean'),
+            _value(replay_stats, 'value_weight_p10'),
+            _value(replay_stats, 'value_weight_low_fraction'),
             _value(replay_stats, 'policy_target_len_mean'),
             _value(replay_stats, 'policy_target_len_p90'),
             _value(replay_stats, 'policy_target_entropy_mean'),
@@ -1052,6 +1158,10 @@ class TrainingLogger:
             _value(selfplay_stats, 'value_std'),
             _value(selfplay_stats, 'search_simulations_used_avg'),
             _value(selfplay_stats, 'search_simulations_budget_avg'),
+            _value(selfplay_stats, 'search_simulations_budget_p10'),
+            _value(selfplay_stats, 'search_simulations_budget_p90'),
+            _value(selfplay_stats, 'search_simulations_budget_min'),
+            _value(selfplay_stats, 'search_simulations_budget_max'),
             _value(selfplay_stats, 'search_simulations_used_p10'),
             _value(selfplay_stats, 'search_extra_budget_rate'),
             _value(selfplay_stats, 'adaptive_stop_rate'),
@@ -1081,6 +1191,19 @@ class TrainingLogger:
             _value(selfplay_stats, 'mcts_legal_move_count_mean'),
             '' if train_policy_entropy is None else train_policy_entropy,
             '' if train_target_value_std is None else train_target_value_std,
+            _value(train_metrics, 'value_mae'),
+            _value(train_metrics, 'value_mae_opening'),
+            _value(train_metrics, 'value_mae_middlegame'),
+            _value(train_metrics, 'value_mae_endgame'),
+            _value(train_metrics, 'value_samples_opening'),
+            _value(train_metrics, 'value_samples_middlegame'),
+            _value(train_metrics, 'value_samples_endgame'),
+            _value(eval_stats, 'mcts_score_rate'),
+            _value(eval_stats, 'no_mcts_score_rate'),
+            _value(eval_stats, 'mcts_qoff_score_rate'),
+            _value(eval_stats, 'mcts_q_ablation_gap'),
+            _value(eval_stats, 'mcts_games'),
+            _value(eval_stats, 'mcts_qoff_games'),
         ]
         with open(self.data_quality_log_path, 'a', newline='') as f:
             csv.writer(f).writerow(row)
@@ -1116,7 +1239,7 @@ class TrainingLogger:
                 ys.append(y)
             return xs, ys
 
-        fig, axes = plt.subplots(4, 3, figsize=(20, 17.2))
+        fig, axes = plt.subplots(5, 3, figsize=(20, 21.2))
         fig.patch.set_facecolor('#F7F8FA')
         fig.suptitle('RL Data Quality Details', fontsize=17, fontweight='bold', y=0.982)
 
@@ -1366,9 +1489,25 @@ class TrainingLogger:
         ax = axes[3, 0]
         _, avg_sims = _plot(ax, 'mcts_avg_sims', 'Avg sims used', colors['blue'], style='-', linewidth=2.1)
         _, avg_budget = _plot(ax, 'mcts_avg_budget', 'Avg budget', colors['slate'], style='--', linewidth=1.9)
+        _, budget_p10 = _plot(ax, 'mcts_budget_p10', 'Budget bottom 10%', colors['cyan'], style=':', linewidth=1.8)
+        _, budget_p90 = _plot(ax, 'mcts_budget_p90', 'Budget top 10%', colors['purple'], style='-.', linewidth=1.8)
+        _, budget_min = _plot(ax, 'mcts_budget_min', 'Budget min', colors['red'], style=':', linewidth=1.35, alpha=0.72)
+        _, budget_max = _plot(ax, 'mcts_budget_max', 'Budget max', colors['green'], style=':', linewidth=1.35, alpha=0.72)
         _, p10_sims = _plot(ax, 'mcts_p10_sims', 'p10 sims used', colors['cyan'], style=':', linewidth=2.0)
         _style_axis(ax, 'MCTS Search Budget', 'simulations')
-        _set_tight_ylim(ax, list(avg_sims) + list(avg_budget) + list(p10_sims), min_pad=4.0)
+        _set_tight_ylim(
+            ax,
+            (
+                list(avg_sims)
+                + list(avg_budget)
+                + list(budget_p10)
+                + list(budget_p90)
+                + list(budget_min)
+                + list(budget_max)
+                + list(p10_sims)
+            ),
+            min_pad=4.0,
+        )
         ax2 = ax.twinx()
         _, stop_rate = _plot(ax2, 'mcts_adaptive_stop_rate', 'Adaptive stop', colors['orange'], style='-.', linewidth=2.0)
         _, extra_rate = _plot(ax2, 'mcts_extra_budget_rate', 'Extra budget', colors['green'], style='--', linewidth=1.8)
@@ -1403,6 +1542,62 @@ class TrainingLogger:
             _apply_sorted_legend(ax, lines + lines2, labels + labels2, loc='best', fontsize=8)
 
         ax = axes[3, 2]
+        sample_values = []
+        for column, label, color, style in [
+            ('train_value_samples_opening', 'Opening samples', colors['blue'], '--'),
+            ('train_value_samples_middlegame', 'Middlegame samples', colors['orange'], '-.'),
+            ('train_value_samples_endgame', 'Endgame samples', colors['green'], ':'),
+        ]:
+            _, values = _plot(ax, column, label, color, style=style, linewidth=2.0)
+            sample_values.extend(values)
+        _style_axis(ax, 'Value Phase Samples', 'samples')
+        _set_tight_ylim(ax, sample_values, min_pad=8.0)
+        if ax.get_legend_handles_labels()[0]:
+            _apply_sorted_legend(ax, loc='best', fontsize=8)
+
+        ax = axes[4, 0]
+        mae_values = []
+        for column, label, color, style in [
+            ('train_value_mae', 'All positions', colors['black'], '-'),
+            ('train_value_mae_opening', 'Opening', colors['blue'], '--'),
+            ('train_value_mae_middlegame', 'Middlegame', colors['orange'], '-.'),
+            ('train_value_mae_endgame', 'Endgame', colors['green'], ':'),
+        ]:
+            _, values = _plot(ax, column, label, color, style=style, linewidth=2.1)
+            mae_values.extend(values)
+        _style_axis(ax, 'Value MAE by Game Phase', 'MAE')
+        _set_tight_ylim(ax, mae_values, min_pad=0.015)
+        if ax.get_legend_handles_labels()[0]:
+            _apply_sorted_legend(ax, loc='best', fontsize=8)
+
+        ax = axes[4, 1]
+        eval_values = []
+        for column, label, color, style in [
+            ('eval_mcts_score_rate', 'MCTS Q-on', colors['purple'], '-'),
+            ('eval_mcts_qoff_score_rate', 'MCTS Q-off', colors['green'], '--'),
+            ('eval_no_mcts_score_rate', 'No-MCTS', colors['slate'], ':'),
+        ]:
+            _, values = _plot(ax, column, label, color, style=style, marker='o', linewidth=2.2)
+            eval_values.extend(values)
+        _style_axis(ax, 'Eval Search Comparison', 'score rate', percent=True)
+        if eval_values:
+            ax.set_ylim(0.0, min(1.0, max(0.55, max(eval_values) * 1.18)))
+        else:
+            ax.set_ylim([0, 1])
+        ax.axhline(0.5, color=colors['black'], linestyle=':', linewidth=1.0, alpha=0.5)
+        ax2 = ax.twinx()
+        _, gap_values = _plot(ax2, 'eval_mcts_q_ablation_gap', 'Q-on minus Q-off', colors['red'], style='-.', marker='s', linewidth=1.8)
+        if gap_values:
+            _set_tight_ylim(ax2, gap_values, min_pad=0.02, center_zero=True)
+        ax2.set_ylabel('Q gap')
+        ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+        ax2.spines['right'].set_alpha(0.18)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            _apply_sorted_legend(ax, lines + lines2, labels + labels2, loc='best', fontsize=8)
+
+        ax = axes[4, 2]
         ax.axis('off')
         latest_lines = ["Latest Data Quality", ""]
         for column, label, fmt in [
@@ -1419,8 +1614,19 @@ class TrainingLogger:
             ('mcts_changed_q_delta_p50', 'Changed Qd p50', '{:+.4f}'),
             ('mcts_changed_to_higher_q_rate', 'Higher-Q changed', '{:.2%}'),
             ('mcts_changed_to_lower_q_when_changed_rate', 'Lower-Q changed', '{:.2%}'),
+            ('train_value_mae_opening', 'MAE opening', '{:.4f}'),
+            ('train_value_mae_middlegame', 'MAE middlegame', '{:.4f}'),
+            ('train_value_mae_endgame', 'MAE endgame', '{:.4f}'),
+            ('eval_mcts_score_rate', 'MCTS Q-on', '{:.2%}'),
+            ('eval_mcts_qoff_score_rate', 'MCTS Q-off', '{:.2%}'),
+            ('eval_mcts_q_ablation_gap', 'Q-on minus Q-off', '{:+.2%}'),
             ('selfplay_auto_draw_rate', 'Auto-draw claim', '{:.2%}'),
             ('mcts_adaptive_stop_rate', 'Adaptive stop', '{:.2%}'),
+            ('mcts_budget_min', 'MCTS budget min', '{:.0f}'),
+            ('mcts_budget_p10', 'MCTS budget b10', '{:.0f}'),
+            ('mcts_avg_budget', 'MCTS budget avg', '{:.1f}'),
+            ('mcts_budget_p90', 'MCTS budget t10', '{:.0f}'),
+            ('mcts_budget_max', 'MCTS budget max', '{:.0f}'),
         ]:
             value = _latest(column)
             if isinstance(value, (int, float)):
@@ -1430,13 +1636,13 @@ class TrainingLogger:
             0.04,
             0.52,
             "\n".join(latest_lines),
-            fontsize=10,
+            fontsize=8.6,
             family='monospace',
             verticalalignment='center',
             bbox=dict(boxstyle='round,pad=0.55', fc='white', ec='#CBD5E1', alpha=0.95),
         )
 
-        fig.subplots_adjust(left=0.055, right=0.945, bottom=0.055, top=0.935, hspace=0.52, wspace=0.42)
+        fig.subplots_adjust(left=0.055, right=0.945, bottom=0.045, top=0.945, hspace=0.55, wspace=0.42)
         fig.savefig(self.data_quality_plot_path, dpi=150, bbox_inches='tight', pad_inches=0.18)
         plt.close(fig)
 
@@ -1467,8 +1673,7 @@ class TrainingLogger:
 
         # Backfill CSV row for this epoch if it already exists.
         try:
-            with open(self.csv_path, 'r', newline='') as f:
-                rows = list(csv.reader(f))
+            metadata_rows, rows = _read_csv_rows_preserving_metadata(self.csv_path)
             if not rows:
                 return
 
@@ -1492,6 +1697,7 @@ class TrainingLogger:
             if updated:
                 with open(self.csv_path, 'w', newline='') as f:
                     writer = csv.writer(f)
+                    writer.writerows(metadata_rows)
                     writer.writerows(rows)
         except Exception:
             # CSV backfill is best-effort only.
@@ -1516,8 +1722,7 @@ class TrainingLogger:
                 pending['estimated_elo_mcts_simulations'] = ''
         if update_csv and self.csv_path.exists():
             try:
-                with open(self.csv_path, 'r', newline='') as f:
-                    rows = list(csv.reader(f))
+                metadata_rows, rows = _read_csv_rows_preserving_metadata(self.csv_path)
                 if not rows:
                     return
                 header = list(rows[0])
@@ -1547,6 +1752,7 @@ class TrainingLogger:
                                 row[sims_idx] = ''
                 with open(self.csv_path, 'w', newline='') as f:
                     writer = csv.writer(f)
+                    writer.writerows(metadata_rows)
                     writer.writerow(header)
                     writer.writerows(rows[1:])
             except Exception:
@@ -1585,8 +1791,7 @@ class TrainingLogger:
             return
 
         try:
-            with open(self.csv_path, 'r', newline='') as f:
-                rows = list(csv.reader(f))
+            metadata_rows, rows = _read_csv_rows_preserving_metadata(self.csv_path)
             if not rows:
                 return
             header = list(rows[0])
@@ -1622,7 +1827,9 @@ class TrainingLogger:
 
             rows[0] = header
             with open(self.csv_path, 'w', newline='') as f:
-                csv.writer(f).writerows(rows)
+                writer = csv.writer(f)
+                writer.writerows(metadata_rows)
+                writer.writerows(rows)
         except Exception:
             return
 
@@ -1741,8 +1948,7 @@ class TrainingLogger:
                 return ''
 
         try:
-            with open(self.csv_path, 'r', newline='') as f:
-                rows = list(csv.reader(f))
+            metadata_rows, rows = _read_csv_rows_preserving_metadata(self.csv_path)
         except Exception:
             return
 
@@ -1777,6 +1983,7 @@ class TrainingLogger:
         try:
             with open(self.csv_path, 'w', newline='') as f:
                 writer = csv.writer(f)
+                writer.writerows(metadata_rows)
                 writer.writerow(header)
                 writer.writerows(data_rows)
         except Exception:
@@ -1791,8 +1998,7 @@ class TrainingLogger:
             val_policy_loss, val_value_loss, wdl_acc, wdl_ce, elo
         """
         try:
-            with open(csv_path, 'r', newline='') as f:
-                rows = list(csv.DictReader(f))
+            rows = _read_csv_dict_rows(csv_path)
         except Exception:
             return None
 
@@ -2162,9 +2368,17 @@ class TrainingLogger:
                     kwargs.get('learning_rate', kwargs.get('lr', '')),
                     kwargs.get('value_loss_weight', ''),
                     kwargs.get('mcts_q_value_scale', ''),
+                    kwargs.get('mcts_q_selection_weight', ''),
+                    kwargs.get('mcts_q_effective_weight', ''),
                     kwargs.get('mcts_q_value_trust', ''),
                     kwargs.get('value_guard_streak', ''),
                     mcts_no_mcts_gap,
+                    kwargs.get('mcts_q_ablation_gap', ''),
+                    kwargs.get('mcts_qoff_score_rate', ''),
+                    kwargs.get('mcts_qoff_win_rate', ''),
+                    kwargs.get('mcts_qoff_draw_rate', ''),
+                    kwargs.get('mcts_qoff_loss_rate', ''),
+                    kwargs.get('mcts_qoff_games', ''),
                     kwargs.get('score_rate', kwargs.get('win_rate', '')),
                     kwargs.get('buffer_size', ''),
                     kwargs.get('avg_game_length', ''),
@@ -2197,6 +2411,12 @@ class TrainingLogger:
                     train_metrics.get('value_mae_weighted', '') if train_metrics else '',
                     train_metrics.get('value_wdl_acc', '') if train_metrics else '',
                     train_metrics.get('value_wdl_ce', '') if train_metrics else '',
+                    train_metrics.get('value_mae_opening', '') if train_metrics else '',
+                    train_metrics.get('value_mae_middlegame', '') if train_metrics else '',
+                    train_metrics.get('value_mae_endgame', '') if train_metrics else '',
+                    train_metrics.get('value_samples_opening', '') if train_metrics else '',
+                    train_metrics.get('value_samples_middlegame', '') if train_metrics else '',
+                    train_metrics.get('value_samples_endgame', '') if train_metrics else '',
                     kwargs.get('completed_draw_rate', ''),
                     kwargs.get('avg_game_value', ''),
                     kwargs.get('value_std', ''),
@@ -2576,14 +2796,13 @@ class TrainingLogger:
             ax_lr = ax.twinx()
             lr_values = []
             try:
-                with open(self.csv_path, 'r', newline='') as f:
-                    for row in csv.DictReader(f):
-                        try:
-                            if str(row.get('epoch', '')).strip().upper() == 'SWA':
-                                continue
-                            lr_values.append(float(row.get('learning_rate', '')))
-                        except (TypeError, ValueError):
-                            lr_values.append(None)
+                for row in _read_csv_dict_rows(self.csv_path):
+                    try:
+                        if str(row.get('epoch', '')).strip().upper() == 'SWA':
+                            continue
+                        lr_values.append(float(row.get('learning_rate', '')))
+                    except (TypeError, ValueError):
+                        lr_values.append(None)
             except Exception:
                 lr_values = []
             if lr_values and len(lr_values) == len(self.iterations):
@@ -2701,8 +2920,7 @@ class TrainingLogger:
         """Plot RL training progress"""
         rows = []
         try:
-            with open(self.csv_path, 'r', newline='') as f:
-                rows = list(csv.DictReader(f))
+            rows = _read_csv_dict_rows(self.csv_path)
         except OSError:
             rows = []
 
@@ -2786,46 +3004,102 @@ class TrainingLogger:
                 smoothed.append(prev)
             return smoothed
 
-        def _plot_line(ax, xs, ys, label, color, style='-', marker=None, linewidth=2.0, alpha=0.95, smooth=None):
+        def _rl_best_markers():
+            markers = list(self.rl_best_model_markers or [])
+            if markers:
+                return markers
+            for row in rows:
+                try:
+                    iteration = int(float(row.get('iteration', '')))
+                except (TypeError, ValueError):
+                    continue
+                raw_marker = str(row.get('rl_best_model', '') or '').strip().lower()
+                if raw_marker in {'1', 'true', 'yes', 'y'}:
+                    markers.append((iteration, f"RL best {iteration}"))
+            if markers:
+                return markers
+            for row in rows:
+                try:
+                    iteration = int(float(row.get('iteration', '')))
+                    score = float(row.get('score_rate', ''))
+                    true_win = float(row.get('true_win_rate', '0') or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if score >= 0.55 and true_win >= 0.0:
+                    markers.append((iteration, f"RL best {iteration}"))
+            return markers
+
+        def _split_on_best_boundaries(xs, ys):
+            pairs = list(zip(list(xs), list(ys)))
+            if len(pairs) <= 1:
+                return [pairs] if pairs else []
+            boundaries = []
+            for marker_iter, _ in _rl_best_markers():
+                try:
+                    boundaries.append(float(marker_iter) + 0.5)
+                except (TypeError, ValueError):
+                    continue
+            if not boundaries:
+                return [pairs]
+            boundaries.sort()
+            segments = []
+            current = [pairs[0]]
+            for prev_pair, pair in zip(pairs, pairs[1:]):
+                try:
+                    prev_x = float(prev_pair[0])
+                    x = float(pair[0])
+                except (TypeError, ValueError):
+                    current.append(pair)
+                    continue
+                if any(min(prev_x, x) < boundary < max(prev_x, x) for boundary in boundaries):
+                    segments.append(current)
+                    current = [pair]
+                else:
+                    current.append(pair)
+            if current:
+                segments.append(current)
+            return segments
+
+        def _plot_line(
+            ax,
+            xs,
+            ys,
+            label,
+            color,
+            style='-',
+            marker=None,
+            linewidth=2.0,
+            alpha=0.95,
+            smooth=None,
+            split_on_best=False,
+        ):
             if not xs or not ys:
                 return
-            marker_to_plot = marker
             use_smooth = self.plot_smoothing_enabled if smooth is None else bool(smooth)
-            if use_smooth and len(xs) >= self.plot_smoothing_min_points:
-                marker_to_plot = None
-            ax.plot(
-                xs,
-                _smooth_values(list(ys)) if use_smooth else list(ys),
-                linestyle=style,
-                marker=marker_to_plot,
-                color=color,
-                label=label,
-                linewidth=linewidth,
-                markersize=4 if marker_to_plot else 0,
-                alpha=alpha,
-            )
+            label_pending = True
+            segments = _split_on_best_boundaries(xs, ys) if split_on_best else [list(zip(list(xs), list(ys)))]
+            for segment in segments:
+                if not segment:
+                    continue
+                seg_xs, seg_ys = zip(*segment)
+                marker_to_plot = marker
+                if use_smooth and len(seg_xs) >= self.plot_smoothing_min_points:
+                    marker_to_plot = None
+                ax.plot(
+                    list(seg_xs),
+                    _smooth_values(list(seg_ys)) if use_smooth else list(seg_ys),
+                    linestyle=style,
+                    marker=marker_to_plot,
+                    color=color,
+                    label=label if label_pending else None,
+                    linewidth=linewidth,
+                    markersize=4 if marker_to_plot else 0,
+                    alpha=alpha,
+                )
+                label_pending = False
 
         def _draw_rl_best_boundaries(ax):
-            markers = list(self.rl_best_model_markers or [])
-            if not markers:
-                for row in rows:
-                    try:
-                        iteration = int(float(row.get('iteration', '')))
-                    except (TypeError, ValueError):
-                        continue
-                    raw_marker = str(row.get('rl_best_model', '') or '').strip().lower()
-                    if raw_marker in {'1', 'true', 'yes', 'y'}:
-                        markers.append((iteration, f"RL best {iteration}"))
-                if not markers:
-                    for row in rows:
-                        try:
-                            iteration = int(float(row.get('iteration', '')))
-                            score = float(row.get('score_rate', ''))
-                            true_win = float(row.get('true_win_rate', '0') or 0.0)
-                        except (TypeError, ValueError):
-                            continue
-                        if score >= 0.55 and true_win >= 0.0:
-                            markers.append((iteration, f"RL best {iteration}"))
+            markers = _rl_best_markers()
             if not markers:
                 return
             y_min, y_max = ax.get_ylim()
@@ -2857,9 +3131,32 @@ class TrainingLogger:
                 )
                 label_added = True
 
-        def _plot_column(ax, column, label, color, style='-', marker=None, linewidth=2.0, alpha=0.95, smooth=None):
+        def _plot_column(
+            ax,
+            column,
+            label,
+            color,
+            style='-',
+            marker=None,
+            linewidth=2.0,
+            alpha=0.95,
+            smooth=None,
+            split_on_best=False,
+        ):
             xs, ys = _series(column)
-            _plot_line(ax, xs, ys, label, color, style=style, marker=marker, linewidth=linewidth, alpha=alpha, smooth=smooth)
+            _plot_line(
+                ax,
+                xs,
+                ys,
+                label,
+                color,
+                style=style,
+                marker=marker,
+                linewidth=linewidth,
+                alpha=alpha,
+                smooth=smooth,
+                split_on_best=split_on_best,
+            )
             return xs, ys
 
         def _safe_legend(ax, handles=None, labels=None, **kwargs):
@@ -2928,10 +3225,10 @@ class TrainingLogger:
         _safe_legend(ax, lines + lines2, labels + labels2, fontsize=8, loc='best')
 
         ax = axes[1, 0]
-        mcts_xs, mcts_ys = _plot_column(ax, 'score_rate', 'MCTS score', colors['eval'], marker='o', smooth=True)
-        _plot_column(ax, 'true_win_rate', 'MCTS win', colors['eval'], style=':', marker='o', alpha=0.75, smooth=True)
-        no_xs, no_ys = _plot_column(ax, 'no_mcts_score_rate', 'No-MCTS score', colors['nomcts'], style='--', marker='s', smooth=True)
-        _plot_column(ax, 'no_mcts_win_rate', 'No-MCTS win', '#F59E0B', style=':', marker='s', alpha=0.75, smooth=True)
+        mcts_xs, mcts_ys = _plot_column(ax, 'score_rate', 'MCTS score', colors['eval'], marker='o', smooth=True, split_on_best=True)
+        _plot_column(ax, 'true_win_rate', 'MCTS win', colors['eval'], style=':', marker='o', alpha=0.75, smooth=True, split_on_best=True)
+        no_xs, no_ys = _plot_column(ax, 'no_mcts_score_rate', 'No-MCTS score', colors['nomcts'], style='--', marker='s', smooth=True, split_on_best=True)
+        _plot_column(ax, 'no_mcts_win_rate', 'No-MCTS win', '#F59E0B', style=':', marker='s', alpha=0.75, smooth=True, split_on_best=True)
         ax.axhline(0.5, color=colors['muted'], linestyle=':', linewidth=1.2)
         _mark_best(ax, mcts_xs, mcts_ys, mode='max', label='best MCTS')
         _mark_best(ax, no_xs, no_ys, mode='max', label='best no-MCTS')
@@ -2963,8 +3260,8 @@ class TrainingLogger:
         _safe_legend(ax, fontsize=8, loc='best')
 
         ax = axes[1, 2]
-        anchor_xs, anchor_ys = _plot_column(ax, 'anchor_score_rate', 'vs Anchor/IL score', colors['mcts'], style='--', marker='s', alpha=0.92, smooth=True)
-        anchor_win_xs, _ = _plot_column(ax, 'anchor_true_win_rate', 'vs Anchor true win', '#6D28D9', style=':', marker='s', alpha=0.75, smooth=True)
+        anchor_xs, anchor_ys = _plot_column(ax, 'anchor_score_rate', 'vs Anchor/IL score', colors['mcts'], style='--', marker='s', alpha=0.92, smooth=True, split_on_best=True)
+        anchor_win_xs, _ = _plot_column(ax, 'anchor_true_win_rate', 'vs Anchor true win', '#6D28D9', style=':', marker='s', alpha=0.75, smooth=True, split_on_best=True)
         _style_axis(ax, 'Current vs IL Anchor', 'Score rate', percent=True)
         ax.set_ylim([0, 1])
         if anchor_xs or anchor_win_xs:
@@ -3105,9 +3402,11 @@ class TrainingLogger:
             _safe_legend(ax, lines + lines2, labels + labels2, fontsize=8, loc='best')
 
         ax = axes[3, 1]
-        _plot_column(ax, 'mcts_q_value_scale', 'MCTS Q scale', colors['mcts'], marker='o')
+        _plot_column(ax, 'mcts_q_effective_weight', 'Effective Q', colors['mcts'], marker='o')
+        _plot_column(ax, 'mcts_q_selection_weight', 'Q selection', '#0F766E', style='--', marker='s', alpha=0.86)
+        _plot_column(ax, 'mcts_q_value_scale', 'Q trust add', '#64748B', style='-.', marker='.', alpha=0.72)
         _plot_column(ax, 'mcts_q_value_trust', 'Value trust', colors['policy'], style=':', marker='^', alpha=0.84)
-        _plot_column(ax, 'value_loss_weight', 'Value loss weight', colors['value'], style='--', marker='s', alpha=0.84)
+        _plot_column(ax, 'value_loss_weight', 'Value loss weight', colors['value'], style=':', marker='s', alpha=0.84)
         _style_axis(ax, 'Search / Value Control', 'Weight')
         _safe_legend(ax, fontsize=8, loc='best')
 

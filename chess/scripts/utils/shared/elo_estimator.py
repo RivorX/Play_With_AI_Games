@@ -45,6 +45,7 @@ def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict
     """Use deterministic full-budget MCTS for Stockfish Elo checks by default."""
     eval_config = dict(config)
     rl_cfg = dict(config.get("reinforcement_learning", {}))
+    rl_cfg["mcts_search_early_stop_enabled"] = False
     rl_cfg["mcts_adaptive_search_enabled"] = False
     eval_config["reinforcement_learning"] = rl_cfg
     return eval_config

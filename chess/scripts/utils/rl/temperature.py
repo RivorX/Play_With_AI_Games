@@ -73,6 +73,10 @@ class AdaptiveTemperatureController:
         self.decisive_target = float(cfg.get("adaptive_temperature_decisive_target", 0.70))
         self.decisive_band = max(1e-6, float(cfg.get("adaptive_temperature_decisive_band", 0.08)))
         self.stagnation_eval_gain = float(cfg.get("adaptive_temperature_min_eval_gain", 0.01))
+        self.draw_step = max(0.0, float(cfg.get("adaptive_temperature_draw_step", 0.05)))
+        self.low_draw_step = max(0.0, float(cfg.get("adaptive_temperature_low_draw_step", self.draw_step * 0.5)))
+        self.decisive_step = max(0.0, float(cfg.get("adaptive_temperature_decisive_step", 0.03)))
+        self.eval_step = max(0.0, float(cfg.get("adaptive_temperature_eval_step", 0.02)))
         self.value_guard_step = max(0.0, float(cfg.get("adaptive_temperature_value_guard_step", 0.01)))
         self.adjustment_smoothing = max(0.0, min(1.0, float(cfg.get("adaptive_temperature_smoothing", 0.50))))
         self.threshold_step = max(1, int(cfg.get("adaptive_temperature_threshold_step", 2)))
@@ -110,28 +114,28 @@ class AdaptiveTemperatureController:
             draw_delta = float(prev_draw_rate) - self.draw_target
             if draw_delta > self.draw_band:
                 strength = min(1.0, (draw_delta - self.draw_band) / self.draw_band)
-                raw_adjustment -= 0.05 * strength
+                raw_adjustment -= self.draw_step * strength
                 reasons.append(f"high_draws={float(prev_draw_rate):.1%}")
             elif draw_delta < -self.draw_band:
                 strength = min(1.0, ((-draw_delta) - self.draw_band) / self.draw_band)
-                raw_adjustment += 0.025 * strength
+                raw_adjustment += self.low_draw_step * strength
                 reasons.append(f"low_draws={float(prev_draw_rate):.1%}")
 
         if prev_decisive_rate is not None:
             decisive_delta = self.decisive_target - float(prev_decisive_rate)
             if decisive_delta > self.decisive_band:
                 strength = min(1.0, (decisive_delta - self.decisive_band) / self.decisive_band)
-                raw_adjustment -= 0.03 * strength
+                raw_adjustment -= self.decisive_step * strength
                 reasons.append(f"low_decisive={float(prev_decisive_rate):.1%}")
             elif decisive_delta < -self.decisive_band:
                 strength = min(1.0, ((-decisive_delta) - self.decisive_band) / self.decisive_band)
-                raw_adjustment += 0.015 * strength
+                raw_adjustment += self.decisive_step * 0.5 * strength
                 reasons.append(f"high_decisive={float(prev_decisive_rate):.1%}")
 
         if last_eval_score_rate is not None and previous_eval_score_rate is not None:
             eval_gain = float(last_eval_score_rate) - float(previous_eval_score_rate)
             if eval_gain < self.stagnation_eval_gain:
-                raw_adjustment -= 0.02
+                raw_adjustment -= self.eval_step
                 reasons.append(f"eval_stagnation={eval_gain:+.1%}")
 
         if int(value_guard_streak) > 0:
