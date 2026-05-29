@@ -572,7 +572,7 @@ def choose_output_path(chess_dir, model_count):
         return None
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    default_path = chess_dir / "logs" / f"elo_comparison_{timestamp}.csv"
+    default_path = chess_dir / "logs" / "csv" / f"elo_comparison_{timestamp}.csv"
     raw = _prompt_text("Output CSV path", str(default_path))
 
     output_path = Path(raw)

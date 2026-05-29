@@ -331,6 +331,7 @@ class _PersistentSelfPlayPool:
         num_games,
         q_value_scale=None,
         q_selection_weight=None,
+        q_selection_floor=None,
         opponent_payload=None,
         model_state=None,
         stream_results_to_queue=False,
@@ -350,6 +351,7 @@ class _PersistentSelfPlayPool:
             'mcts_temperature': temperature,
             'mcts_q_value_scale': q_value_scale,
             'mcts_q_selection_weight': q_selection_weight,
+            'mcts_q_selection_floor': q_selection_floor,
             'stream_results_to_queue': bool(stream_results_to_queue),
         })
         return result_file, progress_file
@@ -361,6 +363,7 @@ class _PersistentSelfPlayPool:
         temperature,
         q_value_scale=None,
         q_selection_weight=None,
+        q_selection_floor=None,
         worker_model_state_paths=None,
         worker_opponent_payloads=None,
         model_state=None,
@@ -380,6 +383,7 @@ class _PersistentSelfPlayPool:
                 temperature=temperature,
                 q_value_scale=q_value_scale,
                 q_selection_weight=q_selection_weight,
+                q_selection_floor=q_selection_floor,
                 num_games=int(games_for_worker),
                 opponent_payload=opponent_payload,
                 model_state=model_state,

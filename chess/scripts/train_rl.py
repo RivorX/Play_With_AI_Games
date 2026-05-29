@@ -130,6 +130,7 @@ def _build_eval_config_with_q_scale(config, q_value_scale):
     rl_config['mcts_q_value_scale'] = q_value_scale
     if q_value_scale <= 0.0:
         rl_config['mcts_q_selection_weight'] = 0.0
+        rl_config['mcts_q_selection_floor'] = 0.0
     eval_config['reinforcement_learning'] = rl_config
     return eval_config
 
@@ -237,7 +238,11 @@ def _q_delta_percentile_from_histogram(hist, percentile):
     index = int(np.searchsorted(np.cumsum(counts), threshold, side='left'))
     index = max(0, min(index, counts.size - 1))
     width = (_Q_DELTA_HIST_MAX - _Q_DELTA_HIST_MIN) / float(counts.size)
-    return float(_Q_DELTA_HIST_MIN + (index + 0.5) * width)
+    bin_low = float(_Q_DELTA_HIST_MIN + index * width)
+    bin_high = float(bin_low + width)
+    if bin_low <= 0.0 <= bin_high:
+        return 0.0
+    return float(bin_low + 0.5 * width)
 
 
 def _format_optional_percent(value, decimals=1):
@@ -1346,15 +1351,22 @@ def play_games_parallel_mcts(
             'mcts_prior_top_visit_prob_sum',
             'mcts_top_prior_prob_sum',
             'mcts_policy_kl_sum',
+            'mcts_top_visit_prob_sum',
+            'mcts_visit_gap_sum',
+            'mcts_visit_entropy_sum',
+            'mcts_good_target_count',
             'mcts_explored_prior_mass_sum',
             'mcts_visited_move_count_sum',
             'mcts_legal_move_count_sum',
+            'mcts_visit_coverage_ratio_sum',
             'mcts_q_delta_samples',
             'mcts_q_delta_sum',
             'mcts_changed_to_lower_q_count',
             'mcts_changed_to_higher_q_count',
             'mcts_changed_q_delta_samples',
             'mcts_changed_q_delta_sum',
+            'mcts_search_discovery_count',
+            'mcts_search_discovery_weight_sum',
         ]:
             target[key] = float(target.get(key, 0.0)) + float(source.get(key, 0.0) or 0.0)
 
@@ -1416,6 +1428,7 @@ def play_games_parallel_mcts(
                         temperature=rl_cfg.get('mcts_temperature'),
                         q_value_scale=rl_cfg.get('mcts_q_value_scale'),
                         q_selection_weight=rl_cfg.get('mcts_q_selection_weight'),
+                        q_selection_floor=rl_cfg.get('mcts_q_selection_floor'),
                         num_games=chunk_games,
                         opponent_payload=payload,
                         stream_results_to_queue=use_queue_transport,
@@ -1459,6 +1472,7 @@ def play_games_parallel_mcts(
                     temperature=rl_cfg.get('mcts_temperature'),
                     q_value_scale=rl_cfg.get('mcts_q_value_scale'),
                     q_selection_weight=rl_cfg.get('mcts_q_selection_weight'),
+                    q_selection_floor=rl_cfg.get('mcts_q_selection_floor'),
                     worker_model_state_paths={},
                     worker_opponent_payloads=opponent_assignments,
                     stream_results_to_queue=use_queue_transport,
@@ -1605,6 +1619,7 @@ def play_games_parallel_mcts(
                         temperature=rl_cfg.get('mcts_temperature'),
                         q_value_scale=rl_cfg.get('mcts_q_value_scale'),
                         q_selection_weight=rl_cfg.get('mcts_q_selection_weight'),
+                        q_selection_floor=rl_cfg.get('mcts_q_selection_floor'),
                         num_games=remaining_games,
                         opponent_payload=payload,
                         stream_results_to_queue=use_queue_transport,
@@ -2146,6 +2161,17 @@ def play_games_parallel_mcts(
             if mcts_quality_samples > 0
             else 0.0
         ),
+        'mcts_search_discovery_rate': (
+            float(total_mcts_quality_stats.get('mcts_search_discovery_count', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_search_discovery_weight_mean': (
+            float(total_mcts_quality_stats.get('mcts_search_discovery_weight_sum', 0.0) or 0.0)
+            / float(total_mcts_quality_stats.get('mcts_search_discovery_count', 0.0) or 0.0)
+            if float(total_mcts_quality_stats.get('mcts_search_discovery_count', 0.0) or 0.0) > 0.0
+            else 1.0
+        ),
         'mcts_prior_top_visit_prob_mean': (
             float(total_mcts_quality_stats.get('mcts_prior_top_visit_prob_sum', 0.0) or 0.0) / float(mcts_quality_samples)
             if mcts_quality_samples > 0
@@ -2161,6 +2187,26 @@ def play_games_parallel_mcts(
             if mcts_quality_samples > 0
             else 0.0
         ),
+        'mcts_top_visit_prob_mean': (
+            float(total_mcts_quality_stats.get('mcts_top_visit_prob_sum', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_visit_gap_mean': (
+            float(total_mcts_quality_stats.get('mcts_visit_gap_sum', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_visit_entropy_mean': (
+            float(total_mcts_quality_stats.get('mcts_visit_entropy_sum', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_good_target_rate': (
+            float(total_mcts_quality_stats.get('mcts_good_target_count', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
         'mcts_explored_prior_mass_mean': (
             float(total_mcts_quality_stats.get('mcts_explored_prior_mass_sum', 0.0) or 0.0) / float(mcts_quality_samples)
             if mcts_quality_samples > 0
@@ -2173,6 +2219,11 @@ def play_games_parallel_mcts(
         ),
         'mcts_legal_move_count_mean': (
             float(total_mcts_quality_stats.get('mcts_legal_move_count_sum', 0.0) or 0.0) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_visit_coverage_ratio_mean': (
+            float(total_mcts_quality_stats.get('mcts_visit_coverage_ratio_sum', 0.0) or 0.0) / float(mcts_quality_samples)
             if mcts_quality_samples > 0
             else 0.0
         ),
@@ -2630,6 +2681,10 @@ def main():
         0.0,
         float(rl_cfg.get('mcts_q_selection_weight', 0.0) or 0.0),
     )
+    base_mcts_q_selection_floor = max(
+        0.0,
+        float(rl_cfg.get('mcts_q_selection_floor', 0.0) or 0.0),
+    )
     recent_snapshot_keep = max(0, int(rl_cfg.get('self_play_recent_snapshots_to_keep', 4)))
     recent_selfplay_snapshots = deque(maxlen=recent_snapshot_keep) if recent_snapshot_keep > 0 else deque(maxlen=0)
     adaptive_opponent_scheduler_state = {
@@ -2958,9 +3013,11 @@ def main():
         reasons = []
         q_scale_now = _float_or_none(current_q_value_scale)
         q_gap = _float_or_none(q_ablation_gap)
+        mcts_score = _float_or_none(mcts_score_rate)
+        no_mcts_score = _float_or_none(no_mcts_score_rate)
         has_search_eval = q_gap is not None or (
-            _float_or_none(mcts_score_rate) is not None
-            and _float_or_none(no_mcts_score_rate) is not None
+            mcts_score is not None
+            and no_mcts_score is not None
         )
 
         mae = _float_or_none(value_mae)
@@ -2991,8 +3048,20 @@ def main():
             good_q_gap = float(schedule.get('trust_good_q_ablation_gap', 0.03) or 0.03)
             bad_q_gap = float(schedule.get('trust_bad_q_ablation_gap', 0.0) or 0.0)
             if q_gap >= good_q_gap:
-                good_signals += 1.0
-                reasons.append(f"q_ablation_good={q_gap:+.2%}")
+                q_good_allowed = True
+                min_mcts_for_q_good = _float_or_none(schedule.get('trust_min_mcts_score_for_q_good', None))
+                if min_mcts_for_q_good is not None and mcts_score is not None and mcts_score < min_mcts_for_q_good:
+                    q_good_allowed = False
+                    reasons.append(f"q_ablation_good_ignored_mcts_low={mcts_score:.2%}")
+                if bool(schedule.get('trust_good_q_requires_mcts_not_bad', False)) and mcts_score is not None and no_mcts_score is not None:
+                    mcts_gap = mcts_score - no_mcts_score
+                    bad_gap_for_q = float(schedule.get('trust_bad_mcts_gap', -0.03) or -0.03)
+                    if mcts_gap <= bad_gap_for_q:
+                        q_good_allowed = False
+                        reasons.append(f"q_ablation_good_ignored_mcts_gap={mcts_gap:+.2%}")
+                if q_good_allowed:
+                    good_signals += 1.0
+                    reasons.append(f"q_ablation_good={q_gap:+.2%}")
             elif q_gap <= bad_q_gap:
                 weight = max(0.0, float(schedule.get('trust_q_ablation_bad_weight', 1.25) or 1.25))
                 bad_signals += weight
@@ -3003,15 +3072,17 @@ def main():
                 if q_gap <= disable_gap:
                     hard_disable_q = True
                     reasons.append(f"q_disable_q_ablation={q_gap:+.2%}")
-        mcts_score = _float_or_none(mcts_score_rate)
-        no_mcts_score = _float_or_none(no_mcts_score_rate)
         if mcts_score is not None and no_mcts_score is not None:
             gap = mcts_score - no_mcts_score
             good_gap = float(schedule.get('trust_good_mcts_gap', 0.03) or 0.03)
             bad_gap = float(schedule.get('trust_bad_mcts_gap', -0.03) or -0.03)
             if gap >= good_gap:
-                good_signals += 1.0
-                reasons.append(f"mcts_gap_good={gap:+.2%}")
+                min_good_mcts_score = _float_or_none(schedule.get('trust_good_mcts_min_score', None))
+                if min_good_mcts_score is not None and mcts_score < min_good_mcts_score:
+                    reasons.append(f"mcts_gap_good_ignored_score={mcts_score:.2%}")
+                else:
+                    good_signals += 1.0
+                    reasons.append(f"mcts_gap_good={gap:+.2%}")
             elif gap <= bad_gap:
                 weight = max(0.0, float(schedule.get('trust_mcts_gap_bad_weight', 1.0) or 1.0))
                 bad_signals += weight
@@ -3187,6 +3258,8 @@ def main():
     adaptive_draw_band = max(0.01, float(rl_cfg.get('adaptive_temperature_draw_band', 0.05)))
     score_rate_threshold = float(rl_cfg.get('score_rate_threshold', 0.55))
     true_win_rate_threshold = float(rl_cfg.get('true_win_rate_threshold', 0.0))
+    promotion_confirmations_required = max(1, int(rl_cfg.get('promotion_confirmations_required', 1) or 1))
+    promotion_candidate_streak = 0
     staged_eval_enabled = bool(rl_cfg.get('eval_staged_enabled', False))
     eval_stage1_games = max(1, int(rl_cfg.get('eval_stage1_games', rl_cfg.get('eval_games', 50))))
     eval_stage2_games = max(0, int(rl_cfg.get('eval_stage2_games', 0)))
@@ -3241,6 +3314,30 @@ def main():
     current_early_stop_patience = early_stop_patience
     early_stop_min_score_improvement = float(rl_cfg.get('early_stop_min_score_improvement', 0.01))
     early_stop_min_true_win_improvement = float(rl_cfg.get('early_stop_min_true_win_improvement', 0.005))
+    post_promotion_stabilization_iters = max(
+        0,
+        int(rl_cfg.get('post_promotion_stabilization_iterations', 0) or 0),
+    )
+    post_promotion_lr_scale = max(
+        0.05,
+        min(1.0, float(rl_cfg.get('post_promotion_lr_scale', 1.0) or 1.0)),
+    )
+    post_promotion_policy_loss_scale = max(
+        0.05,
+        float(rl_cfg.get('post_promotion_policy_loss_scale', 1.0) or 1.0),
+    )
+    post_promotion_value_loss_scale = max(
+        0.05,
+        float(rl_cfg.get('post_promotion_value_loss_scale', 1.0) or 1.0),
+    )
+    diagnostic_ema_alpha = max(
+        0.0,
+        min(1.0, float(rl_cfg.get('rl_diagnostic_ema_alpha', 0.35) or 0.35)),
+    )
+    post_promotion_stabilization_remaining = 0
+    last_promotion_iteration = None
+    mcts_no_mcts_gap_ema = None
+    q_ablation_gap_ema = None
     prev_completed_draw_rate = None
     prev_decisive_rate = None
     prev_eval_score_rate_for_temp = None
@@ -3310,8 +3407,18 @@ def main():
             
             # Update learning rate (cosine decay + warmup)
             current_lr = _compute_lr(iteration)
+            post_promotion_stabilizing = post_promotion_stabilization_remaining > 0
+            if post_promotion_stabilizing:
+                current_lr *= post_promotion_lr_scale
             for group in optimizer.param_groups:
                 group['lr'] = current_lr * float(group.get('lr_factor', 1.0))
+            if post_promotion_stabilizing:
+                print(
+                    "Post-promotion stabilization: "
+                    f"{post_promotion_stabilization_remaining} iter(s) left, "
+                    f"lr_scale={post_promotion_lr_scale:.2f}"
+                )
+                post_promotion_stabilization_remaining -= 1
             
             # Get current temperature
             if use_temp_schedule:
@@ -3381,14 +3488,25 @@ def main():
                 0.0,
                 float(base_mcts_q_selection_weight) * max(0.0, q_selection_trust_scale),
             )
-            print(
-                f"MCTS Q selection: base={base_mcts_q_selection_weight:.3f}, "
-                f"trusted={current_mcts_q_selection_weight:.3f}, "
-                f"trust_add={current_mcts_q_value_scale:.3f}, "
-                f"effective={current_mcts_q_selection_weight + current_mcts_q_value_scale:.3f}"
+            current_mcts_q_selection_floor = (
+                0.0
+                if _mcts_q_schedule_in_warmup(iteration)
+                else float(base_mcts_q_selection_floor)
             )
             current_mcts_effective_q_weight = (
                 current_mcts_q_selection_weight + current_mcts_q_value_scale
+            )
+            if current_mcts_q_selection_floor > 0.0:
+                current_mcts_effective_q_weight = max(
+                    current_mcts_effective_q_weight,
+                    current_mcts_q_selection_floor,
+                )
+            print(
+                f"MCTS Q selection: base={base_mcts_q_selection_weight:.3f}, "
+                f"trusted={current_mcts_q_selection_weight:.3f}, "
+                f"floor={current_mcts_q_selection_floor:.3f}, "
+                f"trust_add={current_mcts_q_value_scale:.3f}, "
+                f"effective={current_mcts_effective_q_weight:.3f}"
             )
             if bool(value_trust_state.get('enabled', False)):
                 print(
@@ -3401,6 +3519,7 @@ def main():
             config['reinforcement_learning']['mcts_temperature_threshold'] = current_temp_threshold
             config['reinforcement_learning']['mcts_q_value_scale'] = current_mcts_q_value_scale
             config['reinforcement_learning']['mcts_q_selection_weight'] = current_mcts_q_selection_weight
+            config['reinforcement_learning']['mcts_q_selection_floor'] = current_mcts_q_selection_floor
             
             if use_lr_schedule:
                 print(f"LR: {current_lr:.2e}")
@@ -3444,6 +3563,9 @@ def main():
                     rl_cfg.get('q_disabled_value_loss_max', current_value_loss_weight) or current_value_loss_weight
                 )
                 current_value_loss_weight = min(current_value_loss_weight, max_repair_value_weight)
+            if post_promotion_stabilizing:
+                current_policy_loss_weight *= post_promotion_policy_loss_scale
+                current_value_loss_weight *= post_promotion_value_loss_scale
             value_adapt_suffix = (
                 f" (adapt={value_loss_weight_adjustment:+.3f})"
                 if bool(rl_cfg.get('value_loss_weight_adaptive_enabled', False))
@@ -3606,6 +3728,8 @@ def main():
             sample_age_p90 = None
             sample_age_new_fraction = None
             sample_age_le1_fraction = None
+            replay_sample_pre_promotion_fraction = None
+            replay_sample_post_promotion_fraction = None
             
             # Training with metrics
             replay_size = len(replay_buffer)
@@ -3659,9 +3783,9 @@ def main():
                     total_policy_entropy += policy_entropy
                     total_value_pred_std += value_pred_std
                     total_target_value_std += target_value_std
-                avg_loss = total_loss / total_train_steps
                 avg_policy = total_policy / total_train_steps
                 avg_value = total_value / total_train_steps
+                avg_loss = avg_policy + avg_value
                 avg_policy_entropy = total_policy_entropy / total_train_steps
                 avg_value_pred_std = total_value_pred_std / total_train_steps
                 avg_target_value_std = total_target_value_std / total_train_steps
@@ -3673,6 +3797,14 @@ def main():
                     sample_age_p90 = float(np.percentile(sample_ages, 90))
                     sample_age_new_fraction = float(np.mean(sample_ages <= 0.0))
                     sample_age_le1_fraction = float(np.mean(sample_ages <= 1.0))
+                    if last_promotion_iteration is not None:
+                        inserted_iterations = float(iteration + 1) - sample_ages
+                        replay_sample_pre_promotion_fraction = float(
+                            np.mean(inserted_iterations <= float(last_promotion_iteration))
+                        )
+                        replay_sample_post_promotion_fraction = float(
+                            np.mean(inserted_iterations > float(last_promotion_iteration))
+                        )
                 
                 # đź“Š Compute metrics
                 train_metrics = metrics_calc.compute()
@@ -3706,6 +3838,8 @@ def main():
                 replay_quality_stats['sample_age_p90'] = sample_age_p90
                 replay_quality_stats['sample_age_new_fraction'] = sample_age_new_fraction
                 replay_quality_stats['sample_age_le1_fraction'] = sample_age_le1_fraction
+                replay_quality_stats['sample_pre_promotion_fraction'] = replay_sample_pre_promotion_fraction
+                replay_quality_stats['sample_post_promotion_fraction'] = replay_sample_post_promotion_fraction
             _finish_stage('train')
              
             # Evaluation
@@ -3890,6 +4024,25 @@ def main():
                         f"(score: {q_ablation_score_rate:.2%}, true win rate: {q_ablation_true_win_rate:.2%}, "
                         f"Q-on minus Q-off: {q_ablation_gap:+.2%}, unresolved: {q_ablation_unresolved})"
                     )
+                if no_mcts_score_rate is not None:
+                    current_mcts_no_mcts_gap = float(score_rate) - float(no_mcts_score_rate)
+                    mcts_no_mcts_gap_ema = (
+                        current_mcts_no_mcts_gap
+                        if mcts_no_mcts_gap_ema is None
+                        else (
+                            (1.0 - diagnostic_ema_alpha) * float(mcts_no_mcts_gap_ema)
+                            + diagnostic_ema_alpha * current_mcts_no_mcts_gap
+                        )
+                    )
+                if q_ablation_gap is not None:
+                    q_ablation_gap_ema = (
+                        float(q_ablation_gap)
+                        if q_ablation_gap_ema is None
+                        else (
+                            (1.0 - diagnostic_ema_alpha) * float(q_ablation_gap_ema)
+                            + diagnostic_ema_alpha * float(q_ablation_gap)
+                        )
+                    )
                 is_new_best_candidate = score_rate >= score_rate_threshold and true_win_rate >= true_win_rate_threshold
                 anchor_gate_enabled = bool(rl_cfg.get('promotion_require_anchor_non_regression', True))
                 previous_eval_score_for_guard = last_eval_score_rate_for_guard
@@ -3981,6 +4134,19 @@ def main():
                             f"true_win={float(anchor_true_win_rate or 0.0):.2%} "
                             f"(required >= {min_anchor_true_win:.2%})."
                         )
+                if is_new_best_candidate:
+                    promotion_candidate_streak += 1
+                    if promotion_candidate_streak < promotion_confirmations_required:
+                        print(
+                            "Promotion pending: "
+                            f"{promotion_candidate_streak}/{promotion_confirmations_required} "
+                            "consecutive passing eval(s)."
+                        )
+                        is_new_best_candidate = False
+                else:
+                    if promotion_candidate_streak > 0:
+                        print("Promotion confirmation streak reset.")
+                    promotion_candidate_streak = 0
                 estimated_elo = None
                 if is_new_best_candidate:
                     estimated_elo = elo_coordinator.evaluate_promoted_best(iteration + 1)
@@ -3996,6 +4162,7 @@ def main():
                     value_loss_weight=current_value_loss_weight,
                     mcts_q_value_scale=current_mcts_q_value_scale,
                     mcts_q_selection_weight=current_mcts_q_selection_weight,
+                    mcts_q_selection_floor=current_mcts_q_selection_floor,
                     mcts_q_effective_weight=current_mcts_effective_q_weight,
                     mcts_q_value_trust=float(value_trust_state.get('scale', 1.0)),
                     value_guard_streak=value_guard_poor_eval_streak,
@@ -4078,6 +4245,12 @@ def main():
                             "Early-stop patience increased after promotion: "
                             f"{current_early_stop_patience} eval cycle(s)."
                         )
+                    post_promotion_stabilization_remaining = max(
+                        post_promotion_stabilization_remaining,
+                        post_promotion_stabilization_iters,
+                    )
+                    promotion_candidate_streak = 0
+                    last_promotion_iteration = int(iteration + 1)
                     logger.add_rl_best_model_marker(
                         iteration + 1,
                         f"RL best {iteration + 1}",
@@ -4298,6 +4471,11 @@ def main():
                 profile=performance_profile,
                 stage_times=iteration_stage_times,
             )
+            replay_quality_stats['iterations_since_promotion'] = (
+                int(iteration + 1) - int(last_promotion_iteration)
+                if last_promotion_iteration is not None
+                else None
+            )
             logger.log_rl_data_quality(
                 iteration + 1,
                 positions_added=positions_added,
@@ -4309,11 +4487,14 @@ def main():
                     'no_mcts_score_rate': no_mcts_score_rate,
                     'mcts_qoff_score_rate': q_ablation_score_rate,
                     'mcts_q_ablation_gap': q_ablation_gap,
+                    'mcts_no_mcts_gap_ema': mcts_no_mcts_gap_ema,
+                    'mcts_q_ablation_gap_ema': q_ablation_gap_ema,
                     'mcts_games': eval_games_total,
                     'mcts_qoff_games': q_ablation_eval_games if q_ablation_score_rate is not None else None,
                 },
                 train_policy_entropy=avg_policy_entropy,
                 train_target_value_std=avg_target_value_std,
+                train_value_pred_std=avg_value_pred_std,
             )
             logger.plot_rl_performance()
             logger.plot_rl_data_quality()

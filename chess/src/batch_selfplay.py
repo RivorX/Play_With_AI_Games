@@ -73,7 +73,11 @@ def _q_delta_percentile_from_histogram(hist, percentile):
     index = int(np.searchsorted(np.cumsum(counts), threshold, side='left'))
     index = max(0, min(index, counts.size - 1))
     width = (_Q_DELTA_HIST_MAX - _Q_DELTA_HIST_MIN) / float(counts.size)
-    return float(_Q_DELTA_HIST_MIN + (index + 0.5) * width)
+    bin_low = float(_Q_DELTA_HIST_MIN + index * width)
+    bin_high = float(bin_low + width)
+    if bin_low <= 0.0 <= bin_high:
+        return 0.0
+    return float(bin_low + 0.5 * width)
 
 
 def _debug_scope(config, name):
@@ -953,6 +957,10 @@ class MultiGameBatchMCTS:
             0.0,
             float(config['reinforcement_learning'].get('mcts_q_selection_weight', 1.0)),
         )
+        self.q_selection_floor = max(
+            0.0,
+            float(config['reinforcement_learning'].get('mcts_q_selection_floor', 0.0)),
+        )
         self.q_centered = bool(config['reinforcement_learning'].get('mcts_q_centered', False))
         self.q_min_child_visits = max(
             0.0,
@@ -1527,6 +1535,8 @@ class MultiGameBatchMCTS:
                 -edges.value_sums[explored_mask] - edges.virtual_losses_f32[explored_mask]
             ) / cv[explored_mask]
         effective_q_weight = float(self.q_selection_weight) + float(self.q_value_scale)
+        if self.q_selection_floor > 0.0:
+            effective_q_weight = max(effective_q_weight, float(self.q_selection_floor))
         if effective_q_weight > 0.0 and self.q_min_fullmove > 1:
             try:
                 fullmove_number = int(getattr(node.board, 'fullmove_number', 1) or 1)
@@ -2752,9 +2762,39 @@ class BatchSelfPlayMCTSBatch:
             0.0,
             float(rl_cfg.get('policy_target_search_discovery_rank_bonus', 0.15)),
         )
+        self.policy_target_search_discovery_allow_q_neutral = bool(
+            rl_cfg.get('policy_target_search_discovery_allow_q_neutral', False)
+        )
+        self.policy_target_search_discovery_min_top_visit_prob = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('policy_target_search_discovery_min_top_visit_prob', 0.55))),
+        )
+        self.policy_target_search_discovery_min_prior_rank = max(
+            1,
+            int(rl_cfg.get('policy_target_search_discovery_min_prior_rank', 2)),
+        )
+        self.policy_target_search_discovery_neutral_min_q_delta = float(
+            rl_cfg.get('policy_target_search_discovery_neutral_min_q_delta', -0.02)
+        )
+        self.policy_target_search_discovery_neutral_bonus = max(
+            0.0,
+            float(rl_cfg.get('policy_target_search_discovery_neutral_bonus', 0.0)),
+        )
+        self.policy_target_search_discovery_neutral_rank_bonus = max(
+            0.0,
+            float(rl_cfg.get('policy_target_search_discovery_neutral_rank_bonus', 0.0)),
+        )
         self.policy_target_search_discovery_max_weight = max(
             1.0,
             float(rl_cfg.get('policy_target_search_discovery_max_weight', 1.55)),
+        )
+        self.mcts_good_target_min_top_visit_prob = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('mcts_good_target_min_top_visit_prob', 0.55))),
+        )
+        self.mcts_good_target_min_visit_gap = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('mcts_good_target_min_visit_gap', 0.12))),
         )
         self.store_frozen_best_positions = bool(
             rl_cfg.get('self_play_store_frozen_best_positions', True)
@@ -3077,29 +3117,59 @@ class BatchSelfPlayMCTSBatch:
         if not changed_top:
             return 1.0
 
-        q_delta = search_metadata.get('mcts_q_delta', None)
-        if q_delta is None:
-            return 1.0
-        try:
-            q_delta = float(q_delta)
-        except (TypeError, ValueError):
-            return 1.0
-        if not math.isfinite(q_delta) or q_delta < float(self.policy_target_search_discovery_min_q_delta):
-            return 1.0
-
-        q_strength = max(0.0, min(1.0, q_delta / float(self.policy_target_search_discovery_q_delta_ref)))
         rank_strength = 0.0
+        prior_rank = 1
         try:
             prior_rank = int(search_metadata.get('prior_top_visit_rank', 1) or 1)
             rank_strength = max(0.0, min(1.0, float(prior_rank - 1) / 4.0))
         except (TypeError, ValueError):
+            prior_rank = 1
             rank_strength = 0.0
+
+        q_delta = search_metadata.get('mcts_q_delta', None)
+        q_delta_is_good = False
+        try:
+            if q_delta is not None:
+                q_delta = float(q_delta)
+                q_delta_is_good = (
+                    math.isfinite(q_delta)
+                    and q_delta >= float(self.policy_target_search_discovery_min_q_delta)
+                )
+        except (TypeError, ValueError):
+            q_delta = None
+            q_delta_is_good = False
+
+        if q_delta_is_good:
+            q_strength = max(0.0, min(1.0, float(q_delta) / float(self.policy_target_search_discovery_q_delta_ref)))
+            weight = (
+                1.0
+                + float(self.policy_target_search_discovery_bonus)
+                + float(self.policy_target_search_discovery_q_bonus) * q_strength
+                + float(self.policy_target_search_discovery_rank_bonus) * rank_strength
+            )
+            return float(max(1.0, min(float(self.policy_target_search_discovery_max_weight), weight)))
+
+        if not self.policy_target_search_discovery_allow_q_neutral:
+            return 1.0
+        if q_delta is not None and math.isfinite(float(q_delta)):
+            if float(q_delta) < float(self.policy_target_search_discovery_neutral_min_q_delta):
+                return 1.0
+
+        try:
+            top_visit_prob = float(search_metadata.get('top_visit_prob', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            top_visit_prob = 0.0
+        if (
+            not math.isfinite(top_visit_prob)
+            or top_visit_prob < float(self.policy_target_search_discovery_min_top_visit_prob)
+            or prior_rank < int(self.policy_target_search_discovery_min_prior_rank)
+        ):
+            return 1.0
 
         weight = (
             1.0
-            + float(self.policy_target_search_discovery_bonus)
-            + float(self.policy_target_search_discovery_q_bonus) * q_strength
-            + float(self.policy_target_search_discovery_rank_bonus) * rank_strength
+            + float(self.policy_target_search_discovery_neutral_bonus)
+            + float(self.policy_target_search_discovery_neutral_rank_bonus) * rank_strength
         )
         return float(max(1.0, min(float(self.policy_target_search_discovery_max_weight), weight)))
 
@@ -3696,9 +3766,14 @@ class BatchSelfPlayMCTSBatch:
             'mcts_prior_top_visit_prob_sum': 0.0,
             'mcts_top_prior_prob_sum': 0.0,
             'mcts_policy_kl_sum': 0.0,
+            'mcts_top_visit_prob_sum': 0.0,
+            'mcts_visit_gap_sum': 0.0,
+            'mcts_visit_entropy_sum': 0.0,
+            'mcts_good_target_count': 0.0,
             'mcts_explored_prior_mass_sum': 0.0,
             'mcts_visited_move_count_sum': 0.0,
             'mcts_legal_move_count_sum': 0.0,
+            'mcts_visit_coverage_ratio_sum': 0.0,
             'mcts_q_delta_samples': 0.0,
             'mcts_q_delta_sum': 0.0,
             'mcts_q_delta_values': [],
@@ -3863,6 +3938,7 @@ class BatchSelfPlayMCTSBatch:
                 else 0.0
             ),
             'mcts_search_discovery_count': int(total_mcts_quality_stats['mcts_search_discovery_count']),
+            'mcts_search_discovery_weight_sum': float(total_mcts_quality_stats['mcts_search_discovery_weight_sum']),
             'mcts_search_discovery_rate': (
                 float(total_mcts_quality_stats['mcts_search_discovery_count']) / float(mcts_quality_samples)
                 if mcts_quality_samples > 0
@@ -3892,18 +3968,51 @@ class BatchSelfPlayMCTSBatch:
                 if mcts_quality_samples > 0
                 else 0.0
             ),
+            'mcts_top_visit_prob_sum': float(total_mcts_quality_stats['mcts_top_visit_prob_sum']),
+            'mcts_top_visit_prob_mean': (
+                float(total_mcts_quality_stats['mcts_top_visit_prob_sum']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_visit_gap_sum': float(total_mcts_quality_stats['mcts_visit_gap_sum']),
+            'mcts_visit_gap_mean': (
+                float(total_mcts_quality_stats['mcts_visit_gap_sum']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_visit_entropy_sum': float(total_mcts_quality_stats['mcts_visit_entropy_sum']),
+            'mcts_visit_entropy_mean': (
+                float(total_mcts_quality_stats['mcts_visit_entropy_sum']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_good_target_count': int(total_mcts_quality_stats['mcts_good_target_count']),
+            'mcts_good_target_rate': (
+                float(total_mcts_quality_stats['mcts_good_target_count']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_explored_prior_mass_sum': float(total_mcts_quality_stats['mcts_explored_prior_mass_sum']),
             'mcts_explored_prior_mass_mean': (
                 float(total_mcts_quality_stats['mcts_explored_prior_mass_sum']) / float(mcts_quality_samples)
                 if mcts_quality_samples > 0
                 else 0.0
             ),
+            'mcts_visited_move_count_sum': float(total_mcts_quality_stats['mcts_visited_move_count_sum']),
             'mcts_visited_move_count_mean': (
                 float(total_mcts_quality_stats['mcts_visited_move_count_sum']) / float(mcts_quality_samples)
                 if mcts_quality_samples > 0
                 else 0.0
             ),
+            'mcts_legal_move_count_sum': float(total_mcts_quality_stats['mcts_legal_move_count_sum']),
             'mcts_legal_move_count_mean': (
                 float(total_mcts_quality_stats['mcts_legal_move_count_sum']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_visit_coverage_ratio_sum': float(total_mcts_quality_stats['mcts_visit_coverage_ratio_sum']),
+            'mcts_visit_coverage_ratio_mean': (
+                float(total_mcts_quality_stats['mcts_visit_coverage_ratio_sum']) / float(mcts_quality_samples)
                 if mcts_quality_samples > 0
                 else 0.0
             ),
@@ -4106,9 +4215,14 @@ class BatchSelfPlayMCTSBatch:
             'prior_top_visit_prob_sum': 0.0,
             'mcts_top_prior_prob_sum': 0.0,
             'policy_kl_sum': 0.0,
+            'top_visit_prob_sum': 0.0,
+            'visit_gap_sum': 0.0,
+            'visit_entropy_sum': 0.0,
+            'good_target_count': 0,
             'explored_prior_mass_sum': 0.0,
             'visited_move_count_sum': 0.0,
             'legal_move_count_sum': 0.0,
+            'visit_coverage_ratio_sum': 0.0,
             'q_comparable': 0,
             'q_delta_sum': 0.0,
             'q_delta_values': [],
@@ -4121,7 +4235,7 @@ class BatchSelfPlayMCTSBatch:
             'search_discovery_weight_sum': 0.0,
         }
 
-        def _accumulate_target_quality(search_metadata, visit_counts, root):
+        def _accumulate_target_quality(search_metadata):
             if not isinstance(search_metadata, dict):
                 return
             agree = search_metadata.get('prior_mcts_agree', None)
@@ -4136,30 +4250,34 @@ class BatchSelfPlayMCTSBatch:
                 ('prior_top_visit_prob', 'prior_top_visit_prob_sum'),
                 ('mcts_top_prior_prob', 'mcts_top_prior_prob_sum'),
                 ('mcts_policy_kl', 'policy_kl_sum'),
+                ('top_visit_prob', 'top_visit_prob_sum'),
+                ('visit_gap', 'visit_gap_sum'),
+                ('visit_entropy', 'visit_entropy_sum'),
+                ('explored_prior_mass', 'explored_prior_mass_sum'),
             ]:
                 value = search_metadata.get(meta_key, None)
                 if value is not None:
                     target_quality[sum_key] += float(value)
-            if visit_counts:
-                visited_count = sum(1 for count in visit_counts.values() if float(count) > 0.0)
-                legal_count = len(visit_counts)
+            try:
+                top_visit_prob = float(search_metadata.get('top_visit_prob', 0.0) or 0.0)
+                visit_gap = float(search_metadata.get('visit_gap', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                top_visit_prob = 0.0
+                visit_gap = 0.0
+            if (
+                top_visit_prob >= float(self.mcts_good_target_min_top_visit_prob)
+                and visit_gap >= float(self.mcts_good_target_min_visit_gap)
+            ):
+                target_quality['good_target_count'] += 1
+            visited_count = search_metadata.get('visited_move_count', None)
+            legal_count = search_metadata.get('legal_move_count', None)
+            if visited_count is not None and legal_count is not None:
+                visited_count = float(visited_count)
+                legal_count = float(legal_count)
                 target_quality['visited_move_count_sum'] += float(visited_count)
                 target_quality['legal_move_count_sum'] += float(legal_count)
-                if root is not None and getattr(root, 'expanded', False) and getattr(root, 'edges', None) is not None:
-                    prior_by_move = {
-                        move: float(prior)
-                        for move, prior in zip(root.edges.moves, root.edges.base_priors)
-                    }
-                    prior_total = sum(prior_by_move.values())
-                    if prior_total > 0.0:
-                        explored_prior = sum(
-                            prior_by_move.get(move, 0.0)
-                            for move, count in visit_counts.items()
-                            if float(count) > 0.0
-                        )
-                        target_quality['explored_prior_mass_sum'] += float(
-                            max(0.0, min(1.0, explored_prior / prior_total))
-                        )
+                if legal_count > 0:
+                    target_quality['visit_coverage_ratio_sum'] += float(visited_count) / float(legal_count)
             q_delta = search_metadata.get('mcts_q_delta', None)
             if q_delta is not None:
                 target_quality['q_comparable'] += 1
@@ -4320,6 +4438,7 @@ class BatchSelfPlayMCTSBatch:
                     gs.get('opponent_source_label', self.opponent_source_label),
                 )
                 if store_policy_position:
+                    _accumulate_target_quality(search_metadata)
                     policy_t0 = time.perf_counter() if self.profile_enabled else None
                     visit_counts = self._prune_policy_target_visits(visit_counts)
                     top1, entropy = self._policy_target_quality_from_visits(visit_counts)
@@ -4338,7 +4457,6 @@ class BatchSelfPlayMCTSBatch:
                         target_quality['search_discovery_weight_sum'] += float(discovery_weight)
                     if not learner_turn and game_opponent_mcts is not None:
                         policy_weight *= float(self.frozen_opponent_policy_weight)
-                    _accumulate_target_quality(search_metadata, visit_counts, root)
                     if root is not None:
                         root_visits = int(getattr(root, 'visit_count', 0) or 0)
                         if root_visits > 0:
@@ -4585,6 +4703,30 @@ class BatchSelfPlayMCTSBatch:
                 if target_quality_samples > 0
                 else 0.0
             ),
+            'mcts_top_visit_prob_sum': float(target_quality['top_visit_prob_sum']),
+            'mcts_top_visit_prob_mean': (
+                float(target_quality['top_visit_prob_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_visit_gap_sum': float(target_quality['visit_gap_sum']),
+            'mcts_visit_gap_mean': (
+                float(target_quality['visit_gap_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_visit_entropy_sum': float(target_quality['visit_entropy_sum']),
+            'mcts_visit_entropy_mean': (
+                float(target_quality['visit_entropy_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_good_target_count': int(target_quality['good_target_count']),
+            'mcts_good_target_rate': (
+                float(target_quality['good_target_count']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
             'mcts_explored_prior_mass_sum': float(target_quality['explored_prior_mass_sum']),
             'mcts_explored_prior_mass_mean': (
                 float(target_quality['explored_prior_mass_sum']) / float(target_quality_samples)
@@ -4600,6 +4742,12 @@ class BatchSelfPlayMCTSBatch:
             'mcts_legal_move_count_sum': float(target_quality['legal_move_count_sum']),
             'mcts_legal_move_count_mean': (
                 float(target_quality['legal_move_count_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_visit_coverage_ratio_sum': float(target_quality['visit_coverage_ratio_sum']),
+            'mcts_visit_coverage_ratio_mean': (
+                float(target_quality['visit_coverage_ratio_sum']) / float(target_quality_samples)
                 if target_quality_samples > 0
                 else 0.0
             ),
@@ -5858,6 +6006,14 @@ def persistent_selfplay_worker(
                     for mcts_obj in [getattr(engine, 'mcts', None)] + opponent_mcts:
                         if mcts_obj is not None and hasattr(mcts_obj, 'q_selection_weight'):
                             mcts_obj.q_selection_weight = q_selection_weight
+                if task.get('mcts_q_selection_floor') is not None:
+                    q_selection_floor = max(0.0, float(task['mcts_q_selection_floor']))
+                    opponent_mcts = list(
+                        (getattr(engine, 'opponent_mcts_by_label', {}) or {}).values()
+                    )
+                    for mcts_obj in [getattr(engine, 'mcts', None)] + opponent_mcts:
+                        if mcts_obj is not None and hasattr(mcts_obj, 'q_selection_floor'):
+                            mcts_obj.q_selection_floor = q_selection_floor
 
                 total_positions, total_games = _play_games_with_engine(
                     rank,
