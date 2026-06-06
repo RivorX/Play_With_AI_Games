@@ -169,13 +169,9 @@ def _apply_il_elo_overrides(elo_config):
     resolved = dict(elo_config)
     override_map = {
         'il_eval_every': 'eval_every',
-        'il_levels': 'levels',
         'il_games_per_level': 'games_per_level',
-        'il_stockfish_time_limit': 'stockfish_time_limit',
         'il_max_moves': 'max_moves',
         'il_workers': 'workers',
-        'il_stockfish_threads': 'stockfish_threads',
-        'il_stockfish_hash_mb': 'stockfish_hash_mb',
         'il_async_device': 'async_device',
         'il_free_threads_utilization': 'free_threads_utilization',
     }
@@ -192,14 +188,7 @@ def _build_il_final_elo_config(elo_config):
 
     resolved = dict(elo_config)
     override_map = {
-        'final_il_levels': 'levels',
-        'final_il_games_per_level': 'games_per_level',
-        'final_il_stockfish_time_limit': 'stockfish_time_limit',
-        'final_il_max_moves': 'max_moves',
         'final_il_workers': 'workers',
-        'final_il_stockfish_threads': 'stockfish_threads',
-        'final_il_stockfish_hash_mb': 'stockfish_hash_mb',
-        'final_il_use_mcts': 'use_mcts',
         'final_il_mcts_simulations': 'mcts_simulations',
     }
     for source_key, target_key in override_map.items():

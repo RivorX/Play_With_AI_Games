@@ -77,7 +77,6 @@ class AdaptiveTemperatureController:
         self.low_draw_step = max(0.0, float(cfg.get("adaptive_temperature_low_draw_step", self.draw_step * 0.5)))
         self.decisive_step = max(0.0, float(cfg.get("adaptive_temperature_decisive_step", 0.03)))
         self.eval_step = max(0.0, float(cfg.get("adaptive_temperature_eval_step", 0.02)))
-        self.value_guard_step = max(0.0, float(cfg.get("adaptive_temperature_value_guard_step", 0.01)))
         self.adjustment_smoothing = max(0.0, min(1.0, float(cfg.get("adaptive_temperature_smoothing", 0.50))))
         self.threshold_step = max(1, int(cfg.get("adaptive_temperature_threshold_step", 2)))
         self.last_adjustment = 0.0
@@ -98,7 +97,6 @@ class AdaptiveTemperatureController:
         prev_decisive_rate=None,
         last_eval_score_rate=None,
         previous_eval_score_rate=None,
-        value_guard_streak=0,
     ):
         if not self.enabled:
             return float(base_temp), int(base_threshold), {
@@ -137,10 +135,6 @@ class AdaptiveTemperatureController:
             if eval_gain < self.stagnation_eval_gain:
                 raw_adjustment -= self.eval_step
                 reasons.append(f"eval_stagnation={eval_gain:+.1%}")
-
-        if int(value_guard_streak) > 0:
-            raw_adjustment -= self.value_guard_step * float(value_guard_streak)
-            reasons.append(f"value_guard={int(value_guard_streak)}")
 
         raw_adjustment = max(-self.max_adjustment, min(self.max_adjustment, raw_adjustment))
         adjustment = (

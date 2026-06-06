@@ -7,6 +7,20 @@ import torch
 
 
 _DEFAULT_MAX_POLICY_TARGETS = 256
+REPLAY_SOURCE_UNKNOWN = 0
+REPLAY_SOURCE_LEARNER = 1
+REPLAY_SOURCE_FROZEN_BEST = 2
+REPLAY_SOURCE_FROZEN_ANCHOR = 3
+REPLAY_SOURCE_FROZEN_RECENT = 4
+REPLAY_SOURCE_OTHER = 5
+REPLAY_SOURCE_LABELS = {
+    REPLAY_SOURCE_UNKNOWN: "unknown",
+    REPLAY_SOURCE_LEARNER: "learner",
+    REPLAY_SOURCE_FROZEN_BEST: "frozen_best",
+    REPLAY_SOURCE_FROZEN_ANCHOR: "frozen_anchor",
+    REPLAY_SOURCE_FROZEN_RECENT: "frozen_recent",
+    REPLAY_SOURCE_OTHER: "other",
+}
 
 
 class ReplayBuffer:
@@ -73,6 +87,7 @@ class ReplayBuffer:
         self._policy_sample_weights = None
         self._value_sample_weights = None
         self._insertion_iterations = None
+        self._source_codes = None
         self._scratch = {}
         self.current_iteration = 0
         self.last_sample_age_stats = {}
@@ -117,6 +132,7 @@ class ReplayBuffer:
         self._policy_sample_weights = torch.ones((self.max_size,), dtype=torch.float32)
         self._value_sample_weights = torch.ones((self.max_size,), dtype=torch.float32)
         self._insertion_iterations = torch.zeros((self.max_size,), dtype=torch.int32)
+        self._source_codes = torch.zeros((self.max_size,), dtype=torch.int8)
 
     def set_current_iteration(self, iteration):
         try:
@@ -154,6 +170,7 @@ class ReplayBuffer:
         importance = float(position[4]) if len(position) > 4 else 0.0
         policy_weight = float(position[5]) if len(position) > 5 else 1.0
         value_weight = float(position[6]) if len(position) > 6 else 1.0
+        source_code = int(position[7]) if len(position) > 7 else REPLAY_SOURCE_UNKNOWN
         if self.use_fp16:
             board = board.half().contiguous()
             policy_values = policy_values.half().contiguous()
@@ -165,10 +182,10 @@ class ReplayBuffer:
 
         policy_indices = policy_indices.to(dtype=torch.int16).contiguous()
         value = value.reshape(1).contiguous()
-        return board, policy_indices, policy_values, value, importance, policy_weight, value_weight
+        return board, policy_indices, policy_values, value, importance, policy_weight, value_weight, source_code
 
     def _store_at_slot(self, slot, position):
-        board, policy_indices, policy_values, value, importance, policy_weight, value_weight = self._normalize_position(position)
+        board, policy_indices, policy_values, value, importance, policy_weight, value_weight, source_code = self._normalize_position(position)
 
         count = int(policy_indices.numel())
         if count > self.max_policy_targets:
@@ -188,6 +205,7 @@ class ReplayBuffer:
         self._policy_sample_weights[slot] = float(policy_weight)
         self._value_sample_weights[slot] = float(value_weight)
         self._insertion_iterations[slot] = int(self.current_iteration)
+        self._source_codes[slot] = int(source_code)
 
     def _build_batch_from_indices(self, indices):
         idx = torch.as_tensor(indices, dtype=torch.long)
@@ -237,6 +255,7 @@ class ReplayBuffer:
         importance_scores=None,
         policy_weights=None,
         value_weights=None,
+        source_codes=None,
     ):
         if boards is None or int(boards.shape[0]) <= 0:
             return
@@ -259,6 +278,10 @@ class ReplayBuffer:
             value_weights = torch.ones((int(boards.shape[0]),), dtype=torch.float32)
         else:
             value_weights = value_weights.reshape(-1).to(dtype=torch.float32).contiguous()
+        if source_codes is None:
+            source_codes = torch.zeros((int(boards.shape[0]),), dtype=torch.int8)
+        else:
+            source_codes = source_codes.reshape(-1).to(dtype=torch.int8).contiguous()
 
         max_len = int(policy_indices.shape[1]) if policy_indices.dim() == 2 else 0
         if max_len > self.max_policy_targets:
@@ -289,6 +312,7 @@ class ReplayBuffer:
             self._policy_sample_weights[dst_slice].copy_(policy_weights[src_slice])
             self._value_sample_weights[dst_slice].copy_(value_weights[src_slice])
             self._insertion_iterations[dst_slice].fill_(int(self.current_iteration))
+            self._source_codes[dst_slice].copy_(source_codes[src_slice])
 
             self.position = (dst_start + count) % self.max_size
             self.size = min(self.size + count, self.max_size)
@@ -554,13 +578,21 @@ class ReplayBuffer:
         np.random.shuffle(indices)
         return indices
 
-    def sample(self, batch_size):
+    def select_indices(self, sample_size):
         if self.size <= 0:
             raise ValueError("Cannot sample from an empty replay buffer.")
-        batch_size = max(1, min(int(batch_size), int(self.size)))
-        indices = self._sample_indices_with_biases(batch_size)
+        sample_size = max(1, min(int(sample_size), int(self.size)))
+        return self._sample_indices_with_biases(sample_size)
+
+    def sample_from_indices(self, indices):
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.size <= 0:
+            raise ValueError("Cannot build an empty replay batch.")
         self._record_sample_age_stats(indices)
         return self._build_batch_from_indices(indices)
+
+    def sample(self, batch_size):
+        return self.sample_from_indices(self.select_indices(batch_size))
 
     def _record_sample_age_stats(self, indices):
         if self._insertion_iterations is None:
@@ -609,6 +641,7 @@ class ReplayBuffer:
         old_policy_sample_weights = self._policy_sample_weights
         old_value_sample_weights = self._value_sample_weights
         old_insertion_iterations = self._insertion_iterations
+        old_source_codes = self._source_codes
 
         board_shape = tuple(old_boards.shape[1:])
         board_dtype = old_boards.dtype
@@ -631,6 +664,7 @@ class ReplayBuffer:
         self._policy_sample_weights = torch.ones((self.max_size,), dtype=old_policy_sample_weights.dtype)
         self._value_sample_weights = torch.ones((self.max_size,), dtype=old_value_sample_weights.dtype)
         self._insertion_iterations = torch.zeros((self.max_size,), dtype=old_insertion_iterations.dtype)
+        self._source_codes = torch.zeros((self.max_size,), dtype=old_source_codes.dtype)
 
         if keep_size > 0:
             idx = torch.as_tensor(keep_indices, dtype=torch.long)
@@ -643,6 +677,7 @@ class ReplayBuffer:
             self._policy_sample_weights[:keep_size].copy_(old_policy_sample_weights[idx])
             self._value_sample_weights[:keep_size].copy_(old_value_sample_weights[idx])
             self._insertion_iterations[:keep_size].copy_(old_insertion_iterations[idx])
+            self._source_codes[:keep_size].copy_(old_source_codes[idx])
 
         self.size = keep_size
         self.position = 0 if keep_size >= self.max_size else keep_size
@@ -664,6 +699,7 @@ class ReplayBuffer:
         policy_weights = self._policy_sample_weights[:self.size].float()
         value_weights = self._value_sample_weights[:self.size].float()
         importance = self._importance[:self.size].float()
+        source_codes = self._source_codes[:self.size].to(dtype=torch.int16)
         decisive_mask = torch.abs(values) > float(self.decisive_value_epsilon)
         draw_mask = ~decisive_mask
         positive_mask = values > float(self.value_balance_epsilon)
@@ -707,6 +743,19 @@ class ReplayBuffer:
             "importance_mean": _safe_mean(importance),
             "importance_p90": _safe_quantile(importance, 0.90),
         })
+        policy_weight_total = max(1e-8, float(policy_weights.sum().item()))
+        source_counts = {}
+        source_policy_weight_sums = {}
+        for source_code, source_label in REPLAY_SOURCE_LABELS.items():
+            source_mask = source_codes == int(source_code)
+            source_count = int(source_mask.sum().item())
+            source_policy_weight_sum = float(policy_weights[source_mask].sum().item()) if source_count > 0 else 0.0
+            source_counts[source_label] = source_count
+            source_policy_weight_sums[source_label] = source_policy_weight_sum
+            stats[f"source_{source_label}_fraction"] = float(source_count) / float(self.size)
+            stats[f"source_{source_label}_policy_weight_share"] = source_policy_weight_sum / policy_weight_total
+        stats["source_counts"] = source_counts
+        stats["source_policy_weight_sums"] = source_policy_weight_sums
 
         policy_values = self._policy_values[:self.size].float()
         if policy_values.numel() > 0:

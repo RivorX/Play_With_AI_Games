@@ -523,8 +523,7 @@ def choose_eval_settings(elo_cfg):
     if _is_tty():
         _print_block("Evaluation Settings")
         print(f"Levels (from config): {levels}")
-    adaptive_enabled = bool(elo_cfg.get("adaptive_ladder_enabled", False))
-    games_label = "Max games per useful level" if adaptive_enabled else "Games per level"
+    games_label = "Max games per useful level"
     games_per_level = _prompt_int(games_label, default_games, min_value=1)
     
     workers = _prompt_int("Parallel workers (0=auto)", default_workers, min_value=0)
@@ -758,8 +757,7 @@ def format_results_table(all_results: list[dict]) -> str:
         if result.get("elo_std_error") is not None:
             ci = result.get("elo_ci95")
             ci_str = f", 95% CI {ci[0]}-{ci[1]}" if isinstance(ci, list) and len(ci) == 2 else ""
-            ladder = "adaptive" if result.get("adaptive") else "fixed"
-            lines.append(f"  Uncertainty: ±{result['elo_std_error']} Elo SE{ci_str} ({ladder} ladder)")
+            lines.append(f"  Uncertainty: ±{result['elo_std_error']} Elo SE{ci_str} (adaptive ladder)")
 
         if result.get("results"):
             parts = []
@@ -906,16 +904,14 @@ def main():
 
     output_path = choose_output_path(chess_dir, len(selected_paths))
 
-    adaptive_enabled = bool(elo_cfg.get("adaptive_ladder_enabled", False))
     max_games_per_run = len(levels) * games_per_level
-    if adaptive_enabled:
-        try:
-            max_games_per_run = min(
-                max_games_per_run,
-                int(elo_cfg.get("adaptive_max_total_games", max_games_per_run) or max_games_per_run),
-            )
-        except (TypeError, ValueError):
-            pass
+    try:
+        max_games_per_run = min(
+            max_games_per_run,
+            int(elo_cfg.get("adaptive_max_total_games", max_games_per_run) or max_games_per_run),
+        )
+    except (TypeError, ValueError):
+        pass
     total_games = len(selected_paths) * max_games_per_run * max(1, len(eval_modes))
     mode_labels = []
     if "nn" in eval_modes:
@@ -931,12 +927,8 @@ def main():
     _print_block("Elo Estimation Plan")
     print(f"Models:         {len(selected_paths)}")
     print(f"Levels:         {levels}")
-    if adaptive_enabled:
-        print(f"Games/level:    adaptive probe/focus, cap {games_per_level}/level")
-        print(f"Total games:    <= {total_games}")
-    else:
-        print(f"Games/level:    {games_per_level}")
-        print(f"Total games:    {total_games}")
+    print(f"Games/level:    adaptive probe/focus, cap {games_per_level}/useful level")
+    print(f"Total games:    <= {total_games}")
     print(f"Mode:           {mode_str}")
     if "mcts" in eval_modes:
         print(f"MCTS sims:      {simulations}")

@@ -48,6 +48,25 @@ _ADAPTIVE_LOCKED_MARGIN = 8
 _Q_DELTA_HIST_MIN = -2.0
 _Q_DELTA_HIST_MAX = 2.0
 _Q_DELTA_HIST_BINS = 200
+_REPLAY_SOURCE_UNKNOWN = 0
+_REPLAY_SOURCE_LEARNER = 1
+_REPLAY_SOURCE_FROZEN_BEST = 2
+_REPLAY_SOURCE_FROZEN_ANCHOR = 3
+_REPLAY_SOURCE_FROZEN_RECENT = 4
+_REPLAY_SOURCE_OTHER = 5
+
+
+def _replay_source_code(learner_turn, game_opponent_mcts, opponent_label):
+    if learner_turn or game_opponent_mcts is None:
+        return _REPLAY_SOURCE_LEARNER
+    label = str(opponent_label or "")
+    if label == "best":
+        return _REPLAY_SOURCE_FROZEN_BEST
+    if label == "anchor":
+        return _REPLAY_SOURCE_FROZEN_ANCHOR
+    if label.startswith("recent_"):
+        return _REPLAY_SOURCE_FROZEN_RECENT
+    return _REPLAY_SOURCE_OTHER
 
 
 def _q_delta_histogram(values):
@@ -557,6 +576,7 @@ class MCTSNode:
         "_position_key_cache",
         "_is_game_over",
         "_board_tensor",
+        "_history_tensor_pair",
         "_legal_moves",
         "_legal_indices",
     )
@@ -583,6 +603,7 @@ class MCTSNode:
         self._position_key_cache = None
         self._is_game_over = None
         self._board_tensor = None
+        self._history_tensor_pair = None
         self._legal_moves = None
         self._legal_indices = None
 
@@ -738,19 +759,15 @@ class MCTSNode:
             board = self.board
             is_black_turn = board.turn == chess.BLACK
             legal_moves = tuple(board.legal_moves)
-            legal_indices = np.fromiter(
-                (
-                    _move_to_index_cached(
-                        move.from_square,
-                        move.to_square,
-                        move.promotion or 0,
-                        is_black_turn,
-                    )
-                    for move in legal_moves
-                ),
-                dtype=np.int32,
-                count=len(legal_moves),
-            )
+            legal_indices = np.empty(len(legal_moves), dtype=np.int32)
+            move_to_idx = _move_to_index_cached
+            for idx, move in enumerate(legal_moves):
+                legal_indices[idx] = move_to_idx(
+                    move.from_square,
+                    move.to_square,
+                    move.promotion or 0,
+                    is_black_turn,
+                )
             self._legal_moves = legal_moves
             self._legal_indices = legal_indices
         return self._legal_moves, self._legal_indices
@@ -811,6 +828,7 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     importance_scores = torch.zeros((batch_size,), dtype=torch.float32)
     policy_weights = torch.ones((batch_size,), dtype=torch.float32)
     value_weights = torch.ones((batch_size,), dtype=torch.float32)
+    source_codes = torch.zeros((batch_size,), dtype=torch.int8)
 
     for row_idx, pos in enumerate(positions):
         _, indices, probs, _ = pos[:4]
@@ -820,6 +838,7 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         importance_scores[row_idx] = float(pos[4]) if len(pos) > 4 else 0.0
         policy_weights[row_idx] = float(pos[5]) if len(pos) > 5 else 1.0
         value_weights[row_idx] = float(pos[6]) if len(pos) > 6 else 1.0
+        source_codes[row_idx] = int(pos[7]) if len(pos) > 7 else _REPLAY_SOURCE_UNKNOWN
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -835,6 +854,7 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         'importance_scores': importance_scores,
         'policy_weights': policy_weights,
         'value_weights': value_weights,
+        'source_codes': source_codes,
         'num_positions': batch_size,
     }
 
@@ -949,18 +969,12 @@ class MultiGameBatchMCTS:
             rl_cfg.get('mcts_fpu_reduction', 0.30)
         )
         self.fpu_absolute = rl_cfg.get('mcts_fpu_absolute', None)
-        self.q_value_scale = max(
-            0.0,
-            float(config['reinforcement_learning'].get('mcts_q_value_scale', 1.0)),
-        )
+        self.q_value_scale = 0.0
         self.q_selection_weight = max(
             0.0,
             float(config['reinforcement_learning'].get('mcts_q_selection_weight', 1.0)),
         )
-        self.q_selection_floor = max(
-            0.0,
-            float(config['reinforcement_learning'].get('mcts_q_selection_floor', 0.0)),
-        )
+        self.q_selection_floor = 0.0
         self.q_centered = bool(config['reinforcement_learning'].get('mcts_q_centered', False))
         self.q_min_child_visits = max(
             0.0,
@@ -1066,6 +1080,42 @@ class MultiGameBatchMCTS:
             1.0,
             float(rl_cfg.get('mcts_search_late_extra_budget_multiplier', 1.5)),
         )
+        self.adaptive_search_discovery_probe_fraction = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('mcts_search_discovery_probe_fraction', 0.0))),
+        )
+        self.adaptive_search_discovery_probe_multiplier = max(
+            1.0,
+            float(
+                rl_cfg.get(
+                    'mcts_search_discovery_probe_budget_multiplier',
+                    rl_cfg.get('adaptive_search_discovery_probe_budget_multiplier', 1.0),
+                )
+            ),
+        )
+        self.adaptive_search_discovery_probe_min_score = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('mcts_search_discovery_probe_min_score', 0.35))),
+        )
+        self.adaptive_search_discovery_probe_prior_margin_ref = max(
+            1e-6,
+            float(rl_cfg.get('mcts_search_discovery_probe_prior_margin_ref', 0.20)),
+        )
+        self.adaptive_search_discovery_probe_prior_top_ref = max(
+            1e-6,
+            float(rl_cfg.get('mcts_search_discovery_probe_prior_top_ref', 0.45)),
+        )
+        self.adaptive_search_discovery_probe_min_budget_fraction = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('mcts_search_discovery_probe_min_budget_fraction', 0.92))),
+        )
+        self.adaptive_search_budget_neutral_enabled = bool(
+            rl_cfg.get('mcts_search_budget_neutral_enabled', False)
+        )
+        self.adaptive_search_budget_neutral_min_fraction = max(
+            0.10,
+            min(1.0, float(rl_cfg.get('mcts_search_budget_neutral_min_fraction', 0.62))),
+        )
         # History configuration (POV)
         self.history_positions = config['model'].get('history_positions', 0)
         self.history_storage_dtype = (
@@ -1076,8 +1126,9 @@ class MultiGameBatchMCTS:
 
         # Tree reuse
         self.reuse_tree = config['reinforcement_learning'].get('mcts_reuse_tree', True)
-        self.cache_node_tensors = bool(
-            config['reinforcement_learning'].get('mcts_cache_node_tensors', False)
+        self.cache_node_tensors = False
+        self.cache_history_tensors = bool(
+            config['reinforcement_learning'].get('mcts_cache_history_tensors', True)
         )
 
         # Dirichlet noise params
@@ -1110,7 +1161,7 @@ class MultiGameBatchMCTS:
         # Inference optimization (AMP on GPU)
         self.use_amp = config.get('hardware', {}).get('use_amp', False) and self.device.type == 'cuda'
         self.amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
-        self._empty_history_tensor = _EMPTY_HISTORY_TENSOR
+        self._empty_history_tensor = _EMPTY_HISTORY_TENSOR.astype(self.history_storage_dtype, copy=False)
         self._board_planes = int(self._empty_history_tensor.shape[0])
         self._history_planes = int(self.history_positions) * self._board_planes
         self._input_planes = self._board_planes + self._history_planes
@@ -1124,9 +1175,27 @@ class MultiGameBatchMCTS:
             and torch.cuda.is_available()
         )
         # Keep lightweight performance counters always on so details/performance CSV/PNG
-        # stays useful even when verbose RL debug profiling is disabled.
+        # stays useful even when verbose RL debug profiling is disabled. Detailed MCTS
+        # stage timers are opt-in because they run inside the tight search loop.
         self.profile_enabled = True
-        self.cuda_stage_profile_enabled = _debug_bool(config, 'rl', 'profile_training', False)
+        self.profile_detail_enabled = _debug_bool(
+            config,
+            'rl',
+            'profile_mcts_detail',
+            _debug_bool(config, 'rl', 'profile_training', False),
+        )
+        debug_root = config.get('debug', {}) or {}
+        debug_rl = debug_root.get('rl', {}) or {}
+        try:
+            self.profile_sample_rate = int(debug_rl.get('profile_mcts_sample_rate', debug_root.get('profile_mcts_sample_rate', 64)))
+        except (TypeError, ValueError):
+            self.profile_sample_rate = 64
+        self.profile_sample_rate = max(0, int(self.profile_sample_rate))
+        self._profile_sample_counts = {}
+        self.cuda_stage_profile_enabled = bool(
+            self.profile_detail_enabled
+            and _debug_bool(config, 'rl', 'profile_training', False)
+        )
         self._profile_stats = {}
 
         self._tactical_capture_enabled = (
@@ -1139,6 +1208,7 @@ class MultiGameBatchMCTS:
         self.reset_profile_stats()
 
     def reset_profile_stats(self):
+        self._profile_sample_counts = {}
         self._profile_stats = {
             'search_many_time': 0.0,
             'search_many_calls': 0,
@@ -1151,6 +1221,7 @@ class MultiGameBatchMCTS:
             'batch_expand_eval_calls': 0,
             'batch_expand_dedup_terminal_time': 0.0,
             'batch_expand_legal_moves_time': 0.0,
+            'batch_expand_tensor_pack_time': 0.0,
             'batch_expand_history_time': 0.0,
             'batch_expand_input_pack_time': 0.0,
             'batch_expand_legal_index_pack_time': 0.0,
@@ -1174,8 +1245,51 @@ class MultiGameBatchMCTS:
     def _profile_inc(self, key, value=1):
         self._profile_stats[key] = int(self._profile_stats.get(key, 0)) + int(value)
 
+    def _profile_sample_begin(self, key):
+        if self.profile_detail_enabled:
+            return time.perf_counter(), 1
+        if not self.profile_enabled or self.profile_sample_rate <= 0:
+            return None, 0
+        count = int(self._profile_sample_counts.get(key, 0)) + 1
+        self._profile_sample_counts[key] = count
+        if count % self.profile_sample_rate != 0:
+            return None, 0
+        return time.perf_counter(), self.profile_sample_rate
+
+    def _profile_sample_finish(self, key, start_time, scale):
+        if start_time is None or scale <= 0:
+            return
+        self._profile_add(f'{key}_time', (time.perf_counter() - start_time) * float(scale))
+        self._profile_inc(f'{key}_calls', int(scale))
+
     def get_profile_stats(self):
         return dict(self._profile_stats)
+
+    def _board_to_tensor_profiled(self, board, flip_perspective=None, storage_dtype=None):
+        sample_t0, sample_scale = self._profile_sample_begin('board_to_tensor')
+        tensor = board_to_tensor(board, flip_perspective=flip_perspective)
+        self._profile_sample_finish('board_to_tensor', sample_t0, sample_scale)
+        if storage_dtype is not None:
+            tensor = tensor.astype(storage_dtype, copy=False)
+        return tensor
+
+    def _history_tensor_pair_for_board(self, board):
+        storage_dtype = self.history_storage_dtype
+        sample_t0, sample_scale = self._profile_sample_begin('board_to_tensor_pair')
+        white_tensor = board_to_tensor(board, flip_perspective=False).astype(storage_dtype, copy=False)
+        black_tensor = board_to_tensor(board, flip_perspective=True).astype(storage_dtype, copy=False)
+        if sample_t0 is not None and sample_scale > 0:
+            self._profile_add('board_to_tensor_time', (time.perf_counter() - sample_t0) * float(sample_scale))
+            self._profile_inc('board_to_tensor_calls', int(sample_scale) * 2)
+        return (white_tensor, black_tensor)
+
+    def _history_tensor_pair_for_node(self, node):
+        cached = getattr(node, "_history_tensor_pair", None)
+        if cached is None or not self.cache_history_tensors:
+            cached = self._history_tensor_pair_for_board(node.board)
+            if self.cache_history_tensors:
+                node._history_tensor_pair = cached
+        return cached
 
     @staticmethod
     def _is_encoded_history_entry(entry):
@@ -1200,19 +1314,7 @@ class MultiGameBatchMCTS:
         if not isinstance(board_obj, chess.Board):
             raise TypeError(f"Unsupported history entry type: {type(board_or_fen)}")
 
-        storage_dtype = self.history_storage_dtype
-        if not self.profile_enabled:
-            return (
-                board_to_tensor(board_obj, flip_perspective=False).astype(storage_dtype, copy=False),
-                board_to_tensor(board_obj, flip_perspective=True).astype(storage_dtype, copy=False),
-            )
-
-        t0 = time.perf_counter()
-        white_tensor = board_to_tensor(board_obj, flip_perspective=False).astype(storage_dtype, copy=False)
-        black_tensor = board_to_tensor(board_obj, flip_perspective=True).astype(storage_dtype, copy=False)
-        self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
-        self._profile_inc('board_to_tensor_calls', 2)
-        return (white_tensor, black_tensor)
+        return self._history_tensor_pair_for_board(board_obj)
 
     def _build_history_tensor(self, current_board, board_history, current_tensor=None):
         """
@@ -1225,13 +1327,7 @@ class MultiGameBatchMCTS:
         if self.history_positions == 0:
             if current_tensor is not None:
                 return current_tensor
-            if not self.profile_enabled:
-                return board_to_tensor(current_board)
-            t0 = time.perf_counter()
-            tensor = board_to_tensor(current_board)
-            self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
-            self._profile_inc('board_to_tensor_calls', 1)
-            return tensor
+            return self._board_to_tensor_profiled(current_board)
 
         history_tensors = []
         use_black_pov = current_board.turn == chess.BLACK
@@ -1247,13 +1343,7 @@ class MultiGameBatchMCTS:
             history_tensors = [self._empty_history_tensor] * pad_count + history_tensors
 
         if current_tensor is None:
-            if not self.profile_enabled:
-                current_tensor = board_to_tensor(current_board)
-            else:
-                t0 = time.perf_counter()
-                current_tensor = board_to_tensor(current_board)
-                self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
-                self._profile_inc('board_to_tensor_calls', 1)
+            current_tensor = self._board_to_tensor_profiled(current_board)
         history_tensors.append(current_tensor)
 
         return np.concatenate(history_tensors, axis=0)
@@ -1262,20 +1352,16 @@ class MultiGameBatchMCTS:
         if self._is_encoded_history_entry(entry):
             return entry[1] if use_black_pov else entry[0]
 
+        if isinstance(entry, MCTSNode):
+            encoded = self._history_tensor_pair_for_node(entry)
+            return encoded[1] if use_black_pov else encoded[0]
+
         if isinstance(entry, chess.Board):
-            if not self.profile_enabled:
-                return board_to_tensor(entry, flip_perspective=use_black_pov).astype(
-                    self.history_storage_dtype,
-                    copy=False,
-                )
-            t0 = time.perf_counter()
-            tensor = board_to_tensor(entry, flip_perspective=use_black_pov).astype(
-                self.history_storage_dtype,
-                copy=False,
+            return self._board_to_tensor_profiled(
+                entry,
+                flip_perspective=use_black_pov,
+                storage_dtype=self.history_storage_dtype,
             )
-            self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
-            self._profile_inc('board_to_tensor_calls', 1)
-            return tensor
 
         encoded = self._encode_history_entry(entry)
         return encoded[1] if use_black_pov else encoded[0]
@@ -1294,7 +1380,7 @@ class MultiGameBatchMCTS:
         simulated_history = []
         ancestor = node.parent
         while ancestor is not None and len(simulated_history) < self.history_positions:
-            simulated_history.append(ancestor.board)
+            simulated_history.append(ancestor)
             ancestor = ancestor.parent
         if simulated_history:
             simulated_history.reverse()
@@ -1322,23 +1408,11 @@ class MultiGameBatchMCTS:
 
     def _current_tensor_for_node(self, node):
         if not self.cache_node_tensors:
-            if not self.profile_enabled:
-                return board_to_tensor(node.board)
-            t0 = time.perf_counter()
-            tensor = board_to_tensor(node.board)
-            self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
-            self._profile_inc('board_to_tensor_calls', 1)
-            return tensor
+            return self._board_to_tensor_profiled(node.board)
 
         cached = getattr(node, "_board_tensor", None)
         if cached is None:
-            if not self.profile_enabled:
-                cached = board_to_tensor(node.board)
-            else:
-                t0 = time.perf_counter()
-                cached = board_to_tensor(node.board)
-                self._profile_add('board_to_tensor_time', time.perf_counter() - t0)
-                self._profile_inc('board_to_tensor_calls', 1)
+            cached = self._board_to_tensor_profiled(node.board)
             node._board_tensor = cached
         return cached
 
@@ -1493,11 +1567,34 @@ class MultiGameBatchMCTS:
 
         return multipliers
 
+    def _effective_q_selection_weight(self, node):
+        effective_q_weight = float(self.q_selection_weight) + float(self.q_value_scale)
+        if self.q_selection_floor > 0.0:
+            effective_q_weight = max(effective_q_weight, float(self.q_selection_floor))
+        if effective_q_weight <= 0.0:
+            return 0.0
+        if self.q_min_fullmove <= 1:
+            return effective_q_weight
+
+        try:
+            fullmove_number = int(getattr(node.board, 'fullmove_number', 1) or 1)
+        except Exception:
+            fullmove_number = 1
+        if fullmove_number < self.q_min_fullmove:
+            return 0.0
+        if self.q_full_weight_fullmove > self.q_min_fullmove:
+            phase_span = float(self.q_full_weight_fullmove - self.q_min_fullmove)
+            phase_progress = float(fullmove_number - self.q_min_fullmove) / phase_span
+            effective_q_weight *= max(0.0, min(1.0, phase_progress))
+        return effective_q_weight
+
     def _select_child(self, node):
         """Select child with highest UCB score (optimized)"""
         edges = node.edges
         if not edges.moves:
             return None
+        if len(edges.moves) == 1:
+            return edges.get_or_create_child(node, 0)
 
         # Precalculate parent term to avoid doing it for every child
         node_visit_count = node.visit_count
@@ -1506,80 +1603,69 @@ class MultiGameBatchMCTS:
         parent_sqrt = math.sqrt(parent_visits + 1)
         c_puct = math.log((parent_visits + self.c_puct_base + 1.0) / self.c_puct_base) + self.c_puct_init
         c_puct = min(c_puct, self.c_puct_max)
-
-        fpu_value = 0.0
-        if self.use_fpu:
-            if self.fpu_absolute is not None:
-                fpu_value = float(self.fpu_absolute)
-            elif parent_visits > 0:
-                parent_q = (node.value_sum - node_virtual_loss) / parent_visits
-                explored_prior = float(node._explored_prior_sum)
-                if explored_prior < 0.0:
-                    explored_prior = 0.0
-                elif explored_prior > 1.0:
-                    explored_prior = 1.0
-                unexplored_prior = 1.0 - explored_prior
-                if unexplored_prior < 0.0:
-                    unexplored_prior = 0.0
-                fpu_value = parent_q - self.fpu_reduction * math.sqrt(unexplored_prior)
+        effective_q_weight = self._effective_q_selection_weight(node)
 
         cv = edges.total_counts
         q_values = edges.selection_scores
-        explored_mask = edges.explored_flags
-        q_values.fill(fpu_value)
-        if explored_mask.any():
-            # Edge value_sums live on child nodes, so they are from the child
-            # side-to-move perspective. The parent must negate them when
-            # deciding which move is good for the current player.
-            q_values[explored_mask] = (
-                -edges.value_sums[explored_mask] - edges.virtual_losses_f32[explored_mask]
-            ) / cv[explored_mask]
-        effective_q_weight = float(self.q_selection_weight) + float(self.q_value_scale)
-        if self.q_selection_floor > 0.0:
-            effective_q_weight = max(effective_q_weight, float(self.q_selection_floor))
-        if effective_q_weight > 0.0 and self.q_min_fullmove > 1:
-            try:
-                fullmove_number = int(getattr(node.board, 'fullmove_number', 1) or 1)
-            except Exception:
-                fullmove_number = 1
-            if fullmove_number < self.q_min_fullmove:
-                effective_q_weight = 0.0
-            elif self.q_full_weight_fullmove > self.q_min_fullmove:
-                phase_span = float(self.q_full_weight_fullmove - self.q_min_fullmove)
-                phase_progress = float(fullmove_number - self.q_min_fullmove) / phase_span
-                effective_q_weight *= max(0.0, min(1.0, phase_progress))
         if effective_q_weight <= 0.0:
             q_values.fill(0.0)
-        elif self.q_centered:
-            transformed_q = q_values
-            # Keep the configured FPU baseline for unvisited / low-visit
-            # children, then overwrite only stable children with centered Q.
-            # Previously centered-Q mode zeroed the whole vector, which made
-            # mcts_use_fpu effectively meaningless whenever q_centered=true.
-            transformed_q.fill(float(fpu_value) * float(effective_q_weight))
-            stable_mask = explored_mask
-            if self.q_min_child_visits > 0.0:
-                stable_mask = explored_mask & (cv >= float(self.q_min_child_visits))
-            if stable_mask.any():
-                stable_q = (
-                    -edges.value_sums[stable_mask] - edges.virtual_losses_f32[stable_mask]
-                ) / cv[stable_mask]
-                stable_counts = cv[stable_mask]
-                q_center = float(np.average(stable_q, weights=np.maximum(stable_counts, 1.0)))
-                centered_q = stable_q - q_center
-                if self.q_tanh_scale > 0.0:
-                    centered_q = np.tanh(centered_q / float(self.q_tanh_scale))
-                parent_gate = min(1.0, float(parent_visits) / float(self.q_parent_visit_warmup))
+        else:
+            fpu_value = 0.0
+            if self.use_fpu:
+                if self.fpu_absolute is not None:
+                    fpu_value = float(self.fpu_absolute)
+                elif parent_visits > 0:
+                    parent_q = (node.value_sum - node_virtual_loss) / parent_visits
+                    explored_prior = float(node._explored_prior_sum)
+                    if explored_prior < 0.0:
+                        explored_prior = 0.0
+                    elif explored_prior > 1.0:
+                        explored_prior = 1.0
+                    unexplored_prior = 1.0 - explored_prior
+                    if unexplored_prior < 0.0:
+                        unexplored_prior = 0.0
+                    fpu_value = parent_q - self.fpu_reduction * math.sqrt(unexplored_prior)
+
+            explored_mask = edges.explored_flags
+            if self.q_centered:
+                transformed_q = q_values
+                # Keep the configured FPU baseline for unvisited / low-visit
+                # children, then overwrite only stable children with centered Q.
+                # Previously centered-Q mode zeroed the whole vector, which made
+                # mcts_use_fpu effectively meaningless whenever q_centered=true.
+                transformed_q.fill(float(fpu_value) * float(effective_q_weight))
+                stable_mask = explored_mask
                 if self.q_min_child_visits > 0.0:
-                    visit_gate = np.minimum(1.0, stable_counts / float(self.q_min_child_visits))
-                else:
-                    visit_gate = 1.0
-                centered_q = centered_q * float(effective_q_weight) * float(parent_gate) * visit_gate
-                if self.q_max_abs > 0.0:
-                    centered_q = np.clip(centered_q, -float(self.q_max_abs), float(self.q_max_abs))
-                transformed_q[stable_mask] = centered_q.astype(np.float32, copy=False)
-        elif effective_q_weight != 1.0:
-            q_values *= float(effective_q_weight)
+                    stable_mask = explored_mask & (cv >= float(self.q_min_child_visits))
+                if stable_mask.any():
+                    stable_q = (
+                        -edges.value_sums[stable_mask] - edges.virtual_losses_f32[stable_mask]
+                    ) / cv[stable_mask]
+                    stable_counts = cv[stable_mask]
+                    q_center = float(np.average(stable_q, weights=np.maximum(stable_counts, 1.0)))
+                    centered_q = stable_q - q_center
+                    if self.q_tanh_scale > 0.0:
+                        centered_q = np.tanh(centered_q / float(self.q_tanh_scale))
+                    parent_gate = min(1.0, float(parent_visits) / float(self.q_parent_visit_warmup))
+                    if self.q_min_child_visits > 0.0:
+                        visit_gate = np.minimum(1.0, stable_counts / float(self.q_min_child_visits))
+                    else:
+                        visit_gate = 1.0
+                    centered_q = centered_q * float(effective_q_weight) * float(parent_gate) * visit_gate
+                    if self.q_max_abs > 0.0:
+                        centered_q = np.clip(centered_q, -float(self.q_max_abs), float(self.q_max_abs))
+                    transformed_q[stable_mask] = centered_q.astype(np.float32, copy=False)
+            else:
+                q_values.fill(fpu_value)
+                if explored_mask.any():
+                    # Edge value_sums live on child nodes, so they are from the child
+                    # side-to-move perspective. The parent must negate them when
+                    # deciding which move is good for the current player.
+                    q_values[explored_mask] = (
+                        -edges.value_sums[explored_mask] - edges.virtual_losses_f32[explored_mask]
+                    ) / cv[explored_mask]
+                if effective_q_weight != 1.0:
+                    q_values *= float(effective_q_weight)
 
         u_values = edges.ucb_buffer
         np.multiply(edges.priors, c_puct * parent_sqrt, out=u_values)
@@ -1731,6 +1817,70 @@ class MultiGameBatchMCTS:
         value = int.from_bytes(digest, byteorder='little', signed=False)
         return float(value) / float((1 << 64) - 1)
 
+    def _discovery_probe_score_for_root(self, root, move_count=None):
+        if root is None or not root.expanded or root.edges is None:
+            return 0.0
+        priors = np.asarray(root.edges.base_priors, dtype=np.float32)
+        if priors.size <= 1:
+            return 0.0
+        prior_total = float(priors.sum())
+        if prior_total <= 0.0:
+            return 0.0
+
+        prior_probs = priors / prior_total
+        sorted_priors = np.sort(prior_probs)
+        top = float(sorted_priors[-1])
+        second = float(sorted_priors[-2]) if sorted_priors.size > 1 else 0.0
+        margin = max(0.0, top - second)
+        entropy = 0.0
+        if prior_probs.size > 1:
+            entropy = float(-(prior_probs * np.log(np.clip(prior_probs, 1e-8, 1.0))).sum())
+            entropy /= float(np.log(prior_probs.size))
+        entropy = float(max(0.0, min(1.0, entropy)))
+
+        legal_count = int(prior_probs.size)
+        profile = self._adaptive_search_root_profile(root, move_count=move_count)
+        if bool(profile.get('forced', False)):
+            return 0.0
+
+        margin_score = 1.0 - min(1.0, margin / float(self.adaptive_search_discovery_probe_prior_margin_ref))
+        top_score = 1.0 - min(1.0, top / float(self.adaptive_search_discovery_probe_prior_top_ref))
+        branching_span = max(1, 28 - int(self.adaptive_search_low_branching_moves))
+        branching_score = max(
+            0.0,
+            min(1.0, float(legal_count - int(self.adaptive_search_low_branching_moves)) / float(branching_span)),
+        )
+        tactic_score = 1.0 if bool(profile.get('in_check', False) or profile.get('sharp_tactic', False)) else 0.0
+        score = (
+            0.42 * margin_score
+            + 0.24 * entropy
+            + 0.18 * top_score
+            + 0.10 * branching_score
+            + 0.06 * tactic_score
+        )
+        return float(max(0.0, min(1.0, score)))
+
+    def _should_apply_discovery_probe(self, root, move_count=None, allow_unexpanded=False):
+        fraction = float(self.adaptive_search_discovery_probe_fraction)
+        if fraction <= 0.0:
+            return False, 0.0
+        stable_fraction = self._stable_fraction_for_root(root)
+        if root is None or not root.expanded or root.edges is None:
+            return bool(allow_unexpanded and stable_fraction < fraction * 0.15), 0.0
+
+        score = self._discovery_probe_score_for_root(root, move_count=move_count)
+        if score < float(self.adaptive_search_discovery_probe_min_score):
+            return False, score
+
+        normalized_score = (
+            (score - float(self.adaptive_search_discovery_probe_min_score))
+            / max(1e-8, 1.0 - float(self.adaptive_search_discovery_probe_min_score))
+        )
+        normalized_score = max(0.0, min(1.0, normalized_score))
+        threshold = fraction * (0.50 + 0.50 * normalized_score)
+        threshold = max(0.0, min(1.0, threshold))
+        return bool(stable_fraction < threshold), score
+
     def _adaptive_search_budget_for_root(self, root, base_budget, move_count=None):
         base_budget = max(1, int(base_budget))
         if not self.adaptive_search_enabled:
@@ -1745,6 +1895,19 @@ class MultiGameBatchMCTS:
         elif profile.get('sharp_tactic', False):
             budget = max(budget, int(round(float(base_budget) * self.adaptive_search_tactical_extra_multiplier)))
             extended = budget > base_budget
+
+        if (
+            self.adaptive_search_discovery_probe_fraction > 0.0
+        ):
+            should_probe, _probe_score = self._should_apply_discovery_probe(
+                root,
+                move_count=move_count,
+                allow_unexpanded=True,
+            )
+            if should_probe:
+                probe_budget = int(round(float(base_budget) * self.adaptive_search_discovery_probe_multiplier))
+                budget = max(budget, probe_budget)
+                extended = budget > base_budget
 
         ply = 0 if move_count is None else max(0, int(move_count))
         if ply < self.adaptive_search_late_after_ply:
@@ -1762,18 +1925,77 @@ class MultiGameBatchMCTS:
         boosted = min(boosted, max(base_budget, max_boosted))
         return max(1, boosted), boosted > base_budget
 
+    def _neutralize_adaptive_search_budgets(self, roots, budgets, extended_flags, base_budget, move_counts):
+        if not self.adaptive_search_budget_neutral_enabled:
+            return budgets
+        if not budgets:
+            return budgets
+
+        base_budget = max(1, int(base_budget))
+        target_total = base_budget * len(budgets)
+        excess = int(sum(int(value) for value in budgets) - target_total)
+        if excess <= 0:
+            return budgets
+
+        candidates = []
+        for idx, budget in enumerate(budgets):
+            budget = int(budget)
+            if budget <= 1:
+                continue
+            root = roots[idx]
+            move_count = move_counts[idx] if idx < len(move_counts) else None
+            profile = self._adaptive_search_root_profile(root, move_count=move_count)
+            if bool(profile.get('in_check', False)) or bool(profile.get('sharp_tactic', False)):
+                continue
+
+            if bool(profile.get('forced', False)):
+                min_budget = 1
+            elif bool(profile.get('low_branching', False)) or bool(profile.get('endgame', False)):
+                min_budget = int(round(float(base_budget) * min(
+                    self.adaptive_search_budget_neutral_min_fraction,
+                    _ADAPTIVE_LOW_BRANCHING_BUDGET_FRACTION,
+                )))
+            else:
+                min_budget = int(round(float(base_budget) * self.adaptive_search_budget_neutral_min_fraction))
+            min_budget = max(1, min(base_budget, min_budget))
+            reducible = max(0, budget - min_budget)
+            if reducible <= 0:
+                continue
+
+            stable_rank = self._stable_fraction_for_root(root)
+            extended_rank = 1 if bool(extended_flags[idx]) else 0
+            candidates.append((extended_rank, -stable_rank, idx, reducible))
+
+        candidates.sort()
+        adjusted = [int(value) for value in budgets]
+        for _extended_rank, _stable_rank, idx, reducible in candidates:
+            if excess <= 0:
+                break
+            reduction = min(int(reducible), int(excess))
+            adjusted[idx] = max(1, int(adjusted[idx]) - reduction)
+            excess -= reduction
+        return adjusted
+
     def _late_minimum_for_budget(self, simulation_budget):
         simulation_budget = max(1, int(simulation_budget))
         if _ADAPTIVE_LATE_MIN_MULTIPLIER <= 0.0:
             return 1
         return max(1, int(round(float(simulation_budget) * _ADAPTIVE_LATE_MIN_MULTIPLIER)))
 
-    def _adaptive_search_minimum_for_root(self, root, simulation_budget=None, move_count=None, extended_budget=False):
+    def _adaptive_search_minimum_for_root(
+        self,
+        root,
+        simulation_budget=None,
+        move_count=None,
+        extended_budget=False,
+        discovery_probe=False,
+    ):
         requirements = self._adaptive_search_requirements_for_root(
             root,
             simulation_budget=simulation_budget,
             move_count=move_count,
             extended_budget=extended_budget,
+            discovery_probe=discovery_probe,
         )
         return int(requirements['minimum'])
 
@@ -1862,6 +2084,7 @@ class MultiGameBatchMCTS:
         simulation_budget=None,
         move_count=None,
         extended_budget=False,
+        discovery_probe=False,
     ):
         base_minimum = max(1, int(self.adaptive_search_min_simulations))
         sim_budget = max(1, int(simulation_budget or base_minimum))
@@ -1910,6 +2133,11 @@ class MultiGameBatchMCTS:
             minimum = max(minimum, self._late_minimum_for_budget(sim_budget))
         if extended_budget:
             minimum = max(minimum, self._late_minimum_for_budget(sim_budget))
+        if discovery_probe:
+            minimum = max(
+                minimum,
+                int(round(float(sim_budget) * float(self.adaptive_search_discovery_probe_min_budget_fraction))),
+            )
 
         minimum = min(sim_budget, max(1, int(minimum)))
         min_visited = max(1, int(self.adaptive_search_min_visited_moves))
@@ -1959,6 +2187,7 @@ class MultiGameBatchMCTS:
         initial_root_visits=0,
         move_count=None,
         extended_budget=False,
+        discovery_probe=False,
     ):
         if not self.adaptive_search_enabled:
             return None
@@ -1967,6 +2196,7 @@ class MultiGameBatchMCTS:
             simulation_budget=simulation_budget,
             move_count=move_count,
             extended_budget=extended_budget,
+            discovery_probe=discovery_probe,
         )
         summary = self._summarize_root_search(root, simulation_budget, initial_root_visits=initial_root_visits)
         used = int(summary['simulations_used'])
@@ -2017,7 +2247,9 @@ class MultiGameBatchMCTS:
             if return_search_metadata:
                 return [], []
             return []
-        search_t0 = time.perf_counter()
+        perf_counter = time.perf_counter
+        profile_detail = self.profile_detail_enabled
+        search_t0 = perf_counter()
 
         game_count = len(game_states)
         boards = [None] * game_count
@@ -2033,7 +2265,7 @@ class MultiGameBatchMCTS:
         # Initialize / reuse roots per game.
         # Supports both dict states and packed list states:
         # [board, root, root_synced, board_history].
-        root_setup_t0 = time.perf_counter() if self.profile_enabled else None
+        root_setup_t0 = perf_counter() if profile_detail else None
         for idx, gs in enumerate(game_states):
             if isinstance(gs, dict):
                 is_mapping_state[idx] = True
@@ -2081,11 +2313,13 @@ class MultiGameBatchMCTS:
                 needs_root_noise_on_expand[idx] = False
             else:
                 needs_root_noise_on_expand[idx] = bool(add_root_noise and not root.expanded)
-        if self.profile_enabled:
-            self._profile_add('search_root_setup_time', time.perf_counter() - root_setup_t0)
+        if profile_detail:
+            self._profile_add('search_root_setup_time', perf_counter() - root_setup_t0)
 
         simulation_budgets = []
         simulation_budget_extended = []
+        discovery_probe_flags = []
+        discovery_probe_scores = []
         for idx, root in enumerate(roots):
             budget, extended = self._adaptive_search_budget_for_root(
                 root,
@@ -2094,6 +2328,24 @@ class MultiGameBatchMCTS:
             )
             simulation_budgets.append(int(budget))
             simulation_budget_extended.append(bool(extended))
+            probe_budget = int(round(float(num_simulations) * self.adaptive_search_discovery_probe_multiplier))
+            discovery_probe_flags.append(bool(int(budget) >= max(int(num_simulations) + 1, probe_budget)))
+            discovery_probe_scores.append(None)
+        simulation_budgets = self._neutralize_adaptive_search_budgets(
+            roots,
+            simulation_budgets,
+            simulation_budget_extended,
+            num_simulations,
+            move_counts,
+        )
+        simulation_budget_extended = [
+            bool(int(budget) > int(num_simulations))
+            for budget in simulation_budgets
+        ]
+        discovery_probe_flags = [
+            bool(flag and int(budget) > int(num_simulations))
+            for flag, budget in zip(discovery_probe_flags, simulation_budgets)
+        ]
 
         remaining = list(simulation_budgets)
         total_remaining = int(sum(remaining))
@@ -2117,7 +2369,7 @@ class MultiGameBatchMCTS:
             leaf_game_indices = []
             selected_this_batch = [0] * game_count
 
-            selection_t0 = time.perf_counter() if self.profile_enabled else None
+            selection_t0 = perf_counter() if profile_detail else None
             for _ in range(batch_size):
                 # Find next game with remaining sims
                 found = False
@@ -2156,8 +2408,8 @@ class MultiGameBatchMCTS:
                 remaining[gs_idx] -= 1
                 total_remaining -= 1
                 game_ptr = (game_ptr + 1) % game_count
-            if self.profile_enabled:
-                self._profile_add('search_selection_time', time.perf_counter() - selection_t0)
+            if profile_detail:
+                self._profile_add('search_selection_time', perf_counter() - selection_t0)
 
             if not leaf_nodes:
                 break
@@ -2170,21 +2422,43 @@ class MultiGameBatchMCTS:
                 needs_root_noise_on_expand,
             )
 
-            backprop_t0 = time.perf_counter() if self.profile_enabled else None
+            backprop_t0 = perf_counter() if profile_detail else None
             for search_path, value in zip(search_paths, values):
                 self._backpropagate(search_path, value)
                 for node in search_path:
                     node.remove_virtual_loss()
-            if self.profile_enabled:
-                self._profile_add('search_backprop_time', time.perf_counter() - backprop_t0)
+            if profile_detail:
+                self._profile_add('search_backprop_time', perf_counter() - backprop_t0)
 
             if self.adaptive_search_enabled:
-                adaptive_t0 = time.perf_counter() if self.profile_enabled else None
+                adaptive_t0 = perf_counter() if profile_detail else None
                 for idx, root in enumerate(roots):
                     if remaining[idx] <= 0:
                         continue
                     if selected_this_batch[idx] <= 0:
                         continue
+                    if (
+                        self.adaptive_search_discovery_probe_fraction > 0.0
+                        and not discovery_probe_flags[idx]
+                        and root is not None
+                        and root.expanded
+                    ):
+                        should_probe, probe_score = self._should_apply_discovery_probe(
+                            root,
+                            move_count=move_counts[idx],
+                            allow_unexpanded=False,
+                        )
+                        discovery_probe_scores[idx] = float(probe_score)
+                        if should_probe:
+                            probe_budget = int(round(float(num_simulations) * self.adaptive_search_discovery_probe_multiplier))
+                            probe_budget = max(int(simulation_budgets[idx]), int(probe_budget))
+                            added = max(0, int(probe_budget) - int(simulation_budgets[idx]))
+                            if added > 0:
+                                simulation_budgets[idx] = int(probe_budget)
+                                simulation_budget_extended[idx] = True
+                                discovery_probe_flags[idx] = True
+                                remaining[idx] += int(added)
+                                total_remaining += int(added)
                     used = max(
                         0,
                         int(getattr(root, 'visit_count', 0) or 0) - int(initial_root_visits[idx]),
@@ -2194,6 +2468,7 @@ class MultiGameBatchMCTS:
                         simulation_budget=simulation_budgets[idx],
                         move_count=move_counts[idx],
                         extended_budget=simulation_budget_extended[idx],
+                        discovery_probe=discovery_probe_flags[idx],
                     ):
                         continue
                     check_interval = max(1, int(self.adaptive_search_check_interval))
@@ -2205,14 +2480,15 @@ class MultiGameBatchMCTS:
                         initial_root_visits=initial_root_visits[idx],
                         move_count=move_counts[idx],
                         extended_budget=simulation_budget_extended[idx],
+                        discovery_probe=discovery_probe_flags[idx],
                     )
                     if stop_reason is None:
                         continue
                     adaptive_stop_reasons[idx] = stop_reason
                     total_remaining -= int(remaining[idx])
                     remaining[idx] = 0
-                if self.profile_enabled:
-                    self._profile_add('search_adaptive_stop_time', time.perf_counter() - adaptive_t0)
+                if profile_detail:
+                    self._profile_add('search_adaptive_stop_time', perf_counter() - adaptive_t0)
 
         # Sync roots back to caller-provided state containers.
         for idx, gs in enumerate(game_states):
@@ -2231,7 +2507,7 @@ class MultiGameBatchMCTS:
             for root in roots
         ]
         search_metadata = []
-        metadata_t0 = time.perf_counter() if self.profile_enabled else None
+        metadata_t0 = perf_counter() if profile_detail else None
         for idx, root in enumerate(roots):
             metadata = self._summarize_root_search(
                 root,
@@ -2239,15 +2515,23 @@ class MultiGameBatchMCTS:
                 initial_root_visits=initial_root_visits[idx],
             )
             metadata['simulation_budget_extra'] = bool(simulation_budget_extended[idx])
+            metadata['simulation_budget_discovery_probe'] = bool(discovery_probe_flags[idx])
+            if discovery_probe_scores[idx] is None:
+                discovery_probe_scores[idx] = self._discovery_probe_score_for_root(
+                    root,
+                    move_count=move_counts[idx],
+                )
+            metadata['discovery_probe_score'] = float(discovery_probe_scores[idx] or 0.0)
+            metadata['discovery_probe_applied'] = 1.0 if bool(discovery_probe_flags[idx]) else 0.0
             metadata['move_count'] = int(move_counts[idx])
             stop_reason = adaptive_stop_reasons[idx]
             if stop_reason is None:
                 stop_reason = 'budget' if not metadata.get('stopped_early', False) else 'unknown'
             metadata['adaptive_stop_reason'] = stop_reason
             search_metadata.append(metadata)
-        if self.profile_enabled:
-            self._profile_add('search_metadata_time', time.perf_counter() - metadata_t0)
-        self._profile_add('search_many_time', time.perf_counter() - search_t0)
+        if profile_detail:
+            self._profile_add('search_metadata_time', perf_counter() - metadata_t0)
+        self._profile_add('search_many_time', perf_counter() - search_t0)
         self._profile_inc('search_many_calls', 1)
         if return_search_metadata:
             return result, search_metadata
@@ -2264,10 +2548,13 @@ class MultiGameBatchMCTS:
         """
         Batch expansion + evaluation for leaf nodes across games.
         """
-        eval_t0 = time.perf_counter() if self.profile_enabled else None
+        perf_counter = time.perf_counter
+        profile_detail = self.profile_detail_enabled
+        profile_timing = self.profile_enabled
+        eval_t0 = perf_counter() if profile_timing else None
         # The same leaf can appear multiple times in one batch.
         # Evaluate each unique node once and fan-out value to duplicates.
-        dedup_t0 = time.perf_counter() if self.profile_enabled else None
+        dedup_t0 = perf_counter() if profile_timing else None
         node_occurrences = {}
         unique_entries = []
         for idx, node in enumerate(nodes):
@@ -2295,8 +2582,8 @@ class MultiGameBatchMCTS:
             else:
                 non_terminal_nodes.append(node)
                 non_terminal_game_indices.append(gi)
-        if self.profile_enabled:
-            self._profile_add('batch_expand_dedup_terminal_time', time.perf_counter() - dedup_t0)
+        if profile_timing:
+            self._profile_add('batch_expand_dedup_terminal_time', perf_counter() - dedup_t0)
 
         values_by_node_id = {}
 
@@ -2319,7 +2606,7 @@ class MultiGameBatchMCTS:
             legal_indices_per_node = []
             legal_counts = []
             max_legal_count = 0
-            legal_moves_t0 = time.perf_counter() if self.profile_enabled else None
+            legal_moves_t0 = perf_counter() if profile_timing else None
             for node in non_terminal_nodes:
                 legal_moves, legal_indices = node.get_legal_moves_and_indices()
                 legal_moves_per_node.append(legal_moves)
@@ -2328,25 +2615,28 @@ class MultiGameBatchMCTS:
                 legal_counts.append(legal_count)
                 if legal_count > max_legal_count:
                     max_legal_count = legal_count
-            if self.profile_enabled:
-                self._profile_add('batch_expand_legal_moves_time', time.perf_counter() - legal_moves_t0)
+            if profile_timing:
+                self._profile_add('batch_expand_legal_moves_time', perf_counter() - legal_moves_t0)
 
             batch_n = len(non_terminal_nodes)
             boards_np = self._get_board_input_scratch(batch_n)
+            tensor_pack_t0 = perf_counter() if profile_timing else None
             for row_idx, (node, gi) in enumerate(zip(non_terminal_nodes, non_terminal_game_indices)):
                 current_tensor = self._current_tensor_for_node(node)
-                history_t0 = time.perf_counter() if self.profile_enabled else None
+                history_t0 = perf_counter() if profile_detail else None
                 history_prefix = _get_history_prefix_for_node(gi, node)
-                if self.profile_enabled:
-                    self._profile_add('batch_expand_history_time', time.perf_counter() - history_t0)
-                input_pack_t0 = time.perf_counter() if self.profile_enabled else None
+                if profile_detail:
+                    self._profile_add('batch_expand_history_time', perf_counter() - history_t0)
+                input_pack_t0 = perf_counter() if profile_detail else None
                 if history_prefix is None:
                     boards_np[row_idx, :, :, :] = current_tensor
                 else:
                     boards_np[row_idx, :self._history_planes, :, :] = history_prefix
                     boards_np[row_idx, self._history_planes:, :, :] = current_tensor
-                if self.profile_enabled:
-                    self._profile_add('batch_expand_input_pack_time', time.perf_counter() - input_pack_t0)
+                if profile_detail:
+                    self._profile_add('batch_expand_input_pack_time', perf_counter() - input_pack_t0)
+            if profile_timing:
+                self._profile_add('batch_expand_tensor_pack_time', perf_counter() - tensor_pack_t0)
 
             use_cuda_stage_timing = (
                 self.cuda_stage_profile_enabled
@@ -2377,7 +2667,7 @@ class MultiGameBatchMCTS:
 
             legal_index_matrix = None
             if max_legal_count > 0:
-                legal_pack_t0 = time.perf_counter() if self.profile_enabled else None
+                legal_pack_t0 = perf_counter() if profile_timing else None
                 legal_index_matrix = self._get_legal_index_scratch(
                     len(non_terminal_nodes),
                     max_legal_count,
@@ -2388,10 +2678,10 @@ class MultiGameBatchMCTS:
                     legal_count = legal_counts[row_idx]
                     if legal_count:
                         legal_index_matrix[row_idx, :legal_count] = legal_indices
-                if self.profile_enabled:
-                    self._profile_add('batch_expand_legal_index_pack_time', time.perf_counter() - legal_pack_t0)
+                if profile_timing:
+                    self._profile_add('batch_expand_legal_index_pack_time', perf_counter() - legal_pack_t0)
 
-            inference_t0 = time.perf_counter()
+            inference_t0 = perf_counter()
             h2d_legal_start = None
             h2d_legal_end = None
             wdl_start = None
@@ -2479,7 +2769,7 @@ class MultiGameBatchMCTS:
             self._profile_inc('nn_inference_calls', 1)
             self._profile_inc('nn_inference_batch_items', batch_n)
             self._profile_inc('nn_legal_move_items', sum(legal_counts))
-            self._profile_add('nn_inference_time', time.perf_counter() - inference_t0)
+            self._profile_add('nn_inference_time', perf_counter() - inference_t0)
             server_batch_size = int(getattr(self.model, 'last_server_batch_size', 0) or 0)
             if server_batch_size > 0:
                 self._profile_inc('central_inference_requests', 1)
@@ -2516,7 +2806,7 @@ class MultiGameBatchMCTS:
                     'central_inference_server_d2h_time',
                     float(getattr(self.model, 'last_server_d2h_s', 0.0) or 0.0),
                 )
-            if self.profile_enabled:
+            if profile_detail:
                 if use_cuda_stage_timing:
                     torch.cuda.synchronize(self.device)
 
@@ -2537,7 +2827,7 @@ class MultiGameBatchMCTS:
                     self._profile_add('nn_gpu_postprocess_time', gpu_postprocess_time)
                     self._profile_add('nn_d2h_time', d2h_time)
 
-            cpu_policy_t0 = time.perf_counter() if self.profile_enabled else None
+            cpu_policy_t0 = perf_counter() if profile_timing else None
             for idx, node in enumerate(non_terminal_nodes):
                 value = float(values_batch[idx])
 
@@ -2571,20 +2861,20 @@ class MultiGameBatchMCTS:
                         needs_root_noise_on_expand[gi] = False
 
                 values_by_node_id[id(node)] = value
-            if self.profile_enabled:
-                self._profile_add('batch_expand_cpu_policy_time', time.perf_counter() - cpu_policy_t0)
+            if profile_timing:
+                self._profile_add('batch_expand_cpu_policy_time', perf_counter() - cpu_policy_t0)
 
-        fanout_t0 = time.perf_counter() if self.profile_enabled else None
+        fanout_t0 = perf_counter() if profile_timing else None
         all_values = [0.0] * len(nodes)
         for node_id, indices in node_occurrences.items():
             value = values_by_node_id.get(node_id, terminal_values.get(node_id, 0.0))
             for idx in indices:
                 all_values[idx] = value
-        if self.profile_enabled:
-            self._profile_add('batch_expand_value_fanout_time', time.perf_counter() - fanout_t0)
+        if profile_timing:
+            self._profile_add('batch_expand_value_fanout_time', perf_counter() - fanout_t0)
 
-        if self.profile_enabled:
-            self._profile_add('batch_expand_eval_time', time.perf_counter() - eval_t0)
+        if profile_timing:
+            self._profile_add('batch_expand_eval_time', perf_counter() - eval_t0)
             self._profile_inc('batch_expand_eval_calls', 1)
         return all_values
 
@@ -2612,6 +2902,14 @@ class BatchSelfPlayMCTSBatch:
         self.opponent_model = opponent_model
         self.opponent_source_label = str(opponent_source_label or "current")
         rl_cfg = config.get('reinforcement_learning', {})
+        self.mcts_phase_opening_max_fullmove = max(
+            1,
+            int(rl_cfg.get('value_phase_opening_max_fullmove', 12)),
+        )
+        self.mcts_phase_endgame_min_fullmove = max(
+            self.mcts_phase_opening_max_fullmove + 1,
+            int(rl_cfg.get('value_phase_endgame_min_fullmove', 40)),
+        )
 
         self.mcts = MultiGameBatchMCTS(model, config, device)
         self.opponent_models_by_label = {}
@@ -2740,6 +3038,21 @@ class BatchSelfPlayMCTSBatch:
             0.0,
             min(1.0, float(rl_cfg.get('policy_target_quality_top1_threshold', 0.48))),
         )
+        self.policy_target_uptake_gate_enabled = bool(
+            rl_cfg.get('policy_target_uptake_gate_enabled', False)
+        )
+        self.policy_target_uptake_unchanged_low_kl_max = max(
+            0.0,
+            float(rl_cfg.get('policy_target_uptake_unchanged_low_kl_max', 0.16)),
+        )
+        self.policy_target_uptake_unchanged_low_kl_weight = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('policy_target_uptake_unchanged_low_kl_weight', 0.22))),
+        )
+        self.policy_target_uptake_unchanged_weight = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('policy_target_uptake_unchanged_weight', 0.50))),
+        )
         self.policy_target_search_discovery_weighting_enabled = bool(
             rl_cfg.get('policy_target_search_discovery_weighting_enabled', False)
         )
@@ -2788,23 +3101,22 @@ class BatchSelfPlayMCTSBatch:
             1.0,
             float(rl_cfg.get('policy_target_search_discovery_max_weight', 1.55)),
         )
-        self.mcts_good_target_min_top_visit_prob = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('mcts_good_target_min_top_visit_prob', 0.55))),
-        )
-        self.mcts_good_target_min_visit_gap = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('mcts_good_target_min_visit_gap', 0.12))),
-        )
+        self.mcts_good_target_min_top_visit_prob = 0.55
+        self.mcts_good_target_min_visit_gap = 0.12
         self.store_frozen_best_positions = bool(
             rl_cfg.get('self_play_store_frozen_best_positions', True)
         )
-        self.store_frozen_recent_positions = bool(
-            rl_cfg.get('self_play_store_frozen_recent_positions', False)
+        self.store_frozen_anchor_positions = bool(
+            rl_cfg.get('self_play_store_frozen_anchor_positions', True)
         )
+        self.store_frozen_recent_positions = False
         self.frozen_opponent_policy_weight = max(
             0.0,
             min(1.0, float(rl_cfg.get('self_play_frozen_opponent_policy_weight', 0.65))),
+        )
+        self.frozen_anchor_policy_weight = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('self_play_frozen_anchor_policy_weight', 0.75))),
         )
         self.replay_importance_gating_enabled = bool(
             rl_cfg.get('replay_importance_gating_enabled', False)
@@ -2901,7 +3213,9 @@ class BatchSelfPlayMCTSBatch:
             )
         search_many_time = float(aggregated.get('learner_mcts_search_many_time', 0.0))
         batch_expand_time = float(aggregated.get('learner_mcts_batch_expand_eval_time', 0.0))
+        batch_expand_calls = int(aggregated.get('learner_mcts_batch_expand_eval_calls', 0) or 0)
         board_tensor_time = float(aggregated.get('learner_mcts_board_to_tensor_time', 0.0))
+        board_tensor_calls = int(aggregated.get('learner_mcts_board_to_tensor_calls', 0) or 0)
         nn_time = float(aggregated.get('learner_mcts_nn_inference_time', 0.0))
         nn_calls = int(aggregated.get('learner_mcts_nn_inference_calls', 0) or 0)
         nn_batch_items = int(aggregated.get('learner_mcts_nn_inference_batch_items', 0) or 0)
@@ -2924,7 +3238,9 @@ class BatchSelfPlayMCTSBatch:
             prefix = f"opponent_mcts_{label}_"
             search_many_time += float(aggregated.get(prefix + 'search_many_time', 0.0))
             batch_expand_time += float(aggregated.get(prefix + 'batch_expand_eval_time', 0.0))
+            batch_expand_calls += int(aggregated.get(prefix + 'batch_expand_eval_calls', 0) or 0)
             board_tensor_time += float(aggregated.get(prefix + 'board_to_tensor_time', 0.0))
+            board_tensor_calls += int(aggregated.get(prefix + 'board_to_tensor_calls', 0) or 0)
             nn_time += float(aggregated.get(prefix + 'nn_inference_time', 0.0))
             nn_calls += int(aggregated.get(prefix + 'nn_inference_calls', 0) or 0)
             nn_batch_items += int(aggregated.get(prefix + 'nn_inference_batch_items', 0) or 0)
@@ -2945,7 +3261,9 @@ class BatchSelfPlayMCTSBatch:
             central_server_d2h_time += float(aggregated.get(prefix + 'central_inference_server_d2h_time', 0.0) or 0.0)
         aggregated['mcts_search_many_time'] = float(search_many_time)
         aggregated['mcts_batch_expand_eval_time'] = float(batch_expand_time)
+        aggregated['mcts_batch_expand_eval_calls'] = int(batch_expand_calls)
         aggregated['mcts_board_to_tensor_time'] = float(board_tensor_time)
+        aggregated['mcts_board_to_tensor_calls'] = int(board_tensor_calls)
         aggregated['mcts_nn_inference_time'] = float(nn_time)
         aggregated['mcts_nn_inference_calls'] = int(nn_calls)
         aggregated['mcts_nn_inference_batch_items'] = int(nn_batch_items)
@@ -2972,6 +3290,7 @@ class BatchSelfPlayMCTSBatch:
             'search_metadata_time',
             'batch_expand_dedup_terminal_time',
             'batch_expand_legal_moves_time',
+            'batch_expand_tensor_pack_time',
             'batch_expand_history_time',
             'batch_expand_input_pack_time',
             'batch_expand_legal_index_pack_time',
@@ -3173,12 +3492,42 @@ class BatchSelfPlayMCTSBatch:
         )
         return float(max(1.0, min(float(self.policy_target_search_discovery_max_weight), weight)))
 
+    def _policy_target_uptake_weight(self, search_metadata):
+        if not self.policy_target_uptake_gate_enabled or not isinstance(search_metadata, dict):
+            return 1.0
+        try:
+            changed_top = float(search_metadata.get('prior_mcts_agree', 1.0)) < 0.5
+        except (TypeError, ValueError):
+            changed_top = False
+        if changed_top:
+            return 1.0
+        try:
+            policy_kl = float(search_metadata.get('mcts_policy_kl', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            policy_kl = 0.0
+        if policy_kl <= float(self.policy_target_uptake_unchanged_low_kl_max):
+            return float(self.policy_target_uptake_unchanged_low_kl_weight)
+        return float(self.policy_target_uptake_unchanged_weight)
+
+    def _mcts_phase_for_board(self, board):
+        try:
+            fullmove_number = int(getattr(board, 'fullmove_number', 1) or 1)
+        except (TypeError, ValueError):
+            fullmove_number = 1
+        if fullmove_number <= int(self.mcts_phase_opening_max_fullmove):
+            return 'opening'
+        if fullmove_number >= int(self.mcts_phase_endgame_min_fullmove):
+            return 'endgame'
+        return 'middlegame'
+
     def _should_store_policy_position(self, learner_turn, game_opponent_mcts, opponent_label):
         if learner_turn or game_opponent_mcts is None:
             return True
         label = str(opponent_label or "")
         if label == "best":
             return bool(self.store_frozen_best_positions)
+        if label == "anchor":
+            return bool(self.store_frozen_anchor_positions)
         if label.startswith("recent_"):
             return bool(self.store_frozen_recent_positions)
         return False
@@ -3458,6 +3807,7 @@ class BatchSelfPlayMCTSBatch:
         history_count, policy_indices, policy_values, turn = history_entry[:4]
         importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
         policy_weight = float(history_entry[6]) if len(history_entry) > 6 else 1.0
+        source_code = int(history_entry[7]) if len(history_entry) > 7 else _REPLAY_SOURCE_UNKNOWN
 
         if outcome == 0.0:
             value = draw_value_target
@@ -3476,6 +3826,7 @@ class BatchSelfPlayMCTSBatch:
             'importance_score': importance_score,
             'policy_weight': policy_weight,
             'value_weight': value_weight,
+            'source_code': source_code,
         }
 
     def _value_target_weight(self, history_idx, history_len, outcome):
@@ -3575,6 +3926,7 @@ class BatchSelfPlayMCTSBatch:
                 float(item.get('importance_score', 0.0)),
                 float(item.get('policy_weight', 1.0)),
                 float(item.get('value_weight', 1.0)),
+                int(item.get('source_code', _REPLAY_SOURCE_UNKNOWN)),
             ))
         if self.profile_enabled:
             self._profile_add('policy_target_postgame_time', time.perf_counter() - postgame_t0)
@@ -3786,7 +4138,18 @@ class BatchSelfPlayMCTSBatch:
             'mcts_changed_q_delta_hist': [0] * _Q_DELTA_HIST_BINS,
             'mcts_search_discovery_count': 0.0,
             'mcts_search_discovery_weight_sum': 0.0,
+            'mcts_discovery_probe_used_count': 0.0,
+            'mcts_discovery_probe_changed_count': 0.0,
+            'mcts_discovery_probe_score_sum': 0.0,
+            'mcts_policy_uptake_samples': 0.0,
+            'mcts_policy_uptake_weight_sum': 0.0,
+            'mcts_policy_uptake_low_count': 0.0,
         }
+        for phase in ('opening', 'middlegame', 'endgame'):
+            total_mcts_quality_stats[f'mcts_phase_{phase}_samples'] = 0.0
+            total_mcts_quality_stats[f'mcts_phase_{phase}_changed_count'] = 0.0
+            total_mcts_quality_stats[f'mcts_phase_{phase}_probe_used_count'] = 0.0
+            total_mcts_quality_stats[f'mcts_phase_{phase}_probe_changed_count'] = 0.0
         opponent_source_counts = {}
         opponent_source_results = {}
 
@@ -3874,6 +4237,23 @@ class BatchSelfPlayMCTSBatch:
         mcts_changed_q_delta_samples = int(total_mcts_quality_stats['mcts_changed_q_delta_samples'])
         mcts_changed_q_delta_values = list(total_mcts_quality_stats.get('mcts_changed_q_delta_values', []) or [])
         mcts_changed_q_delta_hist = list(total_mcts_quality_stats.get('mcts_changed_q_delta_hist', []) or [])
+        mcts_phase_stats = {}
+        for phase in ('opening', 'middlegame', 'endgame'):
+            samples = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_samples', 0.0) or 0.0)
+            changed = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_changed_count', 0.0) or 0.0)
+            probe_used = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_probe_used_count', 0.0) or 0.0)
+            probe_changed = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_probe_changed_count', 0.0) or 0.0)
+            mcts_phase_stats[f'mcts_phase_{phase}_samples'] = int(samples)
+            mcts_phase_stats[f'mcts_phase_{phase}_changed_count'] = int(changed)
+            mcts_phase_stats[f'mcts_phase_{phase}_probe_used_count'] = int(probe_used)
+            mcts_phase_stats[f'mcts_phase_{phase}_probe_changed_count'] = int(probe_changed)
+            mcts_phase_stats[f'mcts_changed_{phase}_rate'] = changed / samples if samples > 0.0 else 0.0
+            mcts_phase_stats[f'mcts_discovery_probe_used_{phase}_rate'] = (
+                probe_used / samples if samples > 0.0 else 0.0
+            )
+            mcts_phase_stats[f'mcts_discovery_probe_changed_{phase}_rate'] = (
+                probe_changed / probe_used if probe_used > 0.0 else 0.0
+            )
         self.last_selfplay_stats = {
             'truncated_games': total_truncated_games,
             'completed_games': max(0, total_games - total_truncated_games),
@@ -3949,6 +4329,41 @@ class BatchSelfPlayMCTSBatch:
                 / float(total_mcts_quality_stats['mcts_search_discovery_count'])
                 if int(total_mcts_quality_stats['mcts_search_discovery_count']) > 0
                 else 1.0
+            ),
+            'mcts_discovery_probe_used_count': int(total_mcts_quality_stats['mcts_discovery_probe_used_count']),
+            'mcts_discovery_probe_used_rate': (
+                float(total_mcts_quality_stats['mcts_discovery_probe_used_count']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_discovery_probe_changed_count': int(total_mcts_quality_stats['mcts_discovery_probe_changed_count']),
+            'mcts_discovery_probe_changed_rate': (
+                float(total_mcts_quality_stats['mcts_discovery_probe_changed_count'])
+                / max(1.0, float(total_mcts_quality_stats['mcts_discovery_probe_used_count']))
+                if int(total_mcts_quality_stats['mcts_discovery_probe_used_count']) > 0
+                else 0.0
+            ),
+            'mcts_discovery_probe_score_sum': float(total_mcts_quality_stats['mcts_discovery_probe_score_sum']),
+            'mcts_discovery_probe_score_mean': (
+                float(total_mcts_quality_stats['mcts_discovery_probe_score_sum']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            **mcts_phase_stats,
+            'mcts_policy_uptake_samples': int(total_mcts_quality_stats['mcts_policy_uptake_samples']),
+            'mcts_policy_uptake_weight_sum': float(total_mcts_quality_stats['mcts_policy_uptake_weight_sum']),
+            'mcts_policy_uptake_low_count': int(total_mcts_quality_stats['mcts_policy_uptake_low_count']),
+            'mcts_policy_uptake_weight_mean': (
+                float(total_mcts_quality_stats['mcts_policy_uptake_weight_sum'])
+                / float(total_mcts_quality_stats['mcts_policy_uptake_samples'])
+                if int(total_mcts_quality_stats['mcts_policy_uptake_samples']) > 0
+                else 1.0
+            ),
+            'mcts_policy_uptake_low_rate': (
+                float(total_mcts_quality_stats['mcts_policy_uptake_low_count'])
+                / float(total_mcts_quality_stats['mcts_policy_uptake_samples'])
+                if int(total_mcts_quality_stats['mcts_policy_uptake_samples']) > 0
+                else 0.0
             ),
             'mcts_prior_top_visit_prob_sum': float(total_mcts_quality_stats['mcts_prior_top_visit_prob_sum']),
             'mcts_prior_top_visit_prob_mean': (
@@ -4233,9 +4648,20 @@ class BatchSelfPlayMCTSBatch:
             'changed_q_delta_values': [],
             'search_discovery_count': 0,
             'search_discovery_weight_sum': 0.0,
+            'policy_uptake_samples': 0,
+            'policy_uptake_weight_sum': 0.0,
+            'policy_uptake_low_count': 0,
+            'discovery_probe_applied_count': 0,
+            'discovery_probe_changed_count': 0,
+            'discovery_probe_score_sum': 0.0,
         }
+        for phase in ('opening', 'middlegame', 'endgame'):
+            target_quality[f'{phase}_samples'] = 0
+            target_quality[f'{phase}_changed_count'] = 0
+            target_quality[f'{phase}_probe_used_count'] = 0
+            target_quality[f'{phase}_probe_changed_count'] = 0
 
-        def _accumulate_target_quality(search_metadata):
+        def _accumulate_target_quality(search_metadata, board):
             if not isinstance(search_metadata, dict):
                 return
             agree = search_metadata.get('prior_mcts_agree', None)
@@ -4243,8 +4669,18 @@ class BatchSelfPlayMCTSBatch:
                 return
             target_quality['samples'] += 1
             agree_value = float(agree)
+            changed_top = agree_value < 0.5
+            probe_applied = float(search_metadata.get('discovery_probe_applied', 0.0) or 0.0) >= 0.5
+            phase = self._mcts_phase_for_board(board)
+            target_quality[f'{phase}_samples'] += 1
+            if changed_top:
+                target_quality[f'{phase}_changed_count'] += 1
+            if probe_applied:
+                target_quality[f'{phase}_probe_used_count'] += 1
+                if changed_top:
+                    target_quality[f'{phase}_probe_changed_count'] += 1
             target_quality['agreement_sum'] += agree_value
-            if agree_value < 0.5:
+            if changed_top:
                 target_quality['changed'] += 1
             for meta_key, sum_key in [
                 ('prior_top_visit_prob', 'prior_top_visit_prob_sum'),
@@ -4258,6 +4694,12 @@ class BatchSelfPlayMCTSBatch:
                 value = search_metadata.get(meta_key, None)
                 if value is not None:
                     target_quality[sum_key] += float(value)
+            target_quality['discovery_probe_applied_count'] += int(probe_applied)
+            if probe_applied and changed_top:
+                target_quality['discovery_probe_changed_count'] += 1
+            target_quality['discovery_probe_score_sum'] += float(
+                search_metadata.get('discovery_probe_score', 0.0) or 0.0
+            )
             try:
                 top_visit_prob = float(search_metadata.get('top_visit_prob', 0.0) or 0.0)
                 visit_gap = float(search_metadata.get('visit_gap', 0.0) or 0.0)
@@ -4284,7 +4726,7 @@ class BatchSelfPlayMCTSBatch:
                 q_delta_value = float(q_delta)
                 target_quality['q_delta_sum'] += q_delta_value
                 target_quality['q_delta_values'].append(q_delta_value)
-                if agree_value < 0.5:
+                if changed_top:
                     target_quality['changed_q_comparable'] += 1
                     target_quality['changed_q_delta_sum'] += q_delta_value
                     target_quality['changed_q_delta_values'].append(q_delta_value)
@@ -4438,17 +4880,24 @@ class BatchSelfPlayMCTSBatch:
                     gs.get('opponent_source_label', self.opponent_source_label),
                 )
                 if store_policy_position:
-                    _accumulate_target_quality(search_metadata)
+                    _accumulate_target_quality(search_metadata, board)
                     policy_t0 = time.perf_counter() if self.profile_enabled else None
-                    visit_counts = self._prune_policy_target_visits(visit_counts)
-                    top1, entropy = self._policy_target_quality_from_visits(visit_counts)
+                    raw_visit_counts = visit_counts
+                    top1, entropy = self._policy_target_quality_from_visits(raw_visit_counts)
                     target_quality_weight = self._policy_target_quality_weight(top1, entropy)
+                    visit_counts = self._prune_policy_target_visits(visit_counts)
                     policy_indices, policy_values = _build_sparse_policy_target_from_visits(visit_counts, board)
                     history_count = len(gs['board_history'])
                     importance_score = self._compute_position_importance(board, move, visit_counts, root)
                     root_value = 0.0
                     policy_weight = float(search_metadata.get('policy_weight', 1.0)) if isinstance(search_metadata, dict) else 1.0
                     policy_weight *= float(target_quality_weight)
+                    policy_uptake_weight = float(self._policy_target_uptake_weight(search_metadata))
+                    policy_weight *= policy_uptake_weight
+                    target_quality['policy_uptake_samples'] += 1
+                    target_quality['policy_uptake_weight_sum'] += policy_uptake_weight
+                    if policy_uptake_weight < 0.999:
+                        target_quality['policy_uptake_low_count'] += 1
                     discovery_weight = self._policy_target_search_discovery_weight(search_metadata)
                     policy_weight *= float(discovery_weight)
                     if discovery_weight > 1.0:
@@ -4456,7 +4905,15 @@ class BatchSelfPlayMCTSBatch:
                         target_quality['search_discovery_count'] += 1
                         target_quality['search_discovery_weight_sum'] += float(discovery_weight)
                     if not learner_turn and game_opponent_mcts is not None:
-                        policy_weight *= float(self.frozen_opponent_policy_weight)
+                        if str(gs.get('opponent_source_label', '')) == "anchor":
+                            policy_weight *= float(self.frozen_anchor_policy_weight)
+                        else:
+                            policy_weight *= float(self.frozen_opponent_policy_weight)
+                    replay_source_code = _replay_source_code(
+                        learner_turn,
+                        game_opponent_mcts,
+                        gs.get('opponent_source_label', self.opponent_source_label),
+                    )
                     if root is not None:
                         root_visits = int(getattr(root, 'visit_count', 0) or 0)
                         if root_visits > 0:
@@ -4469,6 +4926,7 @@ class BatchSelfPlayMCTSBatch:
                         importance_score,
                         root_value,
                         policy_weight,
+                        replay_source_code,
                     ))
                     if self.profile_enabled:
                         self._profile_add('policy_target_build_time', time.perf_counter() - policy_t0)
@@ -4638,6 +5096,23 @@ class BatchSelfPlayMCTSBatch:
         q_delta_hist = _q_delta_histogram(q_delta_values)
         changed_q_delta_values = list(target_quality.get('changed_q_delta_values', []) or [])
         changed_q_delta_hist = _q_delta_histogram(changed_q_delta_values)
+        target_phase_stats = {}
+        for phase in ('opening', 'middlegame', 'endgame'):
+            samples = float(target_quality.get(f'{phase}_samples', 0) or 0)
+            changed = float(target_quality.get(f'{phase}_changed_count', 0) or 0)
+            probe_used = float(target_quality.get(f'{phase}_probe_used_count', 0) or 0)
+            probe_changed = float(target_quality.get(f'{phase}_probe_changed_count', 0) or 0)
+            target_phase_stats[f'mcts_phase_{phase}_samples'] = int(samples)
+            target_phase_stats[f'mcts_phase_{phase}_changed_count'] = int(changed)
+            target_phase_stats[f'mcts_phase_{phase}_probe_used_count'] = int(probe_used)
+            target_phase_stats[f'mcts_phase_{phase}_probe_changed_count'] = int(probe_changed)
+            target_phase_stats[f'mcts_changed_{phase}_rate'] = changed / samples if samples > 0.0 else 0.0
+            target_phase_stats[f'mcts_discovery_probe_used_{phase}_rate'] = (
+                probe_used / samples if samples > 0.0 else 0.0
+            )
+            target_phase_stats[f'mcts_discovery_probe_changed_{phase}_rate'] = (
+                probe_changed / probe_used if probe_used > 0.0 else 0.0
+            )
         return positions, game_lengths, {
             'total_games': int(len(completed_game_states)),
             'truncated_games': int(truncated_games),
@@ -4684,6 +5159,39 @@ class BatchSelfPlayMCTSBatch:
                 float(target_quality['search_discovery_weight_sum']) / float(target_quality['search_discovery_count'])
                 if int(target_quality['search_discovery_count']) > 0
                 else 1.0
+            ),
+            'mcts_discovery_probe_used_count': int(target_quality['discovery_probe_applied_count']),
+            'mcts_discovery_probe_used_rate': (
+                float(target_quality['discovery_probe_applied_count']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_discovery_probe_changed_count': int(target_quality['discovery_probe_changed_count']),
+            'mcts_discovery_probe_changed_rate': (
+                float(target_quality['discovery_probe_changed_count'])
+                / max(1.0, float(target_quality['discovery_probe_applied_count']))
+                if int(target_quality['discovery_probe_applied_count']) > 0
+                else 0.0
+            ),
+            'mcts_discovery_probe_score_sum': float(target_quality['discovery_probe_score_sum']),
+            'mcts_discovery_probe_score_mean': (
+                float(target_quality['discovery_probe_score_sum']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            **target_phase_stats,
+            'mcts_policy_uptake_samples': int(target_quality['policy_uptake_samples']),
+            'mcts_policy_uptake_weight_sum': float(target_quality['policy_uptake_weight_sum']),
+            'mcts_policy_uptake_low_count': int(target_quality['policy_uptake_low_count']),
+            'mcts_policy_uptake_weight_mean': (
+                float(target_quality['policy_uptake_weight_sum']) / float(target_quality['policy_uptake_samples'])
+                if int(target_quality['policy_uptake_samples']) > 0
+                else 1.0
+            ),
+            'mcts_policy_uptake_low_rate': (
+                float(target_quality['policy_uptake_low_count']) / float(target_quality['policy_uptake_samples'])
+                if int(target_quality['policy_uptake_samples']) > 0
+                else 0.0
             ),
             'mcts_prior_top_visit_prob_sum': float(target_quality['prior_top_visit_prob_sum']),
             'mcts_prior_top_visit_prob_mean': (
@@ -5916,6 +6424,14 @@ def persistent_selfplay_worker(
 
             result_file_path = task['result_file_path']
             try:
+                runtime_overrides = dict(task.get('rl_runtime_overrides') or {})
+                if runtime_overrides:
+                    config.setdefault('reinforcement_learning', {}).update({
+                        key: value
+                        for key, value in runtime_overrides.items()
+                        if value is not None
+                    })
+                    rl_cfg = config.get('reinforcement_learning', {})
                 if central_inference_enabled and central_debug_enabled:
                     opponent_payload_preview = task.get('opponent_payload') or {}
                     preview_labels = sorted({
@@ -5990,14 +6506,6 @@ def persistent_selfplay_worker(
 
                 if hasattr(engine, 'temperature') and task.get('mcts_temperature') is not None:
                     engine.temperature = float(task['mcts_temperature'])
-                if task.get('mcts_q_value_scale') is not None:
-                    q_value_scale = max(0.0, float(task['mcts_q_value_scale']))
-                    opponent_mcts = list(
-                        (getattr(engine, 'opponent_mcts_by_label', {}) or {}).values()
-                    )
-                    for mcts_obj in [getattr(engine, 'mcts', None)] + opponent_mcts:
-                        if mcts_obj is not None and hasattr(mcts_obj, 'q_value_scale'):
-                            mcts_obj.q_value_scale = q_value_scale
                 if task.get('mcts_q_selection_weight') is not None:
                     q_selection_weight = max(0.0, float(task['mcts_q_selection_weight']))
                     opponent_mcts = list(
@@ -6006,14 +6514,6 @@ def persistent_selfplay_worker(
                     for mcts_obj in [getattr(engine, 'mcts', None)] + opponent_mcts:
                         if mcts_obj is not None and hasattr(mcts_obj, 'q_selection_weight'):
                             mcts_obj.q_selection_weight = q_selection_weight
-                if task.get('mcts_q_selection_floor') is not None:
-                    q_selection_floor = max(0.0, float(task['mcts_q_selection_floor']))
-                    opponent_mcts = list(
-                        (getattr(engine, 'opponent_mcts_by_label', {}) or {}).values()
-                    )
-                    for mcts_obj in [getattr(engine, 'mcts', None)] + opponent_mcts:
-                        if mcts_obj is not None and hasattr(mcts_obj, 'q_selection_floor'):
-                            mcts_obj.q_selection_floor = q_selection_floor
 
                 total_positions, total_games = _play_games_with_engine(
                     rank,

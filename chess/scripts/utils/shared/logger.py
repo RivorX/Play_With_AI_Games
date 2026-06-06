@@ -6,7 +6,7 @@ import csv
 import json
 import textwrap
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter, MaxNLocator, PercentFormatter
+from matplotlib.ticker import MaxNLocator, PercentFormatter
 from datetime import datetime
 from pathlib import Path
 
@@ -151,11 +151,12 @@ class TrainingLogger:
             else:  # RL mode
                 header = [
                     'iteration', 'avg_loss', 'policy_loss', 'value_loss', 'learning_rate',
-                    'value_loss_weight', 'mcts_q_value_scale', 'mcts_q_selection_weight',
-                    'mcts_q_selection_floor', 'mcts_q_effective_weight', 'mcts_q_value_trust',
-                    'value_guard_streak', 'mcts_no_mcts_gap',
-                    'mcts_q_ablation_gap', 'mcts_qoff_score_rate', 'mcts_qoff_win_rate',
-                    'mcts_qoff_draw_rate', 'mcts_qoff_loss_rate', 'mcts_qoff_games',
+                    'value_loss_weight', 'mcts_q_selection_weight', 'mcts_q_effective_weight',
+                    'early_stop_streak', 'promotion_candidate_streak',
+                    'early_stop_reset_reason', 'eval_score_rate_ema', 'eval_true_win_rate_ema',
+                    'opponent_source_weights_json', 'mcts_no_mcts_gap',
+                    'mcts_q_ablation_gap', 'mcts_q_vs_qoff_score_rate', 'mcts_q_vs_qoff_win_rate',
+                    'mcts_q_vs_qoff_draw_rate', 'mcts_q_vs_qoff_loss_rate', 'mcts_q_vs_qoff_games',
                     'score_rate', 'buffer_size', 'avg_game_length', 'temperature', 'beta',
                     'true_win_rate', 'eval_stage', 'eval_games',
                     'eval_wins', 'eval_draws', 'eval_losses', 'eval_unresolved',
@@ -293,9 +294,12 @@ class TrainingLogger:
                 'mcts_search_adaptive_stop_time_s',
                 'mcts_search_metadata_time_s',
                 'mcts_batch_expand_eval_time_s',
+                'mcts_batch_expand_eval_calls',
                 'mcts_board_to_tensor_time_s',
+                'mcts_board_to_tensor_calls',
                 'mcts_batch_expand_dedup_terminal_time_s',
                 'mcts_batch_expand_legal_moves_time_s',
+                'mcts_batch_expand_tensor_pack_time_s',
                 'mcts_batch_expand_history_time_s',
                 'mcts_batch_expand_input_pack_time_s',
                 'mcts_batch_expand_legal_index_pack_time_s',
@@ -322,6 +326,10 @@ class TrainingLogger:
                     'replay_size',
                     'replay_capacity',
                     'replay_fill_rate',
+                    'train_batch_size',
+                    'train_steps',
+                    'train_selected_samples',
+                    'train_replay_coverage',
                     'replay_decisive_fraction',
                     'replay_draw_fraction',
                     'replay_value_mean',
@@ -339,6 +347,18 @@ class TrainingLogger:
                     'policy_weight_mean',
                     'policy_weight_p10',
                     'policy_weight_low_fraction',
+                    'replay_source_learner_fraction',
+                    'replay_source_frozen_best_fraction',
+                    'replay_source_frozen_anchor_fraction',
+                    'replay_source_frozen_recent_fraction',
+                    'replay_source_other_fraction',
+                    'replay_policy_weight_learner_share',
+                    'replay_policy_weight_frozen_best_share',
+                    'replay_policy_weight_frozen_anchor_share',
+                    'replay_policy_weight_frozen_recent_share',
+                    'replay_policy_weight_other_share',
+                    'replay_source_counts_json',
+                    'replay_source_policy_weight_sums_json',
                     'value_weight_mean',
                     'value_weight_p10',
                     'value_weight_low_fraction',
@@ -368,6 +388,50 @@ class TrainingLogger:
                     'selfplay_auto_draw_rate',
                     'selfplay_avg_game_value',
                     'selfplay_value_std',
+                    'selfplay_curriculum_dropped_positions',
+                    'selfplay_cap_dropped_positions',
+                    'selfplay_replay_storage_keep_rate',
+                    'opponent_current_planned_share',
+                    'opponent_current_actual_share',
+                    'opponent_current_games',
+                    'opponent_current_wins',
+                    'opponent_current_draws',
+                    'opponent_current_losses',
+                    'opponent_current_score_rate',
+                    'opponent_best_planned_share',
+                    'opponent_best_actual_share',
+                    'opponent_best_games',
+                    'opponent_best_wins',
+                    'opponent_best_draws',
+                    'opponent_best_losses',
+                    'opponent_best_score_rate',
+                    'opponent_recent_planned_share',
+                    'opponent_recent_actual_share',
+                    'opponent_recent_games',
+                    'opponent_recent_wins',
+                    'opponent_recent_draws',
+                    'opponent_recent_losses',
+                    'opponent_recent_score_rate',
+                    'opponent_anchor_planned_share',
+                    'opponent_anchor_actual_share',
+                    'opponent_anchor_games',
+                    'opponent_anchor_wins',
+                    'opponent_anchor_draws',
+                    'opponent_anchor_losses',
+                    'opponent_anchor_score_rate',
+                    'opponent_source_weights_json',
+                    'opponent_exact_results_json',
+                    'opponent_recent_results_json',
+                    'opponent_promotion_transition_progress',
+                    'mcts_dirichlet_weight',
+                    'mcts_dirichlet_discovery_scale',
+                    'mcts_discovery_probe_fraction',
+                    'mcts_discovery_probe_raw_fraction',
+                    'mcts_discovery_probe_cap_fraction',
+                    'mcts_discovery_probe_q_gate_ok',
+                    'mcts_discovery_probe_used_rate',
+                    'mcts_discovery_probe_changed_rate',
+                    'mcts_discovery_probe_score_mean',
                     'mcts_avg_sims',
                     'mcts_avg_budget',
                     'mcts_budget_p10',
@@ -380,8 +444,19 @@ class TrainingLogger:
                     'mcts_prior_agreement_samples',
                     'mcts_prior_agreement_rate',
                     'mcts_prior_changed_rate',
+                    'mcts_changed_opening_rate',
+                    'mcts_changed_middlegame_rate',
+                    'mcts_changed_endgame_rate',
+                    'mcts_discovery_probe_used_opening_rate',
+                    'mcts_discovery_probe_used_middlegame_rate',
+                    'mcts_discovery_probe_used_endgame_rate',
+                    'mcts_discovery_probe_changed_opening_rate',
+                    'mcts_discovery_probe_changed_middlegame_rate',
+                    'mcts_discovery_probe_changed_endgame_rate',
                     'mcts_search_discovery_rate',
                     'mcts_search_discovery_weight_mean',
+                    'mcts_policy_uptake_weight_mean',
+                    'mcts_policy_uptake_low_rate',
                     'mcts_q_delta_samples',
                     'mcts_changed_to_lower_q_rate',
                     'mcts_q_delta_mean',
@@ -408,6 +483,13 @@ class TrainingLogger:
                     'mcts_visited_move_count_mean',
                     'mcts_legal_move_count_mean',
                     'mcts_visit_coverage_ratio_mean',
+                    'mcts_expand_eval_ms_per_request',
+                    'mcts_expand_eval_ms_per_position',
+                    'mcts_tensor_pack_ms_per_request',
+                    'mcts_board_to_tensor_ms_per_call',
+                    'mcts_board_to_tensor_ms_per_position',
+                    'mcts_search_cpu_ms_per_request_est',
+                    'mcts_profile_cost_source',
                     'train_policy_entropy',
                     'policy_entropy_gap',
                     'policy_entropy_ratio',
@@ -424,11 +506,16 @@ class TrainingLogger:
                     'eval_no_mcts_score_rate',
                     'eval_mcts_no_mcts_gap',
                     'eval_mcts_no_mcts_gap_ema',
-                    'eval_mcts_qoff_score_rate',
+                    'eval_mcts_q_vs_qoff_score_rate',
                     'eval_mcts_q_ablation_gap',
                     'eval_mcts_q_ablation_gap_ema',
                     'eval_mcts_games',
-                    'eval_mcts_qoff_games',
+                    'eval_mcts_q_vs_qoff_games',
+                    'eval_score_rate_ema',
+                    'eval_true_win_rate_ema',
+                    'early_stop_streak',
+                    'promotion_candidate_streak',
+                    'early_stop_reset_reason',
                 ])
             self.win_rates = []
             self.true_win_rates = []
@@ -715,9 +802,12 @@ class TrainingLogger:
             _value('mcts_search_adaptive_stop_time'),
             _value('mcts_search_metadata_time'),
             _value('mcts_batch_expand_eval_time'),
+            _value('mcts_batch_expand_eval_calls'),
             _value('mcts_board_to_tensor_time'),
+            _value('mcts_board_to_tensor_calls'),
             _value('mcts_batch_expand_dedup_terminal_time'),
             _value('mcts_batch_expand_legal_moves_time'),
+            _value('mcts_batch_expand_tensor_pack_time'),
             _value('mcts_batch_expand_history_time'),
             _value('mcts_batch_expand_input_pack_time'),
             _value('mcts_batch_expand_legal_index_pack_time'),
@@ -1218,6 +1308,7 @@ class TrainingLogger:
         selfplay_stats=None,
         train_metrics=None,
         eval_stats=None,
+        performance_profile=None,
         train_policy_entropy=None,
         train_target_value_std=None,
         train_value_pred_std=None,
@@ -1229,10 +1320,111 @@ class TrainingLogger:
         selfplay_stats = dict(selfplay_stats or {})
         train_metrics = dict(train_metrics or {})
         eval_stats = dict(eval_stats or {})
+        performance_profile = dict(performance_profile or {})
 
         def _value(mapping, key, default=''):
             value = mapping.get(key, default)
             return default if value is None else value
+
+        def _opponent_bucket(label):
+            label = str(label or 'current').strip().lower()
+            if label.startswith('recent'):
+                return 'recent'
+            if label in {'best', 'anchor'}:
+                return label
+            return 'current'
+
+        opponent_buckets = {
+            label: {
+                'planned_share': 0.0,
+                'actual_share': 0.0,
+                'games': 0,
+                'wins': 0,
+                'draws': 0,
+                'losses': 0,
+                'score_rate': '',
+            }
+            for label in ('current', 'best', 'recent', 'anchor')
+        }
+        opponent_debug = dict(_value(selfplay_stats, 'opponent_debug', {}) or {})
+        opponent_source_counts = dict(_value(selfplay_stats, 'opponent_source_counts', {}) or {})
+        opponent_results = dict(_value(selfplay_stats, 'opponent_results', {}) or {})
+        for label, weight in dict(opponent_debug.get('source_weights', {}) or {}).items():
+            bucket = opponent_buckets[_opponent_bucket(label)]
+            bucket['planned_share'] += float(weight or 0.0)
+        for label, count in opponent_source_counts.items():
+            bucket = opponent_buckets[_opponent_bucket(label)]
+            bucket['games'] += int(count or 0)
+        for label, stats in opponent_results.items():
+            stats = dict(stats or {})
+            bucket = opponent_buckets[_opponent_bucket(label)]
+            if label not in opponent_source_counts:
+                bucket['games'] += int(stats.get('games', 0) or 0)
+            bucket['wins'] += int(stats.get('wins', 0) or 0)
+            bucket['draws'] += int(stats.get('draws', 0) or 0)
+            bucket['losses'] += int(stats.get('losses', 0) or 0)
+        opponent_games_total = sum(int(bucket['games']) for bucket in opponent_buckets.values())
+        for bucket in opponent_buckets.values():
+            games = int(bucket['games'])
+            if opponent_games_total > 0:
+                bucket['actual_share'] = float(games) / float(opponent_games_total)
+            scored_games = int(bucket['wins']) + int(bucket['draws']) + int(bucket['losses'])
+            if scored_games > 0:
+                bucket['score_rate'] = (
+                    float(bucket['wins']) + 0.5 * float(bucket['draws'])
+                ) / float(scored_games)
+
+        def _opponent_bucket_row(label):
+            bucket = opponent_buckets[label]
+            return [
+                bucket['planned_share'],
+                bucket['actual_share'],
+                bucket['games'],
+                bucket['wins'],
+                bucket['draws'],
+                bucket['losses'],
+                bucket['score_rate'],
+            ]
+
+        def _opponent_results_json(source_results):
+            payload = {}
+            for label, stats in dict(source_results or {}).items():
+                stats = dict(stats or {})
+                games = int(stats.get('games', 0) or 0)
+                wins = int(stats.get('wins', 0) or 0)
+                draws = int(stats.get('draws', 0) or 0)
+                losses = int(stats.get('losses', 0) or 0)
+                payload[str(label)] = {
+                    'games': games,
+                    'wins': wins,
+                    'draws': draws,
+                    'losses': losses,
+                    'score_rate': ((wins + 0.5 * draws) / games) if games > 0 else None,
+                }
+            return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+        opponent_source_weights_json = json.dumps(
+            dict(opponent_debug.get('source_weights', {}) or {}),
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        opponent_adaptive_factors = dict(opponent_debug.get('adaptive_factors', {}) or {})
+        opponent_exact_results_json = _opponent_results_json(opponent_results)
+        opponent_recent_results_json = _opponent_results_json({
+            label: stats
+            for label, stats in opponent_results.items()
+            if str(label).strip().lower().startswith('recent')
+        })
+        replay_source_counts_json = json.dumps(
+            dict(_value(replay_stats, 'source_counts', {}) or {}),
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        replay_source_policy_weight_sums_json = json.dumps(
+            dict(_value(replay_stats, 'source_policy_weight_sums', {}) or {}),
+            sort_keys=True,
+            separators=(',', ':'),
+        )
 
         replay_draw = _value(replay_stats, 'draw_fraction', None)
         selfplay_draw = _value(selfplay_stats, 'completed_draw_rate', None)
@@ -1262,6 +1454,17 @@ class TrainingLogger:
             policy_entropy_gap = ''
             policy_entropy_ratio = ''
         try:
+            curriculum_drops = int(_value(selfplay_stats, 'curriculum_dropped_positions', 0))
+            cap_drops = int(_value(selfplay_stats, 'cap_dropped_positions', 0))
+            replay_storage_candidates = float(positions_added) + curriculum_drops + cap_drops
+            replay_storage_keep_rate = (
+                float(positions_added) / replay_storage_candidates
+                if replay_storage_candidates > 0.0
+                else ''
+            )
+        except (TypeError, ValueError):
+            replay_storage_keep_rate = ''
+        try:
             mcts_avg_sims = float(_value(selfplay_stats, 'search_simulations_used_avg', None))
             mcts_changed_rate_per_100_sims = (
                 float(_value(selfplay_stats, 'mcts_prior_changed_rate', None)) / max(mcts_avg_sims, 1e-8) * 100.0
@@ -1273,6 +1476,69 @@ class TrainingLogger:
             mcts_changed_rate_per_100_sims = ''
             mcts_kl_per_100_sims = ''
 
+        def _profile_float(key):
+            try:
+                value = performance_profile.get(key, None)
+                if value is None or value == '':
+                    return None
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _profile_int(key):
+            try:
+                value = performance_profile.get(key, None)
+                if value is None or value == '':
+                    return None
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        nn_calls = _profile_int('mcts_nn_inference_calls') or 0
+        nn_items = _profile_int('mcts_nn_inference_batch_items') or 0
+        expand_calls = _profile_int('mcts_batch_expand_eval_calls') or nn_calls
+        board_tensor_calls = _profile_int('mcts_board_to_tensor_calls') or 0
+        expand_time_s = _profile_float('mcts_batch_expand_eval_time')
+        tensor_pack_time_s = _profile_float('mcts_batch_expand_tensor_pack_time')
+        board_tensor_time_s = _profile_float('mcts_board_to_tensor_time')
+        search_many_time_s = _profile_float('mcts_search_many_time')
+        nn_time_s = _profile_float('mcts_nn_inference_time')
+
+        def _ms_per(total_s, count):
+            if total_s is None or count is None or count <= 0:
+                return ''
+            return 1000.0 * float(total_s) / float(count)
+
+        mcts_expand_eval_ms_per_request = _ms_per(expand_time_s, expand_calls)
+        mcts_expand_eval_ms_per_position = _ms_per(expand_time_s, nn_items)
+        mcts_profile_cost_source = ''
+        if mcts_expand_eval_ms_per_request != '':
+            mcts_profile_cost_source = 'measured'
+        elif nn_time_s is not None and nn_calls > 0:
+            # Lower-bound fallback: in central inference this captures the sync NN wait,
+            # not the full Python expansion path.
+            mcts_expand_eval_ms_per_request = _ms_per(nn_time_s, nn_calls)
+            mcts_expand_eval_ms_per_position = _ms_per(nn_time_s, nn_items)
+            mcts_profile_cost_source = 'estimated'
+        mcts_tensor_pack_ms_per_request = _ms_per(tensor_pack_time_s, expand_calls)
+        mcts_board_to_tensor_ms_per_call = _ms_per(board_tensor_time_s, board_tensor_calls)
+        mcts_board_to_tensor_ms_per_position = _ms_per(board_tensor_time_s, nn_items)
+        if (
+            mcts_profile_cost_source == ''
+            and (
+                mcts_tensor_pack_ms_per_request != ''
+                or mcts_board_to_tensor_ms_per_call != ''
+                or mcts_board_to_tensor_ms_per_position != ''
+            )
+        ):
+            mcts_profile_cost_source = 'measured'
+        if search_many_time_s is not None and nn_time_s is not None and nn_calls > 0:
+            mcts_search_cpu_ms_per_request_est = (
+                max(0.0, float(search_many_time_s) - float(nn_time_s)) * 1000.0 / float(nn_calls)
+            )
+        else:
+            mcts_search_cpu_ms_per_request_est = ''
+
         row = [
             int(iteration),
             datetime.now().isoformat(timespec='seconds'),
@@ -1280,6 +1546,10 @@ class TrainingLogger:
             _value(replay_stats, 'size'),
             _value(replay_stats, 'capacity'),
             _value(replay_stats, 'fill_rate'),
+            _value(replay_stats, 'train_batch_size'),
+            _value(replay_stats, 'train_steps'),
+            _value(replay_stats, 'train_selected_samples'),
+            _value(replay_stats, 'train_replay_coverage'),
             _value(replay_stats, 'decisive_fraction'),
             _value(replay_stats, 'draw_fraction'),
             _value(replay_stats, 'value_mean'),
@@ -1297,6 +1567,18 @@ class TrainingLogger:
             _value(replay_stats, 'policy_weight_mean'),
             _value(replay_stats, 'policy_weight_p10'),
             _value(replay_stats, 'policy_weight_low_fraction'),
+            _value(replay_stats, 'source_learner_fraction'),
+            _value(replay_stats, 'source_frozen_best_fraction'),
+            _value(replay_stats, 'source_frozen_anchor_fraction'),
+            _value(replay_stats, 'source_frozen_recent_fraction'),
+            _value(replay_stats, 'source_other_fraction'),
+            _value(replay_stats, 'source_learner_policy_weight_share'),
+            _value(replay_stats, 'source_frozen_best_policy_weight_share'),
+            _value(replay_stats, 'source_frozen_anchor_policy_weight_share'),
+            _value(replay_stats, 'source_frozen_recent_policy_weight_share'),
+            _value(replay_stats, 'source_other_policy_weight_share'),
+            replay_source_counts_json,
+            replay_source_policy_weight_sums_json,
             _value(replay_stats, 'value_weight_mean'),
             _value(replay_stats, 'value_weight_p10'),
             _value(replay_stats, 'value_weight_low_fraction'),
@@ -1326,6 +1608,26 @@ class TrainingLogger:
             _value(selfplay_stats, 'auto_draw_rate'),
             _value(selfplay_stats, 'avg_game_value'),
             _value(selfplay_stats, 'value_std'),
+            _value(selfplay_stats, 'curriculum_dropped_positions'),
+            _value(selfplay_stats, 'cap_dropped_positions'),
+            replay_storage_keep_rate,
+            *_opponent_bucket_row('current'),
+            *_opponent_bucket_row('best'),
+            *_opponent_bucket_row('recent'),
+            *_opponent_bucket_row('anchor'),
+            opponent_source_weights_json,
+            opponent_exact_results_json,
+            opponent_recent_results_json,
+            opponent_adaptive_factors.get('_promotion_transition_progress', None),
+            _value(selfplay_stats, 'mcts_dirichlet_weight'),
+            _value(selfplay_stats, 'mcts_dirichlet_discovery_scale'),
+            _value(selfplay_stats, 'mcts_discovery_probe_fraction'),
+            _value(selfplay_stats, 'mcts_discovery_probe_raw_fraction'),
+            _value(selfplay_stats, 'mcts_discovery_probe_cap_fraction'),
+            _value(selfplay_stats, 'mcts_discovery_probe_q_gate_ok'),
+            _value(selfplay_stats, 'mcts_discovery_probe_used_rate'),
+            _value(selfplay_stats, 'mcts_discovery_probe_changed_rate'),
+            _value(selfplay_stats, 'mcts_discovery_probe_score_mean'),
             _value(selfplay_stats, 'search_simulations_used_avg'),
             _value(selfplay_stats, 'search_simulations_budget_avg'),
             _value(selfplay_stats, 'search_simulations_budget_p10'),
@@ -1338,8 +1640,19 @@ class TrainingLogger:
             _value(selfplay_stats, 'mcts_prior_agreement_samples'),
             _value(selfplay_stats, 'mcts_prior_agreement_rate'),
             _value(selfplay_stats, 'mcts_prior_changed_rate'),
+            _value(selfplay_stats, 'mcts_changed_opening_rate'),
+            _value(selfplay_stats, 'mcts_changed_middlegame_rate'),
+            _value(selfplay_stats, 'mcts_changed_endgame_rate'),
+            _value(selfplay_stats, 'mcts_discovery_probe_used_opening_rate'),
+            _value(selfplay_stats, 'mcts_discovery_probe_used_middlegame_rate'),
+            _value(selfplay_stats, 'mcts_discovery_probe_used_endgame_rate'),
+            _value(selfplay_stats, 'mcts_discovery_probe_changed_opening_rate'),
+            _value(selfplay_stats, 'mcts_discovery_probe_changed_middlegame_rate'),
+            _value(selfplay_stats, 'mcts_discovery_probe_changed_endgame_rate'),
             _value(selfplay_stats, 'mcts_search_discovery_rate'),
             _value(selfplay_stats, 'mcts_search_discovery_weight_mean'),
+            _value(selfplay_stats, 'mcts_policy_uptake_weight_mean'),
+            _value(selfplay_stats, 'mcts_policy_uptake_low_rate'),
             _value(selfplay_stats, 'mcts_q_delta_samples'),
             _value(selfplay_stats, 'mcts_changed_to_lower_q_rate'),
             _value(selfplay_stats, 'mcts_q_delta_mean'),
@@ -1366,6 +1679,13 @@ class TrainingLogger:
             _value(selfplay_stats, 'mcts_visited_move_count_mean'),
             _value(selfplay_stats, 'mcts_legal_move_count_mean'),
             _value(selfplay_stats, 'mcts_visit_coverage_ratio_mean'),
+            mcts_expand_eval_ms_per_request,
+            mcts_expand_eval_ms_per_position,
+            mcts_tensor_pack_ms_per_request,
+            mcts_board_to_tensor_ms_per_call,
+            mcts_board_to_tensor_ms_per_position,
+            mcts_search_cpu_ms_per_request_est,
+            mcts_profile_cost_source,
             '' if train_policy_entropy is None else train_policy_entropy,
             policy_entropy_gap,
             policy_entropy_ratio,
@@ -1382,11 +1702,16 @@ class TrainingLogger:
             _value(eval_stats, 'no_mcts_score_rate'),
             eval_mcts_no_mcts_gap,
             _value(eval_stats, 'mcts_no_mcts_gap_ema'),
-            _value(eval_stats, 'mcts_qoff_score_rate'),
+            _value(eval_stats, 'mcts_q_vs_qoff_score_rate'),
             _value(eval_stats, 'mcts_q_ablation_gap'),
             _value(eval_stats, 'mcts_q_ablation_gap_ema'),
             _value(eval_stats, 'mcts_games'),
-            _value(eval_stats, 'mcts_qoff_games'),
+            _value(eval_stats, 'mcts_q_vs_qoff_games'),
+            _value(eval_stats, 'score_rate_ema'),
+            _value(eval_stats, 'true_win_rate_ema'),
+            _value(eval_stats, 'early_stop_streak'),
+            _value(eval_stats, 'promotion_candidate_streak'),
+            _value(eval_stats, 'early_stop_reset_reason'),
         ]
         with open(self.data_quality_log_path, 'a', newline='') as f:
             csv.writer(f).writerow(row)
@@ -1785,34 +2110,69 @@ class TrainingLogger:
             _apply_sorted_legend(ax, loc='best', fontsize=8)
 
         ax = axes[2, 0]
-        for column, label, color, style in [
-            ('sample_age_avg', 'Avg age', colors['purple'], '-'),
-            ('sample_age_p50', 'p50', '#A855F7', '--'),
-            ('sample_age_p90', 'p90', '#6D28D9', ':'),
+        opponent_mix_values = []
+        for bucket, label, color in [
+            ('current', 'Current', colors['blue']),
+            ('best', 'Best', colors['green']),
+            ('recent', 'Recent', colors['orange']),
+            ('anchor', 'Anchor', colors['purple']),
         ]:
-            _plot(ax, column, label, color, style=style)
-        _style_axis(ax, 'Replay Sample Age', 'iterations old')
+            _, actual_values = _plot(
+                ax,
+                f'opponent_{bucket}_actual_share',
+                f'{label} actual',
+                color,
+                style='-',
+                linewidth=2.1,
+            )
+            _, planned_values = _plot(
+                ax,
+                f'opponent_{bucket}_planned_share',
+                f'{label} planned',
+                color,
+                style='--',
+                linewidth=1.4,
+                alpha=0.62,
+            )
+            opponent_mix_values.extend(actual_values)
+            opponent_mix_values.extend(planned_values)
+        _style_axis(ax, 'Opponent Planned vs Actual Mix', 'share of self-play games', percent=True)
+        _set_percent_ylim(ax, opponent_mix_values, min_pad=0.04, include=[0.0])
         if ax.get_legend_handles_labels()[0]:
-            _apply_sorted_legend(ax, loc='best', fontsize=8)
+            _apply_sorted_legend(ax, loc='best', fontsize=7)
 
         ax = axes[1, 3]
-        _, policy_weight = _plot(ax, 'policy_weight_mean', 'Policy weight mean', colors['blue'], style='-', linewidth=2.0)
-        _, value_weight = _plot(ax, 'value_weight_mean', 'Value weight mean', colors['green'], style='--', linewidth=2.0)
-        _, importance = _plot(ax, 'importance_mean', 'Importance mean', colors['slate'], style=':', linewidth=2.0)
-        _style_axis(ax, 'Replay Weight Health', 'weight / importance')
-        _set_tight_ylim(ax, list(policy_weight) + list(value_weight) + list(importance), min_pad=0.02)
-        ax2 = ax.twinx()
-        _, policy_low = _plot(ax2, 'policy_weight_low_fraction', 'Low policy weight', colors['red'], style='-.', linewidth=1.8)
-        _, value_low = _plot(ax2, 'value_weight_low_fraction', 'Low value weight', colors['orange'], style=':', linewidth=1.8)
-        ax2.set_ylabel('low fraction')
-        ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
-        low_values = list(policy_low) + list(value_low)
-        ax2.set_ylim(0.0, min(1.0, max(0.05, max(low_values) * 1.25))) if low_values else ax2.set_ylim([0, 0.05])
-        ax2.spines['right'].set_alpha(0.18)
-        lines, labels = ax.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        if lines or lines2:
-            _apply_sorted_legend(ax, lines + lines2, labels + labels2, loc='best', fontsize=8)
+        replay_source_values = []
+        for source, label, color in [
+            ('learner', 'Learner positions', colors['blue']),
+            ('frozen_best', 'Frozen best positions', colors['green']),
+            ('frozen_anchor', 'Frozen anchor positions', colors['purple']),
+            ('frozen_recent', 'Frozen recent positions', colors['orange']),
+            ('other', 'Other positions', colors['slate']),
+        ]:
+            _, fraction_values = _plot(
+                ax,
+                f'replay_source_{source}_fraction',
+                label,
+                color,
+                style='-',
+                linewidth=2.0,
+            )
+            _, weight_values = _plot(
+                ax,
+                f'replay_policy_weight_{source}_share',
+                f'{label} policy weight',
+                color,
+                style='--',
+                linewidth=1.35,
+                alpha=0.58,
+            )
+            replay_source_values.extend(fraction_values)
+            replay_source_values.extend(weight_values)
+        _style_axis(ax, 'Replay Source Composition', 'replay / policy-weight share', percent=True)
+        _set_percent_ylim(ax, replay_source_values, min_pad=0.04, include=[0.0])
+        if ax.get_legend_handles_labels()[0]:
+            _apply_sorted_legend(ax, loc='best', fontsize=7)
 
         ax = axes[1, 1]
         replay_balance_values = []
@@ -2076,9 +2436,19 @@ class TrainingLogger:
             _apply_sorted_legend(ax, lines + lines2, labels + labels2, loc='best', fontsize=8)
 
         ax = axes[3, 3]
-        _, kl_values = _plot(ax, 'mcts_policy_kl_mean', 'Policy KL', colors['purple'], style='-', linewidth=2.0)
-        _style_axis(ax, 'MCTS Policy Shift', 'KL')
-        _set_tight_ylim(ax, kl_values, min_pad=0.005)
+        probe_phase_values = []
+        for column, label, color, style in [
+            ('mcts_discovery_probe_raw_fraction', 'Raw requested', colors['purple'], ':'),
+            ('mcts_discovery_probe_fraction', 'Requested after cap', colors['red'], '--'),
+            ('mcts_discovery_probe_used_rate', 'Probe used all', colors['black'], '-'),
+            ('mcts_discovery_probe_used_opening_rate', 'Probe opening', colors['blue'], '--'),
+            ('mcts_discovery_probe_used_middlegame_rate', 'Probe middlegame', colors['orange'], '-.'),
+            ('mcts_discovery_probe_used_endgame_rate', 'Probe endgame', colors['green'], ':'),
+        ]:
+            _, values = _plot(ax, column, label, color, style=style, linewidth=2.0)
+            probe_phase_values.extend(values)
+        _style_axis(ax, 'Discovery Probe by Phase', 'rate', percent=True)
+        _set_percent_ylim(ax, probe_phase_values, min_pad=0.015)
         if ax.get_legend_handles_labels()[0]:
             _apply_sorted_legend(ax, loc='best', fontsize=8)
 
@@ -2131,7 +2501,7 @@ class TrainingLogger:
         eval_values = []
         for column, label, color, style in [
             ('eval_mcts_score_rate', 'MCTS Q-on', colors['purple'], '-'),
-            ('eval_mcts_qoff_score_rate', 'MCTS Q-off', colors['green'], '--'),
+            ('eval_mcts_q_vs_qoff_score_rate', 'Q-on vs Q-off', colors['green'], '--'),
             ('eval_no_mcts_score_rate', 'No-MCTS', colors['slate'], ':'),
         ]:
             _, values = _plot(ax, column, label, color, style=style, marker='o', linewidth=2.2)
@@ -2141,7 +2511,7 @@ class TrainingLogger:
             _set_percent_ylim(ax, eval_values, min_pad=0.04, include=[0.5])
         ax.axhline(0.5, color=colors['black'], linestyle=':', linewidth=1.0, alpha=0.5)
         ax2 = ax.twinx()
-        _, gap_values = _plot(ax2, 'eval_mcts_q_ablation_gap', 'Q-on minus Q-off', colors['red'], style='-.', marker='s', linewidth=1.8)
+        _, gap_values = _plot(ax2, 'eval_mcts_q_ablation_gap', 'Q-on edge vs parity', colors['red'], style='-.', marker='s', linewidth=1.8)
         if gap_values:
             _set_tight_ylim(ax2, gap_values, min_pad=0.02, center_zero=True)
         ax2.set_ylabel('Q gap')
@@ -2155,7 +2525,7 @@ class TrainingLogger:
         ax = axes[5, 1]
         eval_gap_values = []
         for column, label, color, style in [
-            ('eval_mcts_q_ablation_gap', 'Q-on minus Q-off', colors['red'], '-'),
+            ('eval_mcts_q_ablation_gap', 'Q-on edge vs parity', colors['red'], '-'),
             ('eval_mcts_no_mcts_gap', 'MCTS minus no-MCTS', colors['purple'], '--'),
             ('eval_mcts_no_mcts_gap_ema', 'MCTS/no-MCTS EMA', colors['blue'], ':'),
             ('eval_mcts_q_ablation_gap_ema', 'Q gap EMA', colors['orange'], '-.'),
@@ -2209,48 +2579,49 @@ class TrainingLogger:
             _apply_sorted_legend(ax, lines + lines2, labels + labels2, loc='best', fontsize=8)
 
         ax = axes[2, 1]
-        replay_freshness_values = []
-        for column, label, color, style in [
-            ('sample_age_new_fraction', 'age=0', colors['orange'], '-'),
-            ('sample_age_le1_fraction', 'age<=1', colors['green'], '--'),
-            ('sample_pre_promotion_fraction', 'pre-promotion', colors['red'], ':'),
-            ('sample_post_promotion_fraction', 'post-promotion', colors['blue'], '-.'),
+        opponent_score_values = []
+        opponent_game_values = []
+        for bucket, label, color, style in [
+            ('current', 'Current score', colors['blue'], '-'),
+            ('best', 'Best score', colors['green'], '--'),
+            ('recent', 'Recent score', colors['orange'], '-.'),
+            ('anchor', 'Anchor score', colors['purple'], ':'),
         ]:
-            _, values = _plot(ax, column, label, color, style=style, linewidth=2.0)
-            replay_freshness_values.extend(values)
-        _style_axis(ax, 'Replay Freshness / Promotion Mix', 'batch fraction', percent=True)
-        _set_percent_ylim(ax, replay_freshness_values, min_pad=0.04)
-        if ax.get_legend_handles_labels()[0]:
-            _apply_sorted_legend(ax, loc='best', fontsize=8)
+            _, values = _plot(ax, f'opponent_{bucket}_score_rate', label, color, style=style, linewidth=2.0)
+            opponent_score_values.extend(values)
+        _style_axis(ax, 'Opponent Matchup Scores', 'learner score rate', percent=True)
+        _set_percent_ylim(ax, opponent_score_values, min_pad=0.05, include=[0.5])
+        ax.axhline(0.5, color=colors['black'], linestyle=':', linewidth=1.0, alpha=0.45)
+        ax2 = ax.twinx()
+        for bucket, label, color, style in [
+            ('current', 'Current games', colors['blue'], '-'),
+            ('best', 'Best games', colors['green'], '--'),
+            ('recent', 'Recent games', colors['orange'], '-.'),
+            ('anchor', 'Anchor games', colors['purple'], ':'),
+        ]:
+            _, values = _plot(ax2, f'opponent_{bucket}_games', label, color, style=style, linewidth=1.2, alpha=0.32)
+            opponent_game_values.extend(values)
+        _set_tight_ylim(ax2, opponent_game_values, min_pad=2.0)
+        ax2.set_ylabel('games')
+        ax2.spines['right'].set_alpha(0.18)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            _apply_sorted_legend(ax, lines + lines2, labels + labels2, loc='best', fontsize=7)
 
         ax = axes[4, 1]
-        positive_values = []
-        intervention_series = [
-            (_series('mcts_prior_changed_rate'), 'Changed top move', colors['orange'], '-'),
-            (_series_product_from_rows(rows, ['mcts_prior_changed_rate', 'mcts_changed_to_higher_q_rate']), 'Changed to higher Q, all pos', colors['green'], '--'),
-            (_series_product_from_rows(rows, ['mcts_prior_changed_rate', 'mcts_changed_to_lower_q_when_changed_rate']), 'Changed to lower Q, all pos', colors['red'], ':'),
-            (_series('mcts_search_discovery_rate'), 'Discovery boosted', colors['purple'], '-.'),
-        ]
-        for (xs, ys), label, color, style in intervention_series:
-            pairs = [(x, float(y)) for x, y in zip(xs, ys) if y is not None and float(y) > 0.0]
-            if pairs:
-                px, py = zip(*pairs)
-                ax.plot(px, py, linestyle=style, linewidth=2.0, color=color, label=label)
-                positive_values.extend(py)
-        _style_axis(ax, 'MCTS Useful Intervention Rate', 'rate', percent=True)
-        ax.set_yscale('log')
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _pos: f"{value:.1%}" if 0.0 < value < 0.01 else f"{value:.0%}" if value > 0.0 else ""))
-        if positive_values:
-            y_min = max(1e-4, min(positive_values) * 0.65)
-            y_max = min(1.0, max(0.04, max(positive_values) * 1.45))
-            ax.set_ylim(y_min, y_max)
-        else:
-            ax.set_ylim(1e-4, 0.05)
-        y_lo, y_hi = ax.get_ylim()
-        tick_candidates = [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.10]
-        ax.set_yticks([tick for tick in tick_candidates if y_lo <= tick <= y_hi])
-        ax.yaxis.set_minor_formatter(FuncFormatter(lambda _value, _pos: ""))
-        ax.grid(True, which='minor', alpha=0.12, linewidth=0.6)
+        changed_phase_values = []
+        for column, label, color, style in [
+            ('mcts_prior_changed_rate', 'Changed all', colors['black'], '-'),
+            ('mcts_changed_opening_rate', 'Opening', colors['blue'], '--'),
+            ('mcts_changed_middlegame_rate', 'Middlegame', colors['orange'], '-.'),
+            ('mcts_changed_endgame_rate', 'Endgame', colors['green'], ':'),
+            ('mcts_discovery_probe_changed_rate', 'Probe changed', colors['purple'], '-'),
+        ]:
+            _, values = _plot(ax, column, label, color, style=style, linewidth=2.0)
+            changed_phase_values.extend(values)
+        _style_axis(ax, 'MCTS Changed Top Move by Phase', 'rate', percent=True)
+        _set_percent_ylim(ax, changed_phase_values, min_pad=0.015)
         if ax.get_legend_handles_labels()[0]:
             _apply_sorted_legend(ax, loc='best', fontsize=8)
 
@@ -2282,8 +2653,6 @@ class TrainingLogger:
         ax = axes[5, 2]
         _plot_main(ax, 'mcts_q_effective_weight', 'Effective Q', colors['purple'], style='-', marker='o')
         _plot_main(ax, 'mcts_q_selection_weight', 'Q selection', colors['green'], style='--', marker='s')
-        _plot_main(ax, 'mcts_q_selection_floor', 'Q floor', colors['slate'], style='-.', marker='.')
-        _plot_main(ax, 'mcts_q_value_trust', 'Value trust', colors['blue'], style=':', marker='^')
         _plot_main(ax, 'value_loss_weight', 'Value loss weight', colors['orange'], style='-.', marker='s')
         _style_axis(ax, 'Q / Value Control', 'weight')
         if ax.get_legend_handles_labels()[0]:
@@ -2316,7 +2685,7 @@ class TrainingLogger:
         ci_values = []
         for (xs, ys), label, color, style in [
             (_series_eval_ci_from_rows(rows, 'eval_mcts_score_rate', 'eval_mcts_games'), 'MCTS score CI', colors['purple'], '-'),
-            (_series_eval_ci_from_rows(rows, 'eval_mcts_qoff_score_rate', 'eval_mcts_qoff_games'), 'Q-off score CI', colors['green'], '--'),
+            (_series_eval_ci_from_rows(rows, 'eval_mcts_q_vs_qoff_score_rate', 'eval_mcts_q_vs_qoff_games'), 'Q-on vs Q-off score CI', colors['green'], '--'),
             (_series_no_mcts_ci(), 'No-MCTS score CI', colors['orange'], ':'),
         ]:
             if xs:
@@ -2329,18 +2698,48 @@ class TrainingLogger:
             _apply_sorted_legend(ax, loc='best', fontsize=8)
 
         ax = axes[6, 3]
-        accuracy_values = []
+        cost_request_values = []
         for column, label, color, style in [
-            ('policy_top1_acc', 'Policy top-1', colors['green'], '-'),
-            ('policy_top3_acc', 'Policy top-3', colors['blue'], '--'),
-            ('value_wdl_acc', 'Value WDL acc', colors['purple'], '-.'),
+            ('mcts_expand_eval_ms_per_request', 'Expand/eval', colors['orange'], '-'),
+            ('mcts_tensor_pack_ms_per_request', 'Tensor pack', colors['green'], '--'),
+            ('mcts_search_cpu_ms_per_request_est', 'CPU non-NN est', colors['slate'], ':'),
         ]:
-            _, values = _plot_main(ax, column, label, color, style=style, linewidth=2.0)
-            accuracy_values.extend(values)
-        _style_axis(ax, 'Training Accuracies', 'accuracy', percent=True)
-        _set_percent_ylim(ax, accuracy_values, min_pad=0.03)
-        if ax.get_legend_handles_labels()[0]:
-            _apply_sorted_legend(ax, loc='best', fontsize=8)
+            _, values = _plot(ax, column, label, color, style=style, linewidth=2.0)
+            cost_request_values.extend(values)
+        _style_axis(ax, 'MCTS Expand / Tensor Cost', 'ms per request')
+        _set_tight_ylim(ax, cost_request_values, min_pad=0.5)
+        ax2 = ax.twinx()
+        cost_tensor_values = []
+        for column, label, color, style in [
+            ('mcts_board_to_tensor_ms_per_call', 'board_to_tensor/call', colors['blue'], '-.'),
+            ('mcts_board_to_tensor_ms_per_position', 'board_to_tensor/pos', colors['purple'], '--'),
+        ]:
+            _, values = _plot(ax2, column, label, color, style=style, linewidth=1.8, alpha=0.88)
+            cost_tensor_values.extend(values)
+        _set_tight_ylim(ax2, cost_tensor_values, min_pad=0.01)
+        ax2.set_ylabel('tensor ms')
+        ax2.spines['right'].set_alpha(0.18)
+        if not cost_request_values and not cost_tensor_values:
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_xlabel('')
+            ax.set_ylabel('')
+            ax2.set_yticks([])
+            ax2.set_ylabel('')
+            ax.text(
+                0.5,
+                0.5,
+                "Brak danych",
+                ha='center',
+                va='center',
+                transform=ax.transAxes,
+                fontsize=9,
+                color=colors['slate'],
+            )
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        if lines or lines2:
+            _apply_sorted_legend(ax, lines + lines2, labels + labels2, loc='best', fontsize=7)
 
         fig.subplots_adjust(left=0.055, right=0.945, bottom=0.045, top=0.945, hspace=0.55, wspace=0.42)
         fig.savefig(self.data_quality_plot_path, dpi=150, bbox_inches='tight', pad_inches=0.18)
@@ -3067,19 +3466,21 @@ class TrainingLogger:
                     kwargs.get('value_loss', ''),
                     kwargs.get('learning_rate', kwargs.get('lr', '')),
                     kwargs.get('value_loss_weight', ''),
-                    kwargs.get('mcts_q_value_scale', ''),
                     kwargs.get('mcts_q_selection_weight', ''),
-                    kwargs.get('mcts_q_selection_floor', ''),
                     kwargs.get('mcts_q_effective_weight', ''),
-                    kwargs.get('mcts_q_value_trust', ''),
-                    kwargs.get('value_guard_streak', ''),
+                    kwargs.get('early_stop_streak', ''),
+                    kwargs.get('promotion_candidate_streak', ''),
+                    kwargs.get('early_stop_reset_reason', ''),
+                    kwargs.get('eval_score_rate_ema', ''),
+                    kwargs.get('eval_true_win_rate_ema', ''),
+                    kwargs.get('opponent_source_weights_json', ''),
                     mcts_no_mcts_gap,
                     kwargs.get('mcts_q_ablation_gap', ''),
-                    kwargs.get('mcts_qoff_score_rate', ''),
-                    kwargs.get('mcts_qoff_win_rate', ''),
-                    kwargs.get('mcts_qoff_draw_rate', ''),
-                    kwargs.get('mcts_qoff_loss_rate', ''),
-                    kwargs.get('mcts_qoff_games', ''),
+                    kwargs.get('mcts_q_vs_qoff_score_rate', ''),
+                    kwargs.get('mcts_q_vs_qoff_win_rate', ''),
+                    kwargs.get('mcts_q_vs_qoff_draw_rate', ''),
+                    kwargs.get('mcts_q_vs_qoff_loss_rate', ''),
+                    kwargs.get('mcts_q_vs_qoff_games', ''),
                     kwargs.get('score_rate', kwargs.get('win_rate', '')),
                     kwargs.get('buffer_size', ''),
                     kwargs.get('avg_game_length', ''),
@@ -4164,9 +4565,6 @@ class TrainingLogger:
         ax = axes[3, 1]
         _plot_column(ax, 'mcts_q_effective_weight', 'Effective Q', colors['mcts'], marker='o')
         _plot_column(ax, 'mcts_q_selection_weight', 'Q selection', '#0F766E', style='--', marker='s', alpha=0.86)
-        _plot_column(ax, 'mcts_q_selection_floor', 'Q floor', '#475569', style='-.', marker='.', alpha=0.76)
-        _plot_column(ax, 'mcts_q_value_scale', 'Q trust add', '#64748B', style='-.', marker='.', alpha=0.72)
-        _plot_column(ax, 'mcts_q_value_trust', 'Value trust', colors['policy'], style=':', marker='^', alpha=0.84)
         _plot_column(ax, 'value_loss_weight', 'Value loss weight', colors['value'], style=':', marker='s', alpha=0.84)
         _style_axis(ax, 'Search / Value Control', 'Weight')
         _safe_legend(ax, fontsize=8, loc='best')
@@ -4231,8 +4629,6 @@ class TrainingLogger:
                 ['Control', 'Self-play draw', _fmt(_latest('completed_draw_rate'), 'pct')],
                 ['', 'Temperature', _fmt(_latest('temperature'), 'temp')],
                 ['', 'Effective Q', _fmt(_latest('mcts_q_effective_weight'), 'temp')],
-                ['', 'Q floor', _fmt(_latest('mcts_q_selection_floor'), 'temp')],
-                ['', 'Value trust', _fmt(_latest('mcts_q_value_trust'), 'temp')],
                 ['', 'Value weight', _fmt(_latest('value_loss_weight'), 'temp')],
             ]
             table = ax.table(

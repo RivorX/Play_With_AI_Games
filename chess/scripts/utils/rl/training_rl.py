@@ -52,6 +52,28 @@ def _eval_uses_central_inference(config, device):
     return bool(enabled and device.type == "cuda" and torch.cuda.is_available())
 
 
+def _resolve_configured_self_play_workers(rl_cfg, cpu_budget):
+    cpu_budget = max(1, int(cpu_budget))
+    raw_workers = rl_cfg.get("self_play_workers", cpu_budget)
+    if isinstance(raw_workers, str) and raw_workers.strip().lower() in {"auto", "automatic"}:
+        try:
+            multiplier = max(0.10, float(rl_cfg.get("self_play_worker_auto_multiplier", 1.0)))
+        except Exception:
+            multiplier = 1.0
+        return max(1, int(np.ceil(float(cpu_budget) * multiplier)))
+    try:
+        workers = int(raw_workers)
+    except Exception:
+        workers = cpu_budget
+    if workers <= 0:
+        try:
+            multiplier = max(0.10, float(rl_cfg.get("self_play_worker_auto_multiplier", 1.0)))
+        except Exception:
+            multiplier = 1.0
+        return max(1, int(np.ceil(float(cpu_budget) * multiplier)))
+    return max(1, workers)
+
+
 def _resolve_eval_workers(config, device, num_games):
     rl_cfg = config.get("reinforcement_learning", {})
     raw_workers = rl_cfg.get("eval_workers", None)
@@ -64,7 +86,7 @@ def _resolve_eval_workers(config, device, num_games):
             reserve_threads = max(0, int(rl_cfg.get("eval_cpu_threads_to_reserve", 0) or 0))
             cpu_budget = max(1, (os.cpu_count() or 2) - reserve_threads)
             raw_workers = min(
-                int(rl_cfg.get("self_play_workers", cpu_budget) or cpu_budget),
+                _resolve_configured_self_play_workers(rl_cfg, cpu_budget),
                 cpu_budget,
             )
         elif device.type == "cuda":
@@ -78,6 +100,14 @@ def _resolve_eval_workers(config, device, num_games):
         workers = int(raw_workers)
     except Exception:
         workers = 1
+
+    if auto_workers and _eval_uses_central_inference(config, device):
+        try:
+            min_games_per_worker = max(1, int(rl_cfg.get("eval_min_games_per_worker", 1) or 1))
+        except Exception:
+            min_games_per_worker = 1
+        if min_games_per_worker > 1:
+            workers = min(workers, max(1, int(np.ceil(float(num_games) / float(min_games_per_worker)))))
 
     return max(1, min(int(num_games), workers))
 
@@ -104,14 +134,27 @@ def _build_eval_central_server_config(config):
 
 
 def _build_eval_mcts_config(config):
-    """Use deterministic full-budget MCTS for eval/promotion games.
+    """Build deterministic eval MCTS settings.
 
-    Self-play may use adaptive early-stop to save time, but eval should not
-    silently shorten search because that makes model comparisons noisier.
+    Eval can optionally early-stop obviously decided roots, but adaptive budget
+    expansion stays disabled so promotion comparisons remain predictable.
     """
     eval_config = dict(config)
     rl_cfg = dict(config.get("reinforcement_learning", {}))
-    rl_cfg["mcts_search_early_stop_enabled"] = False
+    eval_early_stop = bool(rl_cfg.get("eval_mcts_search_early_stop_enabled", False))
+    rl_cfg["mcts_search_early_stop_enabled"] = eval_early_stop
+    if eval_early_stop:
+        eval_early_stop_overrides = {
+            "eval_mcts_search_early_stop_min_top_visit_prob": "mcts_search_early_stop_min_top_visit_prob",
+            "eval_mcts_search_early_stop_min_visit_gap": "mcts_search_early_stop_min_visit_gap",
+            "eval_mcts_search_early_stop_max_visit_entropy": "mcts_search_early_stop_max_visit_entropy",
+            "eval_mcts_search_early_stop_min_budget_fraction": "mcts_search_early_stop_min_budget_fraction",
+            "eval_mcts_search_early_stop_min_explored_prior_mass": "mcts_search_early_stop_min_explored_prior_mass",
+            "eval_mcts_search_early_stop_min_visited_moves": "mcts_search_early_stop_min_visited_moves",
+        }
+        for eval_key, mcts_key in eval_early_stop_overrides.items():
+            if eval_key in rl_cfg:
+                rl_cfg[mcts_key] = rl_cfg[eval_key]
     rl_cfg["mcts_adaptive_search_enabled"] = False
     eval_config["reinforcement_learning"] = rl_cfg
     return eval_config
@@ -268,7 +311,10 @@ def _get_eval_opening_prefix(config, game_idx, enabled_override=None):
     if not enabled or not _SELFPLAY_OPENING_LINES:
         return ()
 
-    line = _SELFPLAY_OPENING_LINES[int(game_idx) % len(_SELFPLAY_OPENING_LINES)]
+    opening_idx = int(game_idx)
+    if bool(config.get("reinforcement_learning", {}).get("eval_fixed_openings_pair_games", False)):
+        opening_idx //= 2
+    line = _SELFPLAY_OPENING_LINES[opening_idx % len(_SELFPLAY_OPENING_LINES)]
     max_plies = _resolve_eval_fixed_openings_max_plies(config)
     if max_plies <= 0:
         return ()
@@ -526,13 +572,15 @@ def _evaluate_games_batched(
     game_indices,
     use_fixed_openings=None,
     progress_callback=None,
+    model1_mcts_config=None,
+    model2_mcts_config=None,
 ):
     game_indices = list(game_indices or [])
     if not game_indices:
         return _build_eval_stats(0, 0, 0, 0, 0)
 
-    mcts1 = MultiGameBatchMCTS(model1, config, device)
-    mcts2 = MultiGameBatchMCTS(model2, config, device)
+    mcts1 = MultiGameBatchMCTS(model1, model1_mcts_config or config, device)
+    mcts2 = MultiGameBatchMCTS(model2, model2_mcts_config or config, device)
     sims = _resolve_eval_mcts_simulations(config)
     max_moves = _resolve_eval_max_moves(config)
     auto_claim_draw = _resolve_eval_auto_claim_draw(config)
@@ -714,7 +762,18 @@ def _result_for_model1(model1_as_white, result):
     return 0, 0, 0
 
 
-def _eval_worker(rank, model1_state, model2_state, config, device_str, game_indices, result_queue, use_fixed_openings=None):
+def _eval_worker(
+    rank,
+    model1_state,
+    model2_state,
+    config,
+    device_str,
+    game_indices,
+    result_queue,
+    use_fixed_openings=None,
+    model1_mcts_config=None,
+    model2_mcts_config=None,
+):
     try:
         worker_config = dict(config)
         worker_config["model"] = dict(config.get("model", {}))
@@ -752,6 +811,8 @@ def _eval_worker(rank, model1_state, model2_state, config, device_str, game_indi
                 "losses": int(losses),
                 "unresolved": int(unresolved),
             }),
+            model1_mcts_config=model1_mcts_config,
+            model2_mcts_config=model2_mcts_config,
         )
 
         result_queue.put(
@@ -770,7 +831,17 @@ def _eval_worker(rank, model1_state, model2_state, config, device_str, game_indi
         result_queue.put({"type": "error", "rank": rank, "error": str(exc)})
 
 
-def _eval_central_worker(rank, config, game_indices, request_queue, response_receiver, result_queue, use_fixed_openings=None):
+def _eval_central_worker(
+    rank,
+    config,
+    game_indices,
+    request_queue,
+    response_receiver,
+    result_queue,
+    use_fixed_openings=None,
+    model1_mcts_config=None,
+    model2_mcts_config=None,
+):
     try:
         rl_cfg = config.get("reinforcement_learning", {})
         torch_threads = max(1, int(rl_cfg.get("eval_torch_threads", rl_cfg.get("self_play_torch_threads", 1)) or 1))
@@ -831,6 +902,8 @@ def _eval_central_worker(rank, config, game_indices, request_queue, response_rec
                 "losses": int(losses),
                 "unresolved": int(unresolved),
             }),
+            model1_mcts_config=model1_mcts_config,
+            model2_mcts_config=model2_mcts_config,
         )
 
         result_queue.put(
@@ -857,6 +930,8 @@ def _evaluate_models_with_central_inference(
     num_games,
     game_index_offset=0,
     use_fixed_openings=None,
+    model1_mcts_config=None,
+    model2_mcts_config=None,
 ):
     workers = _resolve_eval_workers(config, device, num_games)
     server_count = _resolve_eval_central_server_count(config, workers)
@@ -994,6 +1069,8 @@ def _evaluate_models_with_central_inference(
                     worker_response_receivers[rank],
                     result_queue,
                     use_fixed_openings,
+                    model1_mcts_config,
+                    model2_mcts_config,
                 ),
             )
             proc.daemon = True
@@ -1259,6 +1336,7 @@ def train_on_batch_rl(
     metrics_calc=None,
     value_weight_override=None,
     policy_weight_override=None,
+    anchor_model=None,
 ):
     if len(batch) >= 7:
         boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights = batch[:7]
@@ -1290,11 +1368,32 @@ def train_on_batch_rl(
     value_aux_scalar_loss_weight = float(
         config.get("reinforcement_learning", {}).get("value_aux_scalar_loss_weight", 0.25)
     )
+    value_std_floor_loss_weight = max(
+        0.0,
+        float(config.get("reinforcement_learning", {}).get("value_std_floor_loss_weight", 0.0)),
+    )
+    value_std_floor_target_ratio = max(
+        0.0,
+        float(config.get("reinforcement_learning", {}).get("value_std_floor_target_ratio", 0.70)),
+    )
+    policy_anchor_kl_weight = max(
+        0.0,
+        float(config.get("reinforcement_learning", {}).get("policy_anchor_kl_weight", 0.0)),
+    )
 
     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
         policy_pred, value_pred = model(boards)
+        policy_anchor_kl_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        if anchor_model is not None and policy_anchor_kl_weight > 0.0:
+            with torch.no_grad():
+                anchor_policy_pred, _anchor_value_pred = anchor_model(boards)
+            anchor_policy_probs = torch.exp(anchor_policy_pred.detach())
+            policy_anchor_kl_loss = (
+                anchor_policy_probs * (anchor_policy_pred.detach() - policy_pred)
+            ).sum(dim=1).mean()
         value_pred_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
         target_value_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
+        value_std_floor_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
 
         if policy_indices.numel() == 0:
             policy_loss = torch.zeros(policy_pred.size(0), device=policy_pred.device, dtype=policy_pred.dtype)
@@ -1357,11 +1456,21 @@ def train_on_batch_rl(
                 beta=0.25,
             )
             value_loss = value_ce_loss + value_aux_scalar_loss_weight * value_scalar_aux_loss
-            value_scalar_detached = value_scalar.detach()
-            value_pred_std = value_scalar_detached.std(unbiased=False)
+            value_scalar_std = value_scalar.std(unbiased=False)
+            value_pred_std = value_scalar_std.detach()
+            if value_std_floor_loss_weight > 0.0 and value_scalar.numel() > 1:
+                target_std_floor = target_value_std.detach().to(dtype=value_scalar_std.dtype) * value_std_floor_target_ratio
+                std_shortfall = torch.relu(target_std_floor - value_scalar_std)
+                value_std_floor_loss = std_shortfall * std_shortfall
         else:
             value_loss = (value_pred.squeeze() - target_scalar) ** 2
-            value_pred_std = value_pred.detach().squeeze().std(unbiased=False)
+            value_scalar = value_pred.squeeze()
+            value_scalar_std = value_scalar.std(unbiased=False)
+            value_pred_std = value_scalar_std.detach()
+            if value_std_floor_loss_weight > 0.0 and value_scalar.numel() > 1:
+                target_std_floor = target_value_std.detach().to(dtype=value_scalar_std.dtype) * value_std_floor_target_ratio
+                std_shortfall = torch.relu(target_std_floor - value_scalar_std)
+                value_std_floor_loss = std_shortfall * std_shortfall
 
         if policy_loss.numel() == 0:
             policy_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
@@ -1382,7 +1491,12 @@ def train_on_batch_rl(
             if value_weight_override is None
             else float(value_weight_override)
         )
-        loss = policy_weight * policy_loss + value_weight * value_loss
+        loss = (
+            policy_weight * policy_loss
+            + value_weight * value_loss
+            + value_std_floor_loss_weight * value_std_floor_loss
+            + policy_anchor_kl_weight * policy_anchor_kl_loss
+        )
 
         policy_probs = torch.exp(policy_pred)
         policy_entropy = -(policy_probs * policy_pred).sum(dim=1).mean()
@@ -1438,8 +1552,20 @@ def train_on_batch_rl(
     )
 
 
-def evaluate_models(model1, model2, config, device, num_games=100, game_index_offset=0, use_fixed_openings=None):
+def evaluate_models(
+    model1,
+    model2,
+    config,
+    device,
+    num_games=100,
+    game_index_offset=0,
+    use_fixed_openings=None,
+    model1_mcts_config=None,
+    model2_mcts_config=None,
+):
     config = _build_eval_mcts_config(config)
+    model1_mcts_config = _build_eval_mcts_config(model1_mcts_config or config)
+    model2_mcts_config = _build_eval_mcts_config(model2_mcts_config or config)
     rl_cfg = config.get("reinforcement_learning", {})
     central_min_games = max(1, int(rl_cfg.get("eval_central_inference_min_games", 2) or 2))
     if _eval_uses_central_inference(config, device) and int(num_games) >= central_min_games:
@@ -1451,6 +1577,8 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
             int(num_games),
             game_index_offset=game_index_offset,
             use_fixed_openings=use_fixed_openings,
+            model1_mcts_config=model1_mcts_config,
+            model2_mcts_config=model2_mcts_config,
         )
 
     workers = _resolve_eval_workers(config, device, num_games)
@@ -1467,6 +1595,8 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
                 game_indices,
                 use_fixed_openings=use_fixed_openings,
                 progress_callback=lambda completed, *args: eval_bar.update(int(completed)),
+                model1_mcts_config=model1_mcts_config,
+                model2_mcts_config=model2_mcts_config,
             )
         finally:
             eval_bar.close()
@@ -1501,6 +1631,8 @@ def evaluate_models(model1, model2, config, device, num_games=100, game_index_of
                 game_indices,
                 result_queue,
                 use_fixed_openings,
+                model1_mcts_config,
+                model2_mcts_config,
             ),
         )
         p.start()

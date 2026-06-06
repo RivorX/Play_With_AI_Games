@@ -162,7 +162,7 @@ def _normalize_weight_map(weight_map):
     return {label: (weight / total) for label, weight in normalized.items()}
 
 
-def _bounded_normalize_weight_map(weight_map, min_shares=None, max_shares=None):
+def _bounded_normalize_weight_map(weight_map, min_shares=None, max_shares=None, fallback_label=None):
     """Normalize weights onto a bounded simplex while preserving proportions."""
     labels = [str(label) for label in dict(weight_map or {}).keys()]
     if not labels:
@@ -194,7 +194,13 @@ def _bounded_normalize_weight_map(weight_map, min_shares=None, max_shares=None):
         upper = {label: max(float(lower[label]), float(upper[label])) for label in labels}
     upper_total = float(sum(upper.values()))
     if upper_total < 1.0:
-        upper = {label: 1.0 for label in labels}
+        fallback_label = str(fallback_label or "")
+        if fallback_label not in upper:
+            fallback_label = "current" if "current" in upper else labels[0]
+        upper[fallback_label] = min(
+            1.0,
+            float(upper[fallback_label]) + (1.0 - upper_total),
+        )
 
     assigned = {}
     free = set(labels)
@@ -229,7 +235,151 @@ def _bounded_normalize_weight_map(weight_map, min_shares=None, max_shares=None):
             free.remove(label)
         remaining = max(0.0, remaining)
 
-    return _normalize_weight_map(assigned)
+    assigned_total = float(sum(assigned.values()))
+    if assigned_total < 1.0 - eps:
+        remaining = 1.0 - assigned_total
+        fallback_label = str(fallback_label or "")
+        preferred = [fallback_label] if fallback_label in assigned else []
+        preferred.extend(label for label in labels if label not in preferred)
+        for label in preferred:
+            capacity = max(0.0, float(upper[label]) - float(assigned.get(label, 0.0)))
+            if capacity <= eps:
+                continue
+            extra = min(remaining, capacity)
+            assigned[label] = float(assigned.get(label, 0.0)) + extra
+            remaining -= extra
+            if remaining <= eps:
+                break
+    elif assigned_total > 1.0 + eps:
+        excess = assigned_total - 1.0
+        fallback_label = str(fallback_label or "")
+        preferred = [label for label in labels if label != fallback_label]
+        if fallback_label in assigned:
+            preferred.append(fallback_label)
+        for label in preferred:
+            removable = max(0.0, float(assigned.get(label, 0.0)) - float(lower[label]))
+            if removable <= eps:
+                continue
+            take = min(excess, removable)
+            assigned[label] = float(assigned.get(label, 0.0)) - take
+            excess -= take
+            if excess <= eps:
+                break
+
+    assigned_total = float(sum(assigned.values()))
+    if assigned_total <= eps:
+        return _normalize_weight_map(base)
+    if abs(assigned_total - 1.0) > 1e-7:
+        # Bounds may be infeasible in a bad config. Preserve a valid simplex as
+        # a final fallback instead of returning weights that do not sum to one.
+        return _normalize_weight_map(assigned)
+    return {label: float(assigned.get(label, 0.0)) for label in labels}
+
+
+def _limit_weight_share_shift(weight_map, previous_weight_map, max_delta):
+    """Move bucket shares toward the new target without abrupt iteration jumps."""
+    target = _normalize_weight_map(weight_map)
+    labels = [str(label) for label in target.keys()]
+    if not labels:
+        return target, 1.0
+
+    try:
+        max_delta = float(max_delta)
+    except Exception:
+        max_delta = 1.0
+    if max_delta <= 0.0 or max_delta >= 1.0:
+        return target, 1.0
+
+    previous_raw = {
+        label: max(0.0, float(dict(previous_weight_map or {}).get(label, 0.0)))
+        for label in labels
+    }
+    previous_total = float(sum(previous_raw.values()))
+    if previous_total <= 0.0:
+        return target, 1.0
+    previous = {
+        label: float(value) / previous_total
+        for label, value in previous_raw.items()
+    }
+
+    largest_shift = max(
+        abs(float(target.get(label, 0.0)) - float(previous.get(label, 0.0)))
+        for label in labels
+    )
+    if largest_shift <= max_delta:
+        return target, 1.0
+
+    alpha = max(0.0, min(1.0, max_delta / max(1e-8, largest_shift)))
+    limited = {
+        label: (
+            float(previous.get(label, 0.0))
+            + alpha * (float(target.get(label, 0.0)) - float(previous.get(label, 0.0)))
+        )
+        for label in labels
+    }
+    return _normalize_weight_map(limited), float(alpha)
+
+
+def _promotion_transition_progress(scheduler_state):
+    state = dict(scheduler_state or {})
+    total = max(0, int(state.get("promotion_transition_total", 0) or 0))
+    remaining = max(0, int(state.get("promotion_transition_remaining", 0) or 0))
+    if total <= 0 or remaining <= 0:
+        return 1.0
+    return max(0.0, min(1.0, float(total - remaining + 1) / float(total)))
+
+
+def _advance_promotion_transition(scheduler_state):
+    if not isinstance(scheduler_state, dict):
+        return
+    remaining = max(0, int(scheduler_state.get("promotion_transition_remaining", 0) or 0))
+    if remaining > 0:
+        scheduler_state["promotion_transition_remaining"] = remaining - 1
+
+
+def note_opponent_scheduler_best_promotion(scheduler_state, transition_iterations=0):
+    """Rebase scheduler state after the identity behind the ``best`` label changes."""
+    state = scheduler_state if isinstance(scheduler_state, dict) else {}
+    for history_key in (
+        "score_history",
+        "bucket_score_history",
+        "score_history_exact",
+        "draw_history_exact",
+        "games_history_exact",
+        "bucket_draw_history",
+    ):
+        history = dict(state.get(history_key, {}) or {})
+        history.pop("best", None)
+        state[history_key] = history
+
+    previous_weights = dict(state.get("last_source_weights", {}) or {})
+    if previous_weights:
+        previous_weights["anchor"] = 0.0
+        state["last_source_weights"] = _normalize_weight_map(previous_weights)
+    state["best_generation"] = int(state.get("best_generation", 0) or 0) + 1
+    state["promotion_transition_total"] = max(0, int(transition_iterations or 0))
+    state["promotion_transition_remaining"] = max(0, int(transition_iterations or 0))
+    return state
+
+
+def _cap_combined_share(weight_map, capped_labels, max_share, fallback_label="current"):
+    normalized = _normalize_weight_map(weight_map)
+    max_share = max(0.0, min(1.0, float(max_share)))
+    labels = {str(label) for label in list(capped_labels or [])}
+    capped_total = float(sum(normalized.get(label, 0.0) for label in labels))
+    if capped_total <= max_share + 1e-9:
+        return normalized
+
+    scale = max_share / max(1e-8, capped_total)
+    adjusted = dict(normalized)
+    removed = 0.0
+    for label in labels:
+        old_value = float(adjusted.get(label, 0.0))
+        new_value = old_value * scale
+        adjusted[label] = new_value
+        removed += old_value - new_value
+    adjusted[str(fallback_label)] = float(adjusted.get(str(fallback_label), 0.0)) + removed
+    return _normalize_weight_map(adjusted)
 
 
 def _canonicalize_opponent_bucket(label):
@@ -477,7 +627,27 @@ def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None)
     current_min_fraction = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_current_min_fraction', 0.50))))
     current_max_fraction = max(current_min_fraction, min(1.0, float(rl_cfg.get('self_play_opponent_current_max_fraction', 1.0))))
     best_min_fraction = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_best_min_fraction', 0.0))))
+    best_max_fraction = max(best_min_fraction, min(1.0, float(rl_cfg.get('self_play_opponent_best_max_fraction', 1.0))))
+    anchor_min_fraction = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_anchor_min_fraction', 0.0))))
+    anchor_max_fraction = max(anchor_min_fraction, min(1.0, float(rl_cfg.get('self_play_opponent_anchor_max_fraction', 1.0))))
     recent_max_fraction = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_recent_max_fraction', 1.0))))
+    max_share_delta = max(0.0, min(1.0, float(rl_cfg.get('self_play_opponent_adaptive_max_share_delta', 1.0))))
+    frozen_max_fraction = max(
+        0.0,
+        min(1.0, float(rl_cfg.get('self_play_opponent_frozen_max_fraction', 1.0))),
+    )
+    promotion_transition_progress = _promotion_transition_progress(scheduler_state)
+    promotion_transition_active = promotion_transition_progress < 1.0
+    if promotion_transition_active:
+        current_min_fraction = max(
+            current_min_fraction,
+            max(
+                0.0,
+                min(1.0, float(rl_cfg.get('self_play_post_promotion_current_min_fraction', current_min_fraction))),
+            ),
+        )
+        anchor_min_fraction *= promotion_transition_progress
+        anchor_max_fraction *= promotion_transition_progress
 
     adjusted = {}
     debug_factors = {}
@@ -496,6 +666,8 @@ def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None)
             )
         adjusted[label] = base_weight * factor
         debug_factors[label] = float(factor)
+    if "anchor" in adjusted and promotion_transition_active:
+        adjusted["anchor"] *= promotion_transition_progress
 
     total_weight = float(sum(adjusted.values()))
     if total_weight <= 0.0:
@@ -507,13 +679,37 @@ def _compute_adaptive_opponent_weights(rl_cfg, candidates, scheduler_state=None)
         max_shares["current"] = current_max_fraction
     if "best" in adjusted:
         min_shares["best"] = best_min_fraction
+        max_shares["best"] = best_max_fraction
+    if "anchor" in adjusted:
+        min_shares["anchor"] = anchor_min_fraction
+        max_shares["anchor"] = anchor_max_fraction
     if "recent" in adjusted:
         max_shares["recent"] = recent_max_fraction
     normalized = _bounded_normalize_weight_map(
         adjusted,
         min_shares=min_shares,
         max_shares=max_shares,
+        fallback_label="current",
     )
+    normalized = _cap_combined_share(
+        normalized,
+        capped_labels=("best", "anchor", "recent"),
+        max_share=frozen_max_fraction,
+        fallback_label="current",
+    )
+    normalized, shift_alpha = _limit_weight_share_shift(
+        normalized,
+        scheduler_state.get("last_source_weights", {}) or {},
+        max_share_delta,
+    )
+    normalized = _cap_combined_share(
+        normalized,
+        capped_labels=("best", "anchor", "recent"),
+        max_share=frozen_max_fraction,
+        fallback_label="current",
+    )
+    debug_factors["_share_shift_alpha"] = float(shift_alpha)
+    debug_factors["_promotion_transition_progress"] = float(promotion_transition_progress)
     return normalized, debug_factors
 
 
@@ -772,6 +968,12 @@ def _build_selfplay_opponent_assignments(
         candidates,
         scheduler_state=adaptive_scheduler_state,
     )
+    if isinstance(adaptive_scheduler_state, dict):
+        adaptive_scheduler_state["last_source_weights"] = {
+            str(label): float(weight)
+            for label, weight in dict(source_weights or {}).items()
+        }
+        _advance_promotion_transition(adaptive_scheduler_state)
 
     total_games = int(sum(max(0, int(games)) for _, games in worker_specs))
     if total_games <= 0:
@@ -830,6 +1032,7 @@ def _build_selfplay_opponent_assignments(
     assigned_counts = defaultdict(int)
     debug_info = {
         "source_weights": {str(k): float(v) for k, v in source_weights.items()},
+        "adaptive_factors": {str(k): float(v) for k, v in _adaptive_debug.items()},
         "target_games": {str(k): int(v) for k, v in target_games.items()},
         "selected_recent_pool": [],
         "recent_pool_all": [],

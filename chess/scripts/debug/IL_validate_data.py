@@ -3,16 +3,16 @@ Chess Data Validation Script
 Validates preprocessed binary data for quality, integrity, and correctness.
 
 Usage (from project root or anywhere):
-    python chess/scripts/debug/validate_data.py                    # Validate all files
-    python chess/scripts/debug/validate_data.py --file data.bin    # Validate specific file
-    python chess/scripts/debug/validate_data.py --quick            # Quick validation (fewer samples)
+    python chess/scripts/debug/IL_validate_data.py                    # Validate all files
+    python chess/scripts/debug/IL_validate_data.py --file data.bin    # Validate specific file
+    python chess/scripts/debug/IL_validate_data.py --quick            # Quick validation (fewer samples)
 """
 
 import sys
 from pathlib import Path
 
 # Add project root to path
-# If script is in chess/scripts/debug/validate_data.py, go up 3 levels to project root
+# If script is in chess/scripts/debug/IL_validate_data.py, go up 3 levels to project root
 script_dir = Path(__file__).parent
 project_root = script_dir.parent.parent.parent
 sys.path.insert(0, str(project_root))
@@ -119,7 +119,7 @@ class DataValidator:
         
         # Load config (config_path is relative to project root)
         # Find project root from script location
-        # chess/scripts/debug/validate_data.py -> go up 3 levels
+        # chess/scripts/debug/IL_validate_data.py -> go up 3 levels
         script_dir = Path(__file__).parent
         project_root = script_dir.parent.parent.parent
         config_abs_path = project_root / config_path
@@ -529,10 +529,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples (run from project root):
-  python chess/scripts/debug/validate_data.py                    # Validate all files
-  python chess/scripts/debug/validate_data.py --file data.bin    # Validate specific file
-  python chess/scripts/debug/validate_data.py --quick            # Quick validation (fewer samples)
-  python chess/scripts/debug/validate_data.py --file data.bin --quick
+  python chess/scripts/debug/IL_validate_data.py                    # Validate all files
+  python chess/scripts/debug/IL_validate_data.py --file data.bin    # Validate specific file
+  python chess/scripts/debug/IL_validate_data.py --quick            # Quick validation (fewer samples)
+  python chess/scripts/debug/IL_validate_data.py --file data.bin --quick
         """
     )
     
@@ -551,7 +551,7 @@ Examples (run from project root):
     args = parser.parse_args()
     
     # Get project root
-    # If script is in chess/scripts/debug/validate_data.py, go up 3 levels
+    # If script is in chess/scripts/debug/IL_validate_data.py, go up 3 levels
     script_dir = Path(__file__).parent
     project_root = script_dir.parent.parent.parent
     
