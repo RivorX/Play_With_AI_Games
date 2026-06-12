@@ -134,28 +134,20 @@ def _build_eval_central_server_config(config):
 
 
 def _build_eval_mcts_config(config):
-    """Build deterministic eval MCTS settings.
-
-    Eval can optionally early-stop obviously decided roots, but adaptive budget
-    expansion stays disabled so promotion comparisons remain predictable.
-    """
+    """Build deterministic eval MCTS settings."""
     eval_config = dict(config)
     rl_cfg = dict(config.get("reinforcement_learning", {}))
-    eval_early_stop = bool(rl_cfg.get("eval_mcts_search_early_stop_enabled", False))
-    rl_cfg["mcts_search_early_stop_enabled"] = eval_early_stop
-    if eval_early_stop:
-        eval_early_stop_overrides = {
-            "eval_mcts_search_early_stop_min_top_visit_prob": "mcts_search_early_stop_min_top_visit_prob",
-            "eval_mcts_search_early_stop_min_visit_gap": "mcts_search_early_stop_min_visit_gap",
-            "eval_mcts_search_early_stop_max_visit_entropy": "mcts_search_early_stop_max_visit_entropy",
-            "eval_mcts_search_early_stop_min_budget_fraction": "mcts_search_early_stop_min_budget_fraction",
-            "eval_mcts_search_early_stop_min_explored_prior_mass": "mcts_search_early_stop_min_explored_prior_mass",
-            "eval_mcts_search_early_stop_min_visited_moves": "mcts_search_early_stop_min_visited_moves",
-        }
-        for eval_key, mcts_key in eval_early_stop_overrides.items():
-            if eval_key in rl_cfg:
-                rl_cfg[mcts_key] = rl_cfg[eval_key]
-    rl_cfg["mcts_adaptive_search_enabled"] = False
+    eval_scout_overrides = {
+        "eval_mcts_scout_simulations": "mcts_scout_simulations",
+        "eval_mcts_scout_easy_top_visit_prob": "mcts_scout_easy_top_visit_prob",
+        "eval_mcts_scout_easy_visit_gap": "mcts_scout_easy_visit_gap",
+        "eval_mcts_scout_easy_max_entropy": "mcts_scout_easy_max_entropy",
+        "eval_mcts_scout_easy_min_explored_prior_mass": "mcts_scout_easy_min_explored_prior_mass",
+        "eval_mcts_scout_easy_min_visited_moves": "mcts_scout_easy_min_visited_moves",
+    }
+    for eval_key, mcts_key in eval_scout_overrides.items():
+        rl_cfg[mcts_key] = rl_cfg[eval_key]
+    rl_cfg["mcts_scout_challenge_fraction"] = 0.0
     eval_config["reinforcement_learning"] = rl_cfg
     return eval_config
 
@@ -1337,6 +1329,9 @@ def train_on_batch_rl(
     value_weight_override=None,
     policy_weight_override=None,
     anchor_model=None,
+    best_model_anchor=None,
+    best_policy_kl_weight_override=None,
+    best_value_distill_weight_override=None,
 ):
     if len(batch) >= 7:
         boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights = batch[:7]
@@ -1380,10 +1375,30 @@ def train_on_batch_rl(
         0.0,
         float(config.get("reinforcement_learning", {}).get("policy_anchor_kl_weight", 0.0)),
     )
+    best_policy_kl_weight = max(
+        0.0,
+        float(
+            config.get("reinforcement_learning", {}).get("post_promotion_best_policy_kl_weight", 0.0)
+            if best_policy_kl_weight_override is None
+            else best_policy_kl_weight_override
+        ),
+    )
+    best_value_distill_weight = max(
+        0.0,
+        float(
+            config.get("reinforcement_learning", {}).get("post_promotion_best_value_distill_weight", 0.0)
+            if best_value_distill_weight_override is None
+            else best_value_distill_weight_override
+        ),
+    )
 
     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
         policy_pred, value_pred = model(boards)
         policy_anchor_kl_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        best_policy_kl_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        best_value_distill_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        best_policy_pred = None
+        best_value_pred = None
         if anchor_model is not None and policy_anchor_kl_weight > 0.0:
             with torch.no_grad():
                 anchor_policy_pred, _anchor_value_pred = anchor_model(boards)
@@ -1391,6 +1406,16 @@ def train_on_batch_rl(
             policy_anchor_kl_loss = (
                 anchor_policy_probs * (anchor_policy_pred.detach() - policy_pred)
             ).sum(dim=1).mean()
+        if best_model_anchor is not None and (
+            best_policy_kl_weight > 0.0 or best_value_distill_weight > 0.0
+        ):
+            with torch.no_grad():
+                best_policy_pred, best_value_pred = best_model_anchor(boards)
+            if best_policy_kl_weight > 0.0:
+                best_policy_probs = torch.exp(best_policy_pred.detach())
+                best_policy_kl_loss = (
+                    best_policy_probs * (best_policy_pred.detach() - policy_pred)
+                ).sum(dim=1).mean()
         value_pred_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
         target_value_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
         value_std_floor_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
@@ -1462,6 +1487,21 @@ def train_on_batch_rl(
                 target_std_floor = target_value_std.detach().to(dtype=value_scalar_std.dtype) * value_std_floor_target_ratio
                 std_shortfall = torch.relu(target_std_floor - value_scalar_std)
                 value_std_floor_loss = std_shortfall * std_shortfall
+            if best_value_pred is not None and best_value_distill_weight > 0.0:
+                if best_value_pred.dim() == 2 and best_value_pred.size(1) == 3:
+                    best_value_probs = torch.softmax(best_value_pred.detach(), dim=1)
+                    best_value_scalar = best_value_probs[:, 0] - best_value_probs[:, 2]
+                else:
+                    best_value_scalar = best_value_pred.detach().squeeze()
+                best_value_distill_loss = _weighted_mean(
+                    F.smooth_l1_loss(
+                        value_scalar,
+                        best_value_scalar.to(dtype=value_scalar.dtype),
+                        reduction="none",
+                        beta=0.20,
+                    ),
+                    value_sample_weights,
+                )
         else:
             value_loss = (value_pred.squeeze() - target_scalar) ** 2
             value_scalar = value_pred.squeeze()
@@ -1471,6 +1511,21 @@ def train_on_batch_rl(
                 target_std_floor = target_value_std.detach().to(dtype=value_scalar_std.dtype) * value_std_floor_target_ratio
                 std_shortfall = torch.relu(target_std_floor - value_scalar_std)
                 value_std_floor_loss = std_shortfall * std_shortfall
+            if best_value_pred is not None and best_value_distill_weight > 0.0:
+                if best_value_pred.dim() == 2 and best_value_pred.size(1) == 3:
+                    best_value_probs = torch.softmax(best_value_pred.detach(), dim=1)
+                    best_value_scalar = best_value_probs[:, 0] - best_value_probs[:, 2]
+                else:
+                    best_value_scalar = best_value_pred.detach().squeeze()
+                best_value_distill_loss = _weighted_mean(
+                    F.smooth_l1_loss(
+                        value_scalar,
+                        best_value_scalar.to(dtype=value_scalar.dtype),
+                        reduction="none",
+                        beta=0.20,
+                    ),
+                    value_sample_weights,
+                )
 
         if policy_loss.numel() == 0:
             policy_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
@@ -1496,6 +1551,8 @@ def train_on_batch_rl(
             + value_weight * value_loss
             + value_std_floor_loss_weight * value_std_floor_loss
             + policy_anchor_kl_weight * policy_anchor_kl_loss
+            + best_policy_kl_weight * best_policy_kl_loss
+            + best_value_distill_weight * best_value_distill_loss
         )
 
         policy_probs = torch.exp(policy_pred)

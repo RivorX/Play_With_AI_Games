@@ -129,14 +129,14 @@ class TrainingLogger:
                 header = [
                     'epoch', 'train_loss', 'train_policy_loss', 'train_value_loss',
                     'val_loss', 'val_policy_loss', 'val_value_loss', 'learning_rate',
-                    # 📊 NEW: Metrics
+                    # NEW: Metrics
                     'train_policy_top1', 'train_policy_top3',
                     'train_value_mae', 'train_value_mae_weighted',
                     'train_value_wdl_acc', 'train_value_wdl_ce',
                     'val_policy_top1', 'val_policy_top3',
                     'val_value_mae', 'val_value_mae_weighted',
                     'val_value_wdl_acc', 'val_value_wdl_ce',
-                    # 🆕 Elo estimation
+                    # Elo estimation
                     'estimated_elo',
                     'train_val_loss_gap',
                     'policy_top1_gap',
@@ -164,13 +164,13 @@ class TrainingLogger:
                     'no_mcts_draw_rate', 'no_mcts_loss_rate',
                     'no_mcts_wins', 'no_mcts_draws', 'no_mcts_losses', 'no_mcts_unresolved',
                     'anchor_score_rate', 'anchor_true_win_rate', 'anchor_wins', 'anchor_draws', 'anchor_losses',
-                    # 📊 NEW: Metrics
+                    # NEW: Metrics
                     'policy_top1_acc', 'policy_top3_acc',
                     'value_mae', 'value_mae_weighted',
                     'value_wdl_acc', 'value_wdl_ce',
                     'value_mae_opening', 'value_mae_middlegame', 'value_mae_endgame',
                     'value_samples_opening', 'value_samples_middlegame', 'value_samples_endgame',
-                    # 🧠 RL headline telemetry
+                    # RL headline telemetry
                     'completed_draw_rate',
                     'avg_game_value', 'value_std',
                     'policy_entropy', 'value_pred_std',
@@ -202,7 +202,7 @@ class TrainingLogger:
         self.train_value_losses = []
         self.val_value_losses = []
         
-        # 📊 NEW: Metrics storage
+        # NEW: Metrics storage
         self.train_policy_top1 = []
         self.train_policy_top3 = []
         self.train_value_mae = []
@@ -216,7 +216,7 @@ class TrainingLogger:
         self.val_value_wdl_acc = []
         self.val_value_wdl_ce = []
         
-        # 🆕 Elo estimation storage
+        # Elo estimation storage
         self.estimated_elos = []  # (epoch, elo) tuples
         self._pending_rl_elo_by_iteration = {}
         self.best_final_elo_info = None  # (epoch, elo) for exact final best-model Elo
@@ -291,7 +291,7 @@ class TrainingLogger:
                 'queue_wait_time_ms',
                 'mcts_search_selection_time_s',
                 'mcts_search_backprop_time_s',
-                'mcts_search_adaptive_stop_time_s',
+                'mcts_search_scout_classify_time_s',
                 'mcts_search_metadata_time_s',
                 'mcts_batch_expand_eval_time_s',
                 'mcts_batch_expand_eval_calls',
@@ -424,14 +424,14 @@ class TrainingLogger:
                     'opponent_recent_results_json',
                     'opponent_promotion_transition_progress',
                     'mcts_dirichlet_weight',
-                    'mcts_dirichlet_discovery_scale',
-                    'mcts_discovery_probe_fraction',
-                    'mcts_discovery_probe_raw_fraction',
-                    'mcts_discovery_probe_cap_fraction',
-                    'mcts_discovery_probe_q_gate_ok',
-                    'mcts_discovery_probe_used_rate',
-                    'mcts_discovery_probe_changed_rate',
-                    'mcts_discovery_probe_score_mean',
+                    'mcts_dirichlet_scout_scale',
+                    'mcts_scout_challenge_fraction',
+                    'mcts_scout_challenge_raw_fraction',
+                    'mcts_scout_challenge_cap_fraction',
+                    'mcts_scout_challenge_eligible_rate',
+                    'mcts_scout_challenge_used_rate',
+                    'mcts_scout_challenge_changed_rate',
+                    'mcts_scout_challenge_score_mean',
                     'mcts_avg_sims',
                     'mcts_avg_budget',
                     'mcts_budget_p10',
@@ -440,21 +440,24 @@ class TrainingLogger:
                     'mcts_budget_max',
                     'mcts_p10_sims',
                     'mcts_extra_budget_rate',
-                    'mcts_adaptive_stop_rate',
+                    'mcts_scout_stop_rate',
                     'mcts_prior_agreement_samples',
                     'mcts_prior_agreement_rate',
                     'mcts_prior_changed_rate',
                     'mcts_changed_opening_rate',
                     'mcts_changed_middlegame_rate',
                     'mcts_changed_endgame_rate',
-                    'mcts_discovery_probe_used_opening_rate',
-                    'mcts_discovery_probe_used_middlegame_rate',
-                    'mcts_discovery_probe_used_endgame_rate',
-                    'mcts_discovery_probe_changed_opening_rate',
-                    'mcts_discovery_probe_changed_middlegame_rate',
-                    'mcts_discovery_probe_changed_endgame_rate',
-                    'mcts_search_discovery_rate',
-                    'mcts_search_discovery_weight_mean',
+                    'mcts_scout_challenge_eligible_opening_rate',
+                    'mcts_scout_challenge_eligible_middlegame_rate',
+                    'mcts_scout_challenge_eligible_endgame_rate',
+                    'mcts_scout_challenge_used_opening_rate',
+                    'mcts_scout_challenge_used_middlegame_rate',
+                    'mcts_scout_challenge_used_endgame_rate',
+                    'mcts_scout_challenge_changed_opening_rate',
+                    'mcts_scout_challenge_changed_middlegame_rate',
+                    'mcts_scout_challenge_changed_endgame_rate',
+                    'mcts_search_change_rate',
+                    'mcts_search_change_weight_mean',
                     'mcts_policy_uptake_weight_mean',
                     'mcts_policy_uptake_low_rate',
                     'mcts_q_delta_samples',
@@ -547,9 +550,9 @@ class TrainingLogger:
         self.final_notes = []
         # Optional epoch markers drawn on IL Elo chart (e.g. SWA final epoch).
         self.elo_epoch_markers = []  # (epoch, label)
-        # 🆕 SWA elo stored separately for distinct visual treatment in plots.
+        # SWA elo stored separately for distinct visual treatment in plots.
         self.swa_elo_info = None  # (epoch, elo) or None
-        # 🆕 Full SWA metrics for summary panel.
+        # Full SWA metrics for summary panel.
         self.swa_metrics = None  # dict: {epoch, val_loss, top1, top3, mae, wdl_acc, wdl_ce, elo}
         
         print(f"Logging to: {self.csv_path}")
@@ -799,7 +802,7 @@ class TrainingLogger:
             _value('queue_wait_time_ms'),
             _value('mcts_search_selection_time'),
             _value('mcts_search_backprop_time'),
-            _value('mcts_search_adaptive_stop_time'),
+            _value('mcts_search_scout_classify_time'),
             _value('mcts_search_metadata_time'),
             _value('mcts_batch_expand_eval_time'),
             _value('mcts_batch_expand_eval_calls'),
@@ -1224,7 +1227,7 @@ class TrainingLogger:
         for column, label, color, style in [
             ('mcts_search_selection_time_s', 'Selection', colors['blue'], '-'),
             ('mcts_search_backprop_time_s', 'Backprop', colors['slate'], '--'),
-            ('mcts_search_adaptive_stop_time_s', 'Adaptive stop', colors['orange'], '-.'),
+            ('mcts_search_scout_classify_time_s', 'Scout classify', colors['orange'], '-.'),
             ('mcts_search_metadata_time_s', 'Metadata', colors['green'], ':'),
         ]:
             _plot(ax, column, label, color, style=style, marker=None, linewidth=1.8, alpha=0.9)
@@ -1620,14 +1623,14 @@ class TrainingLogger:
             opponent_recent_results_json,
             opponent_adaptive_factors.get('_promotion_transition_progress', None),
             _value(selfplay_stats, 'mcts_dirichlet_weight'),
-            _value(selfplay_stats, 'mcts_dirichlet_discovery_scale'),
-            _value(selfplay_stats, 'mcts_discovery_probe_fraction'),
-            _value(selfplay_stats, 'mcts_discovery_probe_raw_fraction'),
-            _value(selfplay_stats, 'mcts_discovery_probe_cap_fraction'),
-            _value(selfplay_stats, 'mcts_discovery_probe_q_gate_ok'),
-            _value(selfplay_stats, 'mcts_discovery_probe_used_rate'),
-            _value(selfplay_stats, 'mcts_discovery_probe_changed_rate'),
-            _value(selfplay_stats, 'mcts_discovery_probe_score_mean'),
+            _value(selfplay_stats, 'mcts_dirichlet_scout_scale'),
+            _value(selfplay_stats, 'mcts_scout_challenge_fraction'),
+            _value(selfplay_stats, 'mcts_scout_challenge_raw_fraction'),
+            _value(selfplay_stats, 'mcts_scout_challenge_cap_fraction'),
+            _value(selfplay_stats, 'mcts_scout_challenge_eligible_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_used_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_changed_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_score_mean'),
             _value(selfplay_stats, 'search_simulations_used_avg'),
             _value(selfplay_stats, 'search_simulations_budget_avg'),
             _value(selfplay_stats, 'search_simulations_budget_p10'),
@@ -1636,21 +1639,24 @@ class TrainingLogger:
             _value(selfplay_stats, 'search_simulations_budget_max'),
             _value(selfplay_stats, 'search_simulations_used_p10'),
             _value(selfplay_stats, 'search_extra_budget_rate'),
-            _value(selfplay_stats, 'adaptive_stop_rate'),
+            _value(selfplay_stats, 'scout_stop_rate'),
             _value(selfplay_stats, 'mcts_prior_agreement_samples'),
             _value(selfplay_stats, 'mcts_prior_agreement_rate'),
             _value(selfplay_stats, 'mcts_prior_changed_rate'),
             _value(selfplay_stats, 'mcts_changed_opening_rate'),
             _value(selfplay_stats, 'mcts_changed_middlegame_rate'),
             _value(selfplay_stats, 'mcts_changed_endgame_rate'),
-            _value(selfplay_stats, 'mcts_discovery_probe_used_opening_rate'),
-            _value(selfplay_stats, 'mcts_discovery_probe_used_middlegame_rate'),
-            _value(selfplay_stats, 'mcts_discovery_probe_used_endgame_rate'),
-            _value(selfplay_stats, 'mcts_discovery_probe_changed_opening_rate'),
-            _value(selfplay_stats, 'mcts_discovery_probe_changed_middlegame_rate'),
-            _value(selfplay_stats, 'mcts_discovery_probe_changed_endgame_rate'),
-            _value(selfplay_stats, 'mcts_search_discovery_rate'),
-            _value(selfplay_stats, 'mcts_search_discovery_weight_mean'),
+            _value(selfplay_stats, 'mcts_scout_challenge_eligible_opening_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_eligible_middlegame_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_eligible_endgame_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_used_opening_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_used_middlegame_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_used_endgame_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_changed_opening_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_changed_middlegame_rate'),
+            _value(selfplay_stats, 'mcts_scout_challenge_changed_endgame_rate'),
+            _value(selfplay_stats, 'mcts_search_change_rate'),
+            _value(selfplay_stats, 'mcts_search_change_weight_mean'),
             _value(selfplay_stats, 'mcts_policy_uptake_weight_mean'),
             _value(selfplay_stats, 'mcts_policy_uptake_low_rate'),
             _value(selfplay_stats, 'mcts_q_delta_samples'),
@@ -2042,6 +2048,49 @@ class TrainingLogger:
             if percent:
                 ax.yaxis.set_major_formatter(PercentFormatter(1.0))
 
+        def _promotion_markers_from_main():
+            markers = []
+            for row in main_rows:
+                marker = str(row.get('rl_best_model', '') or '').strip().lower()
+                if marker not in {'1', 'true', 'yes', 'y'}:
+                    continue
+                try:
+                    iteration = int(float(row.get('iteration', '')))
+                except (TypeError, ValueError):
+                    continue
+                markers.append((iteration, f"Best {iteration}"))
+            return markers
+
+        def _draw_promotion_boundaries(ax):
+            markers = _promotion_markers_from_main()
+            if not markers:
+                return
+            y_min, y_max = ax.get_ylim()
+            label_added = False
+            for iteration, label in markers:
+                x = float(iteration) + 0.5
+                ax.axvline(
+                    x=x,
+                    color='#6B7280',
+                    linestyle='--',
+                    linewidth=2.0,
+                    alpha=0.82,
+                    label='New best model' if not label_added else None,
+                    zorder=1,
+                )
+                ax.text(
+                    x,
+                    y_max - (y_max - y_min) * 0.04,
+                    label,
+                    rotation=90,
+                    va='top',
+                    ha='right',
+                    fontsize=7,
+                    color='#4B5563',
+                    alpha=0.86,
+                )
+                label_added = True
+
         def _plot(ax, column, label, color, style='-', marker=None, linewidth=2.0, alpha=0.95):
             xs, ys = _series(column)
             if xs:
@@ -2262,11 +2311,11 @@ class TrainingLogger:
             changed_xs, changed_yield = _series_scaled_ratio_from_rows(rows, 'mcts_prior_changed_rate', 'mcts_avg_sims', 100.0)
             if changed_xs:
                 ax.plot(changed_xs, changed_yield, linestyle='-', linewidth=2.2, color=colors['orange'], label='Changed / 100 sims')
-        discovery_xs, discovery_yield = _series_scaled_ratio_from_rows(rows, 'mcts_search_discovery_rate', 'mcts_avg_sims', 100.0)
-        if discovery_xs:
-            ax.plot(discovery_xs, discovery_yield, linestyle='--', linewidth=2.0, color=colors['green'], label='Discovery / 100 sims')
+        change_xs, change_yield = _series_scaled_ratio_from_rows(rows, 'mcts_search_change_rate', 'mcts_avg_sims', 100.0)
+        if change_xs:
+            ax.plot(change_xs, change_yield, linestyle='--', linewidth=2.0, color=colors['green'], label='Change / 100 sims')
         _style_axis(ax, 'Search Yield per 100 Sims', 'policy change yield', percent=True)
-        _set_percent_ylim(ax, list(changed_yield) + list(discovery_yield), min_pad=0.002)
+        _set_percent_ylim(ax, list(changed_yield) + list(change_yield), min_pad=0.002)
         ax2 = ax.twinx()
         _, kl_yield = _plot(ax2, 'mcts_kl_per_100_sims', 'KL / 100 sims', colors['purple'], style=':', linewidth=2.0)
         if not kl_yield:
@@ -2368,6 +2417,7 @@ class TrainingLogger:
         _style_axis(ax, 'Replay vs Self-Play Alignment', 'rate gap', percent=True)
         _set_tight_ylim(ax, list(draw_gap) + list(decisive_gap), min_pad=0.03, center_zero=True)
         ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+        _draw_promotion_boundaries(ax)
         ax2 = ax.twinx()
         if value_mean_gap_xs:
             ax2.plot(value_mean_gap_xs, value_mean_gap, linestyle=':', linewidth=2.0, color=colors['purple'], label='Value mean gap')
@@ -2419,8 +2469,9 @@ class TrainingLogger:
             ),
             min_pad=4.0,
         )
+        _draw_promotion_boundaries(ax)
         ax2 = ax.twinx()
-        _, stop_rate = _plot(ax2, 'mcts_adaptive_stop_rate', 'Adaptive stop', colors['orange'], style='-.', linewidth=2.0)
+        _, stop_rate = _plot(ax2, 'mcts_scout_stop_rate', 'Scout stop', colors['orange'], style='-.', linewidth=2.0)
         _, extra_rate = _plot(ax2, 'mcts_extra_budget_rate', 'Extra budget', colors['green'], style='--', linewidth=1.8)
         ax2.set_ylabel('rate')
         ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
@@ -2438,17 +2489,19 @@ class TrainingLogger:
         ax = axes[3, 3]
         probe_phase_values = []
         for column, label, color, style in [
-            ('mcts_discovery_probe_raw_fraction', 'Raw requested', colors['purple'], ':'),
-            ('mcts_discovery_probe_fraction', 'Requested after cap', colors['red'], '--'),
-            ('mcts_discovery_probe_used_rate', 'Probe used all', colors['black'], '-'),
-            ('mcts_discovery_probe_used_opening_rate', 'Probe opening', colors['blue'], '--'),
-            ('mcts_discovery_probe_used_middlegame_rate', 'Probe middlegame', colors['orange'], '-.'),
-            ('mcts_discovery_probe_used_endgame_rate', 'Probe endgame', colors['green'], ':'),
+            ('mcts_scout_challenge_raw_fraction', 'Raw requested', colors['purple'], ':'),
+            ('mcts_scout_challenge_fraction', 'Challenge after cap', colors['red'], '--'),
+            ('mcts_scout_challenge_eligible_rate', 'Eligible all', colors['cyan'], '-.'),
+            ('mcts_scout_challenge_used_rate', 'Challenge all', colors['black'], '-'),
+            ('mcts_scout_challenge_used_opening_rate', 'Challenge opening', colors['blue'], '--'),
+            ('mcts_scout_challenge_used_middlegame_rate', 'Challenge middlegame', colors['orange'], '-.'),
+            ('mcts_scout_challenge_used_endgame_rate', 'Challenge endgame', colors['green'], ':'),
         ]:
             _, values = _plot(ax, column, label, color, style=style, linewidth=2.0)
             probe_phase_values.extend(values)
-        _style_axis(ax, 'Discovery Probe by Phase', 'rate', percent=True)
+        _style_axis(ax, 'Change Probe by Phase', 'rate', percent=True)
         _set_percent_ylim(ax, probe_phase_values, min_pad=0.015)
+        _draw_promotion_boundaries(ax)
         if ax.get_legend_handles_labels()[0]:
             _apply_sorted_legend(ax, loc='best', fontsize=8)
 
@@ -2465,6 +2518,7 @@ class TrainingLogger:
         _style_axis(ax, 'Changed Move Q Delta Distribution', 'Q delta')
         _set_tight_ylim(ax, q_delta_values, min_pad=0.005, center_zero=True)
         ax.axhline(0.0, color=colors['black'], linestyle=':', linewidth=1.0, alpha=0.45)
+        _draw_promotion_boundaries(ax)
         if ax.get_legend_handles_labels()[0]:
             _apply_sorted_legend(ax, loc='best', fontsize=8)
 
@@ -2510,6 +2564,7 @@ class TrainingLogger:
         if eval_values:
             _set_percent_ylim(ax, eval_values, min_pad=0.04, include=[0.5])
         ax.axhline(0.5, color=colors['black'], linestyle=':', linewidth=1.0, alpha=0.5)
+        _draw_promotion_boundaries(ax)
         ax2 = ax.twinx()
         _, gap_values = _plot(ax2, 'eval_mcts_q_ablation_gap', 'Q-on edge vs parity', colors['red'], style='-.', marker='s', linewidth=1.8)
         if gap_values:
@@ -2535,6 +2590,7 @@ class TrainingLogger:
         _style_axis(ax, 'Eval Control Gaps', 'gap', percent=True)
         _set_tight_ylim(ax, eval_gap_values, min_pad=0.03, center_zero=True)
         ax.axhline(0.0, color=colors['black'], linestyle=':', linewidth=1.0, alpha=0.5)
+        _draw_promotion_boundaries(ax)
         if ax.get_legend_handles_labels()[0]:
             _apply_sorted_legend(ax, loc='best', fontsize=8)
 
@@ -2548,6 +2604,7 @@ class TrainingLogger:
             ax2.plot(ratio_xs, ratio_ys, color=colors['purple'], linestyle=':', linewidth=1.5, alpha=0.50, label='pred/target')
             ax2.plot(ratio_xs, _ema(ratio_ys, alpha=0.35), color=colors['purple'], linestyle='-', linewidth=2.0, label='ratio EMA')
             ax2.axhline(1.0, color=colors['black'], linestyle=':', linewidth=1.0, alpha=0.45)
+        _draw_promotion_boundaries(ax)
         ax2.set_ylabel('ratio')
         ax2.spines['right'].set_alpha(0.18)
         lines, labels = ax.get_legend_handles_labels()
@@ -2592,6 +2649,7 @@ class TrainingLogger:
         _style_axis(ax, 'Opponent Matchup Scores', 'learner score rate', percent=True)
         _set_percent_ylim(ax, opponent_score_values, min_pad=0.05, include=[0.5])
         ax.axhline(0.5, color=colors['black'], linestyle=':', linewidth=1.0, alpha=0.45)
+        _draw_promotion_boundaries(ax)
         ax2 = ax.twinx()
         for bucket, label, color, style in [
             ('current', 'Current games', colors['blue'], '-'),
@@ -2616,12 +2674,13 @@ class TrainingLogger:
             ('mcts_changed_opening_rate', 'Opening', colors['blue'], '--'),
             ('mcts_changed_middlegame_rate', 'Middlegame', colors['orange'], '-.'),
             ('mcts_changed_endgame_rate', 'Endgame', colors['green'], ':'),
-            ('mcts_discovery_probe_changed_rate', 'Probe changed', colors['purple'], '-'),
+            ('mcts_scout_challenge_changed_rate', 'Challenge changed', colors['purple'], '-'),
         ]:
             _, values = _plot(ax, column, label, color, style=style, linewidth=2.0)
             changed_phase_values.extend(values)
         _style_axis(ax, 'MCTS Changed Top Move by Phase', 'rate', percent=True)
         _set_percent_ylim(ax, changed_phase_values, min_pad=0.015)
+        _draw_promotion_boundaries(ax)
         if ax.get_legend_handles_labels()[0]:
             _apply_sorted_legend(ax, loc='best', fontsize=8)
 
@@ -2655,6 +2714,7 @@ class TrainingLogger:
         _plot_main(ax, 'mcts_q_selection_weight', 'Q selection', colors['green'], style='--', marker='s')
         _plot_main(ax, 'value_loss_weight', 'Value loss weight', colors['orange'], style='-.', marker='s')
         _style_axis(ax, 'Q / Value Control', 'weight')
+        _draw_promotion_boundaries(ax)
         if ax.get_legend_handles_labels()[0]:
             _apply_sorted_legend(ax, loc='best', fontsize=8)
 
@@ -3200,7 +3260,7 @@ class TrainingLogger:
                     ax.axhline(y=ref_elo, color='gray', linestyle=':', alpha=0.4)
                     ax.text(x0, ref_elo + 15, ref_label, fontsize=8, color='gray', alpha=0.6)
 
-        # 🆕 Plot SWA elo as a distinct gold star with annotation
+        # Plot SWA elo as a distinct gold star with annotation
         if self.swa_elo_info:
             sw_ep, sw_elo = self.swa_elo_info
             ax.plot(
@@ -3247,7 +3307,7 @@ class TrainingLogger:
 
         if has_markers:
             for marker_epoch, marker_label in self.elo_epoch_markers:
-                # Skip SWA marker vertical line — the gold star already marks it
+                # Skip SWA marker vertical line - the gold star already marks it
                 if self.swa_elo_info and int(marker_epoch) == swa_epoch:
                     continue
                 ax.axvline(
@@ -3325,7 +3385,7 @@ class TrainingLogger:
                     val_losses['policy'] if val_losses else '',
                     val_losses['value'] if val_losses else '',
                     lr if lr is not None else '',
-                    # 📊 NEW: Metrics
+                    # NEW: Metrics
                     train_metrics.get('policy_top1_acc', '') if train_metrics else '',
                     train_metrics.get('policy_top3_acc', '') if train_metrics else '',
                     train_metrics.get('value_mae', '') if train_metrics else '',
@@ -3340,7 +3400,7 @@ class TrainingLogger:
                     val_metrics.get('value_wdl_ce', '') if val_metrics else ''
                 ]
                 
-                # 🆕 Elo estimation
+                # Elo estimation
                 if estimated_elo is not None:
                     try:
                         row.append(int(round(float(estimated_elo))))
@@ -3437,7 +3497,7 @@ class TrainingLogger:
                     self.val_value_wdl_acc.append(val_metrics.get('value_wdl_acc', 0))
                     self.val_value_wdl_ce.append(val_metrics.get('value_wdl_ce', 0))
                 
-                # 🆕 Elo estimation storage
+                # Elo estimation storage
                 if estimated_elo is not None:
                     # CSV already contains this value in the current row.
                     self.record_estimated_elo(iteration, estimated_elo, update_csv=False)
@@ -3506,7 +3566,7 @@ class TrainingLogger:
                     kwargs.get('anchor_wins', ''),
                     kwargs.get('anchor_draws', ''),
                     kwargs.get('anchor_losses', ''),
-                    # 📊 NEW: Metrics
+                    # NEW: Metrics
                     train_metrics.get('policy_top1_acc', '') if train_metrics else '',
                     train_metrics.get('policy_top3_acc', '') if train_metrics else '',
                     train_metrics.get('value_mae', '') if train_metrics else '',
@@ -3616,7 +3676,7 @@ class TrainingLogger:
         if not self.val_losses or not self.iterations:
             return
 
-        # ── Find best model (min val_loss) ───────────────────────────────
+        # Find best model (min val_loss)
         best_idx = min(range(len(self.val_losses)), key=lambda i: self.val_losses[i])
         best_epoch = self.val_iterations[best_idx] if best_idx < len(self.val_iterations) else self.iterations[best_idx]
 
@@ -3651,10 +3711,10 @@ class TrainingLogger:
 
         swa = self.swa_metrics  # dict or None
 
-        # ── Formatters ───────────────────────────────────────────────────
-        def _fl(v):  return f"{v:.4f}" if v is not None else "—"
-        def _fp(v):  return f"{v:.2%}"  if v is not None else "—"
-        def _fe(v):  return f"{int(round(v))}" if v is not None else "—"
+        # Formatters
+        def _fl(v):  return f"{v:.4f}" if v is not None else "-"
+        def _fp(v):  return f"{v:.2%}"  if v is not None else "-"
+        def _fe(v):  return f"{int(round(v))}" if v is not None else "-"
         def _sv(d, k): return d.get(k) if d else None
 
         def _delta(bv, sv, mode='less', pct=False):
@@ -3664,7 +3724,7 @@ class TrainingLogger:
             s = f"{d:+.2%}" if pct else f"{d:+.4f}"
             good = (d < -1e-6) if mode == 'less' else (d > 1e-6)
             bad  = (d >  1e-6) if mode == 'less' else (d < -1e-6)
-            arrow = "▲" if good else ("▼" if bad else "")
+            arrow = "+" if good else ("-" if bad else "")
             return f"{arrow} {s}".strip() if arrow else s
 
         # Elo delta is special (integer, 'more' is better)
@@ -3672,15 +3732,15 @@ class TrainingLogger:
             if bv is None or sv is None or not sv or not bv:
                 return ""
             d = int(round(sv - bv))
-            arrow = "▲" if d > 0 else ("▼" if d < 0 else "")
+            arrow = "+" if d > 0 else ("-" if d < 0 else "")
             return f"{arrow} {d:+d}".strip() if arrow else f"{d:+d}"
 
-        swa_ep_label = swa.get('epoch', '?') if swa else "—"
+        swa_ep_label = swa.get('epoch', '?') if swa else "-"
         col_labels = [
             "Metric",
             f"Best (ep {best_epoch})",
             f"SWA (ep {swa_ep_label})",
-            "Δ  SWA – Best",
+            "Delta SWA - Best",
         ]
 
         rows_raw = [
@@ -3716,7 +3776,7 @@ class TrainingLogger:
 
         cell_text = [list(r) for r in rows_raw]
 
-        # ── Colour palette ───────────────────────────────────────────────
+        # Colour palette
         C_BEST   = '#2E7D32'   # dark green header
         C_SWA    = '#E65100'   # deep orange header
         C_DELTA  = '#1565C0'   # dark blue header
@@ -3724,14 +3784,14 @@ class TrainingLogger:
         BG_EVEN  = '#F5F5F5'
         BG_ODD   = '#FFFFFF'
         BG_SWA   = '#FFF8E1'   # warm yellow tint for SWA values
-        BG_UP    = '#C8E6C9'   # light green — improvement
-        BG_DOWN  = '#FFCDD2'   # light red   — regression
-        BG_NEUT  = '#E3F2FD'   # light blue  — neutral delta
+        BG_UP    = '#C8E6C9'   # light green - improvement
+        BG_DOWN  = '#FFCDD2'   # light red - regression
+        BG_NEUT  = '#E3F2FD'   # light blue - neutral delta
 
         def _delta_bg(d_str):
-            if '▲' in d_str: return BG_UP
-            if '▼' in d_str: return BG_DOWN
-            if d_str and d_str != "—": return BG_NEUT
+            if '+' in d_str: return BG_UP
+            if '-' in d_str: return BG_DOWN
+            if d_str and d_str != "-": return BG_NEUT
             return BG_ODD
 
         col_colors = [C_METRIC, C_BEST, C_SWA, C_DELTA]
@@ -4273,8 +4333,8 @@ class TrainingLogger:
                     x=x,
                     color='#6B7280',
                     linestyle='--',
-                    linewidth=1.2,
-                    alpha=0.70,
+                    linewidth=2.0,
+                    alpha=0.82,
                     label='New best model' if not label_added else None,
                     zorder=1,
                 )
@@ -4418,6 +4478,7 @@ class TrainingLogger:
         ax.axhline(0.05, color=colors['good'], linestyle=':', linewidth=1.0, alpha=0.55)
         _style_axis(ax, 'MCTS Gap vs No-MCTS', 'Score delta')
         ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+        _draw_rl_best_boundaries(ax)
         _safe_legend(ax, fontsize=8, loc='best')
 
         ax = axes[1, 2]

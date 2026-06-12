@@ -46,21 +46,17 @@ def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict
     eval_config = dict(config)
     elo_config = dict(elo_config or {})
     rl_cfg = dict(config.get("reinforcement_learning", {}))
-    elo_early_stop = bool(elo_config.get("elo_mcts_search_early_stop_enabled", False))
-    rl_cfg["mcts_search_early_stop_enabled"] = elo_early_stop
-    if elo_early_stop:
-        early_stop_overrides = {
-            "elo_mcts_search_early_stop_min_top_visit_prob": "mcts_search_early_stop_min_top_visit_prob",
-            "elo_mcts_search_early_stop_min_visit_gap": "mcts_search_early_stop_min_visit_gap",
-            "elo_mcts_search_early_stop_max_visit_entropy": "mcts_search_early_stop_max_visit_entropy",
-            "elo_mcts_search_early_stop_min_budget_fraction": "mcts_search_early_stop_min_budget_fraction",
-            "elo_mcts_search_early_stop_min_explored_prior_mass": "mcts_search_early_stop_min_explored_prior_mass",
-            "elo_mcts_search_early_stop_min_visited_moves": "mcts_search_early_stop_min_visited_moves",
-        }
-        for elo_key, mcts_key in early_stop_overrides.items():
-            if elo_key in elo_config:
-                rl_cfg[mcts_key] = elo_config[elo_key]
-    rl_cfg["mcts_adaptive_search_enabled"] = False
+    scout_overrides = {
+        "elo_mcts_scout_simulations": "mcts_scout_simulations",
+        "elo_mcts_scout_easy_top_visit_prob": "mcts_scout_easy_top_visit_prob",
+        "elo_mcts_scout_easy_visit_gap": "mcts_scout_easy_visit_gap",
+        "elo_mcts_scout_easy_max_entropy": "mcts_scout_easy_max_entropy",
+        "elo_mcts_scout_easy_min_explored_prior_mass": "mcts_scout_easy_min_explored_prior_mass",
+        "elo_mcts_scout_easy_min_visited_moves": "mcts_scout_easy_min_visited_moves",
+    }
+    for elo_key, mcts_key in scout_overrides.items():
+        rl_cfg[mcts_key] = elo_config[elo_key]
+    rl_cfg["mcts_scout_challenge_fraction"] = 0.0
     eval_config["reinforcement_learning"] = rl_cfg
     return eval_config
 
@@ -183,10 +179,10 @@ def _get_stockfish_download_info() -> tuple[str, str]:
 def _download_stockfish(dest_dir: Path) -> Path:
     """
     Download Stockfish binary to dest_dir and return the path to the executable.
-    Uses only stdlib (urllib) â€” no extra dependencies.
+    Uses only stdlib (urllib) - no extra dependencies.
     """
     if not _HAS_URLLIB:
-        raise RuntimeError("urllib not available â€” cannot auto-download Stockfish.")
+        raise RuntimeError("urllib not available - cannot auto-download Stockfish.")
 
     url, inner_path = _get_stockfish_download_info()
     archive_name = url.rsplit("/", 1)[-1]
@@ -237,10 +233,10 @@ def ensure_stockfish(configured_path: str = "stockfish") -> str:
     """
     Ensure Stockfish is available.  Resolution order:
 
-    1. If configured_path is an absolute path to an existing file â†’ use it.
-    2. If configured_path is on PATH (e.g. "stockfish") â†’ use it.
+    1. If configured_path is an absolute path to an existing file -> use it.
+    2. If configured_path is on PATH (e.g. "stockfish") -> use it.
     3. Check project-local cache  (chess/engines/stockfish*).
-    4. Auto-download from GitHub releases â†’ cache locally.
+    4. Auto-download from GitHub releases -> cache locally.
 
     Returns the path (str) to the Stockfish executable.
     """
@@ -257,7 +253,7 @@ def ensure_stockfish(configured_path: str = "stockfish") -> str:
     # 3. Project-local cache
     # chess/engines/ lives next to chess/scripts/, chess/src/, etc.
     script_dir = Path(__file__).resolve().parent
-    chess_dir = script_dir.parents[2]  # utils/shared â†’ scripts/utils/shared â†’ chess/
+    chess_dir = script_dir.parents[2]  # utils/shared -> scripts/utils/shared -> chess/
     engines_dir = chess_dir / "engines"
 
     # Look for existing cached binary
@@ -268,7 +264,7 @@ def ensure_stockfish(configured_path: str = "stockfish") -> str:
                 return str(candidate)
 
     # 4. Download
-    print("  \u265a Stockfish not found â€” downloading automatically...")
+    print("  Stockfish not found - downloading automatically...")
     try:
         binary = _download_stockfish(engines_dir)
         return str(binary)
@@ -301,7 +297,7 @@ def _performance_rating(opponent_elos: list[float], scores: list[float]) -> floa
     if n == 0:
         return None
     score_pct = total_score / n
-    # Edge cases: perfect score or zero score â†’ cap at Â±800 from avg opponent
+    # Edge cases: perfect score or zero score -> cap at +/-800 from avg opponent
     avg_opp = sum(opponent_elos) / len(opponent_elos)
     if score_pct <= 0.0:
         return avg_opp - 800

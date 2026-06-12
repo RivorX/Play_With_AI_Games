@@ -22,7 +22,7 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
     search_root_setup_time = max(0.0, float(selfplay_profile.get("mcts_search_root_setup_time", 0.0) or 0.0))
     search_selection_time = max(0.0, float(selfplay_profile.get("mcts_search_selection_time", 0.0) or 0.0))
     search_backprop_time = max(0.0, float(selfplay_profile.get("mcts_search_backprop_time", 0.0) or 0.0))
-    search_adaptive_stop_time = max(0.0, float(selfplay_profile.get("mcts_search_adaptive_stop_time", 0.0) or 0.0))
+    search_scout_classify_time = max(0.0, float(selfplay_profile.get("mcts_search_scout_classify_time", 0.0) or 0.0))
     search_metadata_time = max(0.0, float(selfplay_profile.get("mcts_search_metadata_time", 0.0) or 0.0))
     batch_dedup_terminal_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_dedup_terminal_time", 0.0) or 0.0))
     batch_legal_moves_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_legal_moves_time", 0.0) or 0.0))
@@ -90,7 +90,7 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
         search_root_setup_time
         + search_selection_time
         + search_backprop_time
-        + search_adaptive_stop_time
+        + search_scout_classify_time
         + search_metadata_time
     )
     search_other_time = max(0.0, search_many_time - batch_expand_capped - search_known_outside_expand_time)
@@ -179,7 +179,7 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
     _print_batch_expand_line("value_fanout", batch_value_fanout_time)
     _print_batch_expand_line("batch_expand_other", batch_other_time)
     _print_search_line("backprop", search_backprop_time)
-    _print_search_line("adaptive_stop_check", search_adaptive_stop_time)
+    _print_search_line("scout_classify", search_scout_classify_time)
     _print_search_line("metadata", search_metadata_time)
     _print_search_line("search_other", search_other_time)
     _print_total_line("policy_target_build", policy_target_build_time)

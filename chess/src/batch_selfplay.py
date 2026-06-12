@@ -1,7 +1,7 @@
 """
-🎯 BATCH SELF-PLAY WITH FULL MCTS - AlphaZero Style
+BATCH SELF-PLAY WITH FULL MCTS - AlphaZero Style
 Plays multiple games using MCTS for move selection
-✅ CORRECT IMPLEMENTATION:
+CORRECT IMPLEMENTATION:
 - Uses MCTS for all move selections (not raw network)
 - Training targets = MCTS visit distributions
 - High-quality training data
@@ -37,14 +37,7 @@ _PIECE_VALUES = {
 _SYZYGY_ORACLE_CACHE = {}
 _SELFPLAY_COMPILE_LOCKFILE = "selfplay_torch_compile.lock"
 _DEFAULT_REPLAY_MAX_POLICY_TARGETS = 256
-_ADAPTIVE_LOW_BRANCHING_MIN_FRACTION = 0.50
-_ADAPTIVE_LOW_BRANCHING_BUDGET_FRACTION = 0.62
-_ADAPTIVE_LOW_BRANCHING_PRIOR_MASS = 0.85
-_ADAPTIVE_ENDGAME_MIN_FRACTION = 2.0 / 3.0
-_ADAPTIVE_ENDGAME_BUDGET_FRACTION = 0.58
-_ADAPTIVE_LATE_MIN_MULTIPLIER = 0.75
-_ADAPTIVE_LATE_EXTRA_MAX_MULTIPLIER = 1.60
-_ADAPTIVE_LOCKED_MARGIN = 8
+_SCOUT_LOCKED_MARGIN = 8
 _Q_DELTA_HIST_MIN = -2.0
 _Q_DELTA_HIST_MAX = 2.0
 _Q_DELTA_HIST_BINS = 200
@@ -391,7 +384,7 @@ def _maybe_compile_selfplay_model(model, config, device, rank, model_label="lear
         return compiled
     except Exception as exc:
         print(
-            f"⚠️ Self-play worker {rank}: torch.compile skipped for {model_label} "
+            f"WARNING: Self-play worker {rank}: torch.compile skipped for {model_label} "
             f"({type(exc).__name__}: {exc})"
         )
         return model
@@ -579,6 +572,8 @@ class MCTSNode:
         "_history_tensor_pair",
         "_legal_moves",
         "_legal_indices",
+        "selection_prior_temperature",
+        "selection_prior_uniform_mix",
     )
 
     def __init__(self, board=None, parent=None, move=None, prior=0.0, copy_board=True):
@@ -606,6 +601,8 @@ class MCTSNode:
         self._history_tensor_pair = None
         self._legal_moves = None
         self._legal_indices = None
+        self.selection_prior_temperature = 1.0
+        self.selection_prior_uniform_mix = 0.0
 
     @property
     def board(self):
@@ -1001,120 +998,62 @@ class MultiGameBatchMCTS:
             int(config['reinforcement_learning'].get('mcts_q_full_weight_fullmove', self.q_min_fullmove)),
         )
         self.eval_batch_size = config['reinforcement_learning'].get('mcts_batch_size', 32)
-        self.adaptive_search_enabled = bool(
-            rl_cfg.get('mcts_search_early_stop_enabled', True)
-        )
-        self.adaptive_search_min_simulations = max(
-            1,
-            int(rl_cfg.get('mcts_search_early_stop_min_simulations', 64)),
-        )
-        self.adaptive_search_check_interval = max(
-            1,
-            int(rl_cfg.get('mcts_search_early_stop_check_interval', 8)),
-        )
-        self.adaptive_search_low_branching_moves = max(
-            2,
-            int(rl_cfg.get('mcts_search_simple_position_legal_moves', 6)),
-        )
-        self.adaptive_search_endgame_piece_count = max(
-            2,
-            int(rl_cfg.get('mcts_search_simple_endgame_piece_count', 10)),
-        )
-        self.adaptive_search_top_visit_confidence = max(
+        self.scout_simulations = max(1, int(rl_cfg['mcts_scout_simulations']))
+        self.scout_check_interval = max(1, int(rl_cfg['mcts_scout_check_interval']))
+        self.scout_low_branching_moves = max(2, int(rl_cfg['mcts_scout_low_branching_moves']))
+        self.scout_endgame_piece_count = max(2, int(rl_cfg['mcts_scout_endgame_piece_count']))
+        self.scout_easy_top_visit_prob = max(
             0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_early_stop_min_top_visit_prob', 0.84))),
+            min(1.0, float(rl_cfg['mcts_scout_easy_top_visit_prob'])),
         )
-        self.adaptive_search_visit_gap = max(
+        self.scout_easy_visit_gap = max(
             0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_early_stop_min_visit_gap', 0.28))),
+            min(1.0, float(rl_cfg['mcts_scout_easy_visit_gap'])),
         )
-        self.adaptive_search_max_entropy = max(
+        self.scout_easy_max_entropy = max(
             0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_early_stop_max_visit_entropy', 0.40))),
+            min(1.0, float(rl_cfg['mcts_scout_easy_max_entropy'])),
         )
-        self.adaptive_search_min_budget_fraction = max(
+        self.scout_easy_min_explored_prior_mass = max(
             0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_early_stop_min_budget_fraction', 0.60))),
+            min(1.0, float(rl_cfg['mcts_scout_easy_min_explored_prior_mass'])),
         )
-        self.adaptive_search_min_explored_prior_mass = max(
+        self.scout_easy_min_visited_moves = max(1, int(rl_cfg['mcts_scout_easy_min_visited_moves']))
+        self.scout_challenge_fraction = max(
             0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_early_stop_min_explored_prior_mass', 0.88))),
+            min(1.0, float(rl_cfg['mcts_scout_challenge_fraction'])),
         )
-        self.adaptive_search_min_visited_moves = max(
-            1,
-            int(rl_cfg.get('mcts_search_early_stop_min_visited_moves', 3)),
-        )
-        self.adaptive_search_sensitive_min_budget_fraction = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_sensitive_min_budget_fraction', 0.95))),
-        )
-        self.adaptive_search_sensitive_prior_mass = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_sensitive_min_explored_prior_mass', 0.98))),
-        )
-        self.adaptive_search_sensitive_min_visited_moves = max(
-            1,
-            int(rl_cfg.get('mcts_search_sensitive_min_visited_moves', 7)),
-        )
-        self.adaptive_search_check_extra_multiplier = max(
+        self.scout_challenge_budget_multiplier = max(
             1.0,
-            float(rl_cfg.get('mcts_search_check_budget_multiplier', 1.30)),
+            float(rl_cfg['mcts_scout_challenge_budget_multiplier']),
         )
-        self.adaptive_search_tactical_extra_multiplier = max(
-            1.0,
-            float(rl_cfg.get('mcts_search_sharp_tactic_budget_multiplier', 1.12)),
-        )
-        self.adaptive_search_sharp_capture_min_gain = max(
+        self.scout_challenge_min_score = max(
             0.0,
-            float(rl_cfg.get('mcts_search_sharp_capture_min_gain', 1.0)),
+            min(1.0, float(rl_cfg['mcts_scout_challenge_min_score'])),
         )
-        self.adaptive_search_late_after_ply = max(
-            0,
-            int(rl_cfg.get('mcts_search_late_extra_after_ply', 60)),
-        )
-        self.adaptive_search_late_extra_fraction = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_late_extra_fraction', 0.25))),
-        )
-        self.adaptive_search_late_extra_multiplier = max(
-            1.0,
-            float(rl_cfg.get('mcts_search_late_extra_budget_multiplier', 1.5)),
-        )
-        self.adaptive_search_discovery_probe_fraction = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_discovery_probe_fraction', 0.0))),
-        )
-        self.adaptive_search_discovery_probe_multiplier = max(
-            1.0,
-            float(
-                rl_cfg.get(
-                    'mcts_search_discovery_probe_budget_multiplier',
-                    rl_cfg.get('adaptive_search_discovery_probe_budget_multiplier', 1.0),
-                )
-            ),
-        )
-        self.adaptive_search_discovery_probe_min_score = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_discovery_probe_min_score', 0.35))),
-        )
-        self.adaptive_search_discovery_probe_prior_margin_ref = max(
+        self.scout_challenge_prior_margin_ref = max(
             1e-6,
-            float(rl_cfg.get('mcts_search_discovery_probe_prior_margin_ref', 0.20)),
+            float(rl_cfg['mcts_scout_challenge_prior_margin_ref']),
         )
-        self.adaptive_search_discovery_probe_prior_top_ref = max(
+        self.scout_challenge_prior_top_ref = max(
             1e-6,
-            float(rl_cfg.get('mcts_search_discovery_probe_prior_top_ref', 0.45)),
+            float(rl_cfg['mcts_scout_challenge_prior_top_ref']),
         )
-        self.adaptive_search_discovery_probe_min_budget_fraction = max(
+        self.scout_challenge_prior_temperature = max(
+            1.0,
+            float(rl_cfg['mcts_scout_challenge_prior_temperature']),
+        )
+        self.scout_challenge_uniform_mix = max(
             0.0,
-            min(1.0, float(rl_cfg.get('mcts_search_discovery_probe_min_budget_fraction', 0.92))),
+            min(0.50, float(rl_cfg['mcts_scout_challenge_uniform_mix'])),
         )
-        self.adaptive_search_budget_neutral_enabled = bool(
-            rl_cfg.get('mcts_search_budget_neutral_enabled', False)
+        self.scout_challenge_min_budget_fraction = max(
+            0.0,
+            min(1.0, float(rl_cfg['mcts_scout_challenge_min_budget_fraction'])),
         )
-        self.adaptive_search_budget_neutral_min_fraction = max(
-            0.10,
-            min(1.0, float(rl_cfg.get('mcts_search_budget_neutral_min_fraction', 0.62))),
+        self.scout_sharp_capture_min_gain = max(
+            0.0,
+            float(rl_cfg['mcts_scout_sharp_capture_min_gain']),
         )
         # History configuration (POV)
         self.history_positions = config['model'].get('history_positions', 0)
@@ -1215,7 +1154,7 @@ class MultiGameBatchMCTS:
             'search_root_setup_time': 0.0,
             'search_selection_time': 0.0,
             'search_backprop_time': 0.0,
-            'search_adaptive_stop_time': 0.0,
+            'search_scout_classify_time': 0.0,
             'search_metadata_time': 0.0,
             'batch_expand_eval_time': 0.0,
             'batch_expand_eval_calls': 0,
@@ -1668,7 +1607,24 @@ class MultiGameBatchMCTS:
                     q_values *= float(effective_q_weight)
 
         u_values = edges.ucb_buffer
-        np.multiply(edges.priors, c_puct * parent_sqrt, out=u_values)
+        prior_temperature = float(getattr(node, 'selection_prior_temperature', 1.0) or 1.0)
+        prior_uniform_mix = float(getattr(node, 'selection_prior_uniform_mix', 0.0) or 0.0)
+        if prior_temperature > 1.0001 or prior_uniform_mix > 1e-8:
+            np.maximum(edges.priors, 1e-12, out=u_values)
+            if prior_temperature > 1.0001:
+                np.power(u_values, 1.0 / prior_temperature, out=u_values)
+            prior_sum = float(u_values.sum())
+            if prior_sum > 0.0:
+                u_values /= prior_sum
+            else:
+                u_values.fill(1.0 / float(max(1, len(edges.moves))))
+            if prior_uniform_mix > 1e-8 and len(edges.moves) > 0:
+                uniform = 1.0 / float(len(edges.moves))
+                np.multiply(u_values, 1.0 - prior_uniform_mix, out=u_values)
+                u_values += prior_uniform_mix * uniform
+            u_values *= c_puct * parent_sqrt
+        else:
+            np.multiply(edges.priors, c_puct * parent_sqrt, out=u_values)
         np.divide(u_values, (1.0 + cv), out=u_values)
         np.add(q_values, u_values, out=q_values)
         best_idx = int(q_values.argmax())
@@ -1724,7 +1680,7 @@ class MultiGameBatchMCTS:
             'legal_move_count': 0,
             'root_value': 0.0,
             'stopped_early': used < budget,
-            'adaptive_stop_reason': 'budget' if used >= budget else 'unknown',
+            'scout_stop_reason': 'budget' if used >= budget else 'unknown',
             'policy_weight': float(max(0.0, min(1.0, used / float(budget)))),
         }
         if root is None or not root.expanded or root.edges is None:
@@ -1817,7 +1773,17 @@ class MultiGameBatchMCTS:
         value = int.from_bytes(digest, byteorder='little', signed=False)
         return float(value) / float((1 << 64) - 1)
 
-    def _discovery_probe_score_for_root(self, root, move_count=None):
+    def _set_root_challenge_selection(self, root, enabled):
+        if root is None:
+            return
+        if enabled:
+            root.selection_prior_temperature = float(self.scout_challenge_prior_temperature)
+            root.selection_prior_uniform_mix = float(self.scout_challenge_uniform_mix)
+        else:
+            root.selection_prior_temperature = 1.0
+            root.selection_prior_uniform_mix = 0.0
+
+    def _scout_prior_uncertainty_score(self, root, move_count=None):
         if root is None or not root.expanded or root.edges is None:
             return 0.0
         priors = np.asarray(root.edges.base_priors, dtype=np.float32)
@@ -1839,16 +1805,16 @@ class MultiGameBatchMCTS:
         entropy = float(max(0.0, min(1.0, entropy)))
 
         legal_count = int(prior_probs.size)
-        profile = self._adaptive_search_root_profile(root, move_count=move_count)
+        profile = self._scout_root_profile(root, move_count=move_count)
         if bool(profile.get('forced', False)):
             return 0.0
 
-        margin_score = 1.0 - min(1.0, margin / float(self.adaptive_search_discovery_probe_prior_margin_ref))
-        top_score = 1.0 - min(1.0, top / float(self.adaptive_search_discovery_probe_prior_top_ref))
-        branching_span = max(1, 28 - int(self.adaptive_search_low_branching_moves))
+        margin_score = 1.0 - min(1.0, margin / float(self.scout_challenge_prior_margin_ref))
+        top_score = 1.0 - min(1.0, top / float(self.scout_challenge_prior_top_ref))
+        branching_span = max(1, 28 - int(self.scout_low_branching_moves))
         branching_score = max(
             0.0,
-            min(1.0, float(legal_count - int(self.adaptive_search_low_branching_moves)) / float(branching_span)),
+            min(1.0, float(legal_count - int(self.scout_low_branching_moves)) / float(branching_span)),
         )
         tactic_score = 1.0 if bool(profile.get('in_check', False) or profile.get('sharp_tactic', False)) else 0.0
         score = (
@@ -1860,153 +1826,6 @@ class MultiGameBatchMCTS:
         )
         return float(max(0.0, min(1.0, score)))
 
-    def _should_apply_discovery_probe(self, root, move_count=None, allow_unexpanded=False):
-        fraction = float(self.adaptive_search_discovery_probe_fraction)
-        if fraction <= 0.0:
-            return False, 0.0
-        stable_fraction = self._stable_fraction_for_root(root)
-        if root is None or not root.expanded or root.edges is None:
-            return bool(allow_unexpanded and stable_fraction < fraction * 0.15), 0.0
-
-        score = self._discovery_probe_score_for_root(root, move_count=move_count)
-        if score < float(self.adaptive_search_discovery_probe_min_score):
-            return False, score
-
-        normalized_score = (
-            (score - float(self.adaptive_search_discovery_probe_min_score))
-            / max(1e-8, 1.0 - float(self.adaptive_search_discovery_probe_min_score))
-        )
-        normalized_score = max(0.0, min(1.0, normalized_score))
-        threshold = fraction * (0.50 + 0.50 * normalized_score)
-        threshold = max(0.0, min(1.0, threshold))
-        return bool(stable_fraction < threshold), score
-
-    def _adaptive_search_budget_for_root(self, root, base_budget, move_count=None):
-        base_budget = max(1, int(base_budget))
-        if not self.adaptive_search_enabled:
-            return base_budget, False
-
-        profile = self._adaptive_search_root_profile(root, move_count=move_count)
-        budget = base_budget
-        extended = False
-        if profile.get('in_check', False):
-            budget = max(budget, int(round(float(base_budget) * self.adaptive_search_check_extra_multiplier)))
-            extended = budget > base_budget
-        elif profile.get('sharp_tactic', False):
-            budget = max(budget, int(round(float(base_budget) * self.adaptive_search_tactical_extra_multiplier)))
-            extended = budget > base_budget
-
-        if (
-            self.adaptive_search_discovery_probe_fraction > 0.0
-        ):
-            should_probe, _probe_score = self._should_apply_discovery_probe(
-                root,
-                move_count=move_count,
-                allow_unexpanded=True,
-            )
-            if should_probe:
-                probe_budget = int(round(float(base_budget) * self.adaptive_search_discovery_probe_multiplier))
-                budget = max(budget, probe_budget)
-                extended = budget > base_budget
-
-        ply = 0 if move_count is None else max(0, int(move_count))
-        if ply < self.adaptive_search_late_after_ply:
-            return max(1, budget), extended
-
-        if self.adaptive_search_late_extra_fraction <= 0.0:
-            return max(1, budget), extended
-
-        if self._stable_fraction_for_root(root) >= self.adaptive_search_late_extra_fraction:
-            return max(1, budget), extended
-
-        boosted = int(round(float(base_budget) * self.adaptive_search_late_extra_multiplier))
-        boosted = max(budget, boosted)
-        max_boosted = int(round(float(base_budget) * _ADAPTIVE_LATE_EXTRA_MAX_MULTIPLIER))
-        boosted = min(boosted, max(base_budget, max_boosted))
-        return max(1, boosted), boosted > base_budget
-
-    def _neutralize_adaptive_search_budgets(self, roots, budgets, extended_flags, base_budget, move_counts):
-        if not self.adaptive_search_budget_neutral_enabled:
-            return budgets
-        if not budgets:
-            return budgets
-
-        base_budget = max(1, int(base_budget))
-        target_total = base_budget * len(budgets)
-        excess = int(sum(int(value) for value in budgets) - target_total)
-        if excess <= 0:
-            return budgets
-
-        candidates = []
-        for idx, budget in enumerate(budgets):
-            budget = int(budget)
-            if budget <= 1:
-                continue
-            root = roots[idx]
-            move_count = move_counts[idx] if idx < len(move_counts) else None
-            profile = self._adaptive_search_root_profile(root, move_count=move_count)
-            if bool(profile.get('in_check', False)) or bool(profile.get('sharp_tactic', False)):
-                continue
-
-            if bool(profile.get('forced', False)):
-                min_budget = 1
-            elif bool(profile.get('low_branching', False)) or bool(profile.get('endgame', False)):
-                min_budget = int(round(float(base_budget) * min(
-                    self.adaptive_search_budget_neutral_min_fraction,
-                    _ADAPTIVE_LOW_BRANCHING_BUDGET_FRACTION,
-                )))
-            else:
-                min_budget = int(round(float(base_budget) * self.adaptive_search_budget_neutral_min_fraction))
-            min_budget = max(1, min(base_budget, min_budget))
-            reducible = max(0, budget - min_budget)
-            if reducible <= 0:
-                continue
-
-            stable_rank = self._stable_fraction_for_root(root)
-            extended_rank = 1 if bool(extended_flags[idx]) else 0
-            candidates.append((extended_rank, -stable_rank, idx, reducible))
-
-        candidates.sort()
-        adjusted = [int(value) for value in budgets]
-        for _extended_rank, _stable_rank, idx, reducible in candidates:
-            if excess <= 0:
-                break
-            reduction = min(int(reducible), int(excess))
-            adjusted[idx] = max(1, int(adjusted[idx]) - reduction)
-            excess -= reduction
-        return adjusted
-
-    def _late_minimum_for_budget(self, simulation_budget):
-        simulation_budget = max(1, int(simulation_budget))
-        if _ADAPTIVE_LATE_MIN_MULTIPLIER <= 0.0:
-            return 1
-        return max(1, int(round(float(simulation_budget) * _ADAPTIVE_LATE_MIN_MULTIPLIER)))
-
-    def _adaptive_search_minimum_for_root(
-        self,
-        root,
-        simulation_budget=None,
-        move_count=None,
-        extended_budget=False,
-        discovery_probe=False,
-    ):
-        requirements = self._adaptive_search_requirements_for_root(
-            root,
-            simulation_budget=simulation_budget,
-            move_count=move_count,
-            extended_budget=extended_budget,
-            discovery_probe=discovery_probe,
-        )
-        return int(requirements['minimum'])
-
-    def _adaptive_search_confidence_thresholds_for_root(self, root):
-        requirements = self._adaptive_search_requirements_for_root(root)
-        return (
-            float(requirements['top_confidence']),
-            float(requirements['visit_gap']),
-            float(requirements['max_entropy']),
-        )
-
     def _move_is_budget_sensitive_tactic(self, board, move, legal_count=None, move_count=None):
         if move.promotion is not None:
             return True
@@ -2015,7 +1834,7 @@ class MultiGameBatchMCTS:
             is_capture = bool(board.is_capture(move))
             if is_capture:
                 gain = self._captured_piece_value(board, move) - self._moving_piece_value(board, move)
-                if gain >= float(self.adaptive_search_sharp_capture_min_gain):
+                if gain >= float(self.scout_sharp_capture_min_gain):
                     return True
         except Exception:
             pass
@@ -2027,11 +1846,11 @@ class MultiGameBatchMCTS:
             return False
         if is_capture:
             return True
-        if legal_count is not None and int(legal_count) <= max(8, int(self.adaptive_search_low_branching_moves) * 2):
+        if legal_count is not None and int(legal_count) <= max(8, int(self.scout_low_branching_moves) * 2):
             return True
-        return bool(move_count is not None and int(move_count) >= int(self.adaptive_search_late_after_ply))
+        return False
 
-    def _adaptive_search_root_profile(self, root, move_count=None):
+    def _scout_root_profile(self, root, move_count=None):
         legal_count = 0
         piece_count = None
         in_check = False
@@ -2072,165 +1891,121 @@ class MultiGameBatchMCTS:
         return {
             'legal_count': int(legal_count),
             'forced': bool(legal_count <= 1 and legal_count > 0),
-            'low_branching': bool(1 < legal_count <= self.adaptive_search_low_branching_moves),
-            'endgame': bool(piece_count is not None and piece_count <= self.adaptive_search_endgame_piece_count),
+            'low_branching': bool(1 < legal_count <= self.scout_low_branching_moves),
+            'endgame': bool(piece_count is not None and piece_count <= self.scout_endgame_piece_count),
             'in_check': bool(in_check),
             'sharp_tactic': bool(sharp_tactic),
         }
 
-    def _adaptive_search_requirements_for_root(
-        self,
-        root,
-        simulation_budget=None,
-        move_count=None,
-        extended_budget=False,
-        discovery_probe=False,
-    ):
-        base_minimum = max(1, int(self.adaptive_search_min_simulations))
-        sim_budget = max(1, int(simulation_budget or base_minimum))
-        profile = self._adaptive_search_root_profile(root, move_count=move_count)
-        legal_count = int(profile['legal_count'])
-
-        if profile['forced']:
-            return {
-                'minimum': 1,
-                'legal_count': legal_count,
-                'required_visited': 1,
-                'required_prior_mass': 0.0,
-                'top_confidence': 0.0,
-                'visit_gap': 0.0,
-                'max_entropy': 1.0,
-                'locked_confidence': 0.0,
-                'locked_gap': 0.0,
-                'locked_entropy': 1.0,
-            }
-
-        minimum = base_minimum
-        budget_fraction = float(self.adaptive_search_min_budget_fraction)
-        required_prior_mass = float(self.adaptive_search_min_explored_prior_mass)
-
-        if profile['low_branching']:
-            minimum = min(minimum, int(round(base_minimum * _ADAPTIVE_LOW_BRANCHING_MIN_FRACTION)))
-            budget_fraction = min(budget_fraction, _ADAPTIVE_LOW_BRANCHING_BUDGET_FRACTION)
-            required_prior_mass = min(required_prior_mass, _ADAPTIVE_LOW_BRANCHING_PRIOR_MASS)
-
-        if profile['endgame']:
-            minimum = min(minimum, int(round(base_minimum * _ADAPTIVE_ENDGAME_MIN_FRACTION)))
-            budget_fraction = min(budget_fraction, _ADAPTIVE_ENDGAME_BUDGET_FRACTION)
-
-        if profile.get('in_check', False) or profile.get('sharp_tactic', False):
-            budget_fraction = max(budget_fraction, float(self.adaptive_search_sensitive_min_budget_fraction))
-            required_prior_mass = max(required_prior_mass, float(self.adaptive_search_sensitive_prior_mass))
-
-        if budget_fraction > 0.0:
-            minimum = max(minimum, int(round(float(sim_budget) * budget_fraction)))
-
-        if (
-            self.adaptive_search_enabled
-            and move_count is not None
-            and int(move_count) >= self.adaptive_search_late_after_ply
-        ):
-            minimum = max(minimum, self._late_minimum_for_budget(sim_budget))
-        if extended_budget:
-            minimum = max(minimum, self._late_minimum_for_budget(sim_budget))
-        if discovery_probe:
-            minimum = max(
-                minimum,
-                int(round(float(sim_budget) * float(self.adaptive_search_discovery_probe_min_budget_fraction))),
-            )
-
-        minimum = min(sim_budget, max(1, int(minimum)))
-        min_visited = max(1, int(self.adaptive_search_min_visited_moves))
-        if profile.get('in_check', False) or profile.get('sharp_tactic', False):
-            min_visited = max(min_visited, int(self.adaptive_search_sensitive_min_visited_moves))
-        required_visited = min(max(1, legal_count), min_visited)
-        top_confidence = float(self.adaptive_search_top_visit_confidence)
-        visit_gap = float(self.adaptive_search_visit_gap)
-        max_entropy = float(self.adaptive_search_max_entropy)
-
-        return {
-            'minimum': int(minimum),
-            'legal_count': legal_count,
-            'required_visited': int(required_visited),
-            'required_prior_mass': float(max(0.0, min(1.0, required_prior_mass))),
-            'top_confidence': float(max(0.0, min(1.0, top_confidence))),
-            'visit_gap': float(max(0.0, min(1.0, visit_gap))),
-            'max_entropy': float(max(0.0, min(1.0, max_entropy))),
-            'locked_confidence': float(max(0.0, min(1.0, top_confidence - 0.08))),
-            'locked_gap': float(max(0.0, min(1.0, visit_gap * 0.75))),
-            'locked_entropy': float(max(0.0, min(1.0, max_entropy + 0.08))),
-        }
-
-    def _adaptive_search_target_ready(self, root, summary, requirements=None):
+    def _scout_target_ready(self, root, summary):
         if root is None or not root.expanded or root.edges is None:
             return False
-        if requirements is None:
-            requirements = self._adaptive_search_requirements_for_root(root)
-        legal_count = int(requirements.get('legal_count', 0) or 0)
+        legal_count = int(summary.get('legal_move_count', 0) or 0)
         if legal_count <= 1:
             return True
 
         visited_count = int(summary.get('visited_move_count', 0) or 0)
-        required_visited = int(requirements.get('required_visited', self.adaptive_search_min_visited_moves))
+        required_visited = min(max(1, legal_count), int(self.scout_easy_min_visited_moves))
         if visited_count < required_visited:
             return False
 
         if visited_count >= legal_count:
             return True
-        required_prior_mass = float(requirements.get('required_prior_mass', self.adaptive_search_min_explored_prior_mass))
-        return float(summary.get('explored_prior_mass', 0.0) or 0.0) >= required_prior_mass
+        return float(summary.get('explored_prior_mass', 0.0) or 0.0) >= float(self.scout_easy_min_explored_prior_mass)
 
-    def _adaptive_search_stop_reason(
-        self,
-        root,
-        simulation_budget,
-        initial_root_visits=0,
-        move_count=None,
-        extended_budget=False,
-        discovery_probe=False,
-    ):
-        if not self.adaptive_search_enabled:
-            return None
-        requirements = self._adaptive_search_requirements_for_root(
-            root,
-            simulation_budget=simulation_budget,
-            move_count=move_count,
-            extended_budget=extended_budget,
-            discovery_probe=discovery_probe,
+    def _scout_root_is_easy(self, root, summary):
+        if root is None or not root.expanded or root.edges is None:
+            return False
+        legal_count = int(summary.get('legal_move_count', 0) or 0)
+        if legal_count <= 1:
+            return True
+        if not self._scout_target_ready(root, summary):
+            return False
+        return bool(
+            float(summary.get('top_visit_prob', 0.0) or 0.0) >= float(self.scout_easy_top_visit_prob)
+            and float(summary.get('visit_gap', 0.0) or 0.0) >= float(self.scout_easy_visit_gap)
+            and float(summary.get('visit_entropy', 1.0) or 1.0) <= float(self.scout_easy_max_entropy)
         )
-        summary = self._summarize_root_search(root, simulation_budget, initial_root_visits=initial_root_visits)
-        used = int(summary['simulations_used'])
+
+    def _scout_challenge_score(self, root, summary, move_count=None):
+        prior_score = self._scout_prior_uncertainty_score(root, move_count=move_count)
+        top_visit_prob = float(summary.get('top_visit_prob', 0.0) or 0.0)
+        visit_gap = float(summary.get('visit_gap', 0.0) or 0.0)
+        visit_entropy = float(summary.get('visit_entropy', 1.0) or 1.0)
+        top_uncertainty = max(
+            0.0,
+            min(1.0, (float(self.scout_easy_top_visit_prob) - top_visit_prob) / max(1e-6, self.scout_easy_top_visit_prob)),
+        )
+        gap_uncertainty = max(
+            0.0,
+            min(1.0, (float(self.scout_easy_visit_gap) - visit_gap) / max(1e-6, self.scout_easy_visit_gap)),
+        )
+        entropy_pressure = max(
+            0.0,
+            min(1.0, (visit_entropy - float(self.scout_easy_max_entropy)) / max(1e-6, 1.0 - self.scout_easy_max_entropy)),
+        )
+        try:
+            prior_rank = int(summary.get('prior_top_visit_rank', 1) or 1)
+            rank_pressure = max(0.0, min(1.0, float(prior_rank - 1) / 4.0))
+        except Exception:
+            rank_pressure = 0.0
+        q_delta = float(summary.get('mcts_q_delta', 0.0) or 0.0)
+        q_pressure = max(0.0, min(1.0, q_delta / 0.12))
+        profile = self._scout_root_profile(root, move_count=move_count)
+        tactic_pressure = 1.0 if bool(profile.get('in_check', False) or profile.get('sharp_tactic', False)) else 0.0
+        score = (
+            0.28 * prior_score
+            + 0.22 * top_uncertainty
+            + 0.18 * gap_uncertainty
+            + 0.12 * entropy_pressure
+            + 0.10 * rank_pressure
+            + 0.06 * q_pressure
+            + 0.04 * tactic_pressure
+        )
+        return float(max(0.0, min(1.0, score)))
+
+    def _classify_scout_root(self, root, summary, move_count=None):
+        profile = self._scout_root_profile(root, move_count=move_count)
+        if bool(profile.get('forced', False)):
+            return 'easy', 0.0
+        if self._scout_root_is_easy(root, summary) and not bool(
+            profile.get('in_check', False) or profile.get('sharp_tactic', False)
+        ):
+            return 'easy', 0.0
+        challenge_score = self._scout_challenge_score(root, summary, move_count=move_count)
+        stable_fraction = self._stable_fraction_for_root(root)
+        if (
+            challenge_score >= float(self.scout_challenge_min_score)
+            and stable_fraction < float(self.scout_challenge_fraction)
+        ):
+            return 'challenge', challenge_score
+        return 'normal', challenge_score
+
+    def _scout_challenge_minimum(self, simulation_budget):
+        return max(
+            1,
+            int(round(float(max(1, int(simulation_budget))) * float(self.scout_challenge_min_budget_fraction))),
+        )
+
+    def _scout_locked_stop_reason(self, root, summary, simulation_budget):
         if root is None or not root.expanded or root.edges is None:
             return None
-        legal_count = int(requirements.get('legal_count', 0) or 0)
-        if legal_count <= 1:
-            return 'forced'
-        if used < int(requirements['minimum']):
-            return None
-        if not self._adaptive_search_target_ready(root, summary, requirements=requirements):
-            return None
-
         visits = root.edges.visit_counts.astype(np.int32, copy=False)
         visits = visits[visits > 0]
-        if visits.size > 0:
-            visits.sort()
-            top = int(visits[-1])
-            second = int(visits[-2]) if visits.size > 1 else 0
-            remaining = max(0, int(simulation_budget) - used)
-            if (
-                (top - second) > (remaining + _ADAPTIVE_LOCKED_MARGIN)
-                and summary['top_visit_prob'] >= float(requirements['locked_confidence'])
-                and summary['visit_gap'] >= float(requirements['locked_gap'])
-                and summary['visit_entropy'] <= float(requirements['locked_entropy'])
-            ):
-                return 'locked'
-
+        if visits.size <= 0:
+            return None
+        visits.sort()
+        top = int(visits[-1])
+        second = int(visits[-2]) if visits.size > 1 else 0
+        used = int(summary.get('simulations_used', 0) or 0)
+        remaining = max(0, int(simulation_budget) - used)
         if (
-            summary['top_visit_prob'] >= float(requirements['top_confidence'])
-            and summary['visit_gap'] >= float(requirements['visit_gap'])
-            and summary['visit_entropy'] <= float(requirements['max_entropy'])
+            (top - second) > (remaining + _SCOUT_LOCKED_MARGIN)
+            and float(summary.get('top_visit_prob', 0.0) or 0.0) >= max(0.0, self.scout_easy_top_visit_prob - 0.06)
+            and float(summary.get('visit_gap', 0.0) or 0.0) >= max(0.0, self.scout_easy_visit_gap * 0.75)
+            and float(summary.get('visit_entropy', 1.0) or 1.0) <= min(1.0, self.scout_easy_max_entropy + 0.08)
         ):
-            return 'confident'
+            return 'locked'
         return None
 
     def search_many(self, game_states, num_simulations, add_root_noise=False, return_search_metadata=False):
@@ -2257,7 +2032,7 @@ class MultiGameBatchMCTS:
         initial_root_visits = [0] * game_count
         root_synced_flags = [False] * game_count
         needs_root_noise_on_expand = [False] * game_count
-        adaptive_stop_reasons = [None] * game_count
+        scout_stop_reasons = [None] * game_count
         move_counts = [0] * game_count
         board_histories = [None] * game_count
         is_mapping_state = [False] * game_count
@@ -2308,6 +2083,7 @@ class MultiGameBatchMCTS:
             roots[idx] = root
             initial_root_visits[idx] = 0 if root is None else int(getattr(root, 'visit_count', 0) or 0)
             root_synced_flags[idx] = bool(root_synced)
+            self._set_root_challenge_selection(root, False)
             if add_root_noise and root.expanded:
                 self._apply_root_noise(root)
                 needs_root_noise_on_expand[idx] = False
@@ -2316,36 +2092,17 @@ class MultiGameBatchMCTS:
         if profile_detail:
             self._profile_add('search_root_setup_time', perf_counter() - root_setup_t0)
 
-        simulation_budgets = []
-        simulation_budget_extended = []
-        discovery_probe_flags = []
-        discovery_probe_scores = []
-        for idx, root in enumerate(roots):
-            budget, extended = self._adaptive_search_budget_for_root(
-                root,
-                num_simulations,
-                move_count=move_counts[idx],
-            )
-            simulation_budgets.append(int(budget))
-            simulation_budget_extended.append(bool(extended))
-            probe_budget = int(round(float(num_simulations) * self.adaptive_search_discovery_probe_multiplier))
-            discovery_probe_flags.append(bool(int(budget) >= max(int(num_simulations) + 1, probe_budget)))
-            discovery_probe_scores.append(None)
-        simulation_budgets = self._neutralize_adaptive_search_budgets(
-            roots,
-            simulation_budgets,
-            simulation_budget_extended,
-            num_simulations,
-            move_counts,
+        base_budget = max(1, int(num_simulations))
+        scout_budget = min(base_budget, max(1, int(self.scout_simulations)))
+        challenge_budget = max(
+            base_budget,
+            int(round(float(base_budget) * float(self.scout_challenge_budget_multiplier))),
         )
-        simulation_budget_extended = [
-            bool(int(budget) > int(num_simulations))
-            for budget in simulation_budgets
-        ]
-        discovery_probe_flags = [
-            bool(flag and int(budget) > int(num_simulations))
-            for flag, budget in zip(discovery_probe_flags, simulation_budgets)
-        ]
+        simulation_budgets = [base_budget] * game_count
+        simulation_budget_extended = [False] * game_count
+        scout_challenge_flags = [False] * game_count
+        scout_challenge_scores = [None] * game_count
+        scout_classes = [None] * game_count
 
         remaining = list(simulation_budgets)
         total_remaining = int(sum(remaining))
@@ -2360,7 +2117,7 @@ class MultiGameBatchMCTS:
             slots_per_game = max(1, min(
                 self.eval_batch_size // max(1, game_count),
                 max_remaining_any_game // 4,
-                self.adaptive_search_check_interval if self.adaptive_search_enabled else max_remaining_any_game,
+                self.scout_check_interval,
             ))
             batch_size = min(self.eval_batch_size, total_remaining,
                              slots_per_game * game_count)
@@ -2430,65 +2187,71 @@ class MultiGameBatchMCTS:
             if profile_detail:
                 self._profile_add('search_backprop_time', perf_counter() - backprop_t0)
 
-            if self.adaptive_search_enabled:
-                adaptive_t0 = perf_counter() if profile_detail else None
-                for idx, root in enumerate(roots):
-                    if remaining[idx] <= 0:
+            scout_t0 = perf_counter() if profile_detail else None
+            for idx, root in enumerate(roots):
+                if remaining[idx] <= 0:
+                    continue
+                if selected_this_batch[idx] <= 0:
+                    continue
+                if root is None or not root.expanded:
+                    continue
+                used = max(
+                    0,
+                    int(getattr(root, 'visit_count', 0) or 0) - int(initial_root_visits[idx]),
+                )
+                if used < scout_budget:
+                    continue
+                check_interval = max(1, int(self.scout_check_interval))
+                if used % check_interval != 0 and remaining[idx] > check_interval:
+                    continue
+                summary = self._summarize_root_search(
+                    root,
+                    simulation_budgets[idx],
+                    initial_root_visits=initial_root_visits[idx],
+                )
+                scout_class = scout_classes[idx]
+                if scout_class is None:
+                    scout_class, challenge_score = self._classify_scout_root(
+                        root,
+                        summary,
+                        move_count=move_counts[idx],
+                    )
+                    scout_classes[idx] = scout_class
+                    scout_challenge_scores[idx] = float(challenge_score)
+                    if scout_class == 'easy':
+                        scout_stop_reasons[idx] = 'scout_easy'
+                        total_remaining -= int(remaining[idx])
+                        remaining[idx] = 0
                         continue
-                    if selected_this_batch[idx] <= 0:
+                    if scout_class == 'challenge':
+                        added = max(0, int(challenge_budget) - int(simulation_budgets[idx]))
+                        if added > 0:
+                            simulation_budgets[idx] = int(challenge_budget)
+                            simulation_budget_extended[idx] = True
+                            scout_challenge_flags[idx] = True
+                            self._set_root_challenge_selection(root, True)
+                            remaining[idx] += int(added)
+                            total_remaining += int(added)
                         continue
-                    if (
-                        self.adaptive_search_discovery_probe_fraction > 0.0
-                        and not discovery_probe_flags[idx]
-                        and root is not None
-                        and root.expanded
-                    ):
-                        should_probe, probe_score = self._should_apply_discovery_probe(
+                    continue
+
+                stop_reason = None
+                if scout_class == 'challenge':
+                    if used >= self._scout_challenge_minimum(simulation_budgets[idx]):
+                        stop_reason = self._scout_locked_stop_reason(
                             root,
-                            move_count=move_counts[idx],
-                            allow_unexpanded=False,
+                            summary,
+                            simulation_budgets[idx],
                         )
-                        discovery_probe_scores[idx] = float(probe_score)
-                        if should_probe:
-                            probe_budget = int(round(float(num_simulations) * self.adaptive_search_discovery_probe_multiplier))
-                            probe_budget = max(int(simulation_budgets[idx]), int(probe_budget))
-                            added = max(0, int(probe_budget) - int(simulation_budgets[idx]))
-                            if added > 0:
-                                simulation_budgets[idx] = int(probe_budget)
-                                simulation_budget_extended[idx] = True
-                                discovery_probe_flags[idx] = True
-                                remaining[idx] += int(added)
-                                total_remaining += int(added)
-                    used = max(
-                        0,
-                        int(getattr(root, 'visit_count', 0) or 0) - int(initial_root_visits[idx]),
-                    )
-                    if used < self._adaptive_search_minimum_for_root(
-                        root,
-                        simulation_budget=simulation_budgets[idx],
-                        move_count=move_counts[idx],
-                        extended_budget=simulation_budget_extended[idx],
-                        discovery_probe=discovery_probe_flags[idx],
-                    ):
-                        continue
-                    check_interval = max(1, int(self.adaptive_search_check_interval))
-                    if used % check_interval != 0 and remaining[idx] > check_interval:
-                        continue
-                    stop_reason = self._adaptive_search_stop_reason(
-                        root,
-                        simulation_budgets[idx],
-                        initial_root_visits=initial_root_visits[idx],
-                        move_count=move_counts[idx],
-                        extended_budget=simulation_budget_extended[idx],
-                        discovery_probe=discovery_probe_flags[idx],
-                    )
-                    if stop_reason is None:
-                        continue
-                    adaptive_stop_reasons[idx] = stop_reason
-                    total_remaining -= int(remaining[idx])
-                    remaining[idx] = 0
-                if profile_detail:
-                    self._profile_add('search_adaptive_stop_time', perf_counter() - adaptive_t0)
+                elif self._scout_root_is_easy(root, summary):
+                    stop_reason = 'scout_normal_easy'
+                if stop_reason is None:
+                    continue
+                scout_stop_reasons[idx] = stop_reason
+                total_remaining -= int(remaining[idx])
+                remaining[idx] = 0
+            if profile_detail:
+                self._profile_add('search_scout_classify_time', perf_counter() - scout_t0)
 
         # Sync roots back to caller-provided state containers.
         for idx, gs in enumerate(game_states):
@@ -2515,19 +2278,19 @@ class MultiGameBatchMCTS:
                 initial_root_visits=initial_root_visits[idx],
             )
             metadata['simulation_budget_extra'] = bool(simulation_budget_extended[idx])
-            metadata['simulation_budget_discovery_probe'] = bool(discovery_probe_flags[idx])
-            if discovery_probe_scores[idx] is None:
-                discovery_probe_scores[idx] = self._discovery_probe_score_for_root(
+            metadata['simulation_budget_scout_challenge'] = bool(scout_challenge_flags[idx])
+            if scout_challenge_scores[idx] is None:
+                scout_challenge_scores[idx] = self._scout_prior_uncertainty_score(
                     root,
                     move_count=move_counts[idx],
                 )
-            metadata['discovery_probe_score'] = float(discovery_probe_scores[idx] or 0.0)
-            metadata['discovery_probe_applied'] = 1.0 if bool(discovery_probe_flags[idx]) else 0.0
+            metadata['scout_challenge_score'] = float(scout_challenge_scores[idx] or 0.0)
+            metadata['scout_challenge_applied'] = 1.0 if bool(scout_challenge_flags[idx]) else 0.0
             metadata['move_count'] = int(move_counts[idx])
-            stop_reason = adaptive_stop_reasons[idx]
+            stop_reason = scout_stop_reasons[idx]
             if stop_reason is None:
                 stop_reason = 'budget' if not metadata.get('stopped_early', False) else 'unknown'
-            metadata['adaptive_stop_reason'] = stop_reason
+            metadata['scout_stop_reason'] = stop_reason
             search_metadata.append(metadata)
         if profile_detail:
             self._profile_add('search_metadata_time', perf_counter() - metadata_t0)
@@ -3053,53 +2816,53 @@ class BatchSelfPlayMCTSBatch:
             0.0,
             min(1.0, float(rl_cfg.get('policy_target_uptake_unchanged_weight', 0.50))),
         )
-        self.policy_target_search_discovery_weighting_enabled = bool(
-            rl_cfg.get('policy_target_search_discovery_weighting_enabled', False)
+        self.policy_target_search_change_weighting_enabled = bool(
+            rl_cfg.get('policy_target_search_change_weighting_enabled', False)
         )
-        self.policy_target_search_discovery_min_q_delta = float(
-            rl_cfg.get('policy_target_search_discovery_min_q_delta', 0.04)
+        self.policy_target_search_change_min_q_delta = float(
+            rl_cfg.get('policy_target_search_change_min_q_delta', 0.04)
         )
-        self.policy_target_search_discovery_q_delta_ref = max(
+        self.policy_target_search_change_q_delta_ref = max(
             1e-6,
-            float(rl_cfg.get('policy_target_search_discovery_q_delta_ref', 0.30)),
+            float(rl_cfg.get('policy_target_search_change_q_delta_ref', 0.30)),
         )
-        self.policy_target_search_discovery_bonus = max(
+        self.policy_target_search_change_bonus = max(
             0.0,
-            float(rl_cfg.get('policy_target_search_discovery_bonus', 0.20)),
+            float(rl_cfg.get('policy_target_search_change_bonus', 0.20)),
         )
-        self.policy_target_search_discovery_q_bonus = max(
+        self.policy_target_search_change_q_bonus = max(
             0.0,
-            float(rl_cfg.get('policy_target_search_discovery_q_bonus', 0.30)),
+            float(rl_cfg.get('policy_target_search_change_q_bonus', 0.30)),
         )
-        self.policy_target_search_discovery_rank_bonus = max(
+        self.policy_target_search_change_rank_bonus = max(
             0.0,
-            float(rl_cfg.get('policy_target_search_discovery_rank_bonus', 0.15)),
+            float(rl_cfg.get('policy_target_search_change_rank_bonus', 0.15)),
         )
-        self.policy_target_search_discovery_allow_q_neutral = bool(
-            rl_cfg.get('policy_target_search_discovery_allow_q_neutral', False)
+        self.policy_target_search_change_allow_q_neutral = bool(
+            rl_cfg.get('policy_target_search_change_allow_q_neutral', False)
         )
-        self.policy_target_search_discovery_min_top_visit_prob = max(
+        self.policy_target_search_change_min_top_visit_prob = max(
             0.0,
-            min(1.0, float(rl_cfg.get('policy_target_search_discovery_min_top_visit_prob', 0.55))),
+            min(1.0, float(rl_cfg.get('policy_target_search_change_min_top_visit_prob', 0.55))),
         )
-        self.policy_target_search_discovery_min_prior_rank = max(
+        self.policy_target_search_change_min_prior_rank = max(
             1,
-            int(rl_cfg.get('policy_target_search_discovery_min_prior_rank', 2)),
+            int(rl_cfg.get('policy_target_search_change_min_prior_rank', 2)),
         )
-        self.policy_target_search_discovery_neutral_min_q_delta = float(
-            rl_cfg.get('policy_target_search_discovery_neutral_min_q_delta', -0.02)
+        self.policy_target_search_change_neutral_min_q_delta = float(
+            rl_cfg.get('policy_target_search_change_neutral_min_q_delta', -0.02)
         )
-        self.policy_target_search_discovery_neutral_bonus = max(
+        self.policy_target_search_change_neutral_bonus = max(
             0.0,
-            float(rl_cfg.get('policy_target_search_discovery_neutral_bonus', 0.0)),
+            float(rl_cfg.get('policy_target_search_change_neutral_bonus', 0.0)),
         )
-        self.policy_target_search_discovery_neutral_rank_bonus = max(
+        self.policy_target_search_change_neutral_rank_bonus = max(
             0.0,
-            float(rl_cfg.get('policy_target_search_discovery_neutral_rank_bonus', 0.0)),
+            float(rl_cfg.get('policy_target_search_change_neutral_rank_bonus', 0.0)),
         )
-        self.policy_target_search_discovery_max_weight = max(
+        self.policy_target_search_change_max_weight = max(
             1.0,
-            float(rl_cfg.get('policy_target_search_discovery_max_weight', 1.55)),
+            float(rl_cfg.get('policy_target_search_change_max_weight', 1.55)),
         )
         self.mcts_good_target_min_top_visit_prob = 0.55
         self.mcts_good_target_min_visit_gap = 0.12
@@ -3286,7 +3049,7 @@ class BatchSelfPlayMCTSBatch:
             'search_root_setup_time',
             'search_selection_time',
             'search_backprop_time',
-            'search_adaptive_stop_time',
+            'search_scout_classify_time',
             'search_metadata_time',
             'batch_expand_dedup_terminal_time',
             'batch_expand_legal_moves_time',
@@ -3424,8 +3187,8 @@ class BatchSelfPlayMCTSBatch:
         min_weight = float(self.policy_target_quality_min_weight)
         return float(min_weight + (1.0 - min_weight) * confidence)
 
-    def _policy_target_search_discovery_weight(self, search_metadata):
-        if not self.policy_target_search_discovery_weighting_enabled:
+    def _policy_target_search_change_weight(self, search_metadata):
+        if not self.policy_target_search_change_weighting_enabled:
             return 1.0
         if not isinstance(search_metadata, dict):
             return 1.0
@@ -3452,26 +3215,26 @@ class BatchSelfPlayMCTSBatch:
                 q_delta = float(q_delta)
                 q_delta_is_good = (
                     math.isfinite(q_delta)
-                    and q_delta >= float(self.policy_target_search_discovery_min_q_delta)
+                    and q_delta >= float(self.policy_target_search_change_min_q_delta)
                 )
         except (TypeError, ValueError):
             q_delta = None
             q_delta_is_good = False
 
         if q_delta_is_good:
-            q_strength = max(0.0, min(1.0, float(q_delta) / float(self.policy_target_search_discovery_q_delta_ref)))
+            q_strength = max(0.0, min(1.0, float(q_delta) / float(self.policy_target_search_change_q_delta_ref)))
             weight = (
                 1.0
-                + float(self.policy_target_search_discovery_bonus)
-                + float(self.policy_target_search_discovery_q_bonus) * q_strength
-                + float(self.policy_target_search_discovery_rank_bonus) * rank_strength
+                + float(self.policy_target_search_change_bonus)
+                + float(self.policy_target_search_change_q_bonus) * q_strength
+                + float(self.policy_target_search_change_rank_bonus) * rank_strength
             )
-            return float(max(1.0, min(float(self.policy_target_search_discovery_max_weight), weight)))
+            return float(max(1.0, min(float(self.policy_target_search_change_max_weight), weight)))
 
-        if not self.policy_target_search_discovery_allow_q_neutral:
+        if not self.policy_target_search_change_allow_q_neutral:
             return 1.0
         if q_delta is not None and math.isfinite(float(q_delta)):
-            if float(q_delta) < float(self.policy_target_search_discovery_neutral_min_q_delta):
+            if float(q_delta) < float(self.policy_target_search_change_neutral_min_q_delta):
                 return 1.0
 
         try:
@@ -3480,17 +3243,17 @@ class BatchSelfPlayMCTSBatch:
             top_visit_prob = 0.0
         if (
             not math.isfinite(top_visit_prob)
-            or top_visit_prob < float(self.policy_target_search_discovery_min_top_visit_prob)
-            or prior_rank < int(self.policy_target_search_discovery_min_prior_rank)
+            or top_visit_prob < float(self.policy_target_search_change_min_top_visit_prob)
+            or prior_rank < int(self.policy_target_search_change_min_prior_rank)
         ):
             return 1.0
 
         weight = (
             1.0
-            + float(self.policy_target_search_discovery_neutral_bonus)
-            + float(self.policy_target_search_discovery_neutral_rank_bonus) * rank_strength
+            + float(self.policy_target_search_change_neutral_bonus)
+            + float(self.policy_target_search_change_neutral_rank_bonus) * rank_strength
         )
-        return float(max(1.0, min(float(self.policy_target_search_discovery_max_weight), weight)))
+        return float(max(1.0, min(float(self.policy_target_search_change_max_weight), weight)))
 
     def _policy_target_uptake_weight(self, search_metadata):
         if not self.policy_target_uptake_gate_enabled or not isinstance(search_metadata, dict):
@@ -4109,8 +3872,8 @@ class BatchSelfPlayMCTSBatch:
         total_search_samples = 0
         search_simulations_used_samples = []
         search_simulations_budget_samples = []
-        total_adaptive_stopped_early = 0
-        adaptive_stop_reasons = {}
+        total_scout_stopped_early = 0
+        scout_stop_reasons = {}
         total_mcts_quality_stats = {
             'mcts_prior_agreement_samples': 0.0,
             'mcts_prior_agreement_sum': 0.0,
@@ -4136,11 +3899,12 @@ class BatchSelfPlayMCTSBatch:
             'mcts_changed_q_delta_sum': 0.0,
             'mcts_changed_q_delta_values': [],
             'mcts_changed_q_delta_hist': [0] * _Q_DELTA_HIST_BINS,
-            'mcts_search_discovery_count': 0.0,
-            'mcts_search_discovery_weight_sum': 0.0,
-            'mcts_discovery_probe_used_count': 0.0,
-            'mcts_discovery_probe_changed_count': 0.0,
-            'mcts_discovery_probe_score_sum': 0.0,
+            'mcts_search_change_count': 0.0,
+            'mcts_search_change_weight_sum': 0.0,
+            'mcts_scout_challenge_eligible_count': 0.0,
+            'mcts_scout_challenge_used_count': 0.0,
+            'mcts_scout_challenge_changed_count': 0.0,
+            'mcts_scout_challenge_score_sum': 0.0,
             'mcts_policy_uptake_samples': 0.0,
             'mcts_policy_uptake_weight_sum': 0.0,
             'mcts_policy_uptake_low_count': 0.0,
@@ -4148,8 +3912,9 @@ class BatchSelfPlayMCTSBatch:
         for phase in ('opening', 'middlegame', 'endgame'):
             total_mcts_quality_stats[f'mcts_phase_{phase}_samples'] = 0.0
             total_mcts_quality_stats[f'mcts_phase_{phase}_changed_count'] = 0.0
-            total_mcts_quality_stats[f'mcts_phase_{phase}_probe_used_count'] = 0.0
-            total_mcts_quality_stats[f'mcts_phase_{phase}_probe_changed_count'] = 0.0
+            total_mcts_quality_stats[f'mcts_phase_{phase}_scout_challenge_eligible_count'] = 0.0
+            total_mcts_quality_stats[f'mcts_phase_{phase}_scout_challenge_used_count'] = 0.0
+            total_mcts_quality_stats[f'mcts_phase_{phase}_scout_challenge_changed_count'] = 0.0
         opponent_source_counts = {}
         opponent_source_results = {}
 
@@ -4180,9 +3945,9 @@ class BatchSelfPlayMCTSBatch:
         total_search_samples += int(batch_stats.get('search_samples', 0))
         search_simulations_used_samples.extend(list(batch_stats.get('search_simulations_used_samples', []) or []))
         search_simulations_budget_samples.extend(list(batch_stats.get('search_simulations_budget_samples', []) or []))
-        total_adaptive_stopped_early += int(batch_stats.get('adaptive_stopped_early', 0))
-        for reason, count in dict(batch_stats.get('adaptive_stop_reasons', {}) or {}).items():
-            adaptive_stop_reasons[str(reason)] = int(adaptive_stop_reasons.get(str(reason), 0)) + int(count)
+        total_scout_stopped_early += int(batch_stats.get('scout_stopped_early', 0))
+        for reason, count in dict(batch_stats.get('scout_stop_reasons', {}) or {}).items():
+            scout_stop_reasons[str(reason)] = int(scout_stop_reasons.get(str(reason), 0)) + int(count)
         for key in total_mcts_quality_stats:
             if key in {'mcts_q_delta_values', 'mcts_changed_q_delta_values'}:
                 total_mcts_quality_stats[key].extend(list(batch_stats.get(key, []) or []))
@@ -4241,18 +4006,23 @@ class BatchSelfPlayMCTSBatch:
         for phase in ('opening', 'middlegame', 'endgame'):
             samples = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_samples', 0.0) or 0.0)
             changed = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_changed_count', 0.0) or 0.0)
-            probe_used = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_probe_used_count', 0.0) or 0.0)
-            probe_changed = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_probe_changed_count', 0.0) or 0.0)
+            challenge_eligible = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_scout_challenge_eligible_count', 0.0) or 0.0)
+            challenge_used = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_scout_challenge_used_count', 0.0) or 0.0)
+            challenge_changed = float(total_mcts_quality_stats.get(f'mcts_phase_{phase}_scout_challenge_changed_count', 0.0) or 0.0)
             mcts_phase_stats[f'mcts_phase_{phase}_samples'] = int(samples)
             mcts_phase_stats[f'mcts_phase_{phase}_changed_count'] = int(changed)
-            mcts_phase_stats[f'mcts_phase_{phase}_probe_used_count'] = int(probe_used)
-            mcts_phase_stats[f'mcts_phase_{phase}_probe_changed_count'] = int(probe_changed)
+            mcts_phase_stats[f'mcts_phase_{phase}_scout_challenge_eligible_count'] = int(challenge_eligible)
+            mcts_phase_stats[f'mcts_phase_{phase}_scout_challenge_used_count'] = int(challenge_used)
+            mcts_phase_stats[f'mcts_phase_{phase}_scout_challenge_changed_count'] = int(challenge_changed)
             mcts_phase_stats[f'mcts_changed_{phase}_rate'] = changed / samples if samples > 0.0 else 0.0
-            mcts_phase_stats[f'mcts_discovery_probe_used_{phase}_rate'] = (
-                probe_used / samples if samples > 0.0 else 0.0
+            mcts_phase_stats[f'mcts_scout_challenge_eligible_{phase}_rate'] = (
+                challenge_eligible / samples if samples > 0.0 else 0.0
             )
-            mcts_phase_stats[f'mcts_discovery_probe_changed_{phase}_rate'] = (
-                probe_changed / probe_used if probe_used > 0.0 else 0.0
+            mcts_phase_stats[f'mcts_scout_challenge_used_{phase}_rate'] = (
+                challenge_used / samples if samples > 0.0 else 0.0
+            )
+            mcts_phase_stats[f'mcts_scout_challenge_changed_{phase}_rate'] = (
+                challenge_changed / challenge_used if challenge_used > 0.0 else 0.0
             )
         self.last_selfplay_stats = {
             'truncated_games': total_truncated_games,
@@ -4297,13 +4067,13 @@ class BatchSelfPlayMCTSBatch:
                 else 0.0
             ),
             'search_samples': int(total_search_samples),
-            'adaptive_stopped_early': int(total_adaptive_stopped_early),
-            'adaptive_stop_rate': (
-                float(total_adaptive_stopped_early) / float(total_search_samples)
+            'scout_stopped_early': int(total_scout_stopped_early),
+            'scout_stop_rate': (
+                float(total_scout_stopped_early) / float(total_search_samples)
                 if total_search_samples > 0
                 else 0.0
             ),
-            'adaptive_stop_reasons': adaptive_stop_reasons,
+            'scout_stop_reasons': scout_stop_reasons,
             'mcts_prior_agreement_samples': int(mcts_quality_samples),
             'mcts_prior_agreement_sum': float(total_mcts_quality_stats['mcts_prior_agreement_sum']),
             'mcts_prior_agreement_rate': (
@@ -4317,35 +4087,41 @@ class BatchSelfPlayMCTSBatch:
                 if mcts_quality_samples > 0
                 else 0.0
             ),
-            'mcts_search_discovery_count': int(total_mcts_quality_stats['mcts_search_discovery_count']),
-            'mcts_search_discovery_weight_sum': float(total_mcts_quality_stats['mcts_search_discovery_weight_sum']),
-            'mcts_search_discovery_rate': (
-                float(total_mcts_quality_stats['mcts_search_discovery_count']) / float(mcts_quality_samples)
+            'mcts_search_change_count': int(total_mcts_quality_stats['mcts_search_change_count']),
+            'mcts_search_change_weight_sum': float(total_mcts_quality_stats['mcts_search_change_weight_sum']),
+            'mcts_search_change_rate': (
+                float(total_mcts_quality_stats['mcts_search_change_count']) / float(mcts_quality_samples)
                 if mcts_quality_samples > 0
                 else 0.0
             ),
-            'mcts_search_discovery_weight_mean': (
-                float(total_mcts_quality_stats['mcts_search_discovery_weight_sum'])
-                / float(total_mcts_quality_stats['mcts_search_discovery_count'])
-                if int(total_mcts_quality_stats['mcts_search_discovery_count']) > 0
+            'mcts_search_change_weight_mean': (
+                float(total_mcts_quality_stats['mcts_search_change_weight_sum'])
+                / float(total_mcts_quality_stats['mcts_search_change_count'])
+                if int(total_mcts_quality_stats['mcts_search_change_count']) > 0
                 else 1.0
             ),
-            'mcts_discovery_probe_used_count': int(total_mcts_quality_stats['mcts_discovery_probe_used_count']),
-            'mcts_discovery_probe_used_rate': (
-                float(total_mcts_quality_stats['mcts_discovery_probe_used_count']) / float(mcts_quality_samples)
+            'mcts_scout_challenge_eligible_count': int(total_mcts_quality_stats['mcts_scout_challenge_eligible_count']),
+            'mcts_scout_challenge_eligible_rate': (
+                float(total_mcts_quality_stats['mcts_scout_challenge_eligible_count']) / float(mcts_quality_samples)
                 if mcts_quality_samples > 0
                 else 0.0
             ),
-            'mcts_discovery_probe_changed_count': int(total_mcts_quality_stats['mcts_discovery_probe_changed_count']),
-            'mcts_discovery_probe_changed_rate': (
-                float(total_mcts_quality_stats['mcts_discovery_probe_changed_count'])
-                / max(1.0, float(total_mcts_quality_stats['mcts_discovery_probe_used_count']))
-                if int(total_mcts_quality_stats['mcts_discovery_probe_used_count']) > 0
+            'mcts_scout_challenge_used_count': int(total_mcts_quality_stats['mcts_scout_challenge_used_count']),
+            'mcts_scout_challenge_used_rate': (
+                float(total_mcts_quality_stats['mcts_scout_challenge_used_count']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
                 else 0.0
             ),
-            'mcts_discovery_probe_score_sum': float(total_mcts_quality_stats['mcts_discovery_probe_score_sum']),
-            'mcts_discovery_probe_score_mean': (
-                float(total_mcts_quality_stats['mcts_discovery_probe_score_sum']) / float(mcts_quality_samples)
+            'mcts_scout_challenge_changed_count': int(total_mcts_quality_stats['mcts_scout_challenge_changed_count']),
+            'mcts_scout_challenge_changed_rate': (
+                float(total_mcts_quality_stats['mcts_scout_challenge_changed_count'])
+                / max(1.0, float(total_mcts_quality_stats['mcts_scout_challenge_used_count']))
+                if int(total_mcts_quality_stats['mcts_scout_challenge_used_count']) > 0
+                else 0.0
+            ),
+            'mcts_scout_challenge_score_sum': float(total_mcts_quality_stats['mcts_scout_challenge_score_sum']),
+            'mcts_scout_challenge_score_mean': (
+                float(total_mcts_quality_stats['mcts_scout_challenge_score_sum']) / float(mcts_quality_samples)
                 if mcts_quality_samples > 0
                 else 0.0
             ),
@@ -4646,20 +4422,22 @@ class BatchSelfPlayMCTSBatch:
             'changed_q_comparable': 0,
             'changed_q_delta_sum': 0.0,
             'changed_q_delta_values': [],
-            'search_discovery_count': 0,
-            'search_discovery_weight_sum': 0.0,
+            'search_change_count': 0,
+            'search_change_weight_sum': 0.0,
             'policy_uptake_samples': 0,
             'policy_uptake_weight_sum': 0.0,
             'policy_uptake_low_count': 0,
-            'discovery_probe_applied_count': 0,
-            'discovery_probe_changed_count': 0,
-            'discovery_probe_score_sum': 0.0,
+            'scout_challenge_eligible_count': 0,
+            'scout_challenge_applied_count': 0,
+            'scout_challenge_changed_count': 0,
+            'scout_challenge_score_sum': 0.0,
         }
         for phase in ('opening', 'middlegame', 'endgame'):
             target_quality[f'{phase}_samples'] = 0
             target_quality[f'{phase}_changed_count'] = 0
-            target_quality[f'{phase}_probe_used_count'] = 0
-            target_quality[f'{phase}_probe_changed_count'] = 0
+            target_quality[f'{phase}_scout_challenge_eligible_count'] = 0
+            target_quality[f'{phase}_scout_challenge_used_count'] = 0
+            target_quality[f'{phase}_scout_challenge_changed_count'] = 0
 
         def _accumulate_target_quality(search_metadata, board):
             if not isinstance(search_metadata, dict):
@@ -4670,15 +4448,29 @@ class BatchSelfPlayMCTSBatch:
             target_quality['samples'] += 1
             agree_value = float(agree)
             changed_top = agree_value < 0.5
-            probe_applied = float(search_metadata.get('discovery_probe_applied', 0.0) or 0.0) >= 0.5
+            challenge_applied = float(search_metadata.get('scout_challenge_applied', 0.0) or 0.0) >= 0.5
+            challenge_score = float(search_metadata.get('scout_challenge_score', 0.0) or 0.0)
+            mcts_for_challenge_config = getattr(self, 'mcts', None)
+            challenge_fraction = float(
+                getattr(mcts_for_challenge_config, 'scout_challenge_fraction', 0.0) or 0.0
+            )
+            challenge_min_score = float(
+                getattr(mcts_for_challenge_config, 'scout_challenge_min_score', 1.0) or 1.0
+            )
+            challenge_eligible = (
+                challenge_fraction > 0.0
+                and challenge_score >= challenge_min_score
+            )
             phase = self._mcts_phase_for_board(board)
             target_quality[f'{phase}_samples'] += 1
             if changed_top:
                 target_quality[f'{phase}_changed_count'] += 1
-            if probe_applied:
-                target_quality[f'{phase}_probe_used_count'] += 1
+            if challenge_eligible:
+                target_quality[f'{phase}_scout_challenge_eligible_count'] += 1
+            if challenge_applied:
+                target_quality[f'{phase}_scout_challenge_used_count'] += 1
                 if changed_top:
-                    target_quality[f'{phase}_probe_changed_count'] += 1
+                    target_quality[f'{phase}_scout_challenge_changed_count'] += 1
             target_quality['agreement_sum'] += agree_value
             if changed_top:
                 target_quality['changed'] += 1
@@ -4694,12 +4486,11 @@ class BatchSelfPlayMCTSBatch:
                 value = search_metadata.get(meta_key, None)
                 if value is not None:
                     target_quality[sum_key] += float(value)
-            target_quality['discovery_probe_applied_count'] += int(probe_applied)
-            if probe_applied and changed_top:
-                target_quality['discovery_probe_changed_count'] += 1
-            target_quality['discovery_probe_score_sum'] += float(
-                search_metadata.get('discovery_probe_score', 0.0) or 0.0
-            )
+            target_quality['scout_challenge_applied_count'] += int(challenge_applied)
+            target_quality['scout_challenge_eligible_count'] += int(challenge_eligible)
+            if challenge_applied and changed_top:
+                target_quality['scout_challenge_changed_count'] += 1
+            target_quality['scout_challenge_score_sum'] += challenge_score
             try:
                 top_visit_prob = float(search_metadata.get('top_visit_prob', 0.0) or 0.0)
                 visit_gap = float(search_metadata.get('visit_gap', 0.0) or 0.0)
@@ -4817,7 +4608,7 @@ class BatchSelfPlayMCTSBatch:
                     search_stats['samples'] += 1
                     search_stats['samples_list'].append(used)
                     if isinstance(search_metadata, dict):
-                        reason = str(search_metadata.get('adaptive_stop_reason', 'unknown') or 'unknown')
+                        reason = str(search_metadata.get('scout_stop_reason', 'unknown') or 'unknown')
                         search_stats['stop_reasons'][reason] = int(search_stats['stop_reasons'].get(reason, 0)) + 1
                         if bool(search_metadata.get('stopped_early', False)):
                             search_stats['stopped_early'] += 1
@@ -4898,12 +4689,12 @@ class BatchSelfPlayMCTSBatch:
                     target_quality['policy_uptake_weight_sum'] += policy_uptake_weight
                     if policy_uptake_weight < 0.999:
                         target_quality['policy_uptake_low_count'] += 1
-                    discovery_weight = self._policy_target_search_discovery_weight(search_metadata)
-                    policy_weight *= float(discovery_weight)
-                    if discovery_weight > 1.0:
-                        importance_score *= min(float(discovery_weight), 1.35)
-                        target_quality['search_discovery_count'] += 1
-                        target_quality['search_discovery_weight_sum'] += float(discovery_weight)
+                    change_weight = self._policy_target_search_change_weight(search_metadata)
+                    policy_weight *= float(change_weight)
+                    if change_weight > 1.0:
+                        importance_score *= min(float(change_weight), 1.35)
+                        target_quality['search_change_count'] += 1
+                        target_quality['search_change_weight_sum'] += float(change_weight)
                     if not learner_turn and game_opponent_mcts is not None:
                         if str(gs.get('opponent_source_label', '')) == "anchor":
                             policy_weight *= float(self.frozen_anchor_policy_weight)
@@ -5100,18 +4891,23 @@ class BatchSelfPlayMCTSBatch:
         for phase in ('opening', 'middlegame', 'endgame'):
             samples = float(target_quality.get(f'{phase}_samples', 0) or 0)
             changed = float(target_quality.get(f'{phase}_changed_count', 0) or 0)
-            probe_used = float(target_quality.get(f'{phase}_probe_used_count', 0) or 0)
-            probe_changed = float(target_quality.get(f'{phase}_probe_changed_count', 0) or 0)
+            challenge_eligible = float(target_quality.get(f'{phase}_scout_challenge_eligible_count', 0) or 0)
+            challenge_used = float(target_quality.get(f'{phase}_scout_challenge_used_count', 0) or 0)
+            challenge_changed = float(target_quality.get(f'{phase}_scout_challenge_changed_count', 0) or 0)
             target_phase_stats[f'mcts_phase_{phase}_samples'] = int(samples)
             target_phase_stats[f'mcts_phase_{phase}_changed_count'] = int(changed)
-            target_phase_stats[f'mcts_phase_{phase}_probe_used_count'] = int(probe_used)
-            target_phase_stats[f'mcts_phase_{phase}_probe_changed_count'] = int(probe_changed)
+            target_phase_stats[f'mcts_phase_{phase}_scout_challenge_eligible_count'] = int(challenge_eligible)
+            target_phase_stats[f'mcts_phase_{phase}_scout_challenge_used_count'] = int(challenge_used)
+            target_phase_stats[f'mcts_phase_{phase}_scout_challenge_changed_count'] = int(challenge_changed)
             target_phase_stats[f'mcts_changed_{phase}_rate'] = changed / samples if samples > 0.0 else 0.0
-            target_phase_stats[f'mcts_discovery_probe_used_{phase}_rate'] = (
-                probe_used / samples if samples > 0.0 else 0.0
+            target_phase_stats[f'mcts_scout_challenge_eligible_{phase}_rate'] = (
+                challenge_eligible / samples if samples > 0.0 else 0.0
             )
-            target_phase_stats[f'mcts_discovery_probe_changed_{phase}_rate'] = (
-                probe_changed / probe_used if probe_used > 0.0 else 0.0
+            target_phase_stats[f'mcts_scout_challenge_used_{phase}_rate'] = (
+                challenge_used / samples if samples > 0.0 else 0.0
+            )
+            target_phase_stats[f'mcts_scout_challenge_changed_{phase}_rate'] = (
+                challenge_changed / challenge_used if challenge_used > 0.0 else 0.0
             )
         return positions, game_lengths, {
             'total_games': int(len(completed_game_states)),
@@ -5133,8 +4929,8 @@ class BatchSelfPlayMCTSBatch:
                 if int(search_stats['samples']) > 0
                 else 0.0
             ),
-            'adaptive_stopped_early': int(search_stats['stopped_early']),
-            'adaptive_stop_reasons': dict(search_stats['stop_reasons']),
+            'scout_stopped_early': int(search_stats['stopped_early']),
+            'scout_stop_reasons': dict(search_stats['stop_reasons']),
             'mcts_prior_agreement_samples': target_quality_samples,
             'mcts_prior_agreement_sum': float(target_quality['agreement_sum']),
             'mcts_prior_changed_count': int(target_quality['changed']),
@@ -5148,34 +4944,40 @@ class BatchSelfPlayMCTSBatch:
                 if target_quality_samples > 0
                 else 0.0
             ),
-            'mcts_search_discovery_count': int(target_quality['search_discovery_count']),
-            'mcts_search_discovery_weight_sum': float(target_quality['search_discovery_weight_sum']),
-            'mcts_search_discovery_rate': (
-                float(target_quality['search_discovery_count']) / float(target_quality_samples)
+            'mcts_search_change_count': int(target_quality['search_change_count']),
+            'mcts_search_change_weight_sum': float(target_quality['search_change_weight_sum']),
+            'mcts_search_change_rate': (
+                float(target_quality['search_change_count']) / float(target_quality_samples)
                 if target_quality_samples > 0
                 else 0.0
             ),
-            'mcts_search_discovery_weight_mean': (
-                float(target_quality['search_discovery_weight_sum']) / float(target_quality['search_discovery_count'])
-                if int(target_quality['search_discovery_count']) > 0
+            'mcts_search_change_weight_mean': (
+                float(target_quality['search_change_weight_sum']) / float(target_quality['search_change_count'])
+                if int(target_quality['search_change_count']) > 0
                 else 1.0
             ),
-            'mcts_discovery_probe_used_count': int(target_quality['discovery_probe_applied_count']),
-            'mcts_discovery_probe_used_rate': (
-                float(target_quality['discovery_probe_applied_count']) / float(target_quality_samples)
+            'mcts_scout_challenge_eligible_count': int(target_quality['scout_challenge_eligible_count']),
+            'mcts_scout_challenge_eligible_rate': (
+                float(target_quality['scout_challenge_eligible_count']) / float(target_quality_samples)
                 if target_quality_samples > 0
                 else 0.0
             ),
-            'mcts_discovery_probe_changed_count': int(target_quality['discovery_probe_changed_count']),
-            'mcts_discovery_probe_changed_rate': (
-                float(target_quality['discovery_probe_changed_count'])
-                / max(1.0, float(target_quality['discovery_probe_applied_count']))
-                if int(target_quality['discovery_probe_applied_count']) > 0
+            'mcts_scout_challenge_used_count': int(target_quality['scout_challenge_applied_count']),
+            'mcts_scout_challenge_used_rate': (
+                float(target_quality['scout_challenge_applied_count']) / float(target_quality_samples)
+                if target_quality_samples > 0
                 else 0.0
             ),
-            'mcts_discovery_probe_score_sum': float(target_quality['discovery_probe_score_sum']),
-            'mcts_discovery_probe_score_mean': (
-                float(target_quality['discovery_probe_score_sum']) / float(target_quality_samples)
+            'mcts_scout_challenge_changed_count': int(target_quality['scout_challenge_changed_count']),
+            'mcts_scout_challenge_changed_rate': (
+                float(target_quality['scout_challenge_changed_count'])
+                / max(1.0, float(target_quality['scout_challenge_applied_count']))
+                if int(target_quality['scout_challenge_applied_count']) > 0
+                else 0.0
+            ),
+            'mcts_scout_challenge_score_sum': float(target_quality['scout_challenge_score_sum']),
+            'mcts_scout_challenge_score_mean': (
+                float(target_quality['scout_challenge_score_sum']) / float(target_quality_samples)
                 if target_quality_samples > 0
                 else 0.0
             ),
@@ -6514,6 +6316,14 @@ def persistent_selfplay_worker(
                     for mcts_obj in [getattr(engine, 'mcts', None)] + opponent_mcts:
                         if mcts_obj is not None and hasattr(mcts_obj, 'q_selection_weight'):
                             mcts_obj.q_selection_weight = q_selection_weight
+                if task.get('mcts_scout_challenge_fraction') is not None:
+                    challenge_fraction = max(0.0, min(1.0, float(task['mcts_scout_challenge_fraction'])))
+                    opponent_mcts = list(
+                        (getattr(engine, 'opponent_mcts_by_label', {}) or {}).values()
+                    )
+                    for mcts_obj in [getattr(engine, 'mcts', None)] + opponent_mcts:
+                        if mcts_obj is not None and hasattr(mcts_obj, 'scout_challenge_fraction'):
+                            mcts_obj.scout_challenge_fraction = challenge_fraction
 
                 total_positions, total_games = _play_games_with_engine(
                     rank,
@@ -6548,7 +6358,7 @@ def persistent_selfplay_worker(
                     })
                     raise SystemExit(130)
             except Exception as e:
-                print(f"❌ Worker {rank} failed: {e}")
+                print(f"ERROR: Worker {rank} failed: {e}")
                 import traceback
                 traceback.print_exc()
                 with open(result_file_path, 'wb') as f:
@@ -6574,7 +6384,7 @@ def play_games_mcts_worker(
     opponent_payload=None,
 ):
     """
-    🚀 One-shot worker function for parallel MCTS self-play.
+    One-shot worker function for parallel MCTS self-play.
     """
     rl_cfg = config.get('reinforcement_learning', {})
     worker_verbose = bool(rl_cfg.get('self_play_worker_verbose', False))
@@ -6641,7 +6451,7 @@ def play_games_mcts_worker(
         finally:
             raise SystemExit(130)
     except Exception as e:
-        print(f"❌ Worker {rank} failed: {e}")
+        print(f"ERROR: Worker {rank} failed: {e}")
         import traceback
         traceback.print_exc()
         with open(result_file_path, 'wb') as f:
