@@ -43,6 +43,26 @@ class MetricsCalculator:
             'middlegame': 0,
             'endgame': 0,
         }
+        self.value_phase_pred_sum = {
+            'opening': 0.0,
+            'middlegame': 0.0,
+            'endgame': 0.0,
+        }
+        self.value_phase_pred_sq_sum = {
+            'opening': 0.0,
+            'middlegame': 0.0,
+            'endgame': 0.0,
+        }
+        self.value_phase_target_sum = {
+            'opening': 0.0,
+            'middlegame': 0.0,
+            'endgame': 0.0,
+        }
+        self.value_phase_target_sq_sum = {
+            'opening': 0.0,
+            'middlegame': 0.0,
+            'endgame': 0.0,
+        }
         self.value_wdl_correct = 0
         self.value_wdl_total = 0
         self.value_wdl_ce_sum = 0.0
@@ -167,6 +187,12 @@ class MetricsCalculator:
                 phase_errors = value_mae[phase_mask]
                 self.value_phase_abs_error_sum[phase_name] += phase_errors.sum().item()
                 self.value_phase_abs_error_count[phase_name] += count
+                phase_pred = value_scalar[phase_mask].float()
+                phase_target = target_value[phase_mask].float()
+                self.value_phase_pred_sum[phase_name] += phase_pred.sum().item()
+                self.value_phase_pred_sq_sum[phase_name] += (phase_pred * phase_pred).sum().item()
+                self.value_phase_target_sum[phase_name] += phase_target.sum().item()
+                self.value_phase_target_sq_sum[phase_name] += (phase_target * phase_target).sum().item()
         
         # ============================================================
         # PREDICTION CONFIDENCE
@@ -222,6 +248,26 @@ class MetricsCalculator:
                 if count else 0.0
             )
             metrics[f'value_samples_{phase_name}'] = count
+            if count:
+                pred_mean = self.value_phase_pred_sum.get(phase_name, 0.0) / count
+                target_mean = self.value_phase_target_sum.get(phase_name, 0.0) / count
+                pred_var = max(
+                    0.0,
+                    self.value_phase_pred_sq_sum.get(phase_name, 0.0) / count - pred_mean * pred_mean,
+                )
+                target_var = max(
+                    0.0,
+                    self.value_phase_target_sq_sum.get(phase_name, 0.0) / count - target_mean * target_mean,
+                )
+                pred_std = math.sqrt(pred_var)
+                target_std = math.sqrt(target_var)
+                metrics[f'value_pred_std_{phase_name}'] = pred_std
+                metrics[f'value_target_std_{phase_name}'] = target_std
+                metrics[f'value_std_ratio_{phase_name}'] = pred_std / target_std if target_std > 1e-8 else 0.0
+            else:
+                metrics[f'value_pred_std_{phase_name}'] = 0.0
+                metrics[f'value_target_std_{phase_name}'] = 0.0
+                metrics[f'value_std_ratio_{phase_name}'] = 0.0
         
         # Legal move coverage (if available)
         if self.legal_coverages:

@@ -134,19 +134,11 @@ def _build_eval_central_server_config(config):
 
 
 def _build_eval_mcts_config(config):
-    """Build deterministic eval MCTS settings."""
+    """Build deterministic full-budget eval MCTS settings."""
     eval_config = dict(config)
     rl_cfg = dict(config.get("reinforcement_learning", {}))
-    eval_scout_overrides = {
-        "eval_mcts_scout_simulations": "mcts_scout_simulations",
-        "eval_mcts_scout_easy_top_visit_prob": "mcts_scout_easy_top_visit_prob",
-        "eval_mcts_scout_easy_visit_gap": "mcts_scout_easy_visit_gap",
-        "eval_mcts_scout_easy_max_entropy": "mcts_scout_easy_max_entropy",
-        "eval_mcts_scout_easy_min_explored_prior_mass": "mcts_scout_easy_min_explored_prior_mass",
-        "eval_mcts_scout_easy_min_visited_moves": "mcts_scout_easy_min_visited_moves",
-    }
-    for eval_key, mcts_key in eval_scout_overrides.items():
-        rl_cfg[mcts_key] = rl_cfg[eval_key]
+    eval_simulations = max(1, int(rl_cfg.get("mcts_simulations", 1) or 1))
+    rl_cfg["mcts_scout_simulations"] = eval_simulations
     rl_cfg["mcts_scout_challenge_fraction"] = 0.0
     eval_config["reinforcement_learning"] = rl_cfg
     return eval_config
@@ -924,6 +916,7 @@ def _evaluate_models_with_central_inference(
     use_fixed_openings=None,
     model1_mcts_config=None,
     model2_mcts_config=None,
+    progress_desc="Eval vs best",
 ):
     workers = _resolve_eval_workers(config, device, num_games)
     server_count = _resolve_eval_central_server_count(config, workers)
@@ -1081,7 +1074,7 @@ def _evaluate_models_with_central_inference(
         unresolved = 0
         completed = 0
         finished_worker_ranks = set()
-        eval_bar = tqdm(total=num_games, desc="Eval vs best", unit="game")
+        eval_bar = tqdm(total=num_games, desc=progress_desc, unit="game")
         worker_error = None
         try:
             while len(finished_worker_ranks) < len(active_worker_ranks):
@@ -1357,28 +1350,38 @@ def train_on_batch_rl(
 
     optimizer.zero_grad(set_to_none=True)
 
+    rl_cfg = config.get("reinforcement_learning", {})
     use_amp = config["hardware"].get("use_amp", True)
     amp_dtype = torch.bfloat16 if config["hardware"].get("use_bfloat16", False) else torch.float16
 
     value_aux_scalar_loss_weight = float(
-        config.get("reinforcement_learning", {}).get("value_aux_scalar_loss_weight", 0.25)
+        rl_cfg.get("value_aux_scalar_loss_weight", 0.25)
     )
     value_std_floor_loss_weight = max(
         0.0,
-        float(config.get("reinforcement_learning", {}).get("value_std_floor_loss_weight", 0.0)),
+        float(rl_cfg.get("value_std_floor_loss_weight", 0.0)),
     )
     value_std_floor_target_ratio = max(
         0.0,
-        float(config.get("reinforcement_learning", {}).get("value_std_floor_target_ratio", 0.70)),
+        float(rl_cfg.get("value_std_floor_target_ratio", 0.70)),
+    )
+    value_phase_calibration_enabled = bool(rl_cfg.get("value_phase_calibration_enabled", False))
+    value_phase_opening_weight = max(0.05, float(rl_cfg.get("value_phase_opening_weight", 0.85)))
+    value_phase_middlegame_weight = max(0.05, float(rl_cfg.get("value_phase_middlegame_weight", 1.10)))
+    value_phase_endgame_weight = max(0.05, float(rl_cfg.get("value_phase_endgame_weight", 1.25)))
+    value_phase_decisive_bonus = max(0.0, float(rl_cfg.get("value_phase_decisive_bonus", 0.15)))
+    value_phase_decisive_threshold = max(
+        0.0,
+        min(1.0, float(rl_cfg.get("value_phase_decisive_threshold", 0.70))),
     )
     policy_anchor_kl_weight = max(
         0.0,
-        float(config.get("reinforcement_learning", {}).get("policy_anchor_kl_weight", 0.0)),
+        float(rl_cfg.get("policy_anchor_kl_weight", 0.0)),
     )
     best_policy_kl_weight = max(
         0.0,
         float(
-            config.get("reinforcement_learning", {}).get("post_promotion_best_policy_kl_weight", 0.0)
+            rl_cfg.get("post_promotion_best_policy_kl_weight", 0.0)
             if best_policy_kl_weight_override is None
             else best_policy_kl_weight_override
         ),
@@ -1386,7 +1389,7 @@ def train_on_batch_rl(
     best_value_distill_weight = max(
         0.0,
         float(
-            config.get("reinforcement_learning", {}).get("post_promotion_best_value_distill_weight", 0.0)
+            rl_cfg.get("post_promotion_best_value_distill_weight", 0.0)
             if best_value_distill_weight_override is None
             else best_value_distill_weight_override
         ),
@@ -1461,9 +1464,38 @@ def train_on_batch_rl(
 
         target_scalar = _final_outcome_targets(value_targets)
         target_value_std = target_scalar.std(unbiased=False)
+        effective_value_sample_weights = value_sample_weights
+        if value_phase_calibration_enabled and boards.dim() == 4 and boards.size(1) > 15:
+            fullmove_indices = torch.clamp(
+                boards[:, 15, 0, 0].float() * 100.0,
+                min=0.0,
+                max=float(rl_cfg.get("value_phase_max_fullmove", 120)),
+            )
+            opening_max = float(rl_cfg.get("value_phase_opening_max_fullmove", 12))
+            endgame_min = float(rl_cfg.get("value_phase_endgame_min_fullmove", 40))
+            phase_weights = torch.full_like(target_scalar, value_phase_middlegame_weight)
+            phase_weights = torch.where(
+                fullmove_indices <= opening_max,
+                torch.full_like(phase_weights, value_phase_opening_weight),
+                phase_weights,
+            )
+            phase_weights = torch.where(
+                fullmove_indices >= endgame_min,
+                torch.full_like(phase_weights, value_phase_endgame_weight),
+                phase_weights,
+            )
+            if value_phase_decisive_bonus > 0.0 and value_phase_decisive_threshold < 1.0:
+                decisive_strength = torch.clamp(
+                    (torch.abs(target_scalar) - value_phase_decisive_threshold)
+                    / max(1e-6, 1.0 - value_phase_decisive_threshold),
+                    min=0.0,
+                    max=1.0,
+                )
+                phase_weights = phase_weights * (1.0 + value_phase_decisive_bonus * decisive_strength)
+            phase_weights = phase_weights / phase_weights.mean().clamp_min(1e-6)
+            effective_value_sample_weights = value_sample_weights * phase_weights.to(dtype=value_sample_weights.dtype)
 
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
-            rl_cfg = config.get("reinforcement_learning", {})
             target_wdl = _wdl_targets_from_final_outcome(target_scalar)
             target_wdl = _apply_wdl_label_smoothing(
                 target_wdl,
@@ -1500,7 +1532,7 @@ def train_on_batch_rl(
                         reduction="none",
                         beta=0.20,
                     ),
-                    value_sample_weights,
+                    effective_value_sample_weights,
                 )
         else:
             value_loss = (value_pred.squeeze() - target_scalar) ** 2
@@ -1524,7 +1556,7 @@ def train_on_batch_rl(
                         reduction="none",
                         beta=0.20,
                     ),
-                    value_sample_weights,
+                    effective_value_sample_weights,
                 )
 
         if policy_loss.numel() == 0:
@@ -1535,7 +1567,7 @@ def train_on_batch_rl(
                 policy_loss = policy_loss.sum() / policy_weight_total
             else:
                 policy_loss = policy_loss.sum() * 0.0
-        value_loss = _weighted_mean(value_loss, value_sample_weights)
+        value_loss = _weighted_mean(value_loss, effective_value_sample_weights)
         policy_weight = (
             float(config["reinforcement_learning"]["policy_loss_weight"])
             if policy_weight_override is None
@@ -1619,6 +1651,7 @@ def evaluate_models(
     use_fixed_openings=None,
     model1_mcts_config=None,
     model2_mcts_config=None,
+    progress_desc="Eval vs best",
 ):
     config = _build_eval_mcts_config(config)
     model1_mcts_config = _build_eval_mcts_config(model1_mcts_config or config)
@@ -1636,13 +1669,14 @@ def evaluate_models(
             use_fixed_openings=use_fixed_openings,
             model1_mcts_config=model1_mcts_config,
             model2_mcts_config=model2_mcts_config,
+            progress_desc=progress_desc,
         )
 
     workers = _resolve_eval_workers(config, device, num_games)
     if workers <= 1:
         max_moves = _resolve_eval_max_moves(config)
         game_indices = list(range(game_index_offset, game_index_offset + num_games))
-        eval_bar = tqdm(total=num_games, desc="Eval vs best", unit="game")
+        eval_bar = tqdm(total=num_games, desc=progress_desc, unit="game")
         try:
             stats = _evaluate_games_batched(
                 model1,
@@ -1700,7 +1734,7 @@ def evaluate_models(
     losses = 0
     unresolved = 0
     completed = 0
-    eval_bar = tqdm(total=num_games, desc="Eval vs best", unit="game")
+    eval_bar = tqdm(total=num_games, desc=progress_desc, unit="game")
     worker_error = None
     try:
         finished_workers = 0

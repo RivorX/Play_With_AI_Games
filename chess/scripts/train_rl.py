@@ -54,6 +54,7 @@ import torch
 import torch.optim as optim
 import torch.multiprocessing as mp
 import yaml
+import chess
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
@@ -76,6 +77,8 @@ try:
     from src.batch_selfplay import (
         play_games_mcts_worker,
         _resolve_replay_max_policy_targets,
+        MultiGameBatchMCTS,
+        _build_sparse_policy_target_from_visits,
     )
     MCTS_SELFPLAY_AVAILABLE = True
 except ImportError:
@@ -493,6 +496,127 @@ def _select_replay_indices_with_promotion_floor(
     ])
     np.random.shuffle(final_indices)
     return final_indices[:sample_count].astype(np.int64, copy=False)
+
+
+def _run_replay_mcts_reanalyze(replay_buffer, model, config, device):
+    rl_cfg = config.get('reinforcement_learning', {})
+    if not bool(rl_cfg.get('replay_mcts_reanalyze_enabled', False)):
+        return {"selected": 0, "updated": 0, "skipped": 0, "reason": "disabled"}
+    if not MCTS_SELFPLAY_AVAILABLE:
+        return {"selected": 0, "updated": 0, "skipped": 0, "reason": "mcts_unavailable"}
+    if replay_buffer is None or len(replay_buffer) <= 0:
+        return {"selected": 0, "updated": 0, "skipped": 0, "reason": "empty"}
+
+    fraction = max(0.0, min(1.0, float(rl_cfg.get('replay_mcts_reanalyze_fraction', 0.0) or 0.0)))
+    max_positions = max(0, int(rl_cfg.get('replay_mcts_reanalyze_max_positions', 0) or 0))
+    sample_count = int(round(len(replay_buffer) * fraction))
+    if max_positions > 0:
+        sample_count = min(sample_count, max_positions)
+    sample_count = max(0, min(len(replay_buffer), sample_count))
+    if sample_count <= 0:
+        return {"selected": 0, "updated": 0, "skipped": 0, "reason": "no_sample"}
+
+    indices = replay_buffer.select_fen_indices(
+        sample_count,
+        min_age=int(rl_cfg.get('replay_mcts_reanalyze_min_age', 2) or 2),
+    )
+    if int(indices.size) <= 0:
+        return {"selected": 0, "updated": 0, "skipped": sample_count, "reason": "no_fen"}
+
+    base_simulations = max(1, int(rl_cfg.get('mcts_simulations', 160) or 160))
+    simulations_multiplier = max(
+        0.05,
+        float(rl_cfg.get('replay_mcts_reanalyze_simulations_multiplier', 0.60) or 0.60),
+    )
+    simulations = max(1, int(round(float(base_simulations) * simulations_multiplier)))
+    batch_positions = max(1, int(rl_cfg.get('replay_mcts_reanalyze_batch_positions', 16) or 16))
+    policy_mix = max(0.0, min(1.0, float(rl_cfg.get('replay_mcts_reanalyze_policy_mix', 0.60) or 0.60)))
+    value_mix = max(0.0, min(1.0, float(rl_cfg.get('replay_mcts_reanalyze_value_mix', 0.08) or 0.08)))
+    importance_bonus = max(0.0, float(rl_cfg.get('replay_mcts_reanalyze_importance_bonus', 0.08) or 0.08))
+
+    mcts_config = dict(config)
+    mcts_rl_cfg = dict(rl_cfg)
+    mcts_rl_cfg['mcts_simulations'] = int(simulations)
+    mcts_rl_cfg['mcts_dirichlet_weight'] = 0.0
+    mcts_rl_cfg['mcts_scout_challenge_fraction'] = float(
+        rl_cfg.get('replay_mcts_reanalyze_challenge_fraction', 0.0) or 0.0
+    )
+    mcts_rl_cfg['mcts_profile_enabled'] = False
+    mcts_rl_cfg['mcts_profile_detail_enabled'] = False
+    mcts_config['reinforcement_learning'] = mcts_rl_cfg
+
+    was_training = bool(getattr(model, "training", False))
+    model.eval()
+    mcts = MultiGameBatchMCTS(model, mcts_config, device)
+    selected = 0
+    updated = 0
+    skipped = 0
+    fens = replay_buffer.fens_for_indices(indices)
+    history_fens_list = replay_buffer.history_fens_for_indices(indices)
+    for start in range(0, int(indices.size), batch_positions):
+        chunk_indices = indices[start:start + batch_positions]
+        chunk_fens = fens[start:start + batch_positions]
+        chunk_history_fens = history_fens_list[start:start + batch_positions]
+        states = []
+        boards = []
+        valid_indices = []
+        for idx_value, fen, history_fens in zip(chunk_indices.tolist(), chunk_fens, chunk_history_fens):
+            if not fen:
+                skipped += 1
+                continue
+            try:
+                board = chess.Board(fen)
+            except Exception:
+                skipped += 1
+                continue
+            boards.append(board)
+            valid_indices.append(int(idx_value))
+            states.append([
+                board,
+                None,
+                False,
+                list(history_fens or []),
+                int(getattr(board, 'fullmove_number', 1) or 1),
+            ])
+        if not states:
+            continue
+        selected += len(states)
+        try:
+            visit_counts_list, metadata_list = mcts.search_many(
+                states,
+                num_simulations=simulations,
+                add_root_noise=False,
+                return_search_metadata=True,
+            )
+        except Exception:
+            skipped += len(states)
+            continue
+        policy_targets = []
+        root_values = []
+        for board, visit_counts, metadata in zip(boards, visit_counts_list, metadata_list):
+            policy_targets.append(_build_sparse_policy_target_from_visits(visit_counts, board))
+            root_values.append(float((metadata or {}).get('root_value', 0.0) or 0.0))
+        update_stats = replay_buffer.update_sparse_targets(
+            valid_indices,
+            policy_targets,
+            policy_mix=policy_mix,
+            root_values=root_values,
+            value_mix=value_mix,
+            importance_bonus=importance_bonus,
+        )
+        updated += int(update_stats.get('updated', 0) or 0)
+        skipped += int(update_stats.get('skipped', 0) or 0)
+    if was_training:
+        model.train()
+    return {
+        "selected": int(selected),
+        "updated": int(updated),
+        "skipped": int(skipped),
+        "simulations": int(simulations),
+        "policy_mix": float(policy_mix),
+        "value_mix": float(value_mix),
+        "reason": "ok",
+    }
 
 
 def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", elo_result=None):
@@ -1579,6 +1703,9 @@ def play_games_parallel_mcts(
             'mcts_policy_uptake_samples',
             'mcts_policy_uptake_weight_sum',
             'mcts_policy_uptake_low_count',
+            'mcts_policy_delta_target_used_count',
+            'mcts_policy_delta_target_changed_count',
+            'mcts_policy_delta_target_top_prob_sum',
         ]:
             target[key] = float(target.get(key, 0.0)) + float(source.get(key, 0.0) or 0.0)
         for phase in ('opening', 'middlegame', 'endgame'):
@@ -1900,6 +2027,9 @@ def play_games_parallel_mcts(
                                     policy_weights = packed.get('policy_weights')
                                     value_weights = packed.get('value_weights')
                                     source_codes = packed.get('source_codes')
+                                    fens = packed.get('fens')
+                                    root_values = packed.get('root_values')
+                                    history_fens = packed.get('history_fens')
                                     values = packed.get('values')
                                     chunk_positions = int(packed.get('num_positions', 0) or 0)
                                     if (
@@ -1920,6 +2050,9 @@ def play_games_parallel_mcts(
                                             policy_weights=policy_weights,
                                             value_weights=value_weights,
                                             source_codes=source_codes,
+                                            fens=fens,
+                                            root_values=root_values,
+                                            history_fens=history_fens,
                                         )
                                     queue_total_positions += chunk_positions
                                     if values is not None:
@@ -2461,6 +2594,30 @@ def play_games_parallel_mcts(
             if float(total_mcts_quality_stats.get('mcts_policy_uptake_samples', 0.0) or 0.0) > 0.0
             else 0.0
         ),
+        'mcts_policy_delta_target_used_count': int(
+            total_mcts_quality_stats.get('mcts_policy_delta_target_used_count', 0.0) or 0.0
+        ),
+        'mcts_policy_delta_target_used_rate': (
+            float(total_mcts_quality_stats.get('mcts_policy_delta_target_used_count', 0.0) or 0.0)
+            / float(mcts_quality_samples)
+            if mcts_quality_samples > 0
+            else 0.0
+        ),
+        'mcts_policy_delta_target_changed_count': int(
+            total_mcts_quality_stats.get('mcts_policy_delta_target_changed_count', 0.0) or 0.0
+        ),
+        'mcts_policy_delta_target_changed_rate': (
+            float(total_mcts_quality_stats.get('mcts_policy_delta_target_changed_count', 0.0) or 0.0)
+            / float(total_mcts_quality_stats.get('mcts_policy_delta_target_used_count', 0.0) or 0.0)
+            if float(total_mcts_quality_stats.get('mcts_policy_delta_target_used_count', 0.0) or 0.0) > 0.0
+            else 0.0
+        ),
+        'mcts_policy_delta_target_top_prob_mean': (
+            float(total_mcts_quality_stats.get('mcts_policy_delta_target_top_prob_sum', 0.0) or 0.0)
+            / float(total_mcts_quality_stats.get('mcts_policy_delta_target_used_count', 0.0) or 0.0)
+            if float(total_mcts_quality_stats.get('mcts_policy_delta_target_used_count', 0.0) or 0.0) > 0.0
+            else 0.0
+        ),
         'mcts_prior_top_visit_prob_mean': (
             float(total_mcts_quality_stats.get('mcts_prior_top_visit_prob_sum', 0.0) or 0.0) / float(mcts_quality_samples)
             if mcts_quality_samples > 0
@@ -2975,6 +3132,13 @@ def main():
         0.0,
         float(rl_cfg.get('mcts_q_selection_weight', 0.0) or 0.0),
     )
+    mcts_q_eval_gap_dampen_enabled = bool(rl_cfg.get('mcts_q_eval_gap_dampen_enabled', False))
+    mcts_q_eval_gap_dampen_start = float(rl_cfg.get('mcts_q_eval_gap_dampen_start', -0.03) or -0.03)
+    mcts_q_eval_gap_dampen_full = float(rl_cfg.get('mcts_q_eval_gap_dampen_full', -0.12) or -0.12)
+    mcts_q_eval_gap_min_scale = max(
+        0.0,
+        min(1.0, float(rl_cfg.get('mcts_q_eval_gap_min_scale', 0.25) or 0.25)),
+    )
     recent_snapshot_keep = max(0, int(rl_cfg.get('self_play_recent_snapshots_to_keep', 4)))
     recent_selfplay_snapshots = deque(maxlen=recent_snapshot_keep) if recent_snapshot_keep > 0 else deque(maxlen=0)
     adaptive_opponent_scheduler_state = {
@@ -3262,9 +3426,17 @@ def main():
         1e-6,
         float(rl_cfg['mcts_scout_challenge_band']),
     )
+    mcts_scout_challenge_min_fraction = max(
+        0.0,
+        min(1.0, float(rl_cfg.get('mcts_scout_challenge_min_fraction', 0.0) or 0.0)),
+    )
     mcts_scout_challenge_max_fraction = max(
         0.0,
         min(1.0, float(rl_cfg['mcts_scout_challenge_max_fraction'])),
+    )
+    mcts_scout_challenge_min_fraction = min(
+        mcts_scout_challenge_min_fraction,
+        mcts_scout_challenge_max_fraction,
     )
     mcts_scout_avg_budget_target_ratio = max(
         0.10,
@@ -3283,6 +3455,11 @@ def main():
     score_rate_threshold = float(rl_cfg.get('score_rate_threshold', 0.55))
     true_win_rate_threshold = float(rl_cfg.get('true_win_rate_threshold', 0.0))
     promotion_candidate_streak = 0
+    promotion_playoff_enabled = bool(rl_cfg.get('promotion_playoff_enabled', True))
+    promotion_playoff_confirmations = max(
+        1,
+        int(rl_cfg.get('promotion_playoff_confirmations', 2) or 2),
+    )
     promotion_reset_optimizer_state = bool(rl_cfg.get('promotion_reset_optimizer_state', True))
     opponent_post_promotion_transition_iters = max(
         0,
@@ -3358,10 +3535,6 @@ def main():
         0,
         int(rl_cfg.get('post_promotion_lr_recovery_iterations', 0) or 0),
     )
-    post_promotion_q_scale = max(
-        0.0,
-        min(1.0, float(rl_cfg.get('post_promotion_q_scale', 1.0) or 1.0)),
-    )
     post_promotion_best_policy_kl_weight = max(
         0.0,
         float(rl_cfg.get('post_promotion_best_policy_kl_weight', 0.0) or 0.0),
@@ -3374,21 +3547,48 @@ def main():
         0.0,
         min(1.0, float(rl_cfg.get('post_promotion_replay_pre_fraction', 0.0) or 0.0)),
     )
+    post_promotion_train_replay_fraction = max(
+        0.05,
+        min(1.0, float(rl_cfg.get('post_promotion_train_replay_fraction', 1.0) or 1.0)),
+    )
+    post_promotion_guard_enabled = bool(rl_cfg.get('post_promotion_guard_enabled', False))
+    post_promotion_guard_window = max(
+        0,
+        int(rl_cfg.get('post_promotion_guard_window', 0) or 0),
+    )
+    post_promotion_guard_min_score_rate = max(
+        0.0,
+        min(1.0, float(rl_cfg.get('post_promotion_guard_min_score_rate', 0.0) or 0.0)),
+    )
+    post_promotion_guard_min_anchor_score_rate = max(
+        0.0,
+        min(1.0, float(rl_cfg.get('post_promotion_guard_min_anchor_score_rate', 0.0) or 0.0)),
+    )
+    post_promotion_guard_extend_iterations = max(
+        0,
+        int(rl_cfg.get('post_promotion_guard_extend_iterations', post_promotion_stabilization_iters) or 0),
+    )
+    post_promotion_guard_max_rollbacks = max(
+        0,
+        int(rl_cfg.get('post_promotion_guard_max_rollbacks', 1) or 1),
+    )
     diagnostic_ema_alpha = max(
         0.0,
         min(1.0, float(rl_cfg.get('rl_diagnostic_ema_alpha', 0.35) or 0.35)),
     )
     post_promotion_stabilization_remaining = 0
     post_promotion_lr_recovery_remaining = 0
+    post_promotion_guard_rollbacks = 0
     last_promotion_iteration = None
     mcts_no_mcts_gap_ema = None
-    q_ablation_gap_ema = None
     eval_score_rate_ema = None
     eval_true_win_rate_ema = None
     prev_completed_draw_rate = None
     prev_decisive_rate = None
     prev_mcts_prior_changed_rate = None
+    prev_mcts_scout_challenge_eligible_rate = None
     prev_mcts_avg_sims = None
+    mcts_budget_avg_sims_ema = None
     prev_eval_score_rate_for_temp = None
     best_eval_score_seen = None
     best_eval_true_win_seen = None
@@ -3503,6 +3703,17 @@ def main():
                 shortage = mcts_scout_target_changed_rate - float(prev_mcts_prior_changed_rate)
                 shortage_ratio = max(0.0, min(1.0, shortage / mcts_scout_challenge_band))
                 scout_challenge_fraction = mcts_scout_challenge_max_fraction * shortage_ratio
+            if (
+                mcts_scout_challenge_min_fraction > 0.0
+                and (
+                    prev_mcts_scout_challenge_eligible_rate is None
+                    or float(prev_mcts_scout_challenge_eligible_rate) > 0.0
+                )
+            ):
+                scout_challenge_fraction = max(
+                    float(scout_challenge_fraction),
+                    float(mcts_scout_challenge_min_fraction),
+                )
             scout_challenge_fraction_uncontrolled = float(scout_challenge_fraction)
             budget_challenge_cap = None
             if (
@@ -3513,7 +3724,9 @@ def main():
                 target_avg_sims = base_sims_for_budget * float(mcts_scout_avg_budget_target_ratio)
                 tolerance_sims = base_sims_for_budget * float(mcts_scout_avg_budget_target_tolerance)
                 observed_avg_sims = (
-                    float(prev_mcts_avg_sims)
+                    float(mcts_budget_avg_sims_ema)
+                    if mcts_budget_avg_sims_ema is not None
+                    else float(prev_mcts_avg_sims)
                     if prev_mcts_avg_sims is not None
                     else target_avg_sims
                 )
@@ -3559,11 +3772,33 @@ def main():
                     f"scout_scale={dirichlet_scout_scale:.2f}"
                 )
             budget_control_text = ""
+            budget_challenge_applied_cap = None
             if budget_challenge_cap is not None:
+                budget_challenge_applied_cap = float(budget_challenge_cap)
+                eligible_rate = (
+                    float(prev_mcts_scout_challenge_eligible_rate)
+                    if (
+                        prev_mcts_scout_challenge_eligible_rate is not None
+                        and float(prev_mcts_scout_challenge_eligible_rate) > 0.0
+                    )
+                    else 1.0
+                )
+                eligible_rate = max(1e-6, min(1.0, eligible_rate))
+                budget_challenge_cap = min(
+                    mcts_scout_challenge_max_fraction,
+                    float(budget_challenge_applied_cap) / eligible_rate,
+                )
+                scout_challenge_fraction = min(
+                    float(scout_challenge_fraction_uncontrolled),
+                    float(budget_challenge_cap),
+                )
                 budget_control_text = (
                     f", raw={scout_challenge_fraction_uncontrolled:.1%}, "
                     f"cap={float(budget_challenge_cap):.1%}, "
+                    f"applied_cap={float(budget_challenge_applied_cap):.1%}, "
+                    f"eligible={float(prev_mcts_scout_challenge_eligible_rate or 0.0):.1%}, "
                     f"prev_avg_sims={float(prev_mcts_avg_sims or 0.0):.1f}, "
+                    f"avg_ema={float(mcts_budget_avg_sims_ema or 0.0):.1f}, "
                     f"target={mcts_scout_avg_budget_target_ratio:.2f}x"
                 )
             print(
@@ -3576,14 +3811,24 @@ def main():
                 0.0,
                 float(base_mcts_q_selection_weight),
             )
-            if post_promotion_regularization_strength > 0.0 and post_promotion_q_scale < 1.0:
-                q_factor = 1.0 + (post_promotion_q_scale - 1.0) * post_promotion_regularization_strength
-                current_mcts_q_selection_weight *= max(0.0, q_factor)
+            q_eval_gap_scale = 1.0
+            if (
+                mcts_q_eval_gap_dampen_enabled
+                and mcts_no_mcts_gap_ema is not None
+                and float(mcts_no_mcts_gap_ema) < float(mcts_q_eval_gap_dampen_start)
+            ):
+                gap_start = float(mcts_q_eval_gap_dampen_start)
+                gap_full = min(float(mcts_q_eval_gap_dampen_full), gap_start - 1e-6)
+                progress = (gap_start - float(mcts_no_mcts_gap_ema)) / max(1e-6, gap_start - gap_full)
+                progress = max(0.0, min(1.0, progress))
+                q_eval_gap_scale = 1.0 + (float(mcts_q_eval_gap_min_scale) - 1.0) * progress
+                current_mcts_q_selection_weight *= q_eval_gap_scale
             current_mcts_effective_q_weight = current_mcts_q_selection_weight
             print(
                 f"MCTS Q selection: base={base_mcts_q_selection_weight:.3f}, "
                 f"current={current_mcts_q_selection_weight:.3f}, "
-                f"effective={current_mcts_effective_q_weight:.3f}"
+                f"effective={current_mcts_effective_q_weight:.3f}, "
+                f"eval_gap_scale={q_eval_gap_scale:.2f}"
             )
             config['reinforcement_learning']['mcts_temperature'] = current_temp
             config['reinforcement_learning']['mcts_dirichlet_weight'] = current_dirichlet_weight
@@ -3646,13 +3891,25 @@ def main():
             current_replay_pre_promotion_floor = (
                 post_promotion_replay_pre_fraction * post_promotion_regularization_strength
             )
+            current_train_replay_fraction = 1.0
+            if post_promotion_regularization_strength > 0.0:
+                current_train_replay_fraction = (
+                    1.0
+                    + (post_promotion_train_replay_fraction - 1.0)
+                    * post_promotion_regularization_strength
+                )
+                current_train_replay_fraction = max(
+                    post_promotion_train_replay_fraction,
+                    min(1.0, current_train_replay_fraction),
+                )
             if post_promotion_regularization_strength > 0.0:
                 print(
                     "Post-promotion convergence: "
                     f"strength={post_promotion_regularization_strength:.2f}, "
                     f"best_policy_kl={current_best_policy_kl_weight:.3f}, "
                     f"best_value={current_best_value_distill_weight:.3f}, "
-                    f"pre_replay_floor={current_replay_pre_promotion_floor:.1%}"
+                    f"pre_replay_floor={current_replay_pre_promotion_floor:.1%}, "
+                    f"train_replay={current_train_replay_fraction:.1%}"
                 )
 
             _finish_stage('setup')
@@ -3696,6 +3953,9 @@ def main():
             selfplay_stats['mcts_scout_challenge_cap_fraction'] = (
                 None if budget_challenge_cap is None else float(budget_challenge_cap)
             )
+            selfplay_stats['mcts_scout_challenge_applied_cap_fraction'] = (
+                None if budget_challenge_applied_cap is None else float(budget_challenge_applied_cap)
+            )
             _finish_stage('selfplay')
             startup_time_in_selfplay = max(
                 0.0,
@@ -3737,9 +3997,40 @@ def main():
                     )
              
             print(f"Replay buffer: {len(replay_buffer)}/{replay_buffer.max_size} positions (+{positions_added})")
+            replay_mcts_reanalyze_stats = {}
+            if bool(config['reinforcement_learning'].get('replay_mcts_reanalyze_enabled', False)):
+                mcts_reanalyze_every = max(
+                    1,
+                    int(config['reinforcement_learning'].get('replay_mcts_reanalyze_every', 2) or 2),
+                )
+                if (iteration + 1) % mcts_reanalyze_every == 0 and len(replay_buffer) > 0:
+                    mcts_reanalyze_source = str(
+                        config['reinforcement_learning'].get('replay_mcts_reanalyze_model', 'best')
+                    ).strip().lower()
+                    mcts_reanalyze_model = best_model if mcts_reanalyze_source == 'best' else model
+                    replay_mcts_reanalyze_stats = _run_replay_mcts_reanalyze(
+                        replay_buffer,
+                        mcts_reanalyze_model,
+                        config,
+                        device,
+                    )
+                    if int(replay_mcts_reanalyze_stats.get('selected', 0) or 0) > 0:
+                        print(
+                            "Replay MCTS reanalyze: "
+                            f"{int(replay_mcts_reanalyze_stats.get('updated', 0) or 0)}/"
+                            f"{int(replay_mcts_reanalyze_stats.get('selected', 0) or 0)} refreshed "
+                            f"using {mcts_reanalyze_source} "
+                            f"at {int(replay_mcts_reanalyze_stats.get('simulations', 0) or 0)} sims "
+                            f"(policy_mix={float(replay_mcts_reanalyze_stats.get('policy_mix', 0.0)):.2f}, "
+                            f"value_mix={float(replay_mcts_reanalyze_stats.get('value_mix', 0.0)):.2f})"
+                        )
+                    elif str(replay_mcts_reanalyze_stats.get('reason', '')) == 'no_fen':
+                        print("Replay MCTS reanalyze: skipped, replay has no stored FENs yet.")
             replay_quality_stats = replay_buffer.quality_stats(
                 recent_window_fraction=config['reinforcement_learning'].get('replay_recent_window_fraction', None)
             )
+            replay_quality_stats['mcts_reanalyze_selected'] = int(replay_mcts_reanalyze_stats.get('selected', 0) or 0)
+            replay_quality_stats['mcts_reanalyze_updated'] = int(replay_mcts_reanalyze_stats.get('updated', 0) or 0)
             print(
                 "Self-play: "
                 f"draw={float((selfplay_stats or {}).get('completed_draw_rate', 0.0)):.1%}, "
@@ -3811,10 +4102,21 @@ def main():
             prev_mcts_prior_changed_rate = float(
                 (selfplay_stats or {}).get('mcts_prior_changed_rate', 0.0)
             )
+            prev_mcts_scout_challenge_eligible_rate = float(
+                (selfplay_stats or {}).get('mcts_scout_challenge_eligible_rate', 0.0)
+            )
             prev_mcts_avg_sims = float(
                 (selfplay_stats or {}).get(
                     'search_simulations_used_avg',
                     config['reinforcement_learning'].get('mcts_simulations', 0.0),
+                )
+            )
+            mcts_budget_avg_sims_ema = (
+                float(prev_mcts_avg_sims)
+                if mcts_budget_avg_sims_ema is None
+                else (
+                    (1.0 - diagnostic_ema_alpha) * float(mcts_budget_avg_sims_ema)
+                    + diagnostic_ema_alpha * float(prev_mcts_avg_sims)
                 )
             )
             _finish_stage('replay')
@@ -3872,7 +4174,20 @@ def main():
                     1,
                     int(config['reinforcement_learning']['train_epochs_per_iteration']),
                 )
-                replay_steps_per_epoch = max(1, math.ceil(replay_size / base_batch_size))
+                target_train_replay_size = replay_size
+                if current_train_replay_fraction < 0.999:
+                    target_train_replay_size = int(round(float(replay_size) * float(current_train_replay_fraction)))
+                    target_train_replay_size = max(1, min(replay_size, target_train_replay_size))
+                    target_train_replay_size = max(
+                        min(replay_size, int(base_batch_size)),
+                        target_train_replay_size,
+                    )
+                    print(
+                        "Post-promotion replay throttle: "
+                        f"{target_train_replay_size}/{replay_size} positions this pass "
+                        f"({current_train_replay_fraction:.1%})."
+                    )
+                replay_steps_per_epoch = max(1, math.ceil(target_train_replay_size / base_batch_size))
                 uncapped_train_steps = train_epochs * replay_steps_per_epoch
                 total_train_steps = uncapped_train_steps
                 max_train_steps = max(
@@ -3894,7 +4209,7 @@ def main():
                     if remaining_train_steps <= 0:
                         break
                     epoch_steps = min(replay_steps_per_epoch, remaining_train_steps)
-                    epoch_sample_count = min(replay_size, epoch_steps * base_batch_size)
+                    epoch_sample_count = min(target_train_replay_size, epoch_steps * base_batch_size)
                     epoch_indices = _select_replay_indices_with_promotion_floor(
                         replay_buffer,
                         epoch_sample_count,
@@ -3987,6 +4302,12 @@ def main():
                     f"Pred value std: {avg_value_pred_std:.4f}, "
                     f"Target value std: {avg_target_value_std:.4f}"
                 )
+                print(
+                    "Value std ratio by phase: "
+                    f"opening={float(train_metrics.get('value_std_ratio_opening', 0.0)):.3f}, "
+                    f"middle={float(train_metrics.get('value_std_ratio_middlegame', 0.0)):.3f}, "
+                    f"endgame={float(train_metrics.get('value_std_ratio_endgame', 0.0)):.3f}"
+                )
                 if sample_age_avg is not None:
                     print(
                         "Replay sample age: "
@@ -4023,12 +4344,6 @@ def main():
             no_mcts_draw_rate = None
             no_mcts_loss_rate = None
             no_mcts_wins = no_mcts_draws = no_mcts_losses = no_mcts_unresolved = None
-            q_ablation_score_rate = None
-            q_ablation_true_win_rate = None
-            q_ablation_draw_rate = None
-            q_ablation_loss_rate = None
-            q_ablation_wins = q_ablation_draws = q_ablation_losses = q_ablation_unresolved = None
-            q_ablation_gap = None
             promoted_best_this_iter = False
             early_stop_reset_reason = None
             early_stop_should_stop = False
@@ -4146,6 +4461,26 @@ def main():
                     or float(true_win_rate) >= float(best_eval_true_win_seen) + early_stop_min_true_win_improvement
                 )
                 is_new_best_candidate = score_rate >= score_rate_threshold and true_win_rate >= true_win_rate_threshold
+                promotion_stat_gate_enabled = bool(rl_cfg.get('promotion_stat_gate_enabled', True))
+                if is_new_best_candidate and promotion_stat_gate_enabled:
+                    stat_gate_z = max(0.0, float(rl_cfg.get('promotion_stat_gate_z', 1.28) or 1.28))
+                    stat_gate_min_score_lb = float(
+                        rl_cfg.get('promotion_score_lower_bound_min', 0.50) or 0.50
+                    )
+                    stat_gate_games = max(1.0, float(eval_games_total or 1))
+                    score_rate_clamped = max(0.0, min(1.0, float(score_rate)))
+                    score_se = math.sqrt(
+                        score_rate_clamped * (1.0 - score_rate_clamped) / stat_gate_games
+                    )
+                    score_lower_bound = score_rate_clamped - stat_gate_z * score_se
+                    if score_lower_bound < stat_gate_min_score_lb:
+                        is_new_best_candidate = False
+                        print(
+                            "Promotion blocked by statistical gate: "
+                            f"score_lb={score_lower_bound:.2%} "
+                            f"(required >= {stat_gate_min_score_lb:.2%}, "
+                            f"score={score_rate_clamped:.2%}, games={int(stat_gate_games)}, z={stat_gate_z:.2f})."
+                        )
                 anchor_gate_enabled = bool(rl_cfg.get('promotion_require_anchor_non_regression', True))
                 min_anchor_score_for_progress = float(rl_cfg.get('promotion_anchor_min_score_rate', 0.50))
                 min_anchor_true_win_for_progress = float(
@@ -4187,6 +4522,7 @@ def main():
                             int(rl_cfg.get('anchor_eval_games', 40)),
                             game_index_offset=eval_game_index_offset,
                             use_fixed_openings=bool(rl_cfg.get('anchor_eval_use_fixed_openings', True)),
+                            progress_desc="Eval vs anchor",
                         )
                         anchor_score_rate = float((anchor_stats or {}).get('score_rate', 0.0))
                         anchor_true_win_rate = float((anchor_stats or {}).get('win_rate', 0.0))
@@ -4284,6 +4620,73 @@ def main():
                     promotion_candidate_streak += 1
                 else:
                     promotion_candidate_streak = 0
+                if (
+                    is_new_best_candidate
+                    and promotion_playoff_enabled
+                    and promotion_candidate_streak < promotion_playoff_confirmations
+                ):
+                    print(
+                        "Promotion playoff: "
+                        f"candidate pass {promotion_candidate_streak}/"
+                        f"{promotion_playoff_confirmations}; waiting for the next eval confirmation."
+                    )
+                    early_stop_reset_reason = (
+                        f"{early_stop_reset_reason}+promotion_playoff"
+                        if early_stop_reset_reason and early_stop_reset_reason != 'none'
+                        else 'promotion_playoff'
+                    )
+                    no_improvement_eval_streak = 0
+                    early_stop_should_stop = False
+                    is_new_best_candidate = False
+                if (
+                    post_promotion_guard_enabled
+                    and not is_new_best_candidate
+                    and last_promotion_iteration is not None
+                    and int(iteration + 1) > int(last_promotion_iteration)
+                    and (
+                        post_promotion_guard_window <= 0
+                        or int(iteration + 1) - int(last_promotion_iteration) <= post_promotion_guard_window
+                    )
+                    and post_promotion_guard_rollbacks < post_promotion_guard_max_rollbacks
+                ):
+                    guard_reasons = []
+                    if float(score_rate) < post_promotion_guard_min_score_rate:
+                        guard_reasons.append(
+                            f"best_score={float(score_rate):.2%}<{post_promotion_guard_min_score_rate:.2%}"
+                        )
+                    if (
+                        anchor_score_rate is not None
+                        and float(anchor_score_rate) < post_promotion_guard_min_anchor_score_rate
+                    ):
+                        guard_reasons.append(
+                            f"anchor_score={float(anchor_score_rate):.2%}<{post_promotion_guard_min_anchor_score_rate:.2%}"
+                        )
+                    if guard_reasons:
+                        model.load_state_dict(best_model.state_dict())
+                        if promotion_reset_optimizer_state:
+                            _reset_optimizer_state(optimizer)
+                        optimizer.zero_grad(set_to_none=True)
+                        post_promotion_guard_rollbacks += 1
+                        post_promotion_stabilization_remaining = max(
+                            post_promotion_stabilization_remaining,
+                            post_promotion_guard_extend_iterations,
+                        )
+                        post_promotion_lr_recovery_remaining = max(
+                            post_promotion_lr_recovery_remaining,
+                            post_promotion_lr_recovery_iters,
+                        )
+                        no_improvement_eval_streak = 0
+                        early_stop_should_stop = False
+                        early_stop_reset_reason = (
+                            f"{early_stop_reset_reason}+post_promotion_guard"
+                            if early_stop_reset_reason and early_stop_reset_reason != 'none'
+                            else 'post_promotion_guard'
+                        )
+                        print(
+                            "Post-promotion guard rollback: restored current model to promoted best "
+                            f"({', '.join(guard_reasons)}; "
+                            f"rollback {post_promotion_guard_rollbacks}/{post_promotion_guard_max_rollbacks})."
+                        )
                 estimated_elo = None
                 if is_new_best_candidate:
                     if promotion_reset_optimizer_state:
@@ -4309,12 +4712,6 @@ def main():
                     eval_true_win_rate_ema=eval_true_win_rate_ema,
                     opponent_source_weights_json=opponent_source_weights_json,
                     mcts_no_mcts_gap=current_mcts_no_mcts_gap,
-                    mcts_q_ablation_gap=q_ablation_gap,
-                    mcts_q_vs_qoff_score_rate=q_ablation_score_rate,
-                    mcts_q_vs_qoff_win_rate=q_ablation_true_win_rate,
-                    mcts_q_vs_qoff_draw_rate=q_ablation_draw_rate,
-                    mcts_q_vs_qoff_loss_rate=q_ablation_loss_rate,
-                    mcts_q_vs_qoff_games=None,
                     score_rate=score_rate,
                     win_rate=true_win_rate,
                     true_win_rate=true_win_rate,
@@ -4392,6 +4789,7 @@ def main():
                         post_promotion_lr_recovery_iters,
                     )
                     promotion_candidate_streak = 0
+                    post_promotion_guard_rollbacks = 0
                     last_promotion_iteration = int(iteration + 1)
                     logger.add_rl_best_model_marker(
                         iteration + 1,
@@ -4415,8 +4813,6 @@ def main():
                         'anchor_true_win_rate': anchor_true_win_rate,
                         'mcts_q_selection_weight': current_mcts_q_selection_weight,
                         'mcts_q_effective_weight': current_mcts_effective_q_weight,
-                        'mcts_q_vs_qoff_score_rate': q_ablation_score_rate,
-                        'mcts_q_ablation_gap': q_ablation_gap,
                         'policy_loss': avg_policy,
                         'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                         'value_mae': train_metrics.get('value_mae', 0),
@@ -4466,12 +4862,6 @@ def main():
                     eval_score_rate_ema=eval_score_rate_ema,
                     eval_true_win_rate_ema=eval_true_win_rate_ema,
                     opponent_source_weights_json=opponent_source_weights_json,
-                    mcts_q_ablation_gap=q_ablation_gap,
-                    mcts_q_vs_qoff_score_rate=q_ablation_score_rate,
-                    mcts_q_vs_qoff_win_rate=q_ablation_true_win_rate,
-                    mcts_q_vs_qoff_draw_rate=q_ablation_draw_rate,
-                    mcts_q_vs_qoff_loss_rate=q_ablation_loss_rate,
-                    mcts_q_vs_qoff_games=None,
                     buffer_size=len(replay_buffer),
                     avg_game_length=avg_game_length,
                     no_mcts_score_rate=no_mcts_score_rate,
@@ -4540,8 +4930,6 @@ def main():
                 'no_mcts_loss_rate': no_mcts_loss_rate,
                 'mcts_q_selection_weight': current_mcts_q_selection_weight,
                 'mcts_q_effective_weight': current_mcts_effective_q_weight,
-                'mcts_q_vs_qoff_score_rate': q_ablation_score_rate,
-                'mcts_q_ablation_gap': q_ablation_gap,
                 'policy_loss': avg_policy,
                 'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                 'value_mae': train_metrics.get('value_mae', 0),
@@ -4590,6 +4978,8 @@ def main():
                 if last_promotion_iteration is not None
                 else None
             )
+            replay_quality_stats['post_promotion_train_replay_fraction'] = float(current_train_replay_fraction)
+            replay_quality_stats['post_promotion_guard_rollbacks'] = int(post_promotion_guard_rollbacks)
             logger.log_rl_data_quality(
                 iteration + 1,
                 positions_added=positions_added,
@@ -4600,12 +4990,8 @@ def main():
                 eval_stats={
                     'mcts_score_rate': score_rate,
                     'no_mcts_score_rate': no_mcts_score_rate,
-                    'mcts_q_vs_qoff_score_rate': q_ablation_score_rate,
-                    'mcts_q_ablation_gap': q_ablation_gap,
                     'mcts_no_mcts_gap_ema': mcts_no_mcts_gap_ema,
-                    'mcts_q_ablation_gap_ema': q_ablation_gap_ema,
                     'mcts_games': eval_games_total,
-                    'mcts_q_vs_qoff_games': None,
                     'score_rate_ema': eval_score_rate_ema,
                     'true_win_rate_ema': eval_true_win_rate_ema,
                     'early_stop_streak': no_improvement_eval_streak,

@@ -155,8 +155,6 @@ class TrainingLogger:
                     'early_stop_streak', 'promotion_candidate_streak',
                     'early_stop_reset_reason', 'eval_score_rate_ema', 'eval_true_win_rate_ema',
                     'opponent_source_weights_json', 'mcts_no_mcts_gap',
-                    'mcts_q_ablation_gap', 'mcts_q_vs_qoff_score_rate', 'mcts_q_vs_qoff_win_rate',
-                    'mcts_q_vs_qoff_draw_rate', 'mcts_q_vs_qoff_loss_rate', 'mcts_q_vs_qoff_games',
                     'score_rate', 'buffer_size', 'avg_game_length', 'temperature', 'beta',
                     'true_win_rate', 'eval_stage', 'eval_games',
                     'eval_wins', 'eval_draws', 'eval_losses', 'eval_unresolved',
@@ -170,6 +168,9 @@ class TrainingLogger:
                     'value_wdl_acc', 'value_wdl_ce',
                     'value_mae_opening', 'value_mae_middlegame', 'value_mae_endgame',
                     'value_samples_opening', 'value_samples_middlegame', 'value_samples_endgame',
+                    'value_pred_std_opening', 'value_pred_std_middlegame', 'value_pred_std_endgame',
+                    'value_target_std_opening', 'value_target_std_middlegame', 'value_target_std_endgame',
+                    'value_std_ratio_opening', 'value_std_ratio_middlegame', 'value_std_ratio_endgame',
                     # RL headline telemetry
                     'completed_draw_rate',
                     'avg_game_value', 'value_std',
@@ -337,6 +338,13 @@ class TrainingLogger:
                     'replay_value_positive_fraction',
                     'replay_value_neutral_fraction',
                     'replay_value_negative_fraction',
+                    'replay_root_value_mean',
+                    'replay_root_value_std',
+                    'replay_fen_available_fraction',
+                    'replay_history_fen_available_fraction',
+                    'replay_history_fen_len_mean',
+                    'replay_mcts_reanalyze_selected',
+                    'replay_mcts_reanalyze_updated',
                     'replay_recent_decisive_fraction',
                     'replay_recent_draw_fraction',
                     'replay_recent_value_mean',
@@ -379,6 +387,8 @@ class TrainingLogger:
                     'iterations_since_promotion',
                     'sample_pre_promotion_fraction',
                     'sample_post_promotion_fraction',
+                    'post_promotion_train_replay_fraction',
+                    'post_promotion_guard_rollbacks',
                     'selfplay_completed_games',
                     'selfplay_draw_rate',
                     'replay_vs_selfplay_draw_gap',
@@ -428,10 +438,14 @@ class TrainingLogger:
                     'mcts_scout_challenge_fraction',
                     'mcts_scout_challenge_raw_fraction',
                     'mcts_scout_challenge_cap_fraction',
+                    'mcts_scout_challenge_applied_cap_fraction',
                     'mcts_scout_challenge_eligible_rate',
                     'mcts_scout_challenge_used_rate',
                     'mcts_scout_challenge_changed_rate',
                     'mcts_scout_challenge_score_mean',
+                    'mcts_policy_delta_target_used_rate',
+                    'mcts_policy_delta_target_changed_rate',
+                    'mcts_policy_delta_target_top_prob_mean',
                     'mcts_avg_sims',
                     'mcts_avg_budget',
                     'mcts_budget_p10',
@@ -505,15 +519,20 @@ class TrainingLogger:
                     'train_value_samples_opening',
                     'train_value_samples_middlegame',
                     'train_value_samples_endgame',
+                    'train_value_pred_std_opening',
+                    'train_value_pred_std_middlegame',
+                    'train_value_pred_std_endgame',
+                    'train_value_target_std_opening',
+                    'train_value_target_std_middlegame',
+                    'train_value_target_std_endgame',
+                    'train_value_std_ratio_opening',
+                    'train_value_std_ratio_middlegame',
+                    'train_value_std_ratio_endgame',
                     'eval_mcts_score_rate',
                     'eval_no_mcts_score_rate',
                     'eval_mcts_no_mcts_gap',
                     'eval_mcts_no_mcts_gap_ema',
-                    'eval_mcts_q_vs_qoff_score_rate',
-                    'eval_mcts_q_ablation_gap',
-                    'eval_mcts_q_ablation_gap_ema',
                     'eval_mcts_games',
-                    'eval_mcts_q_vs_qoff_games',
                     'eval_score_rate_ema',
                     'eval_true_win_rate_ema',
                     'early_stop_streak',
@@ -1560,6 +1579,13 @@ class TrainingLogger:
             _value(replay_stats, 'value_positive_fraction'),
             _value(replay_stats, 'value_neutral_fraction'),
             _value(replay_stats, 'value_negative_fraction'),
+            _value(replay_stats, 'root_value_mean'),
+            _value(replay_stats, 'root_value_std'),
+            _value(replay_stats, 'fen_available_fraction'),
+            _value(replay_stats, 'history_fen_available_fraction'),
+            _value(replay_stats, 'history_fen_len_mean'),
+            _value(replay_stats, 'mcts_reanalyze_selected'),
+            _value(replay_stats, 'mcts_reanalyze_updated'),
             _value(replay_stats, 'recent_decisive_fraction'),
             _value(replay_stats, 'recent_draw_fraction'),
             _value(replay_stats, 'recent_value_mean'),
@@ -1602,6 +1628,8 @@ class TrainingLogger:
             _value(replay_stats, 'iterations_since_promotion'),
             _value(replay_stats, 'sample_pre_promotion_fraction'),
             _value(replay_stats, 'sample_post_promotion_fraction'),
+            _value(replay_stats, 'post_promotion_train_replay_fraction'),
+            _value(replay_stats, 'post_promotion_guard_rollbacks'),
             _value(selfplay_stats, 'completed_games'),
             _value(selfplay_stats, 'completed_draw_rate'),
             replay_vs_selfplay_draw_gap,
@@ -1627,10 +1655,14 @@ class TrainingLogger:
             _value(selfplay_stats, 'mcts_scout_challenge_fraction'),
             _value(selfplay_stats, 'mcts_scout_challenge_raw_fraction'),
             _value(selfplay_stats, 'mcts_scout_challenge_cap_fraction'),
+            _value(selfplay_stats, 'mcts_scout_challenge_applied_cap_fraction'),
             _value(selfplay_stats, 'mcts_scout_challenge_eligible_rate'),
             _value(selfplay_stats, 'mcts_scout_challenge_used_rate'),
             _value(selfplay_stats, 'mcts_scout_challenge_changed_rate'),
             _value(selfplay_stats, 'mcts_scout_challenge_score_mean'),
+            _value(selfplay_stats, 'mcts_policy_delta_target_used_rate'),
+            _value(selfplay_stats, 'mcts_policy_delta_target_changed_rate'),
+            _value(selfplay_stats, 'mcts_policy_delta_target_top_prob_mean'),
             _value(selfplay_stats, 'search_simulations_used_avg'),
             _value(selfplay_stats, 'search_simulations_budget_avg'),
             _value(selfplay_stats, 'search_simulations_budget_p10'),
@@ -1704,15 +1736,20 @@ class TrainingLogger:
             _value(train_metrics, 'value_samples_opening'),
             _value(train_metrics, 'value_samples_middlegame'),
             _value(train_metrics, 'value_samples_endgame'),
+            _value(train_metrics, 'value_pred_std_opening'),
+            _value(train_metrics, 'value_pred_std_middlegame'),
+            _value(train_metrics, 'value_pred_std_endgame'),
+            _value(train_metrics, 'value_target_std_opening'),
+            _value(train_metrics, 'value_target_std_middlegame'),
+            _value(train_metrics, 'value_target_std_endgame'),
+            _value(train_metrics, 'value_std_ratio_opening'),
+            _value(train_metrics, 'value_std_ratio_middlegame'),
+            _value(train_metrics, 'value_std_ratio_endgame'),
             _value(eval_stats, 'mcts_score_rate'),
             _value(eval_stats, 'no_mcts_score_rate'),
             eval_mcts_no_mcts_gap,
             _value(eval_stats, 'mcts_no_mcts_gap_ema'),
-            _value(eval_stats, 'mcts_q_vs_qoff_score_rate'),
-            _value(eval_stats, 'mcts_q_ablation_gap'),
-            _value(eval_stats, 'mcts_q_ablation_gap_ema'),
             _value(eval_stats, 'mcts_games'),
-            _value(eval_stats, 'mcts_q_vs_qoff_games'),
             _value(eval_stats, 'score_rate_ema'),
             _value(eval_stats, 'true_win_rate_ema'),
             _value(eval_stats, 'early_stop_streak'),
@@ -1940,12 +1977,6 @@ class TrainingLogger:
                     anchor = row.get('anchor_score_rate', '')
                     if anchor not in ('', None):
                         checks.append(float(anchor) >= 0.50)
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    q_gap = row.get('mcts_q_ablation_gap', '')
-                    if q_gap not in ('', None):
-                        checks.append(float(q_gap) >= -0.02)
                 except (TypeError, ValueError):
                     pass
                 if not checks:
@@ -2554,8 +2585,7 @@ class TrainingLogger:
         ax = axes[5, 0]
         eval_values = []
         for column, label, color, style in [
-            ('eval_mcts_score_rate', 'MCTS Q-on', colors['purple'], '-'),
-            ('eval_mcts_q_vs_qoff_score_rate', 'Q-on vs Q-off', colors['green'], '--'),
+            ('eval_mcts_score_rate', 'MCTS', colors['purple'], '-'),
             ('eval_no_mcts_score_rate', 'No-MCTS', colors['slate'], ':'),
         ]:
             _, values = _plot(ax, column, label, color, style=style, marker='o', linewidth=2.2)
@@ -2565,25 +2595,14 @@ class TrainingLogger:
             _set_percent_ylim(ax, eval_values, min_pad=0.04, include=[0.5])
         ax.axhline(0.5, color=colors['black'], linestyle=':', linewidth=1.0, alpha=0.5)
         _draw_promotion_boundaries(ax)
-        ax2 = ax.twinx()
-        _, gap_values = _plot(ax2, 'eval_mcts_q_ablation_gap', 'Q-on edge vs parity', colors['red'], style='-.', marker='s', linewidth=1.8)
-        if gap_values:
-            _set_tight_ylim(ax2, gap_values, min_pad=0.02, center_zero=True)
-        ax2.set_ylabel('Q gap')
-        ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
-        ax2.spines['right'].set_alpha(0.18)
-        lines, labels = ax.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        if lines or lines2:
-            _apply_sorted_legend(ax, lines + lines2, labels + labels2, loc='best', fontsize=8)
+        if ax.get_legend_handles_labels()[0]:
+            _apply_sorted_legend(ax, loc='best', fontsize=8)
 
         ax = axes[5, 1]
         eval_gap_values = []
         for column, label, color, style in [
-            ('eval_mcts_q_ablation_gap', 'Q-on edge vs parity', colors['red'], '-'),
             ('eval_mcts_no_mcts_gap', 'MCTS minus no-MCTS', colors['purple'], '--'),
             ('eval_mcts_no_mcts_gap_ema', 'MCTS/no-MCTS EMA', colors['blue'], ':'),
-            ('eval_mcts_q_ablation_gap_ema', 'Q gap EMA', colors['orange'], '-.'),
         ]:
             _, values = _plot(ax, column, label, color, style=style, marker='o', linewidth=2.0)
             eval_gap_values.extend(values)
@@ -2604,6 +2623,14 @@ class TrainingLogger:
             ax2.plot(ratio_xs, ratio_ys, color=colors['purple'], linestyle=':', linewidth=1.5, alpha=0.50, label='pred/target')
             ax2.plot(ratio_xs, _ema(ratio_ys, alpha=0.35), color=colors['purple'], linestyle='-', linewidth=2.0, label='ratio EMA')
             ax2.axhline(1.0, color=colors['black'], linestyle=':', linewidth=1.0, alpha=0.45)
+        for column, label, color, style in [
+            ('train_value_std_ratio_opening', 'opening ratio', colors['blue'], '--'),
+            ('train_value_std_ratio_middlegame', 'middle ratio', colors['orange'], '-.'),
+            ('train_value_std_ratio_endgame', 'endgame ratio', colors['green'], ':'),
+        ]:
+            phase_xs, phase_ys = _series(column)
+            if phase_xs:
+                ax2.plot(phase_xs, phase_ys, color=color, linestyle=style, linewidth=1.45, alpha=0.80, label=label)
         _draw_promotion_boundaries(ax)
         ax2.set_ylabel('ratio')
         ax2.spines['right'].set_alpha(0.18)
@@ -2745,7 +2772,6 @@ class TrainingLogger:
         ci_values = []
         for (xs, ys), label, color, style in [
             (_series_eval_ci_from_rows(rows, 'eval_mcts_score_rate', 'eval_mcts_games'), 'MCTS score CI', colors['purple'], '-'),
-            (_series_eval_ci_from_rows(rows, 'eval_mcts_q_vs_qoff_score_rate', 'eval_mcts_q_vs_qoff_games'), 'Q-on vs Q-off score CI', colors['green'], '--'),
             (_series_no_mcts_ci(), 'No-MCTS score CI', colors['orange'], ':'),
         ]:
             if xs:
@@ -3535,12 +3561,6 @@ class TrainingLogger:
                     kwargs.get('eval_true_win_rate_ema', ''),
                     kwargs.get('opponent_source_weights_json', ''),
                     mcts_no_mcts_gap,
-                    kwargs.get('mcts_q_ablation_gap', ''),
-                    kwargs.get('mcts_q_vs_qoff_score_rate', ''),
-                    kwargs.get('mcts_q_vs_qoff_win_rate', ''),
-                    kwargs.get('mcts_q_vs_qoff_draw_rate', ''),
-                    kwargs.get('mcts_q_vs_qoff_loss_rate', ''),
-                    kwargs.get('mcts_q_vs_qoff_games', ''),
                     kwargs.get('score_rate', kwargs.get('win_rate', '')),
                     kwargs.get('buffer_size', ''),
                     kwargs.get('avg_game_length', ''),
@@ -3579,6 +3599,15 @@ class TrainingLogger:
                     train_metrics.get('value_samples_opening', '') if train_metrics else '',
                     train_metrics.get('value_samples_middlegame', '') if train_metrics else '',
                     train_metrics.get('value_samples_endgame', '') if train_metrics else '',
+                    train_metrics.get('value_pred_std_opening', '') if train_metrics else '',
+                    train_metrics.get('value_pred_std_middlegame', '') if train_metrics else '',
+                    train_metrics.get('value_pred_std_endgame', '') if train_metrics else '',
+                    train_metrics.get('value_target_std_opening', '') if train_metrics else '',
+                    train_metrics.get('value_target_std_middlegame', '') if train_metrics else '',
+                    train_metrics.get('value_target_std_endgame', '') if train_metrics else '',
+                    train_metrics.get('value_std_ratio_opening', '') if train_metrics else '',
+                    train_metrics.get('value_std_ratio_middlegame', '') if train_metrics else '',
+                    train_metrics.get('value_std_ratio_endgame', '') if train_metrics else '',
                     kwargs.get('completed_draw_rate', ''),
                     kwargs.get('avg_game_value', ''),
                     kwargs.get('value_std', ''),

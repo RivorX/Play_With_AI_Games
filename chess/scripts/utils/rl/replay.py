@@ -88,6 +88,9 @@ class ReplayBuffer:
         self._value_sample_weights = None
         self._insertion_iterations = None
         self._source_codes = None
+        self._root_values = None
+        self._fens = None
+        self._history_fens = None
         self._scratch = {}
         self.current_iteration = 0
         self.last_sample_age_stats = {}
@@ -133,6 +136,9 @@ class ReplayBuffer:
         self._value_sample_weights = torch.ones((self.max_size,), dtype=torch.float32)
         self._insertion_iterations = torch.zeros((self.max_size,), dtype=torch.int32)
         self._source_codes = torch.zeros((self.max_size,), dtype=torch.int8)
+        self._root_values = torch.zeros((self.max_size,), dtype=torch.float32)
+        self._fens = [""] * self.max_size
+        self._history_fens = [[] for _ in range(self.max_size)]
 
     def set_current_iteration(self, iteration):
         try:
@@ -171,6 +177,9 @@ class ReplayBuffer:
         policy_weight = float(position[5]) if len(position) > 5 else 1.0
         value_weight = float(position[6]) if len(position) > 6 else 1.0
         source_code = int(position[7]) if len(position) > 7 else REPLAY_SOURCE_UNKNOWN
+        fen = str(position[8]) if len(position) > 8 and position[8] is not None else ""
+        root_value = float(position[9]) if len(position) > 9 else 0.0
+        history_fens = [str(fen or "") for fen in list(position[10])] if len(position) > 10 and position[10] is not None else []
         if self.use_fp16:
             board = board.half().contiguous()
             policy_values = policy_values.half().contiguous()
@@ -182,10 +191,22 @@ class ReplayBuffer:
 
         policy_indices = policy_indices.to(dtype=torch.int16).contiguous()
         value = value.reshape(1).contiguous()
-        return board, policy_indices, policy_values, value, importance, policy_weight, value_weight, source_code
+        return board, policy_indices, policy_values, value, importance, policy_weight, value_weight, source_code, fen, root_value, history_fens
 
     def _store_at_slot(self, slot, position):
-        board, policy_indices, policy_values, value, importance, policy_weight, value_weight, source_code = self._normalize_position(position)
+        (
+            board,
+            policy_indices,
+            policy_values,
+            value,
+            importance,
+            policy_weight,
+            value_weight,
+            source_code,
+            fen,
+            root_value,
+            history_fens,
+        ) = self._normalize_position(position)
 
         count = int(policy_indices.numel())
         if count > self.max_policy_targets:
@@ -206,6 +227,11 @@ class ReplayBuffer:
         self._value_sample_weights[slot] = float(value_weight)
         self._insertion_iterations[slot] = int(self.current_iteration)
         self._source_codes[slot] = int(source_code)
+        self._root_values[slot] = float(root_value)
+        if self._fens is not None:
+            self._fens[slot] = fen
+        if self._history_fens is not None:
+            self._history_fens[slot] = list(history_fens)
 
     def _build_batch_from_indices(self, indices):
         idx = torch.as_tensor(indices, dtype=torch.long)
@@ -256,6 +282,9 @@ class ReplayBuffer:
         policy_weights=None,
         value_weights=None,
         source_codes=None,
+        fens=None,
+        root_values=None,
+        history_fens=None,
     ):
         if boards is None or int(boards.shape[0]) <= 0:
             return
@@ -282,6 +311,31 @@ class ReplayBuffer:
             source_codes = torch.zeros((int(boards.shape[0]),), dtype=torch.int8)
         else:
             source_codes = source_codes.reshape(-1).to(dtype=torch.int8).contiguous()
+        if root_values is None:
+            root_values = torch.zeros((int(boards.shape[0]),), dtype=torch.float32)
+        else:
+            root_values = root_values.reshape(-1).to(dtype=torch.float32).contiguous()
+        if fens is None:
+            fens = [""] * int(boards.shape[0])
+        else:
+            fens = [str(fen or "") for fen in list(fens)]
+            batch_len = int(boards.shape[0])
+            if len(fens) < batch_len:
+                fens.extend([""] * (batch_len - len(fens)))
+            elif len(fens) > batch_len:
+                fens = fens[:batch_len]
+        if history_fens is None:
+            history_fens = [[] for _ in range(int(boards.shape[0]))]
+        else:
+            history_fens = [
+                [str(fen or "") for fen in list(item or [])]
+                for item in list(history_fens)
+            ]
+            batch_len = int(boards.shape[0])
+            if len(history_fens) < batch_len:
+                history_fens.extend([[] for _ in range(batch_len - len(history_fens))])
+            elif len(history_fens) > batch_len:
+                history_fens = history_fens[:batch_len]
 
         max_len = int(policy_indices.shape[1]) if policy_indices.dim() == 2 else 0
         if max_len > self.max_policy_targets:
@@ -313,6 +367,13 @@ class ReplayBuffer:
             self._value_sample_weights[dst_slice].copy_(value_weights[src_slice])
             self._insertion_iterations[dst_slice].fill_(int(self.current_iteration))
             self._source_codes[dst_slice].copy_(source_codes[src_slice])
+            self._root_values[dst_slice].copy_(root_values[src_slice])
+            if self._fens is not None:
+                self._fens[dst_start:dst_start + count] = fens[src_start:src_end]
+            if self._history_fens is not None:
+                self._history_fens[dst_start:dst_start + count] = [
+                    list(item) for item in history_fens[src_start:src_end]
+                ]
 
             self.position = (dst_start + count) % self.max_size
             self.size = min(self.size + count, self.max_size)
@@ -594,6 +655,125 @@ class ReplayBuffer:
     def sample(self, batch_size):
         return self.sample_from_indices(self.select_indices(batch_size))
 
+    def select_fen_indices(self, sample_size, min_age=1):
+        if self.size <= 0 or not self._fens:
+            return np.empty(0, dtype=np.int64)
+        all_indices = np.arange(int(self.size), dtype=np.int64)
+        fen_mask = np.asarray([bool(fen) for fen in self._fens[:self.size]], dtype=bool)
+        eligible = all_indices[fen_mask]
+        if eligible.size <= 0:
+            return np.empty(0, dtype=np.int64)
+        if self._insertion_iterations is not None:
+            inserted = self._insertion_iterations[:self.size].cpu().numpy()
+            ages = np.maximum(0, int(self.current_iteration) - inserted)
+            eligible = eligible[ages[eligible] >= max(0, int(min_age or 0))]
+        if eligible.size <= 0:
+            return np.empty(0, dtype=np.int64)
+        sample_size = max(1, min(int(sample_size), int(eligible.size)))
+        importance = self._importance[:self.size].float().cpu().numpy()
+        weights = np.maximum(0.0, importance[eligible]) + 1e-3
+        prob = weights / max(1e-12, float(weights.sum()))
+        return np.random.choice(eligible, size=sample_size, replace=False, p=prob).astype(np.int64)
+
+    def fens_for_indices(self, indices):
+        if not self._fens:
+            return []
+        return [self._fens[int(idx)] for idx in np.asarray(indices, dtype=np.int64).tolist()]
+
+    def history_fens_for_indices(self, indices):
+        if not self._history_fens:
+            return [[] for _ in np.asarray(indices, dtype=np.int64).tolist()]
+        return [list(self._history_fens[int(idx)] or []) for idx in np.asarray(indices, dtype=np.int64).tolist()]
+
+    def update_sparse_targets(
+        self,
+        indices,
+        policy_targets,
+        *,
+        policy_mix=1.0,
+        root_values=None,
+        value_mix=0.0,
+        importance_bonus=0.0,
+    ):
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.size <= 0:
+            return {"updated": 0, "skipped": 0}
+        policy_mix = max(0.0, min(1.0, float(policy_mix or 0.0)))
+        value_mix = max(0.0, min(1.0, float(value_mix or 0.0)))
+        root_values = list(root_values or [])
+        updated = 0
+        skipped = 0
+        for row, idx_value in enumerate(indices.tolist()):
+            idx = int(idx_value)
+            if idx < 0 or idx >= self.size:
+                skipped += 1
+                continue
+            if row >= len(policy_targets):
+                skipped += 1
+                continue
+            target = policy_targets[row]
+            if target is None or len(target) < 2:
+                skipped += 1
+                continue
+            policy_indices, policy_values = target[:2]
+            if not torch.is_tensor(policy_indices):
+                policy_indices = torch.as_tensor(policy_indices)
+            if not torch.is_tensor(policy_values):
+                policy_values = torch.as_tensor(policy_values)
+            count = min(int(policy_indices.numel()), int(policy_values.numel()), self.max_policy_targets)
+            if count <= 0:
+                skipped += 1
+                continue
+            new_indices = policy_indices[:count].to(dtype=torch.int16).contiguous()
+            new_values = policy_values[:count].to(dtype=self._policy_values.dtype).contiguous()
+            new_sum = new_values.float().sum().item()
+            if new_sum > 0.0:
+                new_values = (new_values.float() / float(new_sum)).to(dtype=self._policy_values.dtype)
+            if policy_mix >= 0.999:
+                self._policy_indices[idx].fill_(-1)
+                self._policy_values[idx].zero_()
+                self._policy_indices[idx, :count].copy_(new_indices)
+                self._policy_values[idx, :count].copy_(new_values)
+                self._policy_lengths[idx] = count
+            elif policy_mix > 0.0:
+                old_count = int(self._policy_lengths[idx].item())
+                old_indices = self._policy_indices[idx, :old_count].clone() if old_count > 0 else torch.empty(0, dtype=torch.int16)
+                old_values = self._policy_values[idx, :old_count].float().clone() if old_count > 0 else torch.empty(0)
+                self._policy_indices[idx].fill_(-1)
+                self._policy_values[idx].zero_()
+                merged = {}
+                for move_idx, prob in zip(old_indices.tolist(), old_values.tolist()):
+                    if int(move_idx) >= 0:
+                        merged[int(move_idx)] = merged.get(int(move_idx), 0.0) + (1.0 - policy_mix) * float(prob)
+                for move_idx, prob in zip(new_indices.tolist(), new_values.float().tolist()):
+                    if int(move_idx) >= 0:
+                        merged[int(move_idx)] = merged.get(int(move_idx), 0.0) + policy_mix * float(prob)
+                top_items = sorted(merged.items(), key=lambda item: item[1], reverse=True)[:self.max_policy_targets]
+                if not top_items:
+                    skipped += 1
+                    continue
+                total = sum(max(0.0, float(prob)) for _, prob in top_items)
+                if total <= 0.0:
+                    skipped += 1
+                    continue
+                final_count = len(top_items)
+                self._policy_indices[idx, :final_count].copy_(torch.tensor([move for move, _ in top_items], dtype=torch.int16))
+                self._policy_values[idx, :final_count].copy_(
+                    torch.tensor([max(0.0, float(prob)) / total for _, prob in top_items], dtype=self._policy_values.dtype)
+                )
+                self._policy_lengths[idx] = final_count
+            if value_mix > 0.0 and row < len(root_values):
+                mixed_value = (
+                    (1.0 - value_mix) * float(self._values[idx].float().item())
+                    + value_mix * max(-1.0, min(1.0, float(root_values[row])))
+                )
+                self._values[idx] = float(mixed_value)
+                self._root_values[idx] = float(root_values[row])
+            if importance_bonus > 0.0:
+                self._importance[idx] += float(importance_bonus)
+            updated += 1
+        return {"updated": int(updated), "skipped": int(skipped)}
+
     def _record_sample_age_stats(self, indices):
         if self._insertion_iterations is None:
             self.last_sample_ages = np.empty(0, dtype=np.float32)
@@ -642,6 +822,9 @@ class ReplayBuffer:
         old_value_sample_weights = self._value_sample_weights
         old_insertion_iterations = self._insertion_iterations
         old_source_codes = self._source_codes
+        old_root_values = self._root_values
+        old_fens = self._fens
+        old_history_fens = self._history_fens
 
         board_shape = tuple(old_boards.shape[1:])
         board_dtype = old_boards.dtype
@@ -665,6 +848,9 @@ class ReplayBuffer:
         self._value_sample_weights = torch.ones((self.max_size,), dtype=old_value_sample_weights.dtype)
         self._insertion_iterations = torch.zeros((self.max_size,), dtype=old_insertion_iterations.dtype)
         self._source_codes = torch.zeros((self.max_size,), dtype=old_source_codes.dtype)
+        self._root_values = torch.zeros((self.max_size,), dtype=old_root_values.dtype)
+        self._fens = [""] * self.max_size
+        self._history_fens = [[] for _ in range(self.max_size)]
 
         if keep_size > 0:
             idx = torch.as_tensor(keep_indices, dtype=torch.long)
@@ -678,6 +864,14 @@ class ReplayBuffer:
             self._value_sample_weights[:keep_size].copy_(old_value_sample_weights[idx])
             self._insertion_iterations[:keep_size].copy_(old_insertion_iterations[idx])
             self._source_codes[:keep_size].copy_(old_source_codes[idx])
+            self._root_values[:keep_size].copy_(old_root_values[idx])
+            if old_fens is not None:
+                self._fens[:keep_size] = [old_fens[int(old_idx)] for old_idx in keep_indices]
+            if old_history_fens is not None:
+                self._history_fens[:keep_size] = [
+                    list(old_history_fens[int(old_idx)] or [])
+                    for old_idx in keep_indices
+                ]
 
         self.size = keep_size
         self.position = 0 if keep_size >= self.max_size else keep_size
@@ -695,6 +889,7 @@ class ReplayBuffer:
             return stats
 
         values = self._values[:self.size].reshape(-1).float()
+        root_values = self._root_values[:self.size].reshape(-1).float()
         policy_lengths = self._policy_lengths[:self.size].to(dtype=torch.float32)
         policy_weights = self._policy_sample_weights[:self.size].float()
         value_weights = self._value_sample_weights[:self.size].float()
@@ -742,7 +937,25 @@ class ReplayBuffer:
             "policy_target_len_p90": _safe_quantile(policy_lengths, 0.90),
             "importance_mean": _safe_mean(importance),
             "importance_p90": _safe_quantile(importance, 0.90),
+            "root_value_mean": _safe_mean(root_values),
+            "root_value_std": _safe_std(root_values),
         })
+        if self._fens is not None:
+            fen_count = sum(1 for fen in self._fens[:self.size] if fen)
+            stats["fen_available_fraction"] = float(fen_count) / float(max(1, self.size))
+        else:
+            stats["fen_available_fraction"] = 0.0
+        if self._history_fens is not None:
+            history_count = sum(1 for item in self._history_fens[:self.size] if item)
+            stats["history_fen_available_fraction"] = float(history_count) / float(max(1, self.size))
+            history_lengths = torch.tensor(
+                [len(item or []) for item in self._history_fens[:self.size]],
+                dtype=torch.float32,
+            )
+            stats["history_fen_len_mean"] = _safe_mean(history_lengths)
+        else:
+            stats["history_fen_available_fraction"] = 0.0
+            stats["history_fen_len_mean"] = 0.0
         policy_weight_total = max(1e-8, float(policy_weights.sum().item()))
         source_counts = {}
         source_policy_weight_sums = {}

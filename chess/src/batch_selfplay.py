@@ -826,6 +826,9 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     policy_weights = torch.ones((batch_size,), dtype=torch.float32)
     value_weights = torch.ones((batch_size,), dtype=torch.float32)
     source_codes = torch.zeros((batch_size,), dtype=torch.int8)
+    root_values = torch.zeros((batch_size,), dtype=torch.float32)
+    fens = []
+    history_fens = []
 
     for row_idx, pos in enumerate(positions):
         _, indices, probs, _ = pos[:4]
@@ -836,6 +839,10 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         policy_weights[row_idx] = float(pos[5]) if len(pos) > 5 else 1.0
         value_weights[row_idx] = float(pos[6]) if len(pos) > 6 else 1.0
         source_codes[row_idx] = int(pos[7]) if len(pos) > 7 else _REPLAY_SOURCE_UNKNOWN
+        fens.append(str(pos[8]) if len(pos) > 8 and pos[8] is not None else "")
+        root_values[row_idx] = float(pos[9]) if len(pos) > 9 else 0.0
+        history_payload = pos[10] if len(pos) > 10 and pos[10] is not None else []
+        history_fens.append([str(fen or "") for fen in list(history_payload)])
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -852,6 +859,9 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         'policy_weights': policy_weights,
         'value_weights': value_weights,
         'source_codes': source_codes,
+        'fens': fens,
+        'root_values': root_values,
+        'history_fens': history_fens,
         'num_positions': batch_size,
     }
 
@@ -1046,6 +1056,21 @@ class MultiGameBatchMCTS:
         self.scout_challenge_uniform_mix = max(
             0.0,
             min(0.50, float(rl_cfg['mcts_scout_challenge_uniform_mix'])),
+        )
+        self.scout_challenge_delta_target_enabled = bool(
+            rl_cfg.get('mcts_scout_challenge_delta_target_enabled', False)
+        )
+        self.scout_challenge_delta_target_mix = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('mcts_scout_challenge_delta_target_mix', 0.75))),
+        )
+        self.scout_challenge_delta_target_min_visits = max(
+            1,
+            int(rl_cfg.get('mcts_scout_challenge_delta_target_min_visits', 48)),
+        )
+        self.scout_challenge_delta_target_min_top_prob = max(
+            0.0,
+            min(1.0, float(rl_cfg.get('mcts_scout_challenge_delta_target_min_top_prob', 0.28))),
         )
         self.scout_challenge_min_budget_fraction = max(
             0.0,
@@ -1964,6 +1989,56 @@ class MultiGameBatchMCTS:
         )
         return float(max(0.0, min(1.0, score)))
 
+    def _scout_prior_lock_challenge_score(self, root, summary, move_count=None):
+        if root is None or not root.expanded or root.edges is None:
+            return 0.0
+        profile = self._scout_root_profile(root, move_count=move_count)
+        if bool(profile.get('forced', False)):
+            return 0.0
+        priors = np.asarray(root.edges.base_priors, dtype=np.float32)
+        if priors.size <= 1:
+            return 0.0
+        prior_total = float(priors.sum())
+        if prior_total <= 0.0:
+            return 0.0
+        prior_probs = priors / prior_total
+        sorted_priors = np.sort(prior_probs)
+        top_prior = float(sorted_priors[-1])
+        second_prior = float(sorted_priors[-2]) if sorted_priors.size > 1 else 0.0
+        prior_margin = max(0.0, top_prior - second_prior)
+
+        top_lock = max(0.0, min(1.0, (top_prior - 0.38) / 0.37))
+        margin_lock = max(0.0, min(1.0, (prior_margin - 0.12) / 0.25))
+        explored_prior_mass = float(summary.get('explored_prior_mass', 0.0) or 0.0)
+        coverage_gap = max(0.0, min(1.0, 1.0 - explored_prior_mass))
+        try:
+            policy_kl = float(summary.get('mcts_policy_kl', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            policy_kl = 0.0
+        confirmation_pressure = max(0.0, min(1.0, 1.0 - policy_kl / 0.18))
+        legal_count = int(summary.get('legal_move_count', 0) or 0)
+        branching_score = max(
+            0.0,
+            min(1.0, float(legal_count - int(self.scout_low_branching_moves)) / 22.0),
+        )
+        try:
+            move_count_value = int(move_count or 0)
+        except (TypeError, ValueError):
+            move_count_value = 0
+        opening_pressure = 1.0 if 8 <= move_count_value <= 36 else 0.35
+        tactic_pressure = 1.0 if bool(profile.get('in_check', False) or profile.get('sharp_tactic', False)) else 0.0
+
+        score = (
+            0.30 * top_lock
+            + 0.22 * margin_lock
+            + 0.18 * confirmation_pressure
+            + 0.12 * branching_score
+            + 0.08 * opening_pressure
+            + 0.06 * coverage_gap
+            + 0.04 * tactic_pressure
+        )
+        return float(max(0.0, min(1.0, score)))
+
     def _classify_scout_root(self, root, summary, move_count=None):
         profile = self._scout_root_profile(root, move_count=move_count)
         if bool(profile.get('forced', False)):
@@ -1973,6 +2048,25 @@ class MultiGameBatchMCTS:
         ):
             return 'easy', 0.0
         challenge_score = self._scout_challenge_score(root, summary, move_count=move_count)
+        prior_lock_score = self._scout_prior_lock_challenge_score(root, summary, move_count=move_count)
+        if prior_lock_score > challenge_score:
+            try:
+                prior_rank = int(summary.get('prior_top_visit_rank', 1) or 1)
+            except (TypeError, ValueError):
+                prior_rank = 1
+            try:
+                q_delta = float(summary.get('mcts_q_delta', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                q_delta = 0.0
+            try:
+                unexplored_prior_mass = float(summary.get('unexplored_prior_mass', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                unexplored_prior_mass = 0.0
+            # Prior-lock expansion is useful only when there is still a plausible
+            # way to dislodge the raw prior. Otherwise it spends the challenge
+            # budget mostly confirming the IL move again.
+            if prior_rank > 1 or q_delta >= 0.04 or unexplored_prior_mass >= 0.08:
+                challenge_score = prior_lock_score
         stable_fraction = self._stable_fraction_for_root(root)
         if (
             challenge_score >= float(self.scout_challenge_min_score)
@@ -1986,6 +2080,54 @@ class MultiGameBatchMCTS:
             1,
             int(round(float(max(1, int(simulation_budget))) * float(self.scout_challenge_min_budget_fraction))),
         )
+
+    def _build_challenge_delta_policy_target(self, root, start_visits):
+        if (
+            not self.scout_challenge_delta_target_enabled
+            or root is None
+            or not root.expanded
+            or root.edges is None
+            or start_visits is None
+        ):
+            return None
+        try:
+            start = np.asarray(start_visits, dtype=np.int32)
+            current = np.asarray(root.edges.visit_counts, dtype=np.int32)
+        except Exception:
+            return None
+        if start.shape != current.shape or current.size <= 1:
+            return None
+
+        delta = np.maximum(current - start, 0).astype(np.float32, copy=False)
+        delta_total = float(delta.sum())
+        if delta_total < float(self.scout_challenge_delta_target_min_visits):
+            return None
+        delta_top_prob = float(delta.max() / max(1e-8, delta_total))
+        if delta_top_prob < float(self.scout_challenge_delta_target_min_top_prob):
+            return None
+
+        full = current.astype(np.float32, copy=False)
+        full_total = float(full.sum())
+        mix = float(self.scout_challenge_delta_target_mix)
+        if mix >= 0.999 or full_total <= 0.0:
+            target_counts = delta
+        elif mix <= 0.001:
+            target_counts = full
+        else:
+            target_probs = (
+                (1.0 - mix) * (full / max(1e-8, full_total))
+                + mix * (delta / max(1e-8, delta_total))
+            )
+            target_counts = target_probs * max(1.0, full_total)
+
+        moves = root.edges.moves
+        if moves is None:
+            return None
+        return {
+            move: float(count)
+            for move, count in zip(moves, target_counts)
+            if float(count) > 1e-8
+        }
 
     def _scout_locked_stop_reason(self, root, summary, simulation_budget):
         if root is None or not root.expanded or root.edges is None:
@@ -2102,6 +2244,7 @@ class MultiGameBatchMCTS:
         simulation_budget_extended = [False] * game_count
         scout_challenge_flags = [False] * game_count
         scout_challenge_scores = [None] * game_count
+        scout_challenge_start_visits = [None] * game_count
         scout_classes = [None] * game_count
 
         remaining = list(simulation_budgets)
@@ -2226,6 +2369,8 @@ class MultiGameBatchMCTS:
                     if scout_class == 'challenge':
                         added = max(0, int(challenge_budget) - int(simulation_budgets[idx]))
                         if added > 0:
+                            if root is not None and root.expanded and root.edges is not None:
+                                scout_challenge_start_visits[idx] = root.edges.visit_counts.copy()
                             simulation_budgets[idx] = int(challenge_budget)
                             simulation_budget_extended[idx] = True
                             scout_challenge_flags[idx] = True
@@ -2286,6 +2431,32 @@ class MultiGameBatchMCTS:
                 )
             metadata['scout_challenge_score'] = float(scout_challenge_scores[idx] or 0.0)
             metadata['scout_challenge_applied'] = 1.0 if bool(scout_challenge_flags[idx]) else 0.0
+            if bool(scout_challenge_flags[idx]):
+                delta_target = self._build_challenge_delta_policy_target(
+                    root,
+                    scout_challenge_start_visits[idx],
+                )
+                if delta_target:
+                    metadata['policy_visit_counts_override'] = delta_target
+                    metadata['policy_delta_target_used'] = 1.0
+                    try:
+                        priors = root.edges.base_priors.astype(np.float32, copy=False)
+                        prior_top_idx = int(np.argmax(priors)) if priors.size > 0 else -1
+                        delta_moves = list(delta_target.keys())
+                        delta_counts = np.asarray(list(delta_target.values()), dtype=np.float32)
+                        if delta_counts.size > 0 and root.edges.moves is not None:
+                            delta_top_move = delta_moves[int(np.argmax(delta_counts))]
+                            prior_top_move = root.edges.moves[prior_top_idx] if prior_top_idx >= 0 else None
+                            metadata['policy_delta_target_prior_agree'] = (
+                                1.0 if prior_top_move == delta_top_move else 0.0
+                            )
+                            metadata['policy_delta_target_top_prob'] = float(
+                                delta_counts.max() / max(1e-8, float(delta_counts.sum()))
+                            )
+                    except Exception:
+                        pass
+                else:
+                    metadata['policy_delta_target_used'] = 0.0
             metadata['move_count'] = int(move_counts[idx])
             stop_reason = scout_stop_reasons[idx]
             if stop_reason is None:
@@ -2690,6 +2861,7 @@ class BatchSelfPlayMCTSBatch:
         self.opponent_mcts = next(iter(self.opponent_mcts_by_label.values()), None)
         self.opponent_plan_labels = list(opponent_plan_labels or [])
         self._warned_missing_opponent_labels = set()
+        self.history_positions = int(config.get('model', {}).get('history_positions', 0) or 0)
 
         if device.type == 'cuda':
             self.model = self.model.to(memory_format=torch.channels_last)
@@ -2763,6 +2935,10 @@ class BatchSelfPlayMCTSBatch:
         self.replay_cap_fraction_draw = float(rl_cfg.get('replay_cap_fraction_draw', 0.15))
         self.replay_cap_min_positions = int(rl_cfg.get('replay_cap_min_positions', 16))
         self.replay_cap_max_positions = int(rl_cfg.get('replay_cap_max_positions', 120))
+        self.value_root_q_target_mix = max(
+            0.0,
+            min(0.50, float(rl_cfg.get('value_root_q_target_mix', 0.0))),
+        )
         self.policy_target_pruning_enabled = bool(
             rl_cfg.get('policy_target_pruning_enabled', False)
         )
@@ -3187,26 +3363,42 @@ class BatchSelfPlayMCTSBatch:
         min_weight = float(self.policy_target_quality_min_weight)
         return float(min_weight + (1.0 - min_weight) * confidence)
 
+    @staticmethod
+    def _policy_target_changed_top(search_metadata):
+        if not isinstance(search_metadata, dict):
+            return False
+        try:
+            if float(search_metadata.get('policy_delta_target_used', 0.0) or 0.0) >= 0.5:
+                return float(search_metadata.get('policy_delta_target_prior_agree', 1.0)) < 0.5
+        except (TypeError, ValueError):
+            pass
+        try:
+            return float(search_metadata.get('prior_mcts_agree', 1.0)) < 0.5
+        except (TypeError, ValueError):
+            return False
+
     def _policy_target_search_change_weight(self, search_metadata):
         if not self.policy_target_search_change_weighting_enabled:
             return 1.0
         if not isinstance(search_metadata, dict):
             return 1.0
-        try:
-            changed_top = float(search_metadata.get('prior_mcts_agree', 1.0)) < 0.5
-        except (TypeError, ValueError):
-            changed_top = False
+        changed_top = self._policy_target_changed_top(search_metadata)
         if not changed_top:
             return 1.0
 
         rank_strength = 0.0
         prior_rank = 1
+        delta_target_used = False
         try:
+            delta_target_used = float(search_metadata.get('policy_delta_target_used', 0.0) or 0.0) >= 0.5
             prior_rank = int(search_metadata.get('prior_top_visit_rank', 1) or 1)
             rank_strength = max(0.0, min(1.0, float(prior_rank - 1) / 4.0))
         except (TypeError, ValueError):
             prior_rank = 1
             rank_strength = 0.0
+        if delta_target_used and changed_top:
+            prior_rank = max(prior_rank, 2)
+            rank_strength = max(rank_strength, 0.25)
 
         q_delta = search_metadata.get('mcts_q_delta', None)
         q_delta_is_good = False
@@ -3238,7 +3430,10 @@ class BatchSelfPlayMCTSBatch:
                 return 1.0
 
         try:
-            top_visit_prob = float(search_metadata.get('top_visit_prob', 0.0) or 0.0)
+            if delta_target_used:
+                top_visit_prob = float(search_metadata.get('policy_delta_target_top_prob', 0.0) or 0.0)
+            else:
+                top_visit_prob = float(search_metadata.get('top_visit_prob', 0.0) or 0.0)
         except (TypeError, ValueError):
             top_visit_prob = 0.0
         if (
@@ -3258,10 +3453,7 @@ class BatchSelfPlayMCTSBatch:
     def _policy_target_uptake_weight(self, search_metadata):
         if not self.policy_target_uptake_gate_enabled or not isinstance(search_metadata, dict):
             return 1.0
-        try:
-            changed_top = float(search_metadata.get('prior_mcts_agree', 1.0)) < 0.5
-        except (TypeError, ValueError):
-            changed_top = False
+        changed_top = self._policy_target_changed_top(search_metadata)
         if changed_top:
             return 1.0
         try:
@@ -3501,6 +3693,108 @@ class BatchSelfPlayMCTSBatch:
 
         return selected
 
+    def _select_candidates_with_source_balance(self, candidates, effective_cap, history_len, is_decisive=False):
+        if effective_cap <= 0 or len(candidates) <= effective_cap:
+            return list(candidates)
+
+        buckets = {}
+        for item in candidates:
+            source_code = int(item.get('source_code', _REPLAY_SOURCE_UNKNOWN))
+            buckets.setdefault(source_code, []).append(item)
+        non_empty_sources = [
+            source_code for source_code, bucket in buckets.items()
+            if len(bucket) > 0
+        ]
+        if len(non_empty_sources) <= 1:
+            if is_decisive:
+                return self._select_top_scored_candidates(candidates, effective_cap, history_len)
+            return self._select_draw_candidates_stratified(candidates, effective_cap, history_len)
+
+        total_candidates = max(1, len(candidates))
+        allocations = {}
+        remaining = int(effective_cap)
+        if effective_cap >= len(non_empty_sources):
+            for source_code in non_empty_sources:
+                allocations[source_code] = 1
+                remaining -= 1
+        else:
+            ranked_sources = sorted(
+                non_empty_sources,
+                key=lambda source_code: (
+                    -max(self._candidate_importance(item) for item in buckets[source_code]),
+                    source_code,
+                ),
+            )
+            for source_code in ranked_sources[:effective_cap]:
+                allocations[source_code] = 1
+            remaining = 0
+
+        desired = {
+            source_code: float(effective_cap) * len(buckets[source_code]) / float(total_candidates)
+            for source_code in non_empty_sources
+        }
+        while remaining > 0:
+            progressed = False
+            ranked_sources = sorted(
+                non_empty_sources,
+                key=lambda source_code: (
+                    -(desired[source_code] - allocations.get(source_code, 0)),
+                    -len(buckets[source_code]),
+                    source_code,
+                ),
+            )
+            for source_code in ranked_sources:
+                if remaining <= 0:
+                    break
+                current = int(allocations.get(source_code, 0))
+                if current >= len(buckets[source_code]):
+                    continue
+                allocations[source_code] = current + 1
+                remaining -= 1
+                progressed = True
+            if not progressed:
+                break
+
+        selected = []
+        selected_ids = set()
+        for source_code in sorted(non_empty_sources):
+            bucket_cap = int(allocations.get(source_code, 0))
+            if bucket_cap <= 0:
+                continue
+            bucket = buckets[source_code]
+            if is_decisive:
+                bucket_selected = self._select_top_scored_candidates(bucket, bucket_cap, history_len)
+            else:
+                bucket_selected = self._select_draw_candidates_stratified(bucket, bucket_cap, history_len)
+            for item in bucket_selected:
+                history_idx = int(item['history_idx'])
+                if history_idx in selected_ids:
+                    continue
+                selected.append(item)
+                selected_ids.add(history_idx)
+
+        if len(selected) < effective_cap:
+            leftovers = [
+                item for item in candidates
+                if int(item['history_idx']) not in selected_ids
+            ]
+            remaining_cap = int(effective_cap - len(selected))
+            if is_decisive:
+                refill = self._select_top_scored_candidates(leftovers, remaining_cap, history_len)
+            else:
+                refill = self._select_draw_candidates_stratified(leftovers, remaining_cap, history_len)
+            for item in refill:
+                history_idx = int(item['history_idx'])
+                if history_idx in selected_ids:
+                    continue
+                selected.append(item)
+                selected_ids.add(history_idx)
+                if len(selected) >= effective_cap:
+                    break
+
+        selected.sort(key=lambda item: int(item['history_idx']))
+        return selected[:effective_cap]
+
     def _select_history_indices_to_keep(self, candidates, history_len, is_decisive=False):
         total_candidates = len(candidates)
         if total_candidates <= 0:
@@ -3520,10 +3814,12 @@ class BatchSelfPlayMCTSBatch:
                 gate_keep = max(self.replay_importance_gate_min_positions, gate_keep)
                 gate_keep = min(len(filtered), gate_keep)
                 if gate_keep < len(filtered):
-                    if is_decisive:
-                        filtered = self._select_top_scored_candidates(filtered, gate_keep, history_len)
-                    else:
-                        filtered = self._select_draw_candidates_stratified(filtered, gate_keep, history_len)
+                    filtered = self._select_candidates_with_source_balance(
+                        filtered,
+                        gate_keep,
+                        history_len,
+                        is_decisive=is_decisive,
+                    )
                     curriculum_dropped = total_candidates - len(filtered)
 
         # Determine effective cap limits
@@ -3539,10 +3835,12 @@ class BatchSelfPlayMCTSBatch:
             selected = filtered
             cap_dropped = 0
         else:
-            if is_decisive:
-                selected = self._select_top_scored_candidates(filtered, effective_cap, history_len)
-            else:
-                selected = self._select_draw_candidates_stratified(filtered, effective_cap, history_len)
+            selected = self._select_candidates_with_source_balance(
+                filtered,
+                effective_cap,
+                history_len,
+                is_decisive=is_decisive,
+            )
             cap_dropped = len(filtered) - len(selected)
 
         selected.sort(key=lambda item: int(item['history_idx']))
@@ -3555,6 +3853,7 @@ class BatchSelfPlayMCTSBatch:
             candidates.append({
                 'history_idx': history_idx,
                 'importance_score': importance_score,
+                'source_code': int(history_entry[7]) if len(history_entry) > 7 else _REPLAY_SOURCE_UNKNOWN,
             })
         return candidates
 
@@ -3569,14 +3868,22 @@ class BatchSelfPlayMCTSBatch:
         history_entry = gs['game_history'][int(history_idx)]
         history_count, policy_indices, policy_values, turn = history_entry[:4]
         importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
+        root_value = float(history_entry[5]) if len(history_entry) > 5 else 0.0
         policy_weight = float(history_entry[6]) if len(history_entry) > 6 else 1.0
         source_code = int(history_entry[7]) if len(history_entry) > 7 else _REPLAY_SOURCE_UNKNOWN
+        fen = str(history_entry[8]) if len(history_entry) > 8 and history_entry[8] else ""
+        history_fens = list(history_entry[9]) if len(history_entry) > 9 and history_entry[9] else []
 
         if outcome == 0.0:
             value = draw_value_target
         else:
             signed_outcome = outcome if turn == chess.WHITE else -outcome
             value = float(signed_outcome)
+        if self.value_root_q_target_mix > 0.0:
+            value = (
+                (1.0 - self.value_root_q_target_mix) * float(value)
+                + self.value_root_q_target_mix * max(-1.0, min(1.0, float(root_value)))
+            )
         value_weight = self._value_target_weight(int(history_idx), int(history_len), outcome)
 
         return {
@@ -3586,11 +3893,31 @@ class BatchSelfPlayMCTSBatch:
             'policy_values': policy_values,
             'turn': turn,
             'value': value,
+            'root_value': root_value,
+            'fen': fen,
+            'history_fens': history_fens,
             'importance_score': importance_score,
             'policy_weight': policy_weight,
             'value_weight': value_weight,
             'source_code': source_code,
         }
+
+    def _history_fens_for_board(self, board, history_positions):
+        history_positions = max(0, int(history_positions or 0))
+        if history_positions <= 0:
+            return []
+        temp_board = board.copy(stack=True)
+        history_fens = []
+        for _ in range(history_positions):
+            if not temp_board.move_stack:
+                break
+            try:
+                temp_board.pop()
+            except Exception:
+                break
+            history_fens.append(temp_board.fen())
+        history_fens.reverse()
+        return history_fens
 
     def _value_target_weight(self, history_idx, history_len, outcome):
         if not self.value_target_weighting_enabled:
@@ -3690,6 +4017,9 @@ class BatchSelfPlayMCTSBatch:
                 float(item.get('policy_weight', 1.0)),
                 float(item.get('value_weight', 1.0)),
                 int(item.get('source_code', _REPLAY_SOURCE_UNKNOWN)),
+                item.get('fen', ""),
+                float(item.get('root_value', 0.0)),
+                item.get('history_fens', []),
             ))
         if self.profile_enabled:
             self._profile_add('policy_target_postgame_time', time.perf_counter() - postgame_t0)
@@ -3908,6 +4238,9 @@ class BatchSelfPlayMCTSBatch:
             'mcts_policy_uptake_samples': 0.0,
             'mcts_policy_uptake_weight_sum': 0.0,
             'mcts_policy_uptake_low_count': 0.0,
+            'mcts_policy_delta_target_used_count': 0.0,
+            'mcts_policy_delta_target_changed_count': 0.0,
+            'mcts_policy_delta_target_top_prob_sum': 0.0,
         }
         for phase in ('opening', 'middlegame', 'endgame'):
             total_mcts_quality_stats[f'mcts_phase_{phase}_samples'] = 0.0
@@ -4139,6 +4472,25 @@ class BatchSelfPlayMCTSBatch:
                 float(total_mcts_quality_stats['mcts_policy_uptake_low_count'])
                 / float(total_mcts_quality_stats['mcts_policy_uptake_samples'])
                 if int(total_mcts_quality_stats['mcts_policy_uptake_samples']) > 0
+                else 0.0
+            ),
+            'mcts_policy_delta_target_used_count': int(total_mcts_quality_stats['mcts_policy_delta_target_used_count']),
+            'mcts_policy_delta_target_used_rate': (
+                float(total_mcts_quality_stats['mcts_policy_delta_target_used_count']) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_policy_delta_target_changed_count': int(total_mcts_quality_stats['mcts_policy_delta_target_changed_count']),
+            'mcts_policy_delta_target_changed_rate': (
+                float(total_mcts_quality_stats['mcts_policy_delta_target_changed_count'])
+                / float(total_mcts_quality_stats['mcts_policy_delta_target_used_count'])
+                if int(total_mcts_quality_stats['mcts_policy_delta_target_used_count']) > 0
+                else 0.0
+            ),
+            'mcts_policy_delta_target_top_prob_mean': (
+                float(total_mcts_quality_stats['mcts_policy_delta_target_top_prob_sum'])
+                / float(total_mcts_quality_stats['mcts_policy_delta_target_used_count'])
+                if int(total_mcts_quality_stats['mcts_policy_delta_target_used_count']) > 0
                 else 0.0
             ),
             'mcts_prior_top_visit_prob_sum': float(total_mcts_quality_stats['mcts_prior_top_visit_prob_sum']),
@@ -4427,6 +4779,9 @@ class BatchSelfPlayMCTSBatch:
             'policy_uptake_samples': 0,
             'policy_uptake_weight_sum': 0.0,
             'policy_uptake_low_count': 0,
+            'policy_delta_target_used_count': 0,
+            'policy_delta_target_changed_count': 0,
+            'policy_delta_target_top_prob_sum': 0.0,
             'scout_challenge_eligible_count': 0,
             'scout_challenge_applied_count': 0,
             'scout_challenge_changed_count': 0,
@@ -4451,16 +4806,10 @@ class BatchSelfPlayMCTSBatch:
             challenge_applied = float(search_metadata.get('scout_challenge_applied', 0.0) or 0.0) >= 0.5
             challenge_score = float(search_metadata.get('scout_challenge_score', 0.0) or 0.0)
             mcts_for_challenge_config = getattr(self, 'mcts', None)
-            challenge_fraction = float(
-                getattr(mcts_for_challenge_config, 'scout_challenge_fraction', 0.0) or 0.0
-            )
             challenge_min_score = float(
                 getattr(mcts_for_challenge_config, 'scout_challenge_min_score', 1.0) or 1.0
             )
-            challenge_eligible = (
-                challenge_fraction > 0.0
-                and challenge_score >= challenge_min_score
-            )
+            challenge_eligible = challenge_score >= challenge_min_score
             phase = self._mcts_phase_for_board(board)
             target_quality[f'{phase}_samples'] += 1
             if changed_top:
@@ -4491,6 +4840,20 @@ class BatchSelfPlayMCTSBatch:
             if challenge_applied and changed_top:
                 target_quality['scout_challenge_changed_count'] += 1
             target_quality['scout_challenge_score_sum'] += challenge_score
+            if float(search_metadata.get('policy_delta_target_used', 0.0) or 0.0) >= 0.5:
+                target_quality['policy_delta_target_used_count'] += 1
+                try:
+                    delta_agree = float(search_metadata.get('policy_delta_target_prior_agree', 1.0))
+                except (TypeError, ValueError):
+                    delta_agree = 1.0
+                if delta_agree < 0.5:
+                    target_quality['policy_delta_target_changed_count'] += 1
+                try:
+                    target_quality['policy_delta_target_top_prob_sum'] += float(
+                        search_metadata.get('policy_delta_target_top_prob', 0.0) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    pass
             try:
                 top_visit_prob = float(search_metadata.get('top_visit_prob', 0.0) or 0.0)
                 visit_gap = float(search_metadata.get('visit_gap', 0.0) or 0.0)
@@ -4673,13 +5036,18 @@ class BatchSelfPlayMCTSBatch:
                 if store_policy_position:
                     _accumulate_target_quality(search_metadata, board)
                     policy_t0 = time.perf_counter() if self.profile_enabled else None
-                    raw_visit_counts = visit_counts
+                    target_visit_counts = visit_counts
+                    if isinstance(search_metadata, dict):
+                        override_visit_counts = search_metadata.get('policy_visit_counts_override')
+                        if isinstance(override_visit_counts, dict) and override_visit_counts:
+                            target_visit_counts = override_visit_counts
+                    raw_visit_counts = target_visit_counts
                     top1, entropy = self._policy_target_quality_from_visits(raw_visit_counts)
                     target_quality_weight = self._policy_target_quality_weight(top1, entropy)
-                    visit_counts = self._prune_policy_target_visits(visit_counts)
-                    policy_indices, policy_values = _build_sparse_policy_target_from_visits(visit_counts, board)
+                    policy_visit_counts = self._prune_policy_target_visits(target_visit_counts)
+                    policy_indices, policy_values = _build_sparse_policy_target_from_visits(policy_visit_counts, board)
                     history_count = len(gs['board_history'])
-                    importance_score = self._compute_position_importance(board, move, visit_counts, root)
+                    importance_score = self._compute_position_importance(board, move, policy_visit_counts, root)
                     root_value = 0.0
                     policy_weight = float(search_metadata.get('policy_weight', 1.0)) if isinstance(search_metadata, dict) else 1.0
                     policy_weight *= float(target_quality_weight)
@@ -4718,6 +5086,8 @@ class BatchSelfPlayMCTSBatch:
                         root_value,
                         policy_weight,
                         replay_source_code,
+                        board.fen(),
+                        self._history_fens_for_board(board, self.history_positions),
                     ))
                     if self.profile_enabled:
                         self._profile_add('policy_target_build_time', time.perf_counter() - policy_t0)
@@ -4993,6 +5363,25 @@ class BatchSelfPlayMCTSBatch:
             'mcts_policy_uptake_low_rate': (
                 float(target_quality['policy_uptake_low_count']) / float(target_quality['policy_uptake_samples'])
                 if int(target_quality['policy_uptake_samples']) > 0
+                else 0.0
+            ),
+            'mcts_policy_delta_target_used_count': int(target_quality['policy_delta_target_used_count']),
+            'mcts_policy_delta_target_used_rate': (
+                float(target_quality['policy_delta_target_used_count']) / float(target_quality_samples)
+                if target_quality_samples > 0
+                else 0.0
+            ),
+            'mcts_policy_delta_target_changed_count': int(target_quality['policy_delta_target_changed_count']),
+            'mcts_policy_delta_target_changed_rate': (
+                float(target_quality['policy_delta_target_changed_count'])
+                / float(target_quality['policy_delta_target_used_count'])
+                if int(target_quality['policy_delta_target_used_count']) > 0
+                else 0.0
+            ),
+            'mcts_policy_delta_target_top_prob_mean': (
+                float(target_quality['policy_delta_target_top_prob_sum'])
+                / float(target_quality['policy_delta_target_used_count'])
+                if int(target_quality['policy_delta_target_used_count']) > 0
                 else 0.0
             ),
             'mcts_prior_top_visit_prob_sum': float(target_quality['prior_top_visit_prob_sum']),
