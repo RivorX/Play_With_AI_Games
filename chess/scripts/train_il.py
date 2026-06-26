@@ -24,6 +24,7 @@ import time
 import math
 import shutil
 import threading
+import logging
 from pathlib import Path
 import numpy as np
 import gc
@@ -47,6 +48,7 @@ from utils.il.startup import (
     plan_il_startup,
     apply_il_startup_plan,
     ask_resume_additional_epochs,
+    ask_il_target_positions,
     ask_il_hyperparam_source,
     ask_il_start_mode,
     has_il_checkpoints,
@@ -90,6 +92,141 @@ def _format_duration(seconds):
         minutes = int(seconds // 60)
         return f"{minutes}m {seconds - minutes * 60:04.1f}s"
     return f"{seconds:.2f}s"
+
+
+def _target_positions_default_millions(data_cfg, default=15):
+    raw = (data_cfg or {}).get('target_positions', int(default * 1_000_000))
+    if isinstance(raw, str) and raw.strip().lower() in {"max", "all"}:
+        return "max"
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(1, int(round(value / 1_000_000)))
+
+
+def _format_target_positions(value):
+    if isinstance(value, str) and value.strip().lower() in {"max", "all"}:
+        return "max"
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return "max"
+    if value <= 0:
+        return "max"
+    if value % 1_000_000 == 0:
+        return f"{value // 1_000_000}M"
+    return f"{value / 1_000_000:.2f}M"
+
+
+def _format_million_positions(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if value <= 0:
+        return "0M"
+    return f"{value / 1_000_000:.2f}M"
+
+
+def _build_il_run_summary(config, *, model_version=None, start_mode=None, source_label=None,
+                          pgn_count=None, train_count=None, val_count=None,
+                          batch_size=None, soft_train=None, soft_val=None):
+    data_cfg = config.get('data', {}) or {}
+    model_cfg = config.get('model', {}) or {}
+    il_cfg = config.get('imitation_learning', {}) or {}
+    ppg_cfg = data_cfg.get('positions_per_game', {}) or {}
+    dedup_cfg = data_cfg.get('sample_dedup', {}) or {}
+    soft_cfg = data_cfg.get('soft_targets', {}) or {}
+    sampler_cfg = data_cfg.get('train_sampling', {}) or {}
+
+    def _clean(value):
+        if value is None:
+            return None
+        try:
+            if isinstance(value, (np.floating, float)):
+                value = float(value)
+                return None if value != value else value
+            if isinstance(value, (np.integer, int)):
+                return int(value)
+        except TypeError:
+            pass
+        return value
+
+    summary = {
+        'version': model_version or model_cfg.get('version'),
+        'start_mode': start_mode,
+        'source': source_label,
+        'target_positions': data_cfg.get('target_positions', 'max'),
+        'pgn_files': pgn_count,
+        'train_positions': train_count,
+        'val_positions': val_count,
+        'batch_size': batch_size or il_cfg.get('batch_size'),
+        'history_positions': model_cfg.get('history_positions'),
+        'positions_per_game': {
+            'enabled': bool(ppg_cfg.get('enabled', False)),
+            'mode': ppg_cfg.get('mode'),
+            'max_total': ppg_cfg.get('max_total'),
+            'min_distance': ppg_cfg.get('min_distance'),
+            'auto_relax_min_distance': ppg_cfg.get('auto_relax_min_distance'),
+        },
+        'sample_dedup': {
+            'enabled': bool(dedup_cfg.get('enabled', False)),
+            'mode': dedup_cfg.get('mode'),
+            'max_count': dedup_cfg.get('max_count'),
+            'include_history': dedup_cfg.get('include_history'),
+        },
+        'soft_targets': {
+            'enabled': bool(soft_cfg.get('enabled', False)),
+            'mode': soft_cfg.get('mode'),
+            'include_turn': soft_cfg.get('include_turn'),
+            'include_history': soft_cfg.get('include_history'),
+            'max_policy_moves': soft_cfg.get('max_policy_moves'),
+            'policy_mass_threshold': soft_cfg.get('policy_mass_threshold'),
+        },
+        'train_sampling': {
+            'enabled': bool(sampler_cfg.get('enabled', False)),
+            'mode': sampler_cfg.get('mode'),
+            'source': sampler_cfg.get('source'),
+            'weight_power': sampler_cfg.get('weight_power'),
+            'opening_floor': sampler_cfg.get('opening_floor'),
+        },
+        'soft_stats': {
+            'train': soft_train,
+            'val': soft_val,
+        },
+    }
+    return {
+        key: _clean(value)
+        for key, value in summary.items()
+        if value is not None
+    }
+
+
+def _safe_float(value, default=0.0):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(value):
+        return float(default)
+    return value
+
+
+def _il_monitor_loss(val_losses, il_cfg):
+    """Return checkpoint/early-stop monitor loss and a short label."""
+    mode = str(il_cfg.get('early_stop_monitor', 'total') or 'total').strip().lower()
+    if mode not in {'value_aware', 'value-aware', 'value'}:
+        return _safe_float(val_losses.get('total'), default=float('inf')), "val_loss"
+
+    value_weight = max(0.0, _safe_float(il_cfg.get('early_stop_value_loss_weight', 1.25), default=1.25))
+    mlh_weight = max(0.0, _safe_float(il_cfg.get('early_stop_moves_left_loss_weight', 0.03), default=0.03))
+    policy = _safe_float(val_losses.get('policy'), default=0.0)
+    value = _safe_float(val_losses.get('value'), default=0.0)
+    moves_left = _safe_float(val_losses.get('moves_left'), default=0.0)
+    monitor = policy + value_weight * value + mlh_weight * moves_left
+    label = f"value_aware(policy + {value_weight:g}*value + {mlh_weight:g}*mlh)"
+    return monitor, label
 
 
 def _format_il_epoch_profile(
@@ -174,6 +311,12 @@ def _apply_il_elo_overrides(elo_config):
         'il_workers': 'workers',
         'il_async_device': 'async_device',
         'il_free_threads_utilization': 'free_threads_utilization',
+        'il_adaptive_probe_games_per_level': 'adaptive_probe_games_per_level',
+        'il_adaptive_focus_games_per_level': 'adaptive_focus_games_per_level',
+        'il_adaptive_extra_games_per_level': 'adaptive_extra_games_per_level',
+        'il_adaptive_max_total_games': 'adaptive_max_total_games',
+        'il_adaptive_min_games_for_se_stop': 'adaptive_min_games_for_se_stop',
+        'il_adaptive_target_standard_error': 'adaptive_target_standard_error',
     }
     for source_key, target_key in override_map.items():
         if source_key in resolved:
@@ -189,6 +332,15 @@ def _build_il_final_elo_config(elo_config):
     resolved = dict(elo_config)
     override_map = {
         'final_il_workers': 'workers',
+        'final_il_games_per_level': 'games_per_level',
+        'final_il_max_moves': 'max_moves',
+        'final_il_adaptive_probe_games_per_level': 'adaptive_probe_games_per_level',
+        'final_il_adaptive_focus_games_per_level': 'adaptive_focus_games_per_level',
+        'final_il_adaptive_extra_games_per_level': 'adaptive_extra_games_per_level',
+        'final_il_adaptive_target_focus_levels': 'adaptive_target_focus_levels',
+        'final_il_adaptive_max_total_games': 'adaptive_max_total_games',
+        'final_il_adaptive_min_games_for_se_stop': 'adaptive_min_games_for_se_stop',
+        'final_il_adaptive_target_standard_error': 'adaptive_target_standard_error',
         'final_il_mcts_simulations': 'mcts_simulations',
     }
     for source_key, target_key in override_map.items():
@@ -212,6 +364,26 @@ def _build_il_final_elo_configs(elo_config):
     mcts_cfg = dict(raw_cfg)
     raw_cfg['use_mcts'] = False
     mcts_cfg['use_mcts'] = True
+    try:
+        raw_games_multiplier = float(raw_cfg.get('final_il_raw_games_multiplier', 1.0) or 1.0)
+    except (TypeError, ValueError):
+        raw_games_multiplier = 1.0
+    raw_games_multiplier = max(1.0, raw_games_multiplier)
+    if raw_games_multiplier > 1.0:
+        for key in (
+            'games_per_level',
+            'adaptive_probe_games_per_level',
+            'adaptive_focus_games_per_level',
+            'adaptive_extra_games_per_level',
+            'adaptive_max_total_games',
+            'adaptive_min_games_for_se_stop',
+        ):
+            try:
+                current = int(raw_cfg.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                current = 0
+            if current > 0:
+                raw_cfg[key] = max(1, int(round(current * raw_games_multiplier)))
     return raw_cfg, mcts_cfg
 
 
@@ -258,10 +430,20 @@ def _run_il_final_elo(
 
     estimated_elo = elo_result.get("estimated_elo")
     if estimated_elo is not None:
-        logger.record_estimated_elo(epoch_num, estimated_elo, update_csv=True)
-        logger.add_elo_epoch_marker(epoch_num, marker_label)
         use_mcts = bool(elo_config.get("use_mcts", False))
         simulations = int(elo_config.get("mcts_simulations", 0) or 0)
+        mode_key = "mcts" if use_mcts else "nn"
+        logger.record_il_mode_elo(
+            epoch_num,
+            estimated_elo,
+            mode=mode_key,
+            simulations=simulations,
+            label=marker_label,
+            update_csv=True,
+        )
+        if not use_mcts:
+            logger.record_estimated_elo(epoch_num, estimated_elo, update_csv=True)
+            logger.add_elo_epoch_marker(epoch_num, marker_label)
         mode_label = f"MCTS {simulations} sims" if use_mcts else "raw NN"
         print(f"Final IL Estimated Elo ({model_label}, {mode_label}): {int(round(float(estimated_elo)))}")
         if elo_result.get("elo_std_error") is not None:
@@ -296,6 +478,12 @@ def _run_il_final_elo(
     return elo_result
 
 
+def _cleanup_cuda_after_eval(device):
+    if device.type == 'cuda' and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 def _load_il_model_for_final_elo(checkpoint_path, config, device, fallback_model=None):
     """Load a checkpoint for final Elo, falling back to the live model if needed."""
     checkpoint_path = Path(checkpoint_path)
@@ -321,6 +509,12 @@ def _load_il_model_for_final_elo(checkpoint_path, config, device, fallback_model
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
     # Load config
     config_path = script_dir.parent / 'config' / 'config.yaml'
     
@@ -336,6 +530,8 @@ def main():
     if not isinstance(il_debug_cfg, dict):
         il_debug_cfg = {}
     debug_enabled = bool(debug_cfg.get('enabled', False))
+    if not debug_enabled:
+        logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
 
     # Default to compact model logging in IL unless debug mode is enabled.
     config.setdefault('model', {})
@@ -351,7 +547,8 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-        print("✓ TF32 + cuDNN benchmark enabled")
+        if debug_enabled:
+            print("✓ TF32 + cuDNN benchmark enabled")
     
     # Setup device
     device = torch.device(config['hardware']['device'])
@@ -368,7 +565,8 @@ def main():
     
     if use_amp:
         amp_dtype = "bfloat16" if use_bfloat16 else "float16"
-        print(f"✓ Mixed Precision Training (AMP) enabled with {amp_dtype}")
+        if debug_enabled:
+            print(f"✓ Mixed Precision Training (AMP) enabled with {amp_dtype}")
         
         if use_bfloat16 and not torch.cuda.is_bf16_supported():
             print("⚠️ bfloat16 requested but not supported, falling back to float16")
@@ -390,14 +588,16 @@ def main():
     
     # Get configuration
     history_positions = config['model'].get('history_positions', 0)
-    stride = config['data'].get('sliding_window_stride', 1)
+    positions_per_game_cfg = config.get('data', {}).get('positions_per_game', {}) or {}
+    sample_dedup_cfg = config.get('data', {}).get('sample_dedup', {}) or {}
+    soft_targets_cfg = config.get('data', {}).get('soft_targets', {}) or {}
     
     # 🆕 v4.5 FIXED: Calculate expected input planes with chess metadata
     expected_input_planes = 16 * (1 + history_positions)  # 🔧 FIXED: 16 planes (12 pieces + 4 metadata)
     
     print(
         f"IL setup: version={model_version}, blocks={config['model']['num_residual_blocks']}, "
-        f"filters={config['model']['filters']}, history={history_positions}, stride={stride}, "
+        f"filters={config['model']['filters']}, history={history_positions}, "
         f"input_planes={expected_input_planes}"
     )
     print(
@@ -415,10 +615,14 @@ def main():
     model = model.to(memory_format=torch.channels_last)
     print("Model ready")
 
-    hparam_mode = ask_il_hyperparam_source(default_mode="config")
+    hparam_mode = ask_il_hyperparam_source(default_mode="auto")
     selected_start_mode = ask_il_start_mode(
         has_checkpoints=has_il_checkpoints(best_model_path, il_dir)
     )
+    target_positions = ask_il_target_positions(
+        default_millions=_target_positions_default_millions(config.get('data', {}), default=15)
+    )
+    config.setdefault('data', {})['target_positions'] = target_positions
 
     startup_plan = plan_il_startup(
         model=model,
@@ -529,7 +733,7 @@ def main():
             f.write(f"Batch size: {config['imitation_learning']['batch_size']}\n")
             f.write(f"Learning rate: {config['imitation_learning']['learning_rate']}\n")
             f.write(f"History positions: {history_positions} (dynamic)\n")
-            f.write(f"Sliding window stride: {stride}x\n")
+            f.write(f"Positions per game: {positions_per_game_cfg}\n")
             f.write(f"Input planes: {expected_input_planes} (16 per position)\n")
             f.write("Chess metadata: Castling, En Passant, Halfmove, Fullmove\n")
             f.write("WDL Value: True (forced)\n")
@@ -555,8 +759,10 @@ def main():
         logs_dir,
         experiment_name=f"il_training_{model_version}",
         mode="il",
+        verbose=debug_enabled,
     )
     logging_cfg = config.get('logging', {}) or {}
+    il_plot_every = max(1, int(logging_cfg.get('il_plot_every', 1) or 1))
     logger.set_plot_smoothing(
         enabled=logging_cfg.get('il_plot_smoothing_enabled', True),
         alpha=logging_cfg.get('il_plot_smoothing_alpha', 0.35),
@@ -578,7 +784,7 @@ def main():
             other_params = []
 
             for name, param in target_model.named_parameters():
-                if 'value_' in name:  # value_conv1, value_conv2, value_bn, value_fc1, value_fc2
+                if 'value_' in name or 'moves_left_' in name:
                     value_head_params.append(param)
                 else:
                     other_params.append(param)
@@ -620,7 +826,7 @@ def main():
 
     optimizer = _build_optimizer_for_model(model, announce_per_layer_lr=True)
     
-    if torch.cuda.is_available():
+    if debug_enabled and torch.cuda.is_available():
         print("✓ Using fused AdamW optimizer")
     
     # Learning rate scheduler: linear warmup → cosine decay
@@ -640,10 +846,11 @@ def main():
 
     scheduler = _build_scheduler_for_optimizer(optimizer)
 
-    print(
-        f"✓ LR schedule: warmup={warmup_epochs} ep → "
-        f"cosine decay (min_lr_ratio={min_lr_ratio})"
-    )
+    if debug_enabled:
+        print(
+            f"✓ LR schedule: warmup={warmup_epochs} ep → "
+            f"cosine decay (min_lr_ratio={min_lr_ratio})"
+        )
     
     # AMP Gradient Scaler
     scaler = _build_grad_scaler()
@@ -668,6 +875,9 @@ def main():
     patience_counter = startup_state['patience_counter']
     resumed_estimated_elo = startup_state.get('estimated_elo')
     resumed_estimated_elo_epoch = startup_state.get('estimated_elo_epoch')
+    resumed_estimated_elo_nn = startup_state.get('estimated_elo_nn')
+    resumed_estimated_elo_mcts = startup_state.get('estimated_elo_mcts')
+    resumed_estimated_elo_mcts_simulations = startup_state.get('estimated_elo_mcts_simulations')
     selected_compatibility_ratio = startup_state.get('selected_compatibility_ratio')
     transfer_match_ratio = startup_state.get('transfer_match_ratio')
     transfer_freeze_epochs = int(startup_state.get('transfer_freeze_epochs', 0) or 0)
@@ -691,6 +901,7 @@ def main():
         checkpoint_label=selected_checkpoint_label,
         device=device,
         selected_entry=selected_entry,
+        include_parameters=debug_enabled,
     )
 
     if resumed_estimated_elo is not None:
@@ -702,6 +913,28 @@ def main():
             print(f"Resume Elo seed: {int(round(float(resumed_estimated_elo)))} (epoch {int(seed_epoch)})")
         except (TypeError, ValueError):
             pass
+
+    if start_mode in {"resume", "transfer"}:
+        resume_marker_epoch = max(1, int(start_epoch or 0))
+        if resumed_estimated_elo_nn is None and resumed_estimated_elo is not None:
+            resumed_estimated_elo_nn = resumed_estimated_elo
+        if resumed_estimated_elo_nn is not None:
+            logger.record_il_mode_elo(
+                resume_marker_epoch,
+                resumed_estimated_elo_nn,
+                mode="nn",
+                label="Resume NN",
+                update_csv=True,
+            )
+        if resumed_estimated_elo_mcts is not None:
+            logger.record_il_mode_elo(
+                resume_marker_epoch,
+                resumed_estimated_elo_mcts,
+                mode="mcts",
+                simulations=resumed_estimated_elo_mcts_simulations or 0,
+                label="Resume MCTS",
+                update_csv=True,
+            )
 
     if start_mode == "new":
         plot_run_context = "startup: new training from scratch"
@@ -733,9 +966,11 @@ def main():
     _blocks  = config['model'].get('num_residual_blocks', '?')
     _filters = config['model'].get('filters', '?')
     _params_str = f"{_total_params / 1e6:.2f}M"
-    model_info = f"{model_version} | {_params_str} params | {_blocks} blocks {_filters}f"
-    plot_run_context = f"{model_info} | {plot_run_context}"
+    model_context = f"Model: {model_version} | {_params_str} params | {_blocks} blocks {_filters}f"
+    run_context = f"Run: {plot_run_context}"
+    plot_run_context = f"{model_context} | {run_context}"
     logger.set_run_context(plot_run_context)
+    logger.set_run_context_lines([model_context, run_context])
 
     if start_mode == "resume" and start_epoch >= config['imitation_learning']['epochs']:
         print(f"ℹ️ Checkpoint already at epoch {start_epoch}, no epochs left to run.")
@@ -748,13 +983,23 @@ def main():
     if not pgn_files:
         raise FileNotFoundError(f"No PGN files found in {data_dir}")
 
+    logger.set_run_summary_metadata(_build_il_run_summary(
+        config,
+        model_version=model_version,
+        start_mode=start_mode,
+        source_label=source_label,
+        pgn_count=len(pgn_files),
+        batch_size=config['imitation_learning']['batch_size'],
+    ))
+
     print_status_table(
         "Loading Data (IL)",
         [
             ("Data dir", str(data_dir)),
             ("PGN files", f"{len(pgn_files):,}"),
             ("History positions", history_positions),
-            ("Sliding stride", stride),
+            ("Positions/game", positions_per_game_cfg.get('max_total', 'all')),
+            ("Target samples", _format_target_positions(config.get('data', {}).get('target_positions', 'max'))),
             ("Debug mode", "on" if debug_enabled else "off"),
         ],
     )
@@ -798,17 +1043,32 @@ def main():
             print(f"  ❌ Unknown format mismatch - please delete cache and reprocess")
             raise ValueError("Position size mismatch")
 
-    train_loader, val_loader = run_with_optional_stdout_suppression(
-        debug_enabled,
-        create_dataloaders,
-        metadata,
-        config,
+    print("Preparing DataLoaders and train sampler...")
+    train_loader, val_loader = create_dataloaders(metadata, config)
+    print(
+        "DataLoaders ready: "
+        f"train={len(train_loader.dataset):,}, val={len(val_loader.dataset):,}"
+    )
+
+    def _resolve_loader_batch_size(loader, fallback):
+        batch_size = getattr(loader, "batch_size", None)
+        if batch_size is None:
+            batch_sampler = getattr(loader, "batch_sampler", None)
+            batch_size = getattr(batch_sampler, "batch_size", None)
+        if batch_size is None:
+            batch_size = fallback
+        try:
+            return max(1, int(batch_size))
+        except (TypeError, ValueError):
+            return max(1, int(fallback))
+
+    trained_batch_size = _resolve_loader_batch_size(
+        train_loader,
+        config['imitation_learning']['batch_size'],
     )
 
     train_stats = getattr(train_loader.dataset, 'filter_stats', {}) or {}
     val_stats = getattr(val_loader.dataset, 'filter_stats', {}) or {}
-    sampling_cfg = config.get('data', {}).get('position_sampling', {})
-    sampling_enabled = bool(sampling_cfg.get('enabled', False))
 
     def _as_int(value, default=0):
         try:
@@ -819,74 +1079,121 @@ def main():
     def _stat(stats, key, default=0):
         return _as_int(stats.get(key, default), default=default)
 
-    def _fmt_count(value):
-        return f"{_as_int(value):,}"
-
-    def _fmt_cut(removed, base):
-        removed = max(0, _as_int(removed))
-        base = max(0, _as_int(base))
-        pct = (removed * 100.0 / base) if base > 0 else 0.0
-        return f"{removed:,} ({pct:.2f}%)"
-
-    train_before = _stat(train_stats, 'input_count', len(train_loader.dataset))
-    val_before = _stat(val_stats, 'input_count', len(val_loader.dataset))
-
-    train_after_stride = _stat(train_stats, 'after_stride_count', train_before)
-    val_after_stride = _stat(val_stats, 'after_stride_count', val_before)
-
     train_final = _stat(train_stats, 'final_count', len(train_loader.dataset))
     val_final = _stat(val_stats, 'final_count', len(val_loader.dataset))
 
-    train_stride_cut = max(0, train_before - train_after_stride)
-    val_stride_cut = max(0, val_before - val_after_stride)
-    total_before = train_before + val_before
-    total_after_stride = train_after_stride + val_after_stride
-    total_stride_cut = train_stride_cut + val_stride_cut
-
-    train_second_cut = max(0, train_after_stride - train_final)
-    val_second_cut = max(0, val_after_stride - val_final)
     total_final = train_final + val_final
-    total_second_cut = train_second_cut + val_second_cut
-
-    print_status_table(
-        "Data Ready (IL) - Overview",
-        [
-            ("Positions total", f"{metadata.get('total_positions', 0):,}"),
-            ("Position size", f"{actual_position_size} bytes"),
-            ("Board encoding", "38B board (32B pieces + 6B metadata)"),
-            ("POV", "on"),
-            ("Sliding stride", stride),
-            ("2nd filter", "position_sampling (on)" if sampling_enabled else "position_sampling (off)"),
-            ("Batch size", config['imitation_learning']['batch_size']),
-        ],
+    data_context = (
+        f"Data: positions={_format_million_positions(total_final)} "
+        f"(train={_format_million_positions(train_final)}, val={_format_million_positions(val_final)})"
     )
+    logger.set_run_context(f"{plot_run_context} | {data_context}")
+    logger.set_run_context_lines([model_context, data_context, run_context])
 
-    print_multi_column_table(
-        "Data Ready (IL) - Filtering Pipeline",
-        headers=["Stage", "Train", "Val", "Total"],
-        rows=[
-            ("Split (before filters)", _fmt_count(train_before), _fmt_count(val_before), _fmt_count(total_before)),
-            (
-                "Sliding window removed",
-                _fmt_cut(train_stride_cut, train_before),
-                _fmt_cut(val_stride_cut, val_before),
-                _fmt_cut(total_stride_cut, total_before),
-            ),
-            (
-                "After sliding window",
-                _fmt_count(train_after_stride),
-                _fmt_count(val_after_stride),
-                _fmt_count(total_after_stride),
-            ),
-            (
-                "2nd filter removed",
-                _fmt_cut(train_second_cut, train_after_stride),
-                _fmt_cut(val_second_cut, val_after_stride),
-                _fmt_cut(total_second_cut, total_after_stride),
-            ),
-            ("Final samples", _fmt_count(train_final), _fmt_count(val_final), _fmt_count(total_final)),
-        ],
-    )
+    def _soft_data_summary(dataset):
+        soft = getattr(dataset, 'soft_targets', None)
+        if soft is None:
+            return None
+
+        def _array(key):
+            return np.asarray(soft[key])
+
+        occurrence = _array('occurrence_count')
+        sample_weight = _array('sample_weight')
+        policy_mass = _array('policy_mass_kept')
+        moves_left_log = _array('moves_left_log')
+        policy_values = _array('policy_values')
+        nonzero_policy = (policy_values > 0.0).sum(axis=1)
+        return {
+            'occ_avg': float(occurrence.mean()) if occurrence.size else 0.0,
+            'occ_max': float(occurrence.max()) if occurrence.size else 0.0,
+            'weight_avg': float(sample_weight.mean()) if sample_weight.size else 0.0,
+            'weight_max': float(sample_weight.max()) if sample_weight.size else 0.0,
+            'mass_avg': float(policy_mass.mean()) if policy_mass.size else 1.0,
+            'mass_min': float(policy_mass.min()) if policy_mass.size else 1.0,
+            'below_995': int((policy_mass < 0.995).sum()) if policy_mass.size else 0,
+            'moves_avg': float(np.expm1(moves_left_log).mean()) if moves_left_log.size else 0.0,
+            'moves_median': float(np.median(np.expm1(moves_left_log))) if moves_left_log.size else 0.0,
+            'policy_moves_avg': float(nonzero_policy.mean()) if nonzero_policy.size else 0.0,
+            'policy_moves_max': int(nonzero_policy.max()) if nonzero_policy.size else 0,
+        }
+
+    def _soft_basic_summary(dataset):
+        soft = getattr(dataset, 'soft_targets', None)
+        if soft is None:
+            return None
+
+        def _array(key):
+            if key not in soft:
+                return None
+            return np.asarray(soft[key])
+
+        def _mean(arr):
+            return float(arr.mean()) if arr is not None and arr.size else 0.0
+
+        def _max(arr):
+            return float(arr.max()) if arr is not None and arr.size else 0.0
+
+        occurrence = _array('occurrence_count')
+        value_occurrence = _array('value_occurrence_count')
+        sample_weight = _array('sample_weight')
+        value_sample_weight = _array('value_sample_weight')
+        policy_mass = _array('policy_mass_kept')
+        return {
+            'rows': int(len(dataset)),
+            'policy_occ_avg': _mean(occurrence),
+            'policy_occ_max': _max(occurrence),
+            'value_occ_avg': _mean(value_occurrence),
+            'value_occ_max': _max(value_occurrence),
+            'policy_weight_avg': _mean(sample_weight),
+            'policy_weight_max': _max(sample_weight),
+            'value_weight_avg': _mean(value_sample_weight),
+            'value_weight_max': _max(value_sample_weight),
+            'policy_mass_kept_avg': _mean(policy_mass),
+            'policy_mass_kept_min': float(policy_mass.min()) if policy_mass is not None and policy_mass.size else 1.0,
+        }
+
+    train_soft_basic = _soft_basic_summary(train_loader.dataset)
+    val_soft_basic = _soft_basic_summary(val_loader.dataset)
+    logger.set_run_summary_metadata(_build_il_run_summary(
+        config,
+        model_version=model_version,
+        start_mode=start_mode,
+        source_label=source_label,
+        pgn_count=len(pgn_files),
+        train_count=train_final,
+        val_count=val_final,
+        batch_size=trained_batch_size,
+        soft_train=train_soft_basic,
+        soft_val=val_soft_basic,
+    ))
+
+    if debug_enabled:
+        train_soft_summary = _soft_data_summary(train_loader.dataset)
+        val_soft_summary = _soft_data_summary(val_loader.dataset)
+        if train_soft_summary is not None or val_soft_summary is not None:
+            def _sf(summary, key, fmt="{:.3f}"):
+                if summary is None:
+                    return ""
+                value = summary.get(key, 0.0)
+                return fmt.format(value)
+
+            print_multi_column_table(
+                "Data Ready (IL) - Soft Targets",
+                headers=["Metric", "Train", "Val"],
+                rows=[
+                    ("occurrence_count avg", _sf(train_soft_summary, 'occ_avg'), _sf(val_soft_summary, 'occ_avg')),
+                    ("occurrence_count max", _sf(train_soft_summary, 'occ_max', "{:.0f}"), _sf(val_soft_summary, 'occ_max', "{:.0f}")),
+                    ("sample_weight avg", _sf(train_soft_summary, 'weight_avg'), _sf(val_soft_summary, 'weight_avg')),
+                    ("sample_weight max", _sf(train_soft_summary, 'weight_max'), _sf(val_soft_summary, 'weight_max')),
+                    ("policy moves avg/max", f"{_sf(train_soft_summary, 'policy_moves_avg')} / {_sf(train_soft_summary, 'policy_moves_max', '{:.0f}')}", f"{_sf(val_soft_summary, 'policy_moves_avg')} / {_sf(val_soft_summary, 'policy_moves_max', '{:.0f}')}"),
+                    ("top-K mass avg", _sf(train_soft_summary, 'mass_avg', "{:.5f}"), _sf(val_soft_summary, 'mass_avg', "{:.5f}")),
+                    ("top-K mass min", _sf(train_soft_summary, 'mass_min', "{:.5f}"), _sf(val_soft_summary, 'mass_min', "{:.5f}")),
+                    ("rows below 0.995 mass", _sf(train_soft_summary, 'below_995', "{:.0f}"), _sf(val_soft_summary, 'below_995', "{:.0f}")),
+                    ("MLH plies avg", _sf(train_soft_summary, 'moves_avg'), _sf(val_soft_summary, 'moves_avg')),
+                    ("MLH plies median", _sf(train_soft_summary, 'moves_median'), _sf(val_soft_summary, 'moves_median')),
+                ],
+            )
 
     # Stochastic Weight Averaging (SWA) for better generalization with large batches
     use_swa = config['imitation_learning'].get('use_swa', False)
@@ -981,13 +1288,14 @@ def main():
     if use_swa:
         swa_model = torch.optim.swa_utils.AveragedModel(model)
         swa_lr, swa_lr_reason = _resolve_swa_lr(swa_start)
-        print(
-            f"SWA enabled: planned_start={'auto' if swa_auto_start else swa_start}, auto_start={'on' if swa_auto_start else 'off'}, "
-            f"auto_min_epoch={swa_auto_min_epoch}, plateau_patience={swa_auto_plateau_patience}, "
-            f"anneal_epochs={swa_anneal_epochs}, planned_swa_lr={swa_lr:.6f}, "
-            f"stop_after_anneal_no_improve={'on' if swa_stop_after_anneal_no_improve else 'off'}, "
-            f"source={swa_start_reason}, lr_source={swa_lr_reason}"
-        )
+        if debug_enabled:
+            print(
+                f"SWA enabled: planned_start={'auto' if swa_auto_start else swa_start}, auto_start={'on' if swa_auto_start else 'off'}, "
+                f"auto_min_epoch={swa_auto_min_epoch}, plateau_patience={swa_auto_plateau_patience}, "
+                f"anneal_epochs={swa_anneal_epochs}, planned_swa_lr={swa_lr:.6f}, "
+                f"stop_after_anneal_no_improve={'on' if swa_stop_after_anneal_no_improve else 'off'}, "
+                f"source={swa_start_reason}, lr_source={swa_lr_reason}"
+            )
     else:
         swa_lr = float(config['imitation_learning'].get('swa_lr', 0.0005))
         swa_lr_reason = "disabled"
@@ -1020,19 +1328,29 @@ def main():
                     f"source={swa_start_reason}, lr_source={swa_lr_reason}\n"
                 )
         return True
-    print(f"Non-blocking transfers: {'enabled' if non_blocking_transfers else 'disabled'}")
+    max_patience = config['imitation_learning'].get('max_patience', 15)
+    min_delta = config['imitation_learning']['min_delta']
+    total_epochs = config['imitation_learning']['epochs']
+    monitor_label = _il_monitor_loss({'total': 0.0}, config['imitation_learning'])[1]
+    if monitor_label != "val_loss" and start_mode in {"resume", "transfer"}:
+        # Older checkpoints stored raw val_loss as best_val_loss. A value-aware
+        # monitor is on a different scale, so restart monitor patience safely.
+        best_val_loss = float("inf")
+        patience_counter = 0
+    best_raw_val_loss_for_swa = float("inf")
 
     # Training loop
     print("\nStarting training...")
-    start_msg = f"mode={start_mode}"
+    start_msg = f"mode={start_mode}, epochs={total_epochs}, batch={config['imitation_learning']['batch_size']}"
     if selected_checkpoint is not None and start_mode in {"resume", "transfer"}:
         start_msg += f", checkpoint={selected_checkpoint_label}"
     print(start_msg)
-    print(
-        f"optimizer_state={'on' if save_optimizer_state else 'off'}, "
-        f"history={history_positions}, stride={stride}, input_planes={expected_input_planes}"
-    )
     if debug_enabled:
+        print(f"Non-blocking transfers: {'enabled' if non_blocking_transfers else 'disabled'}")
+        print(
+            f"optimizer_state={'on' if save_optimizer_state else 'off'}, "
+            f"history={history_positions}, input_planes={expected_input_planes}"
+        )
         print("Debug profiling is active")
     profile_enabled = bool(debug_enabled and il_debug_cfg.get('profile_training', debug_cfg.get('profile_training', False)))
     profiled_phase_keys = set()
@@ -1042,19 +1360,15 @@ def main():
             return "transfer_frozen" if epoch_idx < transfer_freeze_until_epoch else "transfer_unfrozen"
         return "default"
 
-    max_patience = config['imitation_learning'].get('max_patience', 15)
-    min_delta = config['imitation_learning']['min_delta']
-    total_epochs = config['imitation_learning']['epochs']
-
-    print(
-        f"early_stopping(patience={max_patience}, min_delta={min_delta})"
-    )
+    if debug_enabled:
+        print(f"early_stopping(monitor={monitor_label}, patience={max_patience}, min_delta={min_delta})")
     if start_mode == "transfer" and transfer_post_unfreeze_lr is not None:
         print(f"transfer post-unfreeze lr={float(transfer_post_unfreeze_lr):.6g} (manual override)")
-    print(
-        f"paths: best={best_model_path}, version_best={version_best_model_path}, "
-        f"latest={latest_checkpoint_path}, checkpoints={il_dir}"
-    )
+    if debug_enabled:
+        print(
+            f"paths: best={best_model_path}, version_best={version_best_model_path}, "
+            f"latest={latest_checkpoint_path}, checkpoints={il_dir}"
+        )
 
     transfer_freeze_active = False
     transfer_freeze_until_epoch = start_epoch + transfer_freeze_epochs
@@ -1097,8 +1411,8 @@ def main():
         elo_config_il=elo_config_il,
         logger=logger,
     )
-    elo_coordinator.print_startup_summary()
-    if final_il_elo_enabled:
+    elo_coordinator.print_startup_summary(verbose=debug_enabled)
+    if debug_enabled and final_il_elo_enabled:
         print(
             "Elo final (IL): enabled for best_model_il and SWA, raw NN + MCTS, "
             f"levels={final_elo_config_il.get('levels')}, "
@@ -1176,7 +1490,8 @@ def main():
                             _compiled(_dummy, apply_log_softmax=False)
                 return _compiled
             except Exception as _e:
-                print(f"  ✗ {'mode=' + backend_or_mode if is_mode else 'backend=' + backend_or_mode}: {type(_e).__name__}: {_e}")
+                if debug_enabled:
+                    print(f"  ✗ {'mode=' + backend_or_mode if is_mode else 'backend=' + backend_or_mode}: {type(_e).__name__}: {_e}")
                 return None
 
         nonlocal _compile_strategy
@@ -1187,35 +1502,41 @@ def main():
                 if preferred_strategy['is_mode']
                 else f"backend={preferred_strategy['name']}"
             )
-            print(f"torch.compile: używam zapamiętanej konfiguracji ({preferred_label}, {reason_label})...")
+            if debug_enabled:
+                print(f"torch.compile: używam zapamiętanej konfiguracji ({preferred_label}, {reason_label})...")
             _compiled_model = _try_compile(
                 preferred_strategy['name'],
                 is_mode=preferred_strategy['is_mode'],
             )
             if _compiled_model is not None:
-                if preferred_strategy['is_mode']:
-                    print(f"✓ torch.compile enabled (mode={preferred_strategy['name']}, cached choice)")
-                else:
-                    print(f"✓ torch.compile enabled (backend={preferred_strategy['name']}, cached choice)")
+                if debug_enabled:
+                    if preferred_strategy['is_mode']:
+                        print(f"✓ torch.compile enabled (mode={preferred_strategy['name']}, cached choice)")
+                    else:
+                        print(f"✓ torch.compile enabled (backend={preferred_strategy['name']}, cached choice)")
                 return _compiled_model
-            print("  ⚠️ Zapamiętana konfiguracja torch.compile nie powiodła się, fallback do pełnego testu.")
+            if debug_enabled:
+                print("  ⚠️ Zapamiętana konfiguracja torch.compile nie powiodła się, fallback do pełnego testu.")
 
         warmup_sizes = ", ".join(str(size) for size in _compile_warmup_batch_sizes())
-        print(f"torch.compile: testowanie dostępnych backendów ({reason_label}, warmup_batches=[{warmup_sizes}])...")
+        if debug_enabled:
+            print(f"torch.compile: testowanie dostępnych backendów ({reason_label}, warmup_batches=[{warmup_sizes}])...")
         _compiled_model = None
 
         # 1. Inductor default (wymaga Triton — najlepszy wynik)
         _compiled_model = _try_compile('default', is_mode=True)
         if _compiled_model is not None:
             _compile_strategy = {'name': 'default', 'is_mode': True}
-            print("✓ torch.compile enabled (mode=default, inductor+Triton, warmup ~30-60s)")
+            if debug_enabled:
+                print("✓ torch.compile enabled (mode=default, inductor+Triton, warmup ~30-60s)")
             return _compiled_model
 
         # 2. cudagraphs (nie wymaga Triton, ~10-15% gain, stabilny na Windows)
         _compiled_model = _try_compile('cudagraphs', is_mode=False)
         if _compiled_model is not None:
             _compile_strategy = {'name': 'cudagraphs', 'is_mode': False}
-            print("✓ torch.compile enabled (backend=cudagraphs, ~10-15% gain, bez Triton)")
+            if debug_enabled:
+                print("✓ torch.compile enabled (backend=cudagraphs, ~10-15% gain, bez Triton)")
             return _compiled_model
 
         print("⚠️ torch.compile niedostępny dla bieżącej konfiguracji — trening bez kompilacji")
@@ -1234,6 +1555,7 @@ def main():
 
     training_interrupted = False
     last_epoch_idx = start_epoch - 1
+    completed_epochs_this_run = 0
     last_val_losses = None
     last_val_metrics = None
 
@@ -1391,6 +1713,7 @@ def main():
                 if profile_this_epoch and device.type == 'cuda':
                     torch.cuda.synchronize()
                 eval_time = time.perf_counter() - eval_start_time
+                _cleanup_cuda_after_eval(device)
 
                 print(f"Val - Loss: {val_losses['total']:.4f}, "
                       f"Policy: {val_losses['policy']:.4f}, "
@@ -1407,17 +1730,26 @@ def main():
                 estimated_elo = elo_coordinator.evaluate_if_due(epoch + 1)
                 logger.log(epoch + 1, train_losses, val_losses, train_metrics, val_metrics, epoch_lr,
                            estimated_elo=estimated_elo)
-                logger.plot()
+                completed_epochs_this_run += 1
+                if completed_epochs_this_run % il_plot_every == 0:
+                    logger.plot()
                 elo_coordinator.poll_results()
 
                 # Save best model
-                improvement = best_val_loss - val_losses['total']
+                current_monitor_loss, current_monitor_label = _il_monitor_loss(
+                    val_losses,
+                    config['imitation_learning'],
+                )
+                improvement = best_val_loss - current_monitor_loss
                 if improvement > min_delta:
-                    best_val_loss = val_losses['total']
+                    best_val_loss = current_monitor_loss
+                    best_raw_val_loss_for_swa = float(val_losses['total'])
                     patience_counter = 0
 
-                    print(f"✓ New best model! Val loss: {val_losses['total']:.4f} "
-                          f"(improved by {improvement:.4f})")
+                    print(
+                        f"✓ New best model! {current_monitor_label}: {current_monitor_loss:.4f} "
+                        f"(improved by {improvement:.4f}, val_loss={val_losses['total']:.4f})"
+                    )
                     print(f"  📊 Val Top-1: {val_metrics['policy_top1_acc']:.2%}")
 
                     model_to_save = model
@@ -1425,6 +1757,8 @@ def main():
                     best_metadata = {
                         'val_policy_loss': val_losses['policy'],
                         'val_value_loss': val_losses['value'],
+                        'early_stop_monitor': current_monitor_label,
+                        'early_stop_monitor_loss': current_monitor_loss,
                         'val_policy_top1': val_metrics['policy_top1_acc'],
                         'val_policy_top3': val_metrics['policy_top3_acc'],
                         'val_value_mae': val_metrics['value_mae'],
@@ -1432,7 +1766,10 @@ def main():
                         'use_bfloat16': use_bfloat16,
                         'history_positions': history_positions,
                         'input_planes': expected_input_planes,
-                        'sliding_window_stride': stride,
+                        'training_batch_size': trained_batch_size,
+                        'positions_per_game': dict(positions_per_game_cfg),
+                        'sample_dedup': dict(sample_dedup_cfg),
+                        'soft_targets': dict(soft_targets_cfg),
                         'pov_enabled': True,  # 🆕 v4.2
                         'version': model_version,    # 🆕 Track version
                         'startup_mode': start_mode,
@@ -1478,7 +1815,7 @@ def main():
                             )
                             if swa_post_anneal_no_improve_evals >= swa_stop_after_anneal_grace_evals:
                                 print("\nSWA post-anneal stop triggered.")
-                                print(f"Best validation loss: {best_val_loss:.4f}")
+                                print(f"Best monitor loss: {best_val_loss:.4f} ({monitor_label})")
                                 should_stop = True
 
                 if use_swa and swa_auto_start and swa_scheduler is None:
@@ -1506,7 +1843,7 @@ def main():
                 # Early stopping
                 if patience_counter >= max_patience:
                     print(f"\n🛑 Early stopping triggered!")
-                    print(f"Best validation loss: {best_val_loss:.4f}")
+                    print(f"Best monitor loss: {best_val_loss:.4f} ({monitor_label})")
                     should_stop = True
             else:
                 # Log only training metrics
@@ -1519,6 +1856,7 @@ def main():
                     epoch_lr,
                     estimated_elo=None,
                 )
+                completed_epochs_this_run += 1
                 elo_coordinator.poll_results()
                 eval_time = 0.0
 
@@ -1591,17 +1929,26 @@ def main():
             latest_metadata = {
                 'history_positions': history_positions,
                 'input_planes': expected_input_planes,
-                'sliding_window_stride': stride,
+                'training_batch_size': trained_batch_size,
+                'positions_per_game': dict(positions_per_game_cfg),
+                'sample_dedup': dict(sample_dedup_cfg),
+                'soft_targets': dict(soft_targets_cfg),
                 'pov_enabled': True,  # 🆕 v4.2
                 'version': model_version,
                 'startup_mode': start_mode,
                 'model_architecture': model_architecture,
             }
             if val_losses is not None:
+                latest_monitor_loss, latest_monitor_label = _il_monitor_loss(
+                    val_losses,
+                    config['imitation_learning'],
+                )
                 latest_metadata.update({
                     'val_loss': val_losses['total'],
                     'val_policy_loss': val_losses['policy'],
                     'val_value_loss': val_losses['value'],
+                    'early_stop_monitor': latest_monitor_label,
+                    'early_stop_monitor_loss': latest_monitor_loss,
                 })
             if val_metrics is not None:
                 latest_metadata.update({
@@ -1643,12 +1990,12 @@ def main():
                 il_dir=il_dir,
                 history_positions=history_positions,
                 expected_input_planes=expected_input_planes,
-                stride=stride,
                 model_version=model_version,
                 start_mode=start_mode,
                 use_bfloat16=use_bfloat16,
                 model_file_tag=model_file_tag,
                 model_architecture=model_architecture,
+                training_batch_size=trained_batch_size,
             )
 
             if should_stop:
@@ -1668,6 +2015,10 @@ def main():
     # Final plot
     logger.plot()
 
+    skip_interrupt_final_elo = bool(training_interrupted and completed_epochs_this_run <= 0)
+    if skip_interrupt_final_elo:
+        print("Ctrl+C happened before any epoch finished; skipping final IL Elo checks.")
+
     # Finalize SWA at training end and also on interrupt (if SWA has updates).
     swa_elo_stop_event = threading.Event()
     try:
@@ -1686,14 +2037,15 @@ def main():
             swa_start=swa_start,
             history_positions=history_positions,
             expected_input_planes=expected_input_planes,
-            stride=stride,
             model_version=model_version,
             start_mode=start_mode,
             best_val_loss=best_val_loss,
+            best_raw_val_loss=best_raw_val_loss_for_swa,
             evaluate_il_fn=evaluate_il,
-            elo_config=final_elo_config_il if final_il_elo_enabled else None,
+            elo_config=final_elo_config_il if final_il_elo_enabled and not skip_interrupt_final_elo else None,
             elo_stop_event=swa_elo_stop_event,
             model_architecture=model_architecture,
+            training_batch_size=trained_batch_size,
         )
     except KeyboardInterrupt:
         swa_elo_stop_event.set()
@@ -1750,7 +2102,7 @@ def main():
         logger.plot()
 
     final_best_elo_result = {}
-    if final_il_elo_enabled and not swa_final_result.get("elo_cancelled"):
+    if final_il_elo_enabled and not skip_interrupt_final_elo and not swa_final_result.get("elo_cancelled"):
         best_elo_model, best_elo_label = _load_il_model_for_final_elo(
             best_model_path,
             config,
@@ -1800,7 +2152,11 @@ def main():
             )
 
     if training_interrupted:
-        if not swa_final_result.get("elo_cancelled") and swa_final_result.get("estimated_elo") is None:
+        if (
+            not skip_interrupt_final_elo
+            and not swa_final_result.get("elo_cancelled")
+            and swa_final_result.get("estimated_elo") is None
+        ):
             final_elo_result = final_best_elo_result or {}
             ran_current_final_elo = False
             if final_elo_result.get("estimated_elo") is None and not final_elo_result.get("cancelled"):
@@ -1838,7 +2194,7 @@ def main():
         return
 
     print("\nTraining complete.")
-    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Best monitor loss: {best_val_loss:.4f} ({monitor_label})")
     print(f"Best model: {best_model_path}")
     print(f"Checkpoints: {il_dir}")
     print(f"Logs: {logs_dir}")

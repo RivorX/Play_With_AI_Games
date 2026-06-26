@@ -3,6 +3,7 @@
 import math
 
 import torch
+from tqdm import tqdm
 
 from src.model import save_checkpoint
 from utils.shared.elo_estimator import estimate_model_elo
@@ -49,12 +50,12 @@ def save_swa_snapshot_checkpoint(
     il_dir,
     history_positions,
     expected_input_planes,
-    stride,
     model_version,
     start_mode,
     use_bfloat16,
     model_file_tag,
     model_architecture,
+    training_batch_size=None,
 ):
     """Save SWA snapshot checkpoint (raw SWA weights, without BN refresh)."""
     if not use_swa or swa_model is None:
@@ -81,12 +82,16 @@ def save_swa_snapshot_checkpoint(
         "swa_start_epoch": swa_start,
         "history_positions": history_positions,
         "input_planes": expected_input_planes,
-        "sliding_window_stride": stride,
         "pov_enabled": True,
         "version": model_version,
         "startup_mode": start_mode,
         "model_architecture": dict(model_architecture or {}),
     }
+    if training_batch_size is not None:
+        try:
+            metadata["training_batch_size"] = int(training_batch_size)
+        except (TypeError, ValueError):
+            pass
     if ref_val_loss is not None:
         metadata["val_loss"] = float(ref_val_loss)
         metadata["val_policy_loss"] = ref_val_losses.get("policy")
@@ -114,11 +119,14 @@ def save_swa_snapshot_checkpoint(
     )
 
 
-def _build_single_worker_loader(base_loader, shuffle=False):
-    """Build a safe fallback DataLoader that avoids worker subprocesses."""
-    dataset = getattr(base_loader, "dataset", None)
-    if dataset is None:
-        return None
+def _loader_batch_size(base_loader, preferred_batch_size=None):
+    if preferred_batch_size is not None:
+        try:
+            preferred_batch_size = int(preferred_batch_size)
+            if preferred_batch_size > 0:
+                return preferred_batch_size
+        except (TypeError, ValueError):
+            pass
 
     batch_size = getattr(base_loader, "batch_size", None)
     if batch_size is None:
@@ -126,6 +134,16 @@ def _build_single_worker_loader(base_loader, shuffle=False):
         batch_size = getattr(batch_sampler, "batch_size", None)
     if batch_size is None:
         batch_size = 1
+    return max(1, int(batch_size))
+
+
+def _build_single_worker_loader(base_loader, shuffle=False, batch_size=None):
+    """Build a safe fallback DataLoader that avoids worker subprocesses."""
+    dataset = getattr(base_loader, "dataset", None)
+    if dataset is None:
+        return None
+
+    batch_size = _loader_batch_size(base_loader, batch_size)
 
     collate_fn = getattr(base_loader, "collate_fn", None)
     drop_last = bool(getattr(base_loader, "drop_last", False))
@@ -145,7 +163,7 @@ def _build_single_worker_loader(base_loader, shuffle=False):
         return None
 
 
-def _build_fresh_multi_worker_loader(base_loader, shuffle=False):
+def _build_fresh_multi_worker_loader(base_loader, shuffle=False, batch_size=None):
     """Build a fresh multi-worker DataLoader for one-off BN refresh after interrupts."""
     dataset = getattr(base_loader, "dataset", None)
     if dataset is None:
@@ -155,12 +173,7 @@ def _build_fresh_multi_worker_loader(base_loader, shuffle=False):
     if workers <= 0:
         return None
 
-    batch_size = getattr(base_loader, "batch_size", None)
-    if batch_size is None:
-        batch_sampler = getattr(base_loader, "batch_sampler", None)
-        batch_size = getattr(batch_sampler, "batch_size", None)
-    if batch_size is None:
-        batch_size = 1
+    batch_size = _loader_batch_size(base_loader, batch_size)
 
     collate_fn = getattr(base_loader, "collate_fn", None)
     drop_last = bool(getattr(base_loader, "drop_last", False))
@@ -216,11 +229,40 @@ class _InputOnlyLoader:
         return len(self.base_loader)
 
 
-def _update_bn_from_loader(loader, swa_model, device, use_amp, amp_dtype):
+def _update_bn_from_loader(loader, swa_model, device, use_amp, amp_dtype, desc="SWA BN refresh"):
     """Run SWA BatchNorm refresh using only model inputs from loader batches."""
-    input_loader = _InputOnlyLoader(loader)
-    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-        torch.optim.swa_utils.update_bn(input_loader, swa_model, device=device)
+    momenta = {}
+    was_training = swa_model.training
+    for module in swa_model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.reset_running_stats()
+            momenta[module] = module.momentum
+
+    if not momenta:
+        return
+
+    swa_model.train()
+    for module in momenta:
+        module.momentum = None
+
+    try:
+        iterator = tqdm(
+            _InputOnlyLoader(loader),
+            total=len(loader),
+            desc=desc,
+            unit="batch",
+            leave=True,
+        )
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                for inputs in iterator:
+                    if isinstance(inputs, torch.Tensor):
+                        inputs = inputs.to(device, non_blocking=True)
+                    swa_model(inputs)
+    finally:
+        for module, momentum in momenta.items():
+            module.momentum = momentum
+        swa_model.train(was_training)
 
 
 def _refresh_swa_bn_stats(
@@ -230,6 +272,7 @@ def _refresh_swa_bn_stats(
     use_amp,
     use_bfloat16,
     prefer_fresh_multi_worker=False,
+    training_batch_size=None,
 ):
     """Refresh BN stats with fallback to a single-worker loader if needed.
 
@@ -240,8 +283,14 @@ def _refresh_swa_bn_stats(
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
     refreshed_multi_loader = None
     tried_refreshed_multi = False
+    resolved_batch_size = _loader_batch_size(train_loader, training_batch_size)
+    print(f"  SWA BN refresh batch_size={resolved_batch_size:,}")
     if prefer_fresh_multi_worker:
-        refreshed_multi_loader = _build_fresh_multi_worker_loader(train_loader, shuffle=False)
+        refreshed_multi_loader = _build_fresh_multi_worker_loader(
+            train_loader,
+            shuffle=False,
+            batch_size=resolved_batch_size,
+        )
         tried_refreshed_multi = True
         if refreshed_multi_loader is None:
             print(
@@ -256,6 +305,7 @@ def _refresh_swa_bn_stats(
                     device,
                     use_amp,
                     amp_dtype,
+                    desc="SWA BN refresh",
                 )
                 print("BatchNorm statistics updated via fresh multi-worker loader.")
                 return True, "fresh_multi_worker", None
@@ -263,13 +313,24 @@ def _refresh_swa_bn_stats(
                 print(f"WARNING: BN refresh failed on fresh multi-worker loader ({refresh_exc})")
 
     try:
-        _update_bn_from_loader(train_loader, swa_model, device, use_amp, amp_dtype)
+        _update_bn_from_loader(
+            train_loader,
+            swa_model,
+            device,
+            use_amp,
+            amp_dtype,
+            desc="SWA BN refresh",
+        )
         return True, "train_loader", None
     except Exception as primary_exc:
         print(f"WARNING: BN refresh failed on training loader ({primary_exc})")
 
     if not tried_refreshed_multi:
-        refreshed_multi_loader = _build_fresh_multi_worker_loader(train_loader, shuffle=False)
+        refreshed_multi_loader = _build_fresh_multi_worker_loader(
+            train_loader,
+            shuffle=False,
+            batch_size=resolved_batch_size,
+        )
         if refreshed_multi_loader is not None:
             try:
                 _update_bn_from_loader(
@@ -278,18 +339,30 @@ def _refresh_swa_bn_stats(
                     device,
                     use_amp,
                     amp_dtype,
+                    desc="SWA BN refresh",
                 )
                 print("BatchNorm statistics updated via fresh multi-worker loader.")
                 return True, "fresh_multi_worker", None
             except Exception as refresh_exc:
                 print(f"WARNING: BN refresh failed on fresh multi-worker loader ({refresh_exc})")
 
-    safe_loader = _build_single_worker_loader(train_loader, shuffle=False)
+    safe_loader = _build_single_worker_loader(
+        train_loader,
+        shuffle=False,
+        batch_size=resolved_batch_size,
+    )
     if safe_loader is None:
         return False, "none", "failed to build safe single-worker training loader"
 
     try:
-        _update_bn_from_loader(safe_loader, swa_model, device, use_amp, amp_dtype)
+        _update_bn_from_loader(
+            safe_loader,
+            swa_model,
+            device,
+            use_amp,
+            amp_dtype,
+            desc="SWA BN refresh",
+        )
         print("BatchNorm statistics updated via safe single-worker loader.")
         return True, "safe_single_worker", None
     except Exception as fallback_exc:
@@ -338,14 +411,15 @@ def finalize_swa_model(
     swa_start,
     history_positions,
     expected_input_planes,
-    stride,
     model_version,
     start_mode,
     best_val_loss,
     evaluate_il_fn,
+    best_raw_val_loss=None,
     elo_config=None,
     elo_stop_event=None,
     model_architecture=None,
+    training_batch_size=None,
 ):
     """Finalize SWA model with BN refresh, optional Elo, and save best_model_il_swa.pt."""
     result = {
@@ -383,6 +457,7 @@ def finalize_swa_model(
         use_amp=use_amp,
         use_bfloat16=use_bfloat16,
         prefer_fresh_multi_worker=bool(interrupted),
+        training_batch_size=training_batch_size,
     )
     if not bn_updated:
         print(
@@ -482,13 +557,17 @@ def finalize_swa_model(
         "swa_finalized_on_interrupt": bool(interrupted),
         "history_positions": history_positions,
         "input_planes": expected_input_planes,
-        "sliding_window_stride": stride,
         "pov_enabled": True,
         "version": model_version,
         "startup_mode": start_mode,
         "swa_eval_mode": eval_mode,
         "model_architecture": dict(model_architecture or {}),
     }
+    if training_batch_size is not None:
+        try:
+            metadata["training_batch_size"] = int(training_batch_size)
+        except (TypeError, ValueError):
+            pass
     if bn_refresh_error:
         metadata["swa_bn_refresh_error"] = str(bn_refresh_error)
     if eval_error:
@@ -528,7 +607,8 @@ def finalize_swa_model(
         return result
 
     size_mb = swa_model_path.stat().st_size / (1024 ** 2)
-    best_loss = _safe_loss_value(best_val_loss, default=float("nan"))
+    best_loss_source = best_raw_val_loss if best_raw_val_loss is not None else best_val_loss
+    best_loss = _safe_loss_value(best_loss_source, default=float("nan"))
     val_loss = _safe_loss_value(result.get("val_loss"), default=float("nan"))
     if math.isfinite(best_loss) and math.isfinite(val_loss):
         delta_text = f"{best_loss - val_loss:.4f}"

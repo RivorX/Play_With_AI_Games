@@ -245,6 +245,56 @@ def board_to_compact(board):
     return bytes(packed)
 
 
+def compact_to_board(compact_board, turn=chess.WHITE):
+    """Reconstruct a python-chess board from the compact 38-byte encoding."""
+    if len(compact_board) != 38:
+        raise ValueError(f"Invalid compact board size: {len(compact_board)} (expected 38)")
+
+    code_to_piece = {
+        1: chess.Piece(chess.PAWN, chess.WHITE),
+        2: chess.Piece(chess.KNIGHT, chess.WHITE),
+        3: chess.Piece(chess.BISHOP, chess.WHITE),
+        4: chess.Piece(chess.ROOK, chess.WHITE),
+        5: chess.Piece(chess.QUEEN, chess.WHITE),
+        6: chess.Piece(chess.KING, chess.WHITE),
+        7: chess.Piece(chess.PAWN, chess.BLACK),
+        8: chess.Piece(chess.KNIGHT, chess.BLACK),
+        9: chess.Piece(chess.BISHOP, chess.BLACK),
+        10: chess.Piece(chess.ROOK, chess.BLACK),
+        11: chess.Piece(chess.QUEEN, chess.BLACK),
+        12: chess.Piece(chess.KING, chess.BLACK),
+    }
+
+    board = chess.Board(None)
+    for i in range(32):
+        byte = compact_board[i]
+        codes = ((byte >> 4) & 0x0F, byte & 0x0F)
+        for offset, code in enumerate(codes):
+            piece = code_to_piece.get(code)
+            if piece is not None:
+                board.set_piece_at(i * 2 + offset, piece)
+
+    castling_byte = compact_board[32]
+    castling_rights = 0
+    if castling_byte & 0b1000:
+        castling_rights |= chess.BB_H1
+    if castling_byte & 0b0100:
+        castling_rights |= chess.BB_A1
+    if castling_byte & 0b0010:
+        castling_rights |= chess.BB_H8
+    if castling_byte & 0b0001:
+        castling_rights |= chess.BB_A8
+    board.castling_rights = castling_rights
+
+    ep_square = compact_board[33]
+    board.ep_square = None if ep_square == 255 else int(ep_square)
+    board.halfmove_clock = int(struct.unpack('>H', compact_board[34:36])[0])
+    board.fullmove_number = int(struct.unpack('>H', compact_board[36:38])[0])
+    board.turn = bool(turn)
+    board.clear_stack()
+    return board
+
+
 def compact_to_tensor(compact_board, flip_perspective=False):
     """
     Convert compact representation back to tensor with POV support
@@ -382,11 +432,13 @@ def compact_to_tensor(compact_board, flip_perspective=False):
 
 
 # ==============================================================================
-# POV-AWARE MOVE ENCODING - ALPHAZERO-STYLE (8x8x73)
+# POV-AWARE MOVE ENCODING
 # ==============================================================================
 
 ACTION_PLANES = 73
-ACTION_SIZE = 64 * ACTION_PLANES  # 4672
+AZ_ACTION_SIZE = 64 * ACTION_PLANES  # 4672 intermediate 8x8x73 plane space
+ACTION_SIZE = 1858                   # LC0-style compact policy space
+MAX_LEGAL_MOVES = 256                # Safe fixed padding for legal-only policy loss
 
 # Queen-like directions: N, NE, E, SE, S, SW, W, NW
 _QUEENLIKE_DIRECTIONS = (
@@ -431,6 +483,8 @@ _UNDERPROMOTION_DELTA_TO_INDEX = {
 }
 
 _HFLIP_INV_INDEX_MAP = None
+_POLICY_INDEX_TO_AZ_INDEX = None
+_AZ_INDEX_TO_POLICY_INDEX = None
 
 
 def _to_pov_square(square, is_black_turn):
@@ -481,21 +535,90 @@ def _decode_queenlike_plane(plane):
     return dr * distance, dc * distance
 
 
+def _is_valid_az_policy_index(index):
+    """Return True for AZ plane entries that correspond to a possible chess move."""
+    if index < 0 or index >= AZ_ACTION_SIZE:
+        return False
+
+    from_square = index // ACTION_PLANES
+    plane = index % ACTION_PLANES
+    from_row, from_col = _square_to_coords(from_square)
+
+    if plane < 56:
+        dr, dc = _decode_queenlike_plane(plane)
+        return _coords_to_square(from_row + dr, from_col + dc) is not None
+
+    if plane < 64:
+        dr, dc = _KNIGHT_DELTAS[plane - 56]
+        return _coords_to_square(from_row + dr, from_col + dc) is not None
+
+    if plane < ACTION_PLANES:
+        dir_idx = (plane - 64) % 3
+        dr, dc = _UNDERPROMOTION_DELTAS[dir_idx]
+        # In POV coordinates all promotions move from row 6 to row 7.
+        return from_row == 6 and _coords_to_square(from_row + dr, from_col + dc) is not None
+
+    return False
+
+
+def _build_policy_maps():
+    policy_to_az = [idx for idx in range(AZ_ACTION_SIZE) if _is_valid_az_policy_index(idx)]
+    if len(policy_to_az) != ACTION_SIZE:
+        raise RuntimeError(f"Expected {ACTION_SIZE} compact policy moves, got {len(policy_to_az)}")
+    az_to_policy = np.full(AZ_ACTION_SIZE, -1, dtype=np.int32)
+    for policy_idx, az_idx in enumerate(policy_to_az):
+        az_to_policy[int(az_idx)] = int(policy_idx)
+    return np.asarray(policy_to_az, dtype=np.int64), az_to_policy
+
+
+def get_policy_index_maps():
+    global _POLICY_INDEX_TO_AZ_INDEX, _AZ_INDEX_TO_POLICY_INDEX
+    if _POLICY_INDEX_TO_AZ_INDEX is None or _AZ_INDEX_TO_POLICY_INDEX is None:
+        _POLICY_INDEX_TO_AZ_INDEX, _AZ_INDEX_TO_POLICY_INDEX = _build_policy_maps()
+    return _POLICY_INDEX_TO_AZ_INDEX, _AZ_INDEX_TO_POLICY_INDEX
+
+
+def policy_index_to_az_index(index):
+    policy_to_az, _ = get_policy_index_maps()
+    index = int(index)
+    if index < 0 or index >= ACTION_SIZE:
+        raise ValueError(f"Policy index out of range: {index} (expected 0-{ACTION_SIZE - 1})")
+    return int(policy_to_az[index])
+
+
+def az_index_to_policy_index(index):
+    _, az_to_policy = get_policy_index_maps()
+    index = int(index)
+    if index < 0 or index >= AZ_ACTION_SIZE:
+        raise ValueError(f"AZ index out of range: {index} (expected 0-{AZ_ACTION_SIZE - 1})")
+    policy_index = int(az_to_policy[index])
+    if policy_index < 0:
+        raise ValueError(f"AZ index {index} does not correspond to a compact policy move")
+    return policy_index
+
+
 def move_to_index(move, board):
     """
-    Convert chess.Move to AlphaZero-style index (8x8x73) with POV rotation.
+    Convert chess.Move to compact LC0-style policy index with POV rotation.
     """
     is_black_turn = (board.turn == chess.BLACK)
-    return _move_to_index_cached(
+    az_index = _move_to_az_index_cached(
         move.from_square,
         move.to_square,
         move.promotion or 0,
         is_black_turn,
     )
+    return az_index_to_policy_index(az_index)
 
 
 @lru_cache(maxsize=65536)
 def _move_to_index_cached(from_square_raw, to_square_raw, promotion, is_black_turn):
+    az_index = _move_to_az_index_cached(from_square_raw, to_square_raw, promotion, is_black_turn)
+    return az_index_to_policy_index(az_index)
+
+
+@lru_cache(maxsize=65536)
+def _move_to_az_index_cached(from_square_raw, to_square_raw, promotion, is_black_turn):
     from_square = _to_pov_square(from_square_raw, is_black_turn)
     to_square = _to_pov_square(to_square_raw, is_black_turn)
     promotion = promotion or None
@@ -535,7 +658,7 @@ def _move_to_index_cached(from_square_raw, to_square_raw, promotion, is_black_tu
 
 def index_to_move(index, is_black_turn=False, board=None):
     """
-    Convert AlphaZero-style index (8x8x73) back to chess.Move.
+    Convert compact LC0-style policy index back to chess.Move.
 
     Args:
         index: Move index in [0, ACTION_SIZE).
@@ -544,6 +667,7 @@ def index_to_move(index, is_black_turn=False, board=None):
     """
     if index < 0 or index >= ACTION_SIZE:
         return chess.Move.null()
+    index = policy_index_to_az_index(index)
 
     from_square_pov = index // ACTION_PLANES
     plane = index % ACTION_PLANES
@@ -604,11 +728,12 @@ def build_hflip_inverse_index_map():
     if _HFLIP_INV_INDEX_MAP is not None:
         return _HFLIP_INV_INDEX_MAP
 
+    policy_to_az, az_to_policy = get_policy_index_maps()
     forward_map = np.empty(ACTION_SIZE, dtype=np.int64)
 
-    for idx in range(ACTION_SIZE):
-        from_square = idx // ACTION_PLANES
-        plane = idx % ACTION_PLANES
+    for idx, az_idx in enumerate(policy_to_az):
+        from_square = int(az_idx) // ACTION_PLANES
+        plane = int(az_idx) % ACTION_PLANES
         mirrored_from = _mirror_file_pov_square(from_square)
 
         if plane < 56:
@@ -630,7 +755,11 @@ def build_hflip_inverse_index_map():
             mirrored_dir_idx = _UNDERPROMOTION_DELTA_TO_INDEX[(dr, -dc)]
             mirrored_plane = 64 + piece_idx * 3 + mirrored_dir_idx
 
-        forward_map[idx] = mirrored_from * ACTION_PLANES + mirrored_plane
+        mirrored_az = mirrored_from * ACTION_PLANES + mirrored_plane
+        mirrored_policy = int(az_to_policy[mirrored_az])
+        if mirrored_policy < 0:
+            raise RuntimeError(f"Mirrored AZ index {mirrored_az} is not in compact policy map")
+        forward_map[idx] = mirrored_policy
 
     inverse_map = np.empty_like(forward_map)
     inverse_map[forward_map] = np.arange(ACTION_SIZE, dtype=np.int64)

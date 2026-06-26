@@ -23,7 +23,6 @@ from src.utils.data_pipeline import (
     get_dataset_metadata,
     merge_binary_datasets,
     process_pgn_files,
-    sort_games_by_elo,
     write_positions_to_disk,
 )
 
@@ -46,6 +45,5 @@ __all__ = [
     'get_dataset_metadata',
     'merge_binary_datasets',
     'process_pgn_files',
-    'sort_games_by_elo',
     'write_positions_to_disk',
 ]

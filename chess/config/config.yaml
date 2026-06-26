@@ -20,16 +20,15 @@ paths:
 
 
 # ------------------------------------------------------------------------------
-# DATA PROCESSING - v4.3 TEMPORAL DISCOUNTING + v4.2 POV + SLIDING WINDOW
+# DATA
 # ------------------------------------------------------------------------------
 data:
+  # --------------------------------------------------------------------------
+  # 1) PGN -> BINARY DATA (requires preprocessing rebuild)
+  # --------------------------------------------------------------------------
   min_elo: 2300              # Minimum Elo rating for games
-  max_games: "max"           # Top N games per PGN, or "max" to use the entire file (disables per-file sort/top-N)
-  train_split: 0.85          # Train/validation split ratio
-  max_moves_per_game: 200    # Skip games longer than this
-
-  # Quality filtering
-  sort_by_avg_elo: true      # Sort by average Elo of both players
+  max_games: "max"           # Number of games per PGN, or "max" to use the entire file
+  max_moves_per_game: 300    # Skip only extreme/corrupt games; normal long games are sampled by positions_per_game
 
   # Game-level quality filters (headers + length)
   game_filters:
@@ -37,7 +36,7 @@ data:
     min_fullmove: 10              # Minimum fullmoves for any decisive game
     min_fullmove_draw: 20         # Stronger filter for short draws
     min_fullmove_resign: 12       # Early resignations
-    max_elo_gap: 300              # Detect "rozkladówki"
+    max_elo_gap: 500              # Keep useful strong-vs-strong games with moderate Elo gaps
     exclude_terminations:
       - "Time forfeit"
       - "Timeout"
@@ -45,33 +44,97 @@ data:
       - "Abandoned"
       - "Rules infraction"
 
-  # SLIDING WINDOW: dynamic history, no redundant storage
-  sliding_window_stride: 2   # Sample every Nth position (1=all, 2=half, 3=third)
+  # --------------------------------------------------------------------------
+  # 2) IL SAMPLE CACHE (fast to rebuild before training)
+  # --------------------------------------------------------------------------
+  train_split: 0.85          # Train/validation split ratio for index selection only
 
-  # Position sampling by game progress (reduce opening duplicates)
-  # keep_prob = keep_min + (keep_max - keep_min) * (progress ** power)
-  # progress = move_idx / (total_moves - 1)
-  position_sampling:
+  # Quick knob for making IL smaller/larger without rebuilding the binary.
+  positions_per_game:
     enabled: true
-    seed: 42
-    min_fullmove: 3      # hard-skip first N fullmoves
-    keep_min: 0.1        # early-game keep probability
-    keep_max: 1.0        # late-game keep probability
-    power: 2.0           # >1 biases toward mid/late game
+    selection_mode: "smart"          # smart = scored positions with spacing; even = old evenly-spaced selector
+    max_total: 40                 # Max sampled plies per game
+    min_distance: 4               # Minimum ply distance between selected positions in one game
+    auto_expand_max_total_before_distance: 50 # Raise max_total up to this before relaxing min_distance
+    auto_relax_min_distance_for_target: true  # If target still cannot fit, relax min_distance from 4 to 3
+    workers: auto                 # Parallel selector workers (auto = CPU threads - 1)
+    chunk_size: 2048              # Games per selector task; larger = less overhead, smaller = smoother progress
+    opening_pct: 20               # Percent of max_total from early-game positions
+    middlegame_pct: 45            # Percent of max_total from middlegame positions
+    endgame_pct: 35               # Percent of max_total from late-game positions
+    rare_or_eventful_pct: 0       # Percent reserved for rare/eventful positions; scans full records when > 0
 
-  # Position deduplication (across games)
-  # 🆕 v4.7: SMART DEDUP with max_count + position_plus_move mode
-  position_dedup:
+  # IL target after all filters/dedup. The startup prompt writes an integer here.
+  # Use "max" only when you explicitly want all available selected positions.
+  target_positions: 20000000
+
+  # Training-time sampler over the final deduped rows. This changes how often a
+  # selected row appears in training, not the validation set or cached targets.
+  train_sampling:
     enabled: true
-    mode: "position_plus_move"   # position_plus_move | fen_no_counters | fen | pieces
+    mode: "policy_weighted"       # shuffle | policy_weighted
+    source: "sample_weight"       # sample_weight | occurrence_count
+    weight_power: 0.5             # Mild oversampling; loss still uses full sample_weight
+    min_weight: 0.05
+    max_weight: 64
+    epoch_size_multiplier: 1.0    # 1.0 = one epoch has len(train_dataset) drawn samples
+    opening_floor: 0.0            # Opening boost comes from sample_weight; avoids a huge phase-label scan at startup
+    opening_progress_max: 0.25
+    endgame_progress_min: 0.75
+    phase_chunk_size: 1000000
+
+  # Index-level dedup for IL samples. The binary keeps full games intact for
+  # dynamic history and moves-left; only the training index list is capped.
+  sample_dedup:
+    enabled: true
+    mode: "fen"                  # fen keeps pieces + castling + ep + counters; soft policy stores move mix
     include_turn: true           # Include side-to-move in signature
-    max_count: 2                 # Max occurrences per signature (None = remove all duplicates)
-    random_sample: true          # Random sample (vs first K) - prevents bias
+    include_history: true        # Match the model input when history_positions > 0
+    max_count: 1                 # Soft targets already aggregate repeated outcomes/moves
 
-  # 4-PHASE: parse -> positions -> write -> cleanup
+  # Empirical soft targets from repeated positions inside each split.
+  # No engine needed: policy is a move-frequency distribution, value is WDL frequency.
+  soft_targets:
+    enabled: true
+    workers: auto                 # Parallel aggregation workers (auto = CPU threads - 1)
+    chunk_size: 500000            # Source positions per aggregation task
+    materialize_workers: auto     # Parallel final-array workers
+    materialize_chunk_size: 250000 # Final positions per materialization task
+    policy: true
+    value: true
+    mode: "fen"                  # Do not mix castling, en passant, halfmove/fullmove metadata
+    include_turn: true
+    include_history: false       # Aggregate policy targets by current board; model input still keeps history
+    value_key:
+      mode: "fen_no_counters"     # Value aggregates by current board + rule metadata, not full move number
+      include_turn: true
+      include_history: false      # Policy sees history; value target should generalize across transpositions
+    value_wdl_shrinkage_alpha: 1.0 # Blend low-count WDL targets toward split prior; lower = stronger value signal
+    value_sample_weight:
+      enabled: true
+      confidence_min: 0.60        # Singletons still teach value, repeated positions are trusted more
+      confidence_k: 3.0
+      progress_min: 0.25          # Opening outcome labels are noisy; endgame labels are cleaner
+      progress_power: 1.5
+      max: 1.0
+    max_policy_moves: 32         # Sparse top-K cap; 16 can drop useful opening move mass
+    policy_mass_threshold: 0.995 # Stop before max_policy_moves once this mass is retained
+    sample_weight:
+      enabled: true
+      mode: "sqrt_count"         # occurrence_count | sqrt_count | log_count | none
+      max: 32                    # Normal cap for repeated positions
+      opening_progress_max: 0.25 # Opening samples are aggregated hard; restore some policy mass by weight
+      opening_boost_min_count: 2 # Only boost positions that actually aggregate multiple games
+      opening_multiplier: 2.0
+      opening_max: 64            # Opening-specific cap; value weighting remains separately conservative
+
+  # --------------------------------------------------------------------------
+  # 3) PREPROCESSING SPEED ONLY (does not change data)
+  # --------------------------------------------------------------------------
   files_at_once: 1            # PGN files per batch (1=seq, 2-4=batch)
   phase1_threads: all         # PGN parse workers (1=off, all=cpu)
   phase2_threads: all         # Position workers (1=off, all=cpu)
+  phase2_chunk_size: 512      # Games per Phase 2 task; lowers Windows ProcessPool overhead
 
 
 # ------------------------------------------------------------------------------
@@ -79,17 +142,18 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v8"
+  version: "v9.4"
   # Base architecture
   num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
   filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
-  # Policy head (AZ-style classic chess planes, 8x8x73):
-  # 1x1 conv (C -> policy_head_channels) + BN + ReLU + 1x1 conv (policy_head_channels -> 73 planes)
-  # logits are reshaped to ACTION_SIZE (4672) in from_square-major order
-  policy_head_channels: 128     # Policy head intermediate filters
-  value_head_filters: 192       # Wider value head; cheap extra capacity for MCTS value calibration
-  value_hidden_dim: 1024        # Value head hidden dimension
-  dropout: 0.15                 # Value-head dropout; lower improves scalar value calibration for MCTS
+
+  # Policy head: Conv 3x3 C->96 + BN/ReLU + Conv 1x1 -> 73 planes,
+  # then fixed LC0-style gather to ACTION_SIZE=1858.
+  policy_head_channels: 96      # Policy head intermediate filters
+  value_head_filters: 16        # Spatial value conv filters before flatten
+  value_hidden_dim: 384         # Value head hidden dimension
+  moves_left_hidden_dim: 128    # Small global-mean MLP for moves-left head
+  dropout: 0.08                 # Value-head dropout
 
   history_positions: 4       # Number of past positions to include (0 = current only, current + 4 history)
 
@@ -97,7 +161,7 @@ model:
   use_se_blocks: true           # Squeeze-and-Excitation channel attention
   use_se_bottleneck: true       # Use FC bottleneck in SE block (recommended)
   se_reduction: 4               # Used when bottleneck=true (4=mid=32, 8=mid=16, 16=mid=8)
-  drop_path_rate: 0.1           # Stochastic Depth
+  drop_path_rate: 0.05          # Stochastic Depth
   use_coord_conv: true          # Position-aware conv
 
   # Advanced architectural features
@@ -113,11 +177,13 @@ auto_tune:
   use_for_il: true                   # IL may run probing + cache writes (when IL mode=auto)
   use_for_rl: false                  # RL should not reuse IL cache; huge IL-sized batches were starving RL of update steps
   cache_path: "logs/il_auto_tune_cache.yaml"
-  free_vram_utilization: 0.98
-  safety_margin_gib: 0.1
+  dedicated_vram_utilization: 0.90 # Push IL harder; auto-tune still backs off on OOM
   min_batch_size: 64
-  max_batch_size: 32768
-  batch_round_to: 64
+  max_batch_size: 24576
+  batch_round_to: 256
+  batch_selection: throughput # Pick the fastest probed batch, not the smallest near-peak batch
+  throughput_candidate_count: 7
+  throughput_tolerance: 0.03  # Only relevant for balanced fallback; throughput mode uses the best candidate
   lr_test_enabled: true
   lr_test_min: 0.0002
   lr_test_max: 0.005
@@ -138,13 +204,13 @@ imitation_learning:
   save_optimizer_state: true  # Save optimizer state in IL checkpoints for true resume
 
   # Training hyperparameters (used directly in config mode, and as fallback defaults)
-  batch_size: 9216           # Batch size
+  batch_size: 8192           # Fallback batch size; auto-tune may raise up to auto_tune.max_batch_size
   eval_batch_size: 0         # 0 = derive from train batch using eval_batch_size_multiplier
-  eval_batch_size_multiplier: 1.0 # Eval has no backward pass, so it can use a larger batch
+  eval_batch_size_multiplier: 1.0 # Keep eval batch same as train; larger eval batches spike CUDA cache/VRAM
   learning_rate: 0.001       # Base/fallback LR (used for config mode and LR-test fallback)
 
   # Advanced training hyperparameters
-  value_head_lr_factor: 1.25 # Value head LR multiplier; value needs extra adaptation for MCTS usefulness
+  value_head_lr_factor: 1.0  # Value head LR multiplier; value needs extra adaptation for MCTS usefulness
   epochs: 50                 # Maximum training epochs
   weight_decay: 0.002        # L2 regularization (10x stronger for value head)
   grad_clip: 1.0             # Gradient clipping threshold
@@ -152,13 +218,13 @@ imitation_learning:
   # Stochastic Weight Averaging (SWA) for better generalization
   use_swa: true              # Enable SWA (averages weights from multiple epochs)
   swa_auto_start: true       # Auto-start SWA from validation plateau instead of a fixed early epoch
-  swa_auto_min_epoch: 24     # Never start SWA before this epoch in new/resume training
+  swa_auto_min_epoch: 18     # Never start SWA before this epoch in new/resume training
   swa_auto_plateau_patience: 3 # Start after N evals without meaningful val-loss improvement
   swa_auto_min_delta: 0.0015 # Meaningful val-loss improvement threshold for SWA plateau detection
   swa_transfer_unfreeze_offset: 2  # In transfer mode: start SWA N epoch(s) after first fully unfrozen epoch
   swa_anneal_epochs: 12      # Number of epochs SWALR uses to anneal from current LR to swa_lr
   swa_stop_after_anneal_no_improve: true # Once SWA LR anneal is done, stop on the first eval without meaningful improvement
-  swa_stop_after_anneal_grace_evals: 1 # Number of post-anneal no-improve evals allowed before stopping
+  swa_stop_after_anneal_grace_evals: 3 # Number of post-anneal no-improve evals allowed before stopping
   swa_lr_mode: "auto"        # auto | manual
   swa_lr: 0.00005            # Used only when swa_lr_mode=manual
   swa_lr_ratio: 0.12         # Auto mode: target fraction of effective LR around SWA start
@@ -166,29 +232,29 @@ imitation_learning:
   swa_lr_max: 0.00020        # Auto mode upper clamp
 
   # Advanced training features
-  label_smoothing: 0.08      # Label smoothing (0.0 = off, 0.1 = standard)
+  policy_label_smoothing: 0.03 # v9.4 ablation: soften sparse IL policy targets without changing sampler
   warmup_pct: 0.05           # Warmup fraction of epochs (e.g., 0.02-0.05)
   min_lr_ratio: 0.005        # Min LR = base_lr * ratio
 
-  # v4.3: WDL-specific options
+  # WDL-specific options
   wdl_label_smoothing: 0.01  # Smoothing for value head (WDL is more sensitive to overconfidence)
   # Loss weights
   policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 0.75    # Stronger value supervision; policy was ahead of value for MCTS use
-  value_scalar_aux_loss_weight: 0.25 # Extra SmoothL1 on W-L scalar to improve search calibration
-  train_metrics_interval: 2  # Compute expensive train top-k/softmax metrics every N batches; val metrics remain full
-  # 🆕 WDL value weighting by move index (later positions = stronger signal)
-  value_move_weighting: true
-  value_move_weight_min: 0.1
-  value_move_weight_use_game_length: true
-  value_move_weight_min_total_moves: 40
+  value_loss_weight: 1.0     # Keep value competitive with policy; MCTS needs calibrated WDL
+  value_scalar_aux_loss_weight: 0.20 # SmoothL1 on W-L scalar so value improves beyond soft WDL CE
+  moves_left_loss_weight: 0.05 # Auxiliary SmoothL1 on log1p(remaining plies)
+  train_metrics_interval: 16 # Compute expensive train top-k/softmax metrics every N batches
+  eval_metrics_interval: 32  # Validation loss stays full; expensive val Top-K/phase metrics are sampled
 
   # Evaluation
   eval_every: 1              # Evaluate every N epochs
 
   # Early stopping
-  max_patience: 7            # Stop if no improvement for N epochs
-  min_delta: 0.001           # Minimum improvement threshold
+  max_patience: 5            # Stop if no meaningful monitor improvement for N epochs
+  min_delta: 0.0015          # Minimum improvement threshold
+  early_stop_monitor: value_aware # total or value_aware
+  early_stop_value_loss_weight: 1.25 # Used only by value_aware monitor
+  early_stop_moves_left_loss_weight: 0.03 # Keep MLH from dominating checkpoint selection
 
 # ------------------------------------------------------------------------------
 # REINFORCEMENT LEARNING (RL)
@@ -618,26 +684,17 @@ reinforcement_learning:
   policy_loss_weight: 1.0    # Policy loss weight
   policy_anchor_kl_weight: 0.14 # Keep the IL-policy floor, but stop it from overpowering clean MCTS discoveries
   value_loss_weight: 0.78    # Value/Q must become usable enough for deeper MCTS, not only low-loss on outcomes
-  value_aux_scalar_loss_weight: 0.55  # W-L ordering is the scalar consumed by MCTS Q; keep it visibly calibrated
+  value_aux_scalar_loss_weight: 0.15  # Small optional W-L scalar auxiliary
+  moves_left_loss_weight: 0.05        # Auxiliary SmoothL1 on log1p(remaining plies)
   value_root_q_target_mix: 0.08       # Blend a little root MCTS Q into final-outcome value targets to reduce outcome noise
   value_std_floor_loss_weight: 0.85   # Penalize value collapse when pred std falls far below target std
   value_std_floor_target_ratio: 0.95  # Aim for most of the target value spread before the penalty vanishes
   value_wdl_label_smoothing: 0.010    # Preserve calibration without encouraging overly flat WDL probabilities
-  value_target_weighting_enabled: true # Downweight early-game final-outcome noise; late positions carry clearer value signal
-  value_target_weight_min: 0.35
-  value_target_weight_draw_min: 0.45
-  value_target_weight_power: 1.75
   value_metric_weight_min: 0.20
   value_metric_max_fullmove: 80
   value_phase_opening_max_fullmove: 12
   value_phase_endgame_min_fullmove: 40
   value_phase_max_fullmove: 120
-  value_phase_calibration_enabled: true # Give clearer value/Q supervision to phases where MCTS relies on value most
-  value_phase_opening_weight: 0.82
-  value_phase_middlegame_weight: 1.08
-  value_phase_endgame_weight: 1.28
-  value_phase_decisive_bonus: 0.12
-  value_phase_decisive_threshold: 0.70
   # Value supervision: start slightly stronger, then taper once scalar calibration improves.
   value_loss_weight_schedule:
     start: 0.82
@@ -660,14 +717,20 @@ hardware:
   use_bfloat16: true         # bfloat16 instead of float16 (better range)
   num_workers: 5             # CPU workers for data loading
   prefetch_factor: 1         # DataLoader prefetch factor
-  train_prefetch_factor: 1   # Keep one prepared batch per train worker to reduce RAM/pagefile pressure
+  train_prefetch_factor: 2   # Two prepared train batches per worker smooth out GPU feed stalls
   val_prefetch_factor: 1     # One queued val batch per worker; raise to 2 only if RAM/pagefile stays calm
   pin_memory: true           # Faster GPU data transfer
   val_pin_memory: true       # Validation still benefits from pinned transfer
+  cuda_prefetch_batches: true # Overlap CPU->GPU batch copies with current CUDA compute
+  cuda_prefetch_queue_size: 2 # GPU-side prefetched batches; smooths DataLoader stalls without growing CPU queue
+  cuda_eval_prefetch_queue_size: 1 # Avoid holding multiple large eval batches on GPU
   persistent_workers: true   # Keep train workers alive between epochs
-  val_persistent_workers: false # Do not keep validation workers resident between evals
+  val_persistent_workers: false # Release validation workers after eval; avoids pinned/shared-memory buildup
   dataloader_index_mmap: true # Store sampled index arrays as .npy mmap so workers share them
   dataloader_numpy_shuffle: true # Compact shuffle permutation; avoids huge Python int lists
+  dataloader_board_dtype: "float16" # Halve board tensor RAM/pinned/H2D traffic; cast on GPU for model
+  dataloader_train_in_order: false # Let train yield first-ready worker batch; smoother GPU feed with shuffled data
+  dataloader_val_in_order: false # Eval metrics are order-independent; avoid waiting for slowest worker
   use_compile: true          # torch.compile: fuse Conv+BN+ReLU kernels (~3x speedup)
 
 
@@ -679,8 +742,9 @@ logging:
   tensorboard: true          # Enable TensorBoard logging
   print_every: 10            # Print stats every N batches
   il_plot_smoothing_enabled: true # Light EMA smoothing for IL PNG curves; exact best/SWA markers stay raw
-  il_plot_smoothing_alpha: 0.35   # Higher = follows raw curve more closely, lower = smoother
+  il_plot_smoothing_alpha: 0.65   # Higher = follows raw curve more closely, lower = smoother
   il_plot_smoothing_min_points: 5 # Do not smooth very short runs
+  il_plot_every: 3                # Heavy matplotlib PNG update every N logged IL evals; final plot is still saved
 
 
 # ------------------------------------------------------------------------------
@@ -722,11 +786,28 @@ elo_estimation:
 
   # IL Elo overrides.
   il_eval_every: 2
-  il_games_per_level: 24
+  il_games_per_level: 12
   il_max_moves: 120
-  il_workers: 0
+  il_workers: 2
+  il_free_threads_utilization: 0.35
+  il_adaptive_probe_games_per_level: 2
+  il_adaptive_focus_games_per_level: 12
+  il_adaptive_extra_games_per_level: 4
+  il_adaptive_max_total_games: 128
+  il_adaptive_min_games_for_se_stop: 64
+  il_adaptive_target_standard_error: 55.0
   final_on_il_shutdown: true
   final_il_workers: 12
+  final_il_games_per_level: 40
+  final_il_max_moves: 220
+  final_il_adaptive_probe_games_per_level: 5
+  final_il_adaptive_focus_games_per_level: 40
+  final_il_adaptive_extra_games_per_level: 8
+  final_il_adaptive_target_focus_levels: 4
+  final_il_adaptive_max_total_games: 320
+  final_il_adaptive_min_games_for_se_stop: 140
+  final_il_adaptive_target_standard_error: 30.0
+  final_il_raw_games_multiplier: 2.0 # Raw NN is fast; run more games for a stabler final IL Elo
   final_il_mcts_simulations: 192
 
   # RL promoted-best Elo overrides.
@@ -798,13 +879,13 @@ elo_estimation:
 # 🆕 DEBUG & PROFILING
 # ------------------------------------------------------------------------------
 debug:
-  enabled: true                    # Master switch for debug mode
+  enabled: false                   # Master switch for verbose diagnostics
 
   # Imitation Learning diagnostics
   il:
-    profile_training: true          # Time breakdown per epoch
+    profile_training: false         # Full CUDA-sync timing is expensive; false profiles only first phase epoch
     print_profile_to_console: false # Keep epoch timing tables in logs/debug only
-    log_gpu_memory: true            # GPU memory usage
+    log_gpu_memory: false           # GPU memory logging is diagnostic, not needed in the hot training loop
     print_batch0_diagnostics: false # Print batch-0 target stats + WDL samples
     print_wdl_loss_diagnostics: false # Print one-time WDL class distribution from loss
 

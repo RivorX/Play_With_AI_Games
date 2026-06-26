@@ -21,7 +21,7 @@ import hashlib
 from collections import OrderedDict
 from pathlib import Path
 from src.data import board_to_tensor, move_to_index
-from src.utils.data_helpers import _move_to_index_cached
+from src.utils.data_helpers import MAX_LEGAL_MOVES, _move_to_index_cached
 
 
 _EMPTY_HISTORY_TENSOR = np.zeros((16, 8, 8), dtype=np.float32)
@@ -822,9 +822,16 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     policy_indices = torch.full((batch_size, max_len), -1, dtype=torch.int16)
     policy_values = torch.zeros((batch_size, max_len), dtype=torch.float32)
     policy_lengths = torch.zeros((batch_size,), dtype=torch.int16)
+    max_legal_len = min(
+        MAX_LEGAL_MOVES,
+        max(int((pos[12] if len(pos) > 12 and pos[12] is not None else pos[1]).numel()) for pos in positions),
+    )
+    legal_indices = torch.full((batch_size, max_legal_len), -1, dtype=torch.int16)
+    legal_lengths = torch.zeros((batch_size,), dtype=torch.int16)
     importance_scores = torch.zeros((batch_size,), dtype=torch.float32)
     policy_weights = torch.ones((batch_size,), dtype=torch.float32)
     value_weights = torch.ones((batch_size,), dtype=torch.float32)
+    moves_left = torch.zeros((batch_size, 1), dtype=torch.float32)
     source_codes = torch.zeros((batch_size,), dtype=torch.int8)
     root_values = torch.zeros((batch_size,), dtype=torch.float32)
     fens = []
@@ -843,6 +850,12 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         root_values[row_idx] = float(pos[9]) if len(pos) > 9 else 0.0
         history_payload = pos[10] if len(pos) > 10 and pos[10] is not None else []
         history_fens.append([str(fen or "") for fen in list(history_payload)])
+        moves_left[row_idx, 0] = float(pos[11]) if len(pos) > 11 else 0.0
+        legal_payload = pos[12] if len(pos) > 12 and pos[12] is not None else indices
+        legal_count = min(int(legal_payload.numel()), max_legal_len)
+        if legal_count > 0:
+            legal_indices[row_idx, :legal_count] = legal_payload[:legal_count].to(dtype=torch.int16)
+        legal_lengths[row_idx] = legal_count
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -854,10 +867,13 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         'policy_indices': policy_indices,
         'policy_values': policy_values,
         'policy_lengths': policy_lengths,
+        'legal_indices': legal_indices,
+        'legal_lengths': legal_lengths,
         'values': values,
         'importance_scores': importance_scores,
         'policy_weights': policy_weights,
         'value_weights': value_weights,
+        'moves_left': moves_left,
         'source_codes': source_codes,
         'fens': fens,
         'root_values': root_values,
@@ -3076,22 +3092,6 @@ class BatchSelfPlayMCTSBatch:
             0.0,
             min(1.0, float(rl_cfg.get('replay_importance_top_fraction', 0.70))),
         )
-        self.value_target_weighting_enabled = bool(
-            rl_cfg.get('value_target_weighting_enabled', False)
-        )
-        self.value_target_weight_min = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('value_target_weight_min', 0.35))),
-        )
-        self.value_target_weight_draw_min = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('value_target_weight_draw_min', self.value_target_weight_min))),
-        )
-        self.value_target_weight_power = max(
-            0.1,
-            float(rl_cfg.get('value_target_weight_power', 1.75)),
-        )
-        
         self.max_positions_per_game = max(
             0,
             int(rl_cfg.get('replay_max_positions_per_game', 32)),
@@ -3873,6 +3873,7 @@ class BatchSelfPlayMCTSBatch:
         source_code = int(history_entry[7]) if len(history_entry) > 7 else _REPLAY_SOURCE_UNKNOWN
         fen = str(history_entry[8]) if len(history_entry) > 8 and history_entry[8] else ""
         history_fens = list(history_entry[9]) if len(history_entry) > 9 and history_entry[9] else []
+        legal_indices = history_entry[10] if len(history_entry) > 10 and history_entry[10] is not None else policy_indices
 
         if outcome == 0.0:
             value = draw_value_target
@@ -3884,7 +3885,8 @@ class BatchSelfPlayMCTSBatch:
                 (1.0 - self.value_root_q_target_mix) * float(value)
                 + self.value_root_q_target_mix * max(-1.0, min(1.0, float(root_value)))
             )
-        value_weight = self._value_target_weight(int(history_idx), int(history_len), outcome)
+        value_weight = 1.0
+        moves_left = max(0, len(gs.get('board_history', [])) - int(history_count))
 
         return {
             'history_idx': int(history_idx),
@@ -3899,6 +3901,8 @@ class BatchSelfPlayMCTSBatch:
             'importance_score': importance_score,
             'policy_weight': policy_weight,
             'value_weight': value_weight,
+            'moves_left': moves_left,
+            'legal_indices': legal_indices,
             'source_code': source_code,
         }
 
@@ -3918,19 +3922,6 @@ class BatchSelfPlayMCTSBatch:
             history_fens.append(temp_board.fen())
         history_fens.reverse()
         return history_fens
-
-    def _value_target_weight(self, history_idx, history_len, outcome):
-        if not self.value_target_weighting_enabled:
-            return 1.0
-        history_len = max(1, int(history_len))
-        progress = max(0.0, min(1.0, (int(history_idx) + 1) / float(history_len)))
-        min_weight = (
-            self.value_target_weight_draw_min
-            if float(outcome) == 0.0
-            else self.value_target_weight_min
-        )
-        shaped = progress ** float(self.value_target_weight_power)
-        return float(min_weight + (1.0 - min_weight) * shaped)
 
     def _compute_position_importance(self, board, move, visit_counts, root):
         importance = 1.0
@@ -4020,6 +4011,8 @@ class BatchSelfPlayMCTSBatch:
                 item.get('fen', ""),
                 float(item.get('root_value', 0.0)),
                 item.get('history_fens', []),
+                float(item.get('moves_left', 0.0)),
+                item.get('legal_indices', item['policy_indices']),
             ))
         if self.profile_enabled:
             self._profile_add('policy_target_postgame_time', time.perf_counter() - postgame_t0)
@@ -5046,6 +5039,10 @@ class BatchSelfPlayMCTSBatch:
                     target_quality_weight = self._policy_target_quality_weight(top1, entropy)
                     policy_visit_counts = self._prune_policy_target_visits(target_visit_counts)
                     policy_indices, policy_values = _build_sparse_policy_target_from_visits(policy_visit_counts, board)
+                    legal_indices_full = torch.tensor(
+                        [move_to_index(legal_move, board) for legal_move in board.legal_moves],
+                        dtype=torch.int16,
+                    )
                     history_count = len(gs['board_history'])
                     importance_score = self._compute_position_importance(board, move, policy_visit_counts, root)
                     root_value = 0.0
@@ -5088,6 +5085,7 @@ class BatchSelfPlayMCTSBatch:
                         replay_source_code,
                         board.fen(),
                         self._history_fens_for_board(board, self.history_positions),
+                        legal_indices_full,
                     ))
                     if self.profile_enabled:
                         self._profile_add('policy_target_build_time', time.perf_counter() - policy_t0)

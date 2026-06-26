@@ -1650,6 +1650,32 @@ class EloEstimator:
                 se = _elo_standard_error(all_opponent_elos, estimated)
                 return bool(se is not None and float(se) <= target_se)
 
+            def _current_standard_error() -> float | None:
+                if not all_scores:
+                    return None
+                estimated = _performance_rating(all_opponent_elos, all_scores)
+                if estimated is None:
+                    return None
+                return _elo_standard_error(all_opponent_elos, estimated)
+
+            def _precision_candidate_levels() -> list[int]:
+                candidates = [
+                    int(level)
+                    for level in _played_candidate_levels()
+                    if low_stop < _score_for_level(level) < high_skip
+                ]
+                if not candidates:
+                    candidates = list(focus_levels)
+                if not candidates:
+                    candidates = _played_candidate_levels()
+                return sorted(
+                    candidates,
+                    key=lambda lvl: (
+                        abs(_score_for_level(lvl) - 0.5),
+                        played_by_level.get(int(lvl), 0),
+                    ),
+                )[:target_focus]
+
             if bool(self.elo_config.get("elo_verbose_adaptive", False)):
                 print(
                     "  Adaptive probe waves: "
@@ -1764,6 +1790,59 @@ class EloEstimator:
                     # unless some level still has meaningful capacity and budget.
                     if not any(played_by_level.get(level, 0) < focus_games for level in focus_levels):
                         break
+
+            refine_until_target = bool(
+                self.elo_config.get("adaptive_refine_until_target_se", True)
+            )
+            refinement_started = False
+            while (
+                refine_until_target
+                and target_se > 0.0
+                and len(all_scores) >= min_games_for_se_stop
+                and total_scheduled < max_total_games
+                and not self._is_cancelled()
+                and not _estimate_precise_enough()
+            ):
+                refine_levels = _precision_candidate_levels()
+                if not refine_levels:
+                    break
+                current_se = _current_standard_error()
+                if current_se is not None and not refinement_started:
+                    print(
+                        "  Adaptive Elo: uncertainty still high "
+                        f"(SE={float(current_se):.1f} > target {target_se:.1f}); "
+                        f"adding games on levels {refine_levels}."
+                    )
+                    refinement_started = True
+                tasks = []
+                for level in refine_levels:
+                    if total_scheduled + len(tasks) >= max_total_games:
+                        break
+                    games_to_add = min(
+                        extra_round,
+                        max_total_games - total_scheduled - len(tasks),
+                    )
+                    if games_to_add <= 0:
+                        continue
+                    tasks.extend(self._build_level_tasks(level, played_by_level.get(level, 0), games_to_add))
+                if not tasks:
+                    break
+                total_scheduled += len(tasks)
+                if _run_selected_tasks(tasks, phase="precision"):
+                    break
+            if (
+                refine_until_target
+                and target_se > 0.0
+                and len(all_scores) >= min_games_for_se_stop
+                and total_scheduled >= max_total_games
+            ):
+                current_se = _current_standard_error()
+                if current_se is not None and float(current_se) > target_se:
+                    print(
+                        "  Adaptive Elo: reached game cap "
+                        f"({max_total_games}) with SE={float(current_se):.1f} "
+                        f"> target {target_se:.1f}."
+                    )
             for level in focus_levels:
                 if bool(self.elo_config.get("elo_verbose_adaptive", False)):
                     summary = self._summarize_scores(scores_by_level.get(level, []))

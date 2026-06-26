@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.utils.data_helpers import ACTION_PLANES, ACTION_SIZE
+from src.utils.data_helpers import ACTION_PLANES, ACTION_SIZE, get_policy_index_maps
 
 
 class SEBlock(nn.Module):
@@ -241,8 +241,8 @@ class ChessNet(nn.Module):
         use_layer_scale = config['model'].get('use_layer_scale', True)
         layer_scale_init = config['model'].get('layer_scale_init', 1e-5)
 
-        # Policy head: fixed AlphaZero-style chess head (8x8x73 action space)
-        policy_channels = int(config['model'].get('policy_head_channels', 2))
+        # Policy head: LC0-style compact policy gathered from 8x8x73 conv planes.
+        policy_channels = int(config['model'].get('policy_head_channels', 96))
         if policy_channels < 1:
             raise ValueError(f"policy_head_channels must be >= 1, got {policy_channels}")
         # v4.5: AUTO-CALCULATE input_planes with chess metadata
@@ -281,8 +281,8 @@ class ChessNet(nn.Module):
                 print(f"  > LayerScale: ENABLED (init={layer_scale_init})")
             
             
-            print(f"  > Policy bottleneck: 1x1 ({policy_channels} channels)")
-            print(f"  > Policy Head: AZ-style planes logits (conv-only, 8x8x73)")
+            print(f"  > Policy conv: 3x3 ({policy_channels} channels)")
+            print(f"  > Policy Head: LC0-style {ACTION_SIZE} logits gathered from 8x8x73 planes")
         # Input conv with dynamic input_planes
         if use_coord_conv:
             self.conv_block = nn.Sequential(
@@ -320,21 +320,34 @@ class ChessNet(nn.Module):
         # all heads receive unstable activations. (He et al. 2016)
         self.final_bn = nn.BatchNorm2d(filters)
         
-        # Policy head - fixed AZ-style classic chess planes (8x8x73)
-        # 1x1 conv (C -> policy_channels) + BN + ReLU + 1x1 conv (policy_channels -> 73 planes)
-        self.policy_conv = nn.Conv2d(filters, policy_channels, kernel_size=1, bias=False)
+        policy_to_az, _ = get_policy_index_maps()
+        self.register_buffer(
+            "policy_index_to_az",
+            torch.as_tensor(policy_to_az, dtype=torch.long),
+            persistent=False,
+        )
+
+        # Policy head - spatial conv planes gathered to compact LC0-style policy.
+        # 3x3 conv (C -> policy_channels) + BN + ReLU + 1x1 conv (policy_channels -> 73 planes)
+        self.policy_conv = nn.Conv2d(filters, policy_channels, kernel_size=3, padding=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_logits_conv = nn.Conv2d(policy_channels, ACTION_PLANES, kernel_size=1, bias=True)
         
         # đź†• Value head - WDL (Win/Draw/Loss) classification
         # AlphaZero-style: Conv 1x1 → BN → ReLU → GlobalAvgPool → FC → WDL
-        value_filters = config['model']['value_head_filters']
-        value_hidden = config['model']['value_hidden_dim']
-        self.value_conv = nn.Conv2d(filters, value_filters, kernel_size=1, bias=False)
+        value_filters = int(config['model'].get('value_head_filters', 16))
+        value_hidden = int(config['model'].get('value_hidden_dim', 384))
+        self.value_conv = nn.Conv2d(filters, value_filters, kernel_size=3, padding=1, bias=False)
         self.value_bn = nn.BatchNorm2d(value_filters)
-        self.value_fc1 = nn.Linear(value_filters, value_hidden)
+        value_in_dim = value_filters * 8 * 8 + filters
+        self.value_ln = nn.LayerNorm(value_in_dim)
+        self.value_fc1 = nn.Linear(value_in_dim, value_hidden)
         self.value_fc2 = nn.Linear(value_hidden, 3)  # đź†• 3 outputs: [Win, Draw, Loss]
         self.value_dropout = nn.Dropout(dropout)
+        mlh_hidden = int(config['model'].get('moves_left_hidden_dim', 128))
+        self.moves_left_fc1 = nn.Linear(filters, mlh_hidden)
+        self.moves_left_ln = nn.LayerNorm(mlh_hidden)
+        self.moves_left_fc2 = nn.Linear(mlh_hidden, 1)
         
         # Shared GAP for value head
         self.shared_gap = nn.AdaptiveAvgPool2d(1)
@@ -362,6 +375,9 @@ class ChessNet(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
@@ -373,6 +389,8 @@ class ChessNet(nn.Module):
             nn.init.zeros_(self.policy_logits_conv.bias)
         nn.init.normal_(self.value_fc2.weight, std=0.01)
         nn.init.zeros_(self.value_fc2.bias)
+        nn.init.normal_(self.moves_left_fc2.weight, std=0.01)
+        nn.init.zeros_(self.moves_left_fc2.bias)
 
     @staticmethod
     def _count_parameters(module, trainable_only=False):
@@ -395,8 +413,14 @@ class ChessNet(nn.Module):
         value_params = (
             self._count_parameters(self.value_conv) +
             self._count_parameters(self.value_bn) +
+            self._count_parameters(self.value_ln) +
             self._count_parameters(self.value_fc1) +
             self._count_parameters(self.value_fc2)
+        )
+        moves_left_params = (
+            self._count_parameters(self.moves_left_fc1) +
+            self._count_parameters(self.moves_left_ln) +
+            self._count_parameters(self.moves_left_fc2)
         )
 
         total_params = self._count_parameters(self)
@@ -410,12 +434,13 @@ class ChessNet(nn.Module):
         print(f"    - Final BN: {final_bn_params:,}")
         print(f"    - Policy head: {policy_params:,}")
         print(f"    - Value head: {value_params:,}")
+        print(f"    - Moves-left head: {moves_left_params:,}")
         print(f"    - Trainable params: {trainable_params:,}")
         if frozen_params > 0:
             print(f"    - Frozen params: {frozen_params:,}")
         print(f"    - Total params: {total_params:,}")
 
-    def forward(self, x, apply_log_softmax=True, policy_only=False):
+    def forward(self, x, apply_log_softmax=True, policy_only=False, return_moves_left=False):
         """Forward pass (policy as log-probs by default, raw logits when apply_log_softmax=False)."""
         if not x.is_contiguous(memory_format=torch.channels_last):
             x = x.contiguous(memory_format=torch.channels_last)
@@ -435,26 +460,37 @@ class ChessNet(nn.Module):
         policy_logits_planes = self.policy_logits_conv(policy)  # (B, 73, 8, 8)
         # ACTION index layout is from_square-major then plane:
         # index = (row*8 + col) * 73 + plane.
-        policy_logits = (
-            policy_logits_planes.permute(0, 2, 3, 1).contiguous().view(policy_logits_planes.size(0), ACTION_SIZE)
+        az_policy_logits = (
+            policy_logits_planes.permute(0, 2, 3, 1).contiguous().view(policy_logits_planes.size(0), -1)
         )
+        policy_logits = az_policy_logits.index_select(1, self.policy_index_to_az)
         if apply_log_softmax:
             policy = F.log_softmax(policy_logits, dim=1)
         else:
             policy = policy_logits
         if policy_only:
-            return policy, None
+            return (policy, None, None) if return_moves_left else (policy, None)
 
-        # Value head - AlphaZero-style: Conv -> BN -> ReLU -> GAP -> FC -> WDL
+        trunk_global = self.shared_gap(x).flatten(1)
+
+        # Value head: spatial conv features + global trunk mean -> WDL
         value = self.value_conv(x)
         value = self.value_bn(value)
-        value = F.relu(value, inplace=True)
-        value = self.shared_gap(value)  # GAP: (B, C, 8, 8) -> (B, C, 1, 1)
-        value = value.flatten(1)        # (B, C, 1, 1) -> (B, C)
-        value_hidden = F.relu(self.value_fc1(value), inplace=True)
+        value = F.silu(value, inplace=True)
+        value = value.flatten(1)
+        value = torch.cat([value, trunk_global], dim=1)
+        value = self.value_ln(value)
+        value_hidden = F.silu(self.value_fc1(value), inplace=True)
         value_hidden = self.value_dropout(value_hidden)
         value = self.value_fc2(value_hidden)  # (B, 3) WDL logits
-        return policy, value
+
+        if not return_moves_left:
+            return policy, value
+
+        moves_left = F.relu(self.moves_left_fc1(trunk_global), inplace=True)
+        moves_left = self.moves_left_ln(moves_left)
+        moves_left = self.moves_left_fc2(moves_left)
+        return policy, value, moves_left
 
     def predict(self, board_tensor):
         """

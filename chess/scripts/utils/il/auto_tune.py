@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import math
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,12 +14,12 @@ import yaml
 try:
     from src.utils.data_helpers import ACTION_SIZE as DEFAULT_ACTION_SIZE
 except Exception:
-    DEFAULT_ACTION_SIZE = 4672
+    DEFAULT_ACTION_SIZE = 1858
 
 from .loss import CombinedLoss
 
 
-AUTO_TUNE_ALGO_VERSION = 5
+AUTO_TUNE_ALGO_VERSION = 10
 
 
 def _safe_int(value, default=0):
@@ -281,13 +282,27 @@ def _read_cache_profile(entry, runtime_profile, fallback_to_eager=True):
     return None, None
 
 
-def _cached_profile_is_usable(cached_profile, context_label, current_budget_bytes=None):
+def _cached_profile_is_usable(
+    cached_profile,
+    context_label,
+    current_budget_bytes=None,
+    max_batch_size=None,
+    expected_batch_selection=None,
+    expected_throughput_tolerance=None,
+):
     if not isinstance(cached_profile, dict):
         return False
 
     cached_batch = _safe_int(cached_profile.get("batch_size"), 0)
     cached_lr = _safe_float(cached_profile.get("learning_rate"), 0.0)
     if cached_batch <= 0 or cached_lr <= 0:
+        return False
+
+    if max_batch_size is not None and int(max_batch_size) > 0 and cached_batch > int(max_batch_size):
+        print(
+            f"{context_label}: cached params skipped "
+            f"(batch_size={cached_batch} > max_batch_size={int(max_batch_size)})."
+        )
         return False
 
     cached_algo = _safe_int(cached_profile.get("algo_version"), 0)
@@ -297,6 +312,28 @@ def _cached_profile_is_usable(cached_profile, context_label, current_budget_byte
             f"(algo_version={cached_algo}, expected={AUTO_TUNE_ALGO_VERSION})."
         )
         return False
+
+    if expected_batch_selection is not None:
+        cached_selection = str(cached_profile.get("batch_selection") or "").strip().lower()
+        expected_selection = str(expected_batch_selection or "").strip().lower()
+        if cached_selection and cached_selection != expected_selection:
+            print(
+                f"{context_label}: cached params skipped "
+                f"(batch_selection={cached_selection}, expected={expected_selection})."
+            )
+            return False
+
+    if expected_throughput_tolerance is not None:
+        cached_tol = cached_profile.get("throughput_tolerance")
+        if cached_tol is not None:
+            cached_tol = _safe_float(cached_tol, -1.0)
+            expected_tol = _safe_float(expected_throughput_tolerance, -1.0)
+            if abs(cached_tol - expected_tol) > 1.0e-6:
+                print(
+                    f"{context_label}: cached params skipped "
+                    f"(throughput_tolerance={cached_tol:.3f}, expected={expected_tol:.3f})."
+                )
+                return False
 
     cached_peak = _safe_int(cached_profile.get("estimated_peak_bytes"), 0)
     if (
@@ -366,30 +403,25 @@ def _is_oom_error(exc):
 def _compute_vram_budget(total_vram_bytes, free_vram_bytes, config):
     auto_cfg = _get_auto_tune_cfg(config)
 
-    free_util = _safe_float(auto_cfg.get("free_vram_utilization"), 0.92)
-    free_util = max(0.20, min(0.99, free_util))
+    dedicated_util = _safe_float(auto_cfg.get("dedicated_vram_utilization"), 0.85)
+    dedicated_util = max(0.20, min(0.98, dedicated_util))
 
-    safety_margin_gib = _safe_float(auto_cfg.get("safety_margin_gib"), 1.00)
-    safety_margin_gib = max(0.0, min(8.0, safety_margin_gib))
-    safety_margin_bytes = int(safety_margin_gib * (1024.0 ** 3))
-
-    free_limit = int(float(max(0, free_vram_bytes)) * free_util)
-    budget_bytes = free_limit
-
-    budget_bytes = max(1, budget_bytes - safety_margin_bytes)
+    dedicated_limit = int(float(max(0, total_vram_bytes)) * dedicated_util)
+    budget_bytes = max(1, dedicated_limit)
 
     min_budget_gib = _safe_float(auto_cfg.get("min_budget_gib"), 0.50)
     min_budget_gib = max(0.10, min(8.0, min_budget_gib))
     min_budget_bytes = int(min_budget_gib * (1024.0 ** 3))
     budget_bytes = max(budget_bytes, min_budget_bytes)
 
+    budget_mode = "dedicated_vram_fraction"
+
     return {
         "budget_bytes": int(budget_bytes),
-        "free_limit_bytes": int(free_limit),
-        "free_utilization": float(free_util),
-        "safety_margin_bytes": int(safety_margin_bytes),
+        "dedicated_limit_bytes": int(dedicated_limit),
+        "dedicated_utilization": float(dedicated_util),
         "min_budget_bytes": int(min_budget_bytes),
-        "budget_mode": "free_dedicated_vram",
+        "budget_mode": budget_mode,
     }
 
 
@@ -430,11 +462,7 @@ def _build_synthetic_batch(config, device, batch_size, input_planes, generator=N
 
     move_space = int(config.get("imitation_learning", {}).get("probe_action_size", DEFAULT_ACTION_SIZE))
     max_moves = int(config.get("data", {}).get("max_moves_per_game", 200))
-    min_total_moves = int(
-        config.get("imitation_learning", {}).get("value_move_weight_min_total_moves", 40)
-    )
-    min_total_moves = max(1, min_total_moves)
-    max_moves = max(min_total_moves, max_moves)
+    max_moves = max(1, max_moves)
 
     moves = torch.randint(
         0,
@@ -452,28 +480,25 @@ def _build_synthetic_batch(config, device, batch_size, input_planes, generator=N
         dtype=torch.int32,
         generator=generator,
     ).float()
-    move_indices = torch.randint(
-        0,
-        max_moves + 1,
-        (batch_size,),
-        device=device,
-        dtype=torch.long,
-        generator=generator,
-    )
     total_moves = torch.randint(
-        min_total_moves,
+        1,
         max_moves + 1,
         (batch_size,),
         device=device,
         dtype=torch.long,
         generator=generator,
     )
+    move_indices = (
+        torch.rand(batch_size, device=device, generator=generator) * total_moves.float()
+    ).long()
+    moves_left = (total_moves.float() - move_indices.float()).clamp_min(0.0)
 
     targets = {
         "moves": moves,
         "values": outcomes,
         "move_indices": move_indices,
         "total_moves": total_moves,
+        "moves_left": moves_left,
     }
 
     return boards, targets
@@ -499,10 +524,12 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
     boards = None
     policy_pred = None
     value_pred = None
+    moves_left_pred = None
     moves = None
     outcomes = None
     move_indices = None
     total_moves = None
+    moves_left = None
     predictions = None
     targets = None
     loss = None
@@ -531,21 +558,30 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
         outcomes = synthetic_targets["values"]
         move_indices = synthetic_targets["move_indices"]
         total_moves = synthetic_targets["total_moves"]
+        moves_left = synthetic_targets["moves_left"]
 
+        torch.cuda.synchronize(device)
+        step_start = time.perf_counter()
         with torch.enable_grad():
             probe_optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                policy_pred, value_pred = model(boards, apply_log_softmax=False)
+                policy_pred, value_pred, moves_left_pred = model(
+                    boards,
+                    apply_log_softmax=False,
+                    return_moves_left=True,
+                )
 
                 predictions = {
                     "policy": policy_pred,
                     "value": value_pred,
+                    "moves_left": moves_left_pred,
                 }
                 targets = {
                     "moves": moves,
                     "values": outcomes,
                     "move_indices": move_indices,
                     "total_moves": total_moves,
+                    "moves_left": moves_left,
                 }
 
                 loss, _ = criterion(predictions, targets)
@@ -553,6 +589,7 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
             probe_optimizer.step()
 
         torch.cuda.synchronize(device)
+        elapsed_s = max(1.0e-9, time.perf_counter() - step_start)
         peak_allocated_bytes = int(torch.cuda.max_memory_allocated(device))
         peak_reserved_bytes = int(torch.cuda.max_memory_reserved(device))
         return {
@@ -560,6 +597,8 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
             "oom": False,
             "peak_allocated_bytes": peak_allocated_bytes,
             "peak_reserved_bytes": peak_reserved_bytes,
+            "elapsed_s": float(elapsed_s),
+            "samples_per_second": float(batch_size) / float(elapsed_s),
             "error": None,
         }
     except RuntimeError as exc:
@@ -577,10 +616,12 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
             boards,
             policy_pred,
             value_pred,
+            moves_left_pred,
             moves,
             outcomes,
             move_indices,
             total_moves,
+            moves_left,
             predictions,
             targets,
             loss,
@@ -596,6 +637,25 @@ def _round_batch(batch_size, round_to):
     if round_to <= 1:
         return max(1, int(batch_size))
     return max(1, (int(batch_size) // int(round_to)) * int(round_to))
+
+
+def _select_throughput_candidate(throughput_candidates, batch_selection, throughput_tolerance):
+    if not throughput_candidates:
+        return None, "no_candidates"
+
+    best_sps = max(float(item["samples_per_second"]) for item in throughput_candidates)
+    floor_sps = best_sps * (1.0 - float(throughput_tolerance))
+    close = [
+        item for item in throughput_candidates
+        if float(item["samples_per_second"]) >= floor_sps
+    ]
+    if not close:
+        return None, "no_near_best_candidates"
+
+    if batch_selection == "balanced":
+        return min(close, key=lambda item: int(item["batch_size"])), "smallest_near_best"
+
+    return max(close, key=lambda item: int(item["batch_size"])), "largest_near_best"
 
 
 def _find_max_batch_size(model, config, device, budget_info):
@@ -620,9 +680,16 @@ def _find_max_batch_size(model, config, device, budget_info):
         probe_peak_metric = "reserved"
     probe_to_train_multiplier = _safe_float(auto_cfg.get("probe_to_train_multiplier"), 1.08)
     probe_to_train_multiplier = max(1.0, min(2.0, probe_to_train_multiplier))
+    batch_selection = str(auto_cfg.get("batch_selection", "throughput")).strip().lower()
+    if batch_selection not in {"max", "throughput", "balanced"}:
+        batch_selection = "throughput"
+    throughput_candidate_count = max(3, min(12, _safe_int(auto_cfg.get("throughput_candidate_count"), 6)))
+    throughput_tolerance = _safe_float(auto_cfg.get("throughput_tolerance"), 0.02)
+    throughput_tolerance = max(0.0, min(0.20, throughput_tolerance))
 
     probe_fit_cache = {}
     probe_effective_peak_cache = {}
+    probe_throughput_cache = {}
 
     def fits(batch_size):
         batch_size = max(1, int(batch_size))
@@ -653,6 +720,7 @@ def _find_max_batch_size(model, config, device, budget_info):
 
         probe_fit_cache[batch_size] = fits_budget
         probe_effective_peak_cache[batch_size] = effective_peak
+        probe_throughput_cache[batch_size] = float(probe.get("samples_per_second", 0.0) or 0.0)
         return fits_budget
 
     if not fits(1):
@@ -660,7 +728,6 @@ def _find_max_batch_size(model, config, device, budget_info):
             "budget_bytes": budget_bytes,
             "probe_count": len(probe_fit_cache),
             "estimated_peak_bytes": None,
-            "free_utilization": budget_info.get("free_utilization"),
             "probe_peak_metric": probe_peak_metric,
             "probe_to_train_multiplier": probe_to_train_multiplier,
             "min_batch": min_batch,
@@ -668,8 +735,7 @@ def _find_max_batch_size(model, config, device, budget_info):
             "batch_round_to": batch_round_to,
             "raw_best_batch": 1,
             "batch_search_mode": "fast_units",
-            "free_limit_bytes": budget_info.get("free_limit_bytes"),
-            "safety_margin_bytes": budget_info.get("safety_margin_bytes"),
+            "dedicated_limit_bytes": budget_info.get("dedicated_limit_bytes"),
             "budget_mode": budget_info.get("budget_mode"),
         }
 
@@ -740,6 +806,48 @@ def _find_max_batch_size(model, config, device, budget_info):
     if not fits(rounded_batch):
         rounded_batch = raw_best_batch
 
+    throughput_candidates = []
+    throughput_selected = None
+    if batch_selection in {"throughput", "balanced"} and raw_best_batch > 1:
+        ratios = [0.50, 0.625, 0.75, 0.875, 1.0]
+        if throughput_candidate_count > len(ratios):
+            ratios = [
+                0.50 + (0.50 * i / max(1, throughput_candidate_count - 1))
+                for i in range(throughput_candidate_count)
+            ]
+        candidates = set()
+        for ratio in ratios:
+            candidate = _round_batch(max(min_batch, int(round(raw_best_batch * float(ratio)))), batch_round_to)
+            candidate = max(1, min(int(candidate), int(raw_best_batch)))
+            if candidate > 0:
+                candidates.add(candidate)
+        candidates.add(int(rounded_batch))
+        candidates.add(int(raw_best_batch))
+
+        for candidate in sorted(candidates):
+            if not fits(candidate):
+                continue
+            throughput = float(probe_throughput_cache.get(candidate, 0.0) or 0.0)
+            peak = probe_effective_peak_cache.get(candidate)
+            throughput_candidates.append({
+                "batch_size": int(candidate),
+                "samples_per_second": throughput,
+                "estimated_peak_bytes": int(peak) if peak is not None else None,
+            })
+
+        if throughput_candidates:
+            throughput_selected, throughput_selection_reason = _select_throughput_candidate(
+                throughput_candidates=throughput_candidates,
+                batch_selection=batch_selection,
+                throughput_tolerance=throughput_tolerance,
+            )
+            if throughput_selected:
+                rounded_batch = int(throughput_selected["batch_size"])
+        else:
+            throughput_selection_reason = "no_candidates"
+    else:
+        throughput_selection_reason = "disabled"
+
     final_peak = probe_effective_peak_cache.get(rounded_batch)
     if final_peak is None:
         fits(rounded_batch)
@@ -749,7 +857,6 @@ def _find_max_batch_size(model, config, device, budget_info):
         "budget_bytes": budget_bytes,
         "probe_count": len(probe_fit_cache),
         "estimated_peak_bytes": final_peak,
-        "free_utilization": budget_info.get("free_utilization"),
         "probe_peak_metric": probe_peak_metric,
         "probe_to_train_multiplier": probe_to_train_multiplier,
         "min_batch": min_batch,
@@ -757,8 +864,12 @@ def _find_max_batch_size(model, config, device, budget_info):
         "batch_round_to": batch_round_to,
         "raw_best_batch": raw_best_batch,
         "batch_search_mode": "fast_units",
-        "free_limit_bytes": budget_info.get("free_limit_bytes"),
-        "safety_margin_bytes": budget_info.get("safety_margin_bytes"),
+        "batch_selection": batch_selection,
+        "throughput_tolerance": throughput_tolerance,
+        "throughput_candidates": throughput_candidates,
+        "throughput_selected": throughput_selected,
+        "throughput_selection_reason": throughput_selection_reason,
+        "dedicated_limit_bytes": budget_info.get("dedicated_limit_bytes"),
         "budget_mode": budget_info.get("budget_mode"),
     }
 
@@ -872,6 +983,7 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
             targets = None
             synthetic_targets = None
             loss = None
+            moves_left_pred = None
 
             try:
                 model.load_state_dict(baseline_state, strict=True)
@@ -902,17 +1014,23 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
 
                     optimizer.zero_grad(set_to_none=True)
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                        policy_pred, value_pred = model(boards, apply_log_softmax=False)
+                        policy_pred, value_pred, moves_left_pred = model(
+                            boards,
+                            apply_log_softmax=False,
+                            return_moves_left=True,
+                        )
 
                         predictions = {
                             "policy": policy_pred,
                             "value": value_pred,
+                            "moves_left": moves_left_pred,
                         }
                         targets = {
                             "moves": synthetic_targets["moves"],
                             "values": synthetic_targets["values"],
                             "move_indices": synthetic_targets["move_indices"],
                             "total_moves": synthetic_targets["total_moves"],
+                            "moves_left": synthetic_targets["moves_left"],
                         }
 
                         loss, _ = criterion(predictions, targets)
@@ -940,7 +1058,7 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
                 else:
                     raise
             finally:
-                del optimizer, predictions, targets, synthetic_targets, loss
+                del optimizer, predictions, targets, synthetic_targets, loss, moves_left_pred
                 _clear_probe_state(model, device)
 
             if steps_done > 0 and first_loss is not None and last_loss is not None:
@@ -1242,6 +1360,9 @@ def resolve_il_hyperparameters(
         cached_profile,
         context_label="IL auto-tune",
         current_budget_bytes=current_budget_bytes,
+        max_batch_size=_safe_int(_get_auto_tune_cfg(config).get("max_batch_size"), 0),
+        expected_batch_selection=_get_auto_tune_cfg(config).get("batch_selection", "throughput"),
+        expected_throughput_tolerance=_get_auto_tune_cfg(config).get("throughput_tolerance", 0.02),
     ):
         cached_batch = _safe_int(cached_profile.get("batch_size"), 0)
         cached_lr = _safe_float(cached_profile.get("learning_rate"), 0.0)
@@ -1314,8 +1435,7 @@ def resolve_il_hyperparameters(
     print(f"  Dedicated VRAM free:  {_fmt_gib(free_vram_bytes)}")
     print(
         f"  Budget: {_fmt_gib(current_budget_bytes)} "
-        f"(free_limit={_fmt_gib(budget_info['free_limit_bytes'])}, "
-        f"safety_margin={_fmt_gib(budget_info['safety_margin_bytes'])})"
+        f"(dedicated_vram_utilization={budget_info.get('dedicated_utilization', 0.0):.2f})"
     )
     print(
         f"IL auto-tune [{probe_profile}]: estimating batch size from dedicated GPU VRAM..."
@@ -1377,6 +1497,22 @@ def resolve_il_hyperparameters(
         print(f"  Target VRAM budget: {_fmt_gib(budget_bytes)}")
     if estimated_peak:
         print(f"  Estimated training peak: {_fmt_gib(estimated_peak)}")
+    throughput_candidates = tune_info.get("throughput_candidates")
+    if throughput_candidates:
+        selected_batch = int(tuned_batch)
+        candidate_parts = []
+        for item in throughput_candidates:
+            batch = int(item.get("batch_size", 0) or 0)
+            sps = float(item.get("samples_per_second", 0.0) or 0.0)
+            mark = "*" if batch == selected_batch else ""
+            candidate_parts.append(f"{batch}{mark}:{sps:.0f}/s")
+        print(
+            "  Batch throughput candidates "
+            f"(selection={tune_info.get('batch_selection', 'n/a')}, "
+            f"tol={float(tune_info.get('throughput_tolerance', 0.0)):.1%}, "
+            f"reason={tune_info.get('throughput_selection_reason', 'n/a')}): "
+            + ", ".join(candidate_parts)
+        )
     best_entry = lr_meta.get("best_entry") if isinstance(lr_meta, dict) else None
     selected_entry = lr_meta.get("selected_entry") if isinstance(lr_meta, dict) else None
     if best_entry:
@@ -1406,12 +1542,14 @@ def resolve_il_hyperparameters(
             "dedicated_vram_bytes": int(dedicated_vram_bytes),
             "free_vram_bytes_at_tune": int(free_vram_bytes),
             "budget_bytes": int(budget_bytes) if budget_bytes is not None else None,
-            "free_vram_utilization": float(tune_info.get("free_utilization", 0.0)),
-            "budget_mode": tune_info.get("budget_mode", "free_dedicated_vram"),
-            "free_limit_bytes": int(tune_info.get("free_limit_bytes", 0) or 0),
-            "safety_margin_bytes": int(tune_info.get("safety_margin_bytes", 0) or 0),
+            "dedicated_vram_utilization": float(tune_info.get("dedicated_utilization", 0.0)),
+            "budget_mode": tune_info.get("budget_mode", "dedicated_vram_fraction"),
+            "dedicated_limit_bytes": int(tune_info.get("dedicated_limit_bytes", 0) or 0),
             "probe_peak_metric": tune_info.get("probe_peak_metric"),
             "probe_to_train_multiplier": float(tune_info.get("probe_to_train_multiplier", 1.0)),
+            "batch_selection": tune_info.get("batch_selection"),
+            "throughput_tolerance": float(tune_info.get("throughput_tolerance", 0.0) or 0.0),
+            "throughput_selection_reason": tune_info.get("throughput_selection_reason"),
             "algo_version": AUTO_TUNE_ALGO_VERSION,
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         }
@@ -1430,6 +1568,12 @@ def resolve_il_hyperparameters(
         "lr_scale_factor": float(lr_factor),
         "lr_meta": lr_meta,
         "budget_bytes": int(budget_bytes) if budget_bytes is not None else None,
+        "dedicated_limit_bytes": int(tune_info.get("dedicated_limit_bytes", 0) or 0),
+        "batch_selection": tune_info.get("batch_selection"),
+        "throughput_tolerance": float(tune_info.get("throughput_tolerance", 0.0) or 0.0),
+        "throughput_candidates": tune_info.get("throughput_candidates"),
+        "throughput_selected": tune_info.get("throughput_selected"),
+        "throughput_selection_reason": tune_info.get("throughput_selection_reason"),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     if probe_profile == "compiled" and compile_backend:
@@ -1446,7 +1590,6 @@ def resolve_il_hyperparameters(
 
     try:
         _save_cache(cache_path, cache)
-        print(f"IL auto-tune cache saved: {cache_path}")
     except Exception as exc:
         print(f"Warning: failed to save IL auto-tune cache ({exc})")
 

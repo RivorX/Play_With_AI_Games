@@ -157,7 +157,12 @@ def _build_rl_optimizer_param_groups(model, rl_config, base_lr):
 
     def _family_for_name(name):
         lowered = name.lower()
-        if lowered.startswith('value_') or '.value_' in lowered:
+        if (
+            lowered.startswith('value_')
+            or '.value_' in lowered
+            or lowered.startswith('moves_left_')
+            or '.moves_left_' in lowered
+        ):
             return 'value'
         if lowered.startswith('policy_') or '.policy_' in lowered:
             return 'policy'
@@ -2026,6 +2031,9 @@ def play_games_parallel_mcts(
                                     importance_scores = packed.get('importance_scores')
                                     policy_weights = packed.get('policy_weights')
                                     value_weights = packed.get('value_weights')
+                                    moves_left = packed.get('moves_left')
+                                    legal_indices = packed.get('legal_indices')
+                                    legal_lengths = packed.get('legal_lengths')
                                     source_codes = packed.get('source_codes')
                                     fens = packed.get('fens')
                                     root_values = packed.get('root_values')
@@ -2049,6 +2057,9 @@ def play_games_parallel_mcts(
                                             importance_scores=importance_scores,
                                             policy_weights=policy_weights,
                                             value_weights=value_weights,
+                                            moves_left=moves_left,
+                                            legal_indices=legal_indices,
+                                            legal_lengths=legal_lengths,
                                             source_codes=source_codes,
                                             fens=fens,
                                             root_values=root_values,

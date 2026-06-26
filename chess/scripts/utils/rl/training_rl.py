@@ -1303,6 +1303,53 @@ def _apply_wdl_label_smoothing(target_wdl, smoothing):
     return target_wdl * (1.0 - smoothing) + (1.0 - target_wdl) * off_value
 
 
+def _legal_only_sparse_policy_loss(
+    policy_logits,
+    policy_indices,
+    policy_values,
+    policy_mask,
+    legal_indices,
+    legal_mask,
+):
+    batch_size = int(policy_logits.size(0))
+    num_classes = int(policy_logits.size(1))
+    if policy_indices.numel() == 0:
+        return torch.zeros(batch_size, device=policy_logits.device, dtype=policy_logits.dtype)
+
+    if legal_indices is None or legal_indices.numel() == 0:
+        legal_indices = policy_indices
+        legal_mask = policy_mask
+
+    safe_policy_indices = policy_indices.long().clamp(0, num_classes - 1)
+    valid_policy_mask = policy_mask & (policy_indices >= 0) & (policy_indices < num_classes)
+    dense_targets = torch.zeros(
+        (batch_size, num_classes),
+        device=policy_logits.device,
+        dtype=policy_logits.float().dtype,
+    )
+    dense_targets.scatter_add_(
+        1,
+        safe_policy_indices,
+        torch.where(valid_policy_mask, policy_values.float(), torch.zeros_like(policy_values.float())),
+    )
+
+    safe_legal_indices = legal_indices.long().clamp(0, num_classes - 1)
+    valid_legal_mask = legal_mask & (legal_indices >= 0) & (legal_indices < num_classes)
+    legal_logits = torch.gather(policy_logits.float(), 1, safe_legal_indices)
+    legal_logits = legal_logits.masked_fill(~valid_legal_mask, -1.0e9)
+    legal_log_probs = F.log_softmax(legal_logits, dim=1)
+
+    legal_targets = torch.gather(dense_targets, 1, safe_legal_indices)
+    legal_targets = torch.where(valid_legal_mask, legal_targets, torch.zeros_like(legal_targets))
+    target_mass = legal_targets.sum(dim=1, keepdim=True)
+    legal_targets = torch.where(
+        target_mass > 0.0,
+        legal_targets / target_mass.clamp_min(1e-8),
+        legal_targets,
+    )
+    return -(legal_targets * legal_log_probs).sum(dim=1).to(dtype=policy_logits.dtype)
+
+
 def _weighted_mean(losses, weights):
     weights = torch.clamp(weights.to(dtype=losses.dtype), min=0.0)
     weight_total = weights.sum()
@@ -1326,15 +1373,28 @@ def train_on_batch_rl(
     best_policy_kl_weight_override=None,
     best_value_distill_weight_override=None,
 ):
-    if len(batch) >= 7:
+    if len(batch) >= 10:
+        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask = batch[:10]
+    elif len(batch) >= 8:
+        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets = batch[:8]
+        legal_indices = policy_indices
+        legal_mask = policy_mask
+    elif len(batch) >= 7:
         boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights = batch[:7]
+        moves_left_targets = torch.zeros_like(value_targets, dtype=torch.float32)
+        legal_indices = policy_indices
+        legal_mask = policy_mask
     else:
         boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights = batch
         value_sample_weights = torch.ones_like(policy_sample_weights, dtype=torch.float32)
+        moves_left_targets = torch.zeros_like(value_targets, dtype=torch.float32)
+        legal_indices = policy_indices
+        legal_mask = policy_mask
     if config["reinforcement_learning"].get("replay_fp16", False):
         boards = boards.float()
         policy_values = policy_values.float()
         value_targets = value_targets.float()
+        moves_left_targets = moves_left_targets.float()
 
     boards, policy_indices, policy_values, policy_mask = _maybe_augment_batch(
         boards, policy_indices, policy_values, policy_mask, config
@@ -1343,9 +1403,13 @@ def train_on_batch_rl(
     policy_indices = policy_indices.to(device, non_blocking=True)
     policy_values = policy_values.to(device, non_blocking=True)
     policy_mask = policy_mask.to(device, non_blocking=True)
+    legal_indices = legal_indices.to(device, non_blocking=True)
+    legal_mask = legal_mask.to(device, non_blocking=True)
     value_targets = value_targets.to(device, non_blocking=True)
     policy_sample_weights = policy_sample_weights.to(device, non_blocking=True)
     value_sample_weights = value_sample_weights.to(device, non_blocking=True)
+    moves_left_targets = moves_left_targets.to(device, non_blocking=True)
+    value_sample_weights = torch.ones_like(value_sample_weights, dtype=torch.float32, device=device)
     effective_policy_mask = policy_mask & (policy_sample_weights.unsqueeze(1) > 0)
 
     optimizer.zero_grad(set_to_none=True)
@@ -1365,15 +1429,7 @@ def train_on_batch_rl(
         0.0,
         float(rl_cfg.get("value_std_floor_target_ratio", 0.70)),
     )
-    value_phase_calibration_enabled = bool(rl_cfg.get("value_phase_calibration_enabled", False))
-    value_phase_opening_weight = max(0.05, float(rl_cfg.get("value_phase_opening_weight", 0.85)))
-    value_phase_middlegame_weight = max(0.05, float(rl_cfg.get("value_phase_middlegame_weight", 1.10)))
-    value_phase_endgame_weight = max(0.05, float(rl_cfg.get("value_phase_endgame_weight", 1.25)))
-    value_phase_decisive_bonus = max(0.0, float(rl_cfg.get("value_phase_decisive_bonus", 0.15)))
-    value_phase_decisive_threshold = max(
-        0.0,
-        min(1.0, float(rl_cfg.get("value_phase_decisive_threshold", 0.70))),
-    )
+    moves_left_loss_weight = max(0.0, float(rl_cfg.get("moves_left_loss_weight", 0.05)))
     policy_anchor_kl_weight = max(
         0.0,
         float(rl_cfg.get("policy_anchor_kl_weight", 0.0)),
@@ -1396,7 +1452,12 @@ def train_on_batch_rl(
     )
 
     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-        policy_pred, value_pred = model(boards)
+        policy_logits, value_pred, moves_left_pred = model(
+            boards,
+            apply_log_softmax=False,
+            return_moves_left=True,
+        )
+        policy_pred = F.log_softmax(policy_logits.float(), dim=1)
         policy_anchor_kl_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
         best_policy_kl_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
         best_value_distill_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
@@ -1426,10 +1487,14 @@ def train_on_batch_rl(
         if policy_indices.numel() == 0:
             policy_loss = torch.zeros(policy_pred.size(0), device=policy_pred.device, dtype=policy_pred.dtype)
         else:
-            safe_indices = policy_indices.long().clamp_min(0)
-            gathered_log_probs = torch.gather(policy_pred, 1, safe_indices)
-            gathered_log_probs = torch.where(effective_policy_mask, gathered_log_probs, torch.zeros_like(gathered_log_probs))
-            policy_loss = -(policy_values * gathered_log_probs).sum(dim=1)
+            policy_loss = _legal_only_sparse_policy_loss(
+                policy_logits,
+                policy_indices,
+                policy_values,
+                effective_policy_mask,
+                legal_indices,
+                legal_mask,
+            )
             rl_cfg = config.get("reinforcement_learning", {})
             if bool(rl_cfg.get("policy_target_confidence_weighting_enabled", False)):
                 valid_targets = torch.where(
@@ -1465,35 +1530,6 @@ def train_on_batch_rl(
         target_scalar = _final_outcome_targets(value_targets)
         target_value_std = target_scalar.std(unbiased=False)
         effective_value_sample_weights = value_sample_weights
-        if value_phase_calibration_enabled and boards.dim() == 4 and boards.size(1) > 15:
-            fullmove_indices = torch.clamp(
-                boards[:, 15, 0, 0].float() * 100.0,
-                min=0.0,
-                max=float(rl_cfg.get("value_phase_max_fullmove", 120)),
-            )
-            opening_max = float(rl_cfg.get("value_phase_opening_max_fullmove", 12))
-            endgame_min = float(rl_cfg.get("value_phase_endgame_min_fullmove", 40))
-            phase_weights = torch.full_like(target_scalar, value_phase_middlegame_weight)
-            phase_weights = torch.where(
-                fullmove_indices <= opening_max,
-                torch.full_like(phase_weights, value_phase_opening_weight),
-                phase_weights,
-            )
-            phase_weights = torch.where(
-                fullmove_indices >= endgame_min,
-                torch.full_like(phase_weights, value_phase_endgame_weight),
-                phase_weights,
-            )
-            if value_phase_decisive_bonus > 0.0 and value_phase_decisive_threshold < 1.0:
-                decisive_strength = torch.clamp(
-                    (torch.abs(target_scalar) - value_phase_decisive_threshold)
-                    / max(1e-6, 1.0 - value_phase_decisive_threshold),
-                    min=0.0,
-                    max=1.0,
-                )
-                phase_weights = phase_weights * (1.0 + value_phase_decisive_bonus * decisive_strength)
-            phase_weights = phase_weights / phase_weights.mean().clamp_min(1e-6)
-            effective_value_sample_weights = value_sample_weights * phase_weights.to(dtype=value_sample_weights.dtype)
 
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
             target_wdl = _wdl_targets_from_final_outcome(target_scalar)
@@ -1568,6 +1604,13 @@ def train_on_batch_rl(
             else:
                 policy_loss = policy_loss.sum() * 0.0
         value_loss = _weighted_mean(value_loss, effective_value_sample_weights)
+        moves_left_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        if moves_left_loss_weight > 0.0 and moves_left_pred is not None:
+            pred_mlh = moves_left_pred.reshape(-1)
+            target_mlh = torch.log1p(
+                torch.clamp(moves_left_targets.reshape(-1).to(dtype=pred_mlh.dtype), min=0.0)
+            )
+            moves_left_loss = F.smooth_l1_loss(pred_mlh, target_mlh, beta=0.25)
         policy_weight = (
             float(config["reinforcement_learning"]["policy_loss_weight"])
             if policy_weight_override is None
@@ -1581,6 +1624,7 @@ def train_on_batch_rl(
         loss = (
             policy_weight * policy_loss
             + value_weight * value_loss
+            + moves_left_loss_weight * moves_left_loss
             + value_std_floor_loss_weight * value_std_floor_loss
             + policy_anchor_kl_weight * policy_anchor_kl_loss
             + best_policy_kl_weight * best_policy_kl_loss

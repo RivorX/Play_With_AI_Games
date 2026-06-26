@@ -47,6 +47,38 @@ def _resolve_workers(value, label):
     return value
 
 
+def _resolve_phase2_chunk_size(config, total_games, phase2_workers):
+    """
+    Resolve how many games are sent to one Phase 2 process task.
+
+    Windows ProcessPool overhead is high when every game is submitted as a
+    separate future, so Phase 2 batches games into deterministic chunks.
+    """
+    data_cfg = config.get('data', {}) if config else {}
+    raw_value = data_cfg.get('phase2_chunk_size', 512)
+
+    if isinstance(raw_value, str):
+        text = raw_value.strip().lower()
+        if text in {'auto', '0', 'none'}:
+            if total_games <= 0:
+                return 1
+            target_chunks = max(phase2_workers * 32, 1)
+            return max(64, min(2048, (total_games + target_chunks - 1) // target_chunks))
+        try:
+            raw_value = int(text)
+        except ValueError as exc:
+            raise ValueError(f"phase2_chunk_size must be an int or 'auto', got: {raw_value}") from exc
+
+    try:
+        chunk_size = int(raw_value)
+    except Exception as exc:
+        raise ValueError(f"phase2_chunk_size must be an int or 'auto', got: {raw_value}") from exc
+
+    if chunk_size <= 0:
+        return _resolve_phase2_chunk_size({'data': {'phase2_chunk_size': 'auto'}}, total_games, phase2_workers)
+    return max(1, chunk_size)
+
+
 def _normalize_max_games(value):
     """
     Resolve max_games from config.
@@ -79,14 +111,10 @@ def _get_game_selection_settings(config):
     raw_max_games = config['data'].get('max_games', 100000)
     max_games = _normalize_max_games(raw_max_games)
     full_file_mode = max_games is None
-    sort_by_elo_requested = bool(config['data'].get('sort_by_avg_elo', True))
-    effective_sort_by_elo = bool(sort_by_elo_requested and not full_file_mode)
     return {
         'raw_max_games': raw_max_games,
         'max_games': max_games,
         'full_file_mode': full_file_mode,
-        'sort_by_elo_requested': sort_by_elo_requested,
-        'sort_by_elo': effective_sort_by_elo,
     }
 
 
@@ -187,11 +215,17 @@ class DatasetTracker:
             json.dump(self.tracking_data, f, indent=2)
     
     def _compute_file_hash(self, pgn_path):
-        """Compute hash of PGN file (first 10MB for speed)"""
+        """Compute a cheap but robust PGN fingerprint for preprocessing cache."""
+        pgn_path = Path(pgn_path)
         hasher = hashlib.md5()
+        try:
+            stat = pgn_path.stat()
+            hasher.update(str(int(stat.st_size)).encode('utf-8'))
+            hasher.update(str(int(stat.st_mtime_ns)).encode('utf-8'))
+        except OSError:
+            pass
         
         with open(pgn_path, 'rb') as f:
-            # Read first 10MB (enough to detect file changes)
             chunk = f.read(10 * 1024 * 1024)
             hasher.update(chunk)
         
@@ -207,10 +241,7 @@ class DatasetTracker:
             'min_elo': config['data'].get('min_elo', 0),
             'max_games': selection['max_games'] if selection['max_games'] is not None else 'max',
             'max_moves_per_game': config['data'].get('max_moves_per_game', 200),
-            'sort_by_avg_elo': selection['sort_by_elo'],
             'game_filters': config['data'].get('game_filters', {}),
-            'position_dedup': config['data'].get('position_dedup', {}),
-            'position_sampling': config['data'].get('position_sampling', {}),
             'action_encoding': 'az_classic_8x8x73_v1',
             'action_size': ACTION_SIZE,
             'wdl_mode': 'always',
@@ -276,7 +307,6 @@ class DatasetTracker:
             'config': {
                 'min_elo': config['data'].get('min_elo', 0),
                 'max_games': selection['max_games'] if selection['max_games'] is not None else 'max',
-                'sort_by_avg_elo': selection['sort_by_elo'],
             }
         }
         
@@ -539,7 +569,7 @@ def extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_workers):
         num_games = min(games_per_worker, effective_max_games - start_idx)
         tasks.append((pgn_path, game_offsets[start_idx], num_games))
 
-    all_games = []
+    game_chunks = [None] * len(tasks)
 
     with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
         futures = {
@@ -549,10 +579,16 @@ def extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_workers):
 
         with tqdm(total=len(futures), desc="  Phase 1 workers") as pbar:
             for future in as_completed(futures):
+                task_idx = futures[future]
                 games_chunk = future.result()
-                all_games.extend(games_chunk)
+                game_chunks[task_idx] = games_chunk
                 pbar.update(1)
-                pbar.set_postfix({'games': len(all_games)})
+                pbar.set_postfix({'games': sum(len(chunk or []) for chunk in game_chunks)})
+
+    all_games = []
+    for chunk in game_chunks:
+        if chunk:
+            all_games.extend(chunk)
 
     return all_games[:effective_max_games]
 
@@ -580,23 +616,6 @@ def extract_games_sequential(pgn_path, max_games):
     return games_data
 
 
-def sort_games_by_elo(games_data):
-    """Sort games by average Elo (descending)"""
-    def get_avg_elo(game):
-        try:
-            white_elo = game['white_elo']
-            black_elo = game['black_elo']
-            
-            if white_elo == '?' or black_elo == '?':
-                return 0
-            
-            return (int(white_elo) + int(black_elo)) / 2
-        except:
-            return 0
-    
-    return sorted(games_data, key=get_avg_elo, reverse=True)
-
-
 def _dedupe_games(games_data):
     """Remove duplicate games based on moves+result signature."""
     seen = set()
@@ -619,94 +638,6 @@ def _dedupe_games(games_data):
     return deduped
 
 
-def _dedupe_positions(positions, mode="fen_no_counters", include_turn=True, max_count=None, random_sample=True):
-    """
-    Remove or limit duplicate positions across all games.
-    
-    Args:
-        positions: List of position bytes
-        mode: Deduplication mode:
-            - "fen": pieces + castling + ep + halfmove + fullmove
-            - "fen_no_counters": pieces + castling + ep (no half/fullmove)
-            - "pieces": pieces only
-            - "position_plus_move": (position, move_target) pair - BEST for preserving move diversity!
-        include_turn: Include side-to-move (from move_idx parity)
-        max_count: Max occurrences per signature (None = remove all duplicates)
-        random_sample: If True, randomly sample max_count positions; else take first K
-    
-    Returns:
-        Deduplicated list of positions
-    """
-    if not positions:
-        return positions
-    
-    valid_modes = {"fen", "fen_no_counters", "pieces", "position_plus_move"}
-    if mode not in valid_modes:
-        raise ValueError(f"position_dedup.mode must be one of {sorted(valid_modes)}, got: {mode}")
-    
-    # Build signature → positions mapping
-    from collections import defaultdict
-    sig_to_positions = defaultdict(list)
-    
-    for pos in positions:
-        board = pos[:38]
-        
-        # Choose signature based on mode
-        if mode == "fen":
-            sig_bytes = board
-        elif mode == "fen_no_counters":
-            sig_bytes = board[:34]  # pieces + castling + ep
-        elif mode == "pieces":
-            sig_bytes = board[:32]
-        elif mode == "position_plus_move":
-            # Signature = (board, move_target) - preserves move diversity!
-            move_target = pos[44:46]  # 2 bytes: move_target
-            sig_bytes = board[:34] + move_target  # fen_no_counters + move
-        
-        # Add turn if requested
-        if include_turn and mode != "position_plus_move":  # position_plus_move already has context
-            move_idx = struct.unpack('H', pos[42:44])[0]
-            sig_bytes = sig_bytes + bytes([move_idx & 1])
-        
-        sig = hashlib.blake2b(sig_bytes, digest_size=16).digest()
-        sig_to_positions[sig].append(pos)
-    
-    # Sample positions based on max_count
-    deduped = []
-    total_kept = 0
-    total_removed = 0
-    
-    for sig, pos_list in sig_to_positions.items():
-        count = len(pos_list)
-        
-        if max_count is None:
-            # Old behavior: keep only first occurrence
-            kept = pos_list[:1]
-            removed = count - 1
-        elif count <= max_count:
-            # Keep all
-            kept = pos_list
-            removed = 0
-        else:
-            # Sample max_count positions
-            if random_sample:
-                import random
-                kept = random.sample(pos_list, max_count)
-            else:
-                kept = pos_list[:max_count]
-            removed = count - max_count
-        
-        deduped.extend(kept)
-        total_kept += len(kept)
-        total_removed += removed
-    
-    if total_removed > 0:
-        if max_count is None:
-            print(f"  🔁 Position dedup: removed {total_removed:,} duplicates (mode={mode})")
-        else:
-            print(f"  🔁 Position dedup: removed {total_removed:,} / kept {total_kept:,} (mode={mode}, max_count={max_count})")
-    
-    return deduped
 
 
 # ==============================================================================
@@ -813,25 +744,17 @@ def _filter_games(games_data, config):
     return filtered
 
 
-def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, sort_by_elo=True, config=None):
+def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, config=None):
     """
     PHASE 1: Extract games from PGN file
     """
     max_games = _normalize_max_games(max_games)
     full_file_mode = max_games is None
-    effective_sort_by_elo = bool(sort_by_elo and not full_file_mode)
-
-    if full_file_mode and sort_by_elo:
-        print("  • max_games=max -> sort_by_avg_elo ignored for this file (taking entire PGN)")
-
-    games_to_extract = max_games * 2 if effective_sort_by_elo else max_games
     
-    if effective_sort_by_elo:
-        print(f"  📊 Extracting {games_to_extract:,} games (will sort and select top {max_games:,} by Elo)...")
-    elif full_file_mode:
+    if full_file_mode:
         print("  📚 Extracting entire PGN file (no top-N selection, no per-file Elo sorting)...")
     
-    all_games = extract_games_from_pgn_multiprocess(pgn_path, games_to_extract, phase1_threads)
+    all_games = extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_threads)
     
     if not all_games:
         return []
@@ -842,28 +765,6 @@ def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, sort_by
     # Apply filters (if enabled)
     if config:
         all_games = _filter_games(all_games, config)
-    
-    # Sort by Elo and take top games
-    if effective_sort_by_elo:
-        print(f"  🔝 Sorting {len(all_games):,} games by average Elo...")
-        all_games = sort_games_by_elo(all_games)
-        all_games = all_games[:max_games]
-        
-        # Print Elo stats
-        if all_games:
-            elos = []
-            for game in all_games:
-                try:
-                    if game['white_elo'] != '?' and game['black_elo'] != '?':
-                        avg_elo = (int(game['white_elo']) + int(game['black_elo'])) / 2
-                        elos.append(avg_elo)
-                except:
-                    pass
-            
-            if elos:
-                print(f"  ✅ Selected top {len(all_games):,} games")
-                print(f"     Average Elo range: {min(elos):.0f} - {max(elos):.0f}")
-                print(f"     Mean Elo: {sum(elos)/len(elos):.0f}")
     
     return all_games
 
@@ -970,6 +871,23 @@ def extract_positions_from_game_worker(args):
         return []
 
 
+def extract_positions_from_game_chunk_worker(args):
+    """
+    PHASE 2 CHUNK WORKER: extract positions from a group of games.
+
+    This keeps game_id stable while avoiding one ProcessPool future per game.
+    """
+    indexed_games, min_elo, max_moves_per_game = args
+    chunk_positions = []
+    for game_id, game_data in indexed_games:
+        positions = extract_positions_from_game_worker(
+            (game_data, game_id, min_elo, max_moves_per_game)
+        )
+        if positions:
+            chunk_positions.extend(positions)
+    return chunk_positions
+
+
 def extract_positions_parallel(games_data, config, phase2_workers):
     """
     PHASE 2: Extract positions from games using multi-processing
@@ -980,26 +898,47 @@ def extract_positions_parallel(games_data, config, phase2_workers):
     if phase2_workers <= 1:
         return extract_positions_sequential(games_data, config)
     
-    print(f"  Using {phase2_workers} processes for parallel position extraction...")
+    chunk_size = _resolve_phase2_chunk_size(config, len(games_data), phase2_workers)
+    indexed_games = list(enumerate(games_data))
+    tasks = [
+        indexed_games[start:start + chunk_size]
+        for start in range(0, len(indexed_games), chunk_size)
+    ]
+
+    print(
+        f"  Using {phase2_workers} processes for parallel position extraction "
+        f"({len(tasks):,} chunks, chunk_size={chunk_size:,})..."
+    )
     
-    # Prepare tasks with unique game_id for each game
     # 🔧 v4.3: game_id is uint32 — no modulo needed, supports up to ~4 billion games
-    tasks = [(game, game_idx, min_elo, max_moves)
-             for game_idx, game in enumerate(games_data)]
     
-    # Process in parallel
-    all_positions = []
-    
+    position_chunks = [None] * len(tasks)
+    positions_done = 0
+    games_done = 0
+
     with ProcessPoolExecutor(max_workers=phase2_workers) as executor:
-        futures = {executor.submit(extract_positions_from_game_worker, task): i 
-                   for i, task in enumerate(tasks)}
+        futures = {
+            executor.submit(
+                extract_positions_from_game_chunk_worker,
+                (task, min_elo, max_moves),
+            ): i
+            for i, task in enumerate(tasks)
+        }
         
-        with tqdm(total=len(futures), desc="  Phase 2 workers") as pbar:
+        with tqdm(total=len(futures), desc="  Phase 2 chunks") as pbar:
             for future in as_completed(futures):
+                task_idx = futures[future]
                 positions = future.result()
-                all_positions.extend(positions)
+                position_chunks[task_idx] = positions
+                positions_done += len(positions)
+                games_done += len(tasks[task_idx])
                 pbar.update(1)
-                pbar.set_postfix({'positions': len(all_positions)})
+                pbar.set_postfix({'games': games_done, 'positions': positions_done})
+
+    all_positions = []
+    for chunk in position_chunks:
+        if chunk:
+            all_positions.extend(chunk)
     
     return all_positions
 
@@ -1115,11 +1054,8 @@ def process_pgn_files(pgn_files, config):
         phase2_workers = _resolve_workers(config['data'].get('phase2_threads', 1), "phase2_threads")
         selection = _get_game_selection_settings(config)
         max_games = selection['max_games']
-        sort_by_elo = selection['sort_by_elo']
         if selection['full_file_mode']:
             print("ℹ️ data.max_games=max -> entire PGN files will be used.")
-        elif selection['sort_by_elo']:
-            print(f"ℹ️ data.max_games={max_games:,} with per-file sort_by_avg_elo enabled.")
         
         for pgn_file in new_pgn_files:
             print(f"\n📄 Processing: {Path(pgn_file).name}")
@@ -1128,7 +1064,7 @@ def process_pgn_files(pgn_files, config):
             # Phase 1: Extract games
             print("🔹 PHASE 1: PGN Parsing...")
             games_data = extract_games_from_pgn_parallel(
-                pgn_file, max_games, phase1_workers, sort_by_elo, config=config
+                pgn_file, max_games, phase1_workers, config=config
             )
             
             if not games_data:
@@ -1146,22 +1082,6 @@ def process_pgn_files(pgn_files, config):
                 continue
             
             print(f"  ✅ Extracted {len(positions):,} positions")
-            
-            # Optional: position deduplication (FEN / pieces / position+move)
-            pos_dedup_cfg = config['data'].get('position_dedup', {})
-            if pos_dedup_cfg.get('enabled', False):
-                mode = pos_dedup_cfg.get('mode', 'fen_no_counters')
-                include_turn = pos_dedup_cfg.get('include_turn', True)
-                max_count = pos_dedup_cfg.get('max_count', None)  # None = remove all duplicates
-                random_sample = pos_dedup_cfg.get('random_sample', True)
-                positions = _dedupe_positions(
-                    positions, 
-                    mode=mode, 
-                    include_turn=include_turn,
-                    max_count=max_count,
-                    random_sample=random_sample
-                )
-                print(f"  ✅ After position dedup: {len(positions):,} positions")
             
             # Phase 3: Write to disk
             print(f"\n🔹 PHASE 3: Writing to disk...")
@@ -1214,4 +1134,3 @@ def process_pgn_files(pgn_files, config):
         )
         
         return combined_meta
-

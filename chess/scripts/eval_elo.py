@@ -266,6 +266,7 @@ def _model_arch_keys():
         "policy_head_hidden_dim",
         "value_head_filters",
         "value_hidden_dim",
+        "moves_left_hidden_dim",
     ]
 
 
@@ -340,6 +341,9 @@ def _infer_model_overrides_from_state_dict(state_dict):
     value_fc1_w = state_dict.get("value_fc1.weight")
     if isinstance(value_fc1_w, torch.Tensor):
         overrides["value_hidden_dim"] = int(value_fc1_w.shape[0])
+    moves_left_fc1_w = state_dict.get("moves_left_fc1.weight")
+    if isinstance(moves_left_fc1_w, torch.Tensor):
+        overrides["moves_left_hidden_dim"] = int(moves_left_fc1_w.shape[0])
 
     se_fc1_keys = [key for key in state_dict.keys() if ".se.fc1.weight" in key]
     se_fc_keys = [key for key in state_dict.keys() if ".se.fc.weight" in key]

@@ -37,6 +37,54 @@ def ask_resume_additional_epochs(completed_epochs, default_additional):
         print("Invalid value. Enter an integer >= 0.")
 
 
+def ask_il_target_positions(default_millions=15):
+    """Ask for the IL training-position target in millions, or max for all."""
+    default_is_max = isinstance(default_millions, str) and default_millions.strip().lower() in {
+        "max",
+        "all",
+        "wszystkie",
+    }
+    if default_is_max:
+        if not sys.stdin.isatty():
+            return "max"
+        default_text = "max"
+        default_millions = None
+    else:
+        try:
+            default_millions = float(default_millions)
+        except (TypeError, ValueError):
+            default_millions = 15.0
+        default_millions = max(1.0, default_millions)
+        default_text = f"{default_millions:g}"
+
+    if not sys.stdin.isatty():
+        return int(round(default_millions * 1_000_000))
+
+    _print_block_title("IL Data")
+    print("How many million positions should IL use?")
+    print("Enter a number, or max for all available positions.")
+
+    while True:
+        try:
+            raw = input(f"Target positions in millions (default {default_text}): ").strip().lower()
+        except EOFError:
+            raw = ""
+
+        if not raw:
+            raw = default_text
+        if raw in {"max", "all", "wszystkie"}:
+            return "max"
+
+        raw = raw.replace(",", ".")
+        try:
+            value = float(raw)
+            if value > 0:
+                return int(round(value * 1_000_000))
+        except ValueError:
+            pass
+        print("Invalid value. Enter a number like 15, or max.")
+
+
 def ask_transfer_freeze_epochs(default_epochs=0):
     """Ask how many epochs to freeze all but changed params after transfer."""
     default_epochs = max(0, int(default_epochs))
@@ -138,9 +186,9 @@ def ask_il_hyperparam_source(default_mode="config"):
     if not sys.stdin.isatty():
         return default_mode
 
-    _print_block_title("IL Hyperparameter Source")
-    print("1) Auto tune batch size + learning rate (cached per model hash)")
-    print("2) Use values from config.yaml")
+    _print_block_title("IL Speed")
+    print("1) Auto batch + LR")
+    print("2) Config batch + LR")
 
     default_choice = "1" if default_mode == "auto" else "2"
     mapping = {
@@ -166,7 +214,7 @@ def ask_il_hyperparam_source(default_mode="config"):
 
 
 def _print_block_title(title):
-    line = "=" * 92
+    line = "=" * 56
     print(f"\n{line}")
     print(title)
     print(line)
@@ -203,11 +251,11 @@ def ask_il_start_mode(has_checkpoints):
         return "new"
 
     _print_block_title("IL Startup")
-    print("1) New training")
-    print("2) Resume full state (model + optimizer + scheduler/scaler)")
-    print("3) Transfer matching weights only")
+    print("1) New")
+    print("2) Resume")
+    print("3) Transfer weights")
 
-    default_choice = "2"
+    default_choice = "1"
 
     mapping = {
         "1": "new",
@@ -604,6 +652,9 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
     patience_counter = 0
     estimated_elo = None
     estimated_elo_epoch = None
+    estimated_elo_nn = None
+    estimated_elo_mcts = None
+    estimated_elo_mcts_simulations = None
     selected_compatibility_ratio = None
     transfer_match_ratio = None
     transfer_freeze_epochs = int(startup_plan.get("transfer_freeze_epochs", 0) or 0)
@@ -647,6 +698,15 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
         estimated_elo = _safe_float(
             checkpoint.get("estimated_elo", checkpoint.get("last_estimated_elo"))
         )
+        estimated_elo_nn = _safe_float(
+            checkpoint.get("estimated_elo_nn", checkpoint.get("last_estimated_elo_nn"))
+        )
+        estimated_elo_mcts = _safe_float(
+            checkpoint.get("estimated_elo_mcts", checkpoint.get("last_estimated_elo_mcts"))
+        )
+        estimated_elo_mcts_simulations = _safe_int(
+            checkpoint.get("estimated_elo_mcts_simulations")
+        )
         estimated_elo_epoch = _safe_int(checkpoint.get("estimated_elo_epoch"))
         if estimated_elo_epoch is None:
             epoch_from_ckpt = _safe_int(checkpoint.get("epoch"))
@@ -654,6 +714,15 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
                 estimated_elo_epoch = epoch_from_ckpt + 1
         if estimated_elo is None and selected_entry is not None:
             estimated_elo = _safe_float(selected_entry.get("estimated_elo"))
+        if selected_entry is not None:
+            if estimated_elo_nn is None:
+                estimated_elo_nn = _safe_float(selected_entry.get("elo_nn"))
+            if estimated_elo_mcts is None:
+                estimated_elo_mcts = _safe_float(selected_entry.get("elo_mcts"))
+            if estimated_elo_mcts_simulations is None:
+                estimated_elo_mcts_simulations = _safe_int(
+                    selected_entry.get("elo_mcts_simulations")
+                )
 
         if start_mode == "resume":
             try:
@@ -737,6 +806,9 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
         "patience_counter": patience_counter,
         "estimated_elo": estimated_elo,
         "estimated_elo_epoch": estimated_elo_epoch,
+        "estimated_elo_nn": estimated_elo_nn,
+        "estimated_elo_mcts": estimated_elo_mcts,
+        "estimated_elo_mcts_simulations": estimated_elo_mcts_simulations,
         "selected_compatibility_ratio": selected_compatibility_ratio,
         "transfer_match_ratio": transfer_match_ratio,
         "transfer_freeze_epochs": transfer_freeze_epochs,

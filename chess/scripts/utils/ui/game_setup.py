@@ -166,6 +166,7 @@ _MODEL_ARCH_KEYS = [
     "policy_head_hidden_dim",
     "value_head_filters",
     "value_hidden_dim",
+    "moves_left_hidden_dim",
 ]
 
 
@@ -235,6 +236,9 @@ def _infer_architecture_from_state_dict(state_dict):
     value_fc1 = state_dict.get("value_fc1.weight")
     if value_fc1 is not None and getattr(value_fc1, "ndim", 0) == 2:
         inferred["value_hidden_dim"] = int(value_fc1.shape[0])
+    moves_left_fc1 = state_dict.get("moves_left_fc1.weight")
+    if moves_left_fc1 is not None and getattr(moves_left_fc1, "ndim", 0) == 2:
+        inferred["moves_left_hidden_dim"] = int(moves_left_fc1.shape[0])
 
     se_fc1_keys = [key for key in state_dict.keys() if ".se.fc1.weight" in key]
     se_fc_keys = [key for key in state_dict.keys() if ".se.fc.weight" in key]

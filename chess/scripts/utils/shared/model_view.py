@@ -45,28 +45,11 @@ def _count_params(module, trainable_only=False):
     return sum(p.numel() for p in module.parameters())
 
 
-def _print_kv_table(title, rows):
-    if not rows:
-        return
-
-    key_w = max(len("Field"), max(len(str(k)) for k, _ in rows))
-    val_w = max(len("Value"), max(len(str(v)) for _, v in rows))
-    width = key_w + val_w + 7
-
-    print("\n" + "=" * width)
-    print(title)
-    print("=" * width)
-    print(f"| {'Field':<{key_w}} | {'Value':<{val_w}} |")
-    print(f"| {'-' * key_w} | {'-' * val_w} |")
-    for key, value in rows:
-        print(f"| {str(key):<{key_w}} | {str(value):<{val_w}} |")
-    print("=" * width)
-
-
-def _print_multi_column_table(title, headers, rows):
+def _format_box_table(title, headers, rows, right_align=None):
     if not headers:
-        return
+        return []
 
+    right_align = set(right_align or [])
     header_cells = [str(cell) for cell in headers]
     col_count = len(header_cells)
     normalized_rows = []
@@ -84,23 +67,53 @@ def _print_multi_column_table(title, headers, rows):
         for idx, cell in enumerate(row):
             col_widths[idx] = max(col_widths[idx], len(cell))
 
-    table_lines = [
-        "| " + " | ".join(f"{header_cells[idx]:<{col_widths[idx]}}" for idx in range(col_count)) + " |",
-        "| " + " | ".join("-" * col_widths[idx] for idx in range(col_count)) + " |",
-    ]
+    def border():
+        return "+-" + "-+-".join("-" * width for width in col_widths) + "-+"
 
-    for row in normalized_rows:
-        table_lines.append(
-            "| " + " | ".join(f"{row[idx]:<{col_widths[idx]}}" for idx in range(col_count)) + " |"
-        )
+    def row_line(cells, header=False):
+        rendered = []
+        for idx, cell in enumerate(cells):
+            if not header and idx in right_align:
+                rendered.append(f"{cell:>{col_widths[idx]}}")
+            else:
+                rendered.append(f"{cell:<{col_widths[idx]}}")
+        return "| " + " | ".join(rendered) + " |"
 
-    width = max(len(title), max(len(line) for line in table_lines))
-    print("\n" + "=" * width)
-    print(title)
-    print("=" * width)
-    for line in table_lines:
+    table_lines = [border(), row_line(header_cells, header=True), border()]
+    table_lines.extend(row_line(row) for row in normalized_rows)
+    table_lines.append(border())
+
+    title_line = str(title)
+    width = max(len(title_line), max(len(line) for line in table_lines))
+    return ["", title_line, "-" * width, *table_lines]
+
+
+def _print_kv_table(title, rows):
+    if not rows:
+        return
+
+    for line in _format_box_table(title, ["Field", "Value"], rows):
         print(line)
-    print("=" * width)
+
+
+def _print_multi_column_table(title, headers, rows):
+    if not headers:
+        return
+    right_align = {
+        idx
+        for idx, header in enumerate(headers)
+        if str(header).strip().lower() in {
+            "train",
+            "val",
+            "total",
+            "cut",
+            "kept",
+            "cut from previous",
+        }
+    }
+
+    for line in _format_box_table(title, headers, rows, right_align=right_align):
+        print(line)
 
 
 def _print_param_table(title, rows):
@@ -245,7 +258,11 @@ def _build_parameter_rows(model, num_blocks):
     )
     value_params = sum(
         _count_params(getattr(model, name, None))
-        for name in ("value_conv", "value_bn", "value_fc1", "value_fc2")
+        for name in ("value_conv", "value_bn", "value_ln", "value_fc1", "value_fc2")
+    )
+    moves_left_params = sum(
+        _count_params(getattr(model, name, None))
+        for name in ("moves_left_fc1", "moves_left_ln", "moves_left_fc2")
     )
 
     total_params = _count_params(model)
@@ -259,6 +276,7 @@ def _build_parameter_rows(model, num_blocks):
         ("Final BN", final_bn_params),
         ("Policy head", policy_params),
         ("Value head", value_params),
+        ("Moves-left head", moves_left_params),
     ]
     rows = []
     for part, params in core_parts:
@@ -286,6 +304,7 @@ def print_active_model_summary(
     load_mode=None,
     device=None,
     selected_entry=None,
+    include_parameters=True,
 ):
     """Print concise model and parameter summaries as tables."""
     model_rows = _build_model_rows(
@@ -300,9 +319,10 @@ def print_active_model_summary(
     )
     _print_kv_table(title, model_rows)
 
-    num_blocks = _safe_int(config.get("model", {}).get("num_residual_blocks"))
-    param_rows = _build_parameter_rows(model, num_blocks)
-    _print_param_table(f"{title} - Parameters", param_rows)
+    if include_parameters:
+        num_blocks = _safe_int(config.get("model", {}).get("num_residual_blocks"))
+        param_rows = _build_parameter_rows(model, num_blocks)
+        _print_param_table(f"{title} - Parameters", param_rows)
 
 
 def print_selected_models_table(entries, title="Selected Models", keep_input_order=True):

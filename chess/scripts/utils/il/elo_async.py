@@ -1,6 +1,7 @@
 """Async/sync Elo coordination for IL training."""
 
 import copy
+import gc
 import queue
 import threading
 
@@ -44,6 +45,8 @@ def _async_elo_worker(
     cancel_event,
 ):
     """Background Elo estimation worker for IL (thread target)."""
+    worker_model = None
+    worker_device = torch.device("cpu")
     try:
         if cancel_event is not None and cancel_event.is_set():
             result_queue.put(
@@ -57,10 +60,14 @@ def _async_elo_worker(
         worker_config = copy.deepcopy(config_snapshot)
         worker_config.setdefault("model", {})
         worker_config["model"]["print_summary"] = False
+        worker_config.setdefault("hardware", {})
 
         worker_device = torch.device(worker_device_str)
         if worker_device.type == "cuda" and not torch.cuda.is_available():
             worker_device = torch.device("cpu")
+        worker_config["hardware"]["device"] = worker_device.type
+        if worker_device.type == "cpu":
+            worker_config["hardware"]["use_compile"] = False
 
         worker_model = ChessNet(worker_config).to(worker_device)
         worker_model = worker_model.to(memory_format=torch.channels_last)
@@ -95,6 +102,15 @@ def _async_elo_worker(
                 "error": str(exc),
             }
         )
+    finally:
+        try:
+            del worker_model
+            del model_state_cpu
+        except Exception:
+            pass
+        gc.collect()
+        if worker_device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 class ILEloCoordinator:
@@ -108,7 +124,10 @@ class ILEloCoordinator:
         self.elo_config = dict(elo_config_il or {})
 
         self.enabled = bool(self.elo_config.get("enabled", False))
-        self.eval_every = int(self.elo_config.get("eval_every", 5))
+        self.eval_every = int(self.elo_config.get("eval_every", 5) or 0)
+        if self.eval_every <= 0:
+            self.enabled = False
+            self.eval_every = 0
         self.async_enabled = bool(self.elo_config.get("async_in_il", True)) if self.enabled else False
         self.async_device = _resolve_async_device(device, self.elo_config.get("async_device", "cpu"))
         self.shutdown_wait_sec = float(self.elo_config.get("async_wait_on_shutdown_sec", 0.0))
@@ -118,9 +137,9 @@ class ILEloCoordinator:
         self.worker_epoch = None
         self.worker_cancel_event = None
 
-    def print_startup_summary(self):
+    def print_startup_summary(self, verbose=False):
         """Print runtime Elo configuration."""
-        if not self.enabled:
+        if not self.enabled or not verbose:
             return
         print(
             f"Elo eval: every {self.eval_every} ep, "
@@ -136,7 +155,7 @@ class ILEloCoordinator:
 
     def is_due(self, epoch_num):
         """Return True if Elo should run for given epoch number (1-based)."""
-        return self.enabled and (int(epoch_num) % self.eval_every == 0)
+        return self.enabled and self.eval_every > 0 and (int(epoch_num) % self.eval_every == 0)
 
     def poll_results(self):
         """Collect finished async Elo jobs, write CSV backfills, refresh PNG if needed."""
