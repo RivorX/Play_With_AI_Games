@@ -64,7 +64,6 @@ from utils.shared.runtime_helpers import (
     build_model_file_tag,
     build_model_architecture_metadata,
     cleanup_interrupted_log_csv,
-    run_with_optional_stdout_suppression,
 )
 from utils.shared.elo_estimator import estimate_model_elo
 from utils.shared.model_catalog import persist_checkpoint_elo_metadata
@@ -300,53 +299,34 @@ def _emit_il_profile(lines, debug_log_file=None, print_to_console=False):
 
 
 def _apply_il_elo_overrides(elo_config):
-    """Apply IL-specific Elo overrides onto the shared Elo config."""
+    """Build IL periodic raw-NN Elo config from the shared NN eval settings."""
     if not isinstance(elo_config, dict):
         return {}
     resolved = dict(elo_config)
     override_map = {
-        'il_eval_every': 'eval_every',
-        'il_games_per_level': 'games_per_level',
-        'il_max_moves': 'max_moves',
-        'il_workers': 'workers',
-        'il_async_device': 'async_device',
-        'il_free_threads_utilization': 'free_threads_utilization',
-        'il_adaptive_probe_games_per_level': 'adaptive_probe_games_per_level',
-        'il_adaptive_focus_games_per_level': 'adaptive_focus_games_per_level',
-        'il_adaptive_extra_games_per_level': 'adaptive_extra_games_per_level',
-        'il_adaptive_max_total_games': 'adaptive_max_total_games',
-        'il_adaptive_min_games_for_se_stop': 'adaptive_min_games_for_se_stop',
-        'il_adaptive_target_standard_error': 'adaptive_target_standard_error',
+        'nn_eval_workers': 'workers',
+        'nn_eval_free_threads_utilization': 'free_threads_utilization',
     }
     for source_key, target_key in override_map.items():
         if source_key in resolved:
             resolved[target_key] = resolved[source_key]
+    resolved['use_mcts'] = False
     return resolved
 
 
 def _build_il_final_elo_config(elo_config):
-    """Build the slower, more stable final IL Elo config from shared settings."""
+    """Build the slower final IL MCTS Elo config from shared MCTS eval settings."""
     if not isinstance(elo_config, dict):
         return {}
 
     resolved = dict(elo_config)
     override_map = {
-        'final_il_workers': 'workers',
-        'final_il_games_per_level': 'games_per_level',
-        'final_il_max_moves': 'max_moves',
-        'final_il_adaptive_probe_games_per_level': 'adaptive_probe_games_per_level',
-        'final_il_adaptive_focus_games_per_level': 'adaptive_focus_games_per_level',
-        'final_il_adaptive_extra_games_per_level': 'adaptive_extra_games_per_level',
-        'final_il_adaptive_target_focus_levels': 'adaptive_target_focus_levels',
-        'final_il_adaptive_max_total_games': 'adaptive_max_total_games',
-        'final_il_adaptive_min_games_for_se_stop': 'adaptive_min_games_for_se_stop',
-        'final_il_adaptive_target_standard_error': 'adaptive_target_standard_error',
-        'final_il_mcts_simulations': 'mcts_simulations',
+        'mcts_eval_workers': 'workers',
+        'mcts_eval_simulations': 'mcts_simulations',
     }
     for source_key, target_key in override_map.items():
         if source_key in resolved:
             resolved[target_key] = resolved[source_key]
-
     # Final IL evaluation runs after training has stopped, so it should use the
     # full CPU budget instead of reserving threads for DataLoader workers.
     resolved['prioritize_training'] = False
@@ -355,7 +335,7 @@ def _build_il_final_elo_config(elo_config):
     resolved['stockfish_priority'] = 'normal'
     resolved['progress_bar'] = 'always'
     resolved['auto_worker_reserve_cpus'] = 0
-    resolved['use_mcts'] = bool(resolved.get('use_mcts', False))
+    resolved['use_mcts'] = True
     return resolved
 
 
@@ -364,26 +344,6 @@ def _build_il_final_elo_configs(elo_config):
     mcts_cfg = dict(raw_cfg)
     raw_cfg['use_mcts'] = False
     mcts_cfg['use_mcts'] = True
-    try:
-        raw_games_multiplier = float(raw_cfg.get('final_il_raw_games_multiplier', 1.0) or 1.0)
-    except (TypeError, ValueError):
-        raw_games_multiplier = 1.0
-    raw_games_multiplier = max(1.0, raw_games_multiplier)
-    if raw_games_multiplier > 1.0:
-        for key in (
-            'games_per_level',
-            'adaptive_probe_games_per_level',
-            'adaptive_focus_games_per_level',
-            'adaptive_extra_games_per_level',
-            'adaptive_max_total_games',
-            'adaptive_min_games_for_se_stop',
-        ):
-            try:
-                current = int(raw_cfg.get(key, 0) or 0)
-            except (TypeError, ValueError):
-                current = 0
-            if current > 0:
-                raw_cfg[key] = max(1, int(round(current * raw_games_multiplier)))
     return raw_cfg, mcts_cfg
 
 
@@ -440,9 +400,17 @@ def _run_il_final_elo(
             simulations=simulations,
             label=marker_label,
             update_csv=True,
+            std_error=elo_result.get("elo_std_error"),
+            ci95=elo_result.get("elo_ci95"),
         )
         if not use_mcts:
-            logger.record_estimated_elo(epoch_num, estimated_elo, update_csv=True)
+            logger.record_estimated_elo(
+                epoch_num,
+                estimated_elo,
+                update_csv=True,
+                std_error=elo_result.get("elo_std_error"),
+                ci95=elo_result.get("elo_ci95"),
+            )
             logger.add_elo_epoch_marker(epoch_num, marker_label)
         mode_label = f"MCTS {simulations} sims" if use_mcts else "raw NN"
         print(f"Final IL Estimated Elo ({model_label}, {mode_label}): {int(round(float(estimated_elo)))}")
@@ -876,7 +844,11 @@ def main():
     resumed_estimated_elo = startup_state.get('estimated_elo')
     resumed_estimated_elo_epoch = startup_state.get('estimated_elo_epoch')
     resumed_estimated_elo_nn = startup_state.get('estimated_elo_nn')
+    resumed_estimated_elo_nn_se = startup_state.get('estimated_elo_nn_se')
+    resumed_estimated_elo_nn_ci95 = startup_state.get('estimated_elo_nn_ci95')
     resumed_estimated_elo_mcts = startup_state.get('estimated_elo_mcts')
+    resumed_estimated_elo_mcts_se = startup_state.get('estimated_elo_mcts_se')
+    resumed_estimated_elo_mcts_ci95 = startup_state.get('estimated_elo_mcts_ci95')
     resumed_estimated_elo_mcts_simulations = startup_state.get('estimated_elo_mcts_simulations')
     selected_compatibility_ratio = startup_state.get('selected_compatibility_ratio')
     transfer_match_ratio = startup_state.get('transfer_match_ratio')
@@ -925,6 +897,8 @@ def main():
                 mode="nn",
                 label="Resume NN",
                 update_csv=True,
+                std_error=resumed_estimated_elo_nn_se,
+                ci95=resumed_estimated_elo_nn_ci95,
             )
         if resumed_estimated_elo_mcts is not None:
             logger.record_il_mode_elo(
@@ -934,6 +908,8 @@ def main():
                 simulations=resumed_estimated_elo_mcts_simulations or 0,
                 label="Resume MCTS",
                 update_csv=True,
+                std_error=resumed_estimated_elo_mcts_se,
+                ci95=resumed_estimated_elo_mcts_ci95,
             )
 
     if start_mode == "new":
@@ -1012,12 +988,7 @@ def main():
     config_with_absolute_paths['paths'] = config['paths'].copy()
     config_with_absolute_paths['paths']['data_dir'] = str(data_dir.absolute())
 
-    metadata = run_with_optional_stdout_suppression(
-        debug_enabled,
-        process_pgn_files,
-        pgn_files,
-        config_with_absolute_paths,
-    )
+    metadata = process_pgn_files(pgn_files, config_with_absolute_paths)
 
     # Verify binary format compatibility.
     actual_position_size = metadata.get('position_size')
@@ -1082,10 +1053,31 @@ def main():
     train_final = _stat(train_stats, 'final_count', len(train_loader.dataset))
     val_final = _stat(val_stats, 'final_count', len(val_loader.dataset))
 
+    def _stage_total(stats, stage_name, default=None):
+        stages = stats.get('selection_stages', []) if isinstance(stats, dict) else []
+        for entry in stages or []:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get('stage', '')) == str(stage_name):
+                return _as_int(entry.get('total', default or 0), default=default or 0)
+        return default
+
     total_final = train_final + val_final
+    raw_total = _stage_total(train_stats, 'raw_split', _stat(train_stats, 'binary_positions', total_final))
+    ppg_total = _stage_total(train_stats, 'positions_per_game')
+    dedup_total = _stage_total(train_stats, 'sample_dedup')
+    data_parts = [
+        f"raw={_format_million_positions(raw_total)}",
+        f"selected={_format_million_positions(total_final)}",
+        f"train={_format_million_positions(train_final)}",
+        f"val={_format_million_positions(val_final)}",
+    ]
+    if ppg_total is not None:
+        data_parts.append(f"ppg={_format_million_positions(ppg_total)}")
+    if dedup_total is not None:
+        data_parts.append(f"dedup={_format_million_positions(dedup_total)}")
     data_context = (
-        f"Data: positions={_format_million_positions(total_final)} "
-        f"(train={_format_million_positions(train_final)}, val={_format_million_positions(val_final)})"
+        "Data: " + " | ".join(data_parts)
     )
     logger.set_run_context(f"{plot_run_context} | {data_context}")
     logger.set_run_context_lines([model_context, data_context, run_context])
@@ -1155,6 +1147,30 @@ def main():
 
     train_soft_basic = _soft_basic_summary(train_loader.dataset)
     val_soft_basic = _soft_basic_summary(val_loader.dataset)
+    if soft_targets_cfg.get('enabled', False):
+        def _soft_float(summary, key, default=0.0):
+            if not summary:
+                return float(default)
+            try:
+                return float(summary.get(key, default))
+            except (TypeError, ValueError):
+                return float(default)
+
+        soft_policy_cfg = soft_targets_cfg.get('policy_target', {}) or {}
+        soft_context = (
+            f"Soft: source={soft_targets_cfg.get('source', 'positions_per_game')}, "
+            f"mode={soft_targets_cfg.get('mode', 'fen')}, "
+            f"top={soft_targets_cfg.get('max_policy_moves', '-')}, "
+            f"avg_occ train={_soft_float(train_soft_basic, 'policy_occ_avg'):.2f}/"
+            f"val={_soft_float(val_soft_basic, 'policy_occ_avg'):.2f}, "
+            f"mass train={_soft_float(train_soft_basic, 'policy_mass_kept_avg', 1.0):.4f}, "
+            f"hard<{soft_policy_cfg.get('hard_below_count', '-')}, "
+            f"soft>={soft_policy_cfg.get('soft_full_count', '-')}"
+        )
+    else:
+        soft_context = "Soft: off"
+    logger.set_run_context(f"{model_context} | {data_context} | {soft_context} | {run_context}")
+    logger.set_run_context_lines([model_context, data_context, soft_context, run_context])
     logger.set_run_summary_metadata(_build_il_run_summary(
         config,
         model_version=model_version,
@@ -1414,10 +1430,10 @@ def main():
     elo_coordinator.print_startup_summary(verbose=debug_enabled)
     if debug_enabled and final_il_elo_enabled:
         print(
-            "Elo final (IL): enabled for best_model_il and SWA, raw NN + MCTS, "
+            "Elo final (IL): enabled for SWA and best_model_il MCTS, "
             f"levels={final_elo_config_il.get('levels')}, "
-            f"games/level={final_elo_config_il.get('games_per_level')}, "
-            f"time={float(final_elo_config_il.get('stockfish_time_limit', 0.0)):.2f}s, "
+            f"cap={final_elo_config_il_mcts.get('adaptive_max_total_games')} games, "
+            f"time={float(final_elo_config_il_mcts.get('stockfish_time_limit', 0.0)):.2f}s, "
             f"mcts_sims={int(final_elo_config_il_mcts.get('mcts_simulations', 0) or 0)}"
         )
 
@@ -1669,6 +1685,7 @@ def main():
                 profile=profile_this_epoch,
                 step_scheduler=(not use_swa_scheduler_this_epoch) and (not transfer_post_unfreeze_lr_active),
                 non_blocking_transfer=non_blocking_transfers,
+                progress_callback=elo_coordinator.poll_results,
             )
             if profile_this_epoch and device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -2015,9 +2032,19 @@ def main():
     # Final plot
     logger.plot()
 
-    skip_interrupt_final_elo = bool(training_interrupted and completed_epochs_this_run <= 0)
+    min_interrupt_final_elo_epochs = 10 if start_mode == "new" else 1
+    skip_interrupt_final_elo = bool(
+        training_interrupted
+        and completed_epochs_this_run < min_interrupt_final_elo_epochs
+    )
     if skip_interrupt_final_elo:
-        print("Ctrl+C happened before any epoch finished; skipping final IL Elo checks.")
+        if start_mode == "new":
+            print(
+                "Ctrl+C before 10 completed epochs from scratch; "
+                "skipping final IL MCTS Elo checks."
+            )
+        else:
+            print("Ctrl+C happened before any epoch finished; skipping final IL Elo checks.")
 
     # Finalize SWA at training end and also on interrupt (if SWA has updates).
     swa_elo_stop_event = threading.Event()
@@ -2042,7 +2069,7 @@ def main():
             best_val_loss=best_val_loss,
             best_raw_val_loss=best_raw_val_loss_for_swa,
             evaluate_il_fn=evaluate_il,
-            elo_config=final_elo_config_il if final_il_elo_enabled and not skip_interrupt_final_elo else None,
+            elo_config=final_elo_config_il_mcts if final_il_elo_enabled and not skip_interrupt_final_elo else None,
             elo_stop_event=swa_elo_stop_event,
             model_architecture=model_architecture,
             training_batch_size=trained_batch_size,
@@ -2116,7 +2143,6 @@ def main():
             final_note_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
             final_best_elo_results = []
             for mode_cfg, mode_suffix in (
-                (final_elo_config_il, "NN"),
                 (final_elo_config_il_mcts, "MCTS"),
             ):
                 mode_marker = f"{final_marker_label} {mode_suffix}"
@@ -2136,7 +2162,7 @@ def main():
                 if final_best_elo_result.get("cancelled"):
                     break
                 if final_best_elo_result.get("estimated_elo") is not None:
-                    if best_checkpoint_loaded and mode_suffix == "NN":
+                    if best_checkpoint_loaded and mode_suffix == "MCTS":
                         logger.record_best_final_elo(
                             final_epoch_num,
                             final_best_elo_result.get("estimated_elo"),
@@ -2163,7 +2189,6 @@ def main():
                 ran_current_final_elo = True
                 current_results = []
                 for mode_cfg, mode_suffix in (
-                    (final_elo_config_il, "NN"),
                     (final_elo_config_il_mcts, "MCTS"),
                 ):
                     final_elo_result = _run_il_final_elo(

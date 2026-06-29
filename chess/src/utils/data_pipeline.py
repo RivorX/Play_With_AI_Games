@@ -21,6 +21,32 @@ from tqdm import tqdm
 
 from src.utils.data_helpers import ACTION_SIZE, get_position_size
 
+
+def _phase_desc(phase):
+    return f"  {phase}"
+
+
+def _print_preprocessing_dataset_table(rows):
+    if not rows:
+        return
+
+    headers = ("Dataset", "Positions", "Status")
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, value in enumerate(row):
+            widths[i] = max(widths[i], len(str(value)))
+
+    def line():
+        return "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+
+    print(line())
+    print("| " + " | ".join(str(headers[i]).ljust(widths[i]) for i in range(len(headers))) + " |")
+    print(line())
+    for row in rows:
+        print("| " + " | ".join(str(row[i]).ljust(widths[i]) for i in range(len(row))) + " |")
+    print(line(), flush=True)
+
+
 # ==============================================================================
 # WORKER COUNT RESOLUTION
 # ==============================================================================
@@ -271,9 +297,6 @@ class DatasetTracker:
             
             # Verify files still exist
             if binary_path.exists() and metadata_path.exists():
-                print(f"  ♻️ Found preprocessed dataset: {binary_path.name}")
-                print(f"     Processed on: {entry['processed_date']}")
-                print(f"     Positions: {entry['total_positions']:,}")
                 return binary_path, metadata_path
         
         return None, None
@@ -311,7 +334,6 @@ class DatasetTracker:
         }
         
         self._save_tracking()
-        print(f"  ✅ Dataset registered in tracking system")
 
 
 # ==============================================================================
@@ -544,12 +566,9 @@ def extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_workers):
         return extract_games_sequential(pgn_path, max_games)
 
     if max_games is None:
-        print("  • max_games=max -> scanning all game offsets for parallel split...")
         game_offsets = _scan_game_start_offsets(pgn_path)
         effective_max_games = len(game_offsets)
-        print(f"  • Detected {effective_max_games:,} games in {Path(pgn_path).name}")
     else:
-        print(f"  • Scanning first {max_games:,} game offsets for parallel split...")
         game_offsets = _scan_game_start_offsets(pgn_path, max_offsets=max_games)
         effective_max_games = len(game_offsets)
         if effective_max_games < max_games:
@@ -557,8 +576,6 @@ def extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_workers):
                 f"  • PGN ended early: detected {effective_max_games:,} games "
                 f"(requested {max_games:,})"
             )
-
-    print(f"  Using {phase1_workers} processes for offset-based parallel parsing...")
 
     games_per_worker = (effective_max_games + phase1_workers - 1) // phase1_workers
     tasks = []
@@ -577,7 +594,7 @@ def extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_workers):
             for i, task in enumerate(tasks)
         }
 
-        with tqdm(total=len(futures), desc="  Phase 1 workers") as pbar:
+        with tqdm(total=len(futures), desc=_phase_desc("Phase 1: PGN parsing")) as pbar:
             for future in as_completed(futures):
                 task_idx = futures[future]
                 games_chunk = future.result()
@@ -600,7 +617,7 @@ def extract_games_sequential(pgn_path, max_games):
     games_data = []
     
     with open(pgn_path, 'r', encoding='utf-8', errors='ignore') as f:
-        with tqdm(total=max_games, desc="  Extracting games") as pbar:
+        with tqdm(total=max_games, desc=_phase_desc("Phase 1: PGN parsing")) as pbar:
             game_count = 0
             while max_games is None or game_count < max_games:
                 game = chess.pgn.read_game(f)
@@ -634,7 +651,7 @@ def _dedupe_games(games_data):
         deduped.append(game)
     
     if dupes:
-        print(f"  🔁 Deduplicated games: {dupes} removed")
+        print(f"  Games dedup: -{dupes:,}")
     return deduped
 
 
@@ -729,17 +746,18 @@ def _filter_games(games_data, config):
         stats['kept'] += 1
     
     if filters_enabled:
-        print(f"  Filtered games: {stats['total']:,} -> {stats['kept']:,}")
-        if stats['termination']:
-            print(f"    - termination filter: {stats['termination']:,}")
-        if stats['elo_gap']:
-            print(f"    - elo gap filter: {stats['elo_gap']:,}")
-        if stats['draw_short']:
-            print(f"    - short draw filter: {stats['draw_short']:,}")
-        if stats['resign_short']:
-            print(f"    - short resign filter: {stats['resign_short']:,}")
-        if stats['length']:
-            print(f"    - min length filter: {stats['length']:,}")
+        removed_parts = []
+        for key, label in (
+            ('termination', 'term'),
+            ('elo_gap', 'elo_gap'),
+            ('draw_short', 'short_draw'),
+            ('resign_short', 'short_resign'),
+            ('length', 'min_len'),
+        ):
+            if stats[key]:
+                removed_parts.append(f"{label}={stats[key]:,}")
+        details = "; " + ", ".join(removed_parts) if removed_parts else ""
+        print(f"  Games filter: {stats['total']:,} -> {stats['kept']:,}{details}")
     
     return filtered
 
@@ -749,11 +767,7 @@ def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, config=
     PHASE 1: Extract games from PGN file
     """
     max_games = _normalize_max_games(max_games)
-    full_file_mode = max_games is None
-    
-    if full_file_mode:
-        print("  📚 Extracting entire PGN file (no top-N selection, no per-file Elo sorting)...")
-    
+
     all_games = extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_threads)
     
     if not all_games:
@@ -894,7 +908,6 @@ def extract_positions_parallel(games_data, config, phase2_workers):
     """
     min_elo = config['data'].get('min_elo', 0)
     max_moves = config['data'].get('max_moves_per_game', 200)
-    
     if phase2_workers <= 1:
         return extract_positions_sequential(games_data, config)
     
@@ -905,11 +918,6 @@ def extract_positions_parallel(games_data, config, phase2_workers):
         for start in range(0, len(indexed_games), chunk_size)
     ]
 
-    print(
-        f"  Using {phase2_workers} processes for parallel position extraction "
-        f"({len(tasks):,} chunks, chunk_size={chunk_size:,})..."
-    )
-    
     # 🔧 v4.3: game_id is uint32 — no modulo needed, supports up to ~4 billion games
     
     position_chunks = [None] * len(tasks)
@@ -925,7 +933,7 @@ def extract_positions_parallel(games_data, config, phase2_workers):
             for i, task in enumerate(tasks)
         }
         
-        with tqdm(total=len(futures), desc="  Phase 2 chunks") as pbar:
+        with tqdm(total=len(futures), desc=_phase_desc("Phase 2: position extraction")) as pbar:
             for future in as_completed(futures):
                 task_idx = futures[future]
                 positions = future.result()
@@ -952,7 +960,7 @@ def extract_positions_sequential(games_data, config):
     
     all_positions = []
     
-    for game_idx, game in enumerate(tqdm(games_data, desc="  Extracting positions")):
+    for game_idx, game in enumerate(tqdm(games_data, desc=_phase_desc("Phase 2: position extraction"))):
         # 🔧 v4.3: game_id is uint32 — no modulo needed
         task = (game, game_idx, min_elo, max_moves)
         positions = extract_positions_from_game_worker(task)
@@ -969,14 +977,9 @@ def write_positions_to_disk(positions, binary_file):
     """
     PHASE 3: Write positions to binary file
     """
-    print(f"\n  💾 Writing {len(positions):,} positions to disk...")
-    
     with open(binary_file, 'wb') as f:
-        for pos_data in tqdm(positions, desc="  Writing", unit="pos"):
+        for pos_data in tqdm(positions, desc=_phase_desc("Phase 3: writing to disk"), unit="pos"):
             f.write(pos_data)
-    
-    size_mb = binary_file.stat().st_size / (1024**2)
-    print(f"  ✅ Written: {size_mb:.1f} MB")
 
 
 def get_dataset_metadata(binary_file, config):
@@ -1026,10 +1029,7 @@ def process_pgn_files(pgn_files, config):
     existing_binaries = []
     existing_metadatas = []
     new_pgn_files = []
-    
-    print(f"\n{'='*70}")
-    print(f"📚 Checking for preprocessed datasets...")
-    print(f"{'='*70}")
+    dataset_summary_rows = []
     
     for pgn_file in pgn_files:
         binary_file, metadata_file = tracker.get_processed_dataset(pgn_file, config)
@@ -1037,59 +1037,77 @@ def process_pgn_files(pgn_files, config):
         if binary_file and metadata_file:
             existing_binaries.append(binary_file)
             existing_metadatas.append(metadata_file)
+            positions_text = "?"
+            try:
+                with open(metadata_file, 'rb') as f:
+                    cached_metadata = pickle.load(f)
+                positions_text = f"{int(cached_metadata.get('total_positions', 0)):,}"
+            except Exception:
+                pass
+            dataset_summary_rows.append((Path(pgn_file).name, positions_text, "cache"))
         else:
             new_pgn_files.append(pgn_file)
-            print(f"  🆕 Will process: {Path(pgn_file).name}")
+            dataset_summary_rows.append((Path(pgn_file).name, "pending", "build"))
     
+    total_pgn_files = len(pgn_files)
+    loaded_count = len(existing_binaries)
+    remaining_count = len(new_pgn_files)
+    print(
+        f"  Preprocessed datasets: cache {loaded_count:,}/{total_pgn_files:,}, "
+        f"to build {remaining_count:,}/{total_pgn_files:,}",
+        flush=True,
+    )
+    _print_preprocessing_dataset_table(dataset_summary_rows)
+
     # Process new files if any
     new_binaries = []
     new_metadatas = []
     
     if new_pgn_files:
-        print(f"\n{'='*70}")
-        print(f"🔨 Processing {len(new_pgn_files)} new PGN files...")
-        print(f"{'='*70}")
-        
         phase1_workers = _resolve_workers(config['data'].get('phase1_threads', 1), "phase1_threads")
         phase2_workers = _resolve_workers(config['data'].get('phase2_threads', 1), "phase2_threads")
         selection = _get_game_selection_settings(config)
         max_games = selection['max_games']
-        if selection['full_file_mode']:
-            print("ℹ️ data.max_games=max -> entire PGN files will be used.")
         
-        for pgn_file in new_pgn_files:
-            print(f"\n📄 Processing: {Path(pgn_file).name}")
-            print(f"{'='*70}")
+        total_new = len(new_pgn_files)
+        for dataset_idx, pgn_file in enumerate(new_pgn_files, start=1):
+            dataset_name = Path(pgn_file).name
+            loaded_now = loaded_count + dataset_idx - 1
+            print(
+                f"\nPreprocessing {dataset_name} "
+                f"({dataset_idx:,}/{total_new:,}; cache {loaded_now:,}/{total_pgn_files:,})",
+                flush=True,
+            )
+            print("=" * 70, flush=True)
             
             # Phase 1: Extract games
-            print("🔹 PHASE 1: PGN Parsing...")
             games_data = extract_games_from_pgn_parallel(
-                pgn_file, max_games, phase1_workers, config=config
+                pgn_file,
+                max_games,
+                phase1_workers,
+                config=config,
             )
             
             if not games_data:
                 print("  ⚠️ No games found!")
                 continue
             
-            print(f"  ✅ Extracted {len(games_data):,} games")
-            
             # Phase 2: Extract positions
-            print(f"\n🔹 PHASE 2: Position Extraction...")
-            positions = extract_positions_parallel(games_data, config, phase2_workers)
+            positions = extract_positions_parallel(
+                games_data,
+                config,
+                phase2_workers,
+            )
             
             if not positions:
                 print("  ⚠️ No positions extracted!")
                 continue
             
-            print(f"  ✅ Extracted {len(positions):,} positions")
-            
             # Phase 3: Write to disk
-            print(f"\n🔹 PHASE 3: Writing to disk...")
             binary_file = preprocessing_dir / f"{Path(pgn_file).stem}_positions.bin"
             write_positions_to_disk(positions, binary_file)
             
             # Phase 4: Create metadata
-            print(f"\n🔹 PHASE 4: Creating metadata...")
             metadata = get_dataset_metadata(binary_file, config)
             metadata_file = preprocessing_dir / f"{Path(pgn_file).stem}_meta.pkl"
             
@@ -1102,9 +1120,12 @@ def process_pgn_files(pgn_files, config):
             new_binaries.append(binary_file)
             new_metadatas.append(metadata_file)
             
-            print(f"\n✅ Completed: {Path(pgn_file).name}")
-            print(f"   Positions: {metadata['total_positions']:,}")
-            print(f"   Size: {binary_file.stat().st_size / (1024**2):.1f} MB")
+            print(
+                f"  Done: {Path(pgn_file).name} "
+                f"({metadata['total_positions']:,} positions, "
+                f"{binary_file.stat().st_size / (1024**2):.1f} MB)",
+                flush=True,
+            )
     
     # Merge all datasets (existing + new)
     all_binaries = existing_binaries + new_binaries

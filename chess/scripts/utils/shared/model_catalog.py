@@ -138,28 +138,49 @@ def persist_checkpoint_elo_metadata(
             settings["elo_std_error"] = float(elo_result.get("elo_std_error"))
         if elo_result.get("elo_ci95") is not None:
             settings["elo_ci95"] = list(elo_result.get("elo_ci95") or [])
+    elo_std_error = _safe_float(settings.get("elo_std_error"))
+    elo_ci95 = settings.get("elo_ci95")
+    ci_low = _safe_float(elo_ci95[0]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
+    ci_high = _safe_float(elo_ci95[1]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
 
     checkpoint[mode_prefix] = float(elo_value)
     checkpoint[f"last_{mode_prefix}"] = float(elo_value)
     checkpoint[f"{mode_prefix}_timestamp"] = now
     checkpoint[f"{mode_prefix}_settings"] = settings
     checkpoint[f"{mode_prefix}_source"] = str(source)
+    if elo_std_error is not None:
+        checkpoint[f"{mode_prefix}_se"] = float(elo_std_error)
+    if ci_low is not None:
+        checkpoint[f"{mode_prefix}_ci95_low"] = float(ci_low)
+    if ci_high is not None:
+        checkpoint[f"{mode_prefix}_ci95_high"] = float(ci_high)
     if mode == "mcts":
         checkpoint["estimated_elo_mcts_simulations"] = int(simulations)
         by_sims = _normalize_mcts_elo_by_sims(checkpoint.get("estimated_elo_mcts_by_simulations"))
-        by_sims[int(simulations)] = {
+        sim_entry = {
             "elo": float(elo_value),
             "simulations": int(simulations),
             "timestamp": now,
             "source": str(source),
             "settings": settings,
         }
+        if elo_std_error is not None:
+            sim_entry["se"] = float(elo_std_error)
+        if ci_low is not None and ci_high is not None:
+            sim_entry["ci95"] = [float(ci_low), float(ci_high)]
+        by_sims[int(simulations)] = sim_entry
         checkpoint["estimated_elo_mcts_by_simulations"] = {
             str(int(k)): v for k, v in sorted(by_sims.items(), key=lambda kv: int(kv[0]))
         }
 
     checkpoint["estimated_elo"] = float(elo_value)
     checkpoint["last_estimated_elo"] = float(elo_value)
+    if elo_std_error is not None:
+        checkpoint["estimated_elo_se"] = float(elo_std_error)
+    if ci_low is not None:
+        checkpoint["estimated_elo_ci95_low"] = float(ci_low)
+    if ci_high is not None:
+        checkpoint["estimated_elo_ci95_high"] = float(ci_high)
 
     epoch_raw = checkpoint.get("epoch")
     epoch_idx = _safe_int(epoch_raw)

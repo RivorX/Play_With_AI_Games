@@ -138,6 +138,65 @@ def _iter_prefetched_batches(loader, device, non_blocking=True, enabled=True, qu
         stop_event.set()
         worker.join(timeout=1.0)
 
+
+def _is_dataloader_worker_failure(exc):
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "dataloader worker" in text
+        or "exited unexpectedly" in text
+        or ("worker" in text and "killed" in text)
+        or "broken pipe" in text
+        or "eoferror" in text
+    )
+
+
+def _make_prefetched_iterator(loader, device, non_blocking, enabled, queue_size):
+    return _iter_prefetched_batches(
+        loader,
+        device,
+        non_blocking=non_blocking,
+        enabled=enabled,
+        queue_size=queue_size,
+    )
+
+
+def _next_resilient_batch(iterator_state, label):
+    iterator = iterator_state['iterator']
+    while True:
+        try:
+            return next(iterator)
+        except StopIteration:
+            raise
+        except BaseException as exc:
+            if (
+                not iterator_state['enabled']
+                or not _is_dataloader_worker_failure(exc)
+                or iterator_state['restarts'] >= iterator_state['max_restarts']
+            ):
+                raise
+
+            iterator_state['restarts'] += 1
+            try:
+                close = getattr(iterator, 'close', None)
+                if close is not None:
+                    close()
+            except Exception:
+                pass
+
+            print(
+                f"\n  Warning: {label} DataLoader worker failed; "
+                f"restarting iterator {iterator_state['restarts']}/{iterator_state['max_restarts']}..."
+            )
+            iterator = _make_prefetched_iterator(
+                iterator_state['loader'],
+                iterator_state['device'],
+                iterator_state['non_blocking'],
+                iterator_state['prefetch_enabled'],
+                iterator_state['queue_size'],
+            )
+            iterator_state['iterator'] = iterator
+
+
 def train_epoch_il(
     model,
     train_loader,
@@ -151,6 +210,7 @@ def train_epoch_il(
     profile=False,
     step_scheduler=True,
     non_blocking_transfer=True,
+    progress_callback=None,
 ):
     """
     đź†• v4.3: Train one epoch with WDL value head and move-weighted losses
@@ -172,6 +232,7 @@ def train_epoch_il(
         debug_log_file: Path to debug log (optional)
         step_scheduler: Whether to step the provided scheduler at epoch end
         non_blocking_transfer: Use async host->device copies when possible
+        progress_callback: Optional cheap callback polled during the epoch
     
     Returns:
         Tuple of (losses_dict, metrics_dict, profile_stats or None)
@@ -244,14 +305,34 @@ def train_epoch_il(
     )
     metrics_interval = max(1, int(config['imitation_learning'].get('train_metrics_interval', 1)))
     progress_interval = max(1, int(config.get('logging', {}).get('print_every', 10)))
-    pbar_iter = _iter_prefetched_batches(
+    dataloader_restart_enabled = bool(hw_cfg.get('dataloader_restart_on_worker_failure', True))
+    dataloader_max_restarts = max(0, int(hw_cfg.get('dataloader_worker_restart_limit', 2) or 0))
+    iterator_state = {
+        'loader': train_loader,
+        'device': device,
+        'non_blocking': non_blocking,
+        'prefetch_enabled': cuda_prefetch,
+        'queue_size': cuda_prefetch_queue_size,
+        'enabled': dataloader_restart_enabled,
+        'max_restarts': dataloader_max_restarts,
+        'restarts': 0,
+    }
+    iterator_state['iterator'] = _make_prefetched_iterator(
         train_loader,
         device,
-        non_blocking=non_blocking,
-        enabled=cuda_prefetch,
-        queue_size=cuda_prefetch_queue_size,
+        non_blocking,
+        cuda_prefetch,
+        cuda_prefetch_queue_size,
     )
-    for batch_idx, batch_data in enumerate(pbar_iter):
+    processed_batches = 0
+    expected_batches = len(train_loader)
+    while processed_batches < expected_batches:
+        try:
+            batch_data = _next_resilient_batch(iterator_state, f"train epoch {epoch}")
+        except StopIteration:
+            break
+
+        batch_idx = processed_batches
         if profile_enabled:
             _sync()
             timers['data'] += time.perf_counter() - data_timer_start
@@ -521,7 +602,10 @@ def train_epoch_il(
                 'policy': f'{total_policy_loss / (batch_idx + 1):.4f}',
                 'value': f'{total_value_loss / (batch_idx + 1):.4f}',
             })
+            if progress_callback is not None:
+                progress_callback()
         pbar.update(1)
+        processed_batches += 1
 
         if profile_enabled:
             _sync()
@@ -535,7 +619,7 @@ def train_epoch_il(
         scheduler.step()
     
     # Compute final metrics
-    n = len(train_loader)
+    n = max(1, processed_batches)
     
     losses = {
         'total': total_loss / n,
@@ -608,14 +692,34 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
     
     with torch.inference_mode():
         eval_pbar = tqdm(total=len(val_loader), desc="Evaluating")
-        eval_iter = _iter_prefetched_batches(
+        dataloader_restart_enabled = bool(hw_cfg.get('dataloader_restart_on_worker_failure', True))
+        dataloader_max_restarts = max(0, int(hw_cfg.get('dataloader_worker_restart_limit', 2) or 0))
+        eval_iterator_state = {
+            'loader': val_loader,
+            'device': device,
+            'non_blocking': non_blocking,
+            'prefetch_enabled': cuda_prefetch,
+            'queue_size': cuda_prefetch_queue_size,
+            'enabled': dataloader_restart_enabled,
+            'max_restarts': dataloader_max_restarts,
+            'restarts': 0,
+        }
+        eval_iterator_state['iterator'] = _make_prefetched_iterator(
             val_loader,
             device,
-            non_blocking=non_blocking,
-            enabled=cuda_prefetch,
-            queue_size=cuda_prefetch_queue_size,
+            non_blocking,
+            cuda_prefetch,
+            cuda_prefetch_queue_size,
         )
-        for batch_idx, batch_data in enumerate(eval_iter):
+        processed_batches = 0
+        expected_batches = len(val_loader)
+        while processed_batches < expected_batches:
+            try:
+                batch_data = _next_resilient_batch(eval_iterator_state, "validation")
+            except StopIteration:
+                break
+
+            batch_idx = processed_batches
             if isinstance(batch_data, dict):
                 boards = batch_data['board']
                 moves = batch_data['move']
@@ -761,9 +865,10 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
                     sample_weight=sample_weight,
                 )
             eval_pbar.update(1)
+            processed_batches += 1
         eval_pbar.close()
     
-    n = len(val_loader)
+    n = max(1, processed_batches)
     
     losses = {
         'total': total_loss / n,

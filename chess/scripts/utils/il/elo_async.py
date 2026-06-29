@@ -177,7 +177,13 @@ class ILEloCoordinator:
                 elo_result = payload.get("result", {}) or {}
                 estimated_elo = elo_result.get("estimated_elo")
                 if estimated_elo is not None:
-                    self.logger.record_estimated_elo(result_epoch, estimated_elo, update_csv=True)
+                    self.logger.record_estimated_elo(
+                        result_epoch,
+                        estimated_elo,
+                        update_csv=True,
+                        std_error=elo_result.get("elo_std_error"),
+                        ci95=elo_result.get("elo_ci95"),
+                    )
                     print(f"     [async] Epoch {result_epoch} Estimated Elo: {estimated_elo}")
                     if elo_result.get("elo_std_error") is not None:
                         ci = elo_result.get("elo_ci95")

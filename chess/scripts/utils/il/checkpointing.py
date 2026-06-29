@@ -517,7 +517,10 @@ def finalize_swa_model(
     result["model_path"] = str(swa_model_path)
 
     if isinstance(elo_config, dict) and elo_config.get("enabled", False):
-        print("Estimating SWA Elo (separate final check)...")
+        use_mcts_for_elo = bool(elo_config.get("use_mcts", False))
+        simulations_for_elo = int(elo_config.get("mcts_simulations", 0) or 0)
+        mode_label = f"MCTS {simulations_for_elo} sims" if use_mcts_for_elo else "raw NN"
+        print(f"Estimating SWA Elo ({mode_label}, separate final check)...")
         try:
             elo_result = estimate_model_elo(
                 swa_model.module,
@@ -539,7 +542,11 @@ def finalize_swa_model(
             if swa_elo is not None:
                 result["estimated_elo"] = float(swa_elo)
                 result["estimated_elo_epoch"] = int(epoch_to_store + 1)
-                print(f"SWA Estimated Elo: {int(round(float(swa_elo)))}")
+                result["estimated_elo_mode"] = "mcts" if use_mcts_for_elo else "nn"
+                result["estimated_elo_simulations"] = simulations_for_elo if use_mcts_for_elo else 0
+                result["estimated_elo_std_error"] = elo_result.get("elo_std_error")
+                result["estimated_elo_ci95"] = elo_result.get("elo_ci95")
+                print(f"SWA Estimated Elo ({mode_label}): {int(round(float(swa_elo)))}")
                 for lvl, res in sorted(elo_result.get("results", {}).items()):
                     score_str = f"W{res['wins']}/D{res['draws']}/L{res['losses']}"
                     print(f"  vs SF {lvl}: {score_str} (score: {res['score']:.0%})")
@@ -589,6 +596,23 @@ def finalize_swa_model(
     if result["estimated_elo"] is not None:
         metadata["estimated_elo"] = float(result["estimated_elo"])
         metadata["estimated_elo_epoch"] = int(result["estimated_elo_epoch"] or (epoch_to_store + 1))
+        mode = str(result.get("estimated_elo_mode") or "nn").lower()
+        mode_key = "estimated_elo_mcts" if mode == "mcts" else "estimated_elo_nn"
+        simulations = int(result.get("estimated_elo_simulations") or 0)
+        metadata[mode_key] = float(result["estimated_elo"])
+        metadata[f"last_{mode_key}"] = float(result["estimated_elo"])
+        metadata["estimated_elo_settings"] = {
+            "use_mcts": mode == "mcts",
+            "simulations": simulations if mode == "mcts" else 0,
+        }
+        if mode == "mcts":
+            metadata["estimated_elo_mcts_simulations"] = simulations
+        if result.get("estimated_elo_std_error") is not None:
+            metadata["estimated_elo_se"] = float(result["estimated_elo_std_error"])
+        ci95 = result.get("estimated_elo_ci95")
+        if isinstance(ci95, (list, tuple)) and len(ci95) == 2:
+            metadata["estimated_elo_ci95_low"] = float(ci95[0])
+            metadata["estimated_elo_ci95_high"] = float(ci95[1])
 
     try:
         checkpoint_loss = _safe_loss_value(swa_val_losses.get("total"), default=0.0)

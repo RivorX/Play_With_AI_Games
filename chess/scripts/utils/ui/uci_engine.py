@@ -132,7 +132,7 @@ class UCIChessEngine:
             policy = policy_logits.float().cpu().numpy()[0]
 
         best_move = None
-        best_score = -1.0
+        best_score = -float("inf")
         for move in self.board.legal_moves:
             idx = move_to_index(move, self.board)
             score = float(policy[idx])

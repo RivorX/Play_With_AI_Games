@@ -653,7 +653,11 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
     estimated_elo = None
     estimated_elo_epoch = None
     estimated_elo_nn = None
+    estimated_elo_nn_se = None
+    estimated_elo_nn_ci95 = None
     estimated_elo_mcts = None
+    estimated_elo_mcts_se = None
+    estimated_elo_mcts_ci95 = None
     estimated_elo_mcts_simulations = None
     selected_compatibility_ratio = None
     transfer_match_ratio = None
@@ -701,9 +705,19 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
         estimated_elo_nn = _safe_float(
             checkpoint.get("estimated_elo_nn", checkpoint.get("last_estimated_elo_nn"))
         )
+        estimated_elo_nn_se = _safe_float(checkpoint.get("estimated_elo_nn_se"))
+        nn_ci_low = _safe_float(checkpoint.get("estimated_elo_nn_ci95_low"))
+        nn_ci_high = _safe_float(checkpoint.get("estimated_elo_nn_ci95_high"))
+        if nn_ci_low is not None and nn_ci_high is not None:
+            estimated_elo_nn_ci95 = [nn_ci_low, nn_ci_high]
         estimated_elo_mcts = _safe_float(
             checkpoint.get("estimated_elo_mcts", checkpoint.get("last_estimated_elo_mcts"))
         )
+        estimated_elo_mcts_se = _safe_float(checkpoint.get("estimated_elo_mcts_se"))
+        mcts_ci_low = _safe_float(checkpoint.get("estimated_elo_mcts_ci95_low"))
+        mcts_ci_high = _safe_float(checkpoint.get("estimated_elo_mcts_ci95_high"))
+        if mcts_ci_low is not None and mcts_ci_high is not None:
+            estimated_elo_mcts_ci95 = [mcts_ci_low, mcts_ci_high]
         estimated_elo_mcts_simulations = _safe_int(
             checkpoint.get("estimated_elo_mcts_simulations")
         )
@@ -807,7 +821,11 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
         "estimated_elo": estimated_elo,
         "estimated_elo_epoch": estimated_elo_epoch,
         "estimated_elo_nn": estimated_elo_nn,
+        "estimated_elo_nn_se": estimated_elo_nn_se,
+        "estimated_elo_nn_ci95": estimated_elo_nn_ci95,
         "estimated_elo_mcts": estimated_elo_mcts,
+        "estimated_elo_mcts_se": estimated_elo_mcts_se,
+        "estimated_elo_mcts_ci95": estimated_elo_mcts_ci95,
         "estimated_elo_mcts_simulations": estimated_elo_mcts_simulations,
         "selected_compatibility_ratio": selected_compatibility_ratio,
         "transfer_match_ratio": transfer_match_ratio,

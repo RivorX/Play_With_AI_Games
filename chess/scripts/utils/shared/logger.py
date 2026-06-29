@@ -15,6 +15,23 @@ _CSV_CONFIG_METADATA_KEY = "# config_json"
 _CSV_RUN_SUMMARY_METADATA_KEY = "# run_summary_json"
 
 
+def _clean_optional_float(value):
+    try:
+        if value in (None, ''):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_elo_ci95(ci95):
+    if not isinstance(ci95, (list, tuple)) or len(ci95) != 2:
+        return None, None
+    low = _clean_optional_float(ci95[0])
+    high = _clean_optional_float(ci95[1])
+    return low, high
+
+
 def _is_metadata_row(row):
     return bool(row) and str(row[0]).strip().startswith("#")
 
@@ -192,8 +209,17 @@ class TrainingLogger:
                     'val_soft_policy_mass_kept_avg', 'val_soft_policy_mass_kept_min',
                     # Elo estimation
                     'estimated_elo',
+                    'estimated_elo_se',
+                    'estimated_elo_ci95_low',
+                    'estimated_elo_ci95_high',
                     'estimated_elo_nn',
+                    'estimated_elo_nn_se',
+                    'estimated_elo_nn_ci95_low',
+                    'estimated_elo_nn_ci95_high',
                     'estimated_elo_mcts',
+                    'estimated_elo_mcts_se',
+                    'estimated_elo_mcts_ci95_low',
+                    'estimated_elo_mcts_ci95_high',
                     'estimated_elo_mcts_simulations',
                     'train_val_loss_gap',
                     'policy_top1_gap',
@@ -236,7 +262,11 @@ class TrainingLogger:
                     'selfplay_truncated_rate',
                     'adaptive_temp_adjustment', 'adaptive_temp_threshold',
                     'rl_best_model',
-                    'estimated_elo_nn', 'estimated_elo_mcts', 'estimated_elo_mcts_simulations',
+                    'estimated_elo_nn', 'estimated_elo_nn_se',
+                    'estimated_elo_nn_ci95_low', 'estimated_elo_nn_ci95_high',
+                    'estimated_elo_mcts', 'estimated_elo_mcts_se',
+                    'estimated_elo_mcts_ci95_low', 'estimated_elo_mcts_ci95_high',
+                    'estimated_elo_mcts_simulations',
                 ]
             if config_snapshot is not None:
                 for metadata_row in _upsert_metadata_row([], _CSV_CONFIG_METADATA_KEY, config_snapshot):
@@ -341,6 +371,7 @@ class TrainingLogger:
         
         # Elo estimation storage
         self.estimated_elos = []  # (epoch, elo) tuples
+        self.estimated_elo_errors = {}  # epoch -> {"se": float, "ci95": (low, high)}
         self._pending_rl_elo_by_iteration = {}
         self.best_final_elo_info = None  # (epoch, elo) for exact final best-model Elo
         self.il_mode_elo_markers = []  # dicts: epoch, elo, mode, simulations, label
@@ -3020,7 +3051,7 @@ class TrainingLogger:
         fig.savefig(self.data_quality_plot_path, dpi=150, bbox_inches='tight', pad_inches=0.18)
         plt.close(fig)
 
-    def record_estimated_elo(self, iteration, estimated_elo, update_csv=True):
+    def record_estimated_elo(self, iteration, estimated_elo, update_csv=True, std_error=None, ci95=None):
         """Record estimated Elo for a specific epoch/iteration (supports async updates)."""
         if estimated_elo is None:
             return
@@ -3030,6 +3061,8 @@ class TrainingLogger:
             estimated_elo = float(estimated_elo)
         except (TypeError, ValueError):
             return
+        std_error = _clean_optional_float(std_error)
+        ci_low, ci_high = _clean_elo_ci95(ci95)
 
         # Upsert in-memory storage.
         replaced = False
@@ -3041,6 +3074,11 @@ class TrainingLogger:
         if not replaced:
             self.estimated_elos.append((iteration, estimated_elo))
             self.estimated_elos.sort(key=lambda x: x[0])
+        if std_error is not None or ci_low is not None or ci_high is not None:
+            self.estimated_elo_errors[int(iteration)] = {
+                'se': std_error,
+                'ci95': (ci_low, ci_high),
+            }
 
         if not update_csv:
             return
@@ -3051,10 +3089,16 @@ class TrainingLogger:
             if not rows:
                 return
 
-            header = rows[0]
-            if 'estimated_elo' not in header:
-                return
+            header = list(rows[0])
+            for col in ('estimated_elo', 'estimated_elo_se', 'estimated_elo_ci95_low', 'estimated_elo_ci95_high'):
+                if col not in header:
+                    header.append(col)
+                    for row in rows[1:]:
+                        row.append('')
             elo_col = header.index('estimated_elo')
+            se_col = header.index('estimated_elo_se')
+            ci_low_col = header.index('estimated_elo_ci95_low')
+            ci_high_col = header.index('estimated_elo_ci95_high')
             target_epoch = str(iteration)
 
             updated = False
@@ -3064,7 +3108,15 @@ class TrainingLogger:
                 if row[0] == target_epoch:
                     while len(row) <= elo_col:
                         row.append('')
+                    while len(row) < len(header):
+                        row.append('')
                     row[elo_col] = str(int(round(estimated_elo)))
+                    if std_error is not None:
+                        row[se_col] = f"{std_error:.1f}"
+                    if ci_low is not None:
+                        row[ci_low_col] = str(int(round(ci_low)))
+                    if ci_high is not None:
+                        row[ci_high_col] = str(int(round(ci_high)))
                     updated = True
                     break
 
@@ -3072,12 +3124,23 @@ class TrainingLogger:
                 with open(self.csv_path, 'w', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerows(metadata_rows)
+                    rows[0] = header
                     writer.writerows(rows)
         except Exception:
             # CSV backfill is best-effort only.
             pass
 
-    def record_estimated_elo_mode(self, iteration, estimated_elo, *, mode="nn", simulations=0, update_csv=True):
+    def record_estimated_elo_mode(
+        self,
+        iteration,
+        estimated_elo,
+        *,
+        mode="nn",
+        simulations=0,
+        update_csv=True,
+        std_error=None,
+        ci95=None,
+    ):
         """Backfill mode-specific Elo columns in RL CSV."""
         if self.mode != "rl" or estimated_elo is None:
             return
@@ -3085,10 +3148,19 @@ class TrainingLogger:
             iteration = int(iteration)
             elo_value = int(round(float(estimated_elo)))
         except (TypeError, ValueError):
-            return
+                return
         mode = "mcts" if str(mode).lower() == "mcts" else "nn"
+        std_error = _clean_optional_float(std_error)
+        ci_low, ci_high = _clean_elo_ci95(ci95)
+        prefix = 'estimated_elo_mcts' if mode == "mcts" else 'estimated_elo_nn'
         pending = self._pending_rl_elo_by_iteration.setdefault(int(iteration), {})
-        pending['estimated_elo_mcts' if mode == "mcts" else 'estimated_elo_nn'] = elo_value
+        pending[prefix] = elo_value
+        if std_error is not None:
+            pending[f'{prefix}_se'] = f"{std_error:.1f}"
+        if ci_low is not None:
+            pending[f'{prefix}_ci95_low'] = str(int(round(ci_low)))
+        if ci_high is not None:
+            pending[f'{prefix}_ci95_high'] = str(int(round(ci_high)))
         if mode == "mcts":
             try:
                 pending['estimated_elo_mcts_simulations'] = int(simulations or 0)
@@ -3100,13 +3172,22 @@ class TrainingLogger:
                 if not rows:
                     return
                 header = list(rows[0])
-                for col in ('estimated_elo_nn', 'estimated_elo_mcts', 'estimated_elo_mcts_simulations'):
+                for col in (
+                    'estimated_elo_nn', 'estimated_elo_nn_se',
+                    'estimated_elo_nn_ci95_low', 'estimated_elo_nn_ci95_high',
+                    'estimated_elo_mcts', 'estimated_elo_mcts_se',
+                    'estimated_elo_mcts_ci95_low', 'estimated_elo_mcts_ci95_high',
+                    'estimated_elo_mcts_simulations',
+                ):
                     if col not in header:
                         header.append(col)
                         for row in rows[1:]:
                             row.append('')
-                target_col = 'estimated_elo_mcts' if mode == "mcts" else 'estimated_elo_nn'
+                target_col = prefix
                 target_idx = header.index(target_col)
+                se_idx = header.index(f'{prefix}_se')
+                ci_low_idx = header.index(f'{prefix}_ci95_low')
+                ci_high_idx = header.index(f'{prefix}_ci95_high')
                 sims_idx = header.index('estimated_elo_mcts_simulations')
                 iter_col = 'iteration' if 'iteration' in header else 'epoch'
                 iter_idx = header.index(iter_col)
@@ -3119,6 +3200,12 @@ class TrainingLogger:
                         continue
                     if row_it == iteration:
                         row[target_idx] = str(elo_value)
+                        if std_error is not None:
+                            row[se_idx] = f"{std_error:.1f}"
+                        if ci_low is not None:
+                            row[ci_low_idx] = str(int(round(ci_low)))
+                        if ci_high is not None:
+                            row[ci_high_idx] = str(int(round(ci_high)))
                         if mode == "mcts":
                             try:
                                 row[sims_idx] = str(int(simulations or 0))
@@ -3223,6 +3310,34 @@ class TrainingLogger:
         except (TypeError, ValueError):
             return None, None
 
+    def _plot_elo_errorbars(self, ax, xs, ys, yerrs, color, *, label=None, x_offset=0.0, alpha=0.38):
+        clean_xs, clean_ys, clean_errs = [], [], []
+        for x, y, err in zip(xs or [], ys or [], yerrs or []):
+            err_value = _clean_optional_float(err)
+            if err_value is None or err_value <= 0.0:
+                continue
+            try:
+                clean_xs.append(float(x) + float(x_offset))
+                clean_ys.append(float(y))
+                clean_errs.append(float(err_value))
+            except (TypeError, ValueError):
+                continue
+        if not clean_xs:
+            return
+        ax.errorbar(
+            clean_xs,
+            clean_ys,
+            yerr=clean_errs,
+            fmt='none',
+            ecolor=color,
+            elinewidth=1.35,
+            capsize=3.0,
+            capthick=1.0,
+            alpha=alpha,
+            label=label,
+            zorder=2,
+        )
+
     def record_swa_elo(self, epoch, elo):
         """Store SWA model Elo for distinct visual treatment (gold star) in plots.
 
@@ -3268,6 +3383,8 @@ class TrainingLogger:
         simulations=0,
         label=None,
         update_csv=True,
+        std_error=None,
+        ci95=None,
     ):
         """Store an IL raw-NN or MCTS Elo marker for the Elo panel."""
         if self.mode != "il" or elo is None:
@@ -3279,6 +3396,8 @@ class TrainingLogger:
             return
 
         mode = "mcts" if str(mode).lower() == "mcts" else "nn"
+        std_error = _clean_optional_float(std_error)
+        ci_low, ci_high = _clean_elo_ci95(ci95)
         try:
             simulations = int(simulations or 0)
         except (TypeError, ValueError):
@@ -3293,6 +3412,8 @@ class TrainingLogger:
             "mode": mode,
             "simulations": simulations,
             "label": label_text,
+            "std_error": std_error,
+            "ci95": (ci_low, ci_high),
         }
 
         replaced = False
@@ -3317,7 +3438,13 @@ class TrainingLogger:
             if not rows:
                 return
             header = list(rows[0])
-            for col in ('estimated_elo_nn', 'estimated_elo_mcts', 'estimated_elo_mcts_simulations'):
+            for col in (
+                'estimated_elo_nn', 'estimated_elo_nn_se',
+                'estimated_elo_nn_ci95_low', 'estimated_elo_nn_ci95_high',
+                'estimated_elo_mcts', 'estimated_elo_mcts_se',
+                'estimated_elo_mcts_ci95_low', 'estimated_elo_mcts_ci95_high',
+                'estimated_elo_mcts_simulations',
+            ):
                 if col not in header:
                     header.append(col)
                     for row in rows[1:]:
@@ -3326,6 +3453,9 @@ class TrainingLogger:
             iter_idx = header.index(iter_col)
             target_col = 'estimated_elo_mcts' if mode == "mcts" else 'estimated_elo_nn'
             target_idx = header.index(target_col)
+            se_idx = header.index(f'{target_col}_se')
+            ci_low_idx = header.index(f'{target_col}_ci95_low')
+            ci_high_idx = header.index(f'{target_col}_ci95_high')
             sims_idx = header.index('estimated_elo_mcts_simulations')
 
             target_row = None
@@ -3345,6 +3475,12 @@ class TrainingLogger:
                 rows.append(target_row)
 
             target_row[target_idx] = str(int(round(elo_value)))
+            if std_error is not None:
+                target_row[se_idx] = f"{std_error:.1f}"
+            if ci_low is not None:
+                target_row[ci_low_idx] = str(int(round(ci_low)))
+            if ci_high is not None:
+                target_row[ci_high_idx] = str(int(round(ci_high)))
             if mode == "mcts":
                 target_row[sims_idx] = str(simulations) if simulations > 0 else ''
             rows[0] = header
@@ -3559,6 +3695,18 @@ class TrainingLogger:
                     )
                 else:
                     ax.plot(elo_epochs, elo_vals, 'go-', label='Estimated Elo', linewidth=2, markersize=8)
+                elo_errs = [
+                    (self.estimated_elo_errors.get(int(ep), {}) or {}).get('se')
+                    for ep, _ in regular_elos
+                ]
+                self._plot_elo_errorbars(
+                    ax,
+                    elo_epochs,
+                    elo_vals,
+                    elo_errs,
+                    'green',
+                    label='Estimated Elo ±SE',
+                )
                 all_elo_vals = elo_vals
             else:
                 all_elo_vals = [v for _, v in visible_elos]
@@ -3669,6 +3817,16 @@ class TrainingLogger:
                     linestyle='None',
                     label=legend_label,
                     zorder=7,
+                )
+                self._plot_elo_errorbars(
+                    ax,
+                    [marker_epoch],
+                    [marker_elo],
+                    [marker_info.get("std_error")],
+                    style["color"],
+                    label=f'Final {style["title"]} ±SE',
+                    x_offset=-0.06 if marker_mode == "nn" else 0.06,
+                    alpha=0.45,
                 )
 
         if has_markers:
@@ -3858,10 +4016,21 @@ class TrainingLogger:
                         estimated_elo = None
                 else:
                     row.append('')
+                row.extend([
+                    kwargs.get('estimated_elo_se', ''),
+                    kwargs.get('estimated_elo_ci95_low', ''),
+                    kwargs.get('estimated_elo_ci95_high', ''),
+                ])
 
                 row.extend([
                     kwargs.get('estimated_elo_nn', ''),
+                    kwargs.get('estimated_elo_nn_se', ''),
+                    kwargs.get('estimated_elo_nn_ci95_low', ''),
+                    kwargs.get('estimated_elo_nn_ci95_high', ''),
                     kwargs.get('estimated_elo_mcts', ''),
+                    kwargs.get('estimated_elo_mcts_se', ''),
+                    kwargs.get('estimated_elo_mcts_ci95_low', ''),
+                    kwargs.get('estimated_elo_mcts_ci95_high', ''),
                     kwargs.get('estimated_elo_mcts_simulations', ''),
                 ])
 
@@ -4067,7 +4236,25 @@ class TrainingLogger:
             else:  # RL mode
                 pending_elo = dict(self._pending_rl_elo_by_iteration.pop(int(iteration), {}) or {})
                 estimated_elo_nn = kwargs.get('estimated_elo_nn', pending_elo.get('estimated_elo_nn', ''))
+                estimated_elo_nn_se = kwargs.get('estimated_elo_nn_se', pending_elo.get('estimated_elo_nn_se', ''))
+                estimated_elo_nn_ci95_low = kwargs.get(
+                    'estimated_elo_nn_ci95_low',
+                    pending_elo.get('estimated_elo_nn_ci95_low', ''),
+                )
+                estimated_elo_nn_ci95_high = kwargs.get(
+                    'estimated_elo_nn_ci95_high',
+                    pending_elo.get('estimated_elo_nn_ci95_high', ''),
+                )
                 estimated_elo_mcts = kwargs.get('estimated_elo_mcts', pending_elo.get('estimated_elo_mcts', ''))
+                estimated_elo_mcts_se = kwargs.get('estimated_elo_mcts_se', pending_elo.get('estimated_elo_mcts_se', ''))
+                estimated_elo_mcts_ci95_low = kwargs.get(
+                    'estimated_elo_mcts_ci95_low',
+                    pending_elo.get('estimated_elo_mcts_ci95_low', ''),
+                )
+                estimated_elo_mcts_ci95_high = kwargs.get(
+                    'estimated_elo_mcts_ci95_high',
+                    pending_elo.get('estimated_elo_mcts_ci95_high', ''),
+                )
                 estimated_elo_mcts_simulations = kwargs.get(
                     'estimated_elo_mcts_simulations',
                     pending_elo.get('estimated_elo_mcts_simulations', ''),
@@ -4158,7 +4345,13 @@ class TrainingLogger:
 
                 row.extend([
                     estimated_elo_nn,
+                    estimated_elo_nn_se,
+                    estimated_elo_nn_ci95_low,
+                    estimated_elo_nn_ci95_high,
                     estimated_elo_mcts,
+                    estimated_elo_mcts_se,
+                    estimated_elo_mcts_ci95_low,
+                    estimated_elo_mcts_ci95_high,
                     estimated_elo_mcts_simulations,
                 ])
                  
@@ -4404,7 +4597,7 @@ class TrainingLogger:
 
         fig.suptitle('IL Training Progress', fontsize=21, fontweight='bold', y=0.992)
         context_lines = self._build_plot_context_lines(wrap_width=150)
-        for line_idx, line in enumerate(context_lines[:3]):
+        for line_idx, line in enumerate(context_lines[:4]):
             fig.text(
                 0.5,
                 0.970 - line_idx * 0.012,
@@ -4871,6 +5064,25 @@ class TrainingLogger:
         def _series(column):
             return _series_from(rows, column)
 
+        def _series_errors(xs, column):
+            values_by_iteration = {}
+            for row in rows:
+                try:
+                    iteration = int(float(row.get('iteration', '')))
+                    raw = row.get(column, '')
+                    if raw is None or raw == '':
+                        continue
+                    values_by_iteration[iteration] = float(raw)
+                except (TypeError, ValueError):
+                    continue
+            result = []
+            for x in xs or []:
+                try:
+                    result.append(values_by_iteration.get(int(float(x))))
+                except (TypeError, ValueError):
+                    result.append(None)
+            return result
+
         def _detail_series(column):
             return _series_from(detail_rows, column)
 
@@ -5252,6 +5464,15 @@ class TrainingLogger:
             plotted_elo_points = list(zip(elo_xs, elo_ys))
         else:
             _plot_line(ax, nn_elo_xs, nn_elo_ys, 'Raw NN Elo', '#2563EB', marker='o', linewidth=2.2)
+            self._plot_elo_errorbars(
+                ax,
+                nn_elo_xs,
+                nn_elo_ys,
+                _series_errors(nn_elo_xs, 'estimated_elo_nn_se'),
+                '#2563EB',
+                label='Raw NN ±SE',
+                x_offset=-0.06,
+            )
             sims_xs, sims_ys = _series('estimated_elo_mcts_simulations')
             sims_by_iter = {int(x): int(round(float(y))) for x, y in zip(sims_xs, sims_ys)}
             mcts_label = 'MCTS Elo'
@@ -5262,6 +5483,15 @@ class TrainingLogger:
                 else:
                     mcts_label = "MCTS Elo (sims marked)"
             _plot_line(ax, mcts_elo_xs, mcts_elo_ys, mcts_label, '#059669', marker='s', linewidth=2.2)
+            self._plot_elo_errorbars(
+                ax,
+                mcts_elo_xs,
+                mcts_elo_ys,
+                _series_errors(mcts_elo_xs, 'estimated_elo_mcts_se'),
+                '#059669',
+                label='MCTS ±SE',
+                x_offset=0.06,
+            )
             for x, y in zip(mcts_elo_xs, mcts_elo_ys):
                 sims = sims_by_iter.get(int(x))
                 if sims:

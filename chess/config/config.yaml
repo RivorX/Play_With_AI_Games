@@ -21,22 +21,28 @@ paths:
 
 # ------------------------------------------------------------------------------
 # DATA
+# Data/cache order:
+#   1. PGN/Binary cache: min_elo, max_games, game_filters, max_moves_per_game
+#   2. Game range cache: binary identity only
+#   3. Split: train_split
+#   4. positions/game cache: train_split + positions_per_game
+#   5. final index cache: positions/game + sample_dedup + target_positions
+#   6. soft target cache: final index + soft_targets
+#   7. train_sampling: training only, no dataset cache rebuild
+# Runtime knobs below affect speed only, not cache semantics.
 # ------------------------------------------------------------------------------
 data:
-  # --------------------------------------------------------------------------
-  # 1) PGN -> BINARY DATA (requires preprocessing rebuild)
-  # --------------------------------------------------------------------------
-  min_elo: 2300              # Minimum Elo rating for games
-  max_games: "max"           # Number of games per PGN, or "max" to use the entire file
-  max_moves_per_game: 300    # Skip only extreme/corrupt games; normal long games are sampled by positions_per_game
+  # 1) PGN -> binary cache. Changing these rebuilds *_positions.bin.
+  min_elo: 2300
+  max_games: "max"           # number per PGN, or "max" for full file
+  max_moves_per_game: 300
 
-  # Game-level quality filters (headers + length)
   game_filters:
     enabled: true
-    min_fullmove: 10              # Minimum fullmoves for any decisive game
-    min_fullmove_draw: 20         # Stronger filter for short draws
-    min_fullmove_resign: 12       # Early resignations
-    max_elo_gap: 500              # Keep useful strong-vs-strong games with moderate Elo gaps
+    min_fullmove: 10
+    min_fullmove_draw: 20
+    min_fullmove_resign: 12
+    max_elo_gap: 500
     exclude_terminations:
       - "Time forfeit"
       - "Timeout"
@@ -44,97 +50,93 @@ data:
       - "Abandoned"
       - "Rules infraction"
 
-  # --------------------------------------------------------------------------
-  # 2) IL SAMPLE CACHE (fast to rebuild before training)
-  # --------------------------------------------------------------------------
-  train_split: 0.85          # Train/validation split ratio for index selection only
+  # 2) Train/val split. Changing this rebuilds split-specific position/index/soft caches.
+  train_split: 0.85
 
-  # Quick knob for making IL smaller/larger without rebuilding the binary.
+  # 3) Per-game selector cache. This is the main "which positions enter IL" knob.
   positions_per_game:
     enabled: true
-    selection_mode: "smart"          # smart = scored positions with spacing; even = old evenly-spaced selector
-    max_total: 40                 # Max sampled plies per game
-    min_distance: 4               # Minimum ply distance between selected positions in one game
-    auto_expand_max_total_before_distance: 50 # Raise max_total up to this before relaxing min_distance
-    auto_relax_min_distance_for_target: true  # If target still cannot fit, relax min_distance from 4 to 3
-    workers: auto                 # Parallel selector workers (auto = CPU threads - 1)
-    chunk_size: 2048              # Games per selector task; larger = less overhead, smaller = smoother progress
-    opening_pct: 20               # Percent of max_total from early-game positions
-    middlegame_pct: 45            # Percent of max_total from middlegame positions
-    endgame_pct: 35               # Percent of max_total from late-game positions
-    rare_or_eventful_pct: 0       # Percent reserved for rare/eventful positions; scans full records when > 0
+    selection_mode: "smart"      # smart | even
+    max_total: 40
+    min_distance: 4
+    opening_pct: 20
+    middlegame_pct: 45
+    endgame_pct: 35
+    rare_or_eventful_pct: 0
 
-  # IL target after all filters/dedup. The startup prompt writes an integer here.
-  # Use "max" only when you explicitly want all available selected positions.
-  target_positions: 20000000
-
-  # Training-time sampler over the final deduped rows. This changes how often a
-  # selected row appears in training, not the validation set or cached targets.
-  train_sampling:
-    enabled: true
-    mode: "policy_weighted"       # shuffle | policy_weighted
-    source: "sample_weight"       # sample_weight | occurrence_count
-    weight_power: 0.5             # Mild oversampling; loss still uses full sample_weight
-    min_weight: 0.05
-    max_weight: 64
-    epoch_size_multiplier: 1.0    # 1.0 = one epoch has len(train_dataset) drawn samples
-    opening_floor: 0.0            # Opening boost comes from sample_weight; avoids a huge phase-label scan at startup
-    opening_progress_max: 0.25
-    endgame_progress_min: 0.75
-    phase_chunk_size: 1000000
-
-  # Index-level dedup for IL samples. The binary keeps full games intact for
-  # dynamic history and moves-left; only the training index list is capped.
+  # 4) Final index dedup cache. Binary still keeps full games/history.
   sample_dedup:
     enabled: true
-    mode: "fen"                  # fen keeps pieces + castling + ep + counters; soft policy stores move mix
-    include_turn: true           # Include side-to-move in signature
-    include_history: true        # Match the model input when history_positions > 0
-    max_count: 1                 # Soft targets already aggregate repeated outcomes/moves
+    mode: "fen"
+    include_turn: true
+    include_history: true
+    max_count: 1
 
-  # Empirical soft targets from repeated positions inside each split.
-  # No engine needed: policy is a move-frequency distribution, value is WDL frequency.
+  # 5) Final target size. Changing this rebuilds final index + soft target cache only.
+  target_positions: 20000000
+
+  # 6) Soft target cache. Aggregates raw split knowledge into final selected rows.
   soft_targets:
     enabled: true
-    workers: auto                 # Parallel aggregation workers (auto = CPU threads - 1)
-    chunk_size: 500000            # Source positions per aggregation task
-    materialize_workers: auto     # Parallel final-array workers
-    materialize_chunk_size: 250000 # Final positions per materialization task
     policy: true
     value: true
-    mode: "fen"                  # Do not mix castling, en passant, halfmove/fullmove metadata
+    source: "raw_split"
+    mode: "fen_no_counters"
     include_turn: true
-    include_history: false       # Aggregate policy targets by current board; model input still keeps history
+    include_history: false
+    max_policy_moves: 32
+    policy_mass_threshold: 0.995
+
     value_key:
-      mode: "fen_no_counters"     # Value aggregates by current board + rule metadata, not full move number
+      mode: "fen_no_counters"
       include_turn: true
-      include_history: false      # Policy sees history; value target should generalize across transpositions
-    value_wdl_shrinkage_alpha: 1.0 # Blend low-count WDL targets toward split prior; lower = stronger value signal
-    value_sample_weight:
-      enabled: true
-      confidence_min: 0.60        # Singletons still teach value, repeated positions are trusted more
-      confidence_k: 3.0
-      progress_min: 0.25          # Opening outcome labels are noisy; endgame labels are cleaner
-      progress_power: 1.5
-      max: 1.0
-    max_policy_moves: 32         # Sparse top-K cap; 16 can drop useful opening move mass
-    policy_mass_threshold: 0.995 # Stop before max_policy_moves once this mass is retained
+      include_history: false
+    value_wdl_shrinkage_alpha: 1.0
+
+    policy_target:
+      hard_below_count: 4
+      soft_full_count: 16
+      opening_progress_max: 0.25
+      endgame_progress_min: 0.75
+      opening_soft_power: 0.85
+      middlegame_soft_power: 1.25
+      endgame_soft_power: 1.35
+
     sample_weight:
       enabled: true
-      mode: "sqrt_count"         # occurrence_count | sqrt_count | log_count | none
-      max: 32                    # Normal cap for repeated positions
-      opening_progress_max: 0.25 # Opening samples are aggregated hard; restore some policy mass by weight
-      opening_boost_min_count: 2 # Only boost positions that actually aggregate multiple games
-      opening_multiplier: 2.0
-      opening_max: 64            # Opening-specific cap; value weighting remains separately conservative
+      mode: "sqrt_count"
+      max: 8
+      opening_progress_max: 0.25
+      opening_boost_min_count: 2
+      opening_multiplier: 1.5
+      opening_max: 12
 
-  # --------------------------------------------------------------------------
-  # 3) PREPROCESSING SPEED ONLY (does not change data)
-  # --------------------------------------------------------------------------
-  files_at_once: 1            # PGN files per batch (1=seq, 2-4=batch)
-  phase1_threads: all         # PGN parse workers (1=off, all=cpu)
-  phase2_threads: all         # Position workers (1=off, all=cpu)
-  phase2_chunk_size: 512      # Games per Phase 2 task; lowers Windows ProcessPool overhead
+    value_sample_weight:
+      enabled: true
+      confidence_min: 0.60
+      confidence_k: 3.0
+      progress_min: 0.25
+      progress_power: 1.5
+      max: 1.0
+
+  # 7) Training sampler. No cache rebuild; affects only epoch sampling.
+  train_sampling:
+    enabled: false
+    mode: "policy_weighted"
+    source: "sample_weight"
+    weight_power: 0.5
+    min_weight: 0.05
+    max_weight: 64
+    epoch_size_multiplier: 1.0
+    opening_floor: 0.0
+
+  # PGN/soft-target preprocessing runtime. Speed only, no cache hash.
+  files_at_once: 1
+  phase1_threads: all
+  phase2_threads: all
+  phase2_chunk_size: 512
+  soft_target_workers: auto
+  soft_target_chunk_size: 500000
 
 
 # ------------------------------------------------------------------------------
@@ -142,7 +144,7 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v9.4"
+  version: "v9.7"
   # Base architecture
   num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
   filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
@@ -174,24 +176,25 @@ model:
 # SHARED AUTO-TUNE (IL + RL)
 # ------------------------------------------------------------------------------
 auto_tune:
-  use_for_il: true                   # IL may run probing + cache writes (when IL mode=auto)
-  use_for_rl: false                  # RL should not reuse IL cache; huge IL-sized batches were starving RL of update steps
+  # Scope/cache
+  use_for_rl: false                  # IL auto-tune is enabled by default; RL should not reuse IL-sized batches
   cache_path: "logs/il_auto_tune_cache.yaml"
-  dedicated_vram_utilization: 0.90 # Push IL harder; auto-tune still backs off on OOM
-  min_batch_size: 64
+
+  # Batch search
+  dedicated_vram_utilization: 0.90
   max_batch_size: 24576
   batch_round_to: 256
-  batch_selection: throughput # Pick the fastest probed batch, not the smallest near-peak batch
+  batch_selection: throughput
   throughput_candidate_count: 7
-  throughput_tolerance: 0.03  # Only relevant for balanced fallback; throughput mode uses the best candidate
-  lr_test_enabled: true
+  throughput_tolerance: 0.03
+
+  # LR range test
   lr_test_min: 0.0002
   lr_test_max: 0.005
   lr_test_points: 10
   lr_test_steps: 20
-  lr_test_early_stop_patience: 3   # Stop LR scan after N clearly worse candidates in a row
-  lr_test_early_stop_min_candidates: 4
-  lr_test_early_stop_score_margin: 0.0002
+
+  # Final LR clamp
   lr_min: 0.0002
   lr_max: 0.005
 
@@ -200,61 +203,36 @@ auto_tune:
 # IMITATION LEARNING (IL)
 # ------------------------------------------------------------------------------
 imitation_learning:
-  # Checkpoint content
-  save_optimizer_state: true  # Save optimizer state in IL checkpoints for true resume
+  # Core training
+  epochs: 50
+  batch_size: 8192              # fallback; auto-tune may override
+  learning_rate: 0.001          # fallback/base LR
+  weight_decay: 0.002
 
-  # Training hyperparameters (used directly in config mode, and as fallback defaults)
-  batch_size: 8192           # Fallback batch size; auto-tune may raise up to auto_tune.max_batch_size
-  eval_batch_size: 0         # 0 = derive from train batch using eval_batch_size_multiplier
-  eval_batch_size_multiplier: 1.0 # Keep eval batch same as train; larger eval batches spike CUDA cache/VRAM
-  learning_rate: 0.001       # Base/fallback LR (used for config mode and LR-test fallback)
+  # LR schedule
+  min_lr_ratio: 0.005
 
-  # Advanced training hyperparameters
-  value_head_lr_factor: 1.0  # Value head LR multiplier; value needs extra adaptation for MCTS usefulness
-  epochs: 50                 # Maximum training epochs
-  weight_decay: 0.002        # L2 regularization (10x stronger for value head)
-  grad_clip: 1.0             # Gradient clipping threshold
+  # Losses
+  policy_loss_weight: 1.0
+  value_loss_weight: 1.0
+  value_scalar_aux_loss_weight: 0.20
+  moves_left_loss_weight: 0.05
+  wdl_label_smoothing: 0.01
 
-  # Stochastic Weight Averaging (SWA) for better generalization
-  use_swa: true              # Enable SWA (averages weights from multiple epochs)
-  swa_auto_start: true       # Auto-start SWA from validation plateau instead of a fixed early epoch
-  swa_auto_min_epoch: 18     # Never start SWA before this epoch in new/resume training
-  swa_auto_plateau_patience: 3 # Start after N evals without meaningful val-loss improvement
-  swa_auto_min_delta: 0.0015 # Meaningful val-loss improvement threshold for SWA plateau detection
-  swa_transfer_unfreeze_offset: 2  # In transfer mode: start SWA N epoch(s) after first fully unfrozen epoch
-  swa_anneal_epochs: 12      # Number of epochs SWALR uses to anneal from current LR to swa_lr
-  swa_stop_after_anneal_no_improve: true # Once SWA LR anneal is done, stop on the first eval without meaningful improvement
-  swa_stop_after_anneal_grace_evals: 3 # Number of post-anneal no-improve evals allowed before stopping
-  swa_lr_mode: "auto"        # auto | manual
-  swa_lr: 0.00005            # Used only when swa_lr_mode=manual
-  swa_lr_ratio: 0.12         # Auto mode: target fraction of effective LR around SWA start
-  swa_lr_min: 0.00003        # Auto mode lower clamp
-  swa_lr_max: 0.00020        # Auto mode upper clamp
+  # Eval + checkpoint selection
+  eval_every: 1
+  train_metrics_interval: 16
+  eval_metrics_interval: 32
+  early_stop_monitor: value_aware # total | value_aware
+  max_patience: 5
+  min_delta: 0.0015
 
-  # Advanced training features
-  policy_label_smoothing: 0.03 # v9.4 ablation: soften sparse IL policy targets without changing sampler
-  warmup_pct: 0.05           # Warmup fraction of epochs (e.g., 0.02-0.05)
-  min_lr_ratio: 0.005        # Min LR = base_lr * ratio
-
-  # WDL-specific options
-  wdl_label_smoothing: 0.01  # Smoothing for value head (WDL is more sensitive to overconfidence)
-  # Loss weights
-  policy_loss_weight: 1.0    # Policy loss weight
-  value_loss_weight: 1.0     # Keep value competitive with policy; MCTS needs calibrated WDL
-  value_scalar_aux_loss_weight: 0.20 # SmoothL1 on W-L scalar so value improves beyond soft WDL CE
-  moves_left_loss_weight: 0.05 # Auxiliary SmoothL1 on log1p(remaining plies)
-  train_metrics_interval: 16 # Compute expensive train top-k/softmax metrics every N batches
-  eval_metrics_interval: 32  # Validation loss stays full; expensive val Top-K/phase metrics are sampled
-
-  # Evaluation
-  eval_every: 1              # Evaluate every N epochs
-
-  # Early stopping
-  max_patience: 5            # Stop if no meaningful monitor improvement for N epochs
-  min_delta: 0.0015          # Minimum improvement threshold
-  early_stop_monitor: value_aware # total or value_aware
-  early_stop_value_loss_weight: 1.25 # Used only by value_aware monitor
-  early_stop_moves_left_loss_weight: 0.03 # Keep MLH from dominating checkpoint selection
+  # SWA
+  use_swa: true
+  swa_auto_min_epoch: 18
+  swa_transfer_unfreeze_offset: 2
+  swa_anneal_epochs: 12
+  swa_stop_after_anneal_grace_evals: 3
 
 # ------------------------------------------------------------------------------
 # REINFORCEMENT LEARNING (RL)
@@ -630,6 +608,22 @@ reinforcement_learning:
   eval_no_mcts_every: 1       # Run the no-MCTS eval every RL iteration
   eval_no_mcts_games: 50      # Cheap raw-policy signal every iteration without slowing RL too much
   eval_no_mcts_use_fixed_openings: true
+
+  # Stockfish Elo after RL promotions. Uses shared elo_estimation NN/MCTS budgets.
+  stockfish_elo:
+    promoted_use_mcts: true
+    final_enabled: true
+    final_use_mcts: true
+    fast_promoted:
+      enabled: true
+      use_mcts: false
+      total_games: 80
+      stockfish_time_limit: 0.06
+      probe_games_per_level: 4
+      focus_games_per_level: 8
+      extra_games_per_level: 2
+      target_focus_levels: 3
+
   # Three-stage promotion funnel. The current learner is promoted immediately
   # after passing one strict exam; weights are never frozen across iterations.
   eval_funnel_preliminary_games: 40
@@ -710,28 +704,19 @@ reinforcement_learning:
 # HARDWARE & OPTIMIZATION
 # ------------------------------------------------------------------------------
 hardware:
-  device: "cuda"             # Device: cuda, cpu, or mps (Mac)
+  # Device + precision
+  device: "cuda"
+  use_amp: true
+  use_bfloat16: true
+  use_compile: true
 
-  # Performance optimizations
-  use_amp: true              # Mixed Precision Training (~2x speedup)
-  use_bfloat16: true         # bfloat16 instead of float16 (better range)
-  num_workers: 5             # CPU workers for data loading
-  prefetch_factor: 1         # DataLoader prefetch factor
-  train_prefetch_factor: 2   # Two prepared train batches per worker smooth out GPU feed stalls
-  val_prefetch_factor: 1     # One queued val batch per worker; raise to 2 only if RAM/pagefile stays calm
-  pin_memory: true           # Faster GPU data transfer
-  val_pin_memory: true       # Validation still benefits from pinned transfer
-  cuda_prefetch_batches: true # Overlap CPU->GPU batch copies with current CUDA compute
-  cuda_prefetch_queue_size: 2 # GPU-side prefetched batches; smooths DataLoader stalls without growing CPU queue
-  cuda_eval_prefetch_queue_size: 1 # Avoid holding multiple large eval batches on GPU
-  persistent_workers: true   # Keep train workers alive between epochs
-  val_persistent_workers: false # Release validation workers after eval; avoids pinned/shared-memory buildup
-  dataloader_index_mmap: true # Store sampled index arrays as .npy mmap so workers share them
-  dataloader_numpy_shuffle: true # Compact shuffle permutation; avoids huge Python int lists
-  dataloader_board_dtype: "float16" # Halve board tensor RAM/pinned/H2D traffic; cast on GPU for model
-  dataloader_train_in_order: false # Let train yield first-ready worker batch; smoother GPU feed with shuffled data
-  dataloader_val_in_order: false # Eval metrics are order-independent; avoid waiting for slowest worker
-  use_compile: true          # torch.compile: fuse Conv+BN+ReLU kernels (~3x speedup)
+  # DataLoader throughput
+  num_workers: 5
+  train_prefetch_factor: 1
+  cuda_eval_prefetch_queue_size: 1
+  dataloader_board_dtype: "float16"
+  dataloader_train_in_order: false
+  dataloader_val_in_order: false
 
 
 # ------------------------------------------------------------------------------
@@ -751,129 +736,57 @@ logging:
 # ELO ESTIMATION
 # ------------------------------------------------------------------------------
 elo_estimation:
-  # Base Stockfish match settings used by manual Elo, final checks, and mode overrides.
+  # Shared Stockfish match
   enabled: true
   stockfish_path: "stockfish"
   levels: [1320, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 2100, 2200, 2300, 2400, 2600, 2800]
-  games_per_level: 40
   stockfish_time_limit: 0.10
   max_moves: 150
-  workers: 0
   stockfish_threads: 1
   stockfish_hash_mb: 32
-  stockfish_hide_window: true
-  max_error_logs_per_type: 8
 
-  # Training-friendly process scheduling.
+  # Runtime scheduling
   prioritize_training: true
   reserve_dataloader_workers: true
-  free_threads_utilization: 1.0
   stockfish_priority: "below_normal"
 
-  # Adaptive ladder: always probe all levels lightly, then spend games near the useful bracket.
+  # Adaptive ladder
   adaptive_probe_games_per_level: 5
   adaptive_min_batch_games: 70
   adaptive_focus_games_per_level: 24
   adaptive_extra_games_per_level: 5
   adaptive_target_focus_levels: 3
-  adaptive_focus_min_score: 0.20
-  adaptive_focus_max_score: 0.80
-  adaptive_skip_high_score: 0.92
-  adaptive_stop_low_score: 0.08
   adaptive_max_total_games: 160
   adaptive_target_standard_error: 45.0
   adaptive_min_games_for_se_stop: 80
 
-  # IL Elo overrides.
+  # NN eval: shared by IL periodic checks and RL raw-network checks
+  nn_eval_workers: 2
+  nn_eval_free_threads_utilization: 0.35
+
+  # MCTS eval: shared final/search-strength check
+  mcts_eval_workers: 12
+  mcts_eval_simulations: 192
+
+  # IL scheduling
   il_eval_every: 2
-  il_games_per_level: 12
-  il_max_moves: 120
-  il_workers: 2
-  il_free_threads_utilization: 0.35
-  il_adaptive_probe_games_per_level: 2
-  il_adaptive_focus_games_per_level: 12
-  il_adaptive_extra_games_per_level: 4
-  il_adaptive_max_total_games: 128
-  il_adaptive_min_games_for_se_stop: 64
-  il_adaptive_target_standard_error: 55.0
   final_on_il_shutdown: true
-  final_il_workers: 12
-  final_il_games_per_level: 40
-  final_il_max_moves: 220
-  final_il_adaptive_probe_games_per_level: 5
-  final_il_adaptive_focus_games_per_level: 40
-  final_il_adaptive_extra_games_per_level: 8
-  final_il_adaptive_target_focus_levels: 4
-  final_il_adaptive_max_total_games: 320
-  final_il_adaptive_min_games_for_se_stop: 140
-  final_il_adaptive_target_standard_error: 30.0
-  final_il_raw_games_multiplier: 2.0 # Raw NN is fast; run more games for a stabler final IL Elo
-  final_il_mcts_simulations: 192
 
-  # RL promoted-best Elo overrides.
-  promoted_rl_stockfish_time_limit: 0.20 # Normal final Elo uses this slower Stockfish setting
-  promoted_rl_workers: 12               # Base promoted/final Elo worker count; raw/MCTS multipliers may raise it
-  promoted_rl_raw_worker_multiplier: 2.0 # Raw NN Elo is Stockfish-bound, so it can use more parallel games
-  promoted_rl_mcts_worker_multiplier: 1.0 # MCTS Elo keeps fewer workers to preserve useful central inference batches
-  rl_promoted_use_mcts: true            # Normal final Elo: after raw NN, also run MCTS Elo
-  rl_promoted_fast_enabled: true        # During RL, promoted bests get only a quick rough Elo instead of a long normal check
-  rl_promoted_fast_use_mcts: false      # Keep promotion-time Elo cheap; normal final Elo still measures MCTS
-  rl_promoted_fast_total_games: 50
-  rl_promoted_fast_stockfish_time_limit: 0.06
-  rl_promoted_fast_probe_games_per_level: 2
-  rl_promoted_fast_focus_games_per_level: 8
-  rl_promoted_fast_extra_games_per_level: 2
-  rl_promoted_fast_target_focus_levels: 3
-  rl_promoted_fast_mcts_simulations: 128
-  rl_final_elo_enabled: true            # After RL finishes cleanly, run the normal slower Elo on the best checkpoint
-  rl_final_use_mcts: true
-
-  # Generic/manual Elo model move generation.
+  # Model move generation
   batch_model_moves: true
   batch_raw_model_moves: false
-  use_mcts: false              # Default for manual/generic Elo; RL promoted Elo forces raw NN first
-  mcts_simulations: 100        # Manual/generic MCTS Elo only; RL promoted MCTS uses the RL eval MCTS budget
-  elo_mcts_scout_simulations: 128 # Elo uses deterministic scout stops only; no challenge expansion
+  elo_mcts_scout_simulations: 128
   elo_mcts_scout_easy_top_visit_prob: 0.74
   elo_mcts_scout_easy_visit_gap: 0.22
   elo_mcts_scout_easy_max_entropy: 0.54
   elo_mcts_scout_easy_min_explored_prior_mass: 0.95
   elo_mcts_scout_easy_min_visited_moves: 6
 
-  # Standalone eval_elo.py tuning.
-  eval_elo_stockfish_priority: "normal"
-  eval_elo_raw_worker_multiplier: 2.0
-  eval_elo_mcts_worker_multiplier: 1.5
+  # Standalone eval_elo.py MCTS batching
   eval_elo_central_inference_enabled: true
   eval_elo_central_inference_servers: 1
-  eval_elo_central_inference_auto_workers_per_server: 16
-  eval_elo_central_inference_auto_min_servers: 1
-  eval_elo_central_client_groups: "auto"
-  eval_elo_central_target_client_groups: 6
-  eval_elo_central_min_client_groups: 4
-  eval_elo_central_max_client_groups: 8
-  eval_elo_central_games_per_worker_chunk: 4
-  eval_elo_central_target_chunks_per_group: 2
-  eval_elo_central_max_chunk_games: 12
-  eval_elo_central_inference_max_batch_size: 256
   eval_elo_central_inference_flush_ms: 3.0
-  eval_elo_central_inference_transport_dtype: "float16"
   eval_elo_central_inference_use_compile: true
-  eval_elo_central_inference_cache_enabled: false
-  eval_elo_central_inference_timeout_s: 0
-
-  # Output verbosity.
-  elo_verbose_adaptive: false
-  elo_verbose_worker_stats: false
-  elo_verbose_batch_stats: false
-  elo_print_completion_summary: true
-  elo_print_worker_summary: false
-
-  # Async worker device used by IL background Elo and RL cancellable Elo worker.
-  async_in_il: true
-  async_device: "cpu"
-  async_wait_on_shutdown_sec: 0.0
-
 
 # ------------------------------------------------------------------------------
 # 🆕 DEBUG & PROFILING

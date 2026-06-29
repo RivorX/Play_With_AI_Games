@@ -819,9 +819,9 @@ class EloEstimator:
 
     def _resolve_central_max_chunk_games(self) -> int:
         try:
-            return max(0, int(self.elo_config.get("eval_elo_central_max_chunk_games", 0) or 0))
+            return max(0, int(self.elo_config.get("eval_elo_central_max_chunk_games", 12) or 12))
         except (TypeError, ValueError):
-            return 0
+            return 12
 
     @staticmethod
     def _resolve_central_chunk_size(
@@ -884,7 +884,7 @@ class EloEstimator:
         group_count, group_workers = self._resolve_central_client_groups(workers, len(tasks))
         games_per_worker_chunk = max(
             1,
-            int(self.elo_config.get("eval_elo_central_games_per_worker_chunk", 20) or 20),
+            int(self.elo_config.get("eval_elo_central_games_per_worker_chunk", 4) or 4),
         )
         target_chunks_per_group = self._resolve_central_chunk_target()
         max_chunk_games = self._resolve_central_max_chunk_games()
@@ -1384,7 +1384,7 @@ class EloEstimator:
     def estimate(
         self,
         levels: list[int] | None = None,
-        games_per_level: int = 4,
+        games_per_level: int | None = None,
         stockfish_time_limit: float = 0.05,
         max_moves: int = 150,
         use_mcts: bool = False,
@@ -1470,13 +1470,29 @@ class EloEstimator:
         all_scores: list[float] = []
         results_per_level: dict[int, dict] = {}
 
-        requested_total_games = int(len(levels) * max(1, int(games_per_level)))
+        try:
+            probe_games_cfg = int(self.elo_config.get("adaptive_probe_games_per_level", 8) or 8)
+        except (TypeError, ValueError):
+            probe_games_cfg = 8
+        probe_games_cfg = max(2, probe_games_cfg)
+        try:
+            focus_games_cfg = int(self.elo_config.get("adaptive_focus_games_per_level", probe_games_cfg) or probe_games_cfg)
+        except (TypeError, ValueError):
+            focus_games_cfg = probe_games_cfg
+        focus_games_cfg = max(probe_games_cfg, focus_games_cfg)
+        try:
+            extra_round_cfg = int(self.elo_config.get("adaptive_extra_games_per_level", 8) or 8)
+        except (TypeError, ValueError):
+            extra_round_cfg = 8
+        extra_round_cfg = max(2, extra_round_cfg)
+
+        requested_total_games = int(len(levels) * max(probe_games_cfg, focus_games_cfg))
         max_total_games = requested_total_games
         try:
             max_total_games = int(self.elo_config.get("adaptive_max_total_games", requested_total_games) or requested_total_games)
         except (TypeError, ValueError):
             max_total_games = requested_total_games
-        max_total_games = max(1, min(requested_total_games, max_total_games))
+        max_total_games = max(1, max_total_games)
 
         workers = self._resolve_workers(workers, total_games=max_total_games)
         batch_model_moves = bool(self.elo_config.get("batch_model_moves", True))
@@ -1502,18 +1518,11 @@ class EloEstimator:
             f"time_limit={float(stockfish_time_limit):.3f}s, "
             f"games=adaptive <= {max_total_games}"
         )
-        adaptive_focus_cap = min(
-            max(1, int(games_per_level)),
-            max(
-                1,
-                int(self.elo_config.get("adaptive_focus_games_per_level", games_per_level) or games_per_level),
-            ),
-        )
         print(
             "  Info: Adaptive Elo ladder enabled: "
             f"levels={levels}, max_games={max_total_games}, "
-            f"probe={int(self.elo_config.get('adaptive_probe_games_per_level', 8) or 8)}, "
-            f"focus<= {adaptive_focus_cap}/level"
+            f"probe={probe_games_cfg}, "
+            f"focus<= {focus_games_cfg}/level"
         )
         if batch_model_moves and workers > 1:
             model_path = "batched_mcts" if use_mcts else "batched_raw"
@@ -1593,11 +1602,9 @@ class EloEstimator:
         try:
             if central_inference_enabled:
                 self._start_central_inference_for_elo(workers)
-            probe_games = max(2, int(self.elo_config.get("adaptive_probe_games_per_level", 8) or 8))
-            probe_games = min(max(1, int(games_per_level)), probe_games)
-            focus_games = max(probe_games, int(self.elo_config.get("adaptive_focus_games_per_level", games_per_level) or games_per_level))
-            focus_games = min(max(1, int(games_per_level)), focus_games)
-            extra_round = max(2, int(self.elo_config.get("adaptive_extra_games_per_level", 8) or 8))
+            probe_games = probe_games_cfg
+            focus_games = focus_games_cfg
+            extra_round = extra_round_cfg
             high_skip = float(self.elo_config.get("adaptive_skip_high_score", 0.92) or 0.92)
             low_stop = float(self.elo_config.get("adaptive_stop_low_score", 0.08) or 0.08)
             focus_min = float(self.elo_config.get("adaptive_focus_min_score", 0.20) or 0.20)
@@ -1907,7 +1914,7 @@ class EloEstimator:
             "total_time": elapsed,
             "adaptive": True,
             "levels_requested": [int(x) for x in levels],
-            "games_per_level_requested": int(games_per_level),
+            "games_per_level_requested": int(games_per_level or 0),
             "actual_games_per_level": {int(k): int(v) for k, v in played_by_level.items() if int(v) > 0},
         }
         if elo_se is not None:
@@ -2272,7 +2279,7 @@ def estimate_model_elo(
 
     stockfish_path = elo_config.get("stockfish_path", "stockfish")
     levels = elo_config.get("levels", [1000, 1300, 1600, 1900, 2200])
-    games_per_level = elo_config.get("games_per_level", 4)
+    games_per_level = elo_config.get("games_per_level")
     sf_time = elo_config.get("stockfish_time_limit", 0.05)
     max_moves = elo_config.get("max_moves", 150)
     use_mcts = elo_config.get("use_mcts", False)

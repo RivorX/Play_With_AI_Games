@@ -2356,7 +2356,7 @@ class ChessGUI:
             policy = policy_logits.float().cpu().numpy()[0]
         
         # Find best legal move
-        best_score = -1
+        best_score = -float('inf')
         best_move = None
         for move in self.board.legal_moves:
             #  v4.4 FIX: Use POV-aware move_to_index (handles black's perspective)
@@ -2412,6 +2412,8 @@ class ChessGUI:
         else:
             #  v4.2: Network-only mode with POV support
             move = self._get_network_move(current_model)
+            if move is None:
+                move = next(iter(self.board.legal_moves), None)
         
         if move:
             self._apply_move(move)

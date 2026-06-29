@@ -52,21 +52,11 @@ def _resolve_eval_workers(requested_workers, use_mcts, elo_cfg):
         requested = 0
     if requested > 0:
         return requested
-    if use_mcts:
-        multiplier = _safe_float(
-            elo_cfg.get("eval_elo_mcts_worker_multiplier", elo_cfg.get("mcts_worker_multiplier", 1.5))
-        )
-    else:
-        multiplier = _safe_float(
-            elo_cfg.get("eval_elo_raw_worker_multiplier", elo_cfg.get("raw_worker_multiplier", 2.0))
-        )
-    if multiplier is None or multiplier <= 1.0:
+    key = "mcts_eval_workers" if use_mcts else "nn_eval_workers"
+    mode_workers = _safe_int(elo_cfg.get(key))
+    if mode_workers is None:
         return 0
-
-    stockfish_threads = _safe_int(elo_cfg.get("stockfish_threads", 1)) or 1
-    stockfish_threads = max(1, stockfish_threads)
-    cpu_total = max(1, int(os.cpu_count() or 1))
-    return max(1, int(math.ceil((cpu_total * multiplier) / stockfish_threads)))
+    return max(0, int(mode_workers))
 
 
 def _build_eval_elo_config(
@@ -517,8 +507,8 @@ def choose_model_entries(catalog, best_path):
 def choose_eval_settings(elo_cfg):
     levels = list(elo_cfg.get("levels", [1320, 1500, 1700, 1900, 2200]))
     default_games = int(elo_cfg.get("games_per_level", 6))
-    default_use_mcts = bool(elo_cfg.get("use_mcts", False))
-    default_sims = int(elo_cfg.get("mcts_simulations", 100))
+    default_use_mcts = False
+    default_sims = int(elo_cfg.get("mcts_eval_simulations", 100))
     default_sf_time = float(elo_cfg.get("stockfish_time_limit", 0.05))
     default_max_moves = int(elo_cfg.get("max_moves", 150))
     default_sf_path = str(elo_cfg.get("stockfish_path", "stockfish"))
@@ -940,25 +930,18 @@ def main():
     if workers <= 0 and "nn" in eval_modes:
         raw_workers = _resolve_eval_workers(workers, False, elo_cfg)
         if raw_workers > 0:
-            raw_multiplier = _safe_float(
-                elo_cfg.get("eval_elo_raw_worker_multiplier", elo_cfg.get("raw_worker_multiplier", 2.0))
-            )
-            print(f"Raw NN workers: auto -> {raw_workers} (x{raw_multiplier:.2f} CPU)")
+            print(f"Raw NN workers: {raw_workers}")
     if workers <= 0 and "mcts" in eval_modes:
         mcts_workers = _resolve_eval_workers(workers, True, elo_cfg)
         if mcts_workers > 0:
-            mcts_multiplier = _safe_float(
-                elo_cfg.get("eval_elo_mcts_worker_multiplier", elo_cfg.get("mcts_worker_multiplier", 1.5))
-            )
-            print(f"MCTS workers:   auto -> {mcts_workers} (x{mcts_multiplier:.2f} CPU)")
+            print(f"MCTS workers:   {mcts_workers}")
         else:
             print("MCTS workers:   auto -> full CPU budget")
     if "mcts" in eval_modes:
         central_enabled = bool(elo_cfg.get("eval_elo_central_inference_enabled", False))
         if central_enabled:
             servers = elo_cfg.get("eval_elo_central_inference_servers", "auto")
-            target = elo_cfg.get("eval_elo_central_inference_auto_workers_per_server", 10)
-            print(f"MCTS central:   enabled (servers={servers}, target_workers/server={target})")
+            print(f"MCTS central:   enabled (servers={servers})")
         else:
             print("MCTS central:   disabled")
     print(f"SF time/move:   {sf_time}s")

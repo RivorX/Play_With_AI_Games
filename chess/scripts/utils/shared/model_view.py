@@ -37,6 +37,17 @@ def _fmt_loss(value):
     return f"{float(value):.4f}"
 
 
+def _fmt_params(value):
+    if value is None:
+        return "n/a"
+    value = int(value)
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return str(value)
+
+
 def _count_params(module, trainable_only=False):
     if module is None:
         return 0
@@ -157,6 +168,10 @@ def _build_model_rows(
     blocks = _safe_int(model_cfg.get("num_residual_blocks"))
     dropout = _safe_float(model_cfg.get("dropout"))
     drop_path_rate = _safe_float(model_cfg.get("drop_path_rate"))
+    policy_channels = _safe_int(model_cfg.get("policy_head_channels", model_cfg.get("policy_head_conv_filters")))
+    value_filters = _safe_int(model_cfg.get("value_head_filters"))
+    value_hidden = _safe_int(model_cfg.get("value_hidden_dim"))
+    moves_left_hidden = _safe_int(model_cfg.get("moves_left_hidden_dim"))
     policy_groups = _safe_int(model_cfg.get("policy_head_conv_groups"))
     use_coord_conv = bool(model_cfg.get("use_coord_conv", False))
     use_se = bool(model_cfg.get("use_se_blocks", False))
@@ -170,42 +185,64 @@ def _build_model_rows(
     if source_label:
         rows.append(("Source", source_label))
     if startup_mode:
-        rows.append(("Startup mode", startup_mode))
+        rows.append(("Mode", startup_mode))
     if checkpoint_label:
         rows.append(("Checkpoint", str(checkpoint_label)))
     if load_mode:
         rows.append(("Load mode", load_mode))
     if device is not None:
         rows.append(("Device", str(device)))
-    if blocks is not None:
-        rows.append(("Residual blocks", blocks))
-    if filters is not None:
-        rows.append(("Filters", filters))
-    if history is not None:
-        rows.append(("History positions", history))
-    if input_planes is not None and history is not None:
-        rows.append(("Input planes", f"{input_planes} (16 x {1 + history})"))
-    elif input_planes is not None:
-        rows.append(("Input planes", input_planes))
-    if dropout is not None:
-        rows.append(("Dropout", f"{dropout:.3f}"))
 
+    arch_parts = []
+    if blocks is not None and filters is not None:
+        arch_parts.append(f"{blocks} blocks x {filters} filters")
+    elif blocks is not None:
+        arch_parts.append(f"{blocks} blocks")
+    elif filters is not None:
+        arch_parts.append(f"{filters} filters")
+    if history is not None:
+        arch_parts.append(f"history={history}")
+    if input_planes is not None:
+        arch_parts.append(f"input={input_planes} planes")
+    if arch_parts:
+        rows.append(("Architecture", ", ".join(arch_parts)))
+
+    head_parts = []
+    if policy_channels is not None:
+        head_parts.append(f"policy={policy_channels}ch")
+    if value_filters is not None and value_hidden is not None:
+        head_parts.append(f"value={value_filters}ch/{value_hidden}")
+    elif value_hidden is not None:
+        head_parts.append(f"value={value_hidden}")
+    if moves_left_hidden is not None:
+        head_parts.append(f"mlh={moves_left_hidden}")
+    if head_parts:
+        rows.append(("Heads", ", ".join(head_parts)))
+
+    feature_parts = []
     if use_coord_conv:
-        rows.append(("CoordConv", "enabled"))
+        feature_parts.append("CoordConv")
     if use_se:
         if use_se_bottleneck and se_reduction is not None:
-            rows.append(("SE blocks", f"enabled (bottleneck, r={se_reduction})"))
-        elif use_se_bottleneck:
-            rows.append(("SE blocks", "enabled (bottleneck)"))
+            feature_parts.append(f"SE r={se_reduction}")
         else:
-            rows.append(("SE blocks", "enabled (no bottleneck)"))
+            feature_parts.append("SE")
     if use_layer_scale:
-        if layer_scale_init is None:
-            rows.append(("LayerScale", "enabled"))
-        else:
-            rows.append(("LayerScale", f"enabled (init={layer_scale_init})"))
+        feature_parts.append("LayerScale")
+    if dropout is not None and dropout > 0:
+        feature_parts.append(f"dropout={dropout:.3f}")
     if drop_path_rate is not None and drop_path_rate > 0:
-        rows.append(("Stochastic depth", f"{drop_path_rate:.3f}"))
+        feature_parts.append(f"sd={drop_path_rate:.3f}")
+    if feature_parts:
+        rows.append(("Features", ", ".join(feature_parts)))
+
+    total_params = _count_params(model)
+    trainable_params = _count_params(model, trainable_only=True)
+    if total_params > 0:
+        if trainable_params == total_params:
+            rows.append(("Params", _fmt_params(total_params)))
+        else:
+            rows.append(("Params", f"{_fmt_params(trainable_params)} trainable / {_fmt_params(total_params)} total"))
     if policy_groups is not None and policy_groups > 1:
         rows.append(("Policy conv groups", policy_groups))
     entry = selected_entry or {}
