@@ -2,13 +2,13 @@
 
 import copy
 import gc
+import multiprocessing as mp
 import queue
-import threading
 
 import torch
 
 from src.model import ChessNet, normalize_state_dict_keys
-from utils.shared.elo_estimator import estimate_model_elo
+from utils.shared.elo_runner import run_elo_check
 
 
 def _resolve_async_device(main_device, configured_value):
@@ -74,7 +74,7 @@ def _async_elo_worker(
         worker_model.load_state_dict(model_state_cpu)
         worker_model.eval()
 
-        elo_result = estimate_model_elo(
+        elo_result = run_elo_check(
             worker_model,
             worker_config,
             worker_device,
@@ -131,11 +131,24 @@ class ILEloCoordinator:
         self.async_enabled = bool(self.elo_config.get("async_in_il", True)) if self.enabled else False
         self.async_device = _resolve_async_device(device, self.elo_config.get("async_device", "cpu"))
         self.shutdown_wait_sec = float(self.elo_config.get("async_wait_on_shutdown_sec", 0.0))
+        self.process_restart_limit = max(
+            0,
+            int(
+                self.elo_config.get(
+                    "il_async_process_restart_limit",
+                    self.elo_config.get("async_process_restart_limit", 1),
+                )
+                or 0
+            ),
+        )
 
-        self.result_queue = queue.Queue()
-        self.worker_thread = None
+        self.mp_context = mp.get_context("spawn")
+        self.result_queue = self.mp_context.Queue()
+        self.worker_process = None
         self.worker_epoch = None
         self.worker_cancel_event = None
+        self.worker_payload = None
+        self.worker_restart_count = 0
 
     def print_startup_summary(self, verbose=False):
         """Print runtime Elo configuration."""
@@ -200,31 +213,103 @@ class ILEloCoordinator:
                     print(f"     [async] Epoch {result_epoch} Elo estimation: inconclusive")
 
             if self.worker_epoch == result_epoch:
-                self.worker_epoch = None
-                self.worker_thread = None
-                self.worker_cancel_event = None
+                self._clear_finished_worker()
 
         # Defensive cleanup in case worker ended without queue payload.
-        if self.worker_thread is not None and not self.worker_thread.is_alive() and self.worker_epoch is not None:
-            print(f"     [async] Elo worker for epoch {self.worker_epoch} finished without payload.")
-            self.worker_epoch = None
-            self.worker_thread = None
-            self.worker_cancel_event = None
+        if self.worker_process is not None and not self.worker_process.is_alive() and self.worker_epoch is not None:
+            exitcode = getattr(self.worker_process, "exitcode", None)
+            reason = f"process exited without payload (exitcode={exitcode})"
+            if not self._restart_worker(reason):
+                print(f"     [async] Elo worker for epoch {self.worker_epoch} finished without payload.")
+                self._clear_finished_worker()
 
         if any_new_elo:
             self.logger.plot()
+
+    def _close_worker_process(self, terminate_alive=False):
+        worker = self.worker_process
+        if worker is not None:
+            try:
+                worker.join(timeout=0.2)
+            except Exception:
+                pass
+            try:
+                if terminate_alive and worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=0.5)
+            except Exception:
+                pass
+            try:
+                close = getattr(worker, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
+
+    def _clear_finished_worker(self):
+        self._close_worker_process(terminate_alive=True)
+        self.worker_epoch = None
+        self.worker_process = None
+        self.worker_cancel_event = None
+        self.worker_payload = None
+        self.worker_restart_count = 0
+
+    def _launch_worker_process(self, payload, restart_count=0):
+        epoch_num = int(payload["epoch"])
+        cancel_event = self.mp_context.Event()
+        worker = self.mp_context.Process(
+            target=_async_elo_worker,
+            args=(
+                epoch_num,
+                payload["model_state_cpu"],
+                payload["worker_config"],
+                payload["worker_elo_cfg"],
+                payload["worker_device_str"],
+                self.result_queue,
+                cancel_event,
+            ),
+            name=f"il-elo-epoch-{epoch_num}-try-{restart_count + 1}",
+        )
+        worker.start()
+        self.worker_process = worker
+        self.worker_epoch = epoch_num
+        self.worker_cancel_event = cancel_event
+        self.worker_payload = payload
+        self.worker_restart_count = int(restart_count)
+        return worker
+
+    def _restart_worker(self, reason):
+        if self.worker_payload is None:
+            return False
+        if self.worker_restart_count >= self.process_restart_limit:
+            return False
+
+        epoch_num = int(self.worker_epoch or self.worker_payload.get("epoch", -1))
+        next_restart = self.worker_restart_count + 1
+        print(
+            f"     [async] Elo process for epoch {epoch_num} died ({reason}); "
+            f"restarting {next_restart}/{self.process_restart_limit}."
+        )
+        payload = self.worker_payload
+        self._close_worker_process(terminate_alive=True)
+        self.worker_process = None
+        self.worker_cancel_event = None
+        self._launch_worker_process(payload, restart_count=next_restart)
+        return True
 
     def start_async(self, epoch_num):
         """Start async Elo job if worker is available."""
         if not self.async_enabled:
             return False
 
-        if self.worker_thread is not None and self.worker_thread.is_alive():
+        if self.worker_process is not None and self.worker_process.is_alive():
             print(
                 f"     [async] Worker busy (epoch {self.worker_epoch}); "
                 f"skipping new Elo launch for epoch {epoch_num}."
             )
             return False
+        if self.worker_process is not None:
+            self._clear_finished_worker()
 
         model_state_cpu = _snapshot_model_state_cpu(self.model)
         worker_config = copy.deepcopy(self.config)
@@ -235,27 +320,16 @@ class ILEloCoordinator:
         worker_elo_cfg.setdefault("stockfish_priority", "below_normal")
         worker_elo_cfg.setdefault("stockfish_hide_window", True)
         worker_elo_cfg.setdefault("max_error_logs_per_type", 8)
-        cancel_event = threading.Event()
-
-        worker = threading.Thread(
-            target=_async_elo_worker,
-            args=(
-                int(epoch_num),
-                model_state_cpu,
-                worker_config,
-                worker_elo_cfg,
-                self.async_device.type,
-                self.result_queue,
-                cancel_event,
-            ),
-            daemon=True,
-        )
-        worker.start()
-        self.worker_thread = worker
-        self.worker_epoch = int(epoch_num)
-        self.worker_cancel_event = cancel_event
+        payload = {
+            "epoch": int(epoch_num),
+            "model_state_cpu": model_state_cpu,
+            "worker_config": worker_config,
+            "worker_elo_cfg": worker_elo_cfg,
+            "worker_device_str": self.async_device.type,
+        }
+        self._launch_worker_process(payload, restart_count=0)
         print(
-            f"     [async] Started Elo for epoch {epoch_num} on {self.async_device.type}. "
+            f"     [async] Started Elo process for epoch {epoch_num} on {self.async_device.type}. "
             "Training continues."
         )
         return True
@@ -271,7 +345,7 @@ class ILEloCoordinator:
             return None
 
         print("\n     Estimating Elo (vs Stockfish)...")
-        elo_result = estimate_model_elo(self.model, self.config, self.device, self.elo_config)
+        elo_result = run_elo_check(self.model, self.config, self.device, self.elo_config)
         if elo_result.get("cancelled"):
             raise KeyboardInterrupt
         estimated_elo = elo_result.get("estimated_elo")
@@ -294,7 +368,7 @@ class ILEloCoordinator:
     def shutdown(self, interrupted=False):
         """Handle outstanding async Elo job at shutdown."""
         self.poll_results()
-        if not self.async_enabled or self.worker_thread is None or not self.worker_thread.is_alive():
+        if not self.async_enabled or self.worker_process is None or not self.worker_process.is_alive():
             return
 
         if interrupted and self.worker_cancel_event is not None:
@@ -315,19 +389,25 @@ class ILEloCoordinator:
                 f"Waiting up to {self.shutdown_wait_sec:.1f}s for async Elo "
                 f"(epoch {self.worker_epoch})..."
             )
-            self.worker_thread.join(timeout=self.shutdown_wait_sec)
+            self.worker_process.join(timeout=self.shutdown_wait_sec)
             self.poll_results()
         elif (not interrupted) and self.shutdown_wait_sec <= 0:
             # Give worker a brief chance to observe cancellation and exit.
-            self.worker_thread.join(timeout=1.0)
+            self.worker_process.join(timeout=1.0)
             self.poll_results()
         elif interrupted:
             # On Ctrl+C wait briefly so worker can stop and flush result queue.
-            self.worker_thread.join(timeout=2.0)
+            self.worker_process.join(timeout=2.0)
             self.poll_results()
 
-        if self.worker_thread is not None and self.worker_thread.is_alive():
+        if self.worker_process is not None and self.worker_process.is_alive():
             print(
                 f"Async Elo for epoch {self.worker_epoch} still running; "
-                "continuing shutdown without waiting."
+                "terminating worker process."
             )
+            try:
+                self.worker_process.terminate()
+                self.worker_process.join(timeout=1.0)
+            except Exception:
+                pass
+        self._clear_finished_worker()

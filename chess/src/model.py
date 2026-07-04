@@ -1,4 +1,5 @@
 import os
+import time
 
 import torch
 import torch.nn as nn
@@ -672,6 +673,13 @@ def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None,
         'model_state_dict': state_dict,
         'loss': loss,
     }
+    try:
+        checkpoint['rng_state'] = {
+            'torch_cpu': torch.get_rng_state(),
+            'torch_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        }
+    except Exception:
+        pass
     
     if save_optimizer and optimizer is not None:
         checkpoint['optimizer_state_dict'] = optimizer.state_dict()
@@ -682,9 +690,44 @@ def save_checkpoint(model, optimizer, epoch, loss, path, metadata=None,
     if extra_state:
         checkpoint.update(extra_state)
     
-    torch.save(checkpoint, path)
+    path = os.fspath(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    tmp_path = f"{path}.tmp-{os.getpid()}-{time.time_ns()}"
+    torch.save(checkpoint, tmp_path)
+
+    saved_path = path
+    replace_error = None
+    for attempt in range(6):
+        try:
+            os.replace(tmp_path, path)
+            replace_error = None
+            break
+        except OSError as exc:
+            replace_error = exc
+            time.sleep(0.15 * (attempt + 1))
+
+    if replace_error is not None:
+        fallback_path = f"{path}.fallback-epoch{int(epoch)}-{time.strftime('%Y%m%d_%H%M%S')}.pt"
+        try:
+            os.replace(tmp_path, fallback_path)
+            saved_path = fallback_path
+            print(
+                f"Warning: checkpoint target locked ({path}); "
+                f"saved fallback checkpoint to {fallback_path}. Last error: {replace_error}"
+            )
+        except OSError:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            raise replace_error
     
-    if os.path.exists(path):
-        size_mb = os.path.getsize(path) / (1024 ** 2)
+    if os.path.exists(saved_path):
+        size_mb = os.path.getsize(saved_path) / (1024 ** 2)
         opt_status = "with optimizer" if save_optimizer else "without optimizer"
-        print(f"Checkpoint saved to {path} ({size_mb:.2f} MB, {opt_status})")
+        print(f"Checkpoint saved to {saved_path} ({size_mb:.2f} MB, {opt_status})")
+    return saved_path

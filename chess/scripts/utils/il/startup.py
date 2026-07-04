@@ -674,6 +674,9 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
             val_loss = selected_entry.get("val_loss")
             policy_loss = selected_entry.get("policy_loss")
             selected_elo = selected_entry.get("estimated_elo")
+            selected_elo_nn = selected_entry.get("elo_nn")
+            selected_elo_mcts = selected_entry.get("elo_mcts")
+            selected_elo_mcts_sims = selected_entry.get("elo_mcts_simulations")
             selected_compatibility_ratio = selected_entry.get("compatibility_ratio")
             top1_info = f"{top1 * 100:.2f}%" if top1 is not None else "n/a"
             loss_info = f"{val_loss:.4f}" if val_loss is not None else "n/a"
@@ -683,11 +686,23 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
                 if selected_elo is not None
                 else "n/a"
             )
+            elo_nn_info = (
+                f"{int(round(float(selected_elo_nn)))}"
+                if selected_elo_nn is not None
+                else "n/a"
+            )
+            if selected_elo_mcts is not None:
+                elo_mcts_info = f"{int(round(float(selected_elo_mcts)))}"
+                if selected_elo_mcts_sims is not None:
+                    elo_mcts_info += f"@{int(selected_elo_mcts_sims)}"
+            else:
+                elo_mcts_info = "n/a"
             compat_info = f"{(selected_compatibility_ratio or 0.0) * 100:.2f}%"
             strict_info = "yes" if selected_entry.get("strict_resume_ok", False) else "no"
             print(
                 "  checkpoint stats: "
-                f"top1={top1_info}, val_loss={loss_info}, policy_loss={pol_loss_info}, elo={elo_info}, "
+                f"top1={top1_info}, val_loss={loss_info}, policy_loss={pol_loss_info}, "
+                f"EloNN={elo_nn_info}, EloMCTS={elo_mcts_info}, legacy_elo={elo_info}, "
                 f"compatibility={compat_info}, strict_resume={strict_info}"
             )
         elif selected_entry is not None and selected_entry.get("error"):
@@ -771,6 +786,22 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
                         print("Resume: GradScaler state loaded")
                     except Exception as exc:
                         print(f"WARNING: Failed to load GradScaler state ({exc}).")
+
+                rng_state = checkpoint.get("rng_state")
+                if isinstance(rng_state, dict):
+                    try:
+                        cpu_state = rng_state.get("torch_cpu")
+                        if cpu_state is not None:
+                            torch.set_rng_state(cpu_state.detach().cpu() if hasattr(cpu_state, "detach") else cpu_state)
+                        cuda_states = rng_state.get("torch_cuda") or []
+                        if torch.cuda.is_available() and cuda_states:
+                            torch.cuda.set_rng_state_all([
+                                state.detach().cpu() if hasattr(state, "detach") else state
+                                for state in cuda_states
+                            ])
+                        print("Resume: RNG state loaded")
+                    except Exception as exc:
+                        print(f"WARNING: Failed to load RNG state ({exc}).")
 
                 best_val_loss = float(checkpoint.get("best_val_loss", checkpoint.get("loss", float("inf"))))
                 patience_counter = int(checkpoint.get("patience_counter", 0))

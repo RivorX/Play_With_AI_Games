@@ -12,6 +12,12 @@ from .loss import CombinedLoss
 from ..shared.metrics import MetricsCalculator
 
 
+class _DataLoaderTailSkip(StopIteration):
+    def __init__(self, skipped_batches):
+        super().__init__(skipped_batches)
+        self.skipped_batches = max(0, int(skipped_batches or 0))
+
+
 def _move_batch_to_device(batch_data, device, non_blocking=True):
     """Move a DataLoader batch to device, keeping board tensors channels-last."""
     if torch.is_tensor(batch_data):
@@ -168,9 +174,27 @@ def _next_resilient_batch(iterator_state, label):
         except StopIteration:
             raise
         except BaseException as exc:
+            is_worker_failure = _is_dataloader_worker_failure(exc)
+            expected_batches = int(iterator_state.get('expected_batches', 0) or 0)
+            processed_batches = int(iterator_state.get('processed_batches', 0) or 0)
+            remaining_batches = max(0, expected_batches - processed_batches)
+            tail_tolerance = max(0, int(iterator_state.get('tail_tolerance_batches', 0) or 0))
+            if (
+                iterator_state['enabled']
+                and is_worker_failure
+                and expected_batches > 0
+                and 0 < remaining_batches <= tail_tolerance
+            ):
+                print(
+                    f"\n  Warning: {label} DataLoader worker failed with "
+                    f"{remaining_batches}/{expected_batches} batches left; "
+                    "skipping tail batch(es); workers will be recreated next epoch."
+                )
+                raise _DataLoaderTailSkip(remaining_batches)
+
             if (
                 not iterator_state['enabled']
-                or not _is_dataloader_worker_failure(exc)
+                or not is_worker_failure
                 or iterator_state['restarts'] >= iterator_state['max_restarts']
             ):
                 raise
@@ -303,10 +327,14 @@ def train_epoch_il(
         1,
         int(hw_cfg.get('cuda_train_prefetch_queue_size', hw_cfg.get('cuda_prefetch_queue_size', 2)) or 1),
     )
-    metrics_interval = max(1, int(config['imitation_learning'].get('train_metrics_interval', 1)))
+    metrics_interval = max(1, int(config['imitation_learning'].get('train_metrics_interval', 16)))
     progress_interval = max(1, int(config.get('logging', {}).get('print_every', 10)))
     dataloader_restart_enabled = bool(hw_cfg.get('dataloader_restart_on_worker_failure', True))
     dataloader_max_restarts = max(0, int(hw_cfg.get('dataloader_worker_restart_limit', 2) or 0))
+    dataloader_tail_tolerance = max(
+        0,
+        int(hw_cfg.get('dataloader_worker_failure_tail_tolerance_batches', 2) or 0),
+    )
     iterator_state = {
         'loader': train_loader,
         'device': device,
@@ -316,6 +344,7 @@ def train_epoch_il(
         'enabled': dataloader_restart_enabled,
         'max_restarts': dataloader_max_restarts,
         'restarts': 0,
+        'tail_tolerance_batches': dataloader_tail_tolerance,
     }
     iterator_state['iterator'] = _make_prefetched_iterator(
         train_loader,
@@ -327,8 +356,15 @@ def train_epoch_il(
     processed_batches = 0
     expected_batches = len(train_loader)
     while processed_batches < expected_batches:
+        iterator_state['processed_batches'] = processed_batches
+        iterator_state['expected_batches'] = expected_batches
         try:
             batch_data = _next_resilient_batch(iterator_state, f"train epoch {epoch}")
+        except _DataLoaderTailSkip as exc:
+            skipped = max(0, int(getattr(exc, 'skipped_batches', 0) or 0))
+            if skipped:
+                pbar.update(skipped)
+            break
         except StopIteration:
             break
 
@@ -688,12 +724,16 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
         1,
         int(hw_cfg.get('cuda_eval_prefetch_queue_size', hw_cfg.get('cuda_prefetch_queue_size', 2)) or 1),
     )
-    metrics_interval = max(1, int(config['imitation_learning'].get('eval_metrics_interval', 1)))
+    metrics_interval = max(1, int(config['imitation_learning'].get('eval_metrics_interval', 32)))
     
     with torch.inference_mode():
         eval_pbar = tqdm(total=len(val_loader), desc="Evaluating")
         dataloader_restart_enabled = bool(hw_cfg.get('dataloader_restart_on_worker_failure', True))
         dataloader_max_restarts = max(0, int(hw_cfg.get('dataloader_worker_restart_limit', 2) or 0))
+        dataloader_tail_tolerance = max(
+            0,
+            int(hw_cfg.get('dataloader_worker_failure_tail_tolerance_batches', 2) or 0),
+        )
         eval_iterator_state = {
             'loader': val_loader,
             'device': device,
@@ -703,6 +743,7 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
             'enabled': dataloader_restart_enabled,
             'max_restarts': dataloader_max_restarts,
             'restarts': 0,
+            'tail_tolerance_batches': dataloader_tail_tolerance,
         }
         eval_iterator_state['iterator'] = _make_prefetched_iterator(
             val_loader,
@@ -714,8 +755,15 @@ def evaluate_il(model, val_loader, config, device, non_blocking_transfer=True):
         processed_batches = 0
         expected_batches = len(val_loader)
         while processed_batches < expected_batches:
+            eval_iterator_state['processed_batches'] = processed_batches
+            eval_iterator_state['expected_batches'] = expected_batches
             try:
                 batch_data = _next_resilient_batch(eval_iterator_state, "validation")
+            except _DataLoaderTailSkip as exc:
+                skipped = max(0, int(getattr(exc, 'skipped_batches', 0) or 0))
+                if skipped:
+                    eval_pbar.update(skipped)
+                break
             except StopIteration:
                 break
 

@@ -6,12 +6,10 @@ Run it without parameters and use the menu.
 
 import contextlib
 import copy
-import csv
 import math
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -22,79 +20,22 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet, transfer_matching_weights
-from utils.shared.elo_estimator import EloEstimator, ensure_stockfish
+from utils.shared.elo_estimator import ensure_stockfish
+from utils.shared.elo_runner import (
+    build_eval_elo_config,
+    mode_label,
+    persist_estimated_elo,
+    resolve_eval_workers,
+    run_elo_check,
+    safe_float as _safe_float,
+    safe_int as _safe_int,
+)
 from utils.shared.model_catalog import (
     load_checkpoint_metadata,
-    persist_checkpoint_elo_metadata,
     print_model_table,
     sort_entries_by_folder_and_elo,
 )
 from utils.shared.model_view import print_selected_models_table
-
-
-def _safe_int(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _safe_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _resolve_eval_workers(requested_workers, use_mcts, elo_cfg):
-    requested = _safe_int(requested_workers)
-    if requested is None:
-        requested = 0
-    if requested > 0:
-        return requested
-    key = "mcts_eval_workers" if use_mcts else "nn_eval_workers"
-    mode_workers = _safe_int(elo_cfg.get(key))
-    if mode_workers is None:
-        return 0
-    return max(0, int(mode_workers))
-
-
-def _build_eval_elo_config(
-    elo_cfg,
-    *,
-    levels,
-    games_per_level,
-    mode_use_mcts,
-    simulations,
-    sf_time,
-    max_moves,
-    sf_path,
-    workers,
-):
-    runtime_cfg = copy.deepcopy(elo_cfg)
-    runtime_cfg.update(
-        {
-            "enabled": True,
-            "levels": list(levels),
-            "games_per_level": int(games_per_level),
-            "stockfish_time_limit": float(sf_time),
-            "max_moves": int(max_moves),
-            "stockfish_path": str(sf_path),
-            "workers": int(workers or 0),
-            "use_mcts": bool(mode_use_mcts),
-            "mcts_simulations": int(simulations),
-            "stockfish_priority": str(elo_cfg.get("eval_elo_stockfish_priority", "normal")),
-            "stockfish_hide_window": bool(elo_cfg.get("stockfish_hide_window", True)),
-            "prioritize_training": False,
-            "reserve_dataloader_workers": False,
-            "free_threads_utilization": 1.0,
-            "auto_worker_reserve_cpus": 0,
-            "progress_bar": "always",
-            "batch_model_moves": bool(elo_cfg.get("batch_model_moves", True)),
-            "batch_raw_model_moves": bool(elo_cfg.get("batch_raw_model_moves", False)),
-        }
-    )
-    return runtime_cfg
 
 
 def _is_tty():
@@ -106,16 +47,6 @@ def _print_block(title):
     print(f"\n{line}")
     print(title)
     print(line)
-
-
-def _prompt_text(prompt, default):
-    if not _is_tty():
-        return str(default)
-    try:
-        raw = input(f"{prompt} (default {default}): ").strip()
-    except EOFError:
-        raw = ""
-    return raw or str(default)
 
 
 def _prompt_int(prompt, default, min_value=None):
@@ -168,27 +99,6 @@ def _prompt_float(prompt, default, min_value=None):
             print(f"Value must be >= {min_value}.")
             continue
         return value
-
-
-def _prompt_yes_no(prompt, default):
-    default = bool(default)
-    default_str = "y" if default else "n"
-    if not _is_tty():
-        return default
-
-    while True:
-        try:
-            raw = input(f"{prompt} [y/n] (default {default_str}): ").strip().lower()
-        except EOFError:
-            raw = ""
-
-        if not raw:
-            return default
-        if raw in {"y", "yes"}:
-            return True
-        if raw in {"n", "no"}:
-            return False
-        print("Invalid choice. Enter y or n.")
 
 
 def _prompt_menu(prompt, options, default_idx=0):
@@ -519,8 +429,7 @@ def choose_eval_settings(elo_cfg):
         print(f"Levels (from config): {levels}")
     games_label = "Max games per useful level"
     games_per_level = _prompt_int(games_label, default_games, min_value=1)
-    
-    workers = _prompt_int("Parallel workers (0=auto)", default_workers, min_value=0)
+    workers = default_workers
 
     if _is_tty():
         mcts_default_idx = 1 if default_use_mcts else 0
@@ -543,7 +452,7 @@ def choose_eval_settings(elo_cfg):
 
     sf_time = _prompt_float("Stockfish time per move (seconds)", default_sf_time, min_value=0.0)
     max_moves = _prompt_int("Max moves per game", default_max_moves, min_value=1)
-    sf_path = _prompt_text("Stockfish path", default_sf_path)
+    sf_path = default_sf_path
 
     return {
         "levels": levels,
@@ -556,22 +465,6 @@ def choose_eval_settings(elo_cfg):
         "max_moves": max_moves,
         "sf_path": sf_path,
     }
-
-
-def choose_output_path(chess_dir, model_count):
-    default_save = model_count > 1
-    save_csv = _prompt_yes_no("Save CSV report", default_save)
-    if not save_csv:
-        return None
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    default_path = chess_dir / "logs" / "csv" / f"elo_comparison_{timestamp}.csv"
-    raw = _prompt_text("Output CSV path", str(default_path))
-
-    output_path = Path(raw)
-    if not output_path.is_absolute():
-        output_path = (chess_dir / output_path).resolve()
-    return output_path
 
 
 def load_model(checkpoint_path: Path, config: dict, device: torch.device):
@@ -672,58 +565,6 @@ def load_model(checkpoint_path: Path, config: dict, device: torch.device):
     return model
 
 
-def persist_estimated_elo(
-    checkpoint_path: Path,
-    estimated_elo,
-    *,
-    levels: list[int],
-    games_per_level: int,
-    use_mcts: bool,
-    simulations: int,
-    sf_time: float,
-    elo_result: dict | None = None,
-):
-    """Persist Elo into checkpoint metadata (always overwrites existing value)."""
-    elo_value = _safe_float(estimated_elo)
-    if elo_value is None:
-        return
-
-    if not checkpoint_path.exists():
-        return
-
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    except Exception as exc:
-        print(f"  ! Could not open checkpoint for Elo persist: {exc}")
-        return
-
-    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
-        return
-
-    mode_key = "estimated_elo_mcts" if use_mcts else "estimated_elo_nn"
-    existing_elo = _safe_float(checkpoint.get(mode_key))
-
-    ok, error = persist_checkpoint_elo_metadata(
-        checkpoint_path,
-        elo_value,
-        levels=levels,
-        games_per_level=games_per_level,
-        use_mcts=use_mcts,
-        simulations=simulations,
-        sf_time=sf_time,
-        source="eval_elo_manual",
-        elo_result=elo_result,
-    )
-    if ok:
-        label = "MCTS Elo" if use_mcts else "NN Elo"
-        if existing_elo is not None:
-            print(f"  ✓ Updated {label}: {int(round(existing_elo))} -> {int(round(elo_value))}")
-        else:
-            print(f"  ✓ Saved {label} into checkpoint metadata: {int(round(elo_value))}")
-    elif error:
-        print(f"  ! {error}")
-
-
 def format_results_table(all_results: list[dict]) -> str:
     """Format results as a comparison table."""
     if not all_results:
@@ -799,53 +640,6 @@ def format_results_table(all_results: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def save_results_csv(all_results: list[dict], output_path: Path, levels: list[int]):
-    """Save results to CSV for later analysis."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        header = [
-            "model",
-            "mode",
-            "mcts_simulations",
-            "estimated_elo",
-            "elo_std_error",
-            "elo_ci95_low",
-            "elo_ci95_high",
-            "adaptive",
-            "total_games",
-            "time_seconds",
-        ]
-        for lvl in sorted(levels):
-            header.extend([f"vs_{lvl}_wins", f"vs_{lvl}_draws", f"vs_{lvl}_losses", f"vs_{lvl}_score", f"vs_{lvl}_games"])
-        writer.writerow(header)
-
-        for result in all_results:
-            row = [
-                result.get("model_name", ""),
-                result.get("mode", ""),
-                result.get("mcts_simulations", ""),
-                result.get("estimated_elo", ""),
-                result.get("elo_std_error", ""),
-                (result.get("elo_ci95") or ["", ""])[0],
-                (result.get("elo_ci95") or ["", ""])[1],
-                bool(result.get("adaptive", False)),
-                result.get("total_games", 0),
-                f"{result.get('total_time', 0):.1f}",
-            ]
-            for lvl in sorted(levels):
-                if lvl in result.get("results", {}):
-                    r = result["results"][lvl]
-                    games = int(r.get("games", r.get("wins", 0) + r.get("draws", 0) + r.get("losses", 0)) or 0)
-                    row.extend([r["wins"], r["draws"], r["losses"], f"{r['score']:.3f}", games])
-                else:
-                    row.extend(["", "", "", "", ""])
-            writer.writerow(row)
-
-    print(f"\nResults saved to: {output_path}")
-
-
 def main():
     if len(sys.argv) > 1:
         print("CLI arguments are disabled in this script.")
@@ -896,17 +690,17 @@ def main():
 
     selected_paths = [entry["path"] for entry in selected_entries]
 
-    output_path = choose_output_path(chess_dir, len(selected_paths))
+    default_max_games_per_run = len(levels) * games_per_level
 
-    max_games_per_run = len(levels) * games_per_level
-    try:
-        max_games_per_run = min(
-            max_games_per_run,
-            int(elo_cfg.get("adaptive_max_total_games", max_games_per_run) or max_games_per_run),
-        )
-    except (TypeError, ValueError):
-        pass
-    total_games = len(selected_paths) * max_games_per_run * max(1, len(eval_modes))
+    def _mode_max_games(mode_name):
+        mode_prefix = "mcts_eval" if mode_name == "mcts" else "nn_eval"
+        cap = elo_cfg.get(f"{mode_prefix}_adaptive_max_total_games", elo_cfg.get("adaptive_max_total_games"))
+        try:
+            return min(default_max_games_per_run, int(cap or default_max_games_per_run))
+        except (TypeError, ValueError):
+            return default_max_games_per_run
+
+    total_games = len(selected_paths) * sum(_mode_max_games(mode) for mode in eval_modes)
     mode_labels = []
     if "nn" in eval_modes:
         mode_labels.append("Raw NN")
@@ -928,11 +722,11 @@ def main():
         print(f"MCTS sims:      {simulations}")
     print(f"Workers:        {workers_str}")
     if workers <= 0 and "nn" in eval_modes:
-        raw_workers = _resolve_eval_workers(workers, False, elo_cfg)
+        raw_workers = resolve_eval_workers(workers, False, elo_cfg)
         if raw_workers > 0:
             print(f"Raw NN workers: {raw_workers}")
     if workers <= 0 and "mcts" in eval_modes:
-        mcts_workers = _resolve_eval_workers(workers, True, elo_cfg)
+        mcts_workers = resolve_eval_workers(workers, True, elo_cfg)
         if mcts_workers > 0:
             print(f"MCTS workers:   {mcts_workers}")
         else:
@@ -946,9 +740,6 @@ def main():
             print("MCTS central:   disabled")
     print(f"SF time/move:   {sf_time}s")
     print(f"Max moves:      {max_moves}")
-    print(f"Stockfish path: {sf_path}")
-    if output_path is not None:
-        print(f"CSV output:     {output_path}")
 
     # Ensure Stockfish is available
     sf_path = ensure_stockfish(sf_path)
@@ -965,36 +756,26 @@ def main():
 
         for eval_mode in eval_modes:
             mode_use_mcts = eval_mode == "mcts"
-            mode_label = f"MCTS ({simulations} sims)" if mode_use_mcts else "Raw NN"
-            print(f"  Mode: {mode_label}")
+            mode_label_text = mode_label(mode_use_mcts, simulations)
+            print(f"  Mode: {mode_label_text}")
 
-            mode_workers = _resolve_eval_workers(workers, mode_use_mcts, elo_cfg)
-            mode_elo_cfg = _build_eval_elo_config(
+            mode_workers = resolve_eval_workers(workers, mode_use_mcts, elo_cfg)
+            mode_elo_cfg = build_eval_elo_config(
                 elo_cfg,
                 levels=levels,
                 games_per_level=games_per_level,
-                mode_use_mcts=mode_use_mcts,
+                use_mcts=mode_use_mcts,
                 simulations=simulations,
                 sf_time=sf_time,
                 max_moves=max_moves,
                 sf_path=sf_path,
                 workers=mode_workers,
+                standalone=True,
             )
 
-            estimator = EloEstimator(model, config, device, sf_path, elo_config=mode_elo_cfg)
-            result = estimator.estimate(
-                levels=levels,
-                games_per_level=games_per_level,
-                stockfish_time_limit=sf_time,
-                max_moves=max_moves,
-                use_mcts=mode_use_mcts,
-                simulations=simulations,
-                workers=mode_workers,
-            )
+            result = run_elo_check(model, config, device, mode_elo_cfg)
             if result.get("cancelled"):
                 print("  Elo estimation cancelled. Exiting now and releasing worker resources.", flush=True)
-                with contextlib.suppress(Exception):
-                    del estimator
                 if torch.cuda.is_available():
                     with contextlib.suppress(Exception):
                         torch.cuda.empty_cache()
@@ -1006,12 +787,12 @@ def main():
             result["model_name"] = model_path.name
             result["model_path"] = str(model_path)
             result["mode"] = "mcts" if mode_use_mcts else "nn"
-            result["mode_label"] = mode_label
+            result["mode_label"] = mode_label_text
             result["mcts_simulations"] = int(simulations) if mode_use_mcts else 0
             all_results.append(result)
 
             elo = result.get("estimated_elo")
-            print(f"  Estimated {mode_label} Elo: {elo if elo is not None else 'N/A'}")
+            print(f"  Estimated {mode_label_text} Elo: {elo if elo is not None else 'N/A'}")
 
             persist_estimated_elo(
                 model_path,
@@ -1021,6 +802,7 @@ def main():
                 use_mcts=mode_use_mcts,
                 simulations=simulations,
                 sf_time=sf_time,
+                source="eval_elo_manual",
                 elo_result=result,
             )
 
@@ -1032,9 +814,6 @@ def main():
 
     print(format_results_table(all_results))
     print(f"Total time: {total_elapsed:.1f}s")
-
-    if output_path is not None and all_results:
-        save_results_csv(all_results, output_path, levels)
 
 
 if __name__ == "__main__":

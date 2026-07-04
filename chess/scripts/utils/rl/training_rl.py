@@ -45,11 +45,32 @@ def _snapshot_state_dict_cpu_shared(model):
 
 def _eval_uses_central_inference(config, device):
     rl_cfg = config.get("reinforcement_learning", {})
+    central_cfg = config.get("central_inference", {}) or {}
     enabled = rl_cfg.get(
         "eval_central_inference_enabled",
         rl_cfg.get("self_play_central_inference_enabled", False),
     )
-    return bool(enabled and device.type == "cuda" and torch.cuda.is_available())
+    return bool(enabled and central_cfg.get("enabled", True) and device.type == "cuda" and torch.cuda.is_available())
+
+
+def _central_inference_config(config):
+    return (config or {}).get("central_inference", {}) or {}
+
+
+def _central_inference_option(config, key, default=None):
+    central_cfg = _central_inference_config(config)
+    if key in central_cfg:
+        return central_cfg[key]
+    rl_cfg = (config or {}).get("reinforcement_learning", {}) or {}
+    for prefix in (
+        "eval_central_inference_",
+        "self_play_central_inference_",
+        "central_inference_",
+    ):
+        legacy_key = f"{prefix}{key}"
+        if legacy_key in rl_cfg:
+            return rl_cfg[legacy_key]
+    return default
 
 
 def _resolve_configured_self_play_workers(rl_cfg, cpu_budget):
@@ -113,22 +134,26 @@ def _resolve_eval_workers(config, device, num_games):
 
 
 def _build_eval_central_server_config(config):
-    """Project eval-specific central inference knobs onto the shared server keys."""
+    """Project shared central inference knobs onto the RL server implementation keys."""
     server_config = dict(config)
     rl_cfg = dict(config.get("reinforcement_learning", {}))
-    mappings = {
-        "eval_central_inference_flush_ms": "self_play_central_inference_flush_ms",
-        "eval_central_inference_max_batch_size": "self_play_central_inference_max_batch_size",
-        "eval_central_inference_transport_dtype": "self_play_central_inference_transport_dtype",
-        "eval_central_inference_use_compile": "self_play_central_inference_use_compile",
-        "eval_central_inference_compile_warmup_batches": "self_play_central_inference_compile_warmup_batches",
-        "eval_central_inference_cudnn_benchmark": "self_play_central_inference_cudnn_benchmark",
-        "eval_central_inference_cache_enabled": "self_play_central_inference_cache_enabled",
-        "eval_central_inference_cache_entries": "self_play_central_inference_cache_entries",
+    shared_to_server = {
+        "flush_ms": "self_play_central_inference_flush_ms",
+        "max_batch_size": "self_play_central_inference_max_batch_size",
+        "transport_dtype": "self_play_central_inference_transport_dtype",
+        "use_compile": "self_play_central_inference_use_compile",
+        "compile_warmup_batches": "self_play_central_inference_compile_warmup_batches",
+        "cudnn_benchmark": "self_play_central_inference_cudnn_benchmark",
+        "cache_enabled": "self_play_central_inference_cache_enabled",
+        "cache_entries": "self_play_central_inference_cache_entries",
+        "sync_timing": "self_play_central_inference_sync_timing",
+        "timeout_s": "self_play_central_inference_timeout_s",
+        "stall_warning_s": "self_play_central_inference_stall_warning_s",
     }
-    for eval_key, server_key in mappings.items():
-        if eval_key in rl_cfg:
-            rl_cfg[server_key] = rl_cfg[eval_key]
+    for shared_key, server_key in shared_to_server.items():
+        value = _central_inference_option(config, shared_key, None)
+        if value is not None:
+            rl_cfg[server_key] = value
     server_config["reinforcement_learning"] = rl_cfg
     return server_config
 
@@ -145,8 +170,7 @@ def _build_eval_mcts_config(config):
 
 
 def _resolve_eval_central_server_count(config, workers):
-    rl_cfg = config.get("reinforcement_learning", {})
-    raw_value = rl_cfg.get("eval_central_inference_servers", "auto")
+    raw_value = _central_inference_option(config, "servers", "auto")
     if str(raw_value).strip().lower() not in {"auto", "automatic"}:
         try:
             return max(1, int(raw_value))
@@ -154,9 +178,9 @@ def _resolve_eval_central_server_count(config, workers):
             return 1
 
     workers = max(1, int(workers))
-    target_workers = max(3, int(rl_cfg.get("eval_central_inference_auto_workers_per_server", 6) or 6))
-    min_servers = max(1, int(rl_cfg.get("eval_central_inference_auto_min_servers", 1) or 1))
-    max_servers = max(min_servers, int(rl_cfg.get("eval_central_inference_auto_max_servers", 3) or 3))
+    target_workers = max(3, int(_central_inference_option(config, "auto_workers_per_server", 6) or 6))
+    min_servers = max(1, int(_central_inference_option(config, "auto_min_servers", 1) or 1))
+    max_servers = max(min_servers, int(_central_inference_option(config, "auto_max_servers", 3) or 3))
     by_workers = max(1, (workers + target_workers - 1) // target_workers)
     by_vram = max_servers
     try:
@@ -834,18 +858,9 @@ def _eval_central_worker(
         with contextlib.suppress(Exception):
             torch.set_num_interop_threads(1)
 
-        timeout_s = float(rl_cfg.get(
-            "eval_central_inference_timeout_s",
-            rl_cfg.get("self_play_central_inference_timeout_s", 0),
-        ) or 0)
-        stall_warning_s = float(rl_cfg.get(
-            "eval_central_inference_stall_warning_s",
-            rl_cfg.get("self_play_central_inference_stall_warning_s", 15),
-        ) or 0)
-        transport_dtype = str(rl_cfg.get(
-            "eval_central_inference_transport_dtype",
-            rl_cfg.get("self_play_central_inference_transport_dtype", "float16"),
-        ) or "float16")
+        timeout_s = float(_central_inference_option(config, "timeout_s", 0) or 0)
+        stall_warning_s = float(_central_inference_option(config, "stall_warning_s", 15) or 0)
+        transport_dtype = str(_central_inference_option(config, "transport_dtype", "float16") or "float16")
         debug_enabled = bool(rl_cfg.get("eval_central_inference_debug", False))
 
         model1 = _RemoteInferenceModel(
@@ -970,10 +985,7 @@ def _evaluate_models_with_central_inference(
             proc.start()
             server_processes.append(proc)
 
-        load_timeout_s = float(rl_cfg.get(
-            "eval_central_inference_load_timeout_s",
-            rl_cfg.get("self_play_central_inference_load_timeout_s", 300),
-        ) or 300)
+        load_timeout_s = float(_central_inference_option(config, "load_timeout_s", 300) or 300)
         for request_queue in request_queues:
             request_queue.put({
                 "cmd": "load_models",

@@ -25,6 +25,8 @@ import math
 import shutil
 import threading
 import logging
+import csv
+import json
 from pathlib import Path
 import numpy as np
 import gc
@@ -65,8 +67,12 @@ from utils.shared.runtime_helpers import (
     build_model_architecture_metadata,
     cleanup_interrupted_log_csv,
 )
-from utils.shared.elo_estimator import estimate_model_elo
-from utils.shared.model_catalog import persist_checkpoint_elo_metadata
+from utils.shared.elo_runner import (
+    build_il_final_elo_configs,
+    build_il_periodic_elo_config,
+    persist_estimated_elo,
+    run_elo_check,
+)
 from utils.shared.model_view import (
     print_active_model_summary,
     print_status_table,
@@ -126,6 +132,37 @@ def _format_million_positions(value):
     if value <= 0:
         return "0M"
     return f"{value / 1_000_000:.2f}M"
+
+
+def _format_plot_million_positions(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if value <= 0:
+        return "0M"
+    millions = value / 1_000_000.0
+    if millions >= 10.0:
+        return f"{millions:.0f}M"
+    if millions >= 1.0:
+        return f"{millions:.1f}M"
+    return f"{value / 1000.0:.0f}k"
+
+
+def _checkpoint_resume_tag(checkpoint_path):
+    if checkpoint_path is None:
+        return None
+    try:
+        stem = Path(checkpoint_path).stem
+    except TypeError:
+        return None
+    if stem in {"best_model_il", "best_model", "model"}:
+        return None
+    for suffix in ("_latest_swa", "_best_swa", "_latest", "_best", "_swa"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return stem or None
 
 
 def _build_il_run_summary(config, *, model_version=None, start_mode=None, source_label=None,
@@ -210,6 +247,119 @@ def _safe_float(value, default=0.0):
     if not math.isfinite(value):
         return float(default)
     return value
+
+
+def _safe_int(value, default=None):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _best_existing_nn_elo_from_logger(logger):
+    """Return existing periodic NN Elo closest to the best validation epoch."""
+    estimated_elos = list(getattr(logger, "estimated_elos", []) or [])
+    if not estimated_elos:
+        return None
+    try:
+        if getattr(logger, "val_losses", None):
+            best_idx = min(range(len(logger.val_losses)), key=lambda i: logger.val_losses[i])
+            best_epoch = int(logger.val_iterations[best_idx]) if best_idx < len(logger.val_iterations) else int(logger.iterations[best_idx])
+        else:
+            best_epoch = int(estimated_elos[-1][0])
+    except (TypeError, ValueError, IndexError):
+        best_epoch = int(estimated_elos[-1][0])
+    source_epoch, elo = min(estimated_elos, key=lambda pair: abs(int(pair[0]) - best_epoch))
+    error_info = (getattr(logger, "estimated_elo_errors", {}) or {}).get(int(source_epoch), {}) or {}
+    return {
+        "source_epoch": int(source_epoch),
+        "best_epoch": int(best_epoch),
+        "elo": float(elo),
+        "std_error": error_info.get("se"),
+        "ci95": error_info.get("ci95"),
+    }
+
+
+def _read_csv_metadata_and_epochs(csv_path):
+    try:
+        with open(csv_path, 'r', newline='', encoding='utf-8', errors='replace') as f:
+            rows = list(csv.reader(f))
+    except OSError:
+        return {}, []
+    metadata = {}
+    while rows and rows[0] and str(rows[0][0]).strip().startswith('#'):
+        row = rows.pop(0)
+        if len(row) >= 2:
+            try:
+                metadata[str(row[0]).strip()] = json.loads(row[1])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+    if not rows:
+        return metadata, []
+    header = rows[0]
+    if 'epoch' not in header:
+        return metadata, []
+    epoch_idx = header.index('epoch')
+    epochs = []
+    for row in rows[1:]:
+        if len(row) <= epoch_idx:
+            continue
+        epoch = _safe_int(row[epoch_idx])
+        if epoch is not None:
+            epochs.append(epoch)
+    return metadata, epochs
+
+
+def _find_resume_history_csv(logs_dir, model_version, completed_epoch, current_csv_path=None):
+    if completed_epoch < 1:
+        return None
+    csv_dir = Path(logs_dir) / "csv"
+    if not csv_dir.exists():
+        return None
+    current_csv_path = Path(current_csv_path).resolve() if current_csv_path else None
+    candidates = []
+    prefix = f"il_training_{model_version}_"
+    for path in csv_dir.glob(f"{prefix}*.csv"):
+        try:
+            if current_csv_path and path.resolve() == current_csv_path:
+                continue
+        except OSError:
+            pass
+        metadata, epochs = _read_csv_metadata_and_epochs(path)
+        if not epochs or max(epochs) < completed_epoch:
+            continue
+        summary = metadata.get('# run_summary_json') or {}
+        summary_version = str(summary.get('version') or '')
+        if summary_version and summary_version != str(model_version):
+            continue
+        exact_epoch = completed_epoch in set(epochs)
+        candidates.append((exact_epoch, max(epochs), path.stat().st_mtime, path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return candidates[0][3]
+
+
+def _format_resume_data_line(label, summary):
+    if not summary:
+        return f"{label}: data n/a"
+    soft_stats = summary.get('soft_stats', {}) or {}
+    train_soft = soft_stats.get('train') or {}
+    avg_occ = train_soft.get('policy_occ_avg')
+    target = summary.get('target_positions', 'n/a')
+    pgn_files = summary.get('pgn_files', 'n/a')
+    train_positions = summary.get('train_positions', 'n/a')
+    val_positions = summary.get('val_positions', 'n/a')
+    soft_cfg = summary.get('soft_targets', {}) or {}
+    soft_mode = soft_cfg.get('mode', 'off' if not soft_cfg.get('enabled') else 'on')
+    try:
+        avg_occ_text = f"{float(avg_occ):.2f}"
+    except (TypeError, ValueError):
+        avg_occ_text = "n/a"
+    return (
+        f"{label}: PGN={pgn_files}, target={_format_target_positions(target)}, "
+        f"train/val={train_positions}/{val_positions}, soft={soft_mode}, avg_occ={avg_occ_text}"
+    )
 
 
 def _il_monitor_loss(val_losses, il_cfg):
@@ -298,55 +448,6 @@ def _emit_il_profile(lines, debug_log_file=None, print_to_console=False):
             f.write("\n".join(lines) + "\n")
 
 
-def _apply_il_elo_overrides(elo_config):
-    """Build IL periodic raw-NN Elo config from the shared NN eval settings."""
-    if not isinstance(elo_config, dict):
-        return {}
-    resolved = dict(elo_config)
-    override_map = {
-        'nn_eval_workers': 'workers',
-        'nn_eval_free_threads_utilization': 'free_threads_utilization',
-    }
-    for source_key, target_key in override_map.items():
-        if source_key in resolved:
-            resolved[target_key] = resolved[source_key]
-    resolved['use_mcts'] = False
-    return resolved
-
-
-def _build_il_final_elo_config(elo_config):
-    """Build the slower final IL MCTS Elo config from shared MCTS eval settings."""
-    if not isinstance(elo_config, dict):
-        return {}
-
-    resolved = dict(elo_config)
-    override_map = {
-        'mcts_eval_workers': 'workers',
-        'mcts_eval_simulations': 'mcts_simulations',
-    }
-    for source_key, target_key in override_map.items():
-        if source_key in resolved:
-            resolved[target_key] = resolved[source_key]
-    # Final IL evaluation runs after training has stopped, so it should use the
-    # full CPU budget instead of reserving threads for DataLoader workers.
-    resolved['prioritize_training'] = False
-    resolved['reserve_dataloader_workers'] = False
-    resolved['free_threads_utilization'] = 1.0
-    resolved['stockfish_priority'] = 'normal'
-    resolved['progress_bar'] = 'always'
-    resolved['auto_worker_reserve_cpus'] = 0
-    resolved['use_mcts'] = True
-    return resolved
-
-
-def _build_il_final_elo_configs(elo_config):
-    raw_cfg = _build_il_final_elo_config(elo_config)
-    mcts_cfg = dict(raw_cfg)
-    raw_cfg['use_mcts'] = False
-    mcts_cfg['use_mcts'] = True
-    return raw_cfg, mcts_cfg
-
-
 def _run_il_final_elo(
     model,
     config,
@@ -369,7 +470,7 @@ def _run_il_final_elo(
     was_training = bool(getattr(model, "training", False))
     try:
         model.eval()
-        elo_result = estimate_model_elo(
+        elo_result = run_elo_check(
             model,
             config,
             device,
@@ -403,15 +504,6 @@ def _run_il_final_elo(
             std_error=elo_result.get("elo_std_error"),
             ci95=elo_result.get("elo_ci95"),
         )
-        if not use_mcts:
-            logger.record_estimated_elo(
-                epoch_num,
-                estimated_elo,
-                update_csv=True,
-                std_error=elo_result.get("elo_std_error"),
-                ci95=elo_result.get("elo_ci95"),
-            )
-            logger.add_elo_epoch_marker(epoch_num, marker_label)
         mode_label = f"MCTS {simulations} sims" if use_mcts else "raw NN"
         print(f"Final IL Estimated Elo ({model_label}, {mode_label}): {int(round(float(estimated_elo)))}")
         if elo_result.get("elo_std_error") is not None:
@@ -425,7 +517,7 @@ def _run_il_final_elo(
             print(f"  vs SF {lvl}: {score_str} (score: {res['score']:.0%}, n={games})")
         print(f"  time {elo_result['total_time']:.1f}s ({elo_result['total_games']} games)")
         if checkpoint_path is not None:
-            ok, error = persist_checkpoint_elo_metadata(
+            persist_estimated_elo(
                 checkpoint_path,
                 estimated_elo,
                 levels=list(elo_config.get("levels", [])),
@@ -435,9 +527,9 @@ def _run_il_final_elo(
                 sf_time=float(elo_config.get("stockfish_time_limit", 0.0) or 0.0),
                 source="il_final_elo",
                 elo_result=elo_result,
+                print_prefix="Final IL Elo metadata: ",
+                announce_success=False,
             )
-            if not ok and error:
-                print(f"Final IL Elo metadata save failed: {error}")
     elif elo_result.get("error"):
         print(f"Final IL Elo check failed: {elo_result.get('error')}")
     elif not elo_result.get("skipped"):
@@ -602,6 +694,23 @@ def main():
         base_learning_rate=config['imitation_learning']['learning_rate'],
     )
 
+    if startup_plan.get("start_mode") == "resume":
+        resume_tag = _checkpoint_resume_tag(startup_plan.get("selected_checkpoint"))
+        if resume_tag and resume_tag != model_file_tag:
+            previous_tag = model_file_tag
+            model_version = resume_tag
+            model_file_tag = resume_tag
+            config.setdefault('model', {})['version'] = resume_tag
+            if hasattr(model, 'model_version'):
+                model.model_version = resume_tag
+            model_architecture = build_model_architecture_metadata(config)
+            version_best_model_path = il_dir / f"{model_file_tag}_best.pt"
+            latest_checkpoint_path = il_dir / f"{model_file_tag}_latest.pt"
+            print(
+                "Resume naming: using checkpoint tag "
+                f"{model_file_tag} for logs/checkpoints (was {previous_tag} from config)."
+            )
+
     # For resume mode, allow extending training by additional epochs.
     il_epochs_cfg = int(config['imitation_learning']['epochs'])
     if startup_plan.get("start_mode") == "resume":
@@ -730,7 +839,6 @@ def main():
         verbose=debug_enabled,
     )
     logging_cfg = config.get('logging', {}) or {}
-    il_plot_every = max(1, int(logging_cfg.get('il_plot_every', 1) or 1))
     logger.set_plot_smoothing(
         enabled=logging_cfg.get('il_plot_smoothing_enabled', True),
         alpha=logging_cfg.get('il_plot_smoothing_alpha', 0.35),
@@ -801,16 +909,18 @@ def main():
     total_epochs = config['imitation_learning']['epochs']
     warmup_pct = config['imitation_learning'].get('warmup_pct', 0.05)
     min_lr_ratio = config['imitation_learning'].get('min_lr_ratio', 0.05)
+    lr_plateau_scale = 1.0
 
     warmup_epochs = max(1, int(round(total_epochs * warmup_pct)))
 
     def _lr_lambda(epoch):
         # Linear warmup: 0 → 1 over warmup_epochs
         if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
+            return lr_plateau_scale * ((epoch + 1) / warmup_epochs)
         # Cosine decay: 1 → min_lr_ratio
         progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        cosine_factor = min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return lr_plateau_scale * cosine_factor
 
     scheduler = _build_scheduler_for_optimizer(optimizer)
 
@@ -875,6 +985,34 @@ def main():
         selected_entry=selected_entry,
         include_parameters=debug_enabled,
     )
+
+    resume_history_summary = None
+    resume_history_csv = None
+    if start_mode == "resume" and start_epoch > 0:
+        resume_history_csv = _find_resume_history_csv(
+            logs_dir,
+            model_version,
+            completed_epoch=start_epoch,
+            current_csv_path=logger.csv_path,
+        )
+        if resume_history_csv is not None:
+            imported_history = logger.import_il_history_from_csv(
+                resume_history_csv,
+                completed_epoch=start_epoch,
+            )
+            if imported_history:
+                resume_history_summary = logger.resume_source_summary
+                print(
+                    f"Resume CSV history: copied {resume_history_csv.name} "
+                    f"through epoch {start_epoch}; new rows will append to {logger.csv_path.name}"
+                )
+            else:
+                print(f"Resume CSV history: found {resume_history_csv.name}, but import failed.")
+        else:
+            print("Resume CSV history: no matching previous CSV found; plot starts from this resume run.")
+
+    if start_mode in {"resume", "transfer"} and int(start_epoch or 0) > 0:
+        logger.add_resume_marker(int(start_epoch))
 
     if resumed_estimated_elo is not None:
         seed_epoch = resumed_estimated_elo_epoch
@@ -1016,6 +1154,13 @@ def main():
 
     print("Preparing DataLoaders and train sampler...")
     train_loader, val_loader = create_dataloaders(metadata, config)
+    train_sampler = getattr(train_loader, "sampler", None)
+    if start_mode == "resume" and hasattr(train_sampler, "epoch"):
+        try:
+            train_sampler.epoch = int(start_epoch)
+            print(f"Resume: train sampler epoch set to {int(start_epoch)}")
+        except (TypeError, ValueError):
+            pass
     print(
         "DataLoaders ready: "
         f"train={len(train_loader.dataset):,}, val={len(val_loader.dataset):,}"
@@ -1067,20 +1212,80 @@ def main():
     ppg_total = _stage_total(train_stats, 'positions_per_game')
     dedup_total = _stage_total(train_stats, 'sample_dedup')
     data_parts = [
-        f"raw={_format_million_positions(raw_total)}",
-        f"selected={_format_million_positions(total_final)}",
-        f"train={_format_million_positions(train_final)}",
-        f"val={_format_million_positions(val_final)}",
+        f"PGN={len(pgn_files)}",
+        f"raw={_format_plot_million_positions(raw_total)}",
     ]
     if ppg_total is not None:
-        data_parts.append(f"ppg={_format_million_positions(ppg_total)}")
+        data_parts.append(f"ppg={_format_plot_million_positions(ppg_total)}")
     if dedup_total is not None:
-        data_parts.append(f"dedup={_format_million_positions(dedup_total)}")
+        data_parts.append(f"dedup={_format_plot_million_positions(dedup_total)}")
+    data_parts.extend([
+        f"selected={_format_plot_million_positions(total_final)}",
+        f"train/val={_format_plot_million_positions(train_final)}/{_format_plot_million_positions(val_final)}",
+    ])
     data_context = (
         "Data: " + " | ".join(data_parts)
     )
     logger.set_run_context(f"{plot_run_context} | {data_context}")
-    logger.set_run_context_lines([model_context, data_context, run_context])
+    early_context_lines = [model_context, data_context]
+    if resume_history_summary:
+        early_context_lines.append(_format_resume_data_line("Before resume", resume_history_summary))
+    early_context_lines.append(run_context)
+    logger.set_run_context_lines(early_context_lines)
+
+    policy_distribution_cache = {}
+
+    def _policy_distribution_summary(policy_values, chunk_size=500_000):
+        if policy_values is None:
+            return {
+                'policy_moves_avg': 0.0,
+                'policy_moves_max': 0,
+                'policy_soft_rate': 0.0,
+                'policy_target_entropy': 0.0,
+                'policy_target_effective_moves': 1.0,
+                'policy_target_top1_mass': 1.0,
+            }
+        row_count = int(policy_values.shape[0]) if getattr(policy_values, 'ndim', 0) >= 1 else 0
+        if row_count <= 0:
+            return {
+                'policy_moves_avg': 0.0,
+                'policy_moves_max': 0,
+                'policy_soft_rate': 0.0,
+                'policy_target_entropy': 0.0,
+                'policy_target_effective_moves': 1.0,
+                'policy_target_top1_mass': 1.0,
+            }
+        cache_key = (id(policy_values), tuple(policy_values.shape), str(getattr(policy_values, 'dtype', '')))
+        if cache_key in policy_distribution_cache:
+            return dict(policy_distribution_cache[cache_key])
+        nonzero_sum = 0.0
+        nonzero_max = 0
+        entropy_sum = 0.0
+        top1_sum = 0.0
+        soft_rows = 0
+        for start in range(0, row_count, int(chunk_size)):
+            chunk = np.asarray(policy_values[start:start + int(chunk_size)], dtype=np.float32)
+            if chunk.size == 0:
+                continue
+            nonzero = (chunk > 0.0).sum(axis=1)
+            nonzero_sum += float(nonzero.sum())
+            nonzero_max = max(nonzero_max, int(nonzero.max()) if nonzero.size else 0)
+            safe_chunk = np.clip(chunk.astype(np.float64, copy=False), 1e-12, 1.0)
+            row_entropy = -np.sum(chunk * np.log(safe_chunk), axis=1)
+            entropy_sum += float(row_entropy.sum())
+            soft_rows += int((row_entropy > 1e-4).sum())
+            top1_sum += float(chunk.max(axis=1).sum())
+        entropy_mean = entropy_sum / max(1, row_count)
+        summary = {
+            'policy_moves_avg': nonzero_sum / max(1, row_count),
+            'policy_moves_max': nonzero_max,
+            'policy_soft_rate': soft_rows / max(1, row_count),
+            'policy_target_entropy': entropy_mean,
+            'policy_target_effective_moves': float(np.exp(entropy_mean)),
+            'policy_target_top1_mass': top1_sum / max(1, row_count),
+        }
+        policy_distribution_cache[cache_key] = dict(summary)
+        return summary
 
     def _soft_data_summary(dataset):
         soft = getattr(dataset, 'soft_targets', None)
@@ -1095,7 +1300,7 @@ def main():
         policy_mass = _array('policy_mass_kept')
         moves_left_log = _array('moves_left_log')
         policy_values = _array('policy_values')
-        nonzero_policy = (policy_values > 0.0).sum(axis=1)
+        policy_summary = _policy_distribution_summary(policy_values)
         return {
             'occ_avg': float(occurrence.mean()) if occurrence.size else 0.0,
             'occ_max': float(occurrence.max()) if occurrence.size else 0.0,
@@ -1106,8 +1311,7 @@ def main():
             'below_995': int((policy_mass < 0.995).sum()) if policy_mass.size else 0,
             'moves_avg': float(np.expm1(moves_left_log).mean()) if moves_left_log.size else 0.0,
             'moves_median': float(np.median(np.expm1(moves_left_log))) if moves_left_log.size else 0.0,
-            'policy_moves_avg': float(nonzero_policy.mean()) if nonzero_policy.size else 0.0,
-            'policy_moves_max': int(nonzero_policy.max()) if nonzero_policy.size else 0,
+            **policy_summary,
         }
 
     def _soft_basic_summary(dataset):
@@ -1131,6 +1335,8 @@ def main():
         sample_weight = _array('sample_weight')
         value_sample_weight = _array('value_sample_weight')
         policy_mass = _array('policy_mass_kept')
+        policy_values = _array('policy_values')
+        policy_summary = _policy_distribution_summary(policy_values)
         return {
             'rows': int(len(dataset)),
             'policy_occ_avg': _mean(occurrence),
@@ -1143,6 +1349,10 @@ def main():
             'value_weight_max': _max(value_sample_weight),
             'policy_mass_kept_avg': _mean(policy_mass),
             'policy_mass_kept_min': float(policy_mass.min()) if policy_mass is not None and policy_mass.size else 1.0,
+            'policy_soft_rate': policy_summary['policy_soft_rate'],
+            'policy_target_entropy': policy_summary['policy_target_entropy'],
+            'policy_target_effective_moves': policy_summary['policy_target_effective_moves'],
+            'policy_target_top1_mass': policy_summary['policy_target_top1_mass'],
         }
 
     train_soft_basic = _soft_basic_summary(train_loader.dataset)
@@ -1156,22 +1366,23 @@ def main():
             except (TypeError, ValueError):
                 return float(default)
 
-        soft_policy_cfg = soft_targets_cfg.get('policy_target', {}) or {}
         soft_context = (
-            f"Soft: source={soft_targets_cfg.get('source', 'positions_per_game')}, "
-            f"mode={soft_targets_cfg.get('mode', 'fen')}, "
-            f"top={soft_targets_cfg.get('max_policy_moves', '-')}, "
-            f"avg_occ train={_soft_float(train_soft_basic, 'policy_occ_avg'):.2f}/"
-            f"val={_soft_float(val_soft_basic, 'policy_occ_avg'):.2f}, "
-            f"mass train={_soft_float(train_soft_basic, 'policy_mass_kept_avg', 1.0):.4f}, "
-            f"hard<{soft_policy_cfg.get('hard_below_count', '-')}, "
-            f"soft>={soft_policy_cfg.get('soft_full_count', '-')}"
+            f"Soft compression: {soft_targets_cfg.get('source', 'positions_per_game')}/"
+            f"{soft_targets_cfg.get('mode', 'fen')}, "
+            f"avg_occ T/V={_soft_float(train_soft_basic, 'policy_occ_avg'):.2f}/"
+            f"{_soft_float(val_soft_basic, 'policy_occ_avg'):.2f}, "
+            f"soft_rows T/V={100.0 * _soft_float(train_soft_basic, 'policy_soft_rate'):.1f}%/"
+            f"{100.0 * _soft_float(val_soft_basic, 'policy_soft_rate'):.1f}%, "
+            f"target_eff T/V={_soft_float(train_soft_basic, 'policy_target_effective_moves', 1.0):.2f}/"
+            f"{_soft_float(val_soft_basic, 'policy_target_effective_moves', 1.0):.2f}, "
+            f"top1_mass T/V={_soft_float(train_soft_basic, 'policy_target_top1_mass', 1.0):.3f}/"
+            f"{_soft_float(val_soft_basic, 'policy_target_top1_mass', 1.0):.3f}, "
+            f"weight T/V={_soft_float(train_soft_basic, 'policy_weight_avg', 1.0):.2f}/"
+            f"{_soft_float(val_soft_basic, 'policy_weight_avg', 1.0):.2f}"
         )
     else:
         soft_context = "Soft: off"
-    logger.set_run_context(f"{model_context} | {data_context} | {soft_context} | {run_context}")
-    logger.set_run_context_lines([model_context, data_context, soft_context, run_context])
-    logger.set_run_summary_metadata(_build_il_run_summary(
+    current_run_summary = _build_il_run_summary(
         config,
         model_version=model_version,
         start_mode=start_mode,
@@ -1182,7 +1393,21 @@ def main():
         batch_size=trained_batch_size,
         soft_train=train_soft_basic,
         soft_val=val_soft_basic,
-    ))
+    )
+    resume_data_context = None
+    if resume_history_summary:
+        resume_data_context = (
+            "Resume data: "
+            f"{_format_resume_data_line('before', resume_history_summary)} -> "
+            f"{_format_resume_data_line('after', current_run_summary)}"
+        )
+    context_lines = [model_context, data_context, soft_context]
+    if resume_data_context:
+        context_lines.append(resume_data_context)
+    context_lines.append(run_context)
+    logger.set_run_context(" | ".join(context_lines))
+    logger.set_run_context_lines(context_lines)
+    logger.set_run_summary_metadata(current_run_summary)
 
     if debug_enabled:
         train_soft_summary = _soft_data_summary(train_loader.dataset)
@@ -1194,6 +1419,14 @@ def main():
                 value = summary.get(key, 0.0)
                 return fmt.format(value)
 
+            def _pct(summary, key):
+                if summary is None:
+                    return ""
+                try:
+                    return f"{100.0 * float(summary.get(key, 0.0)):.1f}%"
+                except (TypeError, ValueError):
+                    return ""
+
             print_multi_column_table(
                 "Data Ready (IL) - Soft Targets",
                 headers=["Metric", "Train", "Val"],
@@ -1203,6 +1436,9 @@ def main():
                     ("sample_weight avg", _sf(train_soft_summary, 'weight_avg'), _sf(val_soft_summary, 'weight_avg')),
                     ("sample_weight max", _sf(train_soft_summary, 'weight_max'), _sf(val_soft_summary, 'weight_max')),
                     ("policy moves avg/max", f"{_sf(train_soft_summary, 'policy_moves_avg')} / {_sf(train_soft_summary, 'policy_moves_max', '{:.0f}')}", f"{_sf(val_soft_summary, 'policy_moves_avg')} / {_sf(val_soft_summary, 'policy_moves_max', '{:.0f}')}"),
+                    ("policy soft rows", _pct(train_soft_summary, 'policy_soft_rate'), _pct(val_soft_summary, 'policy_soft_rate')),
+                    ("target effective moves", _sf(train_soft_summary, 'policy_target_effective_moves'), _sf(val_soft_summary, 'policy_target_effective_moves')),
+                    ("target top1 mass", _sf(train_soft_summary, 'policy_target_top1_mass', "{:.4f}"), _sf(val_soft_summary, 'policy_target_top1_mass', "{:.4f}")),
                     ("top-K mass avg", _sf(train_soft_summary, 'mass_avg', "{:.5f}"), _sf(val_soft_summary, 'mass_avg', "{:.5f}")),
                     ("top-K mass min", _sf(train_soft_summary, 'mass_min', "{:.5f}"), _sf(val_soft_summary, 'mass_min', "{:.5f}")),
                     ("rows below 0.995 mass", _sf(train_soft_summary, 'below_995', "{:.0f}"), _sf(val_soft_summary, 'below_995', "{:.0f}")),
@@ -1213,14 +1449,20 @@ def main():
 
     # Stochastic Weight Averaging (SWA) for better generalization with large batches
     use_swa = config['imitation_learning'].get('use_swa', False)
+    il_eval_every = max(1, int(config['imitation_learning'].get('eval_every', 1) or 1))
     swa_model = None
     swa_scheduler = None
     swa_auto_start = bool(config['imitation_learning'].get('swa_auto_start', True))
     swa_start = total_epochs + 1 if swa_auto_start else int(config['imitation_learning'].get('swa_start_epoch', total_epochs + 1))
-    swa_auto_min_epoch = int(config['imitation_learning'].get('swa_auto_min_epoch', swa_start))
-    swa_auto_min_epoch = max(1, swa_auto_min_epoch)
+    swa_auto_min_epoch_config = int(config['imitation_learning'].get('swa_auto_min_epoch', swa_start))
+    swa_auto_min_epoch_config = max(1, swa_auto_min_epoch_config)
+    swa_auto_latest_start_fraction = float(
+        config['imitation_learning'].get('swa_auto_latest_start_fraction', 0.75)
+    )
+    swa_auto_latest_start_fraction = max(0.1, min(1.0, swa_auto_latest_start_fraction))
     swa_auto_plateau_patience = int(config['imitation_learning'].get('swa_auto_plateau_patience', 3))
     swa_auto_plateau_patience = max(1, swa_auto_plateau_patience)
+    swa_start_on_early_stop = bool(config['imitation_learning'].get('swa_start_on_early_stop', True))
     swa_auto_min_delta = float(config['imitation_learning'].get('swa_auto_min_delta', min_delta if 'min_delta' in locals() else 0.001))
     swa_auto_min_delta = max(0.0, swa_auto_min_delta)
     swa_transfer_unfreeze_offset = int(
@@ -1235,10 +1477,45 @@ def main():
         1,
         int(config['imitation_learning'].get('swa_stop_after_anneal_grace_evals', 1)),
     )
+    swa_min_updates_before_stop = max(
+        1,
+        int(
+            config['imitation_learning'].get(
+                'swa_min_updates_before_stop',
+                min(8, swa_anneal_epochs),
+            )
+        ),
+    )
+    remaining_epochs_this_run = max(1, int(total_epochs) - int(start_epoch or 0))
+    swa_min_updates_this_run = max(1, min(swa_min_updates_before_stop, remaining_epochs_this_run))
+    current_run_first_epoch = int(start_epoch or 0) + 1
+    current_run_fraction_start_epoch = int(start_epoch or 0) + max(
+        1,
+        int(math.ceil(remaining_epochs_this_run * swa_auto_latest_start_fraction)),
+    )
+    swa_auto_latest_start_epoch = current_run_fraction_start_epoch
+    swa_auto_update_window_start_epoch = max(
+        current_run_first_epoch,
+        int(total_epochs) - swa_min_updates_this_run + 1,
+    )
+    swa_auto_latest_start_epoch = min(
+        swa_auto_latest_start_epoch,
+        swa_auto_update_window_start_epoch,
+    )
+    swa_auto_min_epoch = min(
+        max(swa_auto_min_epoch_config, current_run_first_epoch),
+        swa_auto_latest_start_epoch,
+    )
+    swa_quality_gate = bool(config['imitation_learning'].get('swa_quality_gate', True))
+    swa_update_max_loss_delta = max(
+        0.0,
+        float(config['imitation_learning'].get('swa_update_max_loss_delta', 0.008)),
+    )
     swa_start_reason = "config"
     swa_best_val_loss = None
     swa_plateau_counter = 0
     swa_post_anneal_no_improve_evals = 0
+    swa_skipped_updates = 0
     non_blocking_transfers = bool(
         config.get('hardware', {}).get('non_blocking_transfers', True)
         and device.type == 'cuda'
@@ -1308,6 +1585,8 @@ def main():
             print(
                 f"SWA enabled: planned_start={'auto' if swa_auto_start else swa_start}, auto_start={'on' if swa_auto_start else 'off'}, "
                 f"auto_min_epoch={swa_auto_min_epoch}, plateau_patience={swa_auto_plateau_patience}, "
+                f"latest_start={swa_auto_latest_start_epoch}, "
+                f"min_updates={swa_min_updates_this_run}/{swa_min_updates_before_stop}, "
                 f"anneal_epochs={swa_anneal_epochs}, planned_swa_lr={swa_lr:.6f}, "
                 f"stop_after_anneal_no_improve={'on' if swa_stop_after_anneal_no_improve else 'off'}, "
                 f"source={swa_start_reason}, lr_source={swa_lr_reason}"
@@ -1334,6 +1613,8 @@ def main():
         print(
             f"SWA activated at epoch {swa_start}: "
             f"swa_lr={swa_lr:.6f}, anneal_epochs={swa_anneal_epochs}, "
+            f"quality_gate={'on' if swa_quality_gate else 'off'}"
+            f"{f'(+{swa_update_max_loss_delta:g})' if swa_quality_gate else ''}, "
             f"source={swa_start_reason}, lr_source={swa_lr_reason}"
         )
         if debug_log_file is not None:
@@ -1341,13 +1622,136 @@ def main():
                 f.write(
                     f"SWA activated at epoch {swa_start}: "
                     f"swa_lr={swa_lr:.6f}, anneal_epochs={swa_anneal_epochs}, "
+                    f"quality_gate={'on' if swa_quality_gate else 'off'}, "
                     f"source={swa_start_reason}, lr_source={swa_lr_reason}\n"
+        )
+        return True
+
+    def _swa_updates_collected():
+        if swa_model is None:
+            return 0
+        n_averaged = getattr(swa_model, "n_averaged", None)
+        if n_averaged is None:
+            return 0
+        try:
+            if hasattr(n_averaged, "item"):
+                return int(n_averaged.item())
+            return int(n_averaged)
+        except (TypeError, ValueError):
+            return 0
+
+    def _maybe_update_swa_after_epoch(current_epoch_num, current_monitor_loss=None, current_monitor_label=None):
+        nonlocal swa_skipped_updates
+        if not use_swa or swa_model is None or swa_scheduler is None:
+            return False
+
+        should_average = True
+        skip_reason = None
+        monitor_value = None
+        if swa_quality_gate:
+            try:
+                monitor_value = float(current_monitor_loss)
+            except (TypeError, ValueError):
+                monitor_value = None
+            if monitor_value is None or not math.isfinite(monitor_value):
+                should_average = False
+                skip_reason = "no validation monitor"
+            else:
+                reference_loss = best_val_loss
+                if not math.isfinite(float(reference_loss)):
+                    reference_loss = monitor_value
+                max_allowed_loss = float(reference_loss) + float(swa_update_max_loss_delta)
+                if monitor_value > max_allowed_loss:
+                    should_average = False
+                    label = current_monitor_label or monitor_label
+                    skip_reason = (
+                        f"{label}={monitor_value:.4f} > "
+                        f"best+gate={max_allowed_loss:.4f}"
+                    )
+
+        if should_average:
+            swa_model.update_parameters(model)
+            print(
+                f"       SWA update accepted "
+                f"({_swa_updates_collected()} averaged, {swa_skipped_updates} skipped)"
+            )
+        else:
+            swa_skipped_updates += 1
+            print(f"       SWA update skipped by quality gate: {skip_reason}")
+            if debug_log_file is not None:
+                with open(debug_log_file, 'a', encoding='utf-8') as f:
+                    f.write(
+                        f"SWA update skipped at epoch {current_epoch_num}: "
+                        f"{skip_reason}\n"
+                    )
+
+        swa_scheduler.step()
+        return should_average
+
+    def _maybe_decay_lr_on_plateau(current_epoch_num, improved):
+        nonlocal lr_plateau_scale, lr_plateau_bad_epochs, lr_plateau_cooldown_remaining
+        nonlocal patience_counter
+        if not lr_plateau_enabled:
+            return False
+        if use_swa and swa_scheduler is not None:
+            return False
+        if transfer_post_unfreeze_lr_active:
+            return False
+        if improved:
+            lr_plateau_bad_epochs = 0
+            if lr_plateau_cooldown_remaining > 0:
+                lr_plateau_cooldown_remaining -= 1
+            return False
+        if lr_plateau_cooldown_remaining > 0:
+            lr_plateau_cooldown_remaining -= 1
+            return False
+
+        lr_plateau_bad_epochs += 1
+        if lr_plateau_bad_epochs < lr_plateau_patience:
+            return False
+
+        old_scale = float(lr_plateau_scale)
+        new_scale = max(float(lr_plateau_min_scale), old_scale * float(lr_plateau_factor))
+        if new_scale >= old_scale - 1e-12:
+            return False
+
+        lr_ratio = new_scale / old_scale
+        for group in optimizer.param_groups:
+            group['lr'] = float(group.get('lr', 0.0)) * lr_ratio
+        lr_plateau_scale = new_scale
+        lr_plateau_bad_epochs = 0
+        lr_plateau_cooldown_remaining = lr_plateau_cooldown_epochs
+        if lr_plateau_reset_patience:
+            patience_counter = 0
+        print(
+            "LR plateau decay: "
+            f"scale {old_scale:.3f} -> {new_scale:.3f}, "
+            f"lr={optimizer.param_groups[0]['lr']:.2e}, "
+            f"patience={'reset' if lr_plateau_reset_patience else 'kept'}"
+        )
+        if debug_log_file is not None:
+            with open(debug_log_file, 'a', encoding='utf-8') as f:
+                f.write(
+                    f"LR plateau decay at epoch {current_epoch_num}: "
+                    f"scale {old_scale:.6g}->{new_scale:.6g}, "
+                    f"lr={optimizer.param_groups[0]['lr']:.6g}\n"
                 )
         return True
+
     max_patience = config['imitation_learning'].get('max_patience', 15)
     min_delta = config['imitation_learning']['min_delta']
     total_epochs = config['imitation_learning']['epochs']
     monitor_label = _il_monitor_loss({'total': 0.0}, config['imitation_learning'])[1]
+    lr_plateau_enabled = bool(config['imitation_learning'].get('lr_plateau_decay', True))
+    lr_plateau_patience = max(1, int(config['imitation_learning'].get('lr_plateau_patience', 2)))
+    lr_plateau_factor = float(config['imitation_learning'].get('lr_plateau_factor', 0.5))
+    lr_plateau_factor = max(0.05, min(0.95, lr_plateau_factor))
+    lr_plateau_min_scale = float(config['imitation_learning'].get('lr_plateau_min_scale', 0.25))
+    lr_plateau_min_scale = max(0.01, min(1.0, lr_plateau_min_scale))
+    lr_plateau_cooldown_epochs = max(0, int(config['imitation_learning'].get('lr_plateau_cooldown', 1)))
+    lr_plateau_reset_patience = bool(config['imitation_learning'].get('lr_plateau_reset_patience', True))
+    lr_plateau_bad_epochs = 0
+    lr_plateau_cooldown_remaining = 0
     if monitor_label != "val_loss" and start_mode in {"resume", "transfer"}:
         # Older checkpoints stored raw val_loss as best_val_loss. A value-aware
         # monitor is on a different scale, so restart monitor patience safely.
@@ -1410,11 +1814,11 @@ def main():
                 "running without freeze."
             )
     elo_config = config.get("elo_estimation", {})
-    elo_config_il = _apply_il_elo_overrides(elo_config)
+    elo_config_il = build_il_periodic_elo_config(elo_config)
     if elo_config_il.get("use_mcts", False):
         print("Note: IL forces elo_estimation.use_mcts=False for speed.")
     elo_config_il["use_mcts"] = False
-    final_elo_config_il, final_elo_config_il_mcts = _build_il_final_elo_configs(elo_config)
+    final_elo_config_il, final_elo_config_il_mcts = build_il_final_elo_configs(elo_config)
     final_il_elo_enabled = bool(
         final_elo_config_il.get("enabled", False)
         and final_elo_config_il.get("final_on_il_shutdown", True)
@@ -1565,8 +1969,12 @@ def main():
         elo_metadata = {}
         if elo_value is not None:
             elo_metadata['estimated_elo'] = float(elo_value)
+            elo_metadata['last_estimated_elo'] = float(elo_value)
+            elo_metadata['estimated_elo_nn'] = float(elo_value)
+            elo_metadata['last_estimated_elo_nn'] = float(elo_value)
         if elo_epoch is not None:
             elo_metadata['estimated_elo_epoch'] = int(elo_epoch)
+            elo_metadata['estimated_elo_nn_epoch'] = int(elo_epoch)
         return elo_metadata, elo_epoch, elo_value
 
     training_interrupted = False
@@ -1667,6 +2075,18 @@ def main():
             if profile_this_epoch and device.type == 'cuda':
                 torch.cuda.synchronize()
             train_start_time = time.perf_counter()
+            if (
+                use_swa
+                and swa_auto_start
+                and swa_scheduler is None
+                and (epoch + 1) >= int(swa_auto_latest_start_epoch)
+            ):
+                swa_start = epoch + 1
+                swa_start_reason = (
+                    "latest-start fallback "
+                    f"(remaining_run_epochs={remaining_epochs_this_run}, "
+                    f"min_updates={swa_min_updates_this_run}/{swa_min_updates_before_stop})"
+                )
             if use_swa and swa_scheduler is None and (epoch + 1) >= int(swa_start):
                 _activate_swa_if_due(epoch + 1, swa_start_reason)
             use_swa_scheduler_this_epoch = bool(
@@ -1693,17 +2113,6 @@ def main():
             if profile_this_epoch and train_profile is not None:
                 train_time = train_profile['total']
 
-            # 🆕 SWA: Update averaged model starting from swa_start epoch (inclusive)
-            if use_swa_scheduler_this_epoch:
-                swa_model.update_parameters(model)
-                if swa_scheduler is not None:
-                    swa_scheduler.step()
-                if debug_enabled:
-                    print(
-                        f"       SWA update ({epoch + 2 - swa_start}/"
-                        f"{config['imitation_learning']['epochs'] - swa_start + 1})"
-                    )
-
             # Print train losses and metrics
             print(f"Train - Loss: {train_losses['total']:.4f}, "
                   f"Policy: {train_losses['policy']:.4f}, "
@@ -1716,7 +2125,7 @@ def main():
 
 
             # Evaluate
-            if (epoch + 1) % config['imitation_learning']['eval_every'] == 0:
+            if (epoch + 1) % il_eval_every == 0:
                 if profile_this_epoch and device.type == 'cuda':
                     torch.cuda.synchronize()
                 eval_start_time = time.perf_counter()
@@ -1748,8 +2157,7 @@ def main():
                 logger.log(epoch + 1, train_losses, val_losses, train_metrics, val_metrics, epoch_lr,
                            estimated_elo=estimated_elo)
                 completed_epochs_this_run += 1
-                if completed_epochs_this_run % il_plot_every == 0:
-                    logger.plot()
+                logger.plot()
                 elo_coordinator.poll_results()
 
                 # Save best model
@@ -1758,7 +2166,8 @@ def main():
                     config['imitation_learning'],
                 )
                 improvement = best_val_loss - current_monitor_loss
-                if improvement > min_delta:
+                improved_this_epoch = improvement > min_delta
+                if improved_this_epoch:
                     best_val_loss = current_monitor_loss
                     best_raw_val_loss_for_swa = float(val_losses['total'])
                     patience_counter = 0
@@ -1793,7 +2202,7 @@ def main():
                         'model_architecture': model_architecture,
                     }
                     best_metadata.update(elo_metadata)
-                    save_checkpoint(
+                    saved_best_path = Path(save_checkpoint(
                         model_to_save,
                         optimizer,
                         epoch,
@@ -1802,13 +2211,13 @@ def main():
                         best_metadata,
                         save_optimizer=False,
                         save_dtype=torch.bfloat16 if use_bfloat16 else None,
-                    )
+                    ))
 
-                    print(f"  💾 Saved to: {best_model_path}")
-                    size_mb = best_model_path.stat().st_size / (1024**2)
+                    print(f"  💾 Saved to: {saved_best_path}")
+                    size_mb = saved_best_path.stat().st_size / (1024**2)
                     print(f"  📦 Model size: {size_mb:.1f} MB (without optimizer)")
                     if version_best_model_path != best_model_path:
-                        shutil.copy2(best_model_path, version_best_model_path)
+                        shutil.copy2(saved_best_path, version_best_model_path)
                         version_best_size_mb = version_best_model_path.stat().st_size / (1024 ** 2)
                         print(
                             f"  💾 Version best updated: {version_best_model_path.name} "
@@ -1817,6 +2226,15 @@ def main():
                 else:
                     patience_counter += 1
                     print(f"No improvement. Patience: {patience_counter}/{max_patience}")
+
+                _maybe_decay_lr_on_plateau(epoch + 1, improved_this_epoch)
+
+                if use_swa_scheduler_this_epoch:
+                    _maybe_update_swa_after_epoch(
+                        epoch + 1,
+                        current_monitor_loss=current_monitor_loss,
+                        current_monitor_label=current_monitor_label,
+                    )
 
                 if use_swa and swa_stop_after_anneal_no_improve and swa_scheduler is not None:
                     swa_anneal_complete_epoch = int(swa_start) + int(swa_anneal_epochs) - 1
@@ -1859,9 +2277,45 @@ def main():
 
                 # Early stopping
                 if patience_counter >= max_patience:
-                    print(f"\n🛑 Early stopping triggered!")
-                    print(f"Best monitor loss: {best_val_loss:.4f} ({monitor_label})")
-                    should_stop = True
+                    if (
+                        use_swa
+                        and swa_auto_start
+                        and swa_start_on_early_stop
+                        and swa_scheduler is None
+                    ):
+                        swa_start = epoch + 1
+                        started_swa = _activate_swa_if_due(
+                            epoch + 1,
+                            (
+                                "early-stop fallback "
+                                f"(patience={patience_counter}/{max_patience}, "
+                                f"configured_min={swa_auto_min_epoch_config}, "
+                                f"resolved_min={swa_auto_min_epoch})"
+                            ),
+                        )
+                        if started_swa:
+                            _maybe_update_swa_after_epoch(
+                                epoch + 1,
+                                current_monitor_loss=current_monitor_loss,
+                                current_monitor_label=current_monitor_label,
+                            )
+
+                    swa_updates = _swa_updates_collected()
+                    if (
+                        use_swa
+                        and swa_scheduler is not None
+                        and swa_updates < swa_min_updates_this_run
+                    ):
+                        print(
+                            "\nEarly stopping delayed for SWA: "
+                            f"collected {swa_updates}/{swa_min_updates_this_run} "
+                            "averaged checkpoints."
+                        )
+                        print(f"Best monitor loss: {best_val_loss:.4f} ({monitor_label})")
+                    else:
+                        print(f"\n🛑 Early stopping triggered!")
+                        print(f"Best monitor loss: {best_val_loss:.4f} ({monitor_label})")
+                        should_stop = True
             else:
                 # Log only training metrics
                 logger.log(
@@ -1875,6 +2329,8 @@ def main():
                 )
                 completed_epochs_this_run += 1
                 elo_coordinator.poll_results()
+                if use_swa_scheduler_this_epoch:
+                    _maybe_update_swa_after_epoch(epoch + 1)
                 eval_time = 0.0
 
             if profile_this_epoch:
@@ -1974,7 +2430,7 @@ def main():
                     'val_value_mae': val_metrics['value_mae'],
                 })
             latest_metadata.update(elo_metadata)
-            save_checkpoint(
+            saved_latest_path = Path(save_checkpoint(
                 model_to_save,
                 optimizer,
                 epoch,
@@ -1991,10 +2447,10 @@ def main():
                     estimated_elo=elo_for_state,
                     estimated_elo_epoch=elo_epoch_for_state,
                 ),
-            )
+            ))
 
-            latest_size_mb = latest_checkpoint_path.stat().st_size / (1024 ** 2)
-            print(f"💾 Latest checkpoint updated: {latest_checkpoint_path.name} ({latest_size_mb:.1f} MB)")
+            latest_size_mb = saved_latest_path.stat().st_size / (1024 ** 2)
+            print(f"💾 Latest checkpoint updated: {saved_latest_path.name} ({latest_size_mb:.1f} MB)")
 
             save_swa_snapshot_checkpoint(
                 epoch_idx=epoch,
@@ -2046,11 +2502,22 @@ def main():
         else:
             print("Ctrl+C happened before any epoch finished; skipping final IL Elo checks.")
 
+    logged_epoch_values = []
+    for logged_epoch in getattr(logger, "iterations", []) or []:
+        try:
+            logged_epoch_values.append(int(logged_epoch))
+        except (TypeError, ValueError):
+            pass
+    final_completed_epoch = max(logged_epoch_values) if logged_epoch_values else max(0, int(start_epoch or 0))
+    latest_estimated_epoch, _latest_estimated_elo = logger.get_latest_estimated_elo_with_epoch()
+    final_epoch_num = max(1, int(latest_estimated_epoch or final_completed_epoch or 1))
+    final_epoch_idx_for_swa = max(0, int(final_completed_epoch or final_epoch_num) - 1)
+
     # Finalize SWA at training end and also on interrupt (if SWA has updates).
     swa_elo_stop_event = threading.Event()
     try:
         swa_final_result = finalize_swa_model(
-            final_epoch_idx=last_epoch_idx,
+            final_epoch_idx=final_epoch_idx_for_swa,
             interrupted=training_interrupted,
             use_swa=use_swa,
             swa_model=swa_model,
@@ -2069,7 +2536,7 @@ def main():
             best_val_loss=best_val_loss,
             best_raw_val_loss=best_raw_val_loss_for_swa,
             evaluate_il_fn=evaluate_il,
-            elo_config=final_elo_config_il_mcts if final_il_elo_enabled and not skip_interrupt_final_elo else None,
+            elo_config=final_elo_config_il if final_il_elo_enabled and not skip_interrupt_final_elo else None,
             elo_stop_event=swa_elo_stop_event,
             model_architecture=model_architecture,
             training_batch_size=trained_batch_size,
@@ -2079,24 +2546,14 @@ def main():
         print("\nSecond Ctrl+C detected. Final SWA/Elo step cancelled.")
         swa_final_result = {"finalized": False, "elo_cancelled": True}
 
-    final_epoch_num = max(1, last_epoch_idx + 1)
     swa_was_active = bool(use_swa and final_epoch_num >= int(swa_start))
     if swa_was_active:
-        swa_marker_epoch = swa_final_result.get("estimated_elo_epoch")
-        if swa_marker_epoch is None:
-            swa_marker_epoch = final_epoch_num
-        try:
-            marker_epoch_int = int(swa_marker_epoch)
-        except (TypeError, ValueError):
-            marker_epoch_int = final_epoch_num
         marker_label = "SWA final" if swa_final_result.get("finalized") else "SWA skipped"
-        logger.add_elo_epoch_marker(marker_epoch_int, marker_label)
+        logger.add_elo_epoch_marker(final_epoch_num, marker_label)
 
     if swa_final_result.get("finalized"):
         swa_elo = swa_final_result.get("estimated_elo")
-        swa_epoch = swa_final_result.get("estimated_elo_epoch")
-        if swa_epoch is None:
-            swa_epoch = max(1, last_epoch_idx + 1)
+        swa_epoch = final_epoch_num
 
         # Record full SWA metrics for the summary table + gold-star Elo point
         logger.record_swa_metrics(
@@ -2111,6 +2568,17 @@ def main():
             elo=swa_elo,
             epoch=swa_epoch,
         )
+        if swa_elo is not None:
+            logger.record_il_mode_elo(
+                swa_epoch,
+                swa_elo,
+                mode="nn",
+                simulations=0,
+                label="SWA final NN",
+                update_csv=True,
+                std_error=swa_final_result.get("estimated_elo_std_error"),
+                ci95=swa_final_result.get("estimated_elo_ci95"),
+            )
 
         swa_note = (
             "SWA final: "
@@ -2124,6 +2592,33 @@ def main():
             swa_note += ", elo=n/a"
         logger.append_final_note(swa_note)
         logger.plot()
+
+        if final_il_elo_enabled and not skip_interrupt_final_elo and not swa_final_result.get("elo_cancelled"):
+            swa_model_path = Path(swa_final_result.get("model_path") or (best_model_path.parent / "best_model_il_swa.pt"))
+            swa_elo_model, swa_elo_label = _load_il_model_for_final_elo(
+                swa_model_path,
+                config,
+                device,
+                fallback_model=None,
+            )
+            if swa_elo_model is not None:
+                swa_mcts_result = _run_il_final_elo(
+                    model=swa_elo_model,
+                    config=config,
+                    device=device,
+                    elo_config=final_elo_config_il_mcts,
+                    logger=logger,
+                    epoch_num=int(swa_epoch),
+                    model_label=f"SWA IL: {swa_elo_label} MCTS",
+                    marker_label="SWA final MCTS",
+                    interrupted=training_interrupted,
+                    checkpoint_path=swa_model_path,
+                )
+                if swa_mcts_result.get("estimated_elo") is not None:
+                    logger.append_final_note(
+                        f"SWA final MCTS: {int(round(float(swa_mcts_result['estimated_elo'])))}"
+                    )
+                    logger.plot()
     elif swa_was_active:
         logger.append_final_note(f"SWA final: not saved (epoch {final_epoch_num})")
         logger.plot()
@@ -2141,6 +2636,25 @@ def main():
             final_model_label = f"best IL: {best_elo_label}" if best_checkpoint_loaded else "current model"
             final_marker_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
             final_note_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
+            if best_checkpoint_loaded:
+                best_nn = _best_existing_nn_elo_from_logger(logger)
+                if best_nn is not None:
+                    logger.record_best_final_elo(final_epoch_num, best_nn["elo"])
+                    logger.record_il_mode_elo(
+                        final_epoch_num,
+                        best_nn["elo"],
+                        mode="nn",
+                        simulations=0,
+                        label="Best NN",
+                        update_csv=True,
+                        std_error=best_nn.get("std_error"),
+                        ci95=best_nn.get("ci95"),
+                    )
+                    logger.append_final_note(
+                        f"{final_note_label} NN: {int(round(float(best_nn['elo'])))} "
+                        f"(reused epoch {best_nn['source_epoch']})"
+                    )
+                    logger.plot()
             final_best_elo_results = []
             for mode_cfg, mode_suffix in (
                 (final_elo_config_il_mcts, "MCTS"),
@@ -2162,11 +2676,6 @@ def main():
                 if final_best_elo_result.get("cancelled"):
                     break
                 if final_best_elo_result.get("estimated_elo") is not None:
-                    if best_checkpoint_loaded and mode_suffix == "MCTS":
-                        logger.record_best_final_elo(
-                            final_epoch_num,
-                            final_best_elo_result.get("estimated_elo"),
-                        )
                     logger.append_final_note(
                         f"{final_note_label} {mode_suffix}: "
                         f"{int(round(float(final_best_elo_result['estimated_elo'])))}"
@@ -2189,6 +2698,7 @@ def main():
                 ran_current_final_elo = True
                 current_results = []
                 for mode_cfg, mode_suffix in (
+                    (final_elo_config_il, "NN"),
                     (final_elo_config_il_mcts, "MCTS"),
                 ):
                     final_elo_result = _run_il_final_elo(

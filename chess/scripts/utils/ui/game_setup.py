@@ -16,7 +16,7 @@ import yaml
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent.parent))
 
-from utils.shared.model_catalog import load_checkpoint_metadata
+from utils.shared.model_catalog import format_elo_stat_parts, format_elo_summary, load_checkpoint_metadata
 from utils.ui.gui_helpers import create_piece_surfaces, start_piece_asset_prefetch
 
 
@@ -456,6 +456,7 @@ def write_setup_log(base_dir, config, setup):
         "mcts_simulations": setup.get("mcts_simulations"),
         "mcts_simulations_white": setup.get("mcts_simulations_white"),
         "mcts_simulations_black": setup.get("mcts_simulations_black"),
+        "match_games": setup.get("match_games"),
         "model_ai": str(setup.get("model1_path")) if setup.get("model1_path") else None,
         "model_white": str(setup.get("model_white")) if setup.get("model_white") else None,
         "model_black": str(setup.get("model_black")) if setup.get("model_black") else None,
@@ -507,6 +508,9 @@ def save_play_preferences(base_dir, config, preferences):
         sims_white = sims
     if sims_black is None:
         sims_black = sims
+    match_games = _safe_int((preferences or {}).get("match_games"), default=1)
+    if match_games is None:
+        match_games = 1
     payload = dict(existing_payload)
     payload.update(
         {
@@ -517,6 +521,7 @@ def save_play_preferences(base_dir, config, preferences):
             "mcts_simulations": max(1, int(sims)),
             "mcts_simulations_white": max(1, int(sims_white)),
             "mcts_simulations_black": max(1, int(sims_black)),
+            "match_games": max(1, int(match_games)),
         }
     )
     for key in ("game_mode", "human_color", "model_ai", "model_white", "model_black"):
@@ -589,9 +594,9 @@ def _format_model_entry(path, models_dir, max_len=66, metadata=None):
     if top1 is not None:
         parts.append(f"Top1:{top1 * 100:.1f}%")
     
-    elo = metadata.get("elo")
-    if elo is not None:
-        parts.append(f"Elo:{int(round(float(elo)))}")
+    elo_summary = format_elo_summary(metadata)
+    if elo_summary != "n/a":
+        parts.append(elo_summary)
     
     size_mb = metadata.get("size_mb", 0.0)
     parts.append(f"{size_mb:.1f}MB")
@@ -786,17 +791,14 @@ def _draw_selection_card(
             metadata=metadata,
         )
         version = metadata.get("version") if isinstance(metadata, dict) else None
-        elo = metadata.get("elo") if isinstance(metadata, dict) else None
+        elo = format_elo_summary(metadata) if isinstance(metadata, dict) else "n/a"
         size_mb = metadata.get("size_mb") if isinstance(metadata, dict) else None
         line3_parts = []
         if version is not None:
             version = str(version)
             line3_parts.append(version if version.startswith("v") else f"v{version}")
-        if elo is not None:
-            try:
-                line3_parts.append(f"Elo {int(round(float(elo)))}")
-            except Exception:
-                pass
+        if elo != "n/a":
+            line3_parts.append(elo)
         if size_mb is not None:
             try:
                 line3_parts.append(f"{float(size_mb):.1f} MB")
@@ -866,8 +868,7 @@ def _get_model_info_content(model_path, models_dir, metadata_cache):
     epoch_value = str(int(epoch) + 1) if epoch is not None else "n/a"
     top1 = metadata.get("top1")
     top1_value = f"{float(top1) * 100:.2f}%" if top1 is not None else "n/a"
-    elo = metadata.get("elo")
-    elo_value = f"{int(round(float(elo)))}" if elo is not None else "n/a"
+    elo_value = format_elo_summary(metadata)
     version = metadata.get("version")
     version_value = f"v{version}" if version and not str(version).startswith("v") else (str(version) if version else "n/a")
     modified = metadata.get("modified") or "n/a"
@@ -885,11 +886,12 @@ def _get_model_info_content(model_path, models_dir, metadata_cache):
         ("Modified", modified),
     ]
 
-    top_stats = [
-        ("Elo", elo_value),
-        ("Top1", top1_value),
-        ("Epoch", epoch_value),
-    ]
+    elo_stats = format_elo_stat_parts(metadata)
+    if len(elo_stats) >= 2:
+        top_stats = elo_stats[:2] + [("Top1", top1_value)]
+    else:
+        top_stats = elo_stats + [("Top1", top1_value), ("Epoch", epoch_value)]
+    top_stats = top_stats[:3]
     return metadata, name, rel, rows, top_stats
 
 
@@ -939,8 +941,10 @@ def _draw_model_info_panel(
         stat_rect = pygame.Rect(rect.left + 16 + idx * (stat_w + stat_gap), stat_y, stat_w, 52)
         pygame.draw.rect(screen, (18, 24, 33), stat_rect, border_radius=12)
         pygame.draw.rect(screen, (70, 88, 113), stat_rect, width=1, border_radius=12)
-        screen.blit(font_meta.render(label, True, (149, 166, 191)), (stat_rect.left + 12, stat_rect.top + 10))
-        value_surface = font_h2.render(str(value), True, _TEXT)
+        label_text = _fit_text(font_meta, label, max(8, stat_rect.width - 24))
+        value_text = _fit_text(font_h2, str(value), max(8, stat_rect.width - 24))
+        screen.blit(font_meta.render(label_text, True, (149, 166, 191)), (stat_rect.left + 12, stat_rect.top + 10))
+        value_surface = font_h2.render(value_text, True, _TEXT)
         screen.blit(value_surface, (stat_rect.left + 12, stat_rect.top + 24))
 
     row_h = max(24, font_meta.get_height() + 10)
@@ -993,49 +997,6 @@ def _draw_model_browser(
         screen.blit(empty, (panel_rect.left + 16, panel_rect.top + 16))
         return actions, 0
 
-    header_rect = pygame.Rect(panel_rect.left + pad, panel_rect.top + pad, panel_rect.width - 2 * pad - 10, header_h)
-    pygame.draw.rect(screen, (16, 21, 30), header_rect, border_radius=11)
-    pygame.draw.rect(screen, (90, 108, 136), header_rect, width=1, border_radius=10)
-    metric_gap = 10
-    metric_w = {"ver": 56, "top1": 84, "elo": 64}
-    metrics_right = header_rect.right - 10
-    elo_left = metrics_right - metric_w["elo"]
-    top1_left = elo_left - metric_gap - metric_w["top1"]
-    ver_left = top1_left - metric_gap - metric_w["ver"]
-
-    model_col_rect = pygame.Rect(header_rect.left + 8, header_rect.top + 4, max(60, ver_left - header_rect.left - 14), header_h - 8)
-    ver_col_rect = pygame.Rect(ver_left, header_rect.top + 4, metric_w["ver"], header_h - 8)
-    top1_col_rect = pygame.Rect(top1_left, header_rect.top + 4, metric_w["top1"], header_h - 8)
-    elo_col_rect = pygame.Rect(elo_left, header_rect.top + 4, metric_w["elo"], header_h - 8)
-
-    def _sort_label(label, key):
-        if sort_key != key:
-            return label
-        return f"{label} {'▼' if sort_desc else '▲'}"
-
-    headers = [
-        (_sort_label("Model", "model"), model_col_rect, "model"),
-        ("Ver", ver_col_rect, None),
-        (_sort_label("Top1", "top1"), top1_col_rect, "top1"),
-        (_sort_label("Elo", "elo"), elo_col_rect, "elo"),
-    ]
-    for label, col_rect, sortable_key in headers:
-        color = (196, 210, 232) if sortable_key and sort_key == sortable_key else (166, 181, 205)
-        text = font_meta.render(label, True, color)
-        screen.blit(text, text.get_rect(center=col_rect.center))
-        if sortable_key:
-            actions.append((col_rect, "sort", sortable_key))
-    for sx in (ver_left - 6, top1_left - 6, elo_left - 6):
-        pygame.draw.line(screen, (74, 90, 114), (sx, header_rect.top + 5), (sx, header_rect.bottom - 5), 1)
-
-    # Clip scrolling content so partially-visible rows are cropped cleanly.
-    content_clip = pygame.Rect(
-        panel_rect.left + pad,
-        header_rect.bottom + 6,
-        panel_rect.width - 2 * pad - 10,
-        max(1, panel_rect.bottom - pad - (header_rect.bottom + 6)),
-    )
-
     def fmt_version(meta):
         version = meta.get("version")
         if version is None:
@@ -1053,13 +1014,92 @@ def _draw_model_browser(
             return "n/a"
 
     def fmt_elo(meta):
-        elo = meta.get("elo")
-        if elo is None:
-            return "n/a"
-        try:
-            return str(int(round(float(elo))))
-        except Exception:
-            return "n/a"
+        summary = format_elo_summary(meta)
+        if summary == "n/a":
+            return summary
+        return (
+            summary.replace("NN ", "N ")
+            .replace("MCTS ", "M ")
+            .replace("Elo ", "")
+        )
+
+    header_rect = pygame.Rect(panel_rect.left + pad, panel_rect.top + pad, panel_rect.width - 2 * pad - 10, header_h)
+    pygame.draw.rect(screen, (16, 21, 30), header_rect, border_radius=11)
+    pygame.draw.rect(screen, (90, 108, 136), header_rect, width=1, border_radius=10)
+    metric_gap = 10
+    def _visible_model_paths():
+        paths = []
+        for category_key in visible_keys:
+            if category_key == "best" or expanded.get(category_key, False):
+                paths.extend(grouped.get(category_key, []))
+        return paths
+
+    visible_metas = [metadata_cache.get(path) or {} for path in _visible_model_paths()]
+
+    def _column_width(label, values, min_w, max_w, pad_w=18):
+        widest = font_meta.size(str(label))[0]
+        for value in values:
+            widest = max(widest, font_meta.size(str(value))[0])
+        return min(max_w, max(min_w, widest + pad_w))
+
+    metric_w = {
+        "ver": _column_width("Ver", [fmt_version(meta) for meta in visible_metas], 64, 132),
+        "top1": _column_width("Top1", [fmt_top1(meta) for meta in visible_metas], 58, 86),
+        "elo": _column_width("Elo", [fmt_elo(meta) for meta in visible_metas], 128, 184),
+    }
+    min_metric_w = {"ver": 54, "top1": 54, "elo": 108}
+    min_model_w = 28
+    max_metric_total = max(
+        sum(min_metric_w.values()),
+        header_rect.width - 20 - min_model_w - 2 * metric_gap,
+    )
+    overflow = sum(metric_w.values()) - max_metric_total
+    for key in ("ver", "elo", "top1"):
+        if overflow <= 0:
+            break
+        shrink = min(overflow, metric_w[key] - min_metric_w[key])
+        metric_w[key] -= shrink
+        overflow -= shrink
+    metrics_right = header_rect.right - 10
+    elo_left = metrics_right - metric_w["elo"]
+    top1_left = elo_left - metric_gap - metric_w["top1"]
+    ver_left = top1_left - metric_gap - metric_w["ver"]
+
+    model_col_rect = pygame.Rect(header_rect.left + 8, header_rect.top + 4, max(0, ver_left - header_rect.left - 14), header_h - 8)
+    ver_col_rect = pygame.Rect(ver_left, header_rect.top + 4, metric_w["ver"], header_h - 8)
+    top1_col_rect = pygame.Rect(top1_left, header_rect.top + 4, metric_w["top1"], header_h - 8)
+    elo_col_rect = pygame.Rect(elo_left, header_rect.top + 4, metric_w["elo"], header_h - 8)
+
+    def _sort_label(label, key):
+        if sort_key != key:
+            return label
+        return f"{label} {'v' if sort_desc else '^'}"
+
+    headers = [
+        (_sort_label("Model", "model"), model_col_rect, "model"),
+        ("Ver", ver_col_rect, None),
+        (_sort_label("Top1", "top1"), top1_col_rect, "top1"),
+        (_sort_label("Elo", "elo"), elo_col_rect, "elo"),
+    ]
+    for label, col_rect, sortable_key in headers:
+        if col_rect.width <= 8:
+            continue
+        color = (196, 210, 232) if sortable_key and sort_key == sortable_key else (166, 181, 205)
+        text = font_meta.render(_fit_text(font_meta, label, max(8, col_rect.width - 4)), True, color)
+        screen.blit(text, text.get_rect(center=col_rect.center))
+        if sortable_key:
+            actions.append((col_rect, "sort", sortable_key))
+    for sx in (ver_left - 6, top1_left - 6, elo_left - 6):
+        if header_rect.left + 6 < sx < header_rect.right - 6:
+            pygame.draw.line(screen, (74, 90, 114), (sx, header_rect.top + 5), (sx, header_rect.bottom - 5), 1)
+
+    # Clip scrolling content so partially-visible rows are cropped cleanly.
+    content_clip = pygame.Rect(
+        panel_rect.left + pad,
+        header_rect.bottom + 6,
+        panel_rect.width - 2 * pad - 10,
+        max(1, panel_rect.bottom - pad - (header_rect.bottom + 6)),
+    )
 
     def _display_name_for_category(path, category_key):
         rel = _short_model_path(path, models_dir, max_len=240)
@@ -1193,17 +1233,19 @@ def _draw_model_browser(
 
             sep_color = (164, 196, 236) if active else (78, 94, 116)
             for sx in (row_ver_left - 6, row_top1_left - 6, row_elo_left - 6):
-                pygame.draw.line(screen, sep_color, (sx, rect.top + 8), (sx, rect.bottom - 8), 1)
+                if rect.left + 10 < sx < rect.right - 10:
+                    pygame.draw.line(screen, sep_color, (sx, rect.top + 8), (sx, rect.bottom - 8), 1)
 
             name_x = rect.left + 20
-            name_max_w = max(80, row_ver_left - name_x - 12)
+            name_max_w = max(0, row_ver_left - name_x - 12)
             raw_name = _display_name_for_category(path, key)
-            name = _fit_text(font_text, raw_name, name_max_w)
-            screen.blit(font_text.render(name, True, text_color), (name_x, rect.top + 11))
+            if name_max_w > 24:
+                name = _fit_text(font_text, raw_name, name_max_w)
+                screen.blit(font_text.render(name, True, text_color), (name_x, rect.top + 11))
 
-            ver_text = font_meta.render(ver, True, meta_color)
-            top1_text = font_meta.render(top1, True, meta_color)
-            elo_text = font_meta.render(elo, True, meta_color)
+            ver_text = font_meta.render(_fit_text(font_meta, ver, max(8, metric_w["ver"] - 6)), True, meta_color)
+            top1_text = font_meta.render(_fit_text(font_meta, top1, max(8, metric_w["top1"] - 6)), True, meta_color)
+            elo_text = font_meta.render(_fit_text(font_meta, elo, max(8, metric_w["elo"] - 6)), True, meta_color)
             ver_rect = pygame.Rect(row_ver_left, rect.top + 10, metric_w["ver"], rect.height - 20)
             top1_rect = pygame.Rect(row_top1_left, rect.top + 10, metric_w["top1"], rect.height - 20)
             elo_rect = pygame.Rect(row_elo_left, rect.top + 10, metric_w["elo"], rect.height - 20)
@@ -1282,6 +1324,7 @@ def _selection_to_result(
     mcts_simulations=None,
     mcts_simulations_white=None,
     mcts_simulations_black=None,
+    match_games=1,
 ):
     if use_mcts_white is None:
         use_mcts_white = use_mcts
@@ -1299,6 +1342,7 @@ def _selection_to_result(
             "mcts_simulations": int(mcts_simulations) if mcts_simulations is not None else None,
             "mcts_simulations_white": int(mcts_simulations_white) if mcts_simulations_white is not None else None,
             "mcts_simulations_black": int(mcts_simulations_black) if mcts_simulations_black is not None else None,
+            "match_games": int(match_games),
             "model1_path": None,
             "model2_path": None,
             "model_white": None,
@@ -1319,6 +1363,7 @@ def _selection_to_result(
             "mcts_simulations": int(mcts_simulations) if mcts_simulations is not None else None,
             "mcts_simulations_white": int(mcts_simulations_white) if mcts_simulations_white is not None else None,
             "mcts_simulations_black": int(mcts_simulations_black) if mcts_simulations_black is not None else None,
+            "match_games": int(match_games),
             "model1_path": opponent_model,
             "model2_path": None,
             "model_white": model_white,
@@ -1335,6 +1380,7 @@ def _selection_to_result(
         "mcts_simulations": int(mcts_simulations) if mcts_simulations is not None else None,
         "mcts_simulations_white": int(mcts_simulations_white) if mcts_simulations_white is not None else None,
         "mcts_simulations_black": int(mcts_simulations_black) if mcts_simulations_black is not None else None,
+        "match_games": int(match_games),
         "model1_path": selected_models["white"],
         "model2_path": selected_models["black"],
         "model_white": selected_models["white"],
@@ -1636,6 +1682,11 @@ def select_models(
     mcts_simulations_white = max(16, min(2000, int(mcts_simulations_white)))
     mcts_simulations_black = max(16, min(2000, int(mcts_simulations_black)))
     mcts_step = 16
+    match_games = _safe_int(saved_preferences.get("match_games"), default=1)
+    match_games = max(1, min(500, int(match_games or 1)))
+    match_games_step = 2
+    active_numeric_field = None
+    numeric_input_text = ""
     mcts_profiles = [
         ("Fast", 64),
         ("Balanced", 100),
@@ -1676,6 +1727,7 @@ def select_models(
         "mcts_simulations": int(mcts_simulations),
         "mcts_simulations_white": int(mcts_simulations_white),
         "mcts_simulations_black": int(mcts_simulations_black),
+        "match_games": int(match_games),
     }
 
     def persist_ui_preferences(force=False):
@@ -1689,6 +1741,7 @@ def select_models(
             "mcts_simulations": int(max(1, mcts_simulations)),
             "mcts_simulations_white": int(max(1, mcts_simulations_white)),
             "mcts_simulations_black": int(max(1, mcts_simulations_black)),
+            "match_games": int(max(1, match_games)),
             "model_ai": str(opponent_model) if opponent_model else None,
             "model_white": str(selected_models["white"]) if selected_models["white"] else None,
             "model_black": str(selected_models["black"]) if selected_models["black"] else None,
@@ -1700,6 +1753,59 @@ def select_models(
             last_saved_preferences = current
         except Exception:
             pass
+
+    def begin_numeric_input(field_key, current_value):
+        nonlocal active_numeric_field, numeric_input_text
+        active_numeric_field = field_key
+        numeric_input_text = str(int(current_value))
+
+    def cancel_numeric_input():
+        nonlocal active_numeric_field, numeric_input_text
+        active_numeric_field = None
+        numeric_input_text = ""
+
+    def commit_numeric_input():
+        nonlocal active_numeric_field, numeric_input_text
+        nonlocal mcts_simulations, mcts_simulations_white, mcts_simulations_black, match_games
+        if active_numeric_field is None:
+            return
+        raw = numeric_input_text.strip()
+        try:
+            value = int(raw) if raw else None
+        except ValueError:
+            value = None
+
+        if active_numeric_field == "match_games":
+            if value is not None:
+                match_games = max(1, min(500, value))
+        elif active_numeric_field == "mcts":
+            if value is not None:
+                mcts_simulations = max(16, min(2000, value))
+        elif active_numeric_field == "mcts_white":
+            if value is not None:
+                mcts_simulations_white = max(16, min(2000, value))
+        elif active_numeric_field == "mcts_black":
+            if value is not None:
+                mcts_simulations_black = max(16, min(2000, value))
+
+        active_numeric_field = None
+        numeric_input_text = ""
+        persist_ui_preferences()
+
+    def numeric_text(field_key, current_value):
+        if active_numeric_field != field_key:
+            return str(int(current_value))
+        caret = "|" if (pygame.time.get_ticks() // 450) % 2 == 0 else ""
+        return f"{numeric_input_text}{caret}"
+
+    def draw_numeric_value(rect, field_key, current_value, font):
+        active = active_numeric_field == field_key
+        border = (118, 165, 234) if active else (94, 112, 140)
+        fill = (22, 31, 45) if active else (19, 25, 35)
+        pygame.draw.rect(canvas, fill, rect, border_radius=10)
+        pygame.draw.rect(canvas, border, rect, width=2 if active else 1, border_radius=10)
+        label = font.render(numeric_text(field_key, current_value), True, _TEXT)
+        canvas.blit(label, label.get_rect(center=rect.center))
 
     def apply_sort(selected_key):
         nonlocal sort_key, sort_desc
@@ -1879,14 +1985,20 @@ def select_models(
         settings_panel_rect = None
         mcts_toggle_rect = None
         mcts_minus_rect = None
+        mcts_value_rect = None
         mcts_plus_rect = None
         mcts_profile_buttons = []
         mcts_white_toggle_rect = None
         mcts_black_toggle_rect = None
         mcts_white_minus_rect = None
+        mcts_white_value_rect = None
         mcts_white_plus_rect = None
         mcts_black_minus_rect = None
+        mcts_black_value_rect = None
         mcts_black_plus_rect = None
+        match_games_minus_rect = None
+        match_games_value_rect = None
+        match_games_plus_rect = None
         content_top = scale_px(356)
         content_bottom = layout_height - scale_px(92)
         content_height = max(scale_px(180), content_bottom - content_top)
@@ -1948,6 +2060,31 @@ def select_models(
                 disabled=game_mode == "human_vs_human",
             )
 
+            if game_mode == "ai_vs_ai":
+                match_label_x = mcts_toggle_rect.right + scale_px(28)
+                match_label_y = mcts_toggle_rect.top - scale_px(2)
+                canvas.blit(font_meta.render("Match games", True, _MUTED), (match_label_x, match_label_y))
+                match_controls_y = mcts_toggle_rect.top + scale_px(18)
+                match_games_minus_rect = pygame.Rect(match_label_x, match_controls_y, scale_px(40), scale_px(34))
+                match_games_value_rect = pygame.Rect(match_games_minus_rect.right + scale_px(8), match_controls_y, scale_px(96), scale_px(34))
+                match_games_plus_rect = pygame.Rect(match_games_value_rect.right + scale_px(8), match_controls_y, scale_px(40), scale_px(34))
+                _draw_button(
+                    canvas,
+                    match_games_minus_rect,
+                    "-",
+                    font_h2,
+                    hovered=match_games_minus_rect.collidepoint(mouse_pos),
+                    disabled=match_games <= 1,
+                )
+                draw_numeric_value(match_games_value_rect, "match_games", match_games, font_h2)
+                _draw_button(
+                    canvas,
+                    match_games_plus_rect,
+                    "+",
+                    font_h2,
+                    hovered=match_games_plus_rect.collidepoint(mouse_pos),
+                )
+
             if game_mode == "human_vs_human":
                 canvas.blit(
                     font_meta.render("MCTS is disabled in Human vs Human mode.", True, (221, 181, 128)),
@@ -1991,10 +2128,7 @@ def select_models(
                         font_h2,
                         hovered=minus_rect.collidepoint(mouse_pos),
                     )
-                    pygame.draw.rect(canvas, (19, 25, 35), value_rect, border_radius=10)
-                    pygame.draw.rect(canvas, (94, 112, 140), value_rect, width=1, border_radius=10)
-                    value_label = font_h2.render(str(sims_value), True, _TEXT)
-                    canvas.blit(value_label, value_label.get_rect(center=value_rect.center))
+                    draw_numeric_value(value_rect, "mcts_white" if is_white else "mcts_black", sims_value, font_h2)
                     _draw_button(
                         canvas,
                         plus_rect,
@@ -2005,10 +2139,12 @@ def select_models(
                     if is_white:
                         mcts_white_toggle_rect = toggle_rect
                         mcts_white_minus_rect = minus_rect
+                        mcts_white_value_rect = value_rect
                         mcts_white_plus_rect = plus_rect
                     else:
                         mcts_black_toggle_rect = toggle_rect
                         mcts_black_minus_rect = minus_rect
+                        mcts_black_value_rect = value_rect
                         mcts_black_plus_rect = plus_rect
                 preset_y = controls_y + scale_px(160)
             else:
@@ -2022,7 +2158,7 @@ def select_models(
 
                 controls_y = settings_panel_rect.top + scale_px(198)
                 mcts_minus_rect = pygame.Rect(settings_panel_rect.left + scale_px(24), controls_y, scale_px(44), scale_px(42))
-                value_rect = pygame.Rect(settings_panel_rect.left + scale_px(76), controls_y, scale_px(168), scale_px(42))
+                mcts_value_rect = pygame.Rect(settings_panel_rect.left + scale_px(76), controls_y, scale_px(168), scale_px(42))
                 mcts_plus_rect = pygame.Rect(settings_panel_rect.left + scale_px(252), controls_y, scale_px(44), scale_px(42))
                 _draw_button(
                     canvas,
@@ -2031,10 +2167,7 @@ def select_models(
                     font_h2,
                     hovered=mcts_minus_rect.collidepoint(mouse_pos),
                 )
-                pygame.draw.rect(canvas, (19, 25, 35), value_rect, border_radius=10)
-                pygame.draw.rect(canvas, (94, 112, 140), value_rect, width=1, border_radius=10)
-                value_label = font_h2.render(str(mcts_simulations), True, _TEXT)
-                canvas.blit(value_label, value_label.get_rect(center=value_rect.center))
+                draw_numeric_value(mcts_value_rect, "mcts", mcts_simulations, font_h2)
                 _draw_button(
                     canvas,
                     mcts_plus_rect,
@@ -2268,7 +2401,7 @@ def select_models(
         _draw_button(
             canvas,
             start_rect,
-            "Start Game",
+            "Start Match" if game_mode == "ai_vs_ai" and match_games > 1 else "Start Game",
             font_text,
             hovered=start_rect.collidepoint(mouse_pos),
             active=can_start,
@@ -2324,6 +2457,18 @@ def select_models(
                 continue
 
             if event.type == pygame.KEYDOWN:
+                if active_numeric_field is not None:
+                    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        commit_numeric_input()
+                    elif event.key == pygame.K_ESCAPE:
+                        cancel_numeric_input()
+                    elif event.key == pygame.K_BACKSPACE:
+                        numeric_input_text = numeric_input_text[:-1]
+                    elif event.key == pygame.K_DELETE:
+                        numeric_input_text = ""
+                    elif event.unicode and event.unicode.isdigit() and len(numeric_input_text) < 5:
+                        numeric_input_text += event.unicode
+                    continue
                 if event.key == pygame.K_ESCAPE:
                     persist_ui_preferences(force=True)
                     return None
@@ -2353,6 +2498,7 @@ def select_models(
                             mcts_simulations,
                             mcts_simulations_white,
                             mcts_simulations_black,
+                            match_games,
                         )
                     )
 
@@ -2378,6 +2524,27 @@ def select_models(
                 if ui_pos is None:
                     continue
 
+                if workspace_tab == "settings":
+                    numeric_fields = [
+                        ("match_games", match_games_value_rect, match_games),
+                        ("mcts", mcts_value_rect, mcts_simulations),
+                        ("mcts_white", mcts_white_value_rect, mcts_simulations_white),
+                        ("mcts_black", mcts_black_value_rect, mcts_simulations_black),
+                    ]
+                    for field_key, rect, current_value in numeric_fields:
+                        if rect and rect.collidepoint(ui_pos):
+                            begin_numeric_input(field_key, current_value)
+                            break
+                    else:
+                        if active_numeric_field is not None:
+                            commit_numeric_input()
+                    if active_numeric_field is not None and any(
+                        rect and rect.collidepoint(ui_pos) for _, rect, _ in numeric_fields
+                    ):
+                        continue
+                elif active_numeric_field is not None:
+                    commit_numeric_input()
+
                 if cancel_rect.collidepoint(ui_pos):
                     persist_ui_preferences(force=True)
                     return None
@@ -2396,6 +2563,7 @@ def select_models(
                             mcts_simulations,
                             mcts_simulations_white,
                             mcts_simulations_black,
+                            match_games,
                         )
                     )
 
@@ -2454,6 +2622,14 @@ def select_models(
                         continue
                     if mcts_black_plus_rect and mcts_black_plus_rect.collidepoint(ui_pos):
                         mcts_simulations_black = min(2000, mcts_simulations_black + mcts_step)
+                        persist_ui_preferences()
+                        continue
+                    if match_games_minus_rect and match_games_minus_rect.collidepoint(ui_pos):
+                        match_games = max(1, match_games - match_games_step)
+                        persist_ui_preferences()
+                        continue
+                    if match_games_plus_rect and match_games_plus_rect.collidepoint(ui_pos):
+                        match_games = min(500, match_games + match_games_step)
                         persist_ui_preferences()
                         continue
                     for rect, value in mcts_profile_buttons:

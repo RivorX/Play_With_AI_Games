@@ -37,7 +37,8 @@ class CentralInferenceSession:
         config: dict,
         device: torch.device,
         workers: int,
-        model_state: dict[str, Any],
+        model_state: dict[str, Any] | None = None,
+        model_states: dict[str, dict[str, Any]] | None = None,
         options: dict | None = None,
         option_prefix: str = "eval_elo",
         model_label: str = "learner",
@@ -46,10 +47,21 @@ class CentralInferenceSession:
         self.config = config
         self.device = device
         self.workers = max(1, int(workers))
-        self.model_state = model_state
         self.options = dict(options or {})
         self.option_prefix = str(option_prefix).rstrip("_")
         self.model_label = str(model_label or "learner")
+        if model_states is not None:
+            self.model_states = {
+                str(label): state
+                for label, state in dict(model_states).items()
+                if state is not None
+            }
+        elif model_state is not None:
+            self.model_states = {self.model_label: model_state}
+        else:
+            self.model_states = {}
+        if not self.model_states:
+            raise ValueError("CentralInferenceSession requires model_state or model_states.")
         self.rank_base = int(rank_base)
 
         self._session = None
@@ -60,8 +72,27 @@ class CentralInferenceSession:
     def _key(self, suffix: str) -> str:
         return f"{self.option_prefix}_{suffix}" if self.option_prefix else suffix
 
+    @staticmethod
+    def _shared_key(suffix: str) -> str:
+        suffix = str(suffix)
+        prefix = "central_inference_"
+        return suffix[len(prefix):] if suffix.startswith(prefix) else suffix
+
     def _option(self, suffix: str, default=None):
-        return self.options.get(self._key(suffix), default)
+        prefixed_key = self._key(suffix)
+        if prefixed_key in self.options:
+            return self.options[prefixed_key]
+        if suffix in self.options:
+            return self.options[suffix]
+        shared_key = self._shared_key(suffix)
+        if shared_key in self.options:
+            return self.options[shared_key]
+        shared_cfg = (self.config or {}).get("central_inference", {}) or {}
+        if shared_key in shared_cfg:
+            return shared_cfg[shared_key]
+        if suffix in shared_cfg:
+            return shared_cfg[suffix]
+        return default
 
     def _float_option(self, suffix: str, default: float) -> float:
         raw_value = self._option(suffix, default)
@@ -107,11 +138,17 @@ class CentralInferenceSession:
         rl_cfg["self_play_central_inference_use_compile"] = bool(
             self._option("central_inference_use_compile", False)
         )
+        warmup_batches = self._option("central_inference_compile_warmup_batches", None)
+        if warmup_batches is not None:
+            rl_cfg["self_play_central_inference_compile_warmup_batches"] = warmup_batches
         rl_cfg["self_play_central_inference_transport_dtype"] = str(
             self._option("central_inference_transport_dtype", "float16") or "float16"
         )
         rl_cfg["self_play_central_inference_cudnn_benchmark"] = bool(
             self._option("central_inference_cudnn_benchmark", False)
+        )
+        rl_cfg["self_play_central_inference_sync_timing"] = bool(
+            self._option("central_inference_sync_timing", False)
         )
         return server_config
 
@@ -158,13 +195,17 @@ class CentralInferenceSession:
             processes.append(process)
 
         task_id = f"central_load_{os.getpid()}_{int(time.time() * 1000)}"
+        model_payload = [
+            {"label": label, "state": state}
+            for label, state in self.model_states.items()
+        ]
         for request_queue in request_queues:
             request_queue.put(
                 {
                     "cmd": "load_models",
                     "task_id": task_id,
                     "clear": True,
-                    "models": [{"label": self.model_label, "state": self.model_state}],
+                    "models": model_payload,
                 }
             )
 
@@ -257,15 +298,18 @@ class CentralInferenceSession:
             self._thread_ranks[thread_id] = rank
             return rank
 
-    def remote_model_for_current_thread(self):
+    def remote_model_for_current_thread(self, model_label: str | None = None):
         if self._session is None:
             return None
         rank = self._rank_for_current_thread()
         if rank < 0:
             return None
+        label = str(model_label or self.model_label)
+        if label not in self.model_states:
+            raise KeyError(f"Central inference model label is not loaded: {label}")
         server_idx = int((self._session.get("rank_to_server", {}) or {}).get(rank, 0))
         return _RemoteInferenceModel(
-            self.model_label,
+            label,
             self._session["request_queues"][server_idx],
             self._session["response_queues_by_rank"][rank],
             rank,

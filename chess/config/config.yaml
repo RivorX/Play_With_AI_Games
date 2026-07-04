@@ -26,7 +26,7 @@ paths:
 #   2. Game range cache: binary identity only
 #   3. Split: train_split
 #   4. positions/game cache: train_split + positions_per_game
-#   5. final index cache: positions/game + sample_dedup + target_positions
+#   5. final index cache: positions/game + sample_dedup + target_positions + target_selection
 #   6. soft target cache: final index + soft_targets
 #   7. train_sampling: training only, no dataset cache rebuild
 # Runtime knobs below affect speed only, not cache semantics.
@@ -75,7 +75,26 @@ data:
   # 5) Final target size. Changing this rebuilds final index + soft target cache only.
   target_positions: 20000000
 
-  # 6) Soft target cache. Aggregates raw split knowledge into final selected rows.
+  # 6) Final target selection. Train keeps broad coverage, then prefers rows with stronger raw occurrence.
+  target_selection:
+    mode: "count_aware"          # even | count_aware
+    broad_fraction: 0.40         # supersoft test: 40% broad/even, 60% count-aware compression
+    min_count_for_bonus: 2
+    max_count_score: 256
+    count_power: 0.90
+    max_bonus_rows_per_soft_key: 1
+    bonus_oversample_factor: 2.0
+    min_unique_moves_for_soft_bonus: 2
+    max_single_move_bonus_fraction: 0.25
+    move_diversity_bonus: 6.0
+    single_move_multiplier: 0.02
+    opening_progress_max: 0.25
+    endgame_progress_min: 0.75
+    count_opening_max_fraction: 0.45
+    opening_score_multiplier: 1.50
+    endgame_score_multiplier: 1.05
+
+  # 7) Soft target cache. Aggregates raw split knowledge into final selected rows.
   soft_targets:
     enabled: true
     policy: true
@@ -94,8 +113,9 @@ data:
     value_wdl_shrinkage_alpha: 1.0
 
     policy_target:
-      hard_below_count: 4
-      soft_full_count: 16
+      hard_below_count: 2
+      soft_full_count: 12
+      min_soft_alpha_for_multi_move: 0.10
       opening_progress_max: 0.25
       endgame_progress_min: 0.75
       opening_soft_power: 0.85
@@ -110,6 +130,10 @@ data:
       opening_boost_min_count: 2
       opening_multiplier: 1.5
       opening_max: 12
+      single_move_multiplier: 0.75
+      single_move_max: 2.0
+      soft_entropy_bonus: 0.35
+      soft_entropy_bonus_max: 1.35
 
     value_sample_weight:
       enabled: true
@@ -119,7 +143,7 @@ data:
       progress_power: 1.5
       max: 1.0
 
-  # 7) Training sampler. No cache rebuild; affects only epoch sampling.
+  # 8) Training sampler. No cache rebuild; affects only epoch sampling.
   train_sampling:
     enabled: false
     mode: "policy_weighted"
@@ -144,7 +168,7 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v9.7"
+  version: "v9.8"
   # Base architecture
   num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
   filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
@@ -211,6 +235,12 @@ imitation_learning:
 
   # LR schedule
   min_lr_ratio: 0.005
+  lr_plateau_decay: true
+  lr_plateau_patience: 2
+  lr_plateau_factor: 0.5
+  lr_plateau_min_scale: 0.25
+  lr_plateau_cooldown: 1
+  lr_plateau_reset_patience: true
 
   # Losses
   policy_loss_weight: 1.0
@@ -219,20 +249,19 @@ imitation_learning:
   moves_left_loss_weight: 0.05
   wdl_label_smoothing: 0.01
 
-  # Eval + checkpoint selection
-  eval_every: 1
-  train_metrics_interval: 16
-  eval_metrics_interval: 32
+  # Checkpoint selection
   early_stop_monitor: value_aware # total | value_aware
   max_patience: 5
   min_delta: 0.0015
 
   # SWA
   use_swa: true
-  swa_auto_min_epoch: 18
-  swa_transfer_unfreeze_offset: 2
-  swa_anneal_epochs: 12
-  swa_stop_after_anneal_grace_evals: 3
+  swa_auto_min_epoch: 36
+  swa_anneal_epochs: 5
+  swa_min_updates_before_stop: 8
+  swa_lr_ratio: 0.08
+  swa_lr_max: 0.00012
+  swa_bn_refresh_max_batches: 512
 
 # ------------------------------------------------------------------------------
 # REINFORCEMENT LEARNING (RL)
@@ -254,17 +283,7 @@ reinforcement_learning:
   self_play_worker_cap_multiplier: 1.7 # Safety cap for explicit/auto workers when central inference lets workers block on GPU
   self_play_torch_threads: 1    # Keep 1 thread per worker; Python MCTS already fans out across many processes
   self_play_history_fp16: true  # Store active game history in fp16 inside workers; replay tensors are still emitted as fp32/fp16 by replay_fp16
-  self_play_central_inference_enabled: true   # Use one GPU inference server for persistent self-play workers; workers keep MCTS trees on CPU
-  self_play_central_inference_servers: auto # auto = shard workers across a safe number of GPU inference servers
-  self_play_central_inference_auto_min_servers: 2 # Fewer GPU server processes reduce context switching on one GPU
-  self_play_central_inference_auto_workers_per_server: 9 # Auto workers are sharded into a small number of larger CIL servers
-  self_play_central_inference_auto_max_servers: 2 # Keep self-play on two CIL processes unless explicitly retuned
-  self_play_central_inference_use_compile: true # Compile the single central GPU model; warmup happens before workers start
-  self_play_central_inference_compile_warmup_batches: [1, 32, 128, 256] # Pre-warm common dynamic batch sizes outside self-play
-  self_play_central_inference_flush_ms: 2.0   # Small coalescing window; two servers reduce queueing while preserving useful batch sizes
-  self_play_central_inference_max_batch_size: 256 # Larger per-server batches improve GPU efficiency with sharded CIL
-  self_play_central_inference_transport_dtype: "float16" # Halve IPC payloads; board planes are binary/small and CUDA inference runs under AMP
-  self_play_central_inference_cache_enabled: false # Raw position hashing is usually slower than useful during self-play
+  self_play_central_inference_enabled: true # Use shared central_inference GPU server settings for persistent self-play workers
   self_play_compile_lock_timeout_s: 900  # Max wait for another worker to finish compile/cache warmup before falling back
 
   self_play_save_every_games: 1  # Multiplier of games_per_iteration (0=off); progress still updates per finished game
@@ -583,20 +602,6 @@ reinforcement_learning:
   eval_min_games_per_worker: 6 # Use more CPU during small evals while keeping central inference batches reasonably full
   eval_central_inference_enabled: true
   eval_central_inference_min_games: 2
-  eval_central_inference_servers: auto
-  eval_central_inference_auto_min_servers: 1
-  eval_central_inference_auto_workers_per_server: 8
-  eval_central_inference_auto_max_servers: 2
-  eval_central_inference_flush_ms: 3.0
-  eval_central_inference_max_batch_size: 256
-  eval_central_inference_transport_dtype: "float16"
-  eval_central_inference_timeout_s: 0
-  eval_central_inference_stall_warning_s: 15
-  eval_central_inference_load_timeout_s: 300
-  eval_central_inference_use_compile: true
-  eval_central_inference_compile_warmup_batches: [1, 32, 128, 256]
-  eval_central_inference_cudnn_benchmark: false
-  eval_central_inference_cache_enabled: false
   eval_mcts_simulations_multiplier: 1.25 # Generic MCTS eval budget when a caller does not pin exact sims
   eval_max_moves: 320        # Align eval with self-play so results are not dominated by ultra-long unresolved games
   eval_auto_claim_draw: true
@@ -711,12 +716,49 @@ hardware:
   use_compile: true
 
   # DataLoader throughput
-  num_workers: 5
+  num_workers: 6
   train_prefetch_factor: 1
+  cuda_train_prefetch_queue_size: 2
   cuda_eval_prefetch_queue_size: 1
+  dataloader_worker_restart_limit: 2
+  dataloader_worker_failure_tail_tolerance_batches: 2
   dataloader_board_dtype: "float16"
+  dataloader_return_numpy: true
+  dataloader_block_shuffle: true
+  dataloader_block_shuffle_size: 65536
   dataloader_train_in_order: false
   dataloader_val_in_order: false
+
+
+# ------------------------------------------------------------------------------
+# SHARED CENTRAL GPU INFERENCE
+# ------------------------------------------------------------------------------
+central_inference:
+  enabled: true
+  servers: auto
+  auto_min_servers: 1
+  auto_workers_per_server: 9
+  auto_max_servers: 3
+  max_batch_size: 256
+  flush_ms: 2.0
+  transport_dtype: "float16"
+  timeout_s: 0
+  stall_warning_s: 15
+  load_timeout_s: 300
+  use_compile: true
+  compile_warmup_batches: [1, 32, 128, 256]
+  cudnn_benchmark: false
+  cache_enabled: false
+  sync_timing: false
+
+
+# ------------------------------------------------------------------------------
+# PLAY / GUI MATCH RUNTIME
+# ------------------------------------------------------------------------------
+play:
+  match_workers: auto
+  match_active_games_per_worker: auto
+  match_max_moves: 220
 
 
 # ------------------------------------------------------------------------------
@@ -729,7 +771,6 @@ logging:
   il_plot_smoothing_enabled: true # Light EMA smoothing for IL PNG curves; exact best/SWA markers stay raw
   il_plot_smoothing_alpha: 0.65   # Higher = follows raw curve more closely, lower = smoother
   il_plot_smoothing_min_points: 5 # Do not smooth very short runs
-  il_plot_every: 3                # Heavy matplotlib PNG update every N logged IL evals; final plot is still saved
 
 
 # ------------------------------------------------------------------------------
@@ -763,6 +804,13 @@ elo_estimation:
   # NN eval: shared by IL periodic checks and RL raw-network checks
   nn_eval_workers: 2
   nn_eval_free_threads_utilization: 0.35
+  nn_eval_adaptive_probe_games_per_level: 6
+  nn_eval_adaptive_min_batch_games: 84
+  nn_eval_adaptive_focus_games_per_level: 30
+  nn_eval_adaptive_extra_games_per_level: 6
+  nn_eval_adaptive_max_total_games: 192
+  nn_eval_adaptive_target_standard_error: 38.0
+  nn_eval_adaptive_min_games_for_se_stop: 112
 
   # MCTS eval: shared final/search-strength check
   mcts_eval_workers: 12
@@ -770,6 +818,7 @@ elo_estimation:
 
   # IL scheduling
   il_eval_every: 2
+  il_async_process_restart_limit: 2
   final_on_il_shutdown: true
 
   # Model move generation
@@ -782,11 +831,15 @@ elo_estimation:
   elo_mcts_scout_easy_min_explored_prior_mass: 0.95
   elo_mcts_scout_easy_min_visited_moves: 6
 
-  # Standalone eval_elo.py MCTS batching
+  # MCTS central batching for eval_elo.py and final IL/RL Elo checks
   eval_elo_central_inference_enabled: true
-  eval_elo_central_inference_servers: 1
-  eval_elo_central_inference_flush_ms: 3.0
-  eval_elo_central_inference_use_compile: true
+  eval_elo_central_client_groups: "auto"
+  eval_elo_central_target_active_games_per_client: 6
+  eval_elo_central_min_client_groups: 2
+  eval_elo_central_max_client_groups: 4
+  eval_elo_central_games_per_worker_chunk: 6
+  eval_elo_central_target_chunks_per_group: 2
+  eval_elo_central_max_chunk_games: 36
 
 # ------------------------------------------------------------------------------
 # 🆕 DEBUG & PROFILING

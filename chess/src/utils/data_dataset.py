@@ -8,6 +8,7 @@ from collections import defaultdict
 import gc
 import hashlib
 import json
+import math
 import mmap
 import os
 import random
@@ -34,6 +35,7 @@ from src.utils.data_helpers import (
 
 _SOFT_TARGET_AGGREGATE_CONTEXT = {}
 _SOFT_TARGET_MATERIALIZE_CONTEXT = {}
+_COUNT_AWARE_SELECTION_CONTEXT = {}
 
 
 def _cache_candidates(primary_path, legacy_paths=None):
@@ -1191,6 +1193,57 @@ def _sample_weight_from_count(count, cfg, move_idx=None, total_moves=None):
     return max(1.0e-6, float(weight))
 
 
+def _adjust_sample_weight_for_policy_target(weight, target_moves, cfg):
+    weight_cfg = cfg.get('sample_weight', {}) or {}
+    if not weight_cfg.get('enabled', True):
+        return float(weight)
+    if not target_moves:
+        return float(weight)
+
+    probs = np.asarray([max(0.0, float(prob)) for _, prob in target_moves], dtype=np.float32)
+    probs = probs[probs > 0.0]
+    if len(probs) <= 1:
+        try:
+            single_multiplier = float(weight_cfg.get('single_move_multiplier', 1.0))
+        except (TypeError, ValueError):
+            single_multiplier = 1.0
+        try:
+            single_max = float(weight_cfg.get('single_move_max', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            single_max = 0.0
+        adjusted = float(weight) * max(0.0, single_multiplier)
+        if single_max > 0.0:
+            adjusted = min(adjusted, single_max)
+        return max(1.0e-6, float(adjusted))
+
+    probs = probs / max(float(np.sum(probs)), 1.0e-12)
+    entropy = float(-np.sum(probs * np.log(np.clip(probs, 1.0e-12, 1.0))))
+    try:
+        bonus = max(0.0, float(weight_cfg.get('soft_entropy_bonus', 0.0) or 0.0))
+    except (TypeError, ValueError):
+        bonus = 0.0
+    try:
+        bonus_max = max(1.0, float(weight_cfg.get('soft_entropy_bonus_max', 1.0) or 1.0))
+    except (TypeError, ValueError):
+        bonus_max = 1.0
+    entropy_ref = math.log(min(max(2, len(probs)), 4))
+    multiplier = 1.0
+    if entropy_ref > 0.0 and bonus > 0.0:
+        multiplier += bonus * min(1.0, entropy / entropy_ref)
+        multiplier = min(multiplier, bonus_max)
+    adjusted = float(weight) * multiplier
+
+    max_weight = float(weight_cfg.get('max', 32.0) or 0.0)
+    try:
+        opening_max = float(weight_cfg.get('opening_max', max_weight) or 0.0)
+    except (TypeError, ValueError):
+        opening_max = max_weight
+    max_weight = max(max_weight, opening_max)
+    if max_weight > 0.0:
+        adjusted = min(adjusted, max_weight)
+    return max(1.0e-6, float(adjusted))
+
+
 def _soft_target_value_key_config(cfg):
     cfg = dict(cfg or {})
     value_key_cfg = dict(cfg.get('value_key', {}) or {})
@@ -1354,6 +1407,12 @@ def _build_policy_target_distribution(moves, hard_move_target, policy_count, cfg
 
     if count < soft_full:
         soft_alpha = _interpolate_by_count(count, 0.0, 1.0, hard_below, soft_full)
+        if len(empirical) > 1:
+            try:
+                min_soft_alpha = float(policy_cfg.get('min_soft_alpha_for_multi_move', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                min_soft_alpha = 0.0
+            soft_alpha = max(soft_alpha, max(0.0, min(1.0, min_soft_alpha)))
         target = {move: prob * soft_alpha for move, prob in empirical.items()}
         target[hard_move_target] = target.get(hard_move_target, 0.0) + (1.0 - soft_alpha)
         force_move = hard_move_target
@@ -1970,7 +2029,7 @@ def _materialize_soft_target_chunk(args):
             hard_move_target = struct.unpack('H', mm[offset + 44:offset + 46])[0]
             if hard_move_target >= ACTION_SIZE and hard_move_target < AZ_ACTION_SIZE:
                 hard_move_target = az_index_to_policy_index(hard_move_target)
-            sample_weight[row] = _sample_weight_from_count(policy_count, cfg, move_idx, total_moves)
+            base_sample_weight = _sample_weight_from_count(policy_count, cfg, move_idx, total_moves)
             value_sample_weight[row] = _value_sample_weight_from_context(value_count, move_idx, total_moves, cfg)
 
             moves = policy_subset.get(policy_key) if policy_key is not None else None
@@ -1989,9 +2048,19 @@ def _materialize_soft_target_chunk(args):
                 for col, (target_move_idx, target_prob) in enumerate(target_moves[:max_policy_moves]):
                     policy_indices[row, col] = int(target_move_idx)
                     policy_values[row, col] = float(target_prob)
+                sample_weight[row] = _adjust_sample_weight_for_policy_target(
+                    base_sample_weight,
+                    target_moves,
+                    cfg,
+                )
             else:
                 policy_indices[row, 0] = int(hard_move_target)
                 policy_values[row, 0] = 1.0
+                sample_weight[row] = _adjust_sample_weight_for_policy_target(
+                    base_sample_weight,
+                    [(int(hard_move_target), 1.0)],
+                    cfg,
+                )
 
             wdl = wdl_subset.get(value_key) if value_key is not None else None
             if wdl is not None and float(np.sum(wdl)) > 0.0:
@@ -2166,50 +2235,100 @@ def _materialize_soft_targets_parallel(binary_file, position_size, final_indices
     return policy_indices, policy_values, value_wdl, occurrence_count, value_occurrence_count, sample_weight, value_sample_weight, moves_left_log, policy_mass_kept
 
 
-def _soft_target_count_histogram(values):
-    values = np.asarray(values, dtype=np.float32)
-    if len(values) == 0:
+def _soft_target_count_histogram(values, chunk_size=500_000):
+    total_len = len(values) if values is not None else 0
+    if total_len == 0:
         return "empty"
-    bins = [
-        ("1", values == 1),
-        ("2-3", (values >= 2) & (values < 4)),
-        ("4-7", (values >= 4) & (values < 8)),
-        ("8-15", (values >= 8) & (values < 16)),
-        ("16-31", (values >= 16) & (values < 32)),
-        ("32-63", (values >= 32) & (values < 64)),
-        ("64+", values >= 64),
+    bin_counts = [
+        ["1", 0],
+        ["2-3", 0],
+        ["4-7", 0],
+        ["8-15", 0],
+        ["16-31", 0],
+        ["32-63", 0],
+        ["64+", 0],
     ]
+    for start in range(0, total_len, max(1, int(chunk_size))):
+        chunk = np.asarray(values[start:start + chunk_size], dtype=np.float32)
+        bin_counts[0][1] += int(np.count_nonzero(chunk == 1))
+        bin_counts[1][1] += int(np.count_nonzero((chunk >= 2) & (chunk < 4)))
+        bin_counts[2][1] += int(np.count_nonzero((chunk >= 4) & (chunk < 8)))
+        bin_counts[3][1] += int(np.count_nonzero((chunk >= 8) & (chunk < 16)))
+        bin_counts[4][1] += int(np.count_nonzero((chunk >= 16) & (chunk < 32)))
+        bin_counts[5][1] += int(np.count_nonzero((chunk >= 32) & (chunk < 64)))
+        bin_counts[6][1] += int(np.count_nonzero(chunk >= 64))
     parts = []
-    total = float(len(values))
-    for label, mask in bins:
-        count = int(np.count_nonzero(mask))
+    total = float(total_len)
+    for label, count in bin_counts:
         parts.append(f"{label}:{count:,} ({100.0 * count / total:.1f}%)")
     return ", ".join(parts)
 
 
-def _soft_target_policy_stats(policy_indices, policy_values, policy_mass_kept):
-    if len(policy_values) == 0:
+def _soft_target_policy_stats(policy_indices, policy_values, policy_mass_kept, chunk_size=250_000,
+                              quantile_sample_rows=1_000_000):
+    total_len = len(policy_values) if policy_values is not None else 0
+    if total_len == 0:
         return {
             'soft_rate': 0.0,
             'entropy_mean': 0.0,
+            'effective_moves': 1.0,
             'entropy_p90': 0.0,
+            'top1_mass_mean': 1.0,
             'kept_mass_mean': 1.0,
             'kept_mass_min': 1.0,
             'kept_mass_p01': 1.0,
         }
-    valid = np.asarray(policy_indices) >= 0
-    values = np.asarray(policy_values, dtype=np.float32)
-    support = np.count_nonzero(valid & (values > 0.0), axis=1)
-    positive = np.where(values > 0.0, values, 1.0)
-    entropy = -np.sum(np.where(values > 0.0, values * np.log(positive), 0.0), axis=1)
-    kept = np.asarray(policy_mass_kept, dtype=np.float32)
+    chunk_size = max(1, int(chunk_size))
+    sample_step = max(1, int(np.ceil(total_len / max(1, int(quantile_sample_rows)))))
+    soft_rows = 0
+    entropy_sum = 0.0
+    top1_sum = 0.0
+    kept_sum = 0.0
+    kept_min = 1.0
+    entropy_samples = []
+    kept_samples = []
+    for start in range(0, total_len, chunk_size):
+        end = min(total_len, start + chunk_size)
+        indices_chunk = np.asarray(policy_indices[start:end])
+        values_chunk = np.asarray(policy_values[start:end], dtype=np.float32)
+        valid = indices_chunk >= 0
+        positive_mask = values_chunk > 0.0
+        support = np.count_nonzero(valid & positive_mask, axis=1)
+        safe_values = np.where(positive_mask, values_chunk, 1.0)
+        entropy = -np.sum(
+            np.where(positive_mask, values_chunk * np.log(safe_values), 0.0),
+            axis=1,
+        )
+        kept = np.asarray(policy_mass_kept[start:end], dtype=np.float32)
+        soft_rows += int(np.count_nonzero(support > 1))
+        entropy_sum += float(np.sum(entropy, dtype=np.float64))
+        top1_sum += float(np.sum(np.max(values_chunk, axis=1), dtype=np.float64))
+        kept_sum += float(np.sum(kept, dtype=np.float64))
+        if len(kept):
+            kept_min = min(kept_min, float(np.min(kept)))
+        local_offset = start % sample_step
+        sample_start = (sample_step - local_offset) % sample_step
+        if sample_start < len(entropy):
+            entropy_samples.append(entropy[sample_start::sample_step].astype(np.float32, copy=False))
+            kept_samples.append(kept[sample_start::sample_step].astype(np.float32, copy=False))
+    if entropy_samples:
+        entropy_sample = np.concatenate(entropy_samples)
+    else:
+        entropy_sample = np.asarray([], dtype=np.float32)
+    if kept_samples:
+        kept_sample = np.concatenate(kept_samples)
+    else:
+        kept_sample = np.asarray([], dtype=np.float32)
+    entropy_mean = float(entropy_sum / total_len)
     return {
-        'soft_rate': float(np.mean(support > 1)) if len(support) else 0.0,
-        'entropy_mean': float(np.mean(entropy)) if len(entropy) else 0.0,
-        'entropy_p90': float(np.percentile(entropy, 90)) if len(entropy) else 0.0,
-        'kept_mass_mean': float(np.mean(kept)) if len(kept) else 1.0,
-        'kept_mass_min': float(np.min(kept)) if len(kept) else 1.0,
-        'kept_mass_p01': float(np.percentile(kept, 1)) if len(kept) else 1.0,
+        'soft_rate': float(soft_rows / total_len),
+        'entropy_mean': entropy_mean,
+        'effective_moves': float(np.exp(entropy_mean)),
+        'entropy_p90': float(np.percentile(entropy_sample, 90)) if len(entropy_sample) else 0.0,
+        'top1_mass_mean': float(top1_sum / total_len),
+        'kept_mass_mean': float(kept_sum / total_len),
+        'kept_mass_min': float(kept_min),
+        'kept_mass_p01': float(np.percentile(kept_sample, 1)) if len(kept_sample) else 1.0,
     }
 
 
@@ -2223,11 +2342,22 @@ def _print_soft_target_array_stats(label, arrays, policy_mass_threshold=1.0):
     if occurrence_count is None or policy_indices is None or policy_values is None or policy_mass_kept is None:
         return
     policy_stats = _soft_target_policy_stats(policy_indices, policy_values, policy_mass_kept)
-    low_mass_rows = int((np.asarray(policy_mass_kept) < policy_mass_threshold).sum()) if len(policy_mass_kept) else 0
-    print(f"    {label} count_hist: {_soft_target_count_histogram(occurrence_count)}")
+    occurrence_array = np.asarray(occurrence_count)
+    occurrence_avg = float(occurrence_array.mean(dtype=np.float64)) if len(occurrence_array) else 0.0
+    occurrence_max = float(occurrence_array.max()) if len(occurrence_array) else 0.0
+    low_mass_rows = 0
+    for start in range(0, len(policy_mass_kept), 500_000):
+        kept_chunk = np.asarray(policy_mass_kept[start:start + 500_000], dtype=np.float32)
+        low_mass_rows += int(np.count_nonzero(kept_chunk < policy_mass_threshold))
+    print(
+        f"    {label} occurrence: avg={occurrence_avg:.2f}, "
+        f"max={occurrence_max:.0f}; count_hist: {_soft_target_count_histogram(occurrence_count)}"
+    )
     print(
         f"    {label} policy_target: soft_rate={100.0 * policy_stats['soft_rate']:.1f}%, "
         f"entropy_mean={policy_stats['entropy_mean']:.3f}, "
+        f"target_eff_moves={policy_stats['effective_moves']:.2f}, "
+        f"top1_mass={policy_stats['top1_mass_mean']:.4f}, "
         f"entropy_p90={policy_stats['entropy_p90']:.3f}, "
         f"kept_mass_mean={policy_stats['kept_mass_mean']:.4f}, "
         f"kept_mass_min={policy_stats['kept_mass_min']:.4f}, "
@@ -2330,6 +2460,8 @@ def _build_soft_targets(binary_file, position_size, source_indices, final_indice
         f"  {label} soft targets: {len(source_indices):,} source -> "
         f"{unique_positions:,} keys "
         f"(avg={avg_count:.2f}, soft={100.0 * policy_stats['soft_rate']:.1f}%, "
+        f"target_eff={policy_stats['effective_moves']:.2f}, "
+        f"top1={policy_stats['top1_mass_mean']:.4f}, "
         f"entropy={policy_stats['entropy_mean']:.3f}, kept_p01={policy_stats['kept_mass_p01']:.4f})"
     )
 
@@ -2396,6 +2528,524 @@ def _evenly_limit_indices(indices, target_count):
     positions = np.linspace(0, len(indices) - 1, num=target_count)
     positions = np.rint(positions).astype(np.int64, copy=False)
     return np.asarray(indices[positions], dtype=np.uint32)
+
+
+def _resolve_count_aware_selection_cfg(data_cfg):
+    cfg = dict((data_cfg or {}).get('target_selection', {}) or {})
+    mode = str(cfg.get('mode', 'even') or 'even').strip().lower()
+    cfg['mode'] = mode
+    cfg['enabled'] = mode in {'count_aware', 'count-aware', 'hybrid'}
+    return cfg
+
+
+def _signature_hash_array_for_indices(binary_file, position_size, indices, cfg, history_positions):
+    indices = np.asarray(indices, dtype=np.uint32)
+    hashes = np.zeros((len(indices),), dtype=np.uint64)
+    if len(indices) == 0:
+        return hashes
+    with open(binary_file, 'rb') as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            for row, idx in enumerate(indices):
+                key = _position_signature_for_index(mm, position_size, int(idx), cfg, history_positions)
+                if key is not None:
+                    hashes[row] = np.frombuffer(key[:8], dtype=np.uint64, count=1)[0]
+        finally:
+            mm.close()
+    return hashes
+
+
+def _signature_hash_worker(args):
+    row_start, indices, binary_file, position_size, cfg, history_positions = args
+    return int(row_start), _signature_hash_array_for_indices(
+        binary_file,
+        position_size,
+        indices,
+        cfg,
+        history_positions,
+    )
+
+
+def _build_signature_hashes_parallel(binary_file, position_size, indices, cfg, label,
+                                     history_positions, workers, chunk_size):
+    indices = np.asarray(indices, dtype=np.uint32)
+    hashes = np.zeros((len(indices),), dtype=np.uint64)
+    if len(indices) == 0:
+        return hashes
+
+    chunk_size = max(1, int(chunk_size))
+    chunks = []
+    for start in range(0, len(indices), chunk_size):
+        end = min(len(indices), start + chunk_size)
+        chunks.append((start, np.asarray(indices[start:end], dtype=np.uint32)))
+
+    if workers <= 1 or len(chunks) <= 1:
+        iterator = tqdm(chunks, desc=f"  {label} count-aware candidate keys", unit="chunk")
+        for start, chunk_indices in iterator:
+            end = start + len(chunk_indices)
+            hashes[start:end] = _signature_hash_array_for_indices(
+                binary_file,
+                position_size,
+                chunk_indices,
+                cfg,
+                history_positions,
+            )
+        return hashes
+
+    def _iter_args():
+        for start, chunk_indices in chunks:
+            yield (
+                start,
+                chunk_indices,
+                binary_file,
+                int(position_size),
+                dict(cfg),
+                int(history_positions or 0),
+            )
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        pending = set()
+        task_iter = iter(_iter_args())
+        max_pending = max(1, int(workers) * 2)
+        for _ in range(max_pending):
+            try:
+                pending.add(executor.submit(_signature_hash_worker, next(task_iter)))
+            except StopIteration:
+                break
+        with tqdm(total=len(indices), desc=f"  {label} count-aware candidate keys", unit="pos") as pbar:
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    start, chunk_hashes = future.result()
+                    end = start + len(chunk_hashes)
+                    hashes[start:end] = chunk_hashes
+                    pbar.update(end - start)
+                    try:
+                        pending.add(executor.submit(_signature_hash_worker, next(task_iter)))
+                    except StopIteration:
+                        pass
+    return hashes
+
+
+def _init_count_aware_selection_worker(binary_file, position_size, cfg, history_positions,
+                                       allowed_hashes_path):
+    global _COUNT_AWARE_SELECTION_CONTEXT
+    _COUNT_AWARE_SELECTION_CONTEXT = {
+        'binary_file': binary_file,
+        'position_size': int(position_size),
+        'cfg': dict(cfg or {}),
+        'history_positions': int(history_positions or 0),
+        'allowed_hashes': np.load(allowed_hashes_path, mmap_mode='r'),
+    }
+
+
+def _count_matching_signature_hashes(binary_file, position_size, indices, cfg, history_positions,
+                                     allowed_hashes):
+    local = defaultdict(int)
+    first_moves = {}
+    diverse_hashes = set()
+    if allowed_hashes is None or len(allowed_hashes) == 0:
+        return (
+            np.zeros(0, dtype=np.uint64),
+            np.zeros(0, dtype=np.uint32),
+            np.zeros(0, dtype=np.uint16),
+            np.zeros(0, dtype=np.uint8),
+        )
+    with open(binary_file, 'rb') as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            for idx in np.asarray(indices, dtype=np.uint32):
+                key = _position_signature_for_index(mm, position_size, int(idx), cfg, history_positions)
+                if key is None:
+                    continue
+                key_hash = np.frombuffer(key[:8], dtype=np.uint64, count=1)[0]
+                pos = int(np.searchsorted(allowed_hashes, key_hash))
+                if pos < len(allowed_hashes) and allowed_hashes[pos] == key_hash:
+                    key_hash_int = int(key_hash)
+                    local[key_hash_int] += 1
+                    offset = int(idx) * int(position_size)
+                    move_target = struct.unpack('H', mm[offset + 44:offset + 46])[0]
+                    if move_target >= ACTION_SIZE and move_target < AZ_ACTION_SIZE:
+                        move_target = az_index_to_policy_index(move_target)
+                    move_target = int(move_target)
+                    previous = first_moves.get(key_hash_int)
+                    if previous is None:
+                        first_moves[key_hash_int] = move_target
+                    elif previous != move_target:
+                        diverse_hashes.add(key_hash_int)
+        finally:
+            mm.close()
+    if not local:
+        return (
+            np.zeros(0, dtype=np.uint64),
+            np.zeros(0, dtype=np.uint32),
+            np.zeros(0, dtype=np.uint16),
+            np.zeros(0, dtype=np.uint8),
+        )
+    hashes = np.fromiter(local.keys(), dtype=np.uint64, count=len(local))
+    counts = np.fromiter(local.values(), dtype=np.uint32, count=len(local))
+    first_move_values = np.fromiter(
+        (min(65534, int(first_moves.get(int(key), 65535))) for key in local.keys()),
+        dtype=np.uint16,
+        count=len(local),
+    )
+    diverse = np.fromiter(
+        (1 if int(key) in diverse_hashes else 0 for key in local.keys()),
+        dtype=np.uint8,
+        count=len(local),
+    )
+    order = np.argsort(hashes, kind='stable')
+    return hashes[order], counts[order], first_move_values[order], diverse[order]
+
+
+def _count_aware_source_worker(args):
+    chunk_id, indices = args
+    ctx = _COUNT_AWARE_SELECTION_CONTEXT
+    hashes, counts, first_moves, diverse = _count_matching_signature_hashes(
+        ctx['binary_file'],
+        ctx['position_size'],
+        indices,
+        ctx['cfg'],
+        ctx['history_positions'],
+        ctx['allowed_hashes'],
+    )
+    return int(chunk_id), len(indices), hashes, counts, first_moves, diverse
+
+
+def _count_occurrences_for_candidate_hashes(binary_file, position_size, source_indices,
+                                            candidate_hashes, cfg, label, history_positions,
+                                            workers, chunk_size):
+    source_indices = np.asarray(source_indices, dtype=np.uint32)
+    candidate_hashes = np.asarray(candidate_hashes, dtype=np.uint64)
+    valid_hashes = np.unique(candidate_hashes[candidate_hashes != np.uint64(0)])
+    counts = np.zeros((len(valid_hashes),), dtype=np.uint32)
+    first_moves = np.full((len(valid_hashes),), 65535, dtype=np.uint16)
+    diverse = np.zeros((len(valid_hashes),), dtype=bool)
+    if len(source_indices) == 0 or len(valid_hashes) == 0:
+        return valid_hashes, counts, diverse.astype(np.uint8)
+
+    chunk_size = max(1, int(chunk_size))
+    chunks = list(_soft_target_index_chunks(source_indices, chunk_size))
+    workers = max(1, int(workers))
+
+    def _merge_hash_counts(hashes, chunk_counts, chunk_first_moves, chunk_diverse):
+        if len(hashes) == 0:
+            return
+        positions = np.searchsorted(valid_hashes, hashes)
+        in_bounds = positions < len(valid_hashes)
+        valid = np.zeros((len(hashes),), dtype=bool)
+        if np.any(in_bounds):
+            valid[in_bounds] = valid_hashes[positions[in_bounds]] == hashes[in_bounds]
+        if np.any(valid):
+            valid_positions = positions[valid]
+            np.add.at(counts, valid_positions, chunk_counts[valid])
+            incoming_first = np.asarray(chunk_first_moves[valid], dtype=np.uint16)
+            known_incoming = incoming_first != np.uint16(65535)
+            unset = first_moves[valid_positions] == np.uint16(65535)
+            set_mask = unset & known_incoming
+            if np.any(set_mask):
+                first_moves[valid_positions[set_mask]] = incoming_first[set_mask]
+            compare_mask = (~unset) & known_incoming
+            if np.any(compare_mask):
+                mismatch = first_moves[valid_positions[compare_mask]] != incoming_first[compare_mask]
+                if np.any(mismatch):
+                    diverse[valid_positions[compare_mask][mismatch]] = True
+            diverse[valid_positions] |= np.asarray(chunk_diverse[valid], dtype=bool)
+
+    if workers <= 1 or len(chunks) <= 1:
+        iterator = tqdm(chunks, desc=f"  {label} count-aware raw counts", unit="chunk")
+        for _, chunk_indices in iterator:
+            hashes, chunk_counts, chunk_first_moves, chunk_diverse = _count_matching_signature_hashes(
+                binary_file,
+                position_size,
+                chunk_indices,
+                cfg,
+                history_positions,
+                valid_hashes,
+            )
+            _merge_hash_counts(hashes, chunk_counts, chunk_first_moves, chunk_diverse)
+        return valid_hashes, counts, diverse.astype(np.uint8)
+
+    filter_path = _save_soft_target_hash_filter(valid_hashes, label, "count_filter")
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_count_aware_selection_worker,
+            initargs=(
+                binary_file,
+                int(position_size),
+                dict(cfg),
+                int(history_positions or 0),
+                filter_path,
+            ),
+        ) as executor:
+            task_iter = iter((chunk_id, indices) for chunk_id, indices in chunks)
+            pending = set()
+            max_pending = max(1, int(workers) * 2)
+            for _ in range(max_pending):
+                try:
+                    pending.add(executor.submit(_count_aware_source_worker, next(task_iter)))
+                except StopIteration:
+                    break
+            with tqdm(total=len(source_indices), desc=f"  {label} count-aware raw counts", unit="pos") as pbar:
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        _, processed, hashes, chunk_counts, chunk_first_moves, chunk_diverse = future.result()
+                        _merge_hash_counts(hashes, chunk_counts, chunk_first_moves, chunk_diverse)
+                        pbar.update(int(processed))
+                        try:
+                            pending.add(executor.submit(_count_aware_source_worker, next(task_iter)))
+                        except StopIteration:
+                            pass
+    finally:
+        if filter_path:
+            try:
+                os.remove(filter_path)
+            except OSError:
+                pass
+    return valid_hashes, counts, diverse.astype(np.uint8)
+
+
+def _candidate_occurrence_counts(binary_file, position_size, source_indices, candidate_indices,
+                                 key_cfg, selection_cfg, label, history_positions):
+    candidate_indices = np.asarray(candidate_indices, dtype=np.uint32)
+    if len(candidate_indices) == 0:
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.uint64)
+    workers = _resolve_soft_target_workers(selection_cfg, len(candidate_indices))
+    chunk_size = _soft_target_chunk_size(selection_cfg, len(candidate_indices), workers)
+    candidate_hashes = _build_signature_hashes_parallel(
+        binary_file,
+        position_size,
+        candidate_indices,
+        key_cfg,
+        label,
+        history_positions,
+        workers,
+        chunk_size,
+    )
+    source_workers = _resolve_soft_target_workers(selection_cfg, len(source_indices))
+    source_chunk_size = _soft_target_chunk_size(selection_cfg, len(source_indices), source_workers)
+    unique_hashes, unique_counts, unique_diverse = _count_occurrences_for_candidate_hashes(
+        binary_file,
+        position_size,
+        source_indices,
+        candidate_hashes,
+        key_cfg,
+        label,
+        history_positions,
+        source_workers,
+        source_chunk_size,
+    )
+    occurrence = np.ones((len(candidate_indices),), dtype=np.float32)
+    move_diversity = np.ones((len(candidate_indices),), dtype=np.float32)
+    if len(unique_hashes) > 0:
+        positions = np.searchsorted(unique_hashes, candidate_hashes)
+        in_bounds = (candidate_hashes != np.uint64(0)) & (positions < len(unique_hashes))
+        valid = np.zeros((len(candidate_hashes),), dtype=bool)
+        if np.any(in_bounds):
+            valid[in_bounds] = unique_hashes[positions[in_bounds]] == candidate_hashes[in_bounds]
+        occurrence[valid] = np.maximum(1, unique_counts[positions[valid]]).astype(np.float32, copy=False)
+        move_diversity[valid] = 1.0 + np.asarray(unique_diverse[positions[valid]], dtype=np.float32)
+    return occurrence, candidate_hashes, move_diversity
+
+
+def _top_rows_by_score(rows, scores, count):
+    rows = np.asarray(rows, dtype=np.int64)
+    if count <= 0 or len(rows) == 0:
+        return np.zeros(0, dtype=np.int64)
+    count = min(int(count), len(rows))
+    row_scores = np.asarray(scores[rows], dtype=np.float32)
+    if count >= len(rows):
+        order = np.argsort(-row_scores, kind='stable')
+        return rows[order]
+    partition = np.argpartition(-row_scores, count - 1)[:count]
+    chosen = rows[partition]
+    order = np.argsort(-np.asarray(scores[chosen], dtype=np.float32), kind='stable')
+    return chosen[order]
+
+
+def _top_unique_hash_rows_by_score(rows, scores, key_hashes, count, oversample_factor=4.0):
+    rows = np.asarray(rows, dtype=np.int64)
+    if count <= 0 or len(rows) == 0:
+        return np.zeros(0, dtype=np.int64)
+
+    count = min(int(count), len(rows))
+    oversample = int(np.ceil(float(count) * max(1.0, float(oversample_factor or 1.0))))
+    oversample = max(count, min(len(rows), oversample))
+    ordered = _top_rows_by_score(rows, scores, oversample)
+    hashes = np.asarray(key_hashes[ordered], dtype=np.uint64)
+    valid = hashes != np.uint64(0)
+    if not np.any(valid):
+        return ordered[:count]
+
+    valid_positions = np.flatnonzero(valid)
+    _, first_valid_positions = np.unique(hashes[valid], return_index=True)
+    keep_positions = valid_positions[np.sort(first_valid_positions)]
+    unique_rows = ordered[keep_positions]
+    if len(unique_rows) >= count:
+        return unique_rows[:count]
+
+    selected = np.zeros((len(key_hashes),), dtype=bool)
+    selected[unique_rows] = True
+    fill_rows = ordered[~selected[ordered]]
+    if len(fill_rows) == 0:
+        return unique_rows
+    return np.concatenate([unique_rows, fill_rows[:count - len(unique_rows)]])
+
+
+def _select_count_bonus_rows(rows, scores, key_hashes, count, selection_cfg):
+    max_per_key = int(selection_cfg.get('max_bonus_rows_per_soft_key', 1) or 1)
+    if max_per_key <= 1:
+        return _top_unique_hash_rows_by_score(
+            rows,
+            scores,
+            key_hashes,
+            count,
+            oversample_factor=float(selection_cfg.get('bonus_oversample_factor', 4.0) or 4.0),
+        )
+    return _top_rows_by_score(rows, scores, count)
+
+
+def _count_aware_limit_indices(binary_file, position_size, total_positions, source_indices, indices, target_count,
+                               soft_targets_cfg, selection_cfg, label, history_positions,
+                               game_length_by_id=None):
+    target_count = int(target_count)
+    indices = np.asarray(indices, dtype=np.uint32)
+    if target_count <= 0 or len(indices) <= target_count:
+        return indices
+    if not selection_cfg.get('enabled', False):
+        return _evenly_limit_indices(indices, target_count)
+
+    key_cfg = dict(soft_targets_cfg or {})
+    if not key_cfg.get('enabled', False):
+        print(f"  - {label} target selection: count-aware disabled because soft_targets are off")
+        return _evenly_limit_indices(indices, target_count)
+
+    occurrence, candidate_hashes, move_diversity = _candidate_occurrence_counts(
+        binary_file,
+        position_size,
+        source_indices,
+        indices,
+        key_cfg,
+        selection_cfg,
+        label,
+        history_positions,
+    )
+
+    broad_fraction = float(selection_cfg.get('broad_fraction', 0.75) or 0.75)
+    broad_fraction = max(0.0, min(1.0, broad_fraction))
+    broad_count = int(round(target_count * broad_fraction))
+    broad_count = max(0, min(target_count, broad_count))
+    broad_rows = np.zeros(0, dtype=np.int64)
+    selected = np.zeros((len(indices),), dtype=bool)
+    if broad_count > 0:
+        broad_positions = np.linspace(0, len(indices) - 1, num=broad_count)
+        broad_rows = np.unique(np.rint(broad_positions).astype(np.int64, copy=False))
+        selected[broad_rows] = True
+
+    count_budget = target_count - int(np.count_nonzero(selected))
+    if count_budget <= 0:
+        return np.asarray(indices[np.sort(np.flatnonzero(selected))], dtype=np.uint32)
+
+    min_count = max(1.0, float(selection_cfg.get('min_count_for_bonus', 2) or 2))
+    max_count = max(min_count, float(selection_cfg.get('max_count_score', 64) or 64))
+    count_power = max(0.05, float(selection_cfg.get('count_power', 0.70) or 0.70))
+    clipped = np.minimum(np.maximum(occurrence, 1.0), max_count)
+    scores = np.where(occurrence >= min_count, np.log1p(clipped) ** count_power, 0.0).astype(np.float32)
+    min_unique_moves = max(1.0, float(selection_cfg.get('min_unique_moves_for_soft_bonus', 2) or 2))
+    diversity_bonus = max(0.0, float(selection_cfg.get('move_diversity_bonus', 4.0) or 4.0))
+    single_move_multiplier = max(0.0, float(selection_cfg.get('single_move_multiplier', 0.15) or 0.15))
+    diverse_mask = move_diversity >= min_unique_moves
+    scores *= np.where(diverse_mask, diversity_bonus, single_move_multiplier).astype(np.float32)
+
+    phase_labels = None
+    if game_length_by_id is not None:
+        phase_labels = _compute_phase_labels_for_indices(
+            binary_file,
+            position_size,
+            total_positions,
+            indices,
+            game_length_by_id,
+            selection_cfg,
+        )
+        scores = scores.copy()
+        scores[phase_labels == 0] *= float(selection_cfg.get('opening_score_multiplier', 0.70) or 0.70)
+        scores[phase_labels == 2] *= float(selection_cfg.get('endgame_score_multiplier', 1.10) or 1.10)
+
+    remaining = np.flatnonzero(~selected)
+    score_positive = scores > 0.0
+    positive_rows = remaining[score_positive[remaining]]
+
+    def _choose_bonus_rows(candidate_rows, budget):
+        candidate_rows = np.asarray(candidate_rows, dtype=np.int64)
+        budget = max(0, min(int(budget), len(candidate_rows)))
+        if budget <= 0 or len(candidate_rows) == 0:
+            return np.zeros(0, dtype=np.int64)
+        if phase_labels is None:
+            return _select_count_bonus_rows(candidate_rows, scores, candidate_hashes, budget, selection_cfg)
+
+        opening_max_fraction = float(selection_cfg.get('count_opening_max_fraction', 0.20) or 0.20)
+        opening_budget = max(0, min(budget, int(round(budget * max(0.0, min(1.0, opening_max_fraction))))))
+        other_budget = budget - opening_budget
+        opening_rows = candidate_rows[phase_labels[candidate_rows] == 0]
+        other_rows = candidate_rows[phase_labels[candidate_rows] != 0]
+        chosen_other = _select_count_bonus_rows(other_rows, scores, candidate_hashes, other_budget, selection_cfg)
+        chosen_opening = _select_count_bonus_rows(opening_rows, scores, candidate_hashes, opening_budget, selection_cfg)
+        chosen = np.concatenate([chosen_other, chosen_opening])
+        shortfall_local = budget - len(chosen)
+        if shortfall_local > 0:
+            if len(chosen):
+                fill_rows = candidate_rows[~np.isin(candidate_rows, chosen, assume_unique=False)]
+            else:
+                fill_rows = candidate_rows
+            fill = _select_count_bonus_rows(fill_rows, scores, candidate_hashes, shortfall_local, selection_cfg)
+            if len(fill):
+                chosen = np.concatenate([chosen, fill])
+        return chosen[:budget]
+
+    max_single_fraction = float(selection_cfg.get('max_single_move_bonus_fraction', 1.0) or 1.0)
+    max_single_fraction = max(0.0, min(1.0, max_single_fraction))
+    single_budget_floor = int(round(count_budget * max_single_fraction))
+    diverse_budget = max(0, count_budget - single_budget_floor)
+    diverse_rows = positive_rows[diverse_mask[positive_rows]]
+    single_rows = positive_rows[~diverse_mask[positive_rows]]
+
+    chosen_diverse = _choose_bonus_rows(diverse_rows, diverse_budget)
+    selected[chosen_diverse] = True
+    remaining_bonus = count_budget - len(chosen_diverse)
+    if remaining_bonus > 0:
+        chosen_single = _choose_bonus_rows(single_rows, remaining_bonus)
+        selected[chosen_single] = True
+
+    shortfall = target_count - int(np.count_nonzero(selected))
+    if shortfall > 0:
+        fill_rows = np.flatnonzero(~selected)
+        fill = _top_rows_by_score(fill_rows, scores, shortfall)
+        selected[fill] = True
+
+    selected_rows = np.sort(np.flatnonzero(selected))
+    if len(selected_rows) > target_count:
+        selected_rows = selected_rows[:target_count]
+
+    count_selected = selected_rows[~np.isin(selected_rows, broad_rows, assume_unique=False)]
+    selected_occ = occurrence[selected_rows]
+    selected_diverse = move_diversity[selected_rows] >= min_unique_moves
+    count_occ = occurrence[count_selected] if len(count_selected) else np.zeros(0, dtype=np.float32)
+    count_diverse = move_diversity[count_selected] >= min_unique_moves if len(count_selected) else np.zeros(0, dtype=bool)
+    bonus_avg_occ = float(np.mean(count_occ)) if len(count_occ) else 0.0
+    positive_diverse = diverse_mask[positive_rows] if len(positive_rows) else np.zeros(0, dtype=bool)
+    print(
+        f"  - {label} target selection: count-aware "
+        f"broad={len(broad_rows):,}, count_bonus={len(count_selected):,}, "
+        f"avg_occ={float(np.mean(selected_occ)):.2f}, "
+        f"bonus_avg_occ={bonus_avg_occ:.2f}, "
+        f"count>=4={100.0 * float(np.mean(selected_occ >= 4.0)):.1f}%, "
+        f"multi_move={100.0 * float(np.mean(selected_diverse)):.1f}%/"
+        f"{100.0 * float(np.mean(count_diverse)) if len(count_diverse) else 0.0:.1f}% bonus, "
+        f"available_multi_move={100.0 * float(np.mean(positive_diverse)) if len(positive_diverse) else 0.0:.1f}%"
+    )
+    return np.asarray(indices[selected_rows], dtype=np.uint32)
 
 
 def _split_target_counts(train_count, val_count, target_total, train_split):
@@ -2586,10 +3236,11 @@ def _build_index_cache_paths(metadata, config):
     })
     final_index_payload = dict(dedup_index_payload)
     final_index_payload.update({
-        'index_cache_schema': 7,
+        'index_cache_schema': 8,
         'history_positions': int(model_cfg.get('history_positions', 0) or 0),
         'sample_dedup': data_cfg.get('sample_dedup', {}),
         'target_positions': data_cfg.get('target_positions', 'max'),
+        'target_selection': data_cfg.get('target_selection', {}),
     })
     soft_payload = dict(final_index_payload)
     soft_payload.update({
@@ -2840,7 +3491,7 @@ class BinaryChessDataset(Dataset):
                  history_positions=0, game_length_by_id=None,
                  index_cache_path=None, use_index_mmap=True,
                  soft_targets=None, soft_target_paths=None, board_dtype='float32',
-                 filter_stats=None):
+                 return_numpy=False, filter_stats=None):
         """
         Args:
             binary_file: Path to binary file
@@ -2861,6 +3512,7 @@ class BinaryChessDataset(Dataset):
         self.game_length_by_id = game_length_by_id
         board_dtype = str(board_dtype or 'float32').strip().lower()
         self.board_np_dtype = np.float16 if board_dtype in {'float16', 'fp16', 'half'} else np.float32
+        self.return_numpy = bool(return_numpy)
         self._empty_history_tensor = np.zeros((16, 8, 8), dtype=self.board_np_dtype)
         self.index_cache_path = str(index_cache_path) if index_cache_path else None
         self.use_index_mmap = bool(use_index_mmap and self.index_cache_path)
@@ -2933,6 +3585,8 @@ class BinaryChessDataset(Dataset):
         self.__dict__.update(state)
         self._mmap = None
         self._file = None
+        if not hasattr(self, 'return_numpy'):
+            self.return_numpy = False
         if self.indices is None and self.use_index_mmap and self.index_cache_path:
             self.indices = np.load(self.index_cache_path, mmap_mode='r')
         if self.soft_targets is None and self.soft_target_paths:
@@ -3041,6 +3695,38 @@ class BinaryChessDataset(Dataset):
         # 🔧 CRITICAL FIX: .copy() to avoid mmap non-resizable storage issue
         # DataLoader collate requires resizable tensors
         stacked_board = stacked_board.astype(self.board_np_dtype, copy=True)
+        if getattr(self, 'return_numpy', False):
+            result = {
+                'board': stacked_board,
+                'move': np.int16(move_target),
+                'value': np.asarray([outcome], dtype=np.float32),
+                'move_idx': np.int16(move_idx),
+            }
+            if total_moves is not None:
+                result['total_moves'] = np.int16(total_moves)
+            if self.soft_targets is not None:
+                result['policy_indices'] = np.array(
+                    self.soft_targets['policy_indices'][idx], dtype=np.int16, copy=True
+                )
+                result['policy_values'] = np.array(
+                    self.soft_targets['policy_values'][idx], dtype=np.float32, copy=True
+                )
+                result['value_wdl'] = np.array(
+                    self.soft_targets['value_wdl'][idx], dtype=np.float32, copy=True
+                )
+                result['occurrence_count'] = np.float32(self.soft_targets['occurrence_count'][idx])
+                if 'value_occurrence_count' in self.soft_targets:
+                    result['value_occurrence_count'] = np.float32(
+                        self.soft_targets['value_occurrence_count'][idx]
+                    )
+                result['sample_weight'] = np.float32(self.soft_targets['sample_weight'][idx])
+                if 'value_sample_weight' in self.soft_targets:
+                    result['value_sample_weight'] = np.float32(
+                        self.soft_targets['value_sample_weight'][idx]
+                    )
+                result['moves_left_log'] = np.float32(self.soft_targets['moves_left_log'][idx])
+                result['policy_mass_kept'] = np.float32(self.soft_targets['policy_mass_kept'][idx])
+            return result
         
         # 🆕 v4.4 FIX: Dodano move_idx dla move-weighted BCE loss
         if total_moves is not None:
@@ -3122,6 +3808,47 @@ class NumpyRandomSampler(Sampler):
         rng.shuffle(permutation)
         for idx in permutation:
             yield int(idx)
+
+    def __len__(self):
+        return len(self.data_source)
+
+
+class NumpyBlockShuffleSampler(Sampler):
+    """Shuffle file-local blocks to reduce random mmap/disk seeks during IL."""
+
+    def __init__(self, data_source, seed=0, block_size=65536, sort_indices=False):
+        self.data_source = data_source
+        self.seed = int(seed or 0)
+        self.epoch = 0
+        self.block_size = max(1, int(block_size or 65536))
+        self.n = len(data_source)
+        self.file_order = None
+        self.order_mode = "identity"
+        if sort_indices and self.n > 1:
+            indices = getattr(data_source, 'indices', None)
+            if indices is not None:
+                order_dtype = np.uint32 if self.n <= np.iinfo(np.uint32).max else np.int64
+                self.file_order = np.argsort(
+                    np.asarray(indices, dtype=np.uint32),
+                    kind='stable',
+                ).astype(order_dtype, copy=False)
+                self.order_mode = "argsort"
+
+    def __iter__(self):
+        n = self.n
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.epoch += 1
+        block_count = int(np.ceil(n / float(self.block_size)))
+        block_ids = np.arange(block_count, dtype=np.uint32)
+        rng.shuffle(block_ids)
+        for block_id in block_ids:
+            start = int(block_id) * self.block_size
+            end = min(n, start + self.block_size)
+            if self.file_order is None:
+                yield from range(start, end)
+            else:
+                for idx in self.file_order[start:end]:
+                    yield int(idx)
 
     def __len__(self):
         return len(self.data_source)
@@ -3763,11 +4490,14 @@ def create_dataloaders(metadata, config):
     positions_per_game_cfg = dict(data_cfg.get('positions_per_game', {}) or {})
     sample_dedup_cfg = dict(data_cfg.get('sample_dedup', {}) or {})
     soft_targets_cfg = dict(data_cfg.get('soft_targets', {}) or {})
+    target_selection_cfg = _resolve_count_aware_selection_cfg(data_cfg)
     if soft_targets_cfg.get('enabled', False):
         soft_targets_cfg.setdefault('workers', data_cfg.get('soft_target_workers', 'auto'))
         soft_targets_cfg.setdefault('chunk_size', data_cfg.get('soft_target_chunk_size', 500000))
         soft_targets_cfg.pop('materialize_workers', None)
         soft_targets_cfg.pop('materialize_chunk_size', None)
+    target_selection_cfg.setdefault('workers', data_cfg.get('soft_target_workers', 'auto'))
+    target_selection_cfg.setdefault('chunk_size', data_cfg.get('soft_target_chunk_size', 500000))
     train_sampling_cfg = dict(data_cfg.get('train_sampling', {}) or {})
     positions_per_game_enabled = bool(positions_per_game_cfg.get('enabled', False))
     train_soft_targets = None
@@ -3859,7 +4589,19 @@ def create_dataloaders(metadata, config):
             if target_limited:
                 before_train = len(train_indices)
                 before_val = len(val_indices)
-                train_indices = _evenly_limit_indices(train_indices, target_train_count)
+                train_indices = _count_aware_limit_indices(
+                    metadata['binary_file'],
+                    metadata['position_size'],
+                    metadata['total_positions'],
+                    train_soft_source_indices,
+                    train_indices,
+                    target_train_count,
+                    soft_targets_cfg,
+                    target_selection_cfg,
+                    "Train",
+                    history_positions,
+                    game_length_by_id=game_length_by_id,
+                )
                 val_indices = _evenly_limit_indices(val_indices, target_val_count)
             else:
                 target_requested = _resolve_target_positions(data_cfg.get('target_positions', 'max'))
@@ -3911,6 +4653,35 @@ def create_dataloaders(metadata, config):
                 train_soft_targets,
                 val_soft_targets,
             )
+            try:
+                del all_ppg_indices
+            except NameError:
+                pass
+            try:
+                del train_mask
+            except NameError:
+                pass
+            try:
+                del train_soft_source_indices
+            except NameError:
+                pass
+            try:
+                del val_soft_source_indices
+            except NameError:
+                pass
+            try:
+                del game_ranges
+            except NameError:
+                pass
+            try:
+                del train_ranges
+            except NameError:
+                pass
+            try:
+                del val_ranges
+            except NameError:
+                pass
+            gc.collect()
         else:
             train_indices, val_indices, game_count, train_game_count, val_game_count = _split_indices_by_game(metadata, config)
     else:
@@ -3975,6 +4746,17 @@ def create_dataloaders(metadata, config):
         )
     else:
         print("  Dedup    : off")
+    if target_selection_cfg.get('enabled', False):
+        print(
+            f"  Target   : count-aware train, "
+            f"broad={100.0 * float(target_selection_cfg.get('broad_fraction', 0.75)):.0f}%, "
+            f"min_count={target_selection_cfg.get('min_count_for_bonus', 2)}, "
+            f"opening_cap={100.0 * float(target_selection_cfg.get('count_opening_max_fraction', 0.20)):.0f}%, "
+            f"max_single_bonus={100.0 * float(target_selection_cfg.get('max_single_move_bonus_fraction', 1.0)):.0f}%, "
+            f"multi_move_bonus={target_selection_cfg.get('move_diversity_bonus', 1.0)}x"
+        )
+    else:
+        print("  Target   : even")
     if soft_targets_cfg.get('enabled', False):
         sw_cfg = soft_targets_cfg.get('sample_weight', {}) or {}
         print(
@@ -3988,6 +4770,7 @@ def create_dataloaders(metadata, config):
             print(
                 f"  Policy   : hard_below={policy_target_cfg.get('hard_below_count', '-')}, "
                 f"soft_full={policy_target_cfg.get('soft_full_count', '-')}, "
+                f"min_multi_alpha={policy_target_cfg.get('min_soft_alpha_for_multi_move', 0.0)}, "
                 f"powers O/M/E={policy_target_cfg.get('opening_soft_power', '-')}/"
                 f"{policy_target_cfg.get('middlegame_soft_power', '-')}/"
                 f"{policy_target_cfg.get('endgame_soft_power', '-')}"
@@ -4008,8 +4791,10 @@ def create_dataloaders(metadata, config):
     print("-" * 70)
     
     # Create datasets
+    print("Creating dataset views...")
     use_index_mmap = bool(config.get('hardware', {}).get('dataloader_index_mmap', True))
     dataloader_board_dtype = str(hw_cfg.get('dataloader_board_dtype', 'float32') or 'float32')
+    dataloader_return_numpy = bool(hw_cfg.get('dataloader_return_numpy', True))
     train_soft_target_paths = _soft_target_paths(index_cache_paths, 'train') if train_soft_targets is not None else None
     val_soft_target_paths = _soft_target_paths(index_cache_paths, 'val') if val_soft_targets is not None else None
     selection_stage_payload = _selection_stages_payload(selection_stages)
@@ -4032,6 +4817,7 @@ def create_dataloaders(metadata, config):
         soft_targets=train_soft_targets,
         soft_target_paths=train_soft_target_paths,
         board_dtype=dataloader_board_dtype,
+        return_numpy=dataloader_return_numpy,
         filter_stats=train_filter_stats,
     )
     val_dataset = BinaryChessDataset(
@@ -4045,6 +4831,7 @@ def create_dataloaders(metadata, config):
         soft_targets=val_soft_targets,
         soft_target_paths=val_soft_target_paths,
         board_dtype=dataloader_board_dtype,
+        return_numpy=dataloader_return_numpy,
         filter_stats=val_filter_stats,
     )
 
@@ -4076,6 +4863,7 @@ def create_dataloaders(metadata, config):
             _print_progress_histogram("Val", counts, sample_count, total_count, bins=10)
     
     # Dataloaders
+    print("Creating DataLoaders...")
     il_cfg = config.get('imitation_learning', {})
     train_batch_size = int(il_cfg['batch_size'])
     eval_batch_size = int(il_cfg.get('eval_batch_size', 0) or 0)
@@ -4091,12 +4879,15 @@ def create_dataloaders(metadata, config):
     train_persistent_workers = bool(hw_cfg.get('persistent_workers', True)) and train_num_workers > 0
     val_persistent_workers = bool(hw_cfg.get('val_persistent_workers', False)) and val_num_workers > 0
     use_numpy_shuffle = bool(hw_cfg.get('dataloader_numpy_shuffle', True))
+    use_block_shuffle = bool(hw_cfg.get('dataloader_block_shuffle', False))
+    block_shuffle_size = max(1, int(hw_cfg.get('dataloader_block_shuffle_size', 65536) or 65536))
     train_in_order = bool(hw_cfg.get('dataloader_train_in_order', True))
     val_in_order = bool(hw_cfg.get('dataloader_val_in_order', True))
     train_sampler = None
     train_sampling_label = "shuffle"
     train_sampling_mode = str(train_sampling_cfg.get('mode', 'shuffle') or 'shuffle').strip().lower()
     weighted_modes = {'weighted', 'policy_weighted', 'weighted_policy'}
+    print("Creating train sampler...")
     if bool(train_sampling_cfg.get('enabled', False)) and train_sampling_mode in weighted_modes:
         weights, weight_source = _build_policy_sampling_weights(train_dataset, train_sampling_cfg)
         if weights is None:
@@ -4145,14 +4936,25 @@ def create_dataloaders(metadata, config):
                     f"{opening_row_frac:.2%}/{opening_weight_frac:.2%}/{effective_opening:.2%}"
                 )
     if train_sampler is None:
-        train_sampler = (
-            NumpyRandomSampler(train_dataset, seed=config.get('seed', 0))
-            if use_numpy_shuffle
-            else None
-        )
-        train_sampling_label = "numpy_shuffle" if train_sampler is not None else "torch_shuffle"
+        if use_block_shuffle:
+            print(f"  - block shuffle sampler: block_size={block_shuffle_size:,}, order=identity")
+            train_sampler = NumpyBlockShuffleSampler(
+                train_dataset,
+                seed=config.get('seed', 0),
+                block_size=block_shuffle_size,
+            )
+            order_mode = getattr(train_sampler, 'order_mode', 'unknown')
+            train_sampling_label = f"block_shuffle:{block_shuffle_size:,}/{order_mode}"
+        else:
+            train_sampler = (
+                NumpyRandomSampler(train_dataset, seed=config.get('seed', 0))
+                if use_numpy_shuffle
+                else None
+            )
+            train_sampling_label = "numpy_shuffle" if train_sampler is not None else "torch_shuffle"
         print(f"Train sampler: {train_sampling_label}")
     
+    print("Creating train DataLoader...")
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_batch_size,
@@ -4165,6 +4967,7 @@ def create_dataloaders(metadata, config):
         in_order=train_in_order if train_num_workers > 0 else True,
     )
     
+    print("Creating val DataLoader...")
     val_loader = DataLoader(
         val_dataset,
         batch_size=eval_batch_size,
@@ -4180,7 +4983,8 @@ def create_dataloaders(metadata, config):
         f"DataLoaders: batch={train_batch_size}/{eval_batch_size}, "
         f"workers={train_num_workers}/{val_num_workers}, "
         f"prefetch={train_prefetch_factor}/{val_prefetch_factor}, "
-        f"dtype={dataloader_board_dtype}, mmap={'on' if use_index_mmap else 'off'}"
+        f"dtype={dataloader_board_dtype}, numpy={'on' if dataloader_return_numpy else 'off'}, "
+        f"mmap={'on' if use_index_mmap else 'off'}"
     )
     
     return train_loader, val_loader

@@ -1459,7 +1459,11 @@ def play_games_parallel_mcts(
     if device_type == 'cpu':
         num_workers = min(int(num_workers), max_cpu_sane_workers)
     else:
-        central_inference_requested = bool(rl_cfg.get('self_play_central_inference_enabled', False))
+        central_cfg = config.get('central_inference', {}) or {}
+        central_inference_requested = bool(
+            rl_cfg.get('self_play_central_inference_enabled', False)
+            and central_cfg.get('enabled', True)
+        )
         if central_inference_requested:
             try:
                 worker_cap_multiplier = max(
@@ -1567,11 +1571,16 @@ def play_games_parallel_mcts(
             device_type == 'cuda'
             and use_persistent_pool
             and bool(rl_cfg.get('self_play_central_inference_enabled', False))
+            and bool((config.get('central_inference', {}) or {}).get('enabled', True))
         )
         central_inference_info = "off"
         if central_inference_enabled:
             central_servers = _resolve_central_inference_server_count(config, worker_specs, device_type)
-            raw_central_servers = str(rl_cfg.get('self_play_central_inference_servers', 'auto'))
+            central_cfg = config.get('central_inference', {}) or {}
+            raw_central_servers = str(central_cfg.get(
+                'servers',
+                rl_cfg.get('self_play_central_inference_servers', 'auto'),
+            ))
             is_auto_cil = raw_central_servers.strip().lower() in {'auto', 'automatic'}
             auto_suffix = " auto" if is_auto_cil else ""
             central_inference_info = f"on  ({central_servers} server{'y' if central_servers != 1 else ''}{auto_suffix})"
@@ -1579,9 +1588,9 @@ def play_games_parallel_mcts(
                 print(
                     "Central inference auto: "
                     f"workers={len(worker_specs)}, "
-                    f"target_workers_per_server={int(rl_cfg.get('self_play_central_inference_auto_workers_per_server', 10) or 10)}, "
-                    f"min={int(rl_cfg.get('self_play_central_inference_auto_min_servers', 1) or 1)}, "
-                    f"max={int(rl_cfg.get('self_play_central_inference_auto_max_servers', 4) or 4)}, "
+                    f"target_workers_per_server={int(central_cfg.get('auto_workers_per_server', rl_cfg.get('self_play_central_inference_auto_workers_per_server', 10)) or 10)}, "
+                    f"min={int(central_cfg.get('auto_min_servers', rl_cfg.get('self_play_central_inference_auto_min_servers', 1)) or 1)}, "
+                    f"max={int(central_cfg.get('auto_max_servers', rl_cfg.get('self_play_central_inference_auto_max_servers', 4)) or 4)}, "
                     f"resolved={central_servers}"
                 )
         max_parallel_games = sum(
@@ -3382,7 +3391,11 @@ def main():
         f"absolute={config['reinforcement_learning'].get('mcts_fpu_absolute', None)})"
     )
     print(f"   - Persistent self-play workers: {config['reinforcement_learning'].get('persistent_self_play_workers', True)}")
-    print(f"   - Central inference server: {config['reinforcement_learning'].get('self_play_central_inference_enabled', False)}")
+    central_inference_enabled = bool(
+        config['reinforcement_learning'].get('self_play_central_inference_enabled', False)
+        and (config.get('central_inference', {}) or {}).get('enabled', True)
+    )
+    print(f"   - Central inference server: {central_inference_enabled}")
     print(f"   - Stream self-play to replay: {config['reinforcement_learning'].get('self_play_stream_to_replay', True)}")
     if bool(config['reinforcement_learning'].get('self_play_opponent_pool_enabled', False)):
         print(

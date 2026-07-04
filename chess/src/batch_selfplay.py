@@ -5791,12 +5791,50 @@ class _RemoteInferenceModel:
             return policy, value
 
 
+def _central_inference_shared_key(key):
+    key = str(key)
+    for prefix in (
+        'self_play_central_inference_',
+        'eval_central_inference_',
+        'central_inference_',
+    ):
+        if key.startswith(prefix):
+            return key[len(prefix):]
+    return key
+
+
+def _central_inference_option(config, key, default=None, rl_cfg=None):
+    shared_key = _central_inference_shared_key(key)
+    shared_cfg = (config or {}).get('central_inference', {}) or {}
+    if shared_key in shared_cfg:
+        return shared_cfg[shared_key]
+    if key in shared_cfg:
+        return shared_cfg[key]
+
+    # Backward-compatible fallbacks for older configs/checkpoints.
+    if rl_cfg is None:
+        rl_cfg = (config or {}).get('reinforcement_learning', {}) or {}
+    for candidate in (
+        key,
+        f'self_play_central_inference_{shared_key}',
+        f'central_inference_{shared_key}',
+    ):
+        if candidate in rl_cfg:
+            return rl_cfg[candidate]
+    return default
+
+
 def central_inference_server(config, device_id, request_queue, response_queues, control_queue=None, server_rank=None):
     """Own GPU inference and batch requests coming from self-play workers."""
     rl_cfg = config.get('reinforcement_learning', {})
     _, central_debug_cfg, debug_root_enabled = _debug_nested(config, 'rl', 'central_inference')
-    max_batch = max(1, int(rl_cfg.get('self_play_central_inference_max_batch_size', rl_cfg.get('mcts_batch_size', 256))))
-    flush_ms = max(0.0, float(rl_cfg.get('self_play_central_inference_flush_ms', 5.0)))
+    max_batch = max(1, int(_central_inference_option(
+        config,
+        'max_batch_size',
+        rl_cfg.get('mcts_batch_size', 256),
+        rl_cfg,
+    )))
+    flush_ms = max(0.0, float(_central_inference_option(config, 'flush_ms', 5.0, rl_cfg)))
     debug_enabled = bool(
         debug_root_enabled and central_debug_cfg.get(
             'verbose',
@@ -5804,10 +5842,11 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
         )
     )
     quiet_startup = True
-    cache_enabled = bool(rl_cfg.get('self_play_central_inference_cache_enabled', True))
-    cache_max_entries = max(0, int(rl_cfg.get('self_play_central_inference_cache_entries', 4096)))
-    central_use_compile = bool(rl_cfg.get('self_play_central_inference_use_compile', False))
-    transport_dtype = str(rl_cfg.get('self_play_central_inference_transport_dtype', 'float16') or 'float16').lower()
+    cache_enabled = bool(_central_inference_option(config, 'cache_enabled', True, rl_cfg))
+    cache_max_entries = max(0, int(_central_inference_option(config, 'cache_entries', 4096, rl_cfg)))
+    central_use_compile = bool(_central_inference_option(config, 'use_compile', False, rl_cfg))
+    sync_timing = bool(_central_inference_option(config, 'sync_timing', debug_enabled, rl_cfg))
+    transport_dtype = str(_central_inference_option(config, 'transport_dtype', 'float16', rl_cfg) or 'float16').lower()
     transport_np_dtype = np.float32 if transport_dtype in {'float32', 'fp32'} else np.float16
 
     try:
@@ -5818,7 +5857,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
             compile_rank = 900000 + int(os.getpid())
         if device.type == 'cuda':
             torch.backends.cudnn.benchmark = bool(
-                rl_cfg.get('self_play_central_inference_cudnn_benchmark', False)
+                _central_inference_option(config, 'cudnn_benchmark', False, rl_cfg)
             )
         models = {}
         caches = {}
@@ -5845,7 +5884,12 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
         def _warmup_central_model(model, label):
             if not central_use_compile or device.type != 'cuda':
                 return None
-            raw_batches = rl_cfg.get('self_play_central_inference_compile_warmup_batches', [1, 32, 128, max_batch])
+            raw_batches = _central_inference_option(
+                config,
+                'compile_warmup_batches',
+                [1, 32, 128, max_batch],
+                rl_cfg,
+            )
             try:
                 warmup_batches = [
                     max(1, int(batch_size))
@@ -6061,7 +6105,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                     else:
                         uncached_legal_indices = legal_indices
                     legal_index_tensor = torch.from_numpy(uncached_legal_indices).to(device, non_blocking=True)
-                if device.type == 'cuda':
+                if sync_timing and device.type == 'cuda':
                     torch.cuda.synchronize(device)
                 h2d_time += time.perf_counter() - h2d_t0
                 with torch.inference_mode():
@@ -6071,7 +6115,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                             policy_logits, value_logits = model(tensor, apply_log_softmax=False)
                     else:
                         policy_logits, value_logits = model(tensor, apply_log_softmax=False)
-                    if device.type == 'cuda':
+                    if sync_timing and device.type == 'cuda':
                         torch.cuda.synchronize(device)
                     forward_time += time.perf_counter() - forward_t0
                     d2h_t0 = time.perf_counter()
@@ -6079,7 +6123,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                         policy_logits = torch.gather(policy_logits, 1, legal_index_tensor)
                     policy_np_batch = policy_logits.to(dtype=torch.float16).cpu().numpy().copy()
                     value_np_batch = value_logits.float().cpu().numpy().copy()
-                    if device.type == 'cuda':
+                    if sync_timing and device.type == 'cuda':
                         torch.cuda.synchronize(device)
                     d2h_time += time.perf_counter() - d2h_t0
                 if use_cache_for_group:
@@ -6574,11 +6618,11 @@ def persistent_selfplay_worker(
         central_stall_warning_s = float(
             central_debug_cfg.get(
                 'stall_warning_s',
-                rl_cfg.get('self_play_central_inference_stall_warning_s', 60.0),
+                _central_inference_option(config, 'stall_warning_s', 60.0, rl_cfg),
             )
         )
         central_transport_dtype = str(
-            rl_cfg.get('self_play_central_inference_transport_dtype', 'float16') or 'float16'
+            _central_inference_option(config, 'transport_dtype', 'float16', rl_cfg) or 'float16'
         )
         model = None if central_inference_enabled else _build_selfplay_worker_model(config, device)
         inference_model = (
@@ -6587,7 +6631,7 @@ def persistent_selfplay_worker(
                 inference_request_queue,
                 inference_response_queue,
                 worker_rank=rank,
-                timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 0.0)),
+                timeout_s=float(_central_inference_option(config, 'timeout_s', 0.0, rl_cfg)),
                 stall_warning_s=central_stall_warning_s,
                 debug_enabled=central_debug_enabled,
                 transport_dtype=central_transport_dtype,
@@ -6657,7 +6701,7 @@ def persistent_selfplay_worker(
                             inference_request_queue,
                             inference_response_queue,
                             worker_rank=rank,
-                            timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 0.0)),
+                            timeout_s=float(_central_inference_option(config, 'timeout_s', 0.0, rl_cfg)),
                             stall_warning_s=central_stall_warning_s,
                             debug_enabled=central_debug_enabled,
                             transport_dtype=central_transport_dtype,
