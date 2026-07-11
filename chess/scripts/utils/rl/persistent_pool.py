@@ -18,27 +18,38 @@ _SELFPLAY_POOL = None
 
 def _resolve_central_inference_server_count(config, worker_specs, device_type):
     rl_cfg = config.get('reinforcement_learning', {})
+    central_cfg = config.get('central_inference', {}) or {}
     central_enabled = bool(
         rl_cfg.get('self_play_central_inference_enabled', False)
         and device_type == 'cuda'
         and torch.cuda.is_available()
+        and central_cfg.get('enabled', True)
     )
     if not central_enabled:
         return 0
 
-    raw_value = rl_cfg.get('self_play_central_inference_servers', 'auto')
+    raw_value = central_cfg.get('servers', rl_cfg.get('self_play_central_inference_servers', 'auto'))
     if str(raw_value).strip().lower() not in {'auto', 'automatic'}:
         return max(1, int(raw_value or 1))
 
     worker_count = max(1, len(list(worker_specs)))
     target_workers_per_server = max(
         4,
-        int(rl_cfg.get('self_play_central_inference_auto_workers_per_server', 10) or 10),
+        int(central_cfg.get(
+            'auto_workers_per_server',
+            rl_cfg.get('self_play_central_inference_auto_workers_per_server', 10),
+        ) or 10),
     )
     by_workers = max(1, (worker_count + target_workers_per_server - 1) // target_workers_per_server)
 
-    min_auto = max(1, int(rl_cfg.get('self_play_central_inference_auto_min_servers', 1) or 1))
-    max_auto = max(1, int(rl_cfg.get('self_play_central_inference_auto_max_servers', 4) or 4))
+    min_auto = max(1, int(central_cfg.get(
+        'auto_min_servers',
+        rl_cfg.get('self_play_central_inference_auto_min_servers', 1),
+    ) or 1))
+    max_auto = max(1, int(central_cfg.get(
+        'auto_max_servers',
+        rl_cfg.get('self_play_central_inference_auto_max_servers', 4),
+    ) or 4))
     max_auto = max(min_auto, max_auto)
     by_vram = max_auto
     try:
@@ -67,10 +78,12 @@ class _PersistentSelfPlayPool:
         self.task_queues = {}
         self.processes = {}
         rl_cfg = config.get('reinforcement_learning', {})
+        central_cfg = config.get('central_inference', {}) or {}
         self.central_inference_enabled = bool(
             rl_cfg.get('self_play_central_inference_enabled', False)
             and device_type == 'cuda'
             and torch.cuda.is_available()
+            and central_cfg.get('enabled', True)
         )
         self.central_inference_server_count = _resolve_central_inference_server_count(
             config,
@@ -171,10 +184,12 @@ class _PersistentSelfPlayPool:
 
     def matches(self, worker_specs, device_type, temp_dir):
         rl_cfg = self.config.get('reinforcement_learning', {})
+        central_cfg = self.config.get('central_inference', {}) or {}
         wanted_central = bool(
             rl_cfg.get('self_play_central_inference_enabled', False)
             and device_type == 'cuda'
             and torch.cuda.is_available()
+            and central_cfg.get('enabled', True)
         )
         wanted_servers = _resolve_central_inference_server_count(self.config, worker_specs, device_type)
         return (
@@ -252,7 +267,12 @@ class _PersistentSelfPlayPool:
                     "clear": bool(clear),
                     "models": models_to_load,
                 })
-            timeout_s = float(self.config.get('reinforcement_learning', {}).get('self_play_central_inference_load_timeout_s', 300.0))
+            central_cfg = self.config.get('central_inference', {}) or {}
+            rl_cfg = self.config.get('reinforcement_learning', {}) or {}
+            timeout_s = float(central_cfg.get(
+                'load_timeout_s',
+                rl_cfg.get('self_play_central_inference_load_timeout_s', 300.0),
+            ))
             import time
             end_time = time.time() + max(1.0, timeout_s)
             pending_servers = set(range(len(self.inference_control_queues)))

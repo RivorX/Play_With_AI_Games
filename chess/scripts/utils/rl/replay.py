@@ -5,6 +5,8 @@ Replay buffer for RL training.
 import numpy as np
 import torch
 
+from src.utils.data_helpers import ACTION_SIZE, AZ_ACTION_SIZE, MAX_LEGAL_MOVES, az_index_to_policy_index
+
 
 _DEFAULT_MAX_POLICY_TARGETS = 256
 REPLAY_SOURCE_UNKNOWN = 0
@@ -21,6 +23,23 @@ REPLAY_SOURCE_LABELS = {
     REPLAY_SOURCE_FROZEN_RECENT: "frozen_recent",
     REPLAY_SOURCE_OTHER: "other",
 }
+
+
+def _remap_legacy_policy_indices(policy_indices):
+    if not torch.is_tensor(policy_indices) or int(policy_indices.numel()) <= 0:
+        return policy_indices
+    if bool(((policy_indices >= ACTION_SIZE) & (policy_indices < AZ_ACTION_SIZE)).any().item()):
+        flat = policy_indices.reshape(-1).to(dtype=torch.long)
+        remapped = flat.clone()
+        mask = (flat >= ACTION_SIZE) & (flat < AZ_ACTION_SIZE)
+        if bool(mask.any().item()):
+            values = [
+                az_index_to_policy_index(int(idx))
+                for idx in flat[mask].cpu().tolist()
+            ]
+            remapped[mask] = torch.as_tensor(values, dtype=remapped.dtype, device=remapped.device)
+        policy_indices = remapped.reshape_as(policy_indices)
+    return policy_indices.to(dtype=torch.int16).contiguous()
 
 
 class ReplayBuffer:
@@ -83,9 +102,12 @@ class ReplayBuffer:
         self._policy_indices = None
         self._policy_values = None
         self._policy_lengths = None
+        self._legal_indices = None
+        self._legal_lengths = None
         self._importance = None
         self._policy_sample_weights = None
         self._value_sample_weights = None
+        self._moves_left = None
         self._insertion_iterations = None
         self._source_codes = None
         self._root_values = None
@@ -131,9 +153,16 @@ class ReplayBuffer:
             dtype=probs_dtype,
         )
         self._policy_lengths = torch.zeros((self.max_size,), dtype=torch.int16)
+        self._legal_indices = torch.full(
+            (self.max_size, MAX_LEGAL_MOVES),
+            -1,
+            dtype=torch.int16,
+        )
+        self._legal_lengths = torch.zeros((self.max_size,), dtype=torch.int16)
         self._importance = torch.zeros((self.max_size,), dtype=torch.float32)
         self._policy_sample_weights = torch.ones((self.max_size,), dtype=torch.float32)
         self._value_sample_weights = torch.ones((self.max_size,), dtype=torch.float32)
+        self._moves_left = torch.zeros((self.max_size, 1), dtype=torch.float32)
         self._insertion_iterations = torch.zeros((self.max_size,), dtype=torch.int32)
         self._source_codes = torch.zeros((self.max_size,), dtype=torch.int8)
         self._root_values = torch.zeros((self.max_size,), dtype=torch.float32)
@@ -146,8 +175,8 @@ class ReplayBuffer:
         except Exception:
             self.current_iteration = 0
 
-    def _get_scratch_batch(self, batch_size, max_len):
-        key = (int(batch_size), int(max_len))
+    def _get_scratch_batch(self, batch_size, max_len, max_legal_len):
+        key = (int(batch_size), int(max_len), int(max_legal_len))
         scratch = self._scratch.get(key)
         if scratch is not None:
             return scratch
@@ -162,9 +191,13 @@ class ReplayBuffer:
             "policy_indices": torch.full((batch_size, max_len), -1, dtype=torch.int16),
             "policy_values": torch.zeros((batch_size, max_len), dtype=probs_dtype),
             "policy_mask": torch.zeros((batch_size, max_len), dtype=torch.bool),
+            "legal_indices": torch.full((batch_size, max_legal_len), -1, dtype=torch.int16),
+            "legal_mask": torch.zeros((batch_size, max_legal_len), dtype=torch.bool),
             "policy_sample_weights": torch.ones((batch_size,), dtype=torch.float32),
             "value_sample_weights": torch.ones((batch_size,), dtype=torch.float32),
+            "moves_left": torch.zeros((batch_size, 1), dtype=torch.float32),
             "arange": torch.arange(max_len, dtype=torch.int16),
+            "legal_arange": torch.arange(max_legal_len, dtype=torch.int16),
         }
         self._scratch[key] = scratch
         return scratch
@@ -180,6 +213,8 @@ class ReplayBuffer:
         fen = str(position[8]) if len(position) > 8 and position[8] is not None else ""
         root_value = float(position[9]) if len(position) > 9 else 0.0
         history_fens = [str(fen or "") for fen in list(position[10])] if len(position) > 10 and position[10] is not None else []
+        moves_left = float(position[11]) if len(position) > 11 else 0.0
+        legal_indices = position[12] if len(position) > 12 and position[12] is not None else policy_indices
         if self.use_fp16:
             board = board.half().contiguous()
             policy_values = policy_values.half().contiguous()
@@ -190,8 +225,15 @@ class ReplayBuffer:
             value = value.contiguous()
 
         policy_indices = policy_indices.to(dtype=torch.int16).contiguous()
+        if int(policy_indices.numel()) > 0:
+            policy_indices = _remap_legacy_policy_indices(policy_indices)
+        if not torch.is_tensor(legal_indices):
+            legal_indices = torch.as_tensor(legal_indices)
+        legal_indices = legal_indices.to(dtype=torch.int16).contiguous()
+        if int(legal_indices.numel()) > 0:
+            legal_indices = _remap_legacy_policy_indices(legal_indices)
         value = value.reshape(1).contiguous()
-        return board, policy_indices, policy_values, value, importance, policy_weight, value_weight, source_code, fen, root_value, history_fens
+        return board, policy_indices, policy_values, value, importance, policy_weight, value_weight, source_code, fen, root_value, history_fens, moves_left, legal_indices
 
     def _store_at_slot(self, slot, position):
         (
@@ -206,6 +248,8 @@ class ReplayBuffer:
             fen,
             root_value,
             history_fens,
+            moves_left,
+            legal_indices,
         ) = self._normalize_position(position)
 
         count = int(policy_indices.numel())
@@ -222,9 +266,15 @@ class ReplayBuffer:
             self._policy_indices[slot, :count].copy_(policy_indices)
             self._policy_values[slot, :count].copy_(policy_values.to(dtype=self._policy_values.dtype))
         self._policy_lengths[slot] = count
+        legal_count = min(int(legal_indices.numel()), MAX_LEGAL_MOVES)
+        self._legal_indices[slot].fill_(-1)
+        if legal_count > 0:
+            self._legal_indices[slot, :legal_count].copy_(legal_indices[:legal_count])
+        self._legal_lengths[slot] = legal_count
         self._importance[slot] = float(importance)
         self._policy_sample_weights[slot] = float(policy_weight)
         self._value_sample_weights[slot] = float(value_weight)
+        self._moves_left[slot] = float(moves_left)
         self._insertion_iterations[slot] = int(self.current_iteration)
         self._source_codes[slot] = int(source_code)
         self._root_values[slot] = float(root_value)
@@ -237,32 +287,46 @@ class ReplayBuffer:
         idx = torch.as_tensor(indices, dtype=torch.long)
         batch_size = int(idx.numel())
         lengths = self._policy_lengths[idx].to(dtype=torch.int16)
+        legal_lengths = self._legal_lengths[idx].to(dtype=torch.int16)
         max_len = int(lengths.max().item()) if batch_size > 0 else 0
+        max_legal_len = int(legal_lengths.max().item()) if batch_size > 0 else 0
 
-        scratch = self._get_scratch_batch(batch_size, max_len)
+        scratch = self._get_scratch_batch(batch_size, max_len, max_legal_len)
         boards = scratch["boards"]
         values = scratch["values"]
         policy_sample_weights = scratch["policy_sample_weights"]
         value_sample_weights = scratch["value_sample_weights"]
+        moves_left = scratch["moves_left"]
         boards.copy_(self._boards[idx])
         values.copy_(self._values[idx])
         policy_sample_weights.copy_(self._policy_sample_weights[idx])
         value_sample_weights.copy_(self._value_sample_weights[idx])
+        moves_left.copy_(self._moves_left[idx])
 
         if max_len <= 0:
             policy_indices = scratch["policy_indices"][:, :0]
             policy_values = scratch["policy_values"][:, :0]
             policy_mask = scratch["policy_mask"][:, :0]
-            return boards, policy_indices, policy_values, policy_mask, values, policy_sample_weights, value_sample_weights
+            legal_indices = scratch["legal_indices"][:, :max_legal_len]
+            legal_mask = scratch["legal_mask"][:, :max_legal_len]
+            if max_legal_len > 0:
+                legal_indices.copy_(self._legal_indices[idx, :max_legal_len])
+                legal_mask.copy_(scratch["legal_arange"].unsqueeze(0) < legal_lengths.unsqueeze(1))
+            return boards, policy_indices, policy_values, policy_mask, values, policy_sample_weights, value_sample_weights, moves_left, legal_indices, legal_mask
 
         policy_indices = scratch["policy_indices"]
         policy_values = scratch["policy_values"]
         policy_mask = scratch["policy_mask"]
+        legal_indices = scratch["legal_indices"]
+        legal_mask = scratch["legal_mask"]
 
         policy_indices.copy_(self._policy_indices[idx, :max_len])
         policy_values.copy_(self._policy_values[idx, :max_len])
         policy_mask.copy_(scratch["arange"].unsqueeze(0) < lengths.unsqueeze(1))
-        return boards, policy_indices, policy_values, policy_mask, values, policy_sample_weights, value_sample_weights
+        if max_legal_len > 0:
+            legal_indices.copy_(self._legal_indices[idx, :max_legal_len])
+            legal_mask.copy_(scratch["legal_arange"].unsqueeze(0) < legal_lengths.unsqueeze(1))
+        return boards, policy_indices, policy_values, policy_mask, values, policy_sample_weights, value_sample_weights, moves_left, legal_indices, legal_mask
 
     def add(self, position):
         board = position[0]
@@ -281,6 +345,9 @@ class ReplayBuffer:
         importance_scores=None,
         policy_weights=None,
         value_weights=None,
+        moves_left=None,
+        legal_indices=None,
+        legal_lengths=None,
         source_codes=None,
         fens=None,
         root_values=None,
@@ -293,6 +360,8 @@ class ReplayBuffer:
         boards = boards.to(dtype=self._boards.dtype).contiguous()
         values = values.reshape(-1, 1).to(dtype=self._values.dtype).contiguous()
         policy_indices = policy_indices.to(dtype=torch.int16).contiguous()
+        if int(policy_indices.numel()) > 0:
+            policy_indices = _remap_legacy_policy_indices(policy_indices)
         policy_values = policy_values.to(dtype=self._policy_values.dtype).contiguous()
         policy_lengths = policy_lengths.to(dtype=torch.int16).contiguous()
         if importance_scores is None:
@@ -307,6 +376,21 @@ class ReplayBuffer:
             value_weights = torch.ones((int(boards.shape[0]),), dtype=torch.float32)
         else:
             value_weights = value_weights.reshape(-1).to(dtype=torch.float32).contiguous()
+        if moves_left is None:
+            moves_left = torch.zeros((int(boards.shape[0]), 1), dtype=torch.float32)
+        else:
+            moves_left = moves_left.reshape(-1, 1).to(dtype=torch.float32).contiguous()
+        if legal_indices is None:
+            legal_indices = policy_indices
+            legal_lengths = policy_lengths
+        else:
+            legal_indices = legal_indices.to(dtype=torch.int16).contiguous()
+            if int(legal_indices.numel()) > 0:
+                legal_indices = _remap_legacy_policy_indices(legal_indices)
+            if legal_lengths is None:
+                legal_lengths = (legal_indices >= 0).sum(dim=1).to(dtype=torch.int16)
+            else:
+                legal_lengths = legal_lengths.to(dtype=torch.int16).contiguous()
         if source_codes is None:
             source_codes = torch.zeros((int(boards.shape[0]),), dtype=torch.int8)
         else:
@@ -343,6 +427,11 @@ class ReplayBuffer:
             policy_indices = policy_indices[:, :max_len]
             policy_values = policy_values[:, :max_len]
             policy_lengths = torch.clamp(policy_lengths, max=max_len)
+        max_legal_len = int(legal_indices.shape[1]) if legal_indices.dim() == 2 else 0
+        if max_legal_len > MAX_LEGAL_MOVES:
+            max_legal_len = MAX_LEGAL_MOVES
+            legal_indices = legal_indices[:, :max_legal_len]
+            legal_lengths = torch.clamp(legal_lengths, max=max_legal_len)
 
         batch_size = int(boards.shape[0])
         remaining = batch_size
@@ -362,9 +451,14 @@ class ReplayBuffer:
                 self._policy_indices[dst_slice, :max_len].copy_(policy_indices[src_slice, :max_len])
                 self._policy_values[dst_slice, :max_len].copy_(policy_values[src_slice, :max_len])
             self._policy_lengths[dst_slice].copy_(policy_lengths[src_slice])
+            self._legal_indices[dst_slice].fill_(-1)
+            if max_legal_len > 0:
+                self._legal_indices[dst_slice, :max_legal_len].copy_(legal_indices[src_slice, :max_legal_len])
+            self._legal_lengths[dst_slice].copy_(legal_lengths[src_slice])
             self._importance[dst_slice].copy_(importance_scores[src_slice])
             self._policy_sample_weights[dst_slice].copy_(policy_weights[src_slice])
             self._value_sample_weights[dst_slice].copy_(value_weights[src_slice])
+            self._moves_left[dst_slice].copy_(moves_left[src_slice])
             self._insertion_iterations[dst_slice].fill_(int(self.current_iteration))
             self._source_codes[dst_slice].copy_(source_codes[src_slice])
             self._root_values[dst_slice].copy_(root_values[src_slice])
@@ -817,9 +911,12 @@ class ReplayBuffer:
         old_policy_indices = self._policy_indices
         old_policy_values = self._policy_values
         old_policy_lengths = self._policy_lengths
+        old_legal_indices = self._legal_indices
+        old_legal_lengths = self._legal_lengths
         old_importance = self._importance
         old_policy_sample_weights = self._policy_sample_weights
         old_value_sample_weights = self._value_sample_weights
+        old_moves_left = self._moves_left
         old_insertion_iterations = self._insertion_iterations
         old_source_codes = self._source_codes
         old_root_values = self._root_values
@@ -843,9 +940,16 @@ class ReplayBuffer:
             dtype=probs_dtype,
         )
         self._policy_lengths = torch.zeros((self.max_size,), dtype=old_policy_lengths.dtype)
+        self._legal_indices = torch.full(
+            (self.max_size, MAX_LEGAL_MOVES),
+            -1,
+            dtype=old_legal_indices.dtype,
+        )
+        self._legal_lengths = torch.zeros((self.max_size,), dtype=old_legal_lengths.dtype)
         self._importance = torch.zeros((self.max_size,), dtype=old_importance.dtype)
         self._policy_sample_weights = torch.ones((self.max_size,), dtype=old_policy_sample_weights.dtype)
         self._value_sample_weights = torch.ones((self.max_size,), dtype=old_value_sample_weights.dtype)
+        self._moves_left = torch.zeros((self.max_size, 1), dtype=old_moves_left.dtype)
         self._insertion_iterations = torch.zeros((self.max_size,), dtype=old_insertion_iterations.dtype)
         self._source_codes = torch.zeros((self.max_size,), dtype=old_source_codes.dtype)
         self._root_values = torch.zeros((self.max_size,), dtype=old_root_values.dtype)
@@ -859,9 +963,12 @@ class ReplayBuffer:
             self._policy_indices[:keep_size].copy_(old_policy_indices[idx])
             self._policy_values[:keep_size].copy_(old_policy_values[idx])
             self._policy_lengths[:keep_size].copy_(old_policy_lengths[idx])
+            self._legal_indices[:keep_size].copy_(old_legal_indices[idx])
+            self._legal_lengths[:keep_size].copy_(old_legal_lengths[idx])
             self._importance[:keep_size].copy_(old_importance[idx])
             self._policy_sample_weights[:keep_size].copy_(old_policy_sample_weights[idx])
             self._value_sample_weights[:keep_size].copy_(old_value_sample_weights[idx])
+            self._moves_left[:keep_size].copy_(old_moves_left[idx])
             self._insertion_iterations[:keep_size].copy_(old_insertion_iterations[idx])
             self._source_codes[:keep_size].copy_(old_source_codes[idx])
             self._root_values[:keep_size].copy_(old_root_values[idx])

@@ -18,7 +18,7 @@ sys.path.insert(0, str(script_dir.parent))
 from utils.shared.model_catalog import (
     load_checkpoint_metadata,
     print_model_table,
-    sort_entries_by_folder_and_elo,
+    sort_entries_by_folder_and_version,
 )
 
 
@@ -42,7 +42,7 @@ def main() -> None:
         sys.exit(0)
 
     entries = [load_checkpoint_metadata(path, models_dir) for path in paths]
-    entries = sort_entries_by_folder_and_elo(entries)
+    entries = sort_entries_by_folder_and_version(entries)
     print_model_table(
         entries,
         title="Model Checkpoints",

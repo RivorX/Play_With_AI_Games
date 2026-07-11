@@ -157,7 +157,12 @@ def _build_rl_optimizer_param_groups(model, rl_config, base_lr):
 
     def _family_for_name(name):
         lowered = name.lower()
-        if lowered.startswith('value_') or '.value_' in lowered:
+        if (
+            lowered.startswith('value_')
+            or '.value_' in lowered
+            or lowered.startswith('moves_left_')
+            or '.moves_left_' in lowered
+        ):
             return 'value'
         if lowered.startswith('policy_') or '.policy_' in lowered:
             return 'policy'
@@ -647,6 +652,10 @@ def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", e
             settings["elo_std_error"] = float(elo_result.get("elo_std_error"))
         if elo_result.get("elo_ci95") is not None:
             settings["elo_ci95"] = list(elo_result.get("elo_ci95") or [])
+    elo_std_error = _safe_float(settings.get("elo_std_error"))
+    elo_ci95 = settings.get("elo_ci95")
+    ci_low = _safe_float(elo_ci95[0]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
+    ci_high = _safe_float(elo_ci95[1]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
     metadata = {
         mode_prefix: elo_value,
         f"last_{mode_prefix}": elo_value,
@@ -659,15 +668,31 @@ def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", e
         "estimated_elo_timestamp": timestamp,
         "estimated_elo_settings": settings,
     }
+    if elo_std_error is not None:
+        metadata[f"{mode_prefix}_se"] = float(elo_std_error)
+        metadata["estimated_elo_se"] = float(elo_std_error)
+    if ci_low is not None:
+        metadata[f"{mode_prefix}_ci95_low"] = float(ci_low)
+        metadata["estimated_elo_ci95_low"] = float(ci_low)
+    if ci_high is not None:
+        metadata[f"{mode_prefix}_ci95_high"] = float(ci_high)
+        metadata["estimated_elo_ci95_high"] = float(ci_high)
     if use_mcts:
         metadata["estimated_elo_mcts_simulations"] = simulations
+        sim_entry = {
+            "elo": elo_value,
+            "simulations": int(simulations),
+            "timestamp": timestamp,
+            "source": str(source),
+            "settings": settings,
+        }
+        if elo_std_error is not None:
+            sim_entry["se"] = float(elo_std_error)
+        if ci_low is not None and ci_high is not None:
+            sim_entry["ci95"] = [float(ci_low), float(ci_high)]
         metadata["estimated_elo_mcts_by_simulations"] = {
             str(int(simulations)): {
-                "elo": elo_value,
-                "simulations": int(simulations),
-                "timestamp": timestamp,
-                "source": str(source),
-                "settings": settings,
+                **sim_entry,
             }
         }
     return metadata
@@ -726,11 +751,14 @@ class RLEloCoordinator:
         self.device = device
         self.logger = logger
         self.elo_config = dict(config.get("elo_estimation", {}) or {})
+        rl_cfg = config.get("reinforcement_learning", {}) or {}
+        self.rl_elo_config = dict(rl_cfg.get("stockfish_elo", {}) or {})
+        self.rl_fast_elo_config = dict(self.rl_elo_config.get("fast_promoted", {}) or {})
         self.checkpoint_targets = [Path(p) for p in list(checkpoint_targets or []) if p is not None]
         self.enabled = bool(self.elo_config.get("enabled", False))
         # RL evaluation is synchronous by design (training is paused while Elo runs).
         # Prefer CUDA for RL Elo/MCTS evaluation when available.
-        rl_eval_device_raw = str(self.elo_config.get("rl_device", "cuda")).strip().lower()
+        rl_eval_device_raw = str(self.rl_elo_config.get("device", "cuda")).strip().lower()
         if rl_eval_device_raw in {"same", ""}:
             self.eval_device = device
         elif rl_eval_device_raw == "cpu":
@@ -749,6 +777,11 @@ class RLEloCoordinator:
         self.best_il_anchor_iteration = None
 
     def _resolve_eval_mcts_simulations(self):
+        if "mcts_eval_simulations" in self.elo_config:
+            try:
+                return max(1, int(self.elo_config.get("mcts_eval_simulations") or 1))
+            except Exception:
+                pass
         rl_cfg = self.config.get("reinforcement_learning", {}) or {}
         try:
             base_sims = max(1, int(rl_cfg.get("mcts_simulations", 50) or 50))
@@ -763,47 +796,67 @@ class RLEloCoordinator:
     def print_startup_summary(self):
         if not self.enabled:
             return
-        fast_enabled = bool(self.elo_config.get("rl_promoted_fast_enabled", True))
+        fast_enabled = self._promoted_fast_enabled()
+        final_use_mcts = bool(
+            self.rl_elo_config.get(
+                "final_use_mcts",
+                self.rl_elo_config.get("promoted_use_mcts", False),
+            )
+        )
         print(
             "Elo eval (RL): promoted best models only vs Stockfish "
             f"({'fast ' if fast_enabled else ''}raw NN + optional MCTS), "
             f"sync_device={self.eval_device.type}, "
             f"promoted_mcts={self._promoted_use_mcts(fast=fast_enabled)}, "
-            f"final_mcts={self.elo_config.get('rl_final_use_mcts', self.elo_config.get('rl_promoted_use_mcts', False))}"
+            f"final_mcts={final_use_mcts}"
         )
 
     def _promoted_fast_enabled(self):
-        return bool(self.elo_config.get("rl_promoted_fast_enabled", True))
+        return bool(self.rl_fast_elo_config.get("enabled", True))
 
     def _promoted_use_mcts(self, *, fast):
-        if fast and "rl_promoted_fast_use_mcts" in self.elo_config:
-            return bool(self.elo_config.get("rl_promoted_fast_use_mcts", False))
-        return bool(self.elo_config.get("rl_promoted_use_mcts", False))
+        if fast and "use_mcts" in self.rl_fast_elo_config:
+            return bool(self.rl_fast_elo_config.get("use_mcts", False))
+        return bool(self.rl_elo_config.get("promoted_use_mcts", False))
+
+    def _apply_shared_mode_overrides(self, elo_config, *, use_mcts):
+        prefix = "mcts_eval" if use_mcts else "nn_eval"
+        override_map = {
+            f"{prefix}_workers": "workers",
+            f"{prefix}_free_threads_utilization": "free_threads_utilization",
+        }
+        if use_mcts:
+            override_map[f"{prefix}_simulations"] = "mcts_simulations"
+        for source_key, target_key in override_map.items():
+            if source_key in self.elo_config:
+                elo_config[target_key] = self.elo_config[source_key]
+        elo_config["use_mcts"] = bool(use_mcts)
+        return elo_config
 
     def _apply_promoted_fast_overrides(self, elo_config):
-        total_games = max(1, int(self.elo_config.get("rl_promoted_fast_total_games", 50) or 50))
+        total_games = max(1, int(self.rl_fast_elo_config.get("total_games", 50) or 50))
         elo_config["adaptive_max_total_games"] = total_games
         elo_config["adaptive_min_batch_games"] = total_games
         elo_config["adaptive_probe_games_per_level"] = max(
             1,
-            int(self.elo_config.get("rl_promoted_fast_probe_games_per_level", 2) or 2),
+            int(self.rl_fast_elo_config.get("probe_games_per_level", 2) or 2),
         )
         elo_config["adaptive_focus_games_per_level"] = max(
             1,
-            int(self.elo_config.get("rl_promoted_fast_focus_games_per_level", 8) or 8),
+            int(self.rl_fast_elo_config.get("focus_games_per_level", 8) or 8),
         )
         elo_config["adaptive_extra_games_per_level"] = max(
             1,
-            int(self.elo_config.get("rl_promoted_fast_extra_games_per_level", 2) or 2),
+            int(self.rl_fast_elo_config.get("extra_games_per_level", 2) or 2),
         )
         elo_config["adaptive_target_focus_levels"] = max(
             1,
-            int(self.elo_config.get("rl_promoted_fast_target_focus_levels", 3) or 3),
+            int(self.rl_fast_elo_config.get("target_focus_levels", 3) or 3),
         )
         elo_config["adaptive_target_standard_error"] = 0.0
         elo_config["adaptive_min_games_for_se_stop"] = total_games
-        if "rl_promoted_fast_stockfish_time_limit" in self.elo_config:
-            elo_config["stockfish_time_limit"] = float(self.elo_config.get("rl_promoted_fast_stockfish_time_limit"))
+        if "stockfish_time_limit" in self.rl_fast_elo_config:
+            elo_config["stockfish_time_limit"] = float(self.rl_fast_elo_config.get("stockfish_time_limit"))
         elo_config["progress_bar"] = "always"
         return elo_config
 
@@ -867,9 +920,14 @@ class RLEloCoordinator:
         return next((r for r in reversed(results) if r is not None), None)
 
     def evaluate_final_best(self, iteration_num, model_override=None):
-        if not self.enabled or not bool(self.elo_config.get("rl_final_elo_enabled", True)):
+        if not self.enabled or not bool(self.rl_elo_config.get("final_enabled", True)):
             return None
-        final_use_mcts = bool(self.elo_config.get("rl_final_use_mcts", self.elo_config.get("rl_promoted_use_mcts", False)))
+        final_use_mcts = bool(
+            self.rl_elo_config.get(
+                "final_use_mcts",
+                self.rl_elo_config.get("promoted_use_mcts", False),
+            )
+        )
         mode_label = "raw NN and MCTS" if final_use_mcts else "raw NN"
         print(f"Final best model: running normal Stockfish Elo for {mode_label}.")
         old_model = self.model
@@ -934,50 +992,17 @@ class RLEloCoordinator:
             elo_config["free_threads_utilization"] = 1.0
             elo_config["stockfish_priority"] = "normal"
             elo_config["progress_bar"] = "always"
-            if "promoted_rl_stockfish_time_limit" in self.elo_config:
-                elo_config["stockfish_time_limit"] = float(self.elo_config.get("promoted_rl_stockfish_time_limit"))
-            if "promoted_rl_workers" in self.elo_config:
-                elo_config["workers"] = int(self.elo_config.get("promoted_rl_workers"))
             if force_use_mcts is not None:
                 elo_config["use_mcts"] = bool(force_use_mcts)
+            use_mcts_for_elo = bool(elo_config.get("use_mcts", False))
+            elo_config = self._apply_shared_mode_overrides(
+                elo_config,
+                use_mcts=use_mcts_for_elo,
+            )
             if fast_override:
                 elo_config = self._apply_promoted_fast_overrides(elo_config)
-            use_mcts_for_elo = bool(elo_config.get("use_mcts", False))
-            if use_mcts_for_elo:
-                multiplier_key = "promoted_rl_mcts_worker_multiplier"
-                fallback_key = "eval_elo_mcts_worker_multiplier"
-            else:
-                multiplier_key = "promoted_rl_raw_worker_multiplier"
-                fallback_key = "eval_elo_raw_worker_multiplier"
-            try:
-                worker_multiplier = float(
-                    self.elo_config.get(
-                        multiplier_key,
-                        self.elo_config.get(fallback_key, 1.0),
-                    )
-                    or 1.0
-                )
-            except (TypeError, ValueError):
-                worker_multiplier = 1.0
-            if worker_multiplier > 1.0:
-                try:
-                    stockfish_threads = max(1, int(elo_config.get("stockfish_threads", 1) or 1))
-                except (TypeError, ValueError):
-                    stockfish_threads = 1
-                cpu_total = max(1, int(os.cpu_count() or 1))
-                scaled_workers = max(1, int(math.ceil((cpu_total * worker_multiplier) / stockfish_threads)))
-                current_workers = int(elo_config.get("workers", 0) or 0)
-                if scaled_workers > current_workers:
-                    elo_config["workers"] = scaled_workers
-
         if bool(elo_config.get("use_mcts", False)):
-            if fast_override and "rl_promoted_fast_mcts_simulations" in self.elo_config:
-                elo_config["mcts_simulations"] = max(
-                    1,
-                    int(self.elo_config.get("rl_promoted_fast_mcts_simulations") or 1),
-                )
-            else:
-                elo_config["mcts_simulations"] = self._resolve_eval_mcts_simulations()
+            elo_config["mcts_simulations"] = self._resolve_eval_mcts_simulations()
 
         print(f"\nEstimating Elo vs Stockfish ({reason_label})...")
         max_attempts = 1
@@ -1041,6 +1066,8 @@ class RLEloCoordinator:
                 mode="mcts" if bool(elo_config.get("use_mcts", False)) else "nn",
                 simulations=int(elo_config.get("mcts_simulations", 0) or 0),
                 update_csv=True,
+                std_error=elo_result.get("elo_std_error"),
+                ci95=elo_result.get("elo_ci95"),
             )
             print(f"Estimated Elo: {estimated_elo}")
             if elo_result.get("elo_std_error") is not None:
@@ -1432,7 +1459,11 @@ def play_games_parallel_mcts(
     if device_type == 'cpu':
         num_workers = min(int(num_workers), max_cpu_sane_workers)
     else:
-        central_inference_requested = bool(rl_cfg.get('self_play_central_inference_enabled', False))
+        central_cfg = config.get('central_inference', {}) or {}
+        central_inference_requested = bool(
+            rl_cfg.get('self_play_central_inference_enabled', False)
+            and central_cfg.get('enabled', True)
+        )
         if central_inference_requested:
             try:
                 worker_cap_multiplier = max(
@@ -1540,11 +1571,16 @@ def play_games_parallel_mcts(
             device_type == 'cuda'
             and use_persistent_pool
             and bool(rl_cfg.get('self_play_central_inference_enabled', False))
+            and bool((config.get('central_inference', {}) or {}).get('enabled', True))
         )
         central_inference_info = "off"
         if central_inference_enabled:
             central_servers = _resolve_central_inference_server_count(config, worker_specs, device_type)
-            raw_central_servers = str(rl_cfg.get('self_play_central_inference_servers', 'auto'))
+            central_cfg = config.get('central_inference', {}) or {}
+            raw_central_servers = str(central_cfg.get(
+                'servers',
+                rl_cfg.get('self_play_central_inference_servers', 'auto'),
+            ))
             is_auto_cil = raw_central_servers.strip().lower() in {'auto', 'automatic'}
             auto_suffix = " auto" if is_auto_cil else ""
             central_inference_info = f"on  ({central_servers} server{'y' if central_servers != 1 else ''}{auto_suffix})"
@@ -1552,9 +1588,9 @@ def play_games_parallel_mcts(
                 print(
                     "Central inference auto: "
                     f"workers={len(worker_specs)}, "
-                    f"target_workers_per_server={int(rl_cfg.get('self_play_central_inference_auto_workers_per_server', 10) or 10)}, "
-                    f"min={int(rl_cfg.get('self_play_central_inference_auto_min_servers', 1) or 1)}, "
-                    f"max={int(rl_cfg.get('self_play_central_inference_auto_max_servers', 4) or 4)}, "
+                    f"target_workers_per_server={int(central_cfg.get('auto_workers_per_server', rl_cfg.get('self_play_central_inference_auto_workers_per_server', 10)) or 10)}, "
+                    f"min={int(central_cfg.get('auto_min_servers', rl_cfg.get('self_play_central_inference_auto_min_servers', 1)) or 1)}, "
+                    f"max={int(central_cfg.get('auto_max_servers', rl_cfg.get('self_play_central_inference_auto_max_servers', 4)) or 4)}, "
                     f"resolved={central_servers}"
                 )
         max_parallel_games = sum(
@@ -2026,6 +2062,9 @@ def play_games_parallel_mcts(
                                     importance_scores = packed.get('importance_scores')
                                     policy_weights = packed.get('policy_weights')
                                     value_weights = packed.get('value_weights')
+                                    moves_left = packed.get('moves_left')
+                                    legal_indices = packed.get('legal_indices')
+                                    legal_lengths = packed.get('legal_lengths')
                                     source_codes = packed.get('source_codes')
                                     fens = packed.get('fens')
                                     root_values = packed.get('root_values')
@@ -2049,6 +2088,9 @@ def play_games_parallel_mcts(
                                             importance_scores=importance_scores,
                                             policy_weights=policy_weights,
                                             value_weights=value_weights,
+                                            moves_left=moves_left,
+                                            legal_indices=legal_indices,
+                                            legal_lengths=legal_lengths,
                                             source_codes=source_codes,
                                             fens=fens,
                                             root_values=root_values,
@@ -3349,7 +3391,11 @@ def main():
         f"absolute={config['reinforcement_learning'].get('mcts_fpu_absolute', None)})"
     )
     print(f"   - Persistent self-play workers: {config['reinforcement_learning'].get('persistent_self_play_workers', True)}")
-    print(f"   - Central inference server: {config['reinforcement_learning'].get('self_play_central_inference_enabled', False)}")
+    central_inference_enabled = bool(
+        config['reinforcement_learning'].get('self_play_central_inference_enabled', False)
+        and (config.get('central_inference', {}) or {}).get('enabled', True)
+    )
+    print(f"   - Central inference server: {central_inference_enabled}")
     print(f"   - Stream self-play to replay: {config['reinforcement_learning'].get('self_play_stream_to_replay', True)}")
     if bool(config['reinforcement_learning'].get('self_play_opponent_pool_enabled', False)):
         print(

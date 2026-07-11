@@ -21,7 +21,7 @@ import hashlib
 from collections import OrderedDict
 from pathlib import Path
 from src.data import board_to_tensor, move_to_index
-from src.utils.data_helpers import _move_to_index_cached
+from src.utils.data_helpers import MAX_LEGAL_MOVES, _move_to_index_cached
 
 
 _EMPTY_HISTORY_TENSOR = np.zeros((16, 8, 8), dtype=np.float32)
@@ -822,9 +822,16 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     policy_indices = torch.full((batch_size, max_len), -1, dtype=torch.int16)
     policy_values = torch.zeros((batch_size, max_len), dtype=torch.float32)
     policy_lengths = torch.zeros((batch_size,), dtype=torch.int16)
+    max_legal_len = min(
+        MAX_LEGAL_MOVES,
+        max(int((pos[12] if len(pos) > 12 and pos[12] is not None else pos[1]).numel()) for pos in positions),
+    )
+    legal_indices = torch.full((batch_size, max_legal_len), -1, dtype=torch.int16)
+    legal_lengths = torch.zeros((batch_size,), dtype=torch.int16)
     importance_scores = torch.zeros((batch_size,), dtype=torch.float32)
     policy_weights = torch.ones((batch_size,), dtype=torch.float32)
     value_weights = torch.ones((batch_size,), dtype=torch.float32)
+    moves_left = torch.zeros((batch_size, 1), dtype=torch.float32)
     source_codes = torch.zeros((batch_size,), dtype=torch.int8)
     root_values = torch.zeros((batch_size,), dtype=torch.float32)
     fens = []
@@ -843,6 +850,12 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         root_values[row_idx] = float(pos[9]) if len(pos) > 9 else 0.0
         history_payload = pos[10] if len(pos) > 10 and pos[10] is not None else []
         history_fens.append([str(fen or "") for fen in list(history_payload)])
+        moves_left[row_idx, 0] = float(pos[11]) if len(pos) > 11 else 0.0
+        legal_payload = pos[12] if len(pos) > 12 and pos[12] is not None else indices
+        legal_count = min(int(legal_payload.numel()), max_legal_len)
+        if legal_count > 0:
+            legal_indices[row_idx, :legal_count] = legal_payload[:legal_count].to(dtype=torch.int16)
+        legal_lengths[row_idx] = legal_count
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -854,10 +867,13 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         'policy_indices': policy_indices,
         'policy_values': policy_values,
         'policy_lengths': policy_lengths,
+        'legal_indices': legal_indices,
+        'legal_lengths': legal_lengths,
         'values': values,
         'importance_scores': importance_scores,
         'policy_weights': policy_weights,
         'value_weights': value_weights,
+        'moves_left': moves_left,
         'source_codes': source_codes,
         'fens': fens,
         'root_values': root_values,
@@ -3076,22 +3092,6 @@ class BatchSelfPlayMCTSBatch:
             0.0,
             min(1.0, float(rl_cfg.get('replay_importance_top_fraction', 0.70))),
         )
-        self.value_target_weighting_enabled = bool(
-            rl_cfg.get('value_target_weighting_enabled', False)
-        )
-        self.value_target_weight_min = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('value_target_weight_min', 0.35))),
-        )
-        self.value_target_weight_draw_min = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('value_target_weight_draw_min', self.value_target_weight_min))),
-        )
-        self.value_target_weight_power = max(
-            0.1,
-            float(rl_cfg.get('value_target_weight_power', 1.75)),
-        )
-        
         self.max_positions_per_game = max(
             0,
             int(rl_cfg.get('replay_max_positions_per_game', 32)),
@@ -3873,6 +3873,7 @@ class BatchSelfPlayMCTSBatch:
         source_code = int(history_entry[7]) if len(history_entry) > 7 else _REPLAY_SOURCE_UNKNOWN
         fen = str(history_entry[8]) if len(history_entry) > 8 and history_entry[8] else ""
         history_fens = list(history_entry[9]) if len(history_entry) > 9 and history_entry[9] else []
+        legal_indices = history_entry[10] if len(history_entry) > 10 and history_entry[10] is not None else policy_indices
 
         if outcome == 0.0:
             value = draw_value_target
@@ -3884,7 +3885,8 @@ class BatchSelfPlayMCTSBatch:
                 (1.0 - self.value_root_q_target_mix) * float(value)
                 + self.value_root_q_target_mix * max(-1.0, min(1.0, float(root_value)))
             )
-        value_weight = self._value_target_weight(int(history_idx), int(history_len), outcome)
+        value_weight = 1.0
+        moves_left = max(0, len(gs.get('board_history', [])) - int(history_count))
 
         return {
             'history_idx': int(history_idx),
@@ -3899,6 +3901,8 @@ class BatchSelfPlayMCTSBatch:
             'importance_score': importance_score,
             'policy_weight': policy_weight,
             'value_weight': value_weight,
+            'moves_left': moves_left,
+            'legal_indices': legal_indices,
             'source_code': source_code,
         }
 
@@ -3918,19 +3922,6 @@ class BatchSelfPlayMCTSBatch:
             history_fens.append(temp_board.fen())
         history_fens.reverse()
         return history_fens
-
-    def _value_target_weight(self, history_idx, history_len, outcome):
-        if not self.value_target_weighting_enabled:
-            return 1.0
-        history_len = max(1, int(history_len))
-        progress = max(0.0, min(1.0, (int(history_idx) + 1) / float(history_len)))
-        min_weight = (
-            self.value_target_weight_draw_min
-            if float(outcome) == 0.0
-            else self.value_target_weight_min
-        )
-        shaped = progress ** float(self.value_target_weight_power)
-        return float(min_weight + (1.0 - min_weight) * shaped)
 
     def _compute_position_importance(self, board, move, visit_counts, root):
         importance = 1.0
@@ -4020,6 +4011,8 @@ class BatchSelfPlayMCTSBatch:
                 item.get('fen', ""),
                 float(item.get('root_value', 0.0)),
                 item.get('history_fens', []),
+                float(item.get('moves_left', 0.0)),
+                item.get('legal_indices', item['policy_indices']),
             ))
         if self.profile_enabled:
             self._profile_add('policy_target_postgame_time', time.perf_counter() - postgame_t0)
@@ -5046,6 +5039,10 @@ class BatchSelfPlayMCTSBatch:
                     target_quality_weight = self._policy_target_quality_weight(top1, entropy)
                     policy_visit_counts = self._prune_policy_target_visits(target_visit_counts)
                     policy_indices, policy_values = _build_sparse_policy_target_from_visits(policy_visit_counts, board)
+                    legal_indices_full = torch.tensor(
+                        [move_to_index(legal_move, board) for legal_move in board.legal_moves],
+                        dtype=torch.int16,
+                    )
                     history_count = len(gs['board_history'])
                     importance_score = self._compute_position_importance(board, move, policy_visit_counts, root)
                     root_value = 0.0
@@ -5088,6 +5085,7 @@ class BatchSelfPlayMCTSBatch:
                         replay_source_code,
                         board.fen(),
                         self._history_fens_for_board(board, self.history_positions),
+                        legal_indices_full,
                     ))
                     if self.profile_enabled:
                         self._profile_add('policy_target_build_time', time.perf_counter() - policy_t0)
@@ -5793,12 +5791,50 @@ class _RemoteInferenceModel:
             return policy, value
 
 
+def _central_inference_shared_key(key):
+    key = str(key)
+    for prefix in (
+        'self_play_central_inference_',
+        'eval_central_inference_',
+        'central_inference_',
+    ):
+        if key.startswith(prefix):
+            return key[len(prefix):]
+    return key
+
+
+def _central_inference_option(config, key, default=None, rl_cfg=None):
+    shared_key = _central_inference_shared_key(key)
+    shared_cfg = (config or {}).get('central_inference', {}) or {}
+    if shared_key in shared_cfg:
+        return shared_cfg[shared_key]
+    if key in shared_cfg:
+        return shared_cfg[key]
+
+    # Backward-compatible fallbacks for older configs/checkpoints.
+    if rl_cfg is None:
+        rl_cfg = (config or {}).get('reinforcement_learning', {}) or {}
+    for candidate in (
+        key,
+        f'self_play_central_inference_{shared_key}',
+        f'central_inference_{shared_key}',
+    ):
+        if candidate in rl_cfg:
+            return rl_cfg[candidate]
+    return default
+
+
 def central_inference_server(config, device_id, request_queue, response_queues, control_queue=None, server_rank=None):
     """Own GPU inference and batch requests coming from self-play workers."""
     rl_cfg = config.get('reinforcement_learning', {})
     _, central_debug_cfg, debug_root_enabled = _debug_nested(config, 'rl', 'central_inference')
-    max_batch = max(1, int(rl_cfg.get('self_play_central_inference_max_batch_size', rl_cfg.get('mcts_batch_size', 256))))
-    flush_ms = max(0.0, float(rl_cfg.get('self_play_central_inference_flush_ms', 5.0)))
+    max_batch = max(1, int(_central_inference_option(
+        config,
+        'max_batch_size',
+        rl_cfg.get('mcts_batch_size', 256),
+        rl_cfg,
+    )))
+    flush_ms = max(0.0, float(_central_inference_option(config, 'flush_ms', 5.0, rl_cfg)))
     debug_enabled = bool(
         debug_root_enabled and central_debug_cfg.get(
             'verbose',
@@ -5806,10 +5842,11 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
         )
     )
     quiet_startup = True
-    cache_enabled = bool(rl_cfg.get('self_play_central_inference_cache_enabled', True))
-    cache_max_entries = max(0, int(rl_cfg.get('self_play_central_inference_cache_entries', 4096)))
-    central_use_compile = bool(rl_cfg.get('self_play_central_inference_use_compile', False))
-    transport_dtype = str(rl_cfg.get('self_play_central_inference_transport_dtype', 'float16') or 'float16').lower()
+    cache_enabled = bool(_central_inference_option(config, 'cache_enabled', True, rl_cfg))
+    cache_max_entries = max(0, int(_central_inference_option(config, 'cache_entries', 4096, rl_cfg)))
+    central_use_compile = bool(_central_inference_option(config, 'use_compile', False, rl_cfg))
+    sync_timing = bool(_central_inference_option(config, 'sync_timing', debug_enabled, rl_cfg))
+    transport_dtype = str(_central_inference_option(config, 'transport_dtype', 'float16', rl_cfg) or 'float16').lower()
     transport_np_dtype = np.float32 if transport_dtype in {'float32', 'fp32'} else np.float16
 
     try:
@@ -5820,7 +5857,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
             compile_rank = 900000 + int(os.getpid())
         if device.type == 'cuda':
             torch.backends.cudnn.benchmark = bool(
-                rl_cfg.get('self_play_central_inference_cudnn_benchmark', False)
+                _central_inference_option(config, 'cudnn_benchmark', False, rl_cfg)
             )
         models = {}
         caches = {}
@@ -5847,7 +5884,12 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
         def _warmup_central_model(model, label):
             if not central_use_compile or device.type != 'cuda':
                 return None
-            raw_batches = rl_cfg.get('self_play_central_inference_compile_warmup_batches', [1, 32, 128, max_batch])
+            raw_batches = _central_inference_option(
+                config,
+                'compile_warmup_batches',
+                [1, 32, 128, max_batch],
+                rl_cfg,
+            )
             try:
                 warmup_batches = [
                     max(1, int(batch_size))
@@ -6063,7 +6105,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                     else:
                         uncached_legal_indices = legal_indices
                     legal_index_tensor = torch.from_numpy(uncached_legal_indices).to(device, non_blocking=True)
-                if device.type == 'cuda':
+                if sync_timing and device.type == 'cuda':
                     torch.cuda.synchronize(device)
                 h2d_time += time.perf_counter() - h2d_t0
                 with torch.inference_mode():
@@ -6073,7 +6115,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                             policy_logits, value_logits = model(tensor, apply_log_softmax=False)
                     else:
                         policy_logits, value_logits = model(tensor, apply_log_softmax=False)
-                    if device.type == 'cuda':
+                    if sync_timing and device.type == 'cuda':
                         torch.cuda.synchronize(device)
                     forward_time += time.perf_counter() - forward_t0
                     d2h_t0 = time.perf_counter()
@@ -6081,7 +6123,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                         policy_logits = torch.gather(policy_logits, 1, legal_index_tensor)
                     policy_np_batch = policy_logits.to(dtype=torch.float16).cpu().numpy().copy()
                     value_np_batch = value_logits.float().cpu().numpy().copy()
-                    if device.type == 'cuda':
+                    if sync_timing and device.type == 'cuda':
                         torch.cuda.synchronize(device)
                     d2h_time += time.perf_counter() - d2h_t0
                 if use_cache_for_group:
@@ -6576,11 +6618,11 @@ def persistent_selfplay_worker(
         central_stall_warning_s = float(
             central_debug_cfg.get(
                 'stall_warning_s',
-                rl_cfg.get('self_play_central_inference_stall_warning_s', 60.0),
+                _central_inference_option(config, 'stall_warning_s', 60.0, rl_cfg),
             )
         )
         central_transport_dtype = str(
-            rl_cfg.get('self_play_central_inference_transport_dtype', 'float16') or 'float16'
+            _central_inference_option(config, 'transport_dtype', 'float16', rl_cfg) or 'float16'
         )
         model = None if central_inference_enabled else _build_selfplay_worker_model(config, device)
         inference_model = (
@@ -6589,7 +6631,7 @@ def persistent_selfplay_worker(
                 inference_request_queue,
                 inference_response_queue,
                 worker_rank=rank,
-                timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 0.0)),
+                timeout_s=float(_central_inference_option(config, 'timeout_s', 0.0, rl_cfg)),
                 stall_warning_s=central_stall_warning_s,
                 debug_enabled=central_debug_enabled,
                 transport_dtype=central_transport_dtype,
@@ -6659,7 +6701,7 @@ def persistent_selfplay_worker(
                             inference_request_queue,
                             inference_response_queue,
                             worker_rank=rank,
-                            timeout_s=float(rl_cfg.get('self_play_central_inference_timeout_s', 0.0)),
+                            timeout_s=float(_central_inference_option(config, 'timeout_s', 0.0, rl_cfg)),
                             stall_warning_s=central_stall_warning_s,
                             debug_enabled=central_debug_enabled,
                             transport_dtype=central_transport_dtype,

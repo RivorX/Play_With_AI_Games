@@ -10,6 +10,7 @@ Provides consistent table formatting for model checkpoints across:
 
 from datetime import datetime
 from pathlib import Path
+import re
 import torch
 
 
@@ -74,7 +75,7 @@ def _format_mcts_elo_summary(entry, max_items=3):
     if by_sims:
         items = sorted(by_sims.items(), key=lambda kv: int(kv[0]), reverse=True)
         parts = [
-            f"{int(round(float(info.get('elo'))))}@{int(sims)}"
+            f"{int(round(float(info.get('elo'))))} | {int(sims)}"
             for sims, info in items[:max_items]
             if info.get("elo") is not None
         ]
@@ -87,8 +88,132 @@ def _format_mcts_elo_summary(entry, max_items=3):
         return "n/a"
     sims = entry.get("elo_mcts_simulations")
     if sims is not None:
-        return f"{int(round(float(elo_mcts)))}@{int(sims)}"
+        return f"{int(round(float(elo_mcts)))} | {int(sims)}"
     return f"{int(round(float(elo_mcts)))}"
+
+
+def _format_elo_number(value):
+    try:
+        return str(int(round(float(value))))
+    except (TypeError, ValueError):
+        return None
+
+
+def _best_mcts_elo_with_sims(entry):
+    elo_mcts = entry.get("elo_mcts")
+    sims = entry.get("elo_mcts_simulations")
+    if elo_mcts is not None:
+        return elo_mcts, sims
+
+    by_sims = entry.get("elo_mcts_by_simulations") or {}
+    if not by_sims:
+        return None, None
+
+    for sim_count, info in sorted(by_sims.items(), key=lambda item: int(item[0]), reverse=True):
+        if isinstance(info, dict) and info.get("elo") is not None:
+            return info.get("elo"), int(sim_count)
+    return None, None
+
+
+def _set_legacy_nn_elo(checkpoint, elo_value, *, std_error=None, ci_low=None, ci_high=None, epoch=None, source=None, timestamp=None, settings=None):
+    """Keep legacy estimated_elo as raw NN only; MCTS lives in estimated_elo_mcts."""
+    checkpoint["estimated_elo"] = float(elo_value)
+    checkpoint["last_estimated_elo"] = float(elo_value)
+    if epoch is not None:
+        checkpoint["estimated_elo_epoch"] = int(epoch)
+    if std_error is not None:
+        checkpoint["estimated_elo_se"] = float(std_error)
+    else:
+        checkpoint.pop("estimated_elo_se", None)
+    if ci_low is not None:
+        checkpoint["estimated_elo_ci95_low"] = float(ci_low)
+    else:
+        checkpoint.pop("estimated_elo_ci95_low", None)
+    if ci_high is not None:
+        checkpoint["estimated_elo_ci95_high"] = float(ci_high)
+    else:
+        checkpoint.pop("estimated_elo_ci95_high", None)
+    if source is not None:
+        checkpoint["estimated_elo_source"] = str(source)
+    if timestamp is not None:
+        checkpoint["estimated_elo_timestamp"] = timestamp
+    if settings is not None:
+        checkpoint["estimated_elo_settings"] = settings
+
+
+def _sync_legacy_elo_from_nn(checkpoint):
+    nn_elo = _safe_float(checkpoint.get("estimated_elo_nn", checkpoint.get("last_estimated_elo_nn")))
+    if nn_elo is None:
+        for key in (
+            "estimated_elo", "last_estimated_elo", "estimated_elo_se",
+            "estimated_elo_ci95_low", "estimated_elo_ci95_high",
+            "estimated_elo_epoch", "estimated_elo_source",
+            "estimated_elo_timestamp", "estimated_elo_settings",
+        ):
+            checkpoint.pop(key, None)
+        return
+
+    _set_legacy_nn_elo(
+        checkpoint,
+        nn_elo,
+        std_error=_safe_float(checkpoint.get("estimated_elo_nn_se")),
+        ci_low=_safe_float(checkpoint.get("estimated_elo_nn_ci95_low")),
+        ci_high=_safe_float(checkpoint.get("estimated_elo_nn_ci95_high")),
+        epoch=_safe_int(checkpoint.get("estimated_elo_nn_epoch")),
+        source=checkpoint.get("estimated_elo_nn_source"),
+        timestamp=checkpoint.get("estimated_elo_nn_timestamp"),
+        settings=checkpoint.get("estimated_elo_nn_settings"),
+    )
+
+
+def format_elo_summary(entry, *, legacy_label=True):
+    """Format checkpoint Elo as separate NN and MCTS values when available."""
+    if not entry or entry.get("error"):
+        return "n/a"
+
+    parts = []
+    nn_text = _format_elo_number(entry.get("elo_nn"))
+    if nn_text is not None:
+        parts.append(f"NN {nn_text}")
+
+    mcts_elo, sims = _best_mcts_elo_with_sims(entry)
+    mcts_text = _format_elo_number(mcts_elo)
+    if mcts_text is not None:
+        if sims is not None:
+            parts.append(f"MCTS {mcts_text} | {int(sims)}")
+        else:
+            parts.append(f"MCTS {mcts_text}")
+
+    if parts:
+        return " | ".join(parts)
+
+    legacy_text = _format_elo_number(entry.get("elo"))
+    if legacy_text is not None:
+        return f"Elo {legacy_text}" if legacy_label else legacy_text
+    return "n/a"
+
+
+def format_elo_stat_parts(entry):
+    """Return compact (label, value) pairs for UI stat cards."""
+    if not entry or entry.get("error"):
+        return [("Elo", "n/a")]
+
+    parts = []
+    nn_text = _format_elo_number(entry.get("elo_nn"))
+    if nn_text is not None:
+        parts.append(("NN", nn_text))
+
+    mcts_elo, sims = _best_mcts_elo_with_sims(entry)
+    mcts_text = _format_elo_number(mcts_elo)
+    if mcts_text is not None:
+        value = f"{mcts_text} | {int(sims)}" if sims is not None else mcts_text
+        parts.append(("MCTS", value))
+
+    if parts:
+        return parts
+
+    legacy_text = _format_elo_number(entry.get("elo"))
+    return [("Elo", legacy_text or "n/a")]
 
 
 def persist_checkpoint_elo_metadata(
@@ -138,40 +263,61 @@ def persist_checkpoint_elo_metadata(
             settings["elo_std_error"] = float(elo_result.get("elo_std_error"))
         if elo_result.get("elo_ci95") is not None:
             settings["elo_ci95"] = list(elo_result.get("elo_ci95") or [])
+    elo_std_error = _safe_float(settings.get("elo_std_error"))
+    elo_ci95 = settings.get("elo_ci95")
+    ci_low = _safe_float(elo_ci95[0]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
+    ci_high = _safe_float(elo_ci95[1]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
 
     checkpoint[mode_prefix] = float(elo_value)
     checkpoint[f"last_{mode_prefix}"] = float(elo_value)
     checkpoint[f"{mode_prefix}_timestamp"] = now
     checkpoint[f"{mode_prefix}_settings"] = settings
     checkpoint[f"{mode_prefix}_source"] = str(source)
+    if elo_std_error is not None:
+        checkpoint[f"{mode_prefix}_se"] = float(elo_std_error)
+    if ci_low is not None:
+        checkpoint[f"{mode_prefix}_ci95_low"] = float(ci_low)
+    if ci_high is not None:
+        checkpoint[f"{mode_prefix}_ci95_high"] = float(ci_high)
     if mode == "mcts":
         checkpoint["estimated_elo_mcts_simulations"] = int(simulations)
         by_sims = _normalize_mcts_elo_by_sims(checkpoint.get("estimated_elo_mcts_by_simulations"))
-        by_sims[int(simulations)] = {
+        sim_entry = {
             "elo": float(elo_value),
             "simulations": int(simulations),
             "timestamp": now,
             "source": str(source),
             "settings": settings,
         }
+        if elo_std_error is not None:
+            sim_entry["se"] = float(elo_std_error)
+        if ci_low is not None and ci_high is not None:
+            sim_entry["ci95"] = [float(ci_low), float(ci_high)]
+        by_sims[int(simulations)] = sim_entry
         checkpoint["estimated_elo_mcts_by_simulations"] = {
             str(int(k)): v for k, v in sorted(by_sims.items(), key=lambda kv: int(kv[0]))
         }
 
-    checkpoint["estimated_elo"] = float(elo_value)
-    checkpoint["last_estimated_elo"] = float(elo_value)
-
     epoch_raw = checkpoint.get("epoch")
     epoch_idx = _safe_int(epoch_raw)
     if epoch_idx is not None:
-        checkpoint["estimated_elo_epoch"] = epoch_idx + 1
         checkpoint[f"{mode_prefix}_epoch"] = epoch_idx + 1
-    elif checkpoint.get("estimated_elo_epoch") is None:
-        checkpoint["estimated_elo_epoch"] = None
+    mode_epoch = _safe_int(checkpoint.get(f"{mode_prefix}_epoch"))
 
-    checkpoint["estimated_elo_source"] = str(source)
-    checkpoint["estimated_elo_timestamp"] = now
-    checkpoint["estimated_elo_settings"] = settings
+    if mode == "nn":
+        _set_legacy_nn_elo(
+            checkpoint,
+            elo_value,
+            std_error=elo_std_error,
+            ci_low=ci_low,
+            ci_high=ci_high,
+            epoch=mode_epoch,
+            source=source,
+            timestamp=now,
+            settings=settings,
+        )
+    else:
+        _sync_legacy_elo_from_nn(checkpoint)
 
     try:
         torch.save(checkpoint, checkpoint_path)
@@ -278,6 +424,8 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
                     entry["elo_mcts_simulations"] = _safe_int(settings.get("simulations"))
         elif mode == "nn" and entry["elo_nn"] is None:
             entry["elo_nn"] = legacy_elo
+        elif mode is None and entry["elo_nn"] is None and entry["elo_mcts"] is None:
+            entry["elo_nn"] = legacy_elo
     if entry["elo_mcts"] is not None and entry["elo_mcts_simulations"] is not None:
         entry["elo_mcts_by_simulations"].setdefault(
             int(entry["elo_mcts_simulations"]),
@@ -335,7 +483,7 @@ def format_model_table_row(
     epoch_str = f"{epoch + 1}" if epoch is not None else "n/a"
     
     # Version
-    version_str = str(entry.get("version") or "n/a")[:8]
+    version_str = str(entry.get("version") or "n/a")[:16]
     
     # Top1
     top1 = entry.get("top1")
@@ -378,7 +526,7 @@ def format_model_table_row(
         parts.append(f"{entry.get('folder', 'n/a'):<7}")
     
     if show_version:
-        parts.append(f"{version_str:<8}")
+        parts.append(f"{version_str:<16}")
     
     parts.extend([
         f"{epoch_str:>6}",
@@ -442,10 +590,10 @@ def format_model_table_header(
         sep_parts.append("-------")
     
     if show_version:
-        parts.append(" Version")
-        sep_parts.append("--------")
+        parts.append(" Version         ")
+        sep_parts.append("----------------")
     
-    parts.extend([" Epoch", "  Top1   ", " ValLoss  ", " PolLoss  ", " EloNN ", "   EloMCTS@Sims   "])
+    parts.extend([" Epoch", "  Top1   ", " ValLoss  ", " PolLoss  ", " EloNN ", "  EloMCTS | Sims  "])
     sep_parts.extend(["------", "--------", "----------", "----------", "--------", "------------------"])
     
     if show_swa:
@@ -596,6 +744,77 @@ def sort_entries_by_folder_and_elo(entries):
             1 if e.get("error") else 0,
             folder_rank(e.get("folder", "")),
             str(e.get("folder", "")).lower(),
+            1 if _checkpoint_display_elo(e) is None else 0,
+            -float(_checkpoint_display_elo(e) or 0.0),
+            -float(e.get("mtime_ts") or 0.0),
+            str(e.get("path_rel", "")).lower(),
+        ),
+    )
+
+
+def _version_sort_key(version):
+    """Return a stable natural-sort key for model version labels."""
+    text = str(version or "").strip().lower()
+    if not text:
+        return ((), "")
+
+    if text.startswith("v"):
+        text = text[1:]
+
+    parts = re.findall(r"\d+|[a-zA-Z]+", text)
+    numbers = []
+    suffix_parts = []
+    for part in parts:
+        if part.isdigit() and not suffix_parts:
+            numbers.append(int(part))
+        else:
+            suffix_parts.append(part)
+
+    return (tuple(numbers), ".".join(suffix_parts))
+
+
+def sort_entries_by_folder_and_version(entries):
+    """Sort entries by folder, then semantic-ish version descending."""
+    def folder_rank(folder):
+        key = str(folder).strip().lower()
+        if key == "root":
+            return 0
+        if key == "il":
+            return 1
+        if key == "rl":
+            return 2
+        return 3
+
+    def neg_version_tuple(version_tuple):
+        padded = list(version_tuple[:6])
+        padded.extend([0] * (6 - len(padded)))
+        return tuple(-int(part) for part in padded)
+
+    def checkpoint_kind_rank(entry):
+        name = str(entry.get("model_name", "")).lower()
+        if "best" in name and "swa" not in name:
+            return 0
+        if "latest" in name and "swa" not in name:
+            return 1
+        if "swa" in name:
+            return 2
+        return 3
+
+    def suffix_rank(version):
+        suffix = _version_sort_key(version)[1]
+        return 0 if suffix else 1
+
+    return sorted(
+        entries,
+        key=lambda e: (
+            1 if e.get("error") else 0,
+            folder_rank(e.get("folder", "")),
+            str(e.get("folder", "")).lower(),
+            neg_version_tuple(_version_sort_key(e.get("version"))[0]),
+            suffix_rank(e.get("version")),
+            str(_version_sort_key(e.get("version"))[1]),
+            checkpoint_kind_rank(e),
+            -(int(e.get("epoch")) if e.get("epoch") is not None else -1),
             1 if _checkpoint_display_elo(e) is None else 0,
             -float(_checkpoint_display_elo(e) or 0.0),
             -float(e.get("mtime_ts") or 0.0),

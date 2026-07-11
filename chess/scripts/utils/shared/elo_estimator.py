@@ -796,10 +796,23 @@ class EloEstimator:
         task_count = max(1, int(task_count))
         raw_groups = self.elo_config.get("eval_elo_central_client_groups", "auto")
         if isinstance(raw_groups, str) and raw_groups.strip().lower() == "auto":
-            target_groups = max(1, int(self.elo_config.get("eval_elo_central_target_client_groups", 6) or 6))
-            min_groups = max(1, int(self.elo_config.get("eval_elo_central_min_client_groups", 4) or 4))
-            max_groups = max(min_groups, int(self.elo_config.get("eval_elo_central_max_client_groups", 8) or 8))
-            group_count = max(min_groups, min(max_groups, target_groups, workers, task_count))
+            try:
+                target_active = max(
+                    1,
+                    int(self.elo_config.get("eval_elo_central_target_active_games_per_client", 4) or 4),
+                )
+            except (TypeError, ValueError):
+                target_active = 4
+            try:
+                min_groups = max(1, int(self.elo_config.get("eval_elo_central_min_client_groups", 2) or 2))
+            except (TypeError, ValueError):
+                min_groups = 2
+            try:
+                max_groups = max(min_groups, int(self.elo_config.get("eval_elo_central_max_client_groups", 4) or 4))
+            except (TypeError, ValueError):
+                max_groups = max(min_groups, 4)
+            desired_groups = int(math.ceil(float(workers) / float(target_active)))
+            group_count = max(min_groups, min(max_groups, desired_groups, workers, task_count))
         else:
             try:
                 group_count = max(1, int(raw_groups))
@@ -819,9 +832,9 @@ class EloEstimator:
 
     def _resolve_central_max_chunk_games(self) -> int:
         try:
-            return max(0, int(self.elo_config.get("eval_elo_central_max_chunk_games", 0) or 0))
+            return max(0, int(self.elo_config.get("eval_elo_central_max_chunk_games", 12) or 12))
         except (TypeError, ValueError):
-            return 0
+            return 12
 
     @staticmethod
     def _resolve_central_chunk_size(
@@ -861,6 +874,17 @@ class EloEstimator:
             "model_move_positions": 0,
             "model_move_time_s": 0.0,
             "stockfish_move_time_s": 0.0,
+            "mcts_nn_inference_calls": 0,
+            "mcts_nn_inference_batch_items": 0,
+            "central_inference_requests": 0,
+            "central_inference_server_batch_items": 0,
+            "central_inference_remote_wait_time": 0.0,
+            "central_inference_request_put_time": 0.0,
+            "central_inference_server_queue_wait_time": 0.0,
+            "central_inference_server_total_time": 0.0,
+            "central_inference_server_forward_time": 0.0,
+            "central_inference_server_h2d_time": 0.0,
+            "central_inference_server_d2h_time": 0.0,
             "worker_game_counts": [],
         }
         for stats in stats_items:
@@ -868,8 +892,37 @@ class EloEstimator:
             merged["model_move_positions"] += int(stats.get("model_move_positions", 0) or 0)
             merged["model_move_time_s"] += float(stats.get("model_move_time_s", 0.0) or 0.0)
             merged["stockfish_move_time_s"] += float(stats.get("stockfish_move_time_s", 0.0) or 0.0)
+            merged["mcts_nn_inference_calls"] += int(stats.get("mcts_nn_inference_calls", 0) or 0)
+            merged["mcts_nn_inference_batch_items"] += int(stats.get("mcts_nn_inference_batch_items", 0) or 0)
+            merged["central_inference_requests"] += int(stats.get("central_inference_requests", 0) or 0)
+            merged["central_inference_server_batch_items"] += int(stats.get("central_inference_server_batch_items", 0) or 0)
+            merged["central_inference_remote_wait_time"] += float(stats.get("central_inference_remote_wait_time", 0.0) or 0.0)
+            merged["central_inference_request_put_time"] += float(stats.get("central_inference_request_put_time", 0.0) or 0.0)
+            merged["central_inference_server_queue_wait_time"] += float(stats.get("central_inference_server_queue_wait_time", 0.0) or 0.0)
+            merged["central_inference_server_total_time"] += float(stats.get("central_inference_server_total_time", 0.0) or 0.0)
+            merged["central_inference_server_forward_time"] += float(stats.get("central_inference_server_forward_time", 0.0) or 0.0)
+            merged["central_inference_server_h2d_time"] += float(stats.get("central_inference_server_h2d_time", 0.0) or 0.0)
+            merged["central_inference_server_d2h_time"] += float(stats.get("central_inference_server_d2h_time", 0.0) or 0.0)
             merged["worker_game_counts"].extend(list(stats.get("worker_game_counts", []) or []))
         return merged
+
+    @staticmethod
+    def _format_central_batch_stats(stats: dict) -> str:
+        requests = int(stats.get("central_inference_requests", 0) or 0)
+        items = int(stats.get("central_inference_server_batch_items", 0) or 0)
+        if requests <= 0:
+            return ""
+        avg_batch = float(items) / float(requests)
+
+        def _ms_per_request(key: str) -> float:
+            return 1000.0 * float(stats.get(key, 0.0) or 0.0) / float(requests)
+
+        return (
+            f", central_batch={avg_batch:.1f}, "
+            f"remote_wait={_ms_per_request('central_inference_remote_wait_time'):.1f}ms/req, "
+            f"server={_ms_per_request('central_inference_server_total_time'):.1f}ms/req, "
+            f"fwd={_ms_per_request('central_inference_server_forward_time'):.1f}ms/req"
+        )
 
     def _estimate_central_batched_groups(
         self,
@@ -884,7 +937,7 @@ class EloEstimator:
         group_count, group_workers = self._resolve_central_client_groups(workers, len(tasks))
         games_per_worker_chunk = max(
             1,
-            int(self.elo_config.get("eval_elo_central_games_per_worker_chunk", 20) or 20),
+            int(self.elo_config.get("eval_elo_central_games_per_worker_chunk", 4) or 4),
         )
         target_chunks_per_group = self._resolve_central_chunk_target()
         max_chunk_games = self._resolve_central_max_chunk_games()
@@ -893,10 +946,12 @@ class EloEstimator:
 
         if not self._printed_central_mcts_clients:
             self._printed_central_mcts_clients = True
+            target_active = self.elo_config.get("eval_elo_central_target_active_games_per_client", "manual")
             print(
                 "  Info: Elo central MCTS clients: "
                 f"groups={group_count}, stockfish_workers={workers}, "
                 f"active_games/client={group_workers}, "
+                f"target_active/client={target_active}, "
                 f"games/worker_chunk={games_per_worker_chunk}, "
                 f"target_chunks/group={target_chunks_per_group}, "
                 f"max_chunk={'auto' if max_chunk_games <= 0 else max_chunk_games}"
@@ -928,31 +983,26 @@ class EloEstimator:
             remote_model = self._build_central_remote_model_for_thread()
             if remote_model is None:
                 raise RuntimeError("Central inference session is not available for Elo MCTS group.")
-            group_elos: list[float] = []
-            group_scores: list[float] = []
-            group_stats_items: list[dict] = []
-            while not self._is_cancelled():
-                chunk = _next_chunk(group_workers[group_idx])
-                if not chunk:
-                    break
-                chunk_stats = {}
-                elos, scores = self._estimate_batched_games(
-                    tasks=chunk,
-                    workers=min(group_workers[group_idx], len(chunk)),
-                    use_mcts=True,
-                    simulations=simulations,
-                    stockfish_time_limit=stockfish_time_limit,
-                    max_moves=max_moves,
-                    stockfish_path=stockfish_path,
-                    progress_bar=progress_bar,
-                    model_override=remote_model,
-                    device_override=torch.device("cpu"),
-                    stats_out=chunk_stats,
-                )
-                group_elos.extend(elos)
-                group_scores.extend(scores)
-                group_stats_items.append(chunk_stats)
-            return group_elos, group_scores, self._merge_batched_stats(group_stats_items)
+            group_stats = {}
+
+            def _next_group_tasks(group_worker_count: int):
+                return _next_chunk(group_worker_count)
+
+            elos, scores = self._estimate_batched_games(
+                tasks=[],
+                workers=group_workers[group_idx],
+                use_mcts=True,
+                simulations=simulations,
+                stockfish_time_limit=stockfish_time_limit,
+                max_moves=max_moves,
+                stockfish_path=stockfish_path,
+                progress_bar=progress_bar,
+                model_override=remote_model,
+                device_override=torch.device("cpu"),
+                stats_out=group_stats,
+                next_tasks_fn=_next_group_tasks,
+            )
+            return elos, scores, self._merge_batched_stats([group_stats])
 
         executor = ThreadPoolExecutor(max_workers=group_count)
         futures = []
@@ -987,11 +1037,13 @@ class EloEstimator:
         positions = int(merged_stats.get("model_move_positions", 0) or 0)
         if calls > 0:
             avg_batch = float(positions) / float(calls)
+            central_part = self._format_central_batch_stats(merged_stats)
             print(
                 "  Info: Elo model batching: "
                 f"avg_batch={avg_batch:.1f}, calls={calls}, "
                 f"model_time={float(merged_stats.get('model_move_time_s', 0.0)):.1f}s, "
                 f"stockfish_wait={float(merged_stats.get('stockfish_move_time_s', 0.0)):.1f}s"
+                f"{central_part}"
             )
         worker_counts = list(merged_stats.get("worker_game_counts", []) or [])
         self._last_elo_batch_stats = dict(merged_stats)
@@ -1002,6 +1054,16 @@ class EloEstimator:
     def _register_worker_engine(self, engine: chess.engine.SimpleEngine):
         with self._worker_engines_lock:
             self._worker_engines.append(engine)
+
+    def _unregister_worker_engines(self, engines):
+        engine_ids = {id(engine) for engine in engines if engine is not None}
+        if not engine_ids:
+            return
+        with self._worker_engines_lock:
+            self._worker_engines = [
+                engine for engine in self._worker_engines
+                if id(engine) not in engine_ids
+            ]
 
     def _force_close_engine(self, engine: chess.engine.SimpleEngine | None):
         if engine is None:
@@ -1367,11 +1429,13 @@ class EloEstimator:
         positions = int(stats.get("model_move_positions", 0) or 0)
         if use_mcts and calls > 0:
             avg_batch = float(positions) / float(calls)
+            central_part = self._format_central_batch_stats(stats)
             print(
                 "  Elo model batching: "
                 f"avg_batch={avg_batch:.1f}, calls={calls}, "
                 f"model_time={float(stats.get('model_move_time_s', 0.0) or 0.0):.1f}s, "
                 f"stockfish_wait={float(stats.get('stockfish_move_time_s', 0.0) or 0.0):.1f}s"
+                f"{central_part}"
             )
         worker_counts = list(stats.get("worker_game_counts", []) or [])
         if worker_counts and bool(self.elo_config.get("elo_print_worker_summary", False)):
@@ -1384,7 +1448,7 @@ class EloEstimator:
     def estimate(
         self,
         levels: list[int] | None = None,
-        games_per_level: int = 4,
+        games_per_level: int | None = None,
         stockfish_time_limit: float = 0.05,
         max_moves: int = 150,
         use_mcts: bool = False,
@@ -1470,13 +1534,29 @@ class EloEstimator:
         all_scores: list[float] = []
         results_per_level: dict[int, dict] = {}
 
-        requested_total_games = int(len(levels) * max(1, int(games_per_level)))
+        try:
+            probe_games_cfg = int(self.elo_config.get("adaptive_probe_games_per_level", 8) or 8)
+        except (TypeError, ValueError):
+            probe_games_cfg = 8
+        probe_games_cfg = max(2, probe_games_cfg)
+        try:
+            focus_games_cfg = int(self.elo_config.get("adaptive_focus_games_per_level", probe_games_cfg) or probe_games_cfg)
+        except (TypeError, ValueError):
+            focus_games_cfg = probe_games_cfg
+        focus_games_cfg = max(probe_games_cfg, focus_games_cfg)
+        try:
+            extra_round_cfg = int(self.elo_config.get("adaptive_extra_games_per_level", 8) or 8)
+        except (TypeError, ValueError):
+            extra_round_cfg = 8
+        extra_round_cfg = max(2, extra_round_cfg)
+
+        requested_total_games = int(len(levels) * max(probe_games_cfg, focus_games_cfg))
         max_total_games = requested_total_games
         try:
             max_total_games = int(self.elo_config.get("adaptive_max_total_games", requested_total_games) or requested_total_games)
         except (TypeError, ValueError):
             max_total_games = requested_total_games
-        max_total_games = max(1, min(requested_total_games, max_total_games))
+        max_total_games = max(1, max_total_games)
 
         workers = self._resolve_workers(workers, total_games=max_total_games)
         batch_model_moves = bool(self.elo_config.get("batch_model_moves", True))
@@ -1502,18 +1582,11 @@ class EloEstimator:
             f"time_limit={float(stockfish_time_limit):.3f}s, "
             f"games=adaptive <= {max_total_games}"
         )
-        adaptive_focus_cap = min(
-            max(1, int(games_per_level)),
-            max(
-                1,
-                int(self.elo_config.get("adaptive_focus_games_per_level", games_per_level) or games_per_level),
-            ),
-        )
         print(
             "  Info: Adaptive Elo ladder enabled: "
             f"levels={levels}, max_games={max_total_games}, "
-            f"probe={int(self.elo_config.get('adaptive_probe_games_per_level', 8) or 8)}, "
-            f"focus<= {adaptive_focus_cap}/level"
+            f"probe={probe_games_cfg}, "
+            f"focus<= {focus_games_cfg}/level"
         )
         if batch_model_moves and workers > 1:
             model_path = "batched_mcts" if use_mcts else "batched_raw"
@@ -1593,11 +1666,9 @@ class EloEstimator:
         try:
             if central_inference_enabled:
                 self._start_central_inference_for_elo(workers)
-            probe_games = max(2, int(self.elo_config.get("adaptive_probe_games_per_level", 8) or 8))
-            probe_games = min(max(1, int(games_per_level)), probe_games)
-            focus_games = max(probe_games, int(self.elo_config.get("adaptive_focus_games_per_level", games_per_level) or games_per_level))
-            focus_games = min(max(1, int(games_per_level)), focus_games)
-            extra_round = max(2, int(self.elo_config.get("adaptive_extra_games_per_level", 8) or 8))
+            probe_games = probe_games_cfg
+            focus_games = focus_games_cfg
+            extra_round = extra_round_cfg
             high_skip = float(self.elo_config.get("adaptive_skip_high_score", 0.92) or 0.92)
             low_stop = float(self.elo_config.get("adaptive_stop_low_score", 0.08) or 0.08)
             focus_min = float(self.elo_config.get("adaptive_focus_min_score", 0.20) or 0.20)
@@ -1628,6 +1699,9 @@ class EloEstimator:
             def _score_for_level(level: int) -> float:
                 return float(self._summarize_scores(scores_by_level.get(int(level), []))["score"])
 
+            def _games_for_level(level: int) -> int:
+                return int(played_by_level.get(int(level), 0) or 0)
+
             def _played_candidate_levels() -> list[int]:
                 return [
                     int(level)
@@ -1649,6 +1723,68 @@ class EloEstimator:
                 estimated = _performance_rating(all_opponent_elos, all_scores)
                 se = _elo_standard_error(all_opponent_elos, estimated)
                 return bool(se is not None and float(se) <= target_se)
+
+            def _current_standard_error() -> float | None:
+                if not all_scores:
+                    return None
+                estimated = _performance_rating(all_opponent_elos, all_scores)
+                if estimated is None:
+                    return None
+                return _elo_standard_error(all_opponent_elos, estimated)
+
+            def _current_estimated_elo() -> float | None:
+                if not all_scores:
+                    return None
+                estimated = _performance_rating(all_opponent_elos, all_scores)
+                if estimated is None:
+                    return None
+                return float(estimated)
+
+            def _expected_score_for_level(level: int) -> float:
+                center = _current_estimated_elo()
+                if center is None:
+                    return 0.5
+                return 1.0 / (1.0 + math.pow(10.0, (float(level) - center) / 400.0))
+
+            def _stable_score_for_level(level: int) -> float:
+                observed = _score_for_level(level)
+                games = _games_for_level(level)
+                if games <= 0:
+                    return _expected_score_for_level(level)
+                prior_games = float(self.elo_config.get("adaptive_focus_score_prior_games", 4.0) or 4.0)
+                prior_games = max(0.0, min(16.0, prior_games))
+                expected = _expected_score_for_level(level)
+                return float((observed * games + expected * prior_games) / max(1.0, games + prior_games))
+
+            def _focus_sort_key(level: int):
+                score = _stable_score_for_level(level)
+                center = _current_estimated_elo()
+                center_penalty = 0.0
+                if center is not None:
+                    # A random 5-game probe can make a far-away level look close
+                    # to 50%. Bias focus toward the current global estimate so
+                    # adaptive games land around the actual rating band.
+                    center_penalty = abs(float(level) - center) / 400.0
+                return (
+                    center_penalty + abs(score - 0.5),
+                    played_by_level.get(int(level), 0),
+                    abs(score - 0.5),
+                )
+
+            def _precision_candidate_levels() -> list[int]:
+                candidates = [
+                    int(level)
+                    for level in _played_candidate_levels()
+                    if low_stop < _stable_score_for_level(level) < high_skip
+                ]
+                if not candidates:
+                    candidates = list(focus_levels)
+                if not candidates:
+                    candidates = _played_candidate_levels()
+                return sorted(
+                    candidates,
+                    key=_focus_sort_key,
+                )[:target_focus]
 
             if bool(self.elo_config.get("elo_verbose_adaptive", False)):
                 print(
@@ -1704,29 +1840,26 @@ class EloEstimator:
             focus_levels = [
                 level
                 for level in candidate_levels
-                if focus_min <= _score_for_level(level) <= focus_max
+                if focus_min <= _stable_score_for_level(level) <= focus_max
             ]
             focus_levels = sorted(
                 focus_levels,
-                key=lambda lvl: abs(_score_for_level(lvl) - 0.5),
+                key=_focus_sort_key,
             )
             if len(focus_levels) < target_focus:
                 extras = sorted(
                     (
                         level
                         for level in candidate_levels
-                        if level not in focus_levels and low_stop < _score_for_level(level) < high_skip
+                        if level not in focus_levels and low_stop < _stable_score_for_level(level) < high_skip
                     ),
-                    key=lambda lvl: (
-                        abs(_score_for_level(lvl) - 0.5),
-                        -lvl if _score_for_level(lvl) >= 0.5 else lvl,
-                    ),
+                    key=_focus_sort_key,
                 )
                 focus_levels.extend(extras[: max(0, target_focus - len(focus_levels))])
             if not focus_levels and candidate_levels:
                 focus_levels = sorted(
                     candidate_levels,
-                    key=lambda lvl: abs(_score_for_level(lvl) - 0.5),
+                    key=_focus_sort_key,
                 )[:1]
             focus_levels = focus_levels[:target_focus]
 
@@ -1764,6 +1897,59 @@ class EloEstimator:
                     # unless some level still has meaningful capacity and budget.
                     if not any(played_by_level.get(level, 0) < focus_games for level in focus_levels):
                         break
+
+            refine_until_target = bool(
+                self.elo_config.get("adaptive_refine_until_target_se", True)
+            )
+            refinement_started = False
+            while (
+                refine_until_target
+                and target_se > 0.0
+                and len(all_scores) >= min_games_for_se_stop
+                and total_scheduled < max_total_games
+                and not self._is_cancelled()
+                and not _estimate_precise_enough()
+            ):
+                refine_levels = _precision_candidate_levels()
+                if not refine_levels:
+                    break
+                current_se = _current_standard_error()
+                if current_se is not None and not refinement_started:
+                    print(
+                        "  Adaptive Elo: uncertainty still high "
+                        f"(SE={float(current_se):.1f} > target {target_se:.1f}); "
+                        f"adding games on levels {refine_levels}."
+                    )
+                    refinement_started = True
+                tasks = []
+                for level in refine_levels:
+                    if total_scheduled + len(tasks) >= max_total_games:
+                        break
+                    games_to_add = min(
+                        extra_round,
+                        max_total_games - total_scheduled - len(tasks),
+                    )
+                    if games_to_add <= 0:
+                        continue
+                    tasks.extend(self._build_level_tasks(level, played_by_level.get(level, 0), games_to_add))
+                if not tasks:
+                    break
+                total_scheduled += len(tasks)
+                if _run_selected_tasks(tasks, phase="precision"):
+                    break
+            if (
+                refine_until_target
+                and target_se > 0.0
+                and len(all_scores) >= min_games_for_se_stop
+                and total_scheduled >= max_total_games
+            ):
+                current_se = _current_standard_error()
+                if current_se is not None and float(current_se) > target_se:
+                    print(
+                        "  Adaptive Elo: reached game cap "
+                        f"({max_total_games}) with SE={float(current_se):.1f} "
+                        f"> target {target_se:.1f}."
+                    )
             for level in focus_levels:
                 if bool(self.elo_config.get("elo_verbose_adaptive", False)):
                     summary = self._summarize_scores(scores_by_level.get(level, []))
@@ -1828,7 +2014,7 @@ class EloEstimator:
             "total_time": elapsed,
             "adaptive": True,
             "levels_requested": [int(x) for x in levels],
-            "games_per_level_requested": int(games_per_level),
+            "games_per_level_requested": int(games_per_level or 0),
             "actual_games_per_level": {int(k): int(v) for k, v in played_by_level.items() if int(v) > 0},
         }
         if elo_se is not None:
@@ -1898,6 +2084,7 @@ class EloEstimator:
         model_override=None,
         device_override=None,
         stats_out: dict | None = None,
+        next_tasks_fn=None,
     ) -> tuple[list[float], list[float]]:
         all_opponent_elos: list[float] = []
         all_scores: list[float] = []
@@ -1914,15 +2101,31 @@ class EloEstimator:
         worker_slots = max(1, workers)
         worker_game_counts = [0 for _ in range(worker_slots)]
         idle_engines: list[tuple[int, chess.engine.SimpleEngine]] = []
+        opened_engines: list[chess.engine.SimpleEngine] = []
         for worker_slot in range(worker_slots):
-            idle_engines.append((worker_slot, self._open_stockfish_engine(stockfish_path)))
+            engine = self._open_stockfish_engine(stockfish_path)
+            opened_engines.append(engine)
+            idle_engines.append((worker_slot, engine))
 
         pending_tasks = deque(tasks)
+        dynamic_tasks_exhausted = False
         active_games: list[dict] = []
         model_move_calls = 0
         model_move_positions = 0
         model_move_time_s = 0.0
         stockfish_move_time_s = 0.0
+
+        def refill_pending_tasks(group_worker_count: int | None = None) -> bool:
+            nonlocal dynamic_tasks_exhausted
+            if dynamic_tasks_exhausted or next_tasks_fn is None or self._is_cancelled():
+                return False
+            requested_workers = worker_slots if group_worker_count is None else max(1, int(group_worker_count))
+            new_tasks = list(next_tasks_fn(requested_workers) or [])
+            if new_tasks:
+                pending_tasks.extend(new_tasks)
+                return True
+            dynamic_tasks_exhausted = True
+            return False
 
         def finalize_game(game: dict, score: float | None = None):
             if score is None:
@@ -1937,7 +2140,11 @@ class EloEstimator:
                 progress_bar.update(1)
 
         def launch_next_game(worker_slot: int, engine: chess.engine.SimpleEngine):
-            while pending_tasks and not self._is_cancelled():
+            while not self._is_cancelled():
+                if not pending_tasks and not refill_pending_tasks(worker_slots):
+                    break
+                if not pending_tasks:
+                    break
                 level, _, model_is_white = pending_tasks.popleft()
                 try:
                     self._configure_stockfish_engine(engine, level)
@@ -1954,6 +2161,7 @@ class EloEstimator:
                         progress_bar.update(1)
                     self._force_close_engine(engine)
                     engine = self._open_stockfish_engine(stockfish_path)
+                    opened_engines.append(engine)
                     continue
 
                 state = batched_player.create_state()
@@ -1972,6 +2180,8 @@ class EloEstimator:
                 return
             idle_engines.append((worker_slot, engine))
 
+        if not pending_tasks:
+            refill_pending_tasks(worker_slots)
         while idle_engines and pending_tasks and not self._is_cancelled():
             worker_slot, engine = idle_engines.pop()
             launch_next_game(worker_slot, engine)
@@ -1987,7 +2197,9 @@ class EloEstimator:
                         still_active.append(game)
                 active_games = still_active
 
-                while idle_engines and pending_tasks and not self._is_cancelled():
+                while idle_engines and not self._is_cancelled():
+                    if not pending_tasks and not refill_pending_tasks(worker_slots):
+                        break
                     worker_slot, engine = idle_engines.pop()
                     launch_next_game(worker_slot, engine)
                 if not active_games or self._is_cancelled():
@@ -2065,7 +2277,9 @@ class EloEstimator:
                 for game in finished_games:
                     finalize_game(game)
 
-                while idle_engines and pending_tasks and not self._is_cancelled():
+                while idle_engines and not self._is_cancelled():
+                    if not pending_tasks and not refill_pending_tasks(worker_slots):
+                        break
                     worker_slot, engine = idle_engines.pop()
                     launch_next_game(worker_slot, engine)
         finally:
@@ -2073,6 +2287,16 @@ class EloEstimator:
                 executor.shutdown(wait=False, cancel_futures=True)
             else:
                 executor.shutdown(wait=True, cancel_futures=False)
+            seen_engines = set()
+            for engine in opened_engines:
+                engine_id = id(engine)
+                if engine_id in seen_engines:
+                    continue
+                seen_engines.add(engine_id)
+                self._force_close_engine(engine)
+            self._unregister_worker_engines(opened_engines)
+            idle_engines.clear()
+            active_games.clear()
 
         if stats_out is not None:
             stats_out["model_move_calls"] = int(model_move_calls)
@@ -2080,6 +2304,30 @@ class EloEstimator:
             stats_out["model_move_time_s"] = float(model_move_time_s)
             stats_out["stockfish_move_time_s"] = float(stockfish_move_time_s)
             stats_out["worker_game_counts"] = list(worker_game_counts)
+            if use_mcts and batched_player.multi_mcts is not None:
+                mcts_profile = batched_player.multi_mcts.get_profile_stats()
+                stats_out["mcts_nn_inference_calls"] = int(
+                    mcts_profile.get("nn_inference_calls", 0) or 0
+                )
+                stats_out["mcts_nn_inference_batch_items"] = int(
+                    mcts_profile.get("nn_inference_batch_items", 0) or 0
+                )
+                stats_out["central_inference_requests"] = int(
+                    mcts_profile.get("central_inference_requests", 0) or 0
+                )
+                stats_out["central_inference_server_batch_items"] = int(
+                    mcts_profile.get("central_inference_server_batch_items", 0) or 0
+                )
+                for profile_key in (
+                    "central_inference_remote_wait_time",
+                    "central_inference_request_put_time",
+                    "central_inference_server_queue_wait_time",
+                    "central_inference_server_total_time",
+                    "central_inference_server_forward_time",
+                    "central_inference_server_h2d_time",
+                    "central_inference_server_d2h_time",
+                ):
+                    stats_out[profile_key] = float(mcts_profile.get(profile_key, 0.0) or 0.0)
         else:
             self._last_elo_batch_stats = {
                 "model_move_calls": int(model_move_calls),
@@ -2088,6 +2336,43 @@ class EloEstimator:
                 "stockfish_move_time_s": float(stockfish_move_time_s),
                 "worker_game_counts": list(worker_game_counts),
             }
+            if use_mcts and batched_player.multi_mcts is not None:
+                mcts_profile = batched_player.multi_mcts.get_profile_stats()
+                self._last_elo_batch_stats.update(
+                    {
+                        "mcts_nn_inference_calls": int(mcts_profile.get("nn_inference_calls", 0) or 0),
+                        "mcts_nn_inference_batch_items": int(
+                            mcts_profile.get("nn_inference_batch_items", 0) or 0
+                        ),
+                        "central_inference_requests": int(
+                            mcts_profile.get("central_inference_requests", 0) or 0
+                        ),
+                        "central_inference_server_batch_items": int(
+                            mcts_profile.get("central_inference_server_batch_items", 0) or 0
+                        ),
+                        "central_inference_remote_wait_time": float(
+                            mcts_profile.get("central_inference_remote_wait_time", 0.0) or 0.0
+                        ),
+                        "central_inference_request_put_time": float(
+                            mcts_profile.get("central_inference_request_put_time", 0.0) or 0.0
+                        ),
+                        "central_inference_server_queue_wait_time": float(
+                            mcts_profile.get("central_inference_server_queue_wait_time", 0.0) or 0.0
+                        ),
+                        "central_inference_server_total_time": float(
+                            mcts_profile.get("central_inference_server_total_time", 0.0) or 0.0
+                        ),
+                        "central_inference_server_forward_time": float(
+                            mcts_profile.get("central_inference_server_forward_time", 0.0) or 0.0
+                        ),
+                        "central_inference_server_h2d_time": float(
+                            mcts_profile.get("central_inference_server_h2d_time", 0.0) or 0.0
+                        ),
+                        "central_inference_server_d2h_time": float(
+                            mcts_profile.get("central_inference_server_d2h_time", 0.0) or 0.0
+                        ),
+                    }
+                )
 
         if (
             model_move_calls > 0
@@ -2193,7 +2478,7 @@ def estimate_model_elo(
 
     stockfish_path = elo_config.get("stockfish_path", "stockfish")
     levels = elo_config.get("levels", [1000, 1300, 1600, 1900, 2200])
-    games_per_level = elo_config.get("games_per_level", 4)
+    games_per_level = elo_config.get("games_per_level")
     sf_time = elo_config.get("stockfish_time_limit", 0.05)
     max_moves = elo_config.get("max_moves", 150)
     use_mcts = elo_config.get("use_mcts", False)

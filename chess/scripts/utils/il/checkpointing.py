@@ -3,6 +3,7 @@
 import math
 
 import torch
+from tqdm import tqdm
 
 from src.model import save_checkpoint
 from utils.shared.elo_estimator import estimate_model_elo
@@ -49,12 +50,12 @@ def save_swa_snapshot_checkpoint(
     il_dir,
     history_positions,
     expected_input_planes,
-    stride,
     model_version,
     start_mode,
     use_bfloat16,
     model_file_tag,
     model_architecture,
+    training_batch_size=None,
 ):
     """Save SWA snapshot checkpoint (raw SWA weights, without BN refresh)."""
     if not use_swa or swa_model is None:
@@ -81,12 +82,16 @@ def save_swa_snapshot_checkpoint(
         "swa_start_epoch": swa_start,
         "history_positions": history_positions,
         "input_planes": expected_input_planes,
-        "sliding_window_stride": stride,
         "pov_enabled": True,
         "version": model_version,
         "startup_mode": start_mode,
         "model_architecture": dict(model_architecture or {}),
     }
+    if training_batch_size is not None:
+        try:
+            metadata["training_batch_size"] = int(training_batch_size)
+        except (TypeError, ValueError):
+            pass
     if ref_val_loss is not None:
         metadata["val_loss"] = float(ref_val_loss)
         metadata["val_policy_loss"] = ref_val_losses.get("policy")
@@ -114,11 +119,14 @@ def save_swa_snapshot_checkpoint(
     )
 
 
-def _build_single_worker_loader(base_loader, shuffle=False):
-    """Build a safe fallback DataLoader that avoids worker subprocesses."""
-    dataset = getattr(base_loader, "dataset", None)
-    if dataset is None:
-        return None
+def _loader_batch_size(base_loader, preferred_batch_size=None):
+    if preferred_batch_size is not None:
+        try:
+            preferred_batch_size = int(preferred_batch_size)
+            if preferred_batch_size > 0:
+                return preferred_batch_size
+        except (TypeError, ValueError):
+            pass
 
     batch_size = getattr(base_loader, "batch_size", None)
     if batch_size is None:
@@ -126,6 +134,16 @@ def _build_single_worker_loader(base_loader, shuffle=False):
         batch_size = getattr(batch_sampler, "batch_size", None)
     if batch_size is None:
         batch_size = 1
+    return max(1, int(batch_size))
+
+
+def _build_single_worker_loader(base_loader, shuffle=False, batch_size=None):
+    """Build a safe fallback DataLoader that avoids worker subprocesses."""
+    dataset = getattr(base_loader, "dataset", None)
+    if dataset is None:
+        return None
+
+    batch_size = _loader_batch_size(base_loader, batch_size)
 
     collate_fn = getattr(base_loader, "collate_fn", None)
     drop_last = bool(getattr(base_loader, "drop_last", False))
@@ -145,7 +163,7 @@ def _build_single_worker_loader(base_loader, shuffle=False):
         return None
 
 
-def _build_fresh_multi_worker_loader(base_loader, shuffle=False):
+def _build_fresh_multi_worker_loader(base_loader, shuffle=False, batch_size=None):
     """Build a fresh multi-worker DataLoader for one-off BN refresh after interrupts."""
     dataset = getattr(base_loader, "dataset", None)
     if dataset is None:
@@ -155,12 +173,7 @@ def _build_fresh_multi_worker_loader(base_loader, shuffle=False):
     if workers <= 0:
         return None
 
-    batch_size = getattr(base_loader, "batch_size", None)
-    if batch_size is None:
-        batch_sampler = getattr(base_loader, "batch_sampler", None)
-        batch_size = getattr(batch_sampler, "batch_size", None)
-    if batch_size is None:
-        batch_size = 1
+    batch_size = _loader_batch_size(base_loader, batch_size)
 
     collate_fn = getattr(base_loader, "collate_fn", None)
     drop_last = bool(getattr(base_loader, "drop_last", False))
@@ -203,24 +216,69 @@ def _extract_model_inputs(batch):
 class _InputOnlyLoader:
     """Adapter exposing only model inputs for torch.optim.swa_utils.update_bn."""
 
-    def __init__(self, base_loader):
+    def __init__(self, base_loader, max_batches=None):
         self.base_loader = base_loader
         self.dataset = getattr(base_loader, "dataset", None)
         self.batch_size = getattr(base_loader, "batch_size", None)
+        if max_batches is None:
+            self.max_batches = None
+        else:
+            try:
+                self.max_batches = max(1, int(max_batches))
+            except (TypeError, ValueError):
+                self.max_batches = None
 
     def __iter__(self):
-        for batch in self.base_loader:
+        for idx, batch in enumerate(self.base_loader):
+            if self.max_batches is not None and idx >= self.max_batches:
+                break
             yield _extract_model_inputs(batch)
 
     def __len__(self):
-        return len(self.base_loader)
+        total = len(self.base_loader)
+        if self.max_batches is None:
+            return total
+        return min(total, int(self.max_batches))
 
 
-def _update_bn_from_loader(loader, swa_model, device, use_amp, amp_dtype):
+def _update_bn_from_loader(loader, swa_model, device, use_amp, amp_dtype, desc="SWA BN refresh", max_batches=None):
     """Run SWA BatchNorm refresh using only model inputs from loader batches."""
-    input_loader = _InputOnlyLoader(loader)
-    with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-        torch.optim.swa_utils.update_bn(input_loader, swa_model, device=device)
+    momenta = {}
+    was_training = swa_model.training
+    for module in swa_model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.reset_running_stats()
+            momenta[module] = module.momentum
+
+    if not momenta:
+        return
+
+    swa_model.train()
+    for module in momenta:
+        module.momentum = None
+
+    try:
+        iterator = tqdm(
+            _InputOnlyLoader(loader, max_batches=max_batches),
+            total=len(_InputOnlyLoader(loader, max_batches=max_batches)),
+            desc=desc,
+            unit="batch",
+            leave=True,
+        )
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                for inputs in iterator:
+                    if isinstance(inputs, torch.Tensor):
+                        inputs = inputs.to(
+                            device,
+                            memory_format=torch.channels_last,
+                            non_blocking=True,
+                        )
+                    swa_model(inputs)
+    finally:
+        for module, momentum in momenta.items():
+            module.momentum = momentum
+        swa_model.train(was_training)
 
 
 def _refresh_swa_bn_stats(
@@ -230,6 +288,8 @@ def _refresh_swa_bn_stats(
     use_amp,
     use_bfloat16,
     prefer_fresh_multi_worker=False,
+    training_batch_size=None,
+    max_batches=None,
 ):
     """Refresh BN stats with fallback to a single-worker loader if needed.
 
@@ -240,8 +300,24 @@ def _refresh_swa_bn_stats(
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
     refreshed_multi_loader = None
     tried_refreshed_multi = False
+    resolved_batch_size = _loader_batch_size(train_loader, training_batch_size)
+    try:
+        max_batches = int(max_batches) if max_batches is not None else None
+        if max_batches is not None and max_batches <= 0:
+            max_batches = None
+    except (TypeError, ValueError):
+        max_batches = None
+    batch_limit_text = f", max_batches={max_batches:,}" if max_batches is not None else ", max_batches=all"
+    if max_batches is not None:
+        sample_count = int(resolved_batch_size) * int(max_batches)
+        batch_limit_text += f" (~{sample_count:,} samples)"
+    print(f"  SWA BN refresh batch_size={resolved_batch_size:,}{batch_limit_text}")
     if prefer_fresh_multi_worker:
-        refreshed_multi_loader = _build_fresh_multi_worker_loader(train_loader, shuffle=False)
+        refreshed_multi_loader = _build_fresh_multi_worker_loader(
+            train_loader,
+            shuffle=False,
+            batch_size=resolved_batch_size,
+        )
         tried_refreshed_multi = True
         if refreshed_multi_loader is None:
             print(
@@ -256,6 +332,8 @@ def _refresh_swa_bn_stats(
                     device,
                     use_amp,
                     amp_dtype,
+                    desc="SWA BN refresh",
+                    max_batches=max_batches,
                 )
                 print("BatchNorm statistics updated via fresh multi-worker loader.")
                 return True, "fresh_multi_worker", None
@@ -263,13 +341,25 @@ def _refresh_swa_bn_stats(
                 print(f"WARNING: BN refresh failed on fresh multi-worker loader ({refresh_exc})")
 
     try:
-        _update_bn_from_loader(train_loader, swa_model, device, use_amp, amp_dtype)
+        _update_bn_from_loader(
+            train_loader,
+            swa_model,
+            device,
+            use_amp,
+            amp_dtype,
+            desc="SWA BN refresh",
+            max_batches=max_batches,
+        )
         return True, "train_loader", None
     except Exception as primary_exc:
         print(f"WARNING: BN refresh failed on training loader ({primary_exc})")
 
     if not tried_refreshed_multi:
-        refreshed_multi_loader = _build_fresh_multi_worker_loader(train_loader, shuffle=False)
+        refreshed_multi_loader = _build_fresh_multi_worker_loader(
+            train_loader,
+            shuffle=False,
+            batch_size=resolved_batch_size,
+        )
         if refreshed_multi_loader is not None:
             try:
                 _update_bn_from_loader(
@@ -278,18 +368,32 @@ def _refresh_swa_bn_stats(
                     device,
                     use_amp,
                     amp_dtype,
+                    desc="SWA BN refresh",
+                    max_batches=max_batches,
                 )
                 print("BatchNorm statistics updated via fresh multi-worker loader.")
                 return True, "fresh_multi_worker", None
             except Exception as refresh_exc:
                 print(f"WARNING: BN refresh failed on fresh multi-worker loader ({refresh_exc})")
 
-    safe_loader = _build_single_worker_loader(train_loader, shuffle=False)
+    safe_loader = _build_single_worker_loader(
+        train_loader,
+        shuffle=False,
+        batch_size=resolved_batch_size,
+    )
     if safe_loader is None:
         return False, "none", "failed to build safe single-worker training loader"
 
     try:
-        _update_bn_from_loader(safe_loader, swa_model, device, use_amp, amp_dtype)
+        _update_bn_from_loader(
+            safe_loader,
+            swa_model,
+            device,
+            use_amp,
+            amp_dtype,
+            desc="SWA BN refresh",
+            max_batches=max_batches,
+        )
         print("BatchNorm statistics updated via safe single-worker loader.")
         return True, "safe_single_worker", None
     except Exception as fallback_exc:
@@ -338,14 +442,15 @@ def finalize_swa_model(
     swa_start,
     history_positions,
     expected_input_planes,
-    stride,
     model_version,
     start_mode,
     best_val_loss,
     evaluate_il_fn,
+    best_raw_val_loss=None,
     elo_config=None,
     elo_stop_event=None,
     model_architecture=None,
+    training_batch_size=None,
 ):
     """Finalize SWA model with BN refresh, optional Elo, and save best_model_il_swa.pt."""
     result = {
@@ -376,6 +481,7 @@ def finalize_swa_model(
     trigger_label = "after interrupt" if interrupted else "at training end"
     print(f"\nFinalizing SWA ({trigger_label})...")
     print("Updating BatchNorm statistics...")
+    swa_cfg = config.get("imitation_learning", {}) if isinstance(config, dict) else {}
     bn_updated, bn_refresh_mode, bn_refresh_error = _refresh_swa_bn_stats(
         train_loader=train_loader,
         swa_model=swa_model,
@@ -383,6 +489,8 @@ def finalize_swa_model(
         use_amp=use_amp,
         use_bfloat16=use_bfloat16,
         prefer_fresh_multi_worker=bool(interrupted),
+        training_batch_size=training_batch_size,
+        max_batches=swa_cfg.get("swa_bn_refresh_max_batches", 256),
     )
     if not bn_updated:
         print(
@@ -442,7 +550,10 @@ def finalize_swa_model(
     result["model_path"] = str(swa_model_path)
 
     if isinstance(elo_config, dict) and elo_config.get("enabled", False):
-        print("Estimating SWA Elo (separate final check)...")
+        use_mcts_for_elo = bool(elo_config.get("use_mcts", False))
+        simulations_for_elo = int(elo_config.get("mcts_simulations", 0) or 0)
+        mode_label = f"MCTS {simulations_for_elo} sims" if use_mcts_for_elo else "raw NN"
+        print(f"Estimating SWA Elo ({mode_label}, separate final check)...")
         try:
             elo_result = estimate_model_elo(
                 swa_model.module,
@@ -464,7 +575,11 @@ def finalize_swa_model(
             if swa_elo is not None:
                 result["estimated_elo"] = float(swa_elo)
                 result["estimated_elo_epoch"] = int(epoch_to_store + 1)
-                print(f"SWA Estimated Elo: {int(round(float(swa_elo)))}")
+                result["estimated_elo_mode"] = "mcts" if use_mcts_for_elo else "nn"
+                result["estimated_elo_simulations"] = simulations_for_elo if use_mcts_for_elo else 0
+                result["estimated_elo_std_error"] = elo_result.get("elo_std_error")
+                result["estimated_elo_ci95"] = elo_result.get("elo_ci95")
+                print(f"SWA Estimated Elo ({mode_label}): {int(round(float(swa_elo)))}")
                 for lvl, res in sorted(elo_result.get("results", {}).items()):
                     score_str = f"W{res['wins']}/D{res['draws']}/L{res['losses']}"
                     print(f"  vs SF {lvl}: {score_str} (score: {res['score']:.0%})")
@@ -482,13 +597,17 @@ def finalize_swa_model(
         "swa_finalized_on_interrupt": bool(interrupted),
         "history_positions": history_positions,
         "input_planes": expected_input_planes,
-        "sliding_window_stride": stride,
         "pov_enabled": True,
         "version": model_version,
         "startup_mode": start_mode,
         "swa_eval_mode": eval_mode,
         "model_architecture": dict(model_architecture or {}),
     }
+    if training_batch_size is not None:
+        try:
+            metadata["training_batch_size"] = int(training_batch_size)
+        except (TypeError, ValueError):
+            pass
     if bn_refresh_error:
         metadata["swa_bn_refresh_error"] = str(bn_refresh_error)
     if eval_error:
@@ -508,8 +627,36 @@ def finalize_swa_model(
         metadata["val_value_mae"] = float(swa_val_metrics["value_mae"])
 
     if result["estimated_elo"] is not None:
-        metadata["estimated_elo"] = float(result["estimated_elo"])
-        metadata["estimated_elo_epoch"] = int(result["estimated_elo_epoch"] or (epoch_to_store + 1))
+        mode = str(result.get("estimated_elo_mode") or "nn").lower()
+        mode_key = "estimated_elo_mcts" if mode == "mcts" else "estimated_elo_nn"
+        mode_epoch = int(result["estimated_elo_epoch"] or (epoch_to_store + 1))
+        simulations = int(result.get("estimated_elo_simulations") or 0)
+        metadata[mode_key] = float(result["estimated_elo"])
+        metadata[f"last_{mode_key}"] = float(result["estimated_elo"])
+        metadata[f"{mode_key}_epoch"] = mode_epoch
+        mode_settings = {
+            "use_mcts": mode == "mcts",
+            "simulations": simulations if mode == "mcts" else 0,
+        }
+        metadata[f"{mode_key}_settings"] = mode_settings
+        if mode == "mcts":
+            metadata["estimated_elo_mcts_simulations"] = simulations
+        else:
+            metadata["estimated_elo"] = float(result["estimated_elo"])
+            metadata["last_estimated_elo"] = float(result["estimated_elo"])
+            metadata["estimated_elo_epoch"] = mode_epoch
+            metadata["estimated_elo_settings"] = mode_settings
+        if result.get("estimated_elo_std_error") is not None:
+            metadata[f"{mode_key}_se"] = float(result["estimated_elo_std_error"])
+            if mode != "mcts":
+                metadata["estimated_elo_se"] = float(result["estimated_elo_std_error"])
+        ci95 = result.get("estimated_elo_ci95")
+        if isinstance(ci95, (list, tuple)) and len(ci95) == 2:
+            metadata[f"{mode_key}_ci95_low"] = float(ci95[0])
+            metadata[f"{mode_key}_ci95_high"] = float(ci95[1])
+            if mode != "mcts":
+                metadata["estimated_elo_ci95_low"] = float(ci95[0])
+                metadata["estimated_elo_ci95_high"] = float(ci95[1])
 
     try:
         checkpoint_loss = _safe_loss_value(swa_val_losses.get("total"), default=0.0)
@@ -528,7 +675,8 @@ def finalize_swa_model(
         return result
 
     size_mb = swa_model_path.stat().st_size / (1024 ** 2)
-    best_loss = _safe_loss_value(best_val_loss, default=float("nan"))
+    best_loss_source = best_raw_val_loss if best_raw_val_loss is not None else best_val_loss
+    best_loss = _safe_loss_value(best_loss_source, default=float("nan"))
     val_loss = _safe_loss_value(result.get("val_loss"), default=float("nan"))
     if math.isfinite(best_loss) and math.isfinite(val_loss):
         delta_text = f"{best_loss - val_loss:.4f}"

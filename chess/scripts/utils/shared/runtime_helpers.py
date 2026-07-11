@@ -74,6 +74,7 @@ def build_model_architecture_metadata(config):
         'policy_head_hidden_dim',
         'value_head_filters',
         'value_hidden_dim',
+        'moves_left_hidden_dim',
     ]
     metadata = {}
     for key in keys:

@@ -5,6 +5,7 @@ Unified training logger for both IL and RL training
 import csv
 import json
 import textwrap
+import shutil
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator, PercentFormatter
 from datetime import datetime
@@ -12,6 +13,44 @@ from pathlib import Path
 
 
 _CSV_CONFIG_METADATA_KEY = "# config_json"
+_CSV_RUN_SUMMARY_METADATA_KEY = "# run_summary_json"
+_CSV_RESUME_METADATA_KEY = "# resume_json"
+
+
+def _clean_optional_float(value):
+    try:
+        if value in (None, ''):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_elo_ci95(ci95):
+    if not isinstance(ci95, (list, tuple)) or len(ci95) != 2:
+        return None, None
+    low = _clean_optional_float(ci95[0])
+    high = _clean_optional_float(ci95[1])
+    return low, high
+
+
+def _format_million_count(value):
+    try:
+        value = int(float(value))
+    except (TypeError, ValueError):
+        return "n/a"
+    if value <= 0:
+        return "0M"
+    millions = value / 1_000_000.0
+    if millions >= 10.0:
+        return f"{millions:.0f}M"
+    if millions >= 1.0:
+        return f"{millions:.1f}M"
+    return f"{value / 1000.0:.0f}k"
+
+
+def _is_metadata_row(row):
+    return bool(row) and str(row[0]).strip().startswith("#")
 
 
 def _json_safe_config(value):
@@ -28,14 +67,35 @@ def _is_config_metadata_row(row):
     return bool(row) and str(row[0]).strip() == _CSV_CONFIG_METADATA_KEY
 
 
+def _is_run_summary_metadata_row(row):
+    return bool(row) and str(row[0]).strip() == _CSV_RUN_SUMMARY_METADATA_KEY
+
+
 def _read_csv_rows_preserving_metadata(csv_path):
     with open(csv_path, 'r', newline='') as f:
         rows = list(csv.reader(f))
     metadata_rows = []
-    if rows and _is_config_metadata_row(rows[0]):
-        metadata_rows = [rows[0]]
+    while rows and _is_metadata_row(rows[0]):
+        metadata_rows.append(rows[0])
         rows = rows[1:]
     return metadata_rows, rows
+
+
+def _upsert_metadata_row(metadata_rows, key, payload):
+    payload_json = json.dumps(
+        _json_safe_config(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+    new_row = [key, payload_json]
+    filtered = [row for row in metadata_rows if not (row and str(row[0]).strip() == key)]
+    if key == _CSV_RUN_SUMMARY_METADATA_KEY:
+        return [new_row] + filtered
+    if key == _CSV_CONFIG_METADATA_KEY:
+        insert_at = 1 if filtered and _is_run_summary_metadata_row(filtered[0]) else 0
+        return filtered[:insert_at] + [new_row] + filtered[insert_at:]
+    return filtered + [new_row]
 
 
 def _read_csv_dict_rows(csv_path):
@@ -50,6 +110,37 @@ def _read_csv_dict_rows(csv_path):
             row.extend([''] * (len(header) - len(row)))
         result.append(dict(zip(header, row[:len(header)])))
     return result
+
+
+def _metadata_json_payload(metadata_rows, key):
+    for row in metadata_rows or []:
+        if row and str(row[0]).strip() == key and len(row) >= 2:
+            try:
+                return json.loads(row[1])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+    return None
+
+
+def _csv_float(row, key, default=None):
+    try:
+        value = row.get(key, '')
+        if value in (None, ''):
+            return default
+        value = float(value)
+        return value if value == value else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _csv_int(row, key, default=None):
+    value = _csv_float(row, key, default=None)
+    if value is None:
+        return default
+    try:
+        return int(round(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def _legend_display_y(handle):
@@ -104,7 +195,7 @@ class TrainingLogger:
     Supports both IL and RL modes with detailed metrics
     """
     
-    def __init__(self, log_dir, experiment_name="training", mode="il", config_snapshot=None):
+    def __init__(self, log_dir, experiment_name="training", mode="il", config_snapshot=None, verbose=True):
         """
         Args:
             log_dir: Directory for logs
@@ -116,6 +207,7 @@ class TrainingLogger:
         self.csv_dir = self.log_dir / "csv"
         self.csv_dir.mkdir(parents=True, exist_ok=True)
         self.mode = mode
+        self.verbose = bool(verbose)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.csv_path = self.csv_dir / f"{experiment_name}_{timestamp}.csv"
@@ -128,16 +220,57 @@ class TrainingLogger:
             if mode == "il":
                 header = [
                     'epoch', 'train_loss', 'train_policy_loss', 'train_value_loss',
-                    'val_loss', 'val_policy_loss', 'val_value_loss', 'learning_rate',
+                    'train_moves_left_loss',
+                    'val_loss', 'val_policy_loss', 'val_value_loss', 'val_moves_left_loss', 'learning_rate',
                     # NEW: Metrics
                     'train_policy_top1', 'train_policy_top3',
-                    'train_value_mae', 'train_value_mae_weighted',
+                    'train_policy_target_mass_top1', 'train_policy_target_mass_top3', 'train_policy_target_mass_top5',
+                    'train_policy_entropy', 'train_policy_effective_moves', 'train_policy_top1_prob',
+                    'train_policy_legal_entropy', 'train_policy_legal_effective_moves',
+                    'train_policy_legal_top1_prob', 'train_policy_legal_top1_margin',
+                    'train_policy_target_entropy', 'train_policy_target_effective_moves', 'train_policy_target_top1_mass',
+                    'train_policy_target_support_top1_prob', 'train_policy_target_support_top1_margin',
+                    'train_value_mae', 'train_value_mae_opening', 'train_value_mae_middlegame', 'train_value_mae_endgame',
                     'train_value_wdl_acc', 'train_value_wdl_ce',
+                    'train_value_wdl_ce_opening', 'train_value_wdl_ce_middlegame', 'train_value_wdl_ce_endgame',
+                    'train_value_std_ratio_opening', 'train_value_std_ratio_middlegame', 'train_value_std_ratio_endgame',
+                    'train_moves_left_loss_opening', 'train_moves_left_loss_middlegame', 'train_moves_left_loss_endgame',
+                    'train_moves_left_mae', 'train_moves_left_mae_opening',
+                    'train_moves_left_mae_middlegame', 'train_moves_left_mae_endgame',
                     'val_policy_top1', 'val_policy_top3',
-                    'val_value_mae', 'val_value_mae_weighted',
+                    'val_policy_target_mass_top1', 'val_policy_target_mass_top3', 'val_policy_target_mass_top5',
+                    'val_policy_entropy', 'val_policy_effective_moves', 'val_policy_top1_prob',
+                    'val_policy_legal_entropy', 'val_policy_legal_effective_moves',
+                    'val_policy_legal_top1_prob', 'val_policy_legal_top1_margin',
+                    'val_policy_target_entropy', 'val_policy_target_effective_moves', 'val_policy_target_top1_mass',
+                    'val_policy_target_support_top1_prob', 'val_policy_target_support_top1_margin',
+                    'val_value_mae', 'val_value_mae_opening', 'val_value_mae_middlegame', 'val_value_mae_endgame',
                     'val_value_wdl_acc', 'val_value_wdl_ce',
+                    'val_value_wdl_ce_opening', 'val_value_wdl_ce_middlegame', 'val_value_wdl_ce_endgame',
+                    'val_value_std_ratio_opening', 'val_value_std_ratio_middlegame', 'val_value_std_ratio_endgame',
+                    'val_moves_left_loss_opening', 'val_moves_left_loss_middlegame', 'val_moves_left_loss_endgame',
+                    'val_moves_left_mae', 'val_moves_left_mae_opening',
+                    'val_moves_left_mae_middlegame', 'val_moves_left_mae_endgame',
+                    'train_soft_occurrence_avg', 'train_soft_occurrence_max', 'train_soft_sample_weight_avg',
+                    'train_soft_policy_mass_kept_avg', 'train_soft_policy_mass_kept_min',
+                    'val_soft_occurrence_avg', 'val_soft_occurrence_max', 'val_soft_sample_weight_avg',
+                    'val_soft_policy_mass_kept_avg', 'val_soft_policy_mass_kept_min',
                     # Elo estimation
                     'estimated_elo',
+                    'estimated_elo_se',
+                    'estimated_elo_ci95_low',
+                    'estimated_elo_ci95_high',
+                    'estimated_elo_nn',
+                    'estimated_elo_nn_se',
+                    'estimated_elo_nn_ci95_low',
+                    'estimated_elo_nn_ci95_high',
+                    'estimated_elo_mcts',
+                    'estimated_elo_mcts_se',
+                    'estimated_elo_mcts_ci95_low',
+                    'estimated_elo_mcts_ci95_high',
+                    'estimated_elo_mcts_simulations',
+                    'estimated_elo_nn_label',
+                    'estimated_elo_mcts_label',
                     'train_val_loss_gap',
                     'policy_top1_gap',
                     'policy_top3_gap',
@@ -164,7 +297,7 @@ class TrainingLogger:
                     'anchor_score_rate', 'anchor_true_win_rate', 'anchor_wins', 'anchor_draws', 'anchor_losses',
                     # NEW: Metrics
                     'policy_top1_acc', 'policy_top3_acc',
-                    'value_mae', 'value_mae_weighted',
+                    'value_mae',
                     'value_wdl_acc', 'value_wdl_ce',
                     'value_mae_opening', 'value_mae_middlegame', 'value_mae_endgame',
                     'value_samples_opening', 'value_samples_middlegame', 'value_samples_endgame',
@@ -179,18 +312,15 @@ class TrainingLogger:
                     'selfplay_truncated_rate',
                     'adaptive_temp_adjustment', 'adaptive_temp_threshold',
                     'rl_best_model',
-                    'estimated_elo_nn', 'estimated_elo_mcts', 'estimated_elo_mcts_simulations',
+                    'estimated_elo_nn', 'estimated_elo_nn_se',
+                    'estimated_elo_nn_ci95_low', 'estimated_elo_nn_ci95_high',
+                    'estimated_elo_mcts', 'estimated_elo_mcts_se',
+                    'estimated_elo_mcts_ci95_low', 'estimated_elo_mcts_ci95_high',
+                    'estimated_elo_mcts_simulations',
                 ]
             if config_snapshot is not None:
-                writer.writerow([
-                    _CSV_CONFIG_METADATA_KEY,
-                    json.dumps(
-                        _json_safe_config(config_snapshot),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(',', ':'),
-                    ),
-                ])
+                for metadata_row in _upsert_metadata_row([], _CSV_CONFIG_METADATA_KEY, config_snapshot):
+                    writer.writerow(metadata_row)
             writer.writerow(header)
         
         # Storage for plotting
@@ -202,25 +332,99 @@ class TrainingLogger:
         self.val_policy_losses = []
         self.train_value_losses = []
         self.val_value_losses = []
+        self.train_moves_left_losses = []
+        self.val_moves_left_losses = []
         
         # NEW: Metrics storage
         self.train_policy_top1 = []
         self.train_policy_top3 = []
+        self.train_policy_target_mass_top1 = []
+        self.train_policy_target_mass_top3 = []
+        self.train_policy_target_mass_top5 = []
+        self.train_policy_entropy = []
+        self.train_policy_effective_moves = []
+        self.train_policy_top1_prob = []
+        self.train_policy_legal_entropy = []
+        self.train_policy_legal_effective_moves = []
+        self.train_policy_legal_top1_prob = []
+        self.train_policy_legal_top1_margin = []
+        self.train_policy_target_entropy = []
+        self.train_policy_target_effective_moves = []
+        self.train_policy_target_top1_mass = []
+        self.train_policy_target_support_top1_prob = []
+        self.train_policy_target_support_top1_margin = []
         self.train_value_mae = []
-        self.train_value_mae_weighted = []
+        self.train_value_mae_opening = []
+        self.train_value_mae_middlegame = []
+        self.train_value_mae_endgame = []
         self.train_value_wdl_acc = []
         self.train_value_wdl_ce = []
+        self.train_value_wdl_ce_opening = []
+        self.train_value_wdl_ce_middlegame = []
+        self.train_value_wdl_ce_endgame = []
+        self.train_value_std_ratio_opening = []
+        self.train_value_std_ratio_middlegame = []
+        self.train_value_std_ratio_endgame = []
+        self.train_moves_left_loss_opening = []
+        self.train_moves_left_loss_middlegame = []
+        self.train_moves_left_loss_endgame = []
+        self.train_moves_left_mae = []
+        self.train_moves_left_mae_opening = []
+        self.train_moves_left_mae_middlegame = []
+        self.train_moves_left_mae_endgame = []
         self.val_policy_top1 = []
         self.val_policy_top3 = []
+        self.val_policy_target_mass_top1 = []
+        self.val_policy_target_mass_top3 = []
+        self.val_policy_target_mass_top5 = []
+        self.val_policy_entropy = []
+        self.val_policy_effective_moves = []
+        self.val_policy_top1_prob = []
+        self.val_policy_legal_entropy = []
+        self.val_policy_legal_effective_moves = []
+        self.val_policy_legal_top1_prob = []
+        self.val_policy_legal_top1_margin = []
+        self.val_policy_target_entropy = []
+        self.val_policy_target_effective_moves = []
+        self.val_policy_target_top1_mass = []
+        self.val_policy_target_support_top1_prob = []
+        self.val_policy_target_support_top1_margin = []
         self.val_value_mae = []
-        self.val_value_mae_weighted = []
+        self.val_value_mae_opening = []
+        self.val_value_mae_middlegame = []
+        self.val_value_mae_endgame = []
         self.val_value_wdl_acc = []
         self.val_value_wdl_ce = []
+        self.val_value_wdl_ce_opening = []
+        self.val_value_wdl_ce_middlegame = []
+        self.val_value_wdl_ce_endgame = []
+        self.val_value_std_ratio_opening = []
+        self.val_value_std_ratio_middlegame = []
+        self.val_value_std_ratio_endgame = []
+        self.val_moves_left_loss_opening = []
+        self.val_moves_left_loss_middlegame = []
+        self.val_moves_left_loss_endgame = []
+        self.val_moves_left_mae = []
+        self.val_moves_left_mae_opening = []
+        self.val_moves_left_mae_middlegame = []
+        self.val_moves_left_mae_endgame = []
+        self.train_soft_occurrence_avg = []
+        self.train_soft_occurrence_max = []
+        self.train_soft_sample_weight_avg = []
+        self.train_soft_policy_mass_kept_avg = []
+        self.train_soft_policy_mass_kept_min = []
+        self.val_soft_occurrence_avg = []
+        self.val_soft_occurrence_max = []
+        self.val_soft_sample_weight_avg = []
+        self.val_soft_policy_mass_kept_avg = []
+        self.val_soft_policy_mass_kept_min = []
         
         # Elo estimation storage
         self.estimated_elos = []  # (epoch, elo) tuples
+        self.estimated_elo_errors = {}  # epoch -> {"se": float, "ci95": (low, high)}
         self._pending_rl_elo_by_iteration = {}
         self.best_final_elo_info = None  # (epoch, elo) for exact final best-model Elo
+        self.il_mode_elo_markers = []  # dicts: epoch, elo, mode, simulations, label
         
         if mode == "rl":
             self.details_dir = self.log_dir / "details"
@@ -562,6 +766,8 @@ class TrainingLogger:
 
         # Optional run context shown in plot header (e.g. startup mode/resume/transfer info).
         self.run_context_text = None
+        self.run_context_lines = []
+        self.run_summary_metadata = None
         self.plot_smoothing_enabled = False
         self.plot_smoothing_alpha = 0.35
         self.plot_smoothing_min_points = 5
@@ -573,9 +779,16 @@ class TrainingLogger:
         self.swa_elo_info = None  # (epoch, elo) or None
         # Full SWA metrics for summary panel.
         self.swa_metrics = None  # dict: {epoch, val_loss, top1, top3, mae, wdl_acc, wdl_ce, elo}
+        # Resume metadata and plot markers.
+        self.resume_markers = []  # dicts: x, next_epoch, label
+        self.resume_source_csv_path = None
+        self.resume_source_summary = None
+        self.resume_current_summary = None
+        self.resume_history_epoch = None
         
-        print(f"Logging to: {self.csv_path}")
-        if self.mode == "rl":
+        if self.verbose:
+            print(f"Logging to: {self.csv_path}")
+        if self.mode == "rl" and self.verbose:
             print(f"RL performance log: {self.performance_log_path}")
             print(f"RL data-quality log: {self.data_quality_log_path}")
 
@@ -583,9 +796,488 @@ class TrainingLogger:
         """Set optional short context displayed on generated PNG plots."""
         if text is None:
             self.run_context_text = None
+            self.run_context_lines = []
             return
         text = str(text).strip()
         self.run_context_text = text if text else None
+        self.run_context_lines = []
+
+    def set_run_context_lines(self, lines):
+        """Set explicit context lines displayed under the plot title."""
+        if not lines:
+            self.run_context_lines = []
+            return
+        cleaned = []
+        for line in lines:
+            text = str(line).strip() if line is not None else ""
+            if text:
+                cleaned.append(text)
+        self.run_context_lines = cleaned
+        self.run_context_text = " | ".join(cleaned) if cleaned else self.run_context_text
+
+    def set_run_summary_metadata(self, summary):
+        """Write/update a compact run summary as leading CSV metadata."""
+        if summary is None:
+            return
+        summary = dict(summary)
+        self.run_summary_metadata = summary
+        if self.resume_source_csv_path is not None:
+            self.resume_current_summary = dict(summary)
+            self._write_resume_metadata()
+        try:
+            metadata_rows, rows = _read_csv_rows_preserving_metadata(self.csv_path)
+            metadata_rows = _upsert_metadata_row(
+                metadata_rows,
+                _CSV_RUN_SUMMARY_METADATA_KEY,
+                summary,
+            )
+            with open(self.csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerows(metadata_rows)
+                writer.writerows(rows)
+        except Exception:
+            pass
+        if self.resume_source_csv_path is not None or self.resume_markers:
+            self._write_resume_metadata()
+
+    def add_resume_marker(self, completed_epoch, label=None):
+        """Draw a vertical resume boundary before the first continued epoch."""
+        if self.mode != "il":
+            return
+        try:
+            completed_epoch = int(completed_epoch)
+        except (TypeError, ValueError):
+            return
+        if completed_epoch < 1:
+            return
+        next_epoch = completed_epoch + 1
+        marker = {
+            'x': float(completed_epoch) + 0.5,
+            'completed_epoch': completed_epoch,
+            'next_epoch': next_epoch,
+            'label': str(label or f"resume -> ep {next_epoch}"),
+        }
+        self.resume_markers = [
+            existing for existing in self.resume_markers
+            if int(existing.get('completed_epoch', -1)) != completed_epoch
+        ]
+        self.resume_markers.append(marker)
+        self.resume_markers.sort(key=lambda item: float(item.get('x', 0.0)))
+        self._write_resume_metadata()
+
+    def _write_resume_metadata(self):
+        if self.resume_source_csv_path is None and not self.resume_markers:
+            return
+        payload = {
+            'source_csv': str(self.resume_source_csv_path) if self.resume_source_csv_path else None,
+            'history_epoch': self.resume_history_epoch,
+            'markers': self.resume_markers,
+            'final_elo_markers': self.il_mode_elo_markers,
+            'previous_run': self.resume_source_summary,
+            'current_run': self.resume_current_summary,
+        }
+        try:
+            metadata_rows, rows = _read_csv_rows_preserving_metadata(self.csv_path)
+            metadata_rows = _upsert_metadata_row(
+                metadata_rows,
+                _CSV_RESUME_METADATA_KEY,
+                payload,
+            )
+            with open(self.csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerows(metadata_rows)
+                writer.writerows(rows)
+        except Exception:
+            pass
+
+    def import_il_history_from_csv(self, source_csv_path, completed_epoch):
+        """Seed this IL logger from a previous CSV and keep rows up to completed_epoch."""
+        if self.mode != "il" or source_csv_path is None:
+            return False
+        source_csv_path = Path(source_csv_path)
+        if not source_csv_path.exists() or source_csv_path.resolve() == self.csv_path.resolve():
+            return False
+        try:
+            completed_epoch = int(completed_epoch)
+        except (TypeError, ValueError):
+            return False
+        if completed_epoch < 1:
+            return False
+
+        try:
+            metadata_rows, rows = _read_csv_rows_preserving_metadata(source_csv_path)
+        except Exception:
+            return False
+        if not rows:
+            return False
+
+        header = list(rows[0])
+        epoch_idx = header.index('epoch') if 'epoch' in header else None
+        if epoch_idx is None:
+            return False
+
+        kept_rows = []
+        for raw_row in rows[1:]:
+            row = list(raw_row)
+            if len(row) <= epoch_idx:
+                continue
+            try:
+                epoch_value = int(float(row[epoch_idx]))
+            except (TypeError, ValueError):
+                continue
+            if epoch_value <= completed_epoch:
+                kept_rows.append(row)
+
+        if not kept_rows:
+            return False
+
+        try:
+            shutil.copy2(source_csv_path, self.csv_path.with_suffix(self.csv_path.suffix + ".pre_resume_copy"))
+        except Exception:
+            pass
+
+        self.resume_source_csv_path = str(source_csv_path)
+        self.resume_source_summary = _metadata_json_payload(metadata_rows, _CSV_RUN_SUMMARY_METADATA_KEY)
+        resume_payload = _metadata_json_payload(metadata_rows, _CSV_RESUME_METADATA_KEY) or {}
+        self.resume_history_epoch = completed_epoch
+        self._reset_il_plot_storage()
+
+        try:
+            with open(self.csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerows(metadata_rows)
+                writer.writerow(header)
+                writer.writerows(kept_rows)
+        except Exception:
+            return False
+
+        dict_rows = []
+        for raw_row in kept_rows:
+            row = list(raw_row)
+            if len(row) < len(header):
+                row.extend([''] * (len(header) - len(row)))
+            dict_rows.append(dict(zip(header, row[:len(header)])))
+        self._load_il_plot_history(dict_rows)
+        for marker in resume_payload.get('final_elo_markers') or []:
+            if not isinstance(marker, dict):
+                continue
+            self.record_il_mode_elo(
+                marker.get('epoch'),
+                marker.get('elo'),
+                mode=marker.get('mode', 'nn'),
+                simulations=marker.get('simulations', 0),
+                label=marker.get('label'),
+                update_csv=False,
+                std_error=marker.get('std_error'),
+                ci95=marker.get('ci95'),
+            )
+        existing_resume_markers = resume_payload.get('markers') or []
+        if isinstance(existing_resume_markers, list):
+            for marker in existing_resume_markers:
+                if not isinstance(marker, dict):
+                    continue
+                try:
+                    completed = int(marker.get('completed_epoch'))
+                except (TypeError, ValueError):
+                    continue
+                self.add_resume_marker(completed, marker.get('label'))
+        self.add_resume_marker(completed_epoch)
+        return True
+
+    def _reset_il_plot_storage(self):
+        self.iterations = []
+        self.train_losses = []
+        self.val_losses = []
+        self.val_iterations = []
+        self.train_policy_losses = []
+        self.val_policy_losses = []
+        self.train_value_losses = []
+        self.val_value_losses = []
+        self.train_moves_left_losses = []
+        self.val_moves_left_losses = []
+        for name in [
+            'train_policy_top1', 'train_policy_top3',
+            'train_policy_target_mass_top1', 'train_policy_target_mass_top3', 'train_policy_target_mass_top5',
+            'train_policy_entropy', 'train_policy_effective_moves', 'train_policy_top1_prob',
+            'train_policy_legal_entropy', 'train_policy_legal_effective_moves',
+            'train_policy_legal_top1_prob', 'train_policy_legal_top1_margin',
+            'train_policy_target_entropy', 'train_policy_target_effective_moves', 'train_policy_target_top1_mass',
+            'train_policy_target_support_top1_prob', 'train_policy_target_support_top1_margin',
+            'train_value_mae', 'train_value_mae_opening', 'train_value_mae_middlegame', 'train_value_mae_endgame',
+            'train_value_wdl_acc', 'train_value_wdl_ce',
+            'train_value_wdl_ce_opening', 'train_value_wdl_ce_middlegame', 'train_value_wdl_ce_endgame',
+            'train_value_std_ratio_opening', 'train_value_std_ratio_middlegame', 'train_value_std_ratio_endgame',
+            'train_moves_left_loss_opening', 'train_moves_left_loss_middlegame', 'train_moves_left_loss_endgame',
+            'train_moves_left_mae', 'train_moves_left_mae_opening',
+            'train_moves_left_mae_middlegame', 'train_moves_left_mae_endgame',
+            'val_policy_top1', 'val_policy_top3',
+            'val_policy_target_mass_top1', 'val_policy_target_mass_top3', 'val_policy_target_mass_top5',
+            'val_policy_entropy', 'val_policy_effective_moves', 'val_policy_top1_prob',
+            'val_policy_legal_entropy', 'val_policy_legal_effective_moves',
+            'val_policy_legal_top1_prob', 'val_policy_legal_top1_margin',
+            'val_policy_target_entropy', 'val_policy_target_effective_moves', 'val_policy_target_top1_mass',
+            'val_policy_target_support_top1_prob', 'val_policy_target_support_top1_margin',
+            'val_value_mae', 'val_value_mae_opening', 'val_value_mae_middlegame', 'val_value_mae_endgame',
+            'val_value_wdl_acc', 'val_value_wdl_ce',
+            'val_value_wdl_ce_opening', 'val_value_wdl_ce_middlegame', 'val_value_wdl_ce_endgame',
+            'val_value_std_ratio_opening', 'val_value_std_ratio_middlegame', 'val_value_std_ratio_endgame',
+            'val_moves_left_loss_opening', 'val_moves_left_loss_middlegame', 'val_moves_left_loss_endgame',
+            'val_moves_left_mae', 'val_moves_left_mae_opening',
+            'val_moves_left_mae_middlegame', 'val_moves_left_mae_endgame',
+            'train_soft_occurrence_avg', 'train_soft_occurrence_max', 'train_soft_sample_weight_avg',
+            'train_soft_policy_mass_kept_avg', 'train_soft_policy_mass_kept_min',
+            'val_soft_occurrence_avg', 'val_soft_occurrence_max', 'val_soft_sample_weight_avg',
+            'val_soft_policy_mass_kept_avg', 'val_soft_policy_mass_kept_min',
+        ]:
+            setattr(self, name, [])
+        self.estimated_elos = []
+        self.estimated_elo_errors = {}
+        self.il_mode_elo_markers = []
+
+    def _load_il_plot_history(self, rows):
+        for row in rows:
+            epoch = _csv_int(row, 'epoch')
+            if epoch is None:
+                epoch_text = str(row.get('epoch', '')).strip().upper()
+                if epoch_text == 'SWA':
+                    swa_epoch = self.estimated_elos[-1][0] if self.estimated_elos else (self.iterations[-1] if self.iterations else 0)
+                    swa_nn_elo = _csv_float(row, 'estimated_elo_nn')
+                    swa_mcts_elo = _csv_float(row, 'estimated_elo_mcts')
+                    legacy_swa_elo = _csv_float(row, 'estimated_elo')
+                    self.swa_metrics = {
+                        'epoch': swa_epoch,
+                        'val_loss': _csv_float(row, 'val_loss'),
+                        'val_policy_loss': _csv_float(row, 'val_policy_loss'),
+                        'val_value_loss': _csv_float(row, 'val_value_loss'),
+                        'top1': _csv_float(row, 'val_policy_top1'),
+                        'top3': _csv_float(row, 'val_policy_top3'),
+                        'mae': _csv_float(row, 'val_value_mae'),
+                        'wdl_acc': _csv_float(row, 'val_value_wdl_acc'),
+                        'wdl_ce': _csv_float(row, 'val_value_wdl_ce'),
+                    }
+                    if swa_nn_elo is not None:
+                        self.swa_metrics['elo'] = swa_nn_elo
+                        self.swa_elo_info = (swa_epoch, swa_nn_elo)
+                        self.record_il_mode_elo(
+                            swa_epoch,
+                            swa_nn_elo,
+                            mode='nn',
+                            label=str(row.get('estimated_elo_nn_label') or 'SWA final NN'),
+                            update_csv=False,
+                        )
+                    elif legacy_swa_elo is not None:
+                        self.swa_metrics['elo_mcts'] = legacy_swa_elo
+                        self.swa_elo_info = (swa_epoch, legacy_swa_elo)
+                    if swa_mcts_elo is not None:
+                        self.swa_metrics['elo_mcts'] = swa_mcts_elo
+                        self.record_il_mode_elo(
+                            swa_epoch,
+                            swa_mcts_elo,
+                            mode='mcts',
+                            simulations=_csv_int(row, 'estimated_elo_mcts_simulations', 0),
+                            label=str(row.get('estimated_elo_mcts_label') or 'SWA final MCTS'),
+                            update_csv=False,
+                        )
+                continue
+            self.iterations.append(epoch)
+            self.train_losses.append(_csv_float(row, 'train_loss', 0.0))
+            self.train_policy_losses.append(_csv_float(row, 'train_policy_loss', 0.0))
+            self.train_value_losses.append(_csv_float(row, 'train_value_loss', 0.0))
+            self.train_moves_left_losses.append(_csv_float(row, 'train_moves_left_loss', 0.0))
+            if _csv_float(row, 'val_loss') is not None:
+                self.val_iterations.append(epoch)
+                self.val_losses.append(_csv_float(row, 'val_loss', 0.0))
+                self.val_policy_losses.append(_csv_float(row, 'val_policy_loss', 0.0))
+                self.val_value_losses.append(_csv_float(row, 'val_value_loss', 0.0))
+                self.val_moves_left_losses.append(_csv_float(row, 'val_moves_left_loss', 0.0))
+            for attr, col in [
+                ('train_policy_top1', 'train_policy_top1'),
+                ('train_policy_top3', 'train_policy_top3'),
+                ('train_policy_target_mass_top1', 'train_policy_target_mass_top1'),
+                ('train_policy_target_mass_top3', 'train_policy_target_mass_top3'),
+                ('train_policy_target_mass_top5', 'train_policy_target_mass_top5'),
+                ('train_policy_entropy', 'train_policy_entropy'),
+                ('train_policy_effective_moves', 'train_policy_effective_moves'),
+                ('train_policy_top1_prob', 'train_policy_top1_prob'),
+                ('train_policy_legal_entropy', 'train_policy_legal_entropy'),
+                ('train_policy_legal_effective_moves', 'train_policy_legal_effective_moves'),
+                ('train_policy_legal_top1_prob', 'train_policy_legal_top1_prob'),
+                ('train_policy_legal_top1_margin', 'train_policy_legal_top1_margin'),
+                ('train_policy_target_entropy', 'train_policy_target_entropy'),
+                ('train_policy_target_effective_moves', 'train_policy_target_effective_moves'),
+                ('train_policy_target_top1_mass', 'train_policy_target_top1_mass'),
+                ('train_policy_target_support_top1_prob', 'train_policy_target_support_top1_prob'),
+                ('train_policy_target_support_top1_margin', 'train_policy_target_support_top1_margin'),
+                ('train_value_mae', 'train_value_mae'),
+                ('train_value_mae_opening', 'train_value_mae_opening'),
+                ('train_value_mae_middlegame', 'train_value_mae_middlegame'),
+                ('train_value_mae_endgame', 'train_value_mae_endgame'),
+                ('train_value_wdl_acc', 'train_value_wdl_acc'),
+                ('train_value_wdl_ce', 'train_value_wdl_ce'),
+                ('train_value_wdl_ce_opening', 'train_value_wdl_ce_opening'),
+                ('train_value_wdl_ce_middlegame', 'train_value_wdl_ce_middlegame'),
+                ('train_value_wdl_ce_endgame', 'train_value_wdl_ce_endgame'),
+                ('train_value_std_ratio_opening', 'train_value_std_ratio_opening'),
+                ('train_value_std_ratio_middlegame', 'train_value_std_ratio_middlegame'),
+                ('train_value_std_ratio_endgame', 'train_value_std_ratio_endgame'),
+                ('train_moves_left_loss_opening', 'train_moves_left_loss_opening'),
+                ('train_moves_left_loss_middlegame', 'train_moves_left_loss_middlegame'),
+                ('train_moves_left_loss_endgame', 'train_moves_left_loss_endgame'),
+                ('train_moves_left_mae', 'train_moves_left_mae'),
+                ('train_moves_left_mae_opening', 'train_moves_left_mae_opening'),
+                ('train_moves_left_mae_middlegame', 'train_moves_left_mae_middlegame'),
+                ('train_moves_left_mae_endgame', 'train_moves_left_mae_endgame'),
+                ('train_soft_occurrence_avg', 'train_soft_occurrence_avg'),
+                ('train_soft_occurrence_max', 'train_soft_occurrence_max'),
+                ('train_soft_sample_weight_avg', 'train_soft_sample_weight_avg'),
+                ('train_soft_policy_mass_kept_avg', 'train_soft_policy_mass_kept_avg'),
+                ('train_soft_policy_mass_kept_min', 'train_soft_policy_mass_kept_min'),
+            ]:
+                getattr(self, attr).append(_csv_float(row, col, 0.0))
+            if _csv_float(row, 'val_loss') is not None:
+                for attr, col in [
+                    ('val_policy_top1', 'val_policy_top1'),
+                    ('val_policy_top3', 'val_policy_top3'),
+                    ('val_policy_target_mass_top1', 'val_policy_target_mass_top1'),
+                    ('val_policy_target_mass_top3', 'val_policy_target_mass_top3'),
+                    ('val_policy_target_mass_top5', 'val_policy_target_mass_top5'),
+                    ('val_policy_entropy', 'val_policy_entropy'),
+                    ('val_policy_effective_moves', 'val_policy_effective_moves'),
+                    ('val_policy_top1_prob', 'val_policy_top1_prob'),
+                    ('val_policy_legal_entropy', 'val_policy_legal_entropy'),
+                    ('val_policy_legal_effective_moves', 'val_policy_legal_effective_moves'),
+                    ('val_policy_legal_top1_prob', 'val_policy_legal_top1_prob'),
+                    ('val_policy_legal_top1_margin', 'val_policy_legal_top1_margin'),
+                    ('val_policy_target_entropy', 'val_policy_target_entropy'),
+                    ('val_policy_target_effective_moves', 'val_policy_target_effective_moves'),
+                    ('val_policy_target_top1_mass', 'val_policy_target_top1_mass'),
+                    ('val_policy_target_support_top1_prob', 'val_policy_target_support_top1_prob'),
+                    ('val_policy_target_support_top1_margin', 'val_policy_target_support_top1_margin'),
+                    ('val_value_mae', 'val_value_mae'),
+                    ('val_value_mae_opening', 'val_value_mae_opening'),
+                    ('val_value_mae_middlegame', 'val_value_mae_middlegame'),
+                    ('val_value_mae_endgame', 'val_value_mae_endgame'),
+                    ('val_value_wdl_acc', 'val_value_wdl_acc'),
+                    ('val_value_wdl_ce', 'val_value_wdl_ce'),
+                    ('val_value_wdl_ce_opening', 'val_value_wdl_ce_opening'),
+                    ('val_value_wdl_ce_middlegame', 'val_value_wdl_ce_middlegame'),
+                    ('val_value_wdl_ce_endgame', 'val_value_wdl_ce_endgame'),
+                    ('val_value_std_ratio_opening', 'val_value_std_ratio_opening'),
+                    ('val_value_std_ratio_middlegame', 'val_value_std_ratio_middlegame'),
+                    ('val_value_std_ratio_endgame', 'val_value_std_ratio_endgame'),
+                    ('val_moves_left_loss_opening', 'val_moves_left_loss_opening'),
+                    ('val_moves_left_loss_middlegame', 'val_moves_left_loss_middlegame'),
+                    ('val_moves_left_loss_endgame', 'val_moves_left_loss_endgame'),
+                    ('val_moves_left_mae', 'val_moves_left_mae'),
+                    ('val_moves_left_mae_opening', 'val_moves_left_mae_opening'),
+                    ('val_moves_left_mae_middlegame', 'val_moves_left_mae_middlegame'),
+                    ('val_moves_left_mae_endgame', 'val_moves_left_mae_endgame'),
+                    ('val_soft_occurrence_avg', 'val_soft_occurrence_avg'),
+                    ('val_soft_occurrence_max', 'val_soft_occurrence_max'),
+                    ('val_soft_sample_weight_avg', 'val_soft_sample_weight_avg'),
+                    ('val_soft_policy_mass_kept_avg', 'val_soft_policy_mass_kept_avg'),
+                    ('val_soft_policy_mass_kept_min', 'val_soft_policy_mass_kept_min'),
+                ]:
+                    getattr(self, attr).append(_csv_float(row, col, 0.0))
+
+            nn_elo = _csv_float(row, 'estimated_elo_nn')
+            mcts_elo = _csv_float(row, 'estimated_elo_mcts')
+            elo = _csv_float(row, 'estimated_elo')
+            elo_is_mode_duplicate = (
+                elo is not None
+                and (
+                    (nn_elo is not None and abs(float(elo) - float(nn_elo)) <= 0.5)
+                    or (mcts_elo is not None and abs(float(elo) - float(mcts_elo)) <= 0.5)
+                )
+            )
+            if elo is not None and not elo_is_mode_duplicate:
+                self.record_estimated_elo(
+                    epoch,
+                    elo,
+                    update_csv=False,
+                    std_error=_csv_float(row, 'estimated_elo_se'),
+                    ci95=(
+                        _csv_float(row, 'estimated_elo_ci95_low'),
+                        _csv_float(row, 'estimated_elo_ci95_high'),
+                    ),
+                )
+            if nn_elo is not None:
+                nn_label = str(row.get('estimated_elo_nn_label') or '').strip()
+                if not nn_label:
+                    if elo is not None and abs(float(elo) - float(nn_elo)) <= 0.5:
+                        nn_label = 'Best NN'
+                    else:
+                        nn_label = 'NN'
+                nn_marker_epoch = epoch
+                if self.estimated_elos and any(token in nn_label.lower() for token in ('best', 'final', 'swa')):
+                    latest_regular_epoch = int(self.estimated_elos[-1][0])
+                    if int(epoch) > latest_regular_epoch:
+                        nn_marker_epoch = latest_regular_epoch
+                self.record_il_mode_elo(
+                    nn_marker_epoch,
+                    nn_elo,
+                    mode='nn',
+                    label=nn_label,
+                    update_csv=False,
+                    std_error=_csv_float(row, 'estimated_elo_nn_se'),
+                    ci95=(
+                        _csv_float(row, 'estimated_elo_nn_ci95_low'),
+                        _csv_float(row, 'estimated_elo_nn_ci95_high'),
+                    ),
+                )
+            if mcts_elo is not None:
+                mcts_label = str(row.get('estimated_elo_mcts_label') or '').strip()
+                if not mcts_label:
+                    if elo is not None and abs(float(elo) - float(mcts_elo)) <= 0.5:
+                        mcts_label = 'Best MCTS'
+                    else:
+                        mcts_label = 'MCTS'
+                mcts_marker_epoch = epoch
+                if self.estimated_elos and any(token in mcts_label.lower() for token in ('best', 'final', 'swa')):
+                    latest_regular_epoch = int(self.estimated_elos[-1][0])
+                    if int(epoch) > latest_regular_epoch:
+                        mcts_marker_epoch = latest_regular_epoch
+                self.record_il_mode_elo(
+                    mcts_marker_epoch,
+                    mcts_elo,
+                    mode='mcts',
+                    simulations=_csv_int(row, 'estimated_elo_mcts_simulations', 0),
+                    label=mcts_label,
+                    update_csv=False,
+                    std_error=_csv_float(row, 'estimated_elo_mcts_se'),
+                    ci95=(
+                        _csv_float(row, 'estimated_elo_mcts_ci95_low'),
+                        _csv_float(row, 'estimated_elo_mcts_ci95_high'),
+                    ),
+                )
+        self._ensure_best_nn_marker_from_regular_elo()
+
+    def _ensure_best_nn_marker_from_regular_elo(self):
+        if self.mode != "il" or not self.estimated_elos or not self.val_losses:
+            return
+        for marker in self.il_mode_elo_markers:
+            if marker.get('mode') == 'nn' and 'best' in str(marker.get('label', '')).lower():
+                return
+        try:
+            best_idx = min(range(len(self.val_losses)), key=lambda i: self.val_losses[i])
+            best_epoch = int(self.val_iterations[best_idx]) if best_idx < len(self.val_iterations) else int(self.iterations[best_idx])
+        except (TypeError, ValueError, IndexError):
+            return
+        try:
+            source_epoch, elo = min(self.estimated_elos, key=lambda pair: abs(int(pair[0]) - best_epoch))
+            marker_epoch = int(self.estimated_elos[-1][0])
+        except (TypeError, ValueError):
+            return
+        error_info = (self.estimated_elo_errors.get(int(source_epoch), {}) or {})
+        self.record_il_mode_elo(
+            marker_epoch,
+            elo,
+            mode='nn',
+            label='Best NN',
+            update_csv=False,
+            std_error=error_info.get('se'),
+            ci95=error_info.get('ci95'),
+        )
 
     def set_plot_smoothing(self, enabled=True, alpha=0.35, min_points=5):
         """Configure light EMA smoothing for plot lines."""
@@ -613,6 +1305,34 @@ class TrainingLogger:
             break_on_hyphens=False,
         )
         return f"{base_title}\n{wrapped_context}"
+
+    def _build_plot_context_text(self, wrap_width=120):
+        if not self.run_context_text:
+            return None
+        return textwrap.fill(
+            self.run_context_text,
+            width=max(50, int(wrap_width)),
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+
+    def _build_plot_context_lines(self, wrap_width=140):
+        if self.run_context_lines:
+            source_lines = self.run_context_lines
+        elif self.run_context_text:
+            source_lines = [self.run_context_text]
+        else:
+            return []
+        wrapped_lines = []
+        for line in source_lines:
+            wrapped = textwrap.fill(
+                str(line),
+                width=max(50, int(wrap_width)),
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            wrapped_lines.extend(wrapped.splitlines() or [""])
+        return wrapped_lines
 
     def append_final_note(self, text):
         """Append short note shown in IL summary panel."""
@@ -2831,7 +3551,7 @@ class TrainingLogger:
         fig.savefig(self.data_quality_plot_path, dpi=150, bbox_inches='tight', pad_inches=0.18)
         plt.close(fig)
 
-    def record_estimated_elo(self, iteration, estimated_elo, update_csv=True):
+    def record_estimated_elo(self, iteration, estimated_elo, update_csv=True, std_error=None, ci95=None):
         """Record estimated Elo for a specific epoch/iteration (supports async updates)."""
         if estimated_elo is None:
             return
@@ -2841,6 +3561,8 @@ class TrainingLogger:
             estimated_elo = float(estimated_elo)
         except (TypeError, ValueError):
             return
+        std_error = _clean_optional_float(std_error)
+        ci_low, ci_high = _clean_elo_ci95(ci95)
 
         # Upsert in-memory storage.
         replaced = False
@@ -2852,6 +3574,11 @@ class TrainingLogger:
         if not replaced:
             self.estimated_elos.append((iteration, estimated_elo))
             self.estimated_elos.sort(key=lambda x: x[0])
+        if std_error is not None or ci_low is not None or ci_high is not None:
+            self.estimated_elo_errors[int(iteration)] = {
+                'se': std_error,
+                'ci95': (ci_low, ci_high),
+            }
 
         if not update_csv:
             return
@@ -2862,10 +3589,16 @@ class TrainingLogger:
             if not rows:
                 return
 
-            header = rows[0]
-            if 'estimated_elo' not in header:
-                return
+            header = list(rows[0])
+            for col in ('estimated_elo', 'estimated_elo_se', 'estimated_elo_ci95_low', 'estimated_elo_ci95_high'):
+                if col not in header:
+                    header.append(col)
+                    for row in rows[1:]:
+                        row.append('')
             elo_col = header.index('estimated_elo')
+            se_col = header.index('estimated_elo_se')
+            ci_low_col = header.index('estimated_elo_ci95_low')
+            ci_high_col = header.index('estimated_elo_ci95_high')
             target_epoch = str(iteration)
 
             updated = False
@@ -2875,7 +3608,15 @@ class TrainingLogger:
                 if row[0] == target_epoch:
                     while len(row) <= elo_col:
                         row.append('')
+                    while len(row) < len(header):
+                        row.append('')
                     row[elo_col] = str(int(round(estimated_elo)))
+                    if std_error is not None:
+                        row[se_col] = f"{std_error:.1f}"
+                    if ci_low is not None:
+                        row[ci_low_col] = str(int(round(ci_low)))
+                    if ci_high is not None:
+                        row[ci_high_col] = str(int(round(ci_high)))
                     updated = True
                     break
 
@@ -2883,12 +3624,23 @@ class TrainingLogger:
                 with open(self.csv_path, 'w', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerows(metadata_rows)
+                    rows[0] = header
                     writer.writerows(rows)
         except Exception:
             # CSV backfill is best-effort only.
             pass
 
-    def record_estimated_elo_mode(self, iteration, estimated_elo, *, mode="nn", simulations=0, update_csv=True):
+    def record_estimated_elo_mode(
+        self,
+        iteration,
+        estimated_elo,
+        *,
+        mode="nn",
+        simulations=0,
+        update_csv=True,
+        std_error=None,
+        ci95=None,
+    ):
         """Backfill mode-specific Elo columns in RL CSV."""
         if self.mode != "rl" or estimated_elo is None:
             return
@@ -2896,10 +3648,19 @@ class TrainingLogger:
             iteration = int(iteration)
             elo_value = int(round(float(estimated_elo)))
         except (TypeError, ValueError):
-            return
+                return
         mode = "mcts" if str(mode).lower() == "mcts" else "nn"
+        std_error = _clean_optional_float(std_error)
+        ci_low, ci_high = _clean_elo_ci95(ci95)
+        prefix = 'estimated_elo_mcts' if mode == "mcts" else 'estimated_elo_nn'
         pending = self._pending_rl_elo_by_iteration.setdefault(int(iteration), {})
-        pending['estimated_elo_mcts' if mode == "mcts" else 'estimated_elo_nn'] = elo_value
+        pending[prefix] = elo_value
+        if std_error is not None:
+            pending[f'{prefix}_se'] = f"{std_error:.1f}"
+        if ci_low is not None:
+            pending[f'{prefix}_ci95_low'] = str(int(round(ci_low)))
+        if ci_high is not None:
+            pending[f'{prefix}_ci95_high'] = str(int(round(ci_high)))
         if mode == "mcts":
             try:
                 pending['estimated_elo_mcts_simulations'] = int(simulations or 0)
@@ -2911,13 +3672,22 @@ class TrainingLogger:
                 if not rows:
                     return
                 header = list(rows[0])
-                for col in ('estimated_elo_nn', 'estimated_elo_mcts', 'estimated_elo_mcts_simulations'):
+                for col in (
+                    'estimated_elo_nn', 'estimated_elo_nn_se',
+                    'estimated_elo_nn_ci95_low', 'estimated_elo_nn_ci95_high',
+                    'estimated_elo_mcts', 'estimated_elo_mcts_se',
+                    'estimated_elo_mcts_ci95_low', 'estimated_elo_mcts_ci95_high',
+                    'estimated_elo_mcts_simulations',
+                ):
                     if col not in header:
                         header.append(col)
                         for row in rows[1:]:
                             row.append('')
-                target_col = 'estimated_elo_mcts' if mode == "mcts" else 'estimated_elo_nn'
+                target_col = prefix
                 target_idx = header.index(target_col)
+                se_idx = header.index(f'{prefix}_se')
+                ci_low_idx = header.index(f'{prefix}_ci95_low')
+                ci_high_idx = header.index(f'{prefix}_ci95_high')
                 sims_idx = header.index('estimated_elo_mcts_simulations')
                 iter_col = 'iteration' if 'iteration' in header else 'epoch'
                 iter_idx = header.index(iter_col)
@@ -2930,6 +3700,12 @@ class TrainingLogger:
                         continue
                     if row_it == iteration:
                         row[target_idx] = str(elo_value)
+                        if std_error is not None:
+                            row[se_idx] = f"{std_error:.1f}"
+                        if ci_low is not None:
+                            row[ci_low_idx] = str(int(round(ci_low)))
+                        if ci_high is not None:
+                            row[ci_high_idx] = str(int(round(ci_high)))
                         if mode == "mcts":
                             try:
                                 row[sims_idx] = str(int(simulations or 0))
@@ -3034,10 +3810,39 @@ class TrainingLogger:
         except (TypeError, ValueError):
             return None, None
 
+    def _plot_elo_errorbars(self, ax, xs, ys, yerrs, color, *, label=None, x_offset=0.0, alpha=0.38):
+        if label and "se" in str(label).lower():
+            label = "_nolegend_"
+        clean_xs, clean_ys, clean_errs = [], [], []
+        for x, y, err in zip(xs or [], ys or [], yerrs or []):
+            err_value = _clean_optional_float(err)
+            if err_value is None or err_value <= 0.0:
+                continue
+            try:
+                clean_xs.append(float(x) + float(x_offset))
+                clean_ys.append(float(y))
+                clean_errs.append(float(err_value))
+            except (TypeError, ValueError):
+                continue
+        if not clean_xs:
+            return
+        ax.errorbar(
+            clean_xs,
+            clean_ys,
+            yerr=clean_errs,
+            fmt='none',
+            ecolor=color,
+            elinewidth=1.35,
+            capsize=3.0,
+            capthick=1.0,
+            alpha=alpha,
+            label=label,
+            zorder=2,
+        )
+
     def record_swa_elo(self, epoch, elo):
         """Store SWA model Elo for distinct visual treatment (gold star) in plots.
 
-        Also backfills the CSV via record_estimated_elo so the value persists.
         Must be called AFTER the regular training elos have been recorded so the
         SWA point is visually distinguishable from the training-time estimates.
         """
@@ -3055,8 +3860,6 @@ class TrainingLogger:
             self.swa_metrics['epoch'] = epoch
         else:
             self.swa_metrics = {'epoch': epoch, 'elo': elo}
-        # Also persist to CSV and in-memory estimated_elos list.
-        self.record_estimated_elo(epoch, elo, update_csv=True)
 
     def record_best_final_elo(self, epoch, elo):
         """Store exact final best-model Elo for the IL summary and Elo panel."""
@@ -3068,7 +3871,129 @@ class TrainingLogger:
         except (TypeError, ValueError):
             return
         self.best_final_elo_info = (epoch, elo)
-        self.record_estimated_elo(epoch, elo, update_csv=True)
+
+    def record_il_mode_elo(
+        self,
+        epoch,
+        elo,
+        *,
+        mode="nn",
+        simulations=0,
+        label=None,
+        update_csv=True,
+        std_error=None,
+        ci95=None,
+    ):
+        """Store an IL raw-NN or MCTS Elo marker for the Elo panel."""
+        if self.mode != "il" or elo is None:
+            return
+        try:
+            epoch = int(epoch)
+            elo_value = float(elo)
+        except (TypeError, ValueError):
+            return
+
+        mode = "mcts" if str(mode).lower() == "mcts" else "nn"
+        std_error = _clean_optional_float(std_error)
+        ci_low, ci_high = _clean_elo_ci95(ci95)
+        try:
+            simulations = int(simulations or 0)
+        except (TypeError, ValueError):
+            simulations = 0
+        label_text = str(label).strip() if label is not None else ""
+        if not label_text:
+            label_text = "MCTS" if mode == "mcts" else "NN"
+
+        marker = {
+            "epoch": epoch,
+            "elo": elo_value,
+            "mode": mode,
+            "simulations": simulations,
+            "label": label_text,
+            "std_error": std_error,
+            "ci95": (ci_low, ci_high),
+        }
+
+        replaced = False
+        for idx, existing in enumerate(self.il_mode_elo_markers):
+            if (
+                int(existing.get("epoch", -1)) == epoch
+                and existing.get("mode") == mode
+                and str(existing.get("label", "")) == label_text
+            ):
+                self.il_mode_elo_markers[idx] = marker
+                replaced = True
+                break
+        if not replaced:
+            self.il_mode_elo_markers.append(marker)
+            self.il_mode_elo_markers.sort(key=lambda item: (int(item["epoch"]), item["mode"], item["label"]))
+
+        if not update_csv or not self.csv_path.exists():
+            return
+
+        try:
+            metadata_rows, rows = _read_csv_rows_preserving_metadata(self.csv_path)
+            if not rows:
+                return
+            header = list(rows[0])
+            for col in (
+                'estimated_elo_nn', 'estimated_elo_nn_se',
+                'estimated_elo_nn_ci95_low', 'estimated_elo_nn_ci95_high',
+                'estimated_elo_mcts', 'estimated_elo_mcts_se',
+                'estimated_elo_mcts_ci95_low', 'estimated_elo_mcts_ci95_high',
+                'estimated_elo_mcts_simulations',
+                'estimated_elo_nn_label', 'estimated_elo_mcts_label',
+            ):
+                if col not in header:
+                    header.append(col)
+                    for row in rows[1:]:
+                        row.append('')
+            iter_col = 'epoch' if 'epoch' in header else 'iteration'
+            iter_idx = header.index(iter_col)
+            target_col = 'estimated_elo_mcts' if mode == "mcts" else 'estimated_elo_nn'
+            target_idx = header.index(target_col)
+            se_idx = header.index(f'{target_col}_se')
+            ci_low_idx = header.index(f'{target_col}_ci95_low')
+            ci_high_idx = header.index(f'{target_col}_ci95_high')
+            sims_idx = header.index('estimated_elo_mcts_simulations')
+            label_col = 'estimated_elo_mcts_label' if mode == "mcts" else 'estimated_elo_nn_label'
+            label_idx = header.index(label_col)
+
+            target_row = None
+            for row in rows[1:]:
+                while len(row) < len(header):
+                    row.append('')
+                try:
+                    row_epoch = int(float(row[iter_idx]))
+                except (TypeError, ValueError):
+                    continue
+                if row_epoch == epoch:
+                    target_row = row
+                    break
+            if target_row is None:
+                target_row = [''] * len(header)
+                target_row[iter_idx] = str(epoch)
+                rows.append(target_row)
+
+            target_row[target_idx] = str(int(round(elo_value)))
+            if std_error is not None:
+                target_row[se_idx] = f"{std_error:.1f}"
+            if ci_low is not None:
+                target_row[ci_low_idx] = str(int(round(ci_low)))
+            if ci_high is not None:
+                target_row[ci_high_idx] = str(int(round(ci_high)))
+            if mode == "mcts":
+                target_row[sims_idx] = str(simulations) if simulations > 0 else ''
+            target_row[label_idx] = label_text
+            rows[0] = header
+            with open(self.csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerows(metadata_rows)
+                writer.writerows(rows)
+        except Exception:
+            pass
+        if self.resume_source_csv_path is not None or self.resume_markers:
+            self._write_resume_metadata()
 
     def record_swa_metrics(self, val_loss=None, top1=None, top3=None,
                             mae=None, mae_weighted=None,
@@ -3109,8 +4034,6 @@ class TrainingLogger:
         # Keep swa_elo_info in sync.
         if 'elo' in m and 'epoch' in m:
             self.swa_elo_info = (m['epoch'], m['elo'])
-            # Backfill elo into regular estimated_elos for gold-star plot point
-            self.record_estimated_elo(m['epoch'], m['elo'], update_csv=True)
 
         # Write / overwrite the dedicated SWA row in the CSV
         self._write_swa_csv_row()
@@ -3140,6 +4063,18 @@ class TrainingLogger:
         if not rows:
             return
         header = rows[0]
+        for col in (
+            'estimated_elo_nn', 'estimated_elo_nn_se',
+            'estimated_elo_nn_ci95_low', 'estimated_elo_nn_ci95_high',
+            'estimated_elo_mcts', 'estimated_elo_mcts_se',
+            'estimated_elo_mcts_ci95_low', 'estimated_elo_mcts_ci95_high',
+            'estimated_elo_mcts_simulations',
+            'estimated_elo_nn_label', 'estimated_elo_mcts_label',
+        ):
+            if col not in header:
+                header.append(col)
+                for existing_row in rows[1:]:
+                    existing_row.append('')
 
         # Build a full-width row (all train cols empty, val cols from swa_metrics)
         col_map = {name: i for i, name in enumerate(header)}
@@ -3156,10 +4091,11 @@ class TrainingLogger:
         _set('val_policy_top1',   _s(m.get('top1')))
         _set('val_policy_top3',   _s(m.get('top3')))
         _set('val_value_mae',     _s(m.get('mae')))
-        _set('val_value_mae_weighted', _s(m.get('mae_weighted')))
         _set('val_value_wdl_acc', _s(m.get('wdl_acc')))
         _set('val_value_wdl_ce',  _s(m.get('wdl_ce')))
-        _set('estimated_elo',     _s(m.get('elo'), '{:.0f}'))
+        _set('estimated_elo_nn',  _s(m.get('elo'), '{:.0f}'))
+        if m.get('elo') is not None:
+            _set('estimated_elo_nn_label', 'SWA final NN')
 
         # Remove any existing SWA row, then append new one
         data_rows = [r for r in rows[1:] if not r or r[0] != 'SWA']
@@ -3179,7 +4115,7 @@ class TrainingLogger:
         """Read the 'epoch=SWA' row from a CSV and return a metrics dict (or None).
 
         Keys match record_swa_metrics kwargs:
-            epoch, val_loss, top1, top3, mae, mae_weighted,
+            epoch, val_loss, top1, top3, mae,
             val_policy_loss, val_value_loss, wdl_acc, wdl_ce, elo
         """
         try:
@@ -3203,10 +4139,9 @@ class TrainingLogger:
                     'top1':            _sf('val_policy_top1'),
                     'top3':            _sf('val_policy_top3'),
                     'mae':             _sf('val_value_mae'),
-                    'mae_weighted':    _sf('val_value_mae_weighted'),
                     'wdl_acc':         _sf('val_value_wdl_acc'),
                     'wdl_ce':          _sf('val_value_wdl_ce'),
-                    'elo':             _sf('estimated_elo'),
+                    'elo':             _sf('estimated_elo_nn') if _sf('estimated_elo_nn') is not None else _sf('estimated_elo'),
                 }
         return None
 
@@ -3214,7 +4149,8 @@ class TrainingLogger:
         """Render IL Elo panel, including optional epoch markers (e.g. SWA final)."""
         has_elos = bool(self.estimated_elos)
         has_markers = bool(self.elo_epoch_markers)
-        if not has_elos and not has_markers:
+        has_mode_markers = bool(self.il_mode_elo_markers)
+        if not has_elos and not has_markers and not has_mode_markers:
             ax.axis('off')
             return
 
@@ -3275,6 +4211,18 @@ class TrainingLogger:
                     )
                 else:
                     ax.plot(elo_epochs, elo_vals, 'go-', label='Estimated Elo', linewidth=2, markersize=8)
+                elo_errs = [
+                    (self.estimated_elo_errors.get(int(ep), {}) or {}).get('se')
+                    for ep, _ in regular_elos
+                ]
+                self._plot_elo_errorbars(
+                    ax,
+                    elo_epochs,
+                    elo_vals,
+                    elo_errs,
+                    'green',
+                    label='Estimated Elo ±SE',
+                )
                 all_elo_vals = elo_vals
             else:
                 all_elo_vals = [v for _, v in visible_elos]
@@ -3289,16 +4237,23 @@ class TrainingLogger:
         # Plot SWA elo as a distinct gold star with annotation
         if self.swa_elo_info:
             sw_ep, sw_elo = self.swa_elo_info
+            swa_is_mcts_only = bool(
+                self.swa_metrics
+                and self.swa_metrics.get('elo') is None
+                and self.swa_metrics.get('elo_mcts') is not None
+            )
+            swa_star_title = "SWA final MCTS" if swa_is_mcts_only else "SWA final"
+            swa_annotation = "SWA MCTS" if swa_is_mcts_only else "SWA"
             ax.plot(
                 sw_ep, sw_elo,
                 marker='*', markersize=18,
                 color='gold', markeredgecolor='darkorange', markeredgewidth=1.5,
                 linestyle='None',
-                label=f'SWA final ({int(round(sw_elo))})',
+                label=f'{swa_star_title} ({int(round(sw_elo))})',
                 zorder=5,
             )
             ax.annotate(
-                f'SWA\n{int(round(sw_elo))}',
+                f'{swa_annotation}\n{int(round(sw_elo))}',
                 xy=(sw_ep, sw_elo),
                 xytext=(-38, 6),
                 textcoords='offset points',
@@ -3309,7 +4264,7 @@ class TrainingLogger:
                                 shrinkB=12),
             )
 
-        if self.best_final_elo_info:
+        if self.best_final_elo_info and not has_mode_markers:
             best_ep, best_elo = self.best_final_elo_info
             ax.plot(
                 best_ep, best_elo,
@@ -3328,13 +4283,117 @@ class TrainingLogger:
                 color='#1E3A8A',
                 fontweight='bold',
                 arrowprops=dict(arrowstyle='->', color='#1E3A8A', lw=1.1,
-                                shrinkB=6),
+                                 shrinkB=6),
             )
+
+        if has_mode_markers:
+            mode_styles = {
+                "nn": {
+                    "title": "NN",
+                    "marker": "D",
+                    "color": "#0EA5E9",
+                    "edge": "#075985",
+                    "offset": (8, 12),
+                },
+                "mcts": {
+                    "title": "MCTS",
+                    "marker": "P",
+                    "color": "#7C3AED",
+                    "edge": "#4C1D95",
+                    "offset": (8, -28),
+                },
+            }
+            markers_to_plot = []
+            for marker_info in self.il_mode_elo_markers:
+                marker_mode = marker_info.get("mode", "nn")
+                marker_label = str(marker_info.get("label", "")).lower()
+                if "swa" in marker_label:
+                    marker_kind = "swa"
+                elif "best" in marker_label:
+                    marker_kind = "best"
+                elif "current" in marker_label:
+                    marker_kind = "current"
+                elif "resume" in marker_label:
+                    marker_kind = "resume"
+                elif "final" in marker_label or "ctrl+c" in marker_label:
+                    marker_kind = "final"
+                else:
+                    marker_kind = "checkpoint"
+                try:
+                    marker_epoch = int(marker_info.get("epoch"))
+                except (TypeError, ValueError):
+                    continue
+                if marker_kind == "checkpoint":
+                    continue
+                if (
+                    marker_kind == "swa"
+                    and marker_mode == "nn"
+                    and self.swa_elo_info
+                    and int(self.swa_elo_info[0]) == marker_epoch
+                ):
+                    try:
+                        if abs(float(self.swa_elo_info[1]) - float(marker_info.get("elo"))) <= 0.5:
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                markers_to_plot.append(marker_info)
+
+            for marker_info in sorted(markers_to_plot, key=lambda item: (int(item.get("epoch", 0)), str(item.get("mode", "")), str(item.get("label", "")))):
+                try:
+                    marker_epoch = int(marker_info.get("epoch"))
+                    marker_elo = float(marker_info.get("elo"))
+                except (TypeError, ValueError):
+                    continue
+                marker_mode = marker_info.get("mode", "nn")
+                style = mode_styles.get(marker_mode, mode_styles["nn"])
+                sims = marker_info.get("simulations", 0) or 0
+                try:
+                    sims = int(sims)
+                except (TypeError, ValueError):
+                    sims = 0
+                sims_text = f" @{sims}" if marker_mode == "mcts" and sims > 0 else ""
+                raw_label = str(marker_info.get("label", "")).strip()
+                raw_label_lower = raw_label.lower()
+                if "swa" in raw_label_lower:
+                    legend_prefix = f'SWA {style["title"]}'
+                elif "best" in raw_label_lower:
+                    legend_prefix = f'Best {style["title"]}'
+                elif "current" in raw_label_lower:
+                    legend_prefix = f'Current {style["title"]}'
+                elif "resume" in raw_label_lower:
+                    legend_prefix = f'Resume {style["title"]}'
+                else:
+                    legend_prefix = f'Final {style["title"]}'
+                legend_label = f'{legend_prefix}{sims_text} ({int(round(marker_elo))})'
+                ax.plot(
+                    marker_epoch,
+                    marker_elo,
+                    marker=style["marker"],
+                    markersize=10,
+                    color=style["color"],
+                    markeredgecolor=style["edge"],
+                    markeredgewidth=1.2,
+                    linestyle='None',
+                    label=legend_label,
+                    zorder=7,
+                )
+                self._plot_elo_errorbars(
+                    ax,
+                    [marker_epoch],
+                    [marker_elo],
+                    [marker_info.get("std_error")],
+                    style["color"],
+                    label=f'Final {style["title"]} ±SE',
+                    x_offset=0.0,
+                    alpha=0.45,
+                )
 
         if has_markers:
             for marker_epoch, marker_label in self.elo_epoch_markers:
                 # Skip SWA marker vertical line - the gold star already marks it
                 if self.swa_elo_info and int(marker_epoch) == swa_epoch:
+                    continue
+                if has_mode_markers and "final elo" in str(marker_label).lower():
                     continue
                 ax.axvline(
                     x=marker_epoch,
@@ -3380,6 +4439,15 @@ class TrainingLogger:
                 best_ep = int(self.best_final_elo_info[0])
                 if x_min <= best_ep and best_ep >= x_max - 1:
                     x_max = best_ep + max(2, int((x_max - x_min) * 0.08) + 1)
+            for marker_info in self.il_mode_elo_markers:
+                try:
+                    marker_ep = int(marker_info.get("epoch"))
+                except (TypeError, ValueError):
+                    continue
+                if x_min <= marker_ep and marker_ep >= x_max - 1:
+                    x_max = marker_ep + max(2, int((x_max - x_min) * 0.08) + 1)
+                if marker_ep <= x_min and marker_ep >= x_min - 1:
+                    x_min = marker_ep - max(1, int((x_max - x_min) * 0.04) + 1)
             ax.set_xlim(x_min, x_max)
 
         _apply_sorted_legend(ax, fontsize=8, loc='lower right')
@@ -3407,23 +4475,95 @@ class TrainingLogger:
                     train_losses['total'],
                     train_losses['policy'],
                     train_losses['value'],
+                    train_losses.get('moves_left', ''),
                     val_losses['total'] if val_losses else '',
                     val_losses['policy'] if val_losses else '',
                     val_losses['value'] if val_losses else '',
+                    val_losses.get('moves_left', '') if val_losses else '',
                     lr if lr is not None else '',
                     # NEW: Metrics
                     train_metrics.get('policy_top1_acc', '') if train_metrics else '',
                     train_metrics.get('policy_top3_acc', '') if train_metrics else '',
+                    train_metrics.get('policy_target_mass_top1', '') if train_metrics else '',
+                    train_metrics.get('policy_target_mass_top3', '') if train_metrics else '',
+                    train_metrics.get('policy_target_mass_top5', '') if train_metrics else '',
+                    train_metrics.get('policy_entropy', '') if train_metrics else '',
+                    train_metrics.get('policy_effective_moves', '') if train_metrics else '',
+                    train_metrics.get('policy_top1_prob', '') if train_metrics else '',
+                    train_metrics.get('policy_legal_entropy', '') if train_metrics else '',
+                    train_metrics.get('policy_legal_effective_moves', '') if train_metrics else '',
+                    train_metrics.get('policy_legal_top1_prob', '') if train_metrics else '',
+                    train_metrics.get('policy_legal_top1_margin', '') if train_metrics else '',
+                    train_metrics.get('policy_target_entropy', '') if train_metrics else '',
+                    train_metrics.get('policy_target_effective_moves', '') if train_metrics else '',
+                    train_metrics.get('policy_target_top1_mass', '') if train_metrics else '',
+                    train_metrics.get('policy_target_support_top1_prob', '') if train_metrics else '',
+                    train_metrics.get('policy_target_support_top1_margin', '') if train_metrics else '',
                     train_metrics.get('value_mae', '') if train_metrics else '',
-                    train_metrics.get('value_mae_weighted', '') if train_metrics else '',
+                    train_metrics.get('value_mae_opening', '') if train_metrics else '',
+                    train_metrics.get('value_mae_middlegame', '') if train_metrics else '',
+                    train_metrics.get('value_mae_endgame', '') if train_metrics else '',
                     train_metrics.get('value_wdl_acc', '') if train_metrics else '',
                     train_metrics.get('value_wdl_ce', '') if train_metrics else '',
+                    train_metrics.get('value_wdl_ce_opening', '') if train_metrics else '',
+                    train_metrics.get('value_wdl_ce_middlegame', '') if train_metrics else '',
+                    train_metrics.get('value_wdl_ce_endgame', '') if train_metrics else '',
+                    train_metrics.get('value_std_ratio_opening', '') if train_metrics else '',
+                    train_metrics.get('value_std_ratio_middlegame', '') if train_metrics else '',
+                    train_metrics.get('value_std_ratio_endgame', '') if train_metrics else '',
+                    train_metrics.get('moves_left_loss_opening', '') if train_metrics else '',
+                    train_metrics.get('moves_left_loss_middlegame', '') if train_metrics else '',
+                    train_metrics.get('moves_left_loss_endgame', '') if train_metrics else '',
+                    train_metrics.get('moves_left_mae', '') if train_metrics else '',
+                    train_metrics.get('moves_left_mae_opening', '') if train_metrics else '',
+                    train_metrics.get('moves_left_mae_middlegame', '') if train_metrics else '',
+                    train_metrics.get('moves_left_mae_endgame', '') if train_metrics else '',
                     val_metrics.get('policy_top1_acc', '') if val_metrics else '',
                     val_metrics.get('policy_top3_acc', '') if val_metrics else '',
+                    val_metrics.get('policy_target_mass_top1', '') if val_metrics else '',
+                    val_metrics.get('policy_target_mass_top3', '') if val_metrics else '',
+                    val_metrics.get('policy_target_mass_top5', '') if val_metrics else '',
+                    val_metrics.get('policy_entropy', '') if val_metrics else '',
+                    val_metrics.get('policy_effective_moves', '') if val_metrics else '',
+                    val_metrics.get('policy_top1_prob', '') if val_metrics else '',
+                    val_metrics.get('policy_legal_entropy', '') if val_metrics else '',
+                    val_metrics.get('policy_legal_effective_moves', '') if val_metrics else '',
+                    val_metrics.get('policy_legal_top1_prob', '') if val_metrics else '',
+                    val_metrics.get('policy_legal_top1_margin', '') if val_metrics else '',
+                    val_metrics.get('policy_target_entropy', '') if val_metrics else '',
+                    val_metrics.get('policy_target_effective_moves', '') if val_metrics else '',
+                    val_metrics.get('policy_target_top1_mass', '') if val_metrics else '',
+                    val_metrics.get('policy_target_support_top1_prob', '') if val_metrics else '',
+                    val_metrics.get('policy_target_support_top1_margin', '') if val_metrics else '',
                     val_metrics.get('value_mae', '') if val_metrics else '',
-                    val_metrics.get('value_mae_weighted', '') if val_metrics else '',
+                    val_metrics.get('value_mae_opening', '') if val_metrics else '',
+                    val_metrics.get('value_mae_middlegame', '') if val_metrics else '',
+                    val_metrics.get('value_mae_endgame', '') if val_metrics else '',
                     val_metrics.get('value_wdl_acc', '') if val_metrics else '',
-                    val_metrics.get('value_wdl_ce', '') if val_metrics else ''
+                    val_metrics.get('value_wdl_ce', '') if val_metrics else '',
+                    val_metrics.get('value_wdl_ce_opening', '') if val_metrics else '',
+                    val_metrics.get('value_wdl_ce_middlegame', '') if val_metrics else '',
+                    val_metrics.get('value_wdl_ce_endgame', '') if val_metrics else '',
+                    val_metrics.get('value_std_ratio_opening', '') if val_metrics else '',
+                    val_metrics.get('value_std_ratio_middlegame', '') if val_metrics else '',
+                    val_metrics.get('value_std_ratio_endgame', '') if val_metrics else '',
+                    val_metrics.get('moves_left_loss_opening', '') if val_metrics else '',
+                    val_metrics.get('moves_left_loss_middlegame', '') if val_metrics else '',
+                    val_metrics.get('moves_left_loss_endgame', '') if val_metrics else '',
+                    val_metrics.get('moves_left_mae', '') if val_metrics else '',
+                    val_metrics.get('moves_left_mae_opening', '') if val_metrics else '',
+                    val_metrics.get('moves_left_mae_middlegame', '') if val_metrics else '',
+                    val_metrics.get('moves_left_mae_endgame', '') if val_metrics else '',
+                    train_metrics.get('soft_occurrence_avg', '') if train_metrics else '',
+                    train_metrics.get('soft_occurrence_max', '') if train_metrics else '',
+                    train_metrics.get('soft_sample_weight_avg', '') if train_metrics else '',
+                    train_metrics.get('soft_policy_mass_kept_avg', '') if train_metrics else '',
+                    train_metrics.get('soft_policy_mass_kept_min', '') if train_metrics else '',
+                    val_metrics.get('soft_occurrence_avg', '') if val_metrics else '',
+                    val_metrics.get('soft_occurrence_max', '') if val_metrics else '',
+                    val_metrics.get('soft_sample_weight_avg', '') if val_metrics else '',
+                    val_metrics.get('soft_policy_mass_kept_avg', '') if val_metrics else '',
+                    val_metrics.get('soft_policy_mass_kept_min', '') if val_metrics else '',
                 ]
                 
                 # Elo estimation
@@ -3435,6 +4575,23 @@ class TrainingLogger:
                         estimated_elo = None
                 else:
                     row.append('')
+                row.extend([
+                    kwargs.get('estimated_elo_se', ''),
+                    kwargs.get('estimated_elo_ci95_low', ''),
+                    kwargs.get('estimated_elo_ci95_high', ''),
+                ])
+
+                row.extend([
+                    kwargs.get('estimated_elo_nn', ''),
+                    kwargs.get('estimated_elo_nn_se', ''),
+                    kwargs.get('estimated_elo_nn_ci95_low', ''),
+                    kwargs.get('estimated_elo_nn_ci95_high', ''),
+                    kwargs.get('estimated_elo_mcts', ''),
+                    kwargs.get('estimated_elo_mcts_se', ''),
+                    kwargs.get('estimated_elo_mcts_ci95_low', ''),
+                    kwargs.get('estimated_elo_mcts_ci95_high', ''),
+                    kwargs.get('estimated_elo_mcts_simulations', ''),
+                ])
 
                 def _metric_value(metrics, key):
                     if not metrics:
@@ -3493,35 +4650,142 @@ class TrainingLogger:
                 self.train_losses.append(train_losses['total'])
                 self.train_policy_losses.append(train_losses['policy'])
                 self.train_value_losses.append(train_losses['value'])
+                self.train_moves_left_losses.append(train_losses.get('moves_left', 0.0))
                 
                 if train_metrics:
                     self.train_policy_top1.append(train_metrics.get('policy_top1_acc', 0))
                     self.train_policy_top3.append(train_metrics.get('policy_top3_acc', 0))
+                    self.train_policy_target_mass_top1.append(train_metrics.get('policy_target_mass_top1', 0))
+                    self.train_policy_target_mass_top3.append(train_metrics.get('policy_target_mass_top3', 0))
+                    self.train_policy_target_mass_top5.append(train_metrics.get('policy_target_mass_top5', 0))
+                    self.train_policy_entropy.append(train_metrics.get('policy_entropy', 0))
+                    self.train_policy_effective_moves.append(train_metrics.get('policy_effective_moves', 0))
+                    self.train_policy_top1_prob.append(train_metrics.get('policy_top1_prob', 0))
+                    self.train_policy_legal_entropy.append(train_metrics.get('policy_legal_entropy', 0))
+                    self.train_policy_legal_effective_moves.append(train_metrics.get('policy_legal_effective_moves', 0))
+                    self.train_policy_legal_top1_prob.append(train_metrics.get('policy_legal_top1_prob', 0))
+                    self.train_policy_legal_top1_margin.append(train_metrics.get('policy_legal_top1_margin', 0))
+                    self.train_policy_target_entropy.append(train_metrics.get('policy_target_entropy', 0))
+                    self.train_policy_target_effective_moves.append(train_metrics.get('policy_target_effective_moves', 0))
+                    self.train_policy_target_top1_mass.append(train_metrics.get('policy_target_top1_mass', 0))
+                    self.train_policy_target_support_top1_prob.append(train_metrics.get('policy_target_support_top1_prob', 0))
+                    self.train_policy_target_support_top1_margin.append(train_metrics.get('policy_target_support_top1_margin', 0))
                     self.train_value_mae.append(train_metrics.get('value_mae', 0))
-                    self.train_value_mae_weighted.append(train_metrics.get('value_mae_weighted', 0))
+                    self.train_value_mae_opening.append(train_metrics.get('value_mae_opening', 0))
+                    self.train_value_mae_middlegame.append(train_metrics.get('value_mae_middlegame', 0))
+                    self.train_value_mae_endgame.append(train_metrics.get('value_mae_endgame', 0))
                     self.train_value_wdl_acc.append(train_metrics.get('value_wdl_acc', 0))
                     self.train_value_wdl_ce.append(train_metrics.get('value_wdl_ce', 0))
+                    self.train_value_wdl_ce_opening.append(train_metrics.get('value_wdl_ce_opening', 0))
+                    self.train_value_wdl_ce_middlegame.append(train_metrics.get('value_wdl_ce_middlegame', 0))
+                    self.train_value_wdl_ce_endgame.append(train_metrics.get('value_wdl_ce_endgame', 0))
+                    self.train_value_std_ratio_opening.append(train_metrics.get('value_std_ratio_opening', 0))
+                    self.train_value_std_ratio_middlegame.append(train_metrics.get('value_std_ratio_middlegame', 0))
+                    self.train_value_std_ratio_endgame.append(train_metrics.get('value_std_ratio_endgame', 0))
+                    self.train_moves_left_loss_opening.append(train_metrics.get('moves_left_loss_opening', 0))
+                    self.train_moves_left_loss_middlegame.append(train_metrics.get('moves_left_loss_middlegame', 0))
+                    self.train_moves_left_loss_endgame.append(train_metrics.get('moves_left_loss_endgame', 0))
+                    self.train_moves_left_mae.append(train_metrics.get('moves_left_mae', 0))
+                    self.train_moves_left_mae_opening.append(train_metrics.get('moves_left_mae_opening', 0))
+                    self.train_moves_left_mae_middlegame.append(train_metrics.get('moves_left_mae_middlegame', 0))
+                    self.train_moves_left_mae_endgame.append(train_metrics.get('moves_left_mae_endgame', 0))
+                    self.train_soft_occurrence_avg.append(train_metrics.get('soft_occurrence_avg', 0))
+                    self.train_soft_occurrence_max.append(train_metrics.get('soft_occurrence_max', 0))
+                    self.train_soft_sample_weight_avg.append(train_metrics.get('soft_sample_weight_avg', 0))
+                    self.train_soft_policy_mass_kept_avg.append(train_metrics.get('soft_policy_mass_kept_avg', 0))
+                    self.train_soft_policy_mass_kept_min.append(train_metrics.get('soft_policy_mass_kept_min', 0))
                 else:
                     self.train_policy_top1.append(0.0)
                     self.train_policy_top3.append(0.0)
+                    self.train_policy_target_mass_top1.append(0.0)
+                    self.train_policy_target_mass_top3.append(0.0)
+                    self.train_policy_target_mass_top5.append(0.0)
+                    self.train_policy_entropy.append(0.0)
+                    self.train_policy_effective_moves.append(0.0)
+                    self.train_policy_top1_prob.append(0.0)
+                    self.train_policy_legal_entropy.append(0.0)
+                    self.train_policy_legal_effective_moves.append(0.0)
+                    self.train_policy_legal_top1_prob.append(0.0)
+                    self.train_policy_legal_top1_margin.append(0.0)
+                    self.train_policy_target_entropy.append(0.0)
+                    self.train_policy_target_effective_moves.append(0.0)
+                    self.train_policy_target_top1_mass.append(0.0)
+                    self.train_policy_target_support_top1_prob.append(0.0)
+                    self.train_policy_target_support_top1_margin.append(0.0)
                     self.train_value_mae.append(0.0)
-                    self.train_value_mae_weighted.append(0.0)
+                    self.train_value_mae_opening.append(0.0)
+                    self.train_value_mae_middlegame.append(0.0)
+                    self.train_value_mae_endgame.append(0.0)
                     self.train_value_wdl_acc.append(0.0)
                     self.train_value_wdl_ce.append(0.0)
+                    self.train_value_wdl_ce_opening.append(0.0)
+                    self.train_value_wdl_ce_middlegame.append(0.0)
+                    self.train_value_wdl_ce_endgame.append(0.0)
+                    self.train_value_std_ratio_opening.append(0.0)
+                    self.train_value_std_ratio_middlegame.append(0.0)
+                    self.train_value_std_ratio_endgame.append(0.0)
+                    self.train_moves_left_loss_opening.append(0.0)
+                    self.train_moves_left_loss_middlegame.append(0.0)
+                    self.train_moves_left_loss_endgame.append(0.0)
+                    self.train_moves_left_mae.append(0.0)
+                    self.train_moves_left_mae_opening.append(0.0)
+                    self.train_moves_left_mae_middlegame.append(0.0)
+                    self.train_moves_left_mae_endgame.append(0.0)
+                    self.train_soft_occurrence_avg.append(0.0)
+                    self.train_soft_occurrence_max.append(0.0)
+                    self.train_soft_sample_weight_avg.append(0.0)
+                    self.train_soft_policy_mass_kept_avg.append(0.0)
+                    self.train_soft_policy_mass_kept_min.append(0.0)
                 
                 if val_losses is not None:
                     self.val_iterations.append(iteration)
                     self.val_losses.append(val_losses['total'])
                     self.val_policy_losses.append(val_losses['policy'])
                     self.val_value_losses.append(val_losses['value'])
+                    self.val_moves_left_losses.append(val_losses.get('moves_left', 0.0))
                 
                 if val_metrics:
                     self.val_policy_top1.append(val_metrics.get('policy_top1_acc', 0))
                     self.val_policy_top3.append(val_metrics.get('policy_top3_acc', 0))
+                    self.val_policy_target_mass_top1.append(val_metrics.get('policy_target_mass_top1', 0))
+                    self.val_policy_target_mass_top3.append(val_metrics.get('policy_target_mass_top3', 0))
+                    self.val_policy_target_mass_top5.append(val_metrics.get('policy_target_mass_top5', 0))
+                    self.val_policy_entropy.append(val_metrics.get('policy_entropy', 0))
+                    self.val_policy_effective_moves.append(val_metrics.get('policy_effective_moves', 0))
+                    self.val_policy_top1_prob.append(val_metrics.get('policy_top1_prob', 0))
+                    self.val_policy_legal_entropy.append(val_metrics.get('policy_legal_entropy', 0))
+                    self.val_policy_legal_effective_moves.append(val_metrics.get('policy_legal_effective_moves', 0))
+                    self.val_policy_legal_top1_prob.append(val_metrics.get('policy_legal_top1_prob', 0))
+                    self.val_policy_legal_top1_margin.append(val_metrics.get('policy_legal_top1_margin', 0))
+                    self.val_policy_target_entropy.append(val_metrics.get('policy_target_entropy', 0))
+                    self.val_policy_target_effective_moves.append(val_metrics.get('policy_target_effective_moves', 0))
+                    self.val_policy_target_top1_mass.append(val_metrics.get('policy_target_top1_mass', 0))
+                    self.val_policy_target_support_top1_prob.append(val_metrics.get('policy_target_support_top1_prob', 0))
+                    self.val_policy_target_support_top1_margin.append(val_metrics.get('policy_target_support_top1_margin', 0))
                     self.val_value_mae.append(val_metrics.get('value_mae', 0))
-                    self.val_value_mae_weighted.append(val_metrics.get('value_mae_weighted', 0))
+                    self.val_value_mae_opening.append(val_metrics.get('value_mae_opening', 0))
+                    self.val_value_mae_middlegame.append(val_metrics.get('value_mae_middlegame', 0))
+                    self.val_value_mae_endgame.append(val_metrics.get('value_mae_endgame', 0))
                     self.val_value_wdl_acc.append(val_metrics.get('value_wdl_acc', 0))
                     self.val_value_wdl_ce.append(val_metrics.get('value_wdl_ce', 0))
+                    self.val_value_wdl_ce_opening.append(val_metrics.get('value_wdl_ce_opening', 0))
+                    self.val_value_wdl_ce_middlegame.append(val_metrics.get('value_wdl_ce_middlegame', 0))
+                    self.val_value_wdl_ce_endgame.append(val_metrics.get('value_wdl_ce_endgame', 0))
+                    self.val_value_std_ratio_opening.append(val_metrics.get('value_std_ratio_opening', 0))
+                    self.val_value_std_ratio_middlegame.append(val_metrics.get('value_std_ratio_middlegame', 0))
+                    self.val_value_std_ratio_endgame.append(val_metrics.get('value_std_ratio_endgame', 0))
+                    self.val_moves_left_loss_opening.append(val_metrics.get('moves_left_loss_opening', 0))
+                    self.val_moves_left_loss_middlegame.append(val_metrics.get('moves_left_loss_middlegame', 0))
+                    self.val_moves_left_loss_endgame.append(val_metrics.get('moves_left_loss_endgame', 0))
+                    self.val_moves_left_mae.append(val_metrics.get('moves_left_mae', 0))
+                    self.val_moves_left_mae_opening.append(val_metrics.get('moves_left_mae_opening', 0))
+                    self.val_moves_left_mae_middlegame.append(val_metrics.get('moves_left_mae_middlegame', 0))
+                    self.val_moves_left_mae_endgame.append(val_metrics.get('moves_left_mae_endgame', 0))
+                    self.val_soft_occurrence_avg.append(val_metrics.get('soft_occurrence_avg', 0))
+                    self.val_soft_occurrence_max.append(val_metrics.get('soft_occurrence_max', 0))
+                    self.val_soft_sample_weight_avg.append(val_metrics.get('soft_sample_weight_avg', 0))
+                    self.val_soft_policy_mass_kept_avg.append(val_metrics.get('soft_policy_mass_kept_avg', 0))
+                    self.val_soft_policy_mass_kept_min.append(val_metrics.get('soft_policy_mass_kept_min', 0))
                 
                 # Elo estimation storage
                 if estimated_elo is not None:
@@ -3531,7 +4795,25 @@ class TrainingLogger:
             else:  # RL mode
                 pending_elo = dict(self._pending_rl_elo_by_iteration.pop(int(iteration), {}) or {})
                 estimated_elo_nn = kwargs.get('estimated_elo_nn', pending_elo.get('estimated_elo_nn', ''))
+                estimated_elo_nn_se = kwargs.get('estimated_elo_nn_se', pending_elo.get('estimated_elo_nn_se', ''))
+                estimated_elo_nn_ci95_low = kwargs.get(
+                    'estimated_elo_nn_ci95_low',
+                    pending_elo.get('estimated_elo_nn_ci95_low', ''),
+                )
+                estimated_elo_nn_ci95_high = kwargs.get(
+                    'estimated_elo_nn_ci95_high',
+                    pending_elo.get('estimated_elo_nn_ci95_high', ''),
+                )
                 estimated_elo_mcts = kwargs.get('estimated_elo_mcts', pending_elo.get('estimated_elo_mcts', ''))
+                estimated_elo_mcts_se = kwargs.get('estimated_elo_mcts_se', pending_elo.get('estimated_elo_mcts_se', ''))
+                estimated_elo_mcts_ci95_low = kwargs.get(
+                    'estimated_elo_mcts_ci95_low',
+                    pending_elo.get('estimated_elo_mcts_ci95_low', ''),
+                )
+                estimated_elo_mcts_ci95_high = kwargs.get(
+                    'estimated_elo_mcts_ci95_high',
+                    pending_elo.get('estimated_elo_mcts_ci95_high', ''),
+                )
                 estimated_elo_mcts_simulations = kwargs.get(
                     'estimated_elo_mcts_simulations',
                     pending_elo.get('estimated_elo_mcts_simulations', ''),
@@ -3590,7 +4872,6 @@ class TrainingLogger:
                     train_metrics.get('policy_top1_acc', '') if train_metrics else '',
                     train_metrics.get('policy_top3_acc', '') if train_metrics else '',
                     train_metrics.get('value_mae', '') if train_metrics else '',
-                    train_metrics.get('value_mae_weighted', '') if train_metrics else '',
                     train_metrics.get('value_wdl_acc', '') if train_metrics else '',
                     train_metrics.get('value_wdl_ce', '') if train_metrics else '',
                     train_metrics.get('value_mae_opening', '') if train_metrics else '',
@@ -3623,7 +4904,13 @@ class TrainingLogger:
 
                 row.extend([
                     estimated_elo_nn,
+                    estimated_elo_nn_se,
+                    estimated_elo_nn_ci95_low,
+                    estimated_elo_nn_ci95_high,
                     estimated_elo_mcts,
+                    estimated_elo_mcts_se,
+                    estimated_elo_mcts_ci95_low,
+                    estimated_elo_mcts_ci95_high,
                     estimated_elo_mcts_simulations,
                 ])
                  
@@ -3642,14 +4929,12 @@ class TrainingLogger:
                     self.train_policy_top1.append(train_metrics.get('policy_top1_acc', 0))
                     self.train_policy_top3.append(train_metrics.get('policy_top3_acc', 0))
                     self.train_value_mae.append(train_metrics.get('value_mae', 0))
-                    self.train_value_mae_weighted.append(train_metrics.get('value_mae_weighted', 0))
                     self.train_value_wdl_acc.append(train_metrics.get('value_wdl_acc', 0))
                     self.train_value_wdl_ce.append(train_metrics.get('value_wdl_ce', 0))
                 else:
                     self.train_policy_top1.append(0.0)
                     self.train_policy_top3.append(0.0)
                     self.train_value_mae.append(0.0)
-                    self.train_value_mae_weighted.append(0.0)
                     self.train_value_wdl_acc.append(0.0)
                     self.train_value_wdl_ce.append(0.0)
                 
@@ -3686,12 +4971,18 @@ class TrainingLogger:
     
     def plot(self):
         """Generate training plots"""
-        if len(self.iterations) < 2:
-            return
-        
         if self.mode == "il":
+            if (
+                len(self.iterations) < 1
+                and not self.estimated_elos
+                and not self.elo_epoch_markers
+                and not self.il_mode_elo_markers
+            ):
+                return
             self._plot_il()
         else:
+            if len(self.iterations) < 2:
+                return
             self._plot_rl()
 
     # ------------------------------------------------------------------
@@ -3740,6 +5031,34 @@ class TrainingLogger:
 
         swa = self.swa_metrics  # dict or None
 
+        def _latest_il_mode_elo(mode, text=None, exclude_text=None):
+            candidates = []
+            text = str(text).lower() if text else None
+            exclude_text = str(exclude_text).lower() if exclude_text else None
+            for marker in self.il_mode_elo_markers:
+                if marker.get('mode') != mode:
+                    continue
+                label = str(marker.get('label', '')).lower()
+                if text and text not in label:
+                    continue
+                if exclude_text and exclude_text in label:
+                    continue
+                try:
+                    candidates.append((int(marker.get('epoch')), float(marker.get('elo'))))
+                except (TypeError, ValueError):
+                    continue
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: item[0])
+            return candidates[-1][1]
+
+        best_mcts_elo = _latest_il_mode_elo('mcts', 'best')
+        if best_mcts_elo is None:
+            best_mcts_elo = _latest_il_mode_elo('mcts', exclude_text='swa')
+        swa_mcts_elo = _latest_il_mode_elo('mcts', 'swa')
+        if swa_mcts_elo is None and self.swa_metrics:
+            swa_mcts_elo = self.swa_metrics.get('elo_mcts')
+
         # Formatters
         def _fl(v):  return f"{v:.4f}" if v is not None else "-"
         def _fp(v):  return f"{v:.2%}"  if v is not None else "-"
@@ -3765,12 +5084,13 @@ class TrainingLogger:
             return f"{arrow} {d:+d}".strip() if arrow else f"{d:+d}"
 
         swa_ep_label = swa.get('epoch', '?') if swa else "-"
-        col_labels = [
-            "Metric",
-            f"Best (ep {best_epoch})",
-            f"SWA (ep {swa_ep_label})",
-            "Delta SWA - Best",
-        ]
+        ax.set_title(
+            f"Training Summary - Best ep {best_epoch}, SWA ep {swa_ep_label}",
+            fontsize=12,
+            fontweight='bold',
+            pad=8,
+        )
+        col_labels = ["Metric", "Best", "SWA", "Delta"]
 
         rows_raw = [
             ("Val Loss",
@@ -3797,11 +5117,18 @@ class TrainingLogger:
              _fl(best['wdl_ce']),
              _fl(_sv(swa,'wdl_ce')),
              _delta(best['wdl_ce'], _sv(swa,'wdl_ce'), 'less')),
-            ("Est. Elo",
+            ("Est. Elo NN",
              _fe(best['elo']),
              _fe(_sv(swa,'elo')),
              _delta_elo(best['elo'], _sv(swa,'elo'))),
         ]
+        if best_mcts_elo is not None or swa_mcts_elo is not None:
+            rows_raw.append((
+                "Est. Elo MCTS",
+                _fe(best_mcts_elo),
+                _fe(swa_mcts_elo),
+                _delta_elo(best_mcts_elo, swa_mcts_elo),
+            ))
 
         cell_text = [list(r) for r in rows_raw]
 
@@ -3859,18 +5186,22 @@ class TrainingLogger:
 
     def _plot_il(self):
         """Plot IL training progress"""
-        fig, axes = plt.subplots(4, 3, figsize=(19, 16))
+        fig, axes = plt.subplots(5, 3, figsize=(19, 19.6))
         fig.patch.set_facecolor('#F7F8FA')
 
-        if self.run_context_text:
-            fig.suptitle(
-                self._build_plot_suptitle("IL Training Progress"),
-                fontsize=15,
-                fontweight='bold',
-                y=0.985,
+        fig.suptitle('IL Training Progress', fontsize=21, fontweight='bold', y=0.992)
+        context_lines = self._build_plot_context_lines(wrap_width=150)
+        for line_idx, line in enumerate(context_lines[:4]):
+            fig.text(
+                0.5,
+                0.970 - line_idx * 0.012,
+                line,
+                ha='center',
+                va='top',
+                fontsize=9.2 if line_idx == 0 else 8.6,
+                fontweight='semibold' if line_idx == 0 else 'normal',
+                color='#334155' if line_idx == 0 else '#64748B',
             )
-        else:
-            fig.suptitle('IL Training Progress', fontsize=18, fontweight='bold', y=0.985)
 
         val_epochs = self.val_iterations if self.val_iterations else []
 
@@ -3927,11 +5258,12 @@ class TrainingLogger:
                 smoothed.append(prev)
             return smoothed
 
-        def _plot_line(ax, xs, ys, label, color, style='-', marker=None, linewidth=2.0, alpha=0.95):
+        def _plot_line(ax, xs, ys, label, color, style='-', marker=None, linewidth=2.0, alpha=0.95, smooth=None):
             if not xs or not ys:
                 return
-            ys_to_plot = _smooth_values(list(ys))
-            marker_to_plot = None if self.plot_smoothing_enabled else marker
+            use_smooth = self.plot_smoothing_enabled if smooth is None else bool(smooth)
+            ys_to_plot = _smooth_values(list(ys)) if use_smooth else list(ys)
+            marker_to_plot = None if use_smooth and self.plot_smoothing_enabled else marker
             ax.plot(
                 xs,
                 ys_to_plot,
@@ -3988,7 +5320,63 @@ class TrainingLogger:
                 bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#CBD5E1', alpha=0.9),
             )
 
-        # Row 1: loss and LR
+        def _show_no_data(ax, message='Available in next run'):
+            ax.text(
+                0.5,
+                0.5,
+                message,
+                transform=ax.transAxes,
+                ha='center',
+                va='center',
+                fontsize=10,
+                color=colors['muted'],
+                bbox=dict(boxstyle='round,pad=0.35', fc='#F8FAFC', ec='#CBD5E1', alpha=0.95),
+            )
+
+        def _draw_resume_markers(ax, annotate=False):
+            if not self.resume_markers:
+                return
+            for marker in self.resume_markers:
+                try:
+                    x_value = float(marker.get('x'))
+                except (TypeError, ValueError):
+                    continue
+                ax.axvline(
+                    x_value,
+                    color='#111827',
+                    linestyle='--',
+                    linewidth=1.1,
+                    alpha=0.42,
+                    zorder=1,
+                )
+                if annotate:
+                    ax.text(
+                        x_value,
+                        0.98,
+                        str(marker.get('label') or 'resume'),
+                        transform=ax.get_xaxis_transform(),
+                        ha='left',
+                        va='top',
+                        rotation=90,
+                        fontsize=7.5,
+                        color='#111827',
+                        bbox=dict(boxstyle='round,pad=0.20', fc='white', ec='#CBD5E1', alpha=0.85),
+                    )
+
+        def _latest_finite(series):
+            for value in reversed(list(series or [])):
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if value == value:
+                    return value
+            return None
+
+        # IL plot layout is grouped by topic for scanning: losses, policy,
+        # value, moves-left, data diagnostics, and final run summary. Keep
+        # Training Summary as the last panel so it is always the closing read.
+        # Row 1: losses
         ax = axes[0, 0]
         _plot_line(ax, self.iterations, self.train_losses, 'Train', colors['train'])
         _plot_line(ax, val_epochs, self.val_losses, 'Val', colors['val'], marker='o')
@@ -4017,7 +5405,7 @@ class TrainingLogger:
                     ax_lr.spines['right'].set_alpha(0.18)
         _apply_sorted_legend(ax, fontsize=8, loc='best')
 
-        ax = axes[2, 0]
+        ax = axes[0, 1]
         _plot_line(ax, self.iterations, self.train_policy_losses, 'Train Policy', colors['train'])
         _plot_line(ax, val_epochs, self.val_policy_losses, 'Val Policy', colors['val'], marker='o')
         _mark_best(ax, val_epochs, self.val_policy_losses, mode='min', label='best')
@@ -4031,99 +5419,316 @@ class TrainingLogger:
         _style_axis(ax, 'Value Loss', 'Loss')
         _apply_sorted_legend(ax, fontsize=8)
 
-        # Row 2: policy and value quality
+        # Row 2: policy quality
         ax = axes[1, 0]
         _plot_line(ax, self.iterations, self.train_policy_top1, 'Train Top-1', colors['train'])
         _plot_line(ax, self.iterations, self.train_policy_top3, 'Train Top-3', colors['train'], style='--', alpha=0.65)
+        _plot_line(ax, self.iterations, self.train_policy_target_mass_top3, 'Train target mass@3', '#0891B2', style=':', alpha=0.85)
         _plot_line(ax, val_epochs, self.val_policy_top1, 'Val Top-1', colors['val'], marker='o')
         _plot_line(ax, val_epochs, self.val_policy_top3, 'Val Top-3', colors['val'], style='--', marker='o', alpha=0.75)
+        _plot_line(ax, val_epochs, self.val_policy_target_mass_top3, 'Val target mass@3', '#F59E0B', style=':', marker='o', alpha=0.85)
         _mark_best(ax, val_epochs, self.val_policy_top1, mode='max', label='best top1')
-        _style_axis(ax, 'Policy Accuracy', 'Accuracy', percent=True)
+        _style_axis(ax, 'Policy Accuracy + Soft Mass', 'Accuracy / mass', percent=True)
         _set_percent_ylim(
             ax,
             list(self.train_policy_top1)
             + list(self.train_policy_top3)
             + list(self.val_policy_top1)
-            + list(self.val_policy_top3),
+            + list(self.val_policy_top3)
+            + list(self.train_policy_target_mass_top3)
+            + list(self.val_policy_target_mass_top3),
             min_pad=0.03,
         )
         _apply_sorted_legend(ax, fontsize=8)
 
         ax = axes[1, 1]
+        _style_axis(ax, 'Policy Sharpness vs Target', 'Effective legal moves')
+        policy_sharpness_values = (
+            list(self.train_policy_effective_moves)
+            + list(self.val_policy_effective_moves)
+            + list(self.train_policy_legal_effective_moves)
+            + list(self.val_policy_legal_effective_moves)
+            + list(self.train_policy_target_effective_moves)
+            + list(self.val_policy_target_effective_moves)
+        )
+        policy_sharpness_values = [float(v) for v in policy_sharpness_values if v is not None and float(v or 0.0) > 0.0]
+        if policy_sharpness_values:
+            _plot_line(ax, self.iterations, self.train_policy_effective_moves, 'Train model', colors['train'])
+            _plot_line(ax, val_epochs, self.val_policy_effective_moves, 'Val model', colors['val'], marker='o')
+            if any(float(v or 0.0) > 0.0 for v in self.train_policy_legal_effective_moves):
+                _plot_line(ax, self.iterations, self.train_policy_legal_effective_moves, 'Train legal', '#0F766E', style=':', alpha=0.8)
+            if any(float(v or 0.0) > 0.0 for v in self.val_policy_legal_effective_moves):
+                _plot_line(ax, val_epochs, self.val_policy_legal_effective_moves, 'Val legal', '#B45309', style=':', marker='o', alpha=0.8)
+            _plot_line(ax, self.iterations, self.train_policy_target_effective_moves, 'Train target', '#0891B2', style='--', alpha=0.8)
+            _plot_line(ax, val_epochs, self.val_policy_target_effective_moves, 'Val target', '#F59E0B', style='--', marker='o', alpha=0.8)
+            y_min = min(policy_sharpness_values)
+            y_max = max(policy_sharpness_values)
+            pad = max(0.5, (y_max - y_min) * 0.18)
+            ax.set_ylim(max(0.0, y_min - pad), y_max + pad)
+            _apply_sorted_legend(ax, fontsize=8)
+        else:
+            _show_no_data(ax, 'Available in next run')
+
+        ax = axes[1, 2]
+        _plot_line(ax, self.iterations, self.train_policy_target_mass_top1, 'Train mass@1', colors['train'], alpha=0.85)
+        _plot_line(ax, self.iterations, self.train_policy_target_mass_top3, 'Train mass@3', colors['train'], style='--', alpha=0.72)
+        _plot_line(ax, self.iterations, self.train_policy_target_mass_top5, 'Train mass@5', colors['train'], style=':', alpha=0.72)
+        _plot_line(ax, val_epochs, self.val_policy_target_mass_top1, 'Val mass@1', colors['val'], marker='o', alpha=0.85)
+        _plot_line(ax, val_epochs, self.val_policy_target_mass_top3, 'Val mass@3', colors['val'], style='--', marker='o', alpha=0.72)
+        _plot_line(ax, val_epochs, self.val_policy_target_mass_top5, 'Val mass@5', colors['val'], style=':', marker='o', alpha=0.72)
+        if any(float(v or 0.0) > 0.0 for v in self.train_policy_target_support_top1_prob):
+            _plot_line(ax, self.iterations, self.train_policy_target_support_top1_prob, 'Train support top1', '#0F766E', style='-.', alpha=0.82)
+        if any(float(v or 0.0) > 0.0 for v in self.val_policy_target_support_top1_prob):
+            _plot_line(ax, val_epochs, self.val_policy_target_support_top1_prob, 'Val support top1', '#B45309', style='-.', marker='o', alpha=0.82)
+        _style_axis(ax, 'Soft Target Coverage + Support Confidence', 'Probability / mass', percent=True)
+        _set_percent_ylim(
+            ax,
+            list(self.train_policy_target_mass_top1)
+            + list(self.train_policy_target_mass_top3)
+            + list(self.train_policy_target_mass_top5)
+            + list(self.val_policy_target_mass_top1)
+            + list(self.val_policy_target_mass_top3)
+            + list(self.val_policy_target_mass_top5)
+            + list(self.train_policy_target_support_top1_prob)
+            + list(self.val_policy_target_support_top1_prob),
+            min_pad=0.03,
+        )
+        policy_mass_values = (
+            list(self.train_policy_target_mass_top1)
+            + list(self.train_policy_target_mass_top3)
+            + list(self.train_policy_target_mass_top5)
+            + list(self.val_policy_target_mass_top1)
+            + list(self.val_policy_target_mass_top3)
+            + list(self.val_policy_target_mass_top5)
+            + list(self.train_policy_target_support_top1_prob)
+            + list(self.val_policy_target_support_top1_prob)
+        )
+        if any(float(v or 0.0) > 0.0 for v in policy_mass_values):
+            _apply_sorted_legend(ax, fontsize=8)
+        else:
+            _show_no_data(ax, 'Needs new CSV columns')
+
+        # Row 3: value
+        ax = axes[2, 0]
         _plot_line(ax, self.iterations, self.train_value_mae, 'Train MAE', colors['train'])
-        _plot_line(ax, self.iterations, self.train_value_mae_weighted, 'Train Weighted', colors['train'], style='--', alpha=0.6)
         _plot_line(ax, val_epochs, self.val_value_mae, 'Val MAE', colors['val'], marker='o')
-        _plot_line(ax, val_epochs, self.val_value_mae_weighted, 'Val Weighted', colors['val'], style='--', marker='o', alpha=0.75)
         _mark_best(ax, val_epochs, self.val_value_mae, mode='min', label='best mae')
         _style_axis(ax, 'Value Scalar MAE', 'MAE')
         _apply_sorted_legend(ax, fontsize=8)
 
-        ax = axes[1, 2]
-        _plot_line(ax, self.iterations, self.train_value_wdl_acc, 'Train WDL Acc', colors['train'])
-        _plot_line(ax, val_epochs, self.val_value_wdl_acc, 'Val WDL Acc', colors['val'], marker='o')
-        _mark_best(ax, val_epochs, self.val_value_wdl_acc, mode='max', label='best')
-        _style_axis(ax, 'WDL Accuracy', 'Accuracy', percent=True)
-        _set_percent_ylim(
-            ax,
-            list(self.train_value_wdl_acc) + list(self.val_value_wdl_acc),
-            min_pad=0.03,
-        )
-        if self.train_value_wdl_acc or self.val_value_wdl_acc:
-            _apply_sorted_legend(ax, fontsize=8)
-
-        # Row 3: diagnostics and gaps
-        ax = axes[2, 0]
-        gap_xs, gap_ys = _val_gap(self.train_losses, self.val_losses)
-        _plot_line(ax, gap_xs, gap_ys, 'Val - Train Loss', colors['gap'], marker='o')
-        ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.2)
-        _style_axis(ax, 'Generalization Gap: Loss', 'Gap')
-        if gap_xs:
-            _apply_sorted_legend(ax, fontsize=8)
-
         ax = axes[2, 1]
-        gap_xs, top1_gap = _val_gap(self.train_policy_top1, self.val_policy_top1)
-        _, top3_gap = _val_gap(self.train_policy_top3, self.val_policy_top3)
-        _plot_line(ax, gap_xs, top1_gap, 'Top-1 gap', colors['gap'], marker='o')
-        _plot_line(ax, gap_xs, top3_gap, 'Top-3 gap', '#F59E0B', style='--', marker='o', alpha=0.85)
-        ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.2)
-        _style_axis(ax, 'Generalization Gap: Policy', 'Val - Train', percent=True)
-        if gap_xs:
-            _apply_sorted_legend(ax, fontsize=8)
+        _style_axis(ax, 'Value MAE by Phase', 'MAE')
+        value_phase_mae_values = (
+            list(self.train_value_mae_opening) + list(self.train_value_mae_middlegame) + list(self.train_value_mae_endgame)
+            + list(self.val_value_mae_opening) + list(self.val_value_mae_middlegame) + list(self.val_value_mae_endgame)
+        )
+        if any(float(v or 0.0) > 0.0 for v in value_phase_mae_values):
+            _plot_line(ax, self.iterations, self.train_value_mae_opening, 'Train Opening', colors['train'], style='--', alpha=0.72)
+            _plot_line(ax, self.iterations, self.train_value_mae_middlegame, 'Train Middlegame', colors['train'], alpha=0.95)
+            _plot_line(ax, self.iterations, self.train_value_mae_endgame, 'Train Endgame', colors['train'], style=':', alpha=0.72)
+            _plot_line(ax, val_epochs, self.val_value_mae_opening, 'Val Opening', colors['val'], style='--', marker='o', alpha=0.72)
+            _plot_line(ax, val_epochs, self.val_value_mae_middlegame, 'Val Middlegame', colors['val'], marker='o', alpha=0.95)
+            _plot_line(ax, val_epochs, self.val_value_mae_endgame, 'Val Endgame', colors['val'], style=':', marker='o', alpha=0.72)
+            _apply_sorted_legend(ax, fontsize=7, loc='best')
+        else:
+            _show_no_data(ax, 'Available in next run')
 
         ax = axes[2, 2]
-        gap_xs, mae_gap = _val_gap(self.train_value_mae, self.val_value_mae)
-        _, wdl_gap = _val_gap(self.train_value_wdl_acc, self.val_value_wdl_acc)
-        _plot_line(ax, gap_xs, mae_gap, 'MAE gap', colors['gap'], marker='o')
-        ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.2)
-        _style_axis(ax, 'Generalization Gap: Value', 'Val - Train MAE')
+        _plot_line(ax, self.iterations, self.train_value_wdl_ce, 'Train WDL CE', colors['train'], smooth=False)
+        _plot_line(ax, val_epochs, self.val_value_wdl_ce, 'Val WDL CE', colors['val'], marker='o', smooth=False)
+        _mark_best(ax, val_epochs, self.val_value_wdl_ce, mode='min', label='best')
+        _style_axis(ax, 'Value WDL Cross-Entropy', 'CE')
+        if self.train_value_wdl_ce or self.val_value_wdl_ce:
+            _apply_sorted_legend(ax, fontsize=8)
+
+        # Row 4: value diagnostics and moves-left
+        ax = axes[3, 0]
+        _plot_line(ax, self.iterations, self.train_value_std_ratio_opening, 'Train Opening', colors['train'], style='--', alpha=0.72)
+        _plot_line(ax, self.iterations, self.train_value_std_ratio_middlegame, 'Train Middlegame', colors['train'], alpha=0.95)
+        _plot_line(ax, self.iterations, self.train_value_std_ratio_endgame, 'Train Endgame', colors['train'], style=':', alpha=0.72)
+        _plot_line(ax, val_epochs, self.val_value_std_ratio_opening, 'Val Opening', colors['val'], style='--', marker='o', alpha=0.72)
+        _plot_line(ax, val_epochs, self.val_value_std_ratio_middlegame, 'Val Middlegame', colors['val'], marker='o', alpha=0.95)
+        _plot_line(ax, val_epochs, self.val_value_std_ratio_endgame, 'Val Endgame', colors['val'], style=':', marker='o', alpha=0.72)
+        ax.axhline(1.0, color=colors['muted'], linestyle=':', linewidth=1.2)
+        _style_axis(ax, 'Value Std Ratio by Phase', 'Pred std / target std')
+        if (
+            self.train_value_std_ratio_opening or self.train_value_std_ratio_middlegame
+            or self.train_value_std_ratio_endgame or self.val_value_std_ratio_opening
+            or self.val_value_std_ratio_middlegame or self.val_value_std_ratio_endgame
+        ):
+            _apply_sorted_legend(ax, fontsize=7, loc='best')
+        else:
+            _show_no_data(ax, 'Needs new CSV columns')
+
+        ax = axes[3, 1]
+        _plot_line(ax, self.iterations, self.train_value_wdl_ce_opening, 'Train Opening', colors['train'], style='--', alpha=0.75)
+        _plot_line(ax, self.iterations, self.train_value_wdl_ce_middlegame, 'Train Middlegame', colors['train'], alpha=0.95)
+        _plot_line(ax, self.iterations, self.train_value_wdl_ce_endgame, 'Train Endgame', colors['train'], style=':', alpha=0.75)
+        _plot_line(ax, val_epochs, self.val_value_wdl_ce_opening, 'Val Opening', colors['val'], style='--', marker='o', alpha=0.75)
+        _plot_line(ax, val_epochs, self.val_value_wdl_ce_middlegame, 'Val Middlegame', colors['val'], marker='o', alpha=0.95)
+        _plot_line(ax, val_epochs, self.val_value_wdl_ce_endgame, 'Val Endgame', colors['val'], style=':', marker='o', alpha=0.75)
+        _style_axis(ax, 'Value WDL CE by Phase', 'CE')
+        if (
+            self.train_value_wdl_ce_opening or self.train_value_wdl_ce_middlegame
+            or self.train_value_wdl_ce_endgame or self.val_value_wdl_ce_opening
+            or self.val_value_wdl_ce_middlegame or self.val_value_wdl_ce_endgame
+        ):
+            _apply_sorted_legend(ax, fontsize=7, loc='best')
+
+        ax = axes[3, 2]
+        _plot_line(ax, self.iterations, self.train_moves_left_losses, 'Train Global', colors['train'], linewidth=2.2)
+        _plot_line(ax, self.iterations, self.train_moves_left_loss_opening, 'Train Opening', colors['train'], style='--', alpha=0.72)
+        _plot_line(ax, self.iterations, self.train_moves_left_loss_middlegame, 'Train Middlegame', colors['train'], style='-.', alpha=0.72)
+        _plot_line(ax, self.iterations, self.train_moves_left_loss_endgame, 'Train Endgame', colors['train'], style=':', alpha=0.72)
+        _plot_line(ax, val_epochs, self.val_moves_left_losses, 'Val Global', colors['val'], marker='o', linewidth=2.2)
+        _plot_line(ax, val_epochs, self.val_moves_left_loss_opening, 'Val Opening', colors['val'], style='--', marker='o', alpha=0.72)
+        _plot_line(ax, val_epochs, self.val_moves_left_loss_middlegame, 'Val Middlegame', colors['val'], style='-.', marker='o', alpha=0.72)
+        _plot_line(ax, val_epochs, self.val_moves_left_loss_endgame, 'Val Endgame', colors['val'], style=':', marker='o', alpha=0.72)
+        _style_axis(ax, 'Moves-Left SmoothL1 Loss by Phase', 'Loss')
+        if self.train_moves_left_losses or self.val_moves_left_losses:
+            _apply_sorted_legend(ax, fontsize=7, loc='best')
+        else:
+            _show_no_data(ax, 'Needs new CSV columns')
+
+        # Row 5: data diagnostics, Elo, and final summary
+        ax = axes[4, 0]
+        _plot_line(ax, self.iterations, self.train_soft_occurrence_avg, 'Train occurrence', colors['train'])
+        _plot_line(ax, val_epochs, self.val_soft_occurrence_avg, 'Val occurrence', colors['val'], marker='o')
+        _plot_line(ax, self.iterations, self.train_soft_occurrence_max, 'Train max occurrence', colors['train'], style=':', alpha=0.7)
+        _plot_line(ax, val_epochs, self.val_soft_occurrence_max, 'Val max occurrence', colors['val'], style=':', marker='o', alpha=0.7)
+        if any(float(v or 0.0) > 100.0 for v in list(self.train_soft_occurrence_max) + list(self.val_soft_occurrence_max)):
+            ax.set_yscale('log')
+        _style_axis(ax, 'Soft Target Compression', 'Occurrence count')
         ax2 = ax.twinx()
-        _plot_line(ax2, gap_xs, wdl_gap, 'WDL acc gap', '#0891B2', style='--', marker='o', alpha=0.75)
-        ax2.set_ylabel('Val - Train WDL Acc')
-        ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+        _plot_line(ax2, self.iterations, self.train_soft_sample_weight_avg, 'Train weight', '#0891B2', style='--', alpha=0.75)
+        _plot_line(ax2, val_epochs, self.val_soft_sample_weight_avg, 'Val weight', '#F59E0B', style='--', marker='o', alpha=0.75)
+        ax2.set_ylabel('Avg sample weight')
         ax2.tick_params(axis='y', labelcolor='#0891B2')
         ax2.spines['right'].set_alpha(0.18)
         lines, labels = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         if lines or lines2:
             _apply_sorted_legend(ax, lines + lines2, labels + labels2, fontsize=8, loc='best')
+        train_occ_latest = _latest_finite(self.train_soft_occurrence_avg)
+        val_occ_latest = _latest_finite(self.val_soft_occurrence_avg)
+        train_weight_latest = _latest_finite(self.train_soft_sample_weight_avg)
+        val_weight_latest = _latest_finite(self.val_soft_sample_weight_avg)
+        train_occ_max_latest = _latest_finite(self.train_soft_occurrence_max)
+        val_occ_max_latest = _latest_finite(self.val_soft_occurrence_max)
+        train_target_eff_latest = _latest_finite(self.train_policy_target_effective_moves)
+        val_target_eff_latest = _latest_finite(self.val_policy_target_effective_moves)
+        train_target_top1_latest = _latest_finite(self.train_policy_target_mass_top1)
+        val_target_top1_latest = _latest_finite(self.val_policy_target_mass_top1)
+        pool_train_occ = None
+        pool_val_occ = None
+        pool_train_target_eff = None
+        pool_val_target_eff = None
+        pool_train_soft_rate = None
+        pool_val_soft_rate = None
+        soft_stats = (self.run_summary_metadata or {}).get('soft_stats', {}) or {}
+        train_soft_stats = soft_stats.get('train') or {}
+        val_soft_stats = soft_stats.get('val') or {}
+        train_epoch_positions = (self.run_summary_metadata or {}).get('train_epoch_positions')
+        total_epoch_positions = (self.run_summary_metadata or {}).get('total_epoch_positions')
+        total_pool_positions = (self.run_summary_metadata or {}).get('total_pool_positions')
+        if train_soft_stats.get('policy_occ_avg') is not None:
+            pool_train_occ = float(train_soft_stats.get('policy_occ_avg') or 0.0)
+        if val_soft_stats.get('policy_occ_avg') is not None:
+            pool_val_occ = float(val_soft_stats.get('policy_occ_avg') or 0.0)
+        if train_soft_stats.get('policy_target_effective_moves') is not None:
+            pool_train_target_eff = float(train_soft_stats.get('policy_target_effective_moves') or 1.0)
+        if val_soft_stats.get('policy_target_effective_moves') is not None:
+            pool_val_target_eff = float(val_soft_stats.get('policy_target_effective_moves') or 1.0)
+        if train_soft_stats.get('policy_soft_rate') is not None:
+            pool_train_soft_rate = float(train_soft_stats.get('policy_soft_rate') or 0.0)
+        if val_soft_stats.get('policy_soft_rate') is not None:
+            pool_val_soft_rate = float(val_soft_stats.get('policy_soft_rate') or 0.0)
+        if train_occ_latest is not None or val_occ_latest is not None:
+            info_lines = [
+                "sampled avg_occ: "
+                f"T={train_occ_latest:.2f}" if train_occ_latest is not None else "sampled avg_occ: T=-",
+                f"V={val_occ_latest:.2f}" if val_occ_latest is not None else "V=-",
+            ]
+            weight_line = (
+                "sampled weight: "
+                f"T={train_weight_latest:.2f}" if train_weight_latest is not None else "sampled weight: T=-"
+            )
+            weight_line += f", V={val_weight_latest:.2f}" if val_weight_latest is not None else ", V=-"
+            max_line = (
+                "sampled max_occ: "
+                f"T={train_occ_max_latest:.0f}" if train_occ_max_latest is not None else "sampled max_occ: T=-"
+            )
+            max_line += f", V={val_occ_max_latest:.0f}" if val_occ_max_latest is not None else ", V=-"
+            eff_line = (
+                "target_eff_moves: "
+                f"T={train_target_eff_latest:.2f}" if train_target_eff_latest is not None else "target_eff_moves: T=-"
+            )
+            eff_line += f", V={val_target_eff_latest:.2f}" if val_target_eff_latest is not None else ", V=-"
+            top1_line = (
+                "target_top1_mass: "
+                f"T={train_target_top1_latest:.3f}" if train_target_top1_latest is not None else "target_top1_mass: T=-"
+            )
+            top1_line += f", V={val_target_top1_latest:.3f}" if val_target_top1_latest is not None else ", V=-"
+            pool_lines = []
+            if pool_train_occ is not None or pool_val_occ is not None:
+                pool_line = (
+                    "pool avg_occ: "
+                    f"T={pool_train_occ:.2f}" if pool_train_occ is not None else "pool avg_occ: T=-"
+                )
+                pool_line += f", V={pool_val_occ:.2f}" if pool_val_occ is not None else ", V=-"
+                pool_lines.append(pool_line)
+            if pool_train_soft_rate is not None or pool_val_soft_rate is not None:
+                pool_line = (
+                    "pool soft_rows: "
+                    f"T={100.0 * pool_train_soft_rate:.1f}%" if pool_train_soft_rate is not None else "pool soft_rows: T=-"
+                )
+                pool_line += (
+                    f", V={100.0 * pool_val_soft_rate:.1f}%" if pool_val_soft_rate is not None else ", V=-"
+                )
+                pool_lines.append(pool_line)
+            if pool_train_target_eff is not None or pool_val_target_eff is not None:
+                pool_line = (
+                    "pool eff_moves: "
+                    f"T={pool_train_target_eff:.2f}" if pool_train_target_eff is not None else "pool eff_moves: T=-"
+                )
+                pool_line += f", V={pool_val_target_eff:.2f}" if pool_val_target_eff is not None else ", V=-"
+                pool_lines.append(pool_line)
+            detail_lines = [
+                (
+                    "data: "
+                    f"train/epoch={_format_million_count(train_epoch_positions)}, "
+                    f"epoch_total={_format_million_count(total_epoch_positions)}, "
+                    f"pool_total={_format_million_count(total_pool_positions)}"
+                ),
+                f"{info_lines[0]}, {info_lines[1]}",
+                eff_line,
+                top1_line,
+                weight_line,
+            ]
+            detail_lines[1:1] = pool_lines[:2]
+            ax.text(
+                0.02,
+                0.04,
+                "\n".join(detail_lines),
+                transform=ax.transAxes,
+                ha='left',
+                va='bottom',
+                fontsize=8,
+                color='#334155',
+                bbox=dict(boxstyle='round,pad=0.35', fc='white', ec='#CBD5E1', alpha=0.92),
+            )
 
-        # Row 4: WDL CE, Elo, summary
-        ax = axes[3, 0]
-        _plot_line(ax, self.iterations, self.train_value_wdl_ce, 'Train WDL CE', colors['train'])
-        _plot_line(ax, val_epochs, self.val_value_wdl_ce, 'Val WDL CE', colors['val'], marker='o')
-        _mark_best(ax, val_epochs, self.val_value_wdl_ce, mode='min', label='best')
-        _style_axis(ax, 'Value WDL Cross-Entropy', 'CE')
-        if self.train_value_wdl_ce or self.val_value_wdl_ce:
-            _apply_sorted_legend(ax, fontsize=8)
-
-        ax = axes[3, 1]
+        ax = axes[4, 1]
         self._plot_il_elo_panel(ax)
         ax.set_facecolor('#FFFFFF')
 
-        ax = axes[3, 2]
+        ax = axes[4, 2]
         self._plot_il_summary_panel(ax)
 
-        fig.subplots_adjust(left=0.055, right=0.985, bottom=0.045, top=0.925, hspace=0.45, wspace=0.28)
+        for marker_ax in axes.flat[:-1]:
+            _draw_resume_markers(marker_ax, annotate=(marker_ax is axes[0, 0]))
+
+        fig.subplots_adjust(left=0.055, right=0.985, bottom=0.035, top=0.910, hspace=0.50, wspace=0.28)
         fig.savefig(self.plot_path, dpi=150)
         plt.close(fig)
         
@@ -4160,6 +5765,25 @@ class TrainingLogger:
 
         def _series(column):
             return _series_from(rows, column)
+
+        def _series_errors(xs, column):
+            values_by_iteration = {}
+            for row in rows:
+                try:
+                    iteration = int(float(row.get('iteration', '')))
+                    raw = row.get(column, '')
+                    if raw is None or raw == '':
+                        continue
+                    values_by_iteration[iteration] = float(raw)
+                except (TypeError, ValueError):
+                    continue
+            result = []
+            for x in xs or []:
+                try:
+                    result.append(values_by_iteration.get(int(float(x))))
+                except (TypeError, ValueError):
+                    result.append(None)
+            return result
 
         def _detail_series(column):
             return _series_from(detail_rows, column)
@@ -4542,6 +6166,15 @@ class TrainingLogger:
             plotted_elo_points = list(zip(elo_xs, elo_ys))
         else:
             _plot_line(ax, nn_elo_xs, nn_elo_ys, 'Raw NN Elo', '#2563EB', marker='o', linewidth=2.2)
+            self._plot_elo_errorbars(
+                ax,
+                nn_elo_xs,
+                nn_elo_ys,
+                _series_errors(nn_elo_xs, 'estimated_elo_nn_se'),
+                '#2563EB',
+                label='Raw NN ±SE',
+                x_offset=-0.06,
+            )
             sims_xs, sims_ys = _series('estimated_elo_mcts_simulations')
             sims_by_iter = {int(x): int(round(float(y))) for x, y in zip(sims_xs, sims_ys)}
             mcts_label = 'MCTS Elo'
@@ -4552,6 +6185,15 @@ class TrainingLogger:
                 else:
                     mcts_label = "MCTS Elo (sims marked)"
             _plot_line(ax, mcts_elo_xs, mcts_elo_ys, mcts_label, '#059669', marker='s', linewidth=2.2)
+            self._plot_elo_errorbars(
+                ax,
+                mcts_elo_xs,
+                mcts_elo_ys,
+                _series_errors(mcts_elo_xs, 'estimated_elo_mcts_se'),
+                '#059669',
+                label='MCTS ±SE',
+                x_offset=0.06,
+            )
             for x, y in zip(mcts_elo_xs, mcts_elo_ys):
                 sims = sims_by_iter.get(int(x))
                 if sims:

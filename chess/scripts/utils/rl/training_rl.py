@@ -45,11 +45,32 @@ def _snapshot_state_dict_cpu_shared(model):
 
 def _eval_uses_central_inference(config, device):
     rl_cfg = config.get("reinforcement_learning", {})
+    central_cfg = config.get("central_inference", {}) or {}
     enabled = rl_cfg.get(
         "eval_central_inference_enabled",
         rl_cfg.get("self_play_central_inference_enabled", False),
     )
-    return bool(enabled and device.type == "cuda" and torch.cuda.is_available())
+    return bool(enabled and central_cfg.get("enabled", True) and device.type == "cuda" and torch.cuda.is_available())
+
+
+def _central_inference_config(config):
+    return (config or {}).get("central_inference", {}) or {}
+
+
+def _central_inference_option(config, key, default=None):
+    central_cfg = _central_inference_config(config)
+    if key in central_cfg:
+        return central_cfg[key]
+    rl_cfg = (config or {}).get("reinforcement_learning", {}) or {}
+    for prefix in (
+        "eval_central_inference_",
+        "self_play_central_inference_",
+        "central_inference_",
+    ):
+        legacy_key = f"{prefix}{key}"
+        if legacy_key in rl_cfg:
+            return rl_cfg[legacy_key]
+    return default
 
 
 def _resolve_configured_self_play_workers(rl_cfg, cpu_budget):
@@ -113,22 +134,26 @@ def _resolve_eval_workers(config, device, num_games):
 
 
 def _build_eval_central_server_config(config):
-    """Project eval-specific central inference knobs onto the shared server keys."""
+    """Project shared central inference knobs onto the RL server implementation keys."""
     server_config = dict(config)
     rl_cfg = dict(config.get("reinforcement_learning", {}))
-    mappings = {
-        "eval_central_inference_flush_ms": "self_play_central_inference_flush_ms",
-        "eval_central_inference_max_batch_size": "self_play_central_inference_max_batch_size",
-        "eval_central_inference_transport_dtype": "self_play_central_inference_transport_dtype",
-        "eval_central_inference_use_compile": "self_play_central_inference_use_compile",
-        "eval_central_inference_compile_warmup_batches": "self_play_central_inference_compile_warmup_batches",
-        "eval_central_inference_cudnn_benchmark": "self_play_central_inference_cudnn_benchmark",
-        "eval_central_inference_cache_enabled": "self_play_central_inference_cache_enabled",
-        "eval_central_inference_cache_entries": "self_play_central_inference_cache_entries",
+    shared_to_server = {
+        "flush_ms": "self_play_central_inference_flush_ms",
+        "max_batch_size": "self_play_central_inference_max_batch_size",
+        "transport_dtype": "self_play_central_inference_transport_dtype",
+        "use_compile": "self_play_central_inference_use_compile",
+        "compile_warmup_batches": "self_play_central_inference_compile_warmup_batches",
+        "cudnn_benchmark": "self_play_central_inference_cudnn_benchmark",
+        "cache_enabled": "self_play_central_inference_cache_enabled",
+        "cache_entries": "self_play_central_inference_cache_entries",
+        "sync_timing": "self_play_central_inference_sync_timing",
+        "timeout_s": "self_play_central_inference_timeout_s",
+        "stall_warning_s": "self_play_central_inference_stall_warning_s",
     }
-    for eval_key, server_key in mappings.items():
-        if eval_key in rl_cfg:
-            rl_cfg[server_key] = rl_cfg[eval_key]
+    for shared_key, server_key in shared_to_server.items():
+        value = _central_inference_option(config, shared_key, None)
+        if value is not None:
+            rl_cfg[server_key] = value
     server_config["reinforcement_learning"] = rl_cfg
     return server_config
 
@@ -145,8 +170,7 @@ def _build_eval_mcts_config(config):
 
 
 def _resolve_eval_central_server_count(config, workers):
-    rl_cfg = config.get("reinforcement_learning", {})
-    raw_value = rl_cfg.get("eval_central_inference_servers", "auto")
+    raw_value = _central_inference_option(config, "servers", "auto")
     if str(raw_value).strip().lower() not in {"auto", "automatic"}:
         try:
             return max(1, int(raw_value))
@@ -154,9 +178,9 @@ def _resolve_eval_central_server_count(config, workers):
             return 1
 
     workers = max(1, int(workers))
-    target_workers = max(3, int(rl_cfg.get("eval_central_inference_auto_workers_per_server", 6) or 6))
-    min_servers = max(1, int(rl_cfg.get("eval_central_inference_auto_min_servers", 1) or 1))
-    max_servers = max(min_servers, int(rl_cfg.get("eval_central_inference_auto_max_servers", 3) or 3))
+    target_workers = max(3, int(_central_inference_option(config, "auto_workers_per_server", 6) or 6))
+    min_servers = max(1, int(_central_inference_option(config, "auto_min_servers", 1) or 1))
+    max_servers = max(min_servers, int(_central_inference_option(config, "auto_max_servers", 3) or 3))
     by_workers = max(1, (workers + target_workers - 1) // target_workers)
     by_vram = max_servers
     try:
@@ -834,18 +858,9 @@ def _eval_central_worker(
         with contextlib.suppress(Exception):
             torch.set_num_interop_threads(1)
 
-        timeout_s = float(rl_cfg.get(
-            "eval_central_inference_timeout_s",
-            rl_cfg.get("self_play_central_inference_timeout_s", 0),
-        ) or 0)
-        stall_warning_s = float(rl_cfg.get(
-            "eval_central_inference_stall_warning_s",
-            rl_cfg.get("self_play_central_inference_stall_warning_s", 15),
-        ) or 0)
-        transport_dtype = str(rl_cfg.get(
-            "eval_central_inference_transport_dtype",
-            rl_cfg.get("self_play_central_inference_transport_dtype", "float16"),
-        ) or "float16")
+        timeout_s = float(_central_inference_option(config, "timeout_s", 0) or 0)
+        stall_warning_s = float(_central_inference_option(config, "stall_warning_s", 15) or 0)
+        transport_dtype = str(_central_inference_option(config, "transport_dtype", "float16") or "float16")
         debug_enabled = bool(rl_cfg.get("eval_central_inference_debug", False))
 
         model1 = _RemoteInferenceModel(
@@ -970,10 +985,7 @@ def _evaluate_models_with_central_inference(
             proc.start()
             server_processes.append(proc)
 
-        load_timeout_s = float(rl_cfg.get(
-            "eval_central_inference_load_timeout_s",
-            rl_cfg.get("self_play_central_inference_load_timeout_s", 300),
-        ) or 300)
+        load_timeout_s = float(_central_inference_option(config, "load_timeout_s", 300) or 300)
         for request_queue in request_queues:
             request_queue.put({
                 "cmd": "load_models",
@@ -1303,6 +1315,53 @@ def _apply_wdl_label_smoothing(target_wdl, smoothing):
     return target_wdl * (1.0 - smoothing) + (1.0 - target_wdl) * off_value
 
 
+def _legal_only_sparse_policy_loss(
+    policy_logits,
+    policy_indices,
+    policy_values,
+    policy_mask,
+    legal_indices,
+    legal_mask,
+):
+    batch_size = int(policy_logits.size(0))
+    num_classes = int(policy_logits.size(1))
+    if policy_indices.numel() == 0:
+        return torch.zeros(batch_size, device=policy_logits.device, dtype=policy_logits.dtype)
+
+    if legal_indices is None or legal_indices.numel() == 0:
+        legal_indices = policy_indices
+        legal_mask = policy_mask
+
+    safe_policy_indices = policy_indices.long().clamp(0, num_classes - 1)
+    valid_policy_mask = policy_mask & (policy_indices >= 0) & (policy_indices < num_classes)
+    dense_targets = torch.zeros(
+        (batch_size, num_classes),
+        device=policy_logits.device,
+        dtype=policy_logits.float().dtype,
+    )
+    dense_targets.scatter_add_(
+        1,
+        safe_policy_indices,
+        torch.where(valid_policy_mask, policy_values.float(), torch.zeros_like(policy_values.float())),
+    )
+
+    safe_legal_indices = legal_indices.long().clamp(0, num_classes - 1)
+    valid_legal_mask = legal_mask & (legal_indices >= 0) & (legal_indices < num_classes)
+    legal_logits = torch.gather(policy_logits.float(), 1, safe_legal_indices)
+    legal_logits = legal_logits.masked_fill(~valid_legal_mask, -1.0e9)
+    legal_log_probs = F.log_softmax(legal_logits, dim=1)
+
+    legal_targets = torch.gather(dense_targets, 1, safe_legal_indices)
+    legal_targets = torch.where(valid_legal_mask, legal_targets, torch.zeros_like(legal_targets))
+    target_mass = legal_targets.sum(dim=1, keepdim=True)
+    legal_targets = torch.where(
+        target_mass > 0.0,
+        legal_targets / target_mass.clamp_min(1e-8),
+        legal_targets,
+    )
+    return -(legal_targets * legal_log_probs).sum(dim=1).to(dtype=policy_logits.dtype)
+
+
 def _weighted_mean(losses, weights):
     weights = torch.clamp(weights.to(dtype=losses.dtype), min=0.0)
     weight_total = weights.sum()
@@ -1326,15 +1385,28 @@ def train_on_batch_rl(
     best_policy_kl_weight_override=None,
     best_value_distill_weight_override=None,
 ):
-    if len(batch) >= 7:
+    if len(batch) >= 10:
+        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask = batch[:10]
+    elif len(batch) >= 8:
+        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets = batch[:8]
+        legal_indices = policy_indices
+        legal_mask = policy_mask
+    elif len(batch) >= 7:
         boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights = batch[:7]
+        moves_left_targets = torch.zeros_like(value_targets, dtype=torch.float32)
+        legal_indices = policy_indices
+        legal_mask = policy_mask
     else:
         boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights = batch
         value_sample_weights = torch.ones_like(policy_sample_weights, dtype=torch.float32)
+        moves_left_targets = torch.zeros_like(value_targets, dtype=torch.float32)
+        legal_indices = policy_indices
+        legal_mask = policy_mask
     if config["reinforcement_learning"].get("replay_fp16", False):
         boards = boards.float()
         policy_values = policy_values.float()
         value_targets = value_targets.float()
+        moves_left_targets = moves_left_targets.float()
 
     boards, policy_indices, policy_values, policy_mask = _maybe_augment_batch(
         boards, policy_indices, policy_values, policy_mask, config
@@ -1343,9 +1415,13 @@ def train_on_batch_rl(
     policy_indices = policy_indices.to(device, non_blocking=True)
     policy_values = policy_values.to(device, non_blocking=True)
     policy_mask = policy_mask.to(device, non_blocking=True)
+    legal_indices = legal_indices.to(device, non_blocking=True)
+    legal_mask = legal_mask.to(device, non_blocking=True)
     value_targets = value_targets.to(device, non_blocking=True)
     policy_sample_weights = policy_sample_weights.to(device, non_blocking=True)
     value_sample_weights = value_sample_weights.to(device, non_blocking=True)
+    moves_left_targets = moves_left_targets.to(device, non_blocking=True)
+    value_sample_weights = torch.ones_like(value_sample_weights, dtype=torch.float32, device=device)
     effective_policy_mask = policy_mask & (policy_sample_weights.unsqueeze(1) > 0)
 
     optimizer.zero_grad(set_to_none=True)
@@ -1365,15 +1441,7 @@ def train_on_batch_rl(
         0.0,
         float(rl_cfg.get("value_std_floor_target_ratio", 0.70)),
     )
-    value_phase_calibration_enabled = bool(rl_cfg.get("value_phase_calibration_enabled", False))
-    value_phase_opening_weight = max(0.05, float(rl_cfg.get("value_phase_opening_weight", 0.85)))
-    value_phase_middlegame_weight = max(0.05, float(rl_cfg.get("value_phase_middlegame_weight", 1.10)))
-    value_phase_endgame_weight = max(0.05, float(rl_cfg.get("value_phase_endgame_weight", 1.25)))
-    value_phase_decisive_bonus = max(0.0, float(rl_cfg.get("value_phase_decisive_bonus", 0.15)))
-    value_phase_decisive_threshold = max(
-        0.0,
-        min(1.0, float(rl_cfg.get("value_phase_decisive_threshold", 0.70))),
-    )
+    moves_left_loss_weight = max(0.0, float(rl_cfg.get("moves_left_loss_weight", 0.05)))
     policy_anchor_kl_weight = max(
         0.0,
         float(rl_cfg.get("policy_anchor_kl_weight", 0.0)),
@@ -1396,7 +1464,12 @@ def train_on_batch_rl(
     )
 
     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-        policy_pred, value_pred = model(boards)
+        policy_logits, value_pred, moves_left_pred = model(
+            boards,
+            apply_log_softmax=False,
+            return_moves_left=True,
+        )
+        policy_pred = F.log_softmax(policy_logits.float(), dim=1)
         policy_anchor_kl_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
         best_policy_kl_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
         best_value_distill_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
@@ -1426,10 +1499,14 @@ def train_on_batch_rl(
         if policy_indices.numel() == 0:
             policy_loss = torch.zeros(policy_pred.size(0), device=policy_pred.device, dtype=policy_pred.dtype)
         else:
-            safe_indices = policy_indices.long().clamp_min(0)
-            gathered_log_probs = torch.gather(policy_pred, 1, safe_indices)
-            gathered_log_probs = torch.where(effective_policy_mask, gathered_log_probs, torch.zeros_like(gathered_log_probs))
-            policy_loss = -(policy_values * gathered_log_probs).sum(dim=1)
+            policy_loss = _legal_only_sparse_policy_loss(
+                policy_logits,
+                policy_indices,
+                policy_values,
+                effective_policy_mask,
+                legal_indices,
+                legal_mask,
+            )
             rl_cfg = config.get("reinforcement_learning", {})
             if bool(rl_cfg.get("policy_target_confidence_weighting_enabled", False)):
                 valid_targets = torch.where(
@@ -1465,35 +1542,6 @@ def train_on_batch_rl(
         target_scalar = _final_outcome_targets(value_targets)
         target_value_std = target_scalar.std(unbiased=False)
         effective_value_sample_weights = value_sample_weights
-        if value_phase_calibration_enabled and boards.dim() == 4 and boards.size(1) > 15:
-            fullmove_indices = torch.clamp(
-                boards[:, 15, 0, 0].float() * 100.0,
-                min=0.0,
-                max=float(rl_cfg.get("value_phase_max_fullmove", 120)),
-            )
-            opening_max = float(rl_cfg.get("value_phase_opening_max_fullmove", 12))
-            endgame_min = float(rl_cfg.get("value_phase_endgame_min_fullmove", 40))
-            phase_weights = torch.full_like(target_scalar, value_phase_middlegame_weight)
-            phase_weights = torch.where(
-                fullmove_indices <= opening_max,
-                torch.full_like(phase_weights, value_phase_opening_weight),
-                phase_weights,
-            )
-            phase_weights = torch.where(
-                fullmove_indices >= endgame_min,
-                torch.full_like(phase_weights, value_phase_endgame_weight),
-                phase_weights,
-            )
-            if value_phase_decisive_bonus > 0.0 and value_phase_decisive_threshold < 1.0:
-                decisive_strength = torch.clamp(
-                    (torch.abs(target_scalar) - value_phase_decisive_threshold)
-                    / max(1e-6, 1.0 - value_phase_decisive_threshold),
-                    min=0.0,
-                    max=1.0,
-                )
-                phase_weights = phase_weights * (1.0 + value_phase_decisive_bonus * decisive_strength)
-            phase_weights = phase_weights / phase_weights.mean().clamp_min(1e-6)
-            effective_value_sample_weights = value_sample_weights * phase_weights.to(dtype=value_sample_weights.dtype)
 
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
             target_wdl = _wdl_targets_from_final_outcome(target_scalar)
@@ -1568,6 +1616,13 @@ def train_on_batch_rl(
             else:
                 policy_loss = policy_loss.sum() * 0.0
         value_loss = _weighted_mean(value_loss, effective_value_sample_weights)
+        moves_left_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        if moves_left_loss_weight > 0.0 and moves_left_pred is not None:
+            pred_mlh = moves_left_pred.reshape(-1)
+            target_mlh = torch.log1p(
+                torch.clamp(moves_left_targets.reshape(-1).to(dtype=pred_mlh.dtype), min=0.0)
+            )
+            moves_left_loss = F.smooth_l1_loss(pred_mlh, target_mlh, beta=0.25)
         policy_weight = (
             float(config["reinforcement_learning"]["policy_loss_weight"])
             if policy_weight_override is None
@@ -1581,6 +1636,7 @@ def train_on_batch_rl(
         loss = (
             policy_weight * policy_loss
             + value_weight * value_loss
+            + moves_left_loss_weight * moves_left_loss
             + value_std_floor_loss_weight * value_std_floor_loss
             + policy_anchor_kl_weight * policy_anchor_kl_loss
             + best_policy_kl_weight * best_policy_kl_loss

@@ -15,9 +15,13 @@ import yaml
 import sys
 import io
 import math
+import os
+import queue
+import copy
 import ctypes
 import time
 import wave
+import threading
 import numpy as np
 from array import array
 from pathlib import Path
@@ -29,15 +33,21 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet
-from src.batch_selfplay import MCTS, select_move_by_visits
+from src.batch_selfplay import MCTS, MultiGameBatchMCTS, select_move_by_visits
 
 #  v4.2: Import board_to_tensor from data_helpers
 #  v4.4: Added move_to_index for POV-aware move encoding
 from src.utils.data_helpers import board_to_tensor, move_to_index
 
 # Import from utils
-from utils.ui.game_setup import load_model_from_checkpoint, select_models, write_setup_log
-from utils.shared.model_catalog import load_checkpoint_metadata
+from utils.ui.game_setup import (
+    _infer_architecture_from_state_dict,
+    load_model_from_checkpoint,
+    select_models,
+    write_setup_log,
+)
+from utils.shared.central_inference_session import CentralInferenceSession, snapshot_model_state_cpu
+from utils.shared.model_catalog import format_elo_summary, load_checkpoint_metadata
 from utils.ui.gui_helpers import (
     build_pgn_game,
     create_piece_surfaces,
@@ -65,6 +75,282 @@ _enable_windows_dpi_awareness()
 
 # Initialize Pygame
 pygame.init()
+
+
+def _headless_history_tensor(board, board_history, history_positions):
+    history_positions = max(0, int(history_positions or 0))
+    if history_positions <= 0:
+        return board_to_tensor(board)
+
+    tensors = []
+    flip_history = board.turn == chess.BLACK
+    for hist_board in list(board_history)[-history_positions:]:
+        tensors.append(board_to_tensor(hist_board, flip_perspective=flip_history))
+    while len(tensors) < history_positions:
+        tensors.insert(0, np.zeros((16, 8, 8), dtype=np.float32))
+    tensors.append(board_to_tensor(board))
+    return np.concatenate(tensors, axis=0)
+
+
+@torch.inference_mode()
+def _headless_raw_move(model, board, board_history, device, inference_lock=None):
+    history_positions = int(getattr(model, "history_positions", 0) or 0)
+    board_tensor = torch.from_numpy(
+        _headless_history_tensor(board, board_history, history_positions)
+    ).unsqueeze(0).to(device)
+    lock = inference_lock
+    if lock is None:
+        policy_logits, _ = model(board_tensor, apply_log_softmax=False)
+    else:
+        with lock:
+            policy_logits, _ = model(board_tensor, apply_log_softmax=False)
+    policy = policy_logits.float().cpu().numpy()[0]
+
+    best_move = None
+    best_score = -float("inf")
+    for move in board.legal_moves:
+        idx = move_to_index(move, board)
+        if idx is not None and 0 <= idx < len(policy) and policy[idx] > best_score:
+            best_score = float(policy[idx])
+            best_move = move
+    return best_move
+
+
+def _headless_ai_game(
+    white_model,
+    black_model,
+    config,
+    device,
+    *,
+    use_mcts_white=False,
+    use_mcts_black=False,
+    mcts_simulations_white=100,
+    mcts_simulations_black=100,
+    max_moves=220,
+    stop_event=None,
+    inference_lock=None,
+):
+    board = chess.Board()
+    board_history = []
+    mcts_white = MCTS(white_model, config, device) if use_mcts_white else None
+    mcts_black = MCTS(black_model, config, device) if use_mcts_black else None
+    if mcts_white is not None:
+        mcts_white.history_positions = int(getattr(white_model, "history_positions", 0) or 0)
+    if mcts_black is not None:
+        mcts_black.history_positions = int(getattr(black_model, "history_positions", 0) or 0)
+
+    for _ply in range(max(1, int(max_moves))):
+        if stop_event is not None and stop_event.is_set():
+            return None, len(board_history)
+        if board.is_game_over(claim_draw=True):
+            break
+
+        moving_color = board.turn
+        model = white_model if moving_color == chess.WHITE else black_model
+        mcts = mcts_white if moving_color == chess.WHITE else mcts_black
+        sims = mcts_simulations_white if moving_color == chess.WHITE else mcts_simulations_black
+
+        if mcts is not None:
+            visit_counts = mcts.search(board, max(1, int(sims)))
+            if visit_counts:
+                move, _ = select_move_by_visits(visit_counts, temperature=0.0)
+            else:
+                move = _headless_raw_move(model, board, board_history, device, inference_lock)
+        else:
+            move = _headless_raw_move(model, board, board_history, device, inference_lock)
+
+        if move is None or move not in board.legal_moves:
+            move = next(iter(board.legal_moves), None)
+        if move is None:
+            break
+
+        board_history.append(board.copy())
+        for mcts_obj in (mcts_white, mcts_black):
+            if mcts_obj is not None:
+                mcts_obj.update_history(board)
+                mcts_obj.advance_root(move)
+        board.push(move)
+
+    result = board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "1/2-1/2"
+    return result, len(board_history)
+
+
+def _advance_detached_root(root, move):
+    if root is None:
+        return None, False
+    try:
+        child = root.get_child_for_move(move)
+    except Exception:
+        child = None
+    if child is None:
+        return None, False
+    try:
+        _ = child.board
+        return child.detach_as_root(), True
+    except Exception:
+        return None, False
+
+
+def _headless_ai_games_batched(
+    model_a,
+    model_b,
+    config,
+    device,
+    game_indices,
+    *,
+    use_mcts_a=False,
+    use_mcts_b=False,
+    mcts_simulations_a=100,
+    mcts_simulations_b=100,
+    max_moves=220,
+    active_games=4,
+    stop_event=None,
+    inference_lock=None,
+    result_callback=None,
+):
+    pending = list(game_indices or [])
+    active_games = max(1, int(active_games or 1))
+    max_moves = max(1, int(max_moves or 220))
+    active = []
+    completed = 0
+
+    mcts_a = MultiGameBatchMCTS(model_a, config, device) if use_mcts_a else None
+    mcts_b = MultiGameBatchMCTS(model_b, config, device) if use_mcts_b else None
+    if mcts_a is not None:
+        mcts_a.history_positions = int(getattr(model_a, "history_positions", 0) or 0)
+    if mcts_b is not None:
+        mcts_b.history_positions = int(getattr(model_b, "history_positions", 0) or 0)
+
+    def new_slot(game_index):
+        return {
+            "game_index": int(game_index),
+            "white_is_model1": int(game_index) % 2 == 0,
+            "board": chess.Board(),
+            "history": [],
+            "plies": 0,
+            "root_a": None,
+            "root_b": None,
+            "sync_a": False,
+            "sync_b": False,
+        }
+
+    def finish_slot(slot):
+        nonlocal completed
+        board = slot["board"]
+        result = board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "1/2-1/2"
+        completed += 1
+        if result_callback is not None:
+            result_callback(
+                result,
+                int(slot.get("plies", 0) or 0),
+                bool(slot.get("white_is_model1", True)),
+            )
+
+    while (pending or active) and not (stop_event is not None and stop_event.is_set()):
+        while pending and len(active) < active_games:
+            active.append(new_slot(pending.pop(0)))
+        if not active:
+            break
+
+        finished_indices = []
+        search_groups = {}
+        raw_slots = []
+
+        for slot_idx, slot in enumerate(active):
+            board = slot["board"]
+            if board.is_game_over(claim_draw=True) or int(slot["plies"]) >= max_moves:
+                finished_indices.append(slot_idx)
+                continue
+
+            white_is_a = bool(slot["white_is_model1"])
+            moving_is_a = (board.turn == chess.WHITE and white_is_a) or (board.turn == chess.BLACK and not white_is_a)
+            if moving_is_a:
+                use_mcts = bool(use_mcts_a and mcts_a is not None)
+                sims = max(1, int(mcts_simulations_a))
+                key = ("a", sims)
+            else:
+                use_mcts = bool(use_mcts_b and mcts_b is not None)
+                sims = max(1, int(mcts_simulations_b))
+                key = ("b", sims)
+
+            if use_mcts:
+                search_groups.setdefault(key, []).append(slot_idx)
+            else:
+                raw_slots.append((slot_idx, moving_is_a))
+
+        moves_by_slot = {}
+        for slot_idx, moving_is_a in raw_slots:
+            slot = active[slot_idx]
+            model = model_a if moving_is_a else model_b
+            move = _headless_raw_move(
+                model,
+                slot["board"],
+                slot["history"],
+                device,
+                inference_lock,
+            )
+            moves_by_slot[slot_idx] = move
+
+        for (model_key, sims), slot_indices in search_groups.items():
+            mcts = mcts_a if model_key == "a" else mcts_b
+            states = []
+            for slot_idx in slot_indices:
+                slot = active[slot_idx]
+                states.append({
+                    "board": slot["board"],
+                    "root": slot["root_a"] if model_key == "a" else slot["root_b"],
+                    "_root_synced": bool(slot["sync_a"] if model_key == "a" else slot["sync_b"]),
+                    "board_history": slot["history"],
+                })
+            visit_counts_list = mcts.search_many(states, num_simulations=sims)
+            for slot_idx, state, visit_counts in zip(slot_indices, states, visit_counts_list):
+                slot = active[slot_idx]
+                if model_key == "a":
+                    slot["root_a"] = state.get("root")
+                    slot["sync_a"] = bool(state.get("_root_synced", False))
+                else:
+                    slot["root_b"] = state.get("root")
+                    slot["sync_b"] = bool(state.get("_root_synced", False))
+                if visit_counts:
+                    move, _ = select_move_by_visits(visit_counts, temperature=0.0)
+                else:
+                    moving_is_a = model_key == "a"
+                    move = _headless_raw_move(
+                        model_a if moving_is_a else model_b,
+                        slot["board"],
+                        slot["history"],
+                        device,
+                        inference_lock,
+                    )
+                moves_by_slot[slot_idx] = move
+
+        for slot_idx, move in sorted(moves_by_slot.items(), reverse=True):
+            if slot_idx >= len(active):
+                continue
+            slot = active[slot_idx]
+            board = slot["board"]
+            if move is None or move not in board.legal_moves:
+                move = next(iter(board.legal_moves), None)
+            if move is None:
+                finished_indices.append(slot_idx)
+                continue
+
+            slot["history"].append(board.copy())
+            max_history = int(config.get("model", {}).get("history_positions", 0) or 0) + 10
+            if len(slot["history"]) > max_history:
+                slot["history"] = slot["history"][-max_history:]
+            slot["root_a"], slot["sync_a"] = _advance_detached_root(slot["root_a"], move)
+            slot["root_b"], slot["sync_b"] = _advance_detached_root(slot["root_b"], move)
+            board.push(move)
+            slot["plies"] = int(slot["plies"]) + 1
+            if board.is_game_over(claim_draw=True) or int(slot["plies"]) >= max_moves:
+                finished_indices.append(slot_idx)
+
+        for slot_idx in sorted(set(finished_indices), reverse=True):
+            if 0 <= slot_idx < len(active):
+                finish_slot(active.pop(slot_idx))
+
+    return completed
 
 # Constants
 SQUARE_SIZE = 80
@@ -233,6 +519,7 @@ class ChessGUI:
         use_mcts_black=None,
         mcts_simulations_white=None,
         mcts_simulations_black=None,
+        match_games=1,
     ):
         self.model1 = model1  # White AI or main AI
         self.model2 = model2  # Black AI (for AI vs AI mode)
@@ -254,6 +541,10 @@ class ChessGUI:
             self.mcts_simulations_black = max(1, int(mcts_simulations_black if mcts_simulations_black is not None else default_mcts_sims))
         except (TypeError, ValueError):
             self.mcts_simulations_black = default_mcts_sims
+        try:
+            self.match_total_games = max(1, min(500, int(match_games)))
+        except (TypeError, ValueError):
+            self.match_total_games = 1
         
         #  MCTS toggle
         self.mcts_enabled = enable_mcts
@@ -269,14 +560,20 @@ class ChessGUI:
         if model1 and self.mcts_enabled:
             self.mcts1 = MCTS(model1, config, device)
             self.mcts1.history_positions = self.model1_history_positions
+            self.analysis_mcts1 = MCTS(model1, config, device)
+            self.analysis_mcts1.history_positions = self.model1_history_positions
         else:
             self.mcts1 = None
+            self.analysis_mcts1 = None
             
         if model2 and self.mcts_enabled:
             self.mcts2 = MCTS(model2, config, device)
             self.mcts2.history_positions = self.model2_history_positions
+            self.analysis_mcts2 = MCTS(model2, config, device)
+            self.analysis_mcts2.history_positions = self.model2_history_positions
         else:
             self.mcts2 = None
+            self.analysis_mcts2 = None
 
         default_window_width, default_window_height = _get_default_window_size()
         self.base_width = max(CANVAS_MIN_WIDTH, default_window_width)
@@ -335,6 +632,14 @@ class ChessGUI:
         self.analysis_cache = self._empty_analysis_cache()
         self.analysis_cache_by_color = self._empty_analysis_cache_by_color()
         self.mcts_analysis_cache_by_color = self._empty_analysis_cache_by_color()
+        self.match_lock = threading.Lock()
+        self.match_stop_event = threading.Event()
+        self.match_thread = None
+        self.match_threads = []
+        self.match_central_session = None
+        self.match_generation = 0
+        self.inference_lock = threading.Lock()
+        self.match_stats = self._new_match_stats()
         self._resize_canvas(*self.restore_window_size)
         self._update_viewport()
         try:
@@ -390,6 +695,7 @@ class ChessGUI:
         self.current_game_saved = False
         self.game_index = 1
         self._refresh_analysis_cache()
+        self._start_background_match_games()
 
     @staticmethod
     def _build_vertical_gradient(width, height, top_color, bottom_color):
@@ -821,18 +1127,6 @@ class ChessGUI:
         return version_text if version_text.startswith("v") else f"v{version_text}"
 
     @staticmethod
-    def _format_elo(metadata):
-        if not metadata:
-            return "n/a"
-        elo_value = metadata.get("elo")
-        if elo_value is None:
-            return "n/a"
-        try:
-            return str(int(round(float(elo_value))))
-        except (TypeError, ValueError):
-            return "n/a"
-
-    @staticmethod
     def _format_duration(seconds):
         try:
             total_seconds = max(0.0, float(seconds))
@@ -865,6 +1159,386 @@ class ChessGUI:
             chess.WHITE: {"rows": [], "label": "White", "fen": None},
             chess.BLACK: {"rows": [], "label": "Black", "fen": None},
         }
+
+    def _new_match_stats(self):
+        return {
+            "completed": 0,
+            "white_wins": 0,
+            "black_wins": 0,
+            "draws": 0,
+            "model1_wins": 0,
+            "model2_wins": 0,
+            "model1_score_x2": 0,
+            "model2_score_x2": 0,
+            "model1_as_white": 0,
+            "model1_as_black": 0,
+            "visible_counted": False,
+            "background_done": self.match_total_games <= 1,
+            "background_starting": False,
+            "background_workers": 0,
+            "active_games_per_worker": 0,
+            "central_inference": False,
+            "error": None,
+            "plies_total": 0,
+            "started_at": time.perf_counter(),
+        }
+
+    def _match_enabled(self):
+        return (
+            self.game_mode == "ai_vs_ai"
+            and self.model1 is not None
+            and self.model2 is not None
+            and self.match_total_games > 1
+        )
+
+    def _record_match_result(self, result, plies=0, *, visible=False, generation=None, white_is_model1=True):
+        if self.game_mode != "ai_vs_ai":
+            return
+        with self.match_lock:
+            if generation is not None and int(generation) != int(self.match_generation):
+                return
+            if visible and self.match_stats.get("visible_counted"):
+                return
+            if visible:
+                self.match_stats["visible_counted"] = True
+            if result == "1-0":
+                self.match_stats["white_wins"] += 1
+            elif result == "0-1":
+                self.match_stats["black_wins"] += 1
+            else:
+                self.match_stats["draws"] += 1
+            if white_is_model1:
+                self.match_stats["model1_as_white"] += 1
+            else:
+                self.match_stats["model1_as_black"] += 1
+            if result == "1-0":
+                if white_is_model1:
+                    self.match_stats["model1_wins"] += 1
+                    self.match_stats["model1_score_x2"] += 2
+                else:
+                    self.match_stats["model2_wins"] += 1
+                    self.match_stats["model2_score_x2"] += 2
+            elif result == "0-1":
+                if white_is_model1:
+                    self.match_stats["model2_wins"] += 1
+                    self.match_stats["model2_score_x2"] += 2
+                else:
+                    self.match_stats["model1_wins"] += 1
+                    self.match_stats["model1_score_x2"] += 2
+            else:
+                self.match_stats["model1_score_x2"] += 1
+                self.match_stats["model2_score_x2"] += 1
+            self.match_stats["completed"] = min(
+                self.match_total_games,
+                int(self.match_stats.get("completed", 0)) + 1,
+            )
+            self.match_stats["plies_total"] += max(0, int(plies or 0))
+
+    def _record_visible_match_result(self):
+        if self.game_mode != "ai_vs_ai":
+            return
+        self._record_match_result(self.board.result(), len(self.move_history), visible=True)
+
+    def _match_snapshot(self):
+        with self.match_lock:
+            snapshot = dict(self.match_stats)
+        snapshot["total"] = int(self.match_total_games)
+        return snapshot
+
+    def _mark_background_done(self, error=None, generation=None):
+        with self.match_lock:
+            if generation is not None and int(generation) != int(self.match_generation):
+                return
+            self.match_stats["background_done"] = True
+            self.match_stats["background_starting"] = False
+            if error:
+                self.match_stats["error"] = str(error)
+
+    def _resolve_match_worker_count(self, remaining_games):
+        try:
+            raw_workers = self.config.get("play", {}).get("match_workers", "auto")
+        except Exception:
+            raw_workers = "auto"
+        if isinstance(raw_workers, str) and raw_workers.strip().lower() == "auto":
+            cpu_count = os.cpu_count() or 1
+            workers = max(1, cpu_count - 1)
+        else:
+            try:
+                workers = int(raw_workers)
+            except (TypeError, ValueError):
+                workers = max(1, (os.cpu_count() or 1) - 1)
+        return max(1, min(int(remaining_games), workers))
+
+    def _resolve_match_active_games_per_worker(self, remaining_games, worker_count):
+        try:
+            raw_value = self.config.get("play", {}).get("match_active_games_per_worker", "auto")
+        except Exception:
+            raw_value = "auto"
+        if isinstance(raw_value, str) and raw_value.strip().lower() in {"auto", "automatic"}:
+            # Keep a small per-thread batch. RL self-play can go wider because it
+            # owns process workers; play.py shares a UI process and should stay responsive.
+            value = 4 if (self.use_mcts_white or self.use_mcts_black) else 8
+        else:
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError):
+                value = 4
+        if worker_count <= 0:
+            worker_count = 1
+        max_reasonable = max(1, int(math.ceil(float(max(1, remaining_games)) / float(worker_count))))
+        return max(1, min(int(value), max_reasonable))
+
+    @staticmethod
+    def _state_shapes_for_match(model):
+        if model is None:
+            return {}
+        shapes = {}
+        for key, value in model.state_dict().items():
+            if key.endswith(("coord_x", "coord_y")):
+                continue
+            shapes[key] = tuple(value.shape)
+        return shapes
+
+    def _central_match_enabled_in_config(self):
+        try:
+            central_cfg = self.config.get("central_inference", {}) or {}
+        except Exception:
+            central_cfg = {}
+        return bool(central_cfg.get("enabled", True))
+
+    def _build_match_central_config(self):
+        state1 = self.model1.state_dict() if self.model1 is not None else {}
+        state2 = self.model2.state_dict() if self.model2 is not None else {}
+        shapes1 = self._state_shapes_for_match(self.model1)
+        shapes2 = self._state_shapes_for_match(self.model2)
+        if not shapes1 or not shapes2 or shapes1 != shapes2:
+            return None
+        inferred_arch = _infer_architecture_from_state_dict(state1)
+        central_config = copy.deepcopy(self.config)
+        central_config.setdefault("model", {})
+        central_config["model"].update(inferred_arch)
+        central_config["model"]["print_summary"] = False
+        return central_config
+
+    def _start_match_central_session(self, worker_count):
+        if (
+            self.match_central_session is not None
+            or not self._central_match_enabled_in_config()
+            or self.device.type != "cuda"
+            or self.model1 is None
+            or self.model2 is None
+        ):
+            return None
+        central_config = self._build_match_central_config()
+        if central_config is None:
+            return None
+        session = None
+        try:
+            session = CentralInferenceSession(
+                config=central_config,
+                device=self.device,
+                workers=max(1, int(worker_count)),
+                model_states={
+                    "model_a": snapshot_model_state_cpu(self.model1),
+                    "model_b": snapshot_model_state_cpu(self.model2),
+                },
+                option_prefix="",
+                model_label="model_a",
+                rank_base=740000,
+            )
+            session.start()
+        except Exception as exc:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            if self.console_verbose:
+                print(f"AI-vs-AI central inference disabled: {exc}")
+            return None
+        self.match_central_session = session
+        if self.console_verbose:
+            print(f"AI-vs-AI central inference: {session.describe()}")
+        return session
+
+    def _stop_match_central_session(self):
+        session = self.match_central_session
+        self.match_central_session = None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def _start_background_match_games(self):
+        if not self._match_enabled():
+            return
+
+        remaining_games = max(0, self.match_total_games - 1)
+        if remaining_games <= 0:
+            return
+
+        stop_event = threading.Event()
+        self.match_stop_event = stop_event
+        with self.match_lock:
+            generation = int(self.match_generation)
+            self.match_stats["background_done"] = False
+            self.match_stats["background_starting"] = True
+
+        try:
+            max_moves = int(
+                self.config.get("play", {}).get(
+                    "match_max_moves",
+                    self.config.get("elo_estimator", {}).get("max_moves", 220),
+                )
+            )
+        except (TypeError, ValueError):
+            max_moves = 220
+
+        worker_count = self._resolve_match_worker_count(remaining_games)
+        active_games_per_worker = self._resolve_match_active_games_per_worker(remaining_games, worker_count)
+        game_queue = queue.Queue()
+        for game_index in range(1, remaining_games + 1):
+            game_queue.put(game_index)
+
+        with self.match_lock:
+                if generation == int(self.match_generation):
+                    self.match_stats["background_workers"] = int(worker_count)
+                    self.match_stats["active_games_per_worker"] = int(active_games_per_worker)
+                    self.match_stats["central_inference"] = False
+
+        def coordinator():
+            central_session = None
+            try:
+                if not stop_event.is_set():
+                    central_session = self._start_match_central_session(worker_count)
+                if stop_event.is_set():
+                    if central_session is not None and self.match_central_session is central_session:
+                        self._stop_match_central_session()
+                    self._mark_background_done(generation=generation)
+                    return
+            except Exception as exc:
+                with self.match_lock:
+                    if generation == int(self.match_generation):
+                        self.match_stats["background_starting"] = False
+                self._mark_background_done(error=exc, generation=generation)
+                return
+
+            with self.match_lock:
+                if generation == int(self.match_generation):
+                    self.match_stats["background_starting"] = False
+                    self.match_stats["background_workers"] = int(worker_count)
+                    self.match_stats["active_games_per_worker"] = int(active_games_per_worker)
+                    self.match_stats["central_inference"] = bool(central_session is not None)
+
+            done_lock = threading.Lock()
+            done_workers = 0
+            first_error = None
+
+            def mark_worker_finished(error=None):
+                nonlocal done_workers, first_error
+                with done_lock:
+                    done_workers += 1
+                    if error is not None:
+                        first_error = first_error or error
+                    all_done = done_workers >= worker_count
+                    final_error = first_error
+                if error is not None:
+                    stop_event.set()
+                if all_done:
+                    self._mark_background_done(error=final_error, generation=generation)
+                    if central_session is not None and self.match_central_session is central_session:
+                        self._stop_match_central_session()
+
+            def worker(worker_id):
+                remote_model_a = None
+                remote_model_b = None
+                if central_session is not None:
+                    remote_model_a = central_session.remote_model_for_current_thread("model_a")
+                    remote_model_b = central_session.remote_model_for_current_thread("model_b")
+                    setattr(remote_model_a, "history_positions", self.model1_history_positions)
+                    setattr(remote_model_b, "history_positions", self.model2_history_positions)
+                try:
+                    while not stop_event.is_set():
+                        game_indices = []
+                        max_chunk_games = max(active_games_per_worker, active_games_per_worker * 4)
+                        for _ in range(max_chunk_games):
+                            try:
+                                game_indices.append(game_queue.get_nowait())
+                            except queue.Empty:
+                                break
+                        if not game_indices:
+                            break
+
+                        model_a = remote_model_a if remote_model_a is not None else self.model1
+                        model_b = remote_model_b if remote_model_b is not None else self.model2
+
+                        def on_result(result, plies, white_is_model1):
+                            self._record_match_result(
+                                result,
+                                plies,
+                                visible=False,
+                                generation=generation,
+                                white_is_model1=white_is_model1,
+                            )
+
+                        _headless_ai_games_batched(
+                            model_a,
+                            model_b,
+                            self.config,
+                            torch.device("cpu") if central_session is not None else self.device,
+                            game_indices,
+                            use_mcts_a=self.use_mcts_white,
+                            use_mcts_b=self.use_mcts_black,
+                            mcts_simulations_a=self.mcts_simulations_white,
+                            mcts_simulations_b=self.mcts_simulations_black,
+                            max_moves=max_moves,
+                            active_games=active_games_per_worker,
+                            stop_event=stop_event,
+                            inference_lock=None if central_session is not None else self.inference_lock,
+                            result_callback=on_result,
+                        )
+                except Exception as exc:
+                    mark_worker_finished(exc)
+                    return
+                mark_worker_finished()
+
+            worker_threads = [
+                threading.Thread(
+                    target=worker,
+                    args=(idx,),
+                    name=f"play-ai-vs-ai-match-{idx + 1}",
+                    daemon=True,
+                )
+                for idx in range(worker_count)
+            ]
+            with self.match_lock:
+                if generation == int(self.match_generation):
+                    self.match_threads = [threading.current_thread()] + worker_threads
+                    self.match_thread = worker_threads[0] if worker_threads else threading.current_thread()
+            for thread in worker_threads:
+                thread.start()
+
+        coordinator_thread = threading.Thread(
+            target=coordinator,
+            name="play-ai-vs-ai-match-coordinator",
+            daemon=True,
+        )
+        self.match_threads = [coordinator_thread]
+        self.match_thread = coordinator_thread
+        coordinator_thread.start()
+
+    def _stop_background_match(self):
+        self.match_stop_event.set()
+        threads = list(getattr(self, "match_threads", []) or [])
+        if not threads and self.match_thread is not None:
+            threads = [self.match_thread]
+        for thread in threads:
+            if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+                thread.join(timeout=0.5)
+        self.match_threads = []
+        self.match_thread = None
+        self._stop_match_central_session()
 
     def _reset_analysis_storage(self):
         self.analysis_cache = self._empty_analysis_cache()
@@ -1070,8 +1744,8 @@ class ChessGUI:
         if not self._side_uses_mcts(color):
             return None
         if self.game_mode == "ai_vs_ai":
-            return self.mcts1 if color == chess.WHITE else self.mcts2
-        return self.mcts1
+            return self.analysis_mcts1 if color == chess.WHITE else self.analysis_mcts2
+        return self.analysis_mcts1
 
     def _analysis_mcts_simulations(self, color):
         if self.game_mode == "ai_vs_ai":
@@ -1101,6 +1775,10 @@ class ChessGUI:
             return []
 
         sims = max(1, int(self._analysis_mcts_simulations(color)))
+        mcts.reset_tree()
+        max_history = int(self.config.get("model", {}).get("history_positions", 0) or 0) + 10
+        for hist_board in list(self.board_history)[-max_history:]:
+            mcts.update_history(hist_board)
         visit_counts = mcts.search(self.board, sims)
         if not visit_counts:
             return []
@@ -1164,10 +1842,11 @@ class ChessGUI:
                 self._build_history_tensor(self.board, history_positions=history_positions)
             ).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                policy_logits, _ = model(
-                    board_tensor,
-                    apply_log_softmax=False,
-                )
+                with self.inference_lock:
+                    policy_logits, _ = model(
+                        board_tensor,
+                        apply_log_softmax=False,
+                    )
                 logits = policy_logits.float().cpu().numpy()[0]
 
             legal_moves = list(self.board.legal_moves)
@@ -1247,7 +1926,7 @@ class ChessGUI:
             "is_human": False,
             "name": Path(str(model_name or "model.pt")).stem,
             "version": self._format_version(model_meta),
-            "elo": self._format_elo(model_meta),
+            "elo": format_elo_summary(model_meta),
             "avg_time": self.side_time_stats[color]["total"] / max(1, self.side_time_stats[color]["moves"]),
             "total_time": self.side_time_stats[color]["total"],
         }
@@ -1269,7 +1948,7 @@ class ChessGUI:
             else:
                 lines.extend(
                     [
-                        (self.tiny_font, f"Ver: {side_info['version']}  |  Elo: {side_info['elo']}"),
+                        (self.tiny_font, f"Ver: {side_info['version']}  |  {side_info['elo']}"),
                         (
                             self.tiny_font,
                             f"Avg: {self._format_duration(side_info['avg_time'])}  |  Total: {self._format_duration(side_info['total_time'])}",
@@ -1288,7 +1967,7 @@ class ChessGUI:
             else:
                 lines.extend(
                     [
-                        (self.tiny_font, f"{side_info['side']}  |  Elo: {side_info['elo']}"),
+                        (self.tiny_font, f"{side_info['side']}  |  {side_info['elo']}"),
                         (self.tiny_font, f"Avg: {self._format_duration(side_info['avg_time'])}"),
                     ]
                 )
@@ -1304,7 +1983,7 @@ class ChessGUI:
             lines.append(
                 (
                     self.tiny_font,
-                    f"{side_info['side']}  |  Elo {side_info['elo']}  |  Avg {self._format_duration(side_info['avg_time'])}",
+                    f"{side_info['side']}  |  {side_info['elo']}  |  Avg {self._format_duration(side_info['avg_time'])}",
                 )
             )
         return lines
@@ -1726,7 +2405,10 @@ class ChessGUI:
         history_height = history_header_h + (max_rows * row_h) + 12
         action_rows = 4 if self.game_mode in ("ai_vs_ai", "human_vs_ai") else 3
         button_area_height = 34 + action_rows * 38 + (action_rows - 1) * 10 + 14
+        match_panel_h = self._match_panel_height() if self._match_enabled() else 0
         content_height = 56 + history_height + 14 + button_area_height + 14
+        if match_panel_h:
+            content_height += match_panel_h + 14
         content_rect = pygame.Rect(panel.left, panel.top, panel.width, content_height)
         self._draw_card(content_rect, fill=(28, 35, 47), border=(77, 95, 124))
 
@@ -1738,6 +2420,7 @@ class ChessGUI:
         history_rect = pygame.Rect(content_rect.left + 14, content_rect.top + 56, content_rect.width - 28, history_height)
         self.history_rect = history_rect
         button_area = pygame.Rect(content_rect.left + 14, history_rect.bottom + 14, content_rect.width - 28, button_area_height)
+        match_area = pygame.Rect(content_rect.left + 14, button_area.bottom + 14, content_rect.width - 28, match_panel_h) if match_panel_h else None
 
         self._draw_card(history_rect, fill=(23, 30, 41), border=(60, 76, 102))
         self.canvas.blit(
@@ -1889,6 +2572,101 @@ class ChessGUI:
             )
             self.action_buttons.append({"action": action, "rect": rect, "enabled": enabled})
 
+        if match_area is not None:
+            self._draw_match_panel(match_area)
+
+    def _match_model_label(self, model_name):
+        label = Path(str(model_name or "model")).stem
+        return label or "model"
+
+    def _match_panel_rows(self):
+        return [
+            (self._match_model_label(self.model1_name), None),
+            (self._match_model_label(self.model2_name), None),
+            ("Draws", None),
+            ("White", None),
+        ]
+
+    def _match_panel_height(self):
+        row_h = max(18, self.tiny_font.get_height() + 4)
+        # Padding + title + 2 status lines + progress bar + metric rows.
+        return 98 + len(self._match_panel_rows()) * row_h + 16
+
+    def _draw_match_panel(self, rect):
+        snapshot = self._match_snapshot()
+        completed = int(snapshot.get("completed", 0) or 0)
+        total = max(1, int(snapshot.get("total", 1) or 1))
+        white_wins = int(snapshot.get("white_wins", 0) or 0)
+        black_wins = int(snapshot.get("black_wins", 0) or 0)
+        draws = int(snapshot.get("draws", 0) or 0)
+        model1_wins = int(snapshot.get("model1_wins", 0) or 0)
+        model2_wins = int(snapshot.get("model2_wins", 0) or 0)
+        model1_score_x2 = int(snapshot.get("model1_score_x2", 0) or 0)
+        model2_score_x2 = int(snapshot.get("model2_score_x2", 0) or 0)
+        worker_count = int(snapshot.get("background_workers", 0) or 0)
+        active_games_per_worker = int(snapshot.get("active_games_per_worker", 0) or 0)
+        central_inference = bool(snapshot.get("central_inference", False))
+        background_done = bool(snapshot.get("background_done", False))
+        background_starting = bool(snapshot.get("background_starting", False))
+        error = snapshot.get("error")
+
+        self._draw_card(rect, fill=(23, 30, 41), border=(60, 76, 102))
+        self.canvas.blit(
+            self.small_font.render("AI vs AI match", True, TEXT_COLOR),
+            (rect.left + 12, rect.top + 10),
+        )
+        status = "starting" if background_starting else ("done" if completed >= total and background_done else "running")
+        if error:
+            status = "error"
+        if worker_count > 0 and active_games_per_worker > 1:
+            worker_label = f"workers {worker_count} x{active_games_per_worker}"
+        else:
+            worker_label = f"workers {worker_count}" if worker_count > 0 else "visible only"
+        infer_label = "central gpu" if central_inference else "local gpu"
+        progress_label = f"{completed}/{total} games  |  {status}"
+        runtime_label = f"{worker_label}  |  {infer_label}"
+        self.canvas.blit(
+            self.tiny_font.render(self._fit_text(self.tiny_font, progress_label, rect.width - 24), True, (172, 191, 220)),
+            (rect.left + 12, rect.top + 38),
+        )
+        self.canvas.blit(
+            self.tiny_font.render(self._fit_text(self.tiny_font, runtime_label, rect.width - 24), True, (132, 148, 174)),
+            (rect.left + 12, rect.top + 56),
+        )
+
+        bar_rect = pygame.Rect(rect.left + 12, rect.top + 78, rect.width - 24, 12)
+        pygame.draw.rect(self.canvas, (42, 51, 67), bar_rect, border_radius=6)
+        fill_w = int(round(bar_rect.width * min(1.0, completed / float(total))))
+        if fill_w > 0:
+            pygame.draw.rect(self.canvas, (93, 156, 229), pygame.Rect(bar_rect.left, bar_rect.top, fill_w, bar_rect.height), border_radius=6)
+
+        denom = max(1, completed)
+        draw_rate = draws / denom * 100.0
+        white_score = (white_wins + 0.5 * draws) / denom * 100.0
+        model1_score = model1_score_x2 / (2.0 * denom) * 100.0
+        model2_score = model2_score_x2 / (2.0 * denom) * 100.0
+        rows = [
+            (self._match_model_label(self.model1_name), f"{model1_score:.1f}% ({model1_wins}W)"),
+            (self._match_model_label(self.model2_name), f"{model2_score:.1f}% ({model2_wins}W)"),
+            ("Draws", f"{draw_rate:.1f}% ({draws})"),
+            ("White", f"{white_score:.1f}% ({white_wins}-{black_wins})"),
+        ]
+        y = bar_rect.bottom + 12
+        max_label_px = max(
+            self.tiny_font.size(str(label))[0]
+            for label, _ in rows
+        ) if rows else 76
+        label_w = min(max(76, max_label_px + 14), rect.width - 104)
+        row_h = max(18, self.tiny_font.get_height() + 4)
+        for label, value in rows:
+            value_x = rect.left + 12 + label_w
+            value_w = max(48, rect.right - value_x - 12)
+            label_surf = self.tiny_font.render(self._fit_text(self.tiny_font, label, label_w - 8), True, (154, 170, 195))
+            value_surf = self.tiny_font.render(self._fit_text(self.tiny_font, value, value_w), True, (224, 233, 245))
+            self.canvas.blit(label_surf, (rect.left + 12, y))
+            self.canvas.blit(value_surf, (value_x, y))
+            y += row_h
+
     def draw_hud(self):
         self._draw_left_panel()
         self._draw_right_panel()
@@ -1986,6 +2764,13 @@ class ChessGUI:
         white_name = self._side_info(chess.WHITE)["name"]
         black_name = self._side_info(chess.BLACK)["name"]
         summary_text = f"Ruchy: {len(self.move_history)}   |   White: {white_name}   |   Black: {black_name}"
+        if self._match_enabled():
+            match = self._match_snapshot()
+            completed = int(match.get("completed", 0) or 0)
+            total = int(match.get("total", self.match_total_games) or self.match_total_games)
+            model1_score = int(match.get("model1_score_x2", 0) or 0) / (2.0 * max(1, completed)) * 100.0
+            draws = int(match.get("draws", 0) or 0)
+            summary_text = f"Match: {completed}/{total}   |   A score: {model1_score:.1f}%   |   Draws: {draws}   |   {white_name} vs {black_name}"
         summary_surface = self.tiny_font.render(self._fit_text(self.tiny_font, summary_text, stats_rect.width - 24), True, (196, 208, 225))
         self.canvas.blit(summary_surface, summary_surface.get_rect(center=stats_rect.center))
 
@@ -2097,7 +2882,7 @@ class ChessGUI:
 
     def _sync_mcts_histories(self):
         """Rebuild MCTS histories after undoing moves."""
-        for mcts in (self.mcts1, self.mcts2):
+        for mcts in (self.mcts1, self.mcts2, self.analysis_mcts1, self.analysis_mcts2):
             if mcts:
                 mcts.reset_tree()
                 for hist_board in self.board_history:
@@ -2237,6 +3022,7 @@ class ChessGUI:
         if self.board.is_game_over():
             self.game_over = True
             self._save_current_game()
+            self._record_visible_match_result()
         self._refresh_analysis_cache()
     
     def handle_click(self, pos):
@@ -2349,14 +3135,15 @@ class ChessGUI:
         
         # Get policy from model
         with torch.no_grad():
-            policy_logits, _ = model(
-                board_tensor,
-                apply_log_softmax=False,
-            )
+            with self.inference_lock:
+                policy_logits, _ = model(
+                    board_tensor,
+                    apply_log_softmax=False,
+                )
             policy = policy_logits.float().cpu().numpy()[0]
         
         # Find best legal move
-        best_score = -1
+        best_score = -float('inf')
         best_move = None
         for move in self.board.legal_moves:
             #  v4.4 FIX: Use POV-aware move_to_index (handles black's perspective)
@@ -2412,6 +3199,8 @@ class ChessGUI:
         else:
             #  v4.2: Network-only mode with POV support
             move = self._get_network_move(current_model)
+            if move is None:
+                move = next(iter(self.board.legal_moves), None)
         
         if move:
             self._apply_move(move)
@@ -2429,6 +3218,7 @@ class ChessGUI:
                     termination="abandoned by restart",
                 )
 
+        self._stop_background_match()
         self.board = chess.Board()
         self.initial_fen = self.board.fen()
         self.game_over = False
@@ -2444,8 +3234,16 @@ class ChessGUI:
             self.mcts1.reset_tree()
         if self.mcts2:
             self.mcts2.reset_tree()
+        if self.analysis_mcts1:
+            self.analysis_mcts1.reset_tree()
+        if self.analysis_mcts2:
+            self.analysis_mcts2.reset_tree()
+        with self.match_lock:
+            self.match_generation += 1
+            self.match_stats = self._new_match_stats()
         self._reset_analysis_storage()
         self._refresh_analysis_cache()
+        self._start_background_match_games()
     
     def run(self):
         """Main game loop.
@@ -2547,6 +3345,7 @@ class ChessGUI:
 
             pygame.display.flip()
         self._update_mouse_cursor(False)
+        self._stop_background_match()
         return exit_action
 
 
@@ -2618,6 +3417,7 @@ def main():
         setup_mcts_simulations = setup.get("mcts_simulations")
         setup_mcts_simulations_white = setup.get("mcts_simulations_white")
         setup_mcts_simulations_black = setup.get("mcts_simulations_black")
+        setup_match_games = setup.get("match_games", 1)
         if setup_mcts_simulations is not None:
             try:
                 sims_value = max(1, int(setup_mcts_simulations))
@@ -2696,6 +3496,7 @@ def main():
             use_mcts_black=setup_use_mcts_black,
             mcts_simulations_white=setup_mcts_simulations_white,
             mcts_simulations_black=setup_mcts_simulations_black,
+            match_games=setup_match_games,
         )
 
         if game_mode == "human_vs_ai":
