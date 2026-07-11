@@ -12,14 +12,17 @@ import hashlib
 import json
 import pickle
 import re
+import shutil
 import struct
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 from tqdm import tqdm
 
 from src.utils.data_helpers import ACTION_SIZE, get_position_size
+from src.utils.config import normalize_data_config
 
 
 def _phase_desc(phase):
@@ -268,7 +271,8 @@ class DatasetTracker:
             'max_games': selection['max_games'] if selection['max_games'] is not None else 'max',
             'max_moves_per_game': config['data'].get('max_moves_per_game', 200),
             'game_filters': config['data'].get('game_filters', {}),
-            'action_encoding': 'az_classic_8x8x73_v1',
+            # v2 stores ActorElo after Outcome so old 50-byte caches cannot be reused.
+            'action_encoding': 'az_classic_8x8x73_v2_actor_elo',
             'action_size': ACTION_SIZE,
             'wdl_mode': 'always',
         }
@@ -428,43 +432,59 @@ def merge_binary_datasets(binary_files, metadata_files, output_binary, output_me
     # Merge binary files — rewriting GameIDs to be globally unique across all source files.
     # Each source file's GameIDs start at 0, so after concatenation two different games in
     # different files can share the same GameID.  We fix this by offsetting every GameID
-    # by the cumulative position count of all previous files.  Because positions within one
+    # by the cumulative game count of all previous files.  Because positions within one
     # source file are ordered by game (all moves of game 0, then game 1, …) and the history
     # walk relies solely on GameID equality to detect game boundaries, the remapped IDs
     # preserve that property while eliminating cross-file collisions.
     print(f"\n  🔨 Writing merged binary file (with GameID remapping)...")
-    chunk_size = 100 * 1024 * 1024  # 100 MB chunks
-    
-    # We need per-position rewriting for GameID remapping, so we process record-by-record.
-    # GameID offset: we use the max GameID seen in previous files + 1 as the base for the
-    # next file.  This way IDs never collide regardless of how many games each file has.
-    game_id_offset = 0  # running offset applied to each file's GameIDs
+    chunk_bytes = 256 * 1024 * 1024
+    records_per_chunk = max(1, chunk_bytes // int(position_size))
+    record_dtype = np.dtype({
+        'names': ['game_id'],
+        'formats': ['<u4'],
+        'offsets': [38],
+        'itemsize': int(position_size),
+    })
+
+    # Rewrite GameIDs in large vectorized chunks. This keeps the same binary layout, but avoids
+    # millions of tiny struct.unpack/pack calls while merging large PGN months.
+    game_id_offset = 0
     
     with open(output_binary, 'wb') as outfile:
         for i, (binary_file, meta) in enumerate(zip(binary_files, all_metadata), 1):
             print(f"     Merging file {i}/{len(binary_files)}: {Path(binary_file).name} "
                   f"(GameID offset: {game_id_offset})")
             
-            file_positions = meta['total_positions']
+            file_positions = int(meta['total_positions'])
             max_game_id_in_file = 0
             
             with open(binary_file, 'rb') as infile:
-                for _ in range(file_positions):
-                    record = bytearray(infile.read(position_size))
-                    if len(record) < position_size:
-                        break  # truncated file, stop
-                    
-                    # 🔧 v4.5 CRITICAL FIX: Board is now 38B (32B pieces + 6B metadata)
-                    # Layout: [Board 38B] + [GameID 4B] + [MoveIdx 2B] + [MoveTarget 2B] + [Outcome 4B] + [MTL 12B]
-                    # Read original GameID (uint32 at offset 38, not 36!)
-                    original_game_id = struct.unpack('I', record[38:42])[0]
-                    max_game_id_in_file = max(max_game_id_in_file, original_game_id)
-                    
-                    # Write remapped GameID
-                    new_game_id = original_game_id + game_id_offset
-                    record[38:42] = struct.pack('I', new_game_id)
-                    
-                    outfile.write(record)
+                remaining = file_positions
+                while remaining > 0:
+                    requested_records = min(records_per_chunk, remaining)
+                    raw = infile.read(requested_records * int(position_size))
+                    if not raw:
+                        break
+
+                    actual_records = len(raw) // int(position_size)
+                    if actual_records <= 0:
+                        break
+                    if len(raw) != actual_records * int(position_size):
+                        raw = raw[:actual_records * int(position_size)]
+
+                    chunk = bytearray(raw)
+                    records = np.frombuffer(chunk, dtype=record_dtype, count=actual_records)
+                    game_ids = records['game_id']
+                    if len(game_ids):
+                        max_game_id_in_file = max(max_game_id_in_file, int(game_ids.max()))
+                        if game_id_offset:
+                            remapped = game_ids.astype(np.uint64, copy=False) + np.uint64(game_id_offset)
+                            if int(remapped.max()) > np.iinfo(np.uint32).max:
+                                raise ValueError("Merged GameID exceeds uint32 range.")
+                            game_ids[:] = remapped.astype(np.uint32, copy=False)
+
+                    outfile.write(chunk)
+                    remaining -= actual_records
             
             # Next file's IDs start after the highest ID we just wrote
             game_id_offset += max_game_id_in_file + 1
@@ -500,30 +520,67 @@ def merge_binary_datasets(binary_files, metadata_files, output_binary, output_me
 # PHASE 1: PGN EXTRACTION (Multi-processing)
 # ==============================================================================
 
-def extract_game_data(game):
-    """Extract serializable data from chess.pgn.Game"""
+class _MainlineVisitor(chess.pgn.BaseVisitor):
+    """Lean PGN reader: retain headers and mainline moves, skip tree allocation."""
+
+    def __init__(self):
+        self.headers = chess.pgn.Headers()
+        self.moves = []
+
+    def begin_headers(self):
+        return self.headers
+
+    def visit_header(self, tagname, tagvalue):
+        self.headers[tagname] = tagvalue
+
+    def visit_move(self, board, move):
+        self.moves.append(move)
+
+    def begin_variation(self):
+        return chess.pgn.SKIP
+
+    def handle_error(self, error):
+        # Match GameBuilder's forgiving behavior: invalid tails are skipped and
+        # never enter the IL binary.
+        return None
+
+    def result(self):
+        return self.headers, self.moves
+
+
+def _read_mainline_game(pgn_file):
+    parsed = chess.pgn.read_game(pgn_file, Visitor=_MainlineVisitor)
+    if parsed is None:
+        return None, None
+    return parsed
+
+
+def _game_data_from_headers_moves(headers, move_objects):
+    return {
+        'white_elo': headers.get('WhiteElo', '?'),
+        'black_elo': headers.get('BlackElo', '?'),
+        'result': headers.get('Result', '*'),
+        'termination': headers.get('Termination', ''),
+        'moves': [move.uci() for move in move_objects],
+    }
+
+
+def _extract_game_data_with_moves(game):
+    """Return serializable headers/UCI plus the already-parsed move objects."""
     try:
         if game is None:
-            return None
+            return None, None
         
-        white_elo = game.headers.get('WhiteElo', '?')
-        black_elo = game.headers.get('BlackElo', '?')
-        result = game.headers.get('Result', '*')
-        termination = game.headers.get('Termination', '')
-        
-        moves = []
-        for move in game.mainline_moves():
-            moves.append(move.uci())
-        
-        return {
-            'white_elo': white_elo,
-            'black_elo': black_elo,
-            'result': result,
-            'termination': termination,
-            'moves': moves
-        }
+        move_objects = list(game.mainline_moves())
+        return _game_data_from_headers_moves(game.headers, move_objects), move_objects
     except:
-        return None
+        return None, None
+
+
+def extract_game_data(game):
+    """Extract serializable data from chess.pgn.Game."""
+    game_data, _ = _extract_game_data_with_moves(game)
+    return game_data
 
 
 def parse_games_offset_batch_worker(args):
@@ -689,13 +746,6 @@ def _filter_games(games_data, config):
     if not filters_enabled:
         return games_data
     
-    exclude_term_keywords = [s.lower() for s in (cfg.get('exclude_terminations', []) or [])]
-    
-    min_fullmove = int(cfg.get('min_fullmove', 0))
-    min_fullmove_draw = int(cfg.get('min_fullmove_draw', min_fullmove))
-    min_fullmove_resign = int(cfg.get('min_fullmove_resign', min_fullmove))
-    max_elo_gap = int(cfg.get('max_elo_gap', 0) or 0)
-    
     filtered = []
     stats = {
         'total': 0,
@@ -709,38 +759,10 @@ def _filter_games(games_data, config):
     
     for game in games_data:
         stats['total'] += 1
-        moves = game.get('moves') or []
-        fullmoves = _fullmoves_from_moves(moves)
-        
-        result = game.get('result', '*')
-        termination = (game.get('termination', '') or '').lower()
-        
-        # Termination filter
-        if filters_enabled:
-            if termination and exclude_term_keywords and _contains_any(termination, exclude_term_keywords):
-                stats['termination'] += 1
-                continue
-        
-        # Elo gap filter
-        if filters_enabled and max_elo_gap > 0:
-            white_elo = _safe_int(game.get('white_elo'))
-            black_elo = _safe_int(game.get('black_elo'))
-            if white_elo is not None and black_elo is not None:
-                if abs(white_elo - black_elo) > max_elo_gap:
-                    stats['elo_gap'] += 1
-                    continue
-        
-        # Length filters
-        if filters_enabled:
-            if result == "1/2-1/2" and min_fullmove_draw > 0 and fullmoves < min_fullmove_draw:
-                stats['draw_short'] += 1
-                continue
-            if _contains_any(termination, ["resign", "resignation"]) and min_fullmove_resign > 0 and fullmoves < min_fullmove_resign:
-                stats['resign_short'] += 1
-                continue
-            if min_fullmove > 0 and fullmoves < min_fullmove:
-                stats['length'] += 1
-                continue
+        reason = _game_filter_reason(game, cfg)
+        if reason is not None:
+            stats[reason] += 1
+            continue
         
         filtered.append(game)
         stats['kept'] += 1
@@ -787,6 +809,223 @@ def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, config=
 # PHASE 2: POSITION EXTRACTION (Multi-processing) - 🆕 POV + NO EMBEDDED HISTORY
 # ==============================================================================
 
+def _game_filter_reason(game_data, filters_cfg):
+    """Return ``None`` when a parsed game passes the configured PGN filters."""
+    filters_cfg = filters_cfg or {}
+    if not bool(filters_cfg.get('enabled', False)):
+        return None
+
+    termination = (game_data.get('termination', '') or '').lower()
+    excluded = [str(value).lower() for value in (filters_cfg.get('exclude_terminations', []) or [])]
+    if termination and excluded and _contains_any(termination, excluded):
+        return 'termination'
+
+    max_elo_gap = int(filters_cfg.get('max_elo_gap', 0) or 0)
+    if max_elo_gap > 0:
+        white_elo = _safe_int(game_data.get('white_elo'))
+        black_elo = _safe_int(game_data.get('black_elo'))
+        if white_elo is not None and black_elo is not None and abs(white_elo - black_elo) > max_elo_gap:
+            return 'elo_gap'
+
+    fullmoves = _fullmoves_from_moves(game_data.get('moves') or [])
+    result = game_data.get('result', '*')
+    min_fullmove = int(filters_cfg.get('min_fullmove', 0) or 0)
+    min_draw = int(filters_cfg.get('min_fullmove_draw', min_fullmove) or 0)
+    min_resign = int(filters_cfg.get('min_fullmove_resign', min_fullmove) or 0)
+    if result == '1/2-1/2' and min_draw > 0 and fullmoves < min_draw:
+        return 'draw_short'
+    if _contains_any(termination, ['resign', 'resignation']) and min_resign > 0 and fullmoves < min_resign:
+        return 'resign_short'
+    if min_fullmove > 0 and fullmoves < min_fullmove:
+        return 'length'
+    return None
+
+
+def _stream_pgn_positions_shard_worker(args):
+    """Parse, filter and materialize one PGN shard directly into a temp binary part."""
+    (
+        pgn_path,
+        start_offset,
+        game_count,
+        part_path,
+        min_elo,
+        max_moves_per_game,
+        filters_cfg,
+    ) = args
+    import chess.pgn
+
+    games = []
+    local_game_id = 0
+    positions_written = 0
+    parsed_games = 0
+    Path(part_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(part_path, 'wb') as part_file:
+        with open(pgn_path, 'rb') as raw_file:
+            raw_file.seek(int(start_offset))
+            with io.TextIOWrapper(raw_file, encoding='utf-8', errors='ignore', newline='') as pgn_file:
+                for _ in range(int(game_count)):
+                    headers, move_objects = _read_mainline_game(pgn_file)
+                    if headers is None:
+                        break
+                    game_data = _game_data_from_headers_moves(headers, move_objects)
+                    parsed_games += 1
+                    signature = hashlib.md5(
+                        (str(game_data.get('result', '')) + '|' + ' '.join(game_data.get('moves') or [])).encode('utf-8')
+                    ).digest()
+                    filter_reason = _game_filter_reason(game_data, filters_cfg)
+                    start = int(part_file.tell())
+                    if filter_reason is None:
+                        positions = extract_positions_from_game_worker(
+                            (game_data, local_game_id, min_elo, max_moves_per_game, move_objects)
+                        )
+                        local_game_id += 1
+                        if positions:
+                            raw_positions = b''.join(positions)
+                            part_file.write(raw_positions)
+                            positions_written += len(positions)
+                    end = int(part_file.tell())
+                    games.append((signature, start, end, filter_reason))
+
+    return {
+        'part_path': str(part_path),
+        'games': games,
+        'parsed_games': int(parsed_games),
+        'positions': int(positions_written),
+    }
+
+
+def _rewrite_game_id(raw_records, position_size, game_id):
+    """Set one compact GameID in a contiguous game's binary records."""
+    if not raw_records:
+        return raw_records
+    if len(raw_records) % int(position_size):
+        raise ValueError('PGN shard contains a partial position record.')
+    payload = bytearray(raw_records)
+    record_dtype = np.dtype({
+        'names': ['game_id'],
+        'formats': ['<u4'],
+        'offsets': [38],
+        'itemsize': int(position_size),
+    })
+    records = np.frombuffer(payload, dtype=record_dtype)
+    records['game_id'] = np.uint32(game_id)
+    return payload
+
+
+def _stream_pgn_to_binary(pgn_path, binary_file, config, workers):
+    """Build one binary dataset in a single parse-and-extract multiprocessing pass."""
+    data_cfg = config['data']
+    max_games = _normalize_max_games(data_cfg.get('max_games', 'max'))
+    offsets = _scan_game_start_offsets(pgn_path, max_offsets=max_games)
+    if not offsets:
+        return 0
+
+    workers = max(1, min(int(workers), len(offsets)))
+    task_count = min(len(offsets), max(workers, workers * 4))
+    games_per_task = max(1, (len(offsets) + task_count - 1) // task_count)
+    part_dir = Path(binary_file).parent / f'.{Path(binary_file).stem}_parts'
+    temp_binary = Path(binary_file).with_suffix(Path(binary_file).suffix + '.building')
+    filters_cfg = dict(data_cfg.get('game_filters', {}) or {})
+    tasks = []
+    for task_id, start_index in enumerate(range(0, len(offsets), games_per_task)):
+        count = min(games_per_task, len(offsets) - start_index)
+        tasks.append((
+            str(pgn_path), int(offsets[start_index]), int(count),
+            str(part_dir / f'shard_{task_id:04d}.bin'),
+            int(data_cfg.get('min_elo', 0) or 0),
+            int(data_cfg.get('max_moves_per_game', 0) or 0), filters_cfg,
+        ))
+
+    if part_dir.exists():
+        shutil.rmtree(part_dir)
+    part_dir.mkdir(parents=True, exist_ok=True)
+    results = [None] * len(tasks)
+    try:
+        parsed_games = 0
+        materialized_positions = 0
+        if workers == 1:
+            with tqdm(total=len(tasks), desc=_phase_desc('Building positions'), unit=' shard') as progress:
+                for task_id, task in enumerate(tasks):
+                    result = _stream_pgn_positions_shard_worker(task)
+                    results[task_id] = result
+                    parsed_games += int(result['parsed_games'])
+                    materialized_positions += int(result['positions'])
+                    progress.update(1)
+                    progress.set_postfix_str(f"{parsed_games:,} games | {materialized_positions:,} positions")
+        else:
+            with tqdm(total=len(tasks), desc=_phase_desc('Building positions'), unit=' shard') as progress:
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    futures = {
+                        executor.submit(_stream_pgn_positions_shard_worker, task): task_id
+                        for task_id, task in enumerate(tasks)
+                    }
+                    for future in as_completed(futures):
+                        task_id = futures[future]
+                        result = future.result()
+                        results[task_id] = result
+                        parsed_games += int(result['parsed_games'])
+                        materialized_positions += int(result['positions'])
+                        progress.update(1)
+                        progress.set_postfix_str(f"{parsed_games:,} games | {materialized_positions:,} positions")
+
+        seen_signatures = set()
+        filter_counts = {'termination': 0, 'elo_gap': 0, 'draw_short': 0, 'resign_short': 0, 'length': 0}
+        duplicate_count = 0
+        next_game_id = 0
+        written_positions = 0
+        write_buffer = bytearray()
+        flush_threshold = 8 * 1024 * 1024
+        position_size = get_position_size(history_positions=0)
+        with open(temp_binary, 'wb') as output_file:
+            for result in results:
+                with open(result['part_path'], 'rb') as part_file:
+                    for signature, start, end, filter_reason in result['games']:
+                        if signature in seen_signatures:
+                            duplicate_count += 1
+                            continue
+                        seen_signatures.add(signature)
+                        if filter_reason is not None:
+                            filter_counts[filter_reason] += 1
+                            continue
+                        part_file.seek(int(start))
+                        raw_records = part_file.read(int(end) - int(start))
+                        if raw_records:
+                            remapped = _rewrite_game_id(raw_records, position_size, next_game_id)
+                            write_buffer.extend(remapped)
+                            written_positions += len(remapped) // position_size
+                            if len(write_buffer) >= flush_threshold:
+                                output_file.write(write_buffer)
+                                write_buffer.clear()
+                        next_game_id += 1
+            if write_buffer:
+                output_file.write(write_buffer)
+
+        if filters_cfg.get('enabled', False) or duplicate_count:
+            kept_games = len(seen_signatures) - sum(filter_counts.values())
+            labels = {
+                'termination': 'termination',
+                'elo_gap': 'elo gap',
+                'draw_short': 'short draw',
+                'resign_short': 'short resign',
+                'length': 'short game',
+            }
+            removed = []
+            if duplicate_count:
+                removed.append(f'{duplicate_count:,} duplicates')
+            removed.extend(f'{count:,} {labels[name]}' for name, count in filter_counts.items() if count)
+            suffix = f"  |  removed: {', '.join(removed)}" if removed else ''
+            print(f"  Games: {len(seen_signatures):,} -> {kept_games:,} kept{suffix}")
+        os.replace(temp_binary, binary_file)
+        return int(written_positions)
+    except Exception:
+        if temp_binary.exists():
+            temp_binary.unlink()
+        raise
+    finally:
+        shutil.rmtree(part_dir, ignore_errors=True)
+
+
 def extract_positions_from_game_worker(args):
     """
     PHASE 2 WORKER: Extract positions from a single game
@@ -798,9 +1037,9 @@ def extract_positions_from_game_worker(args):
     - WDL-only mode: clean final +/-1.0/0.0 targets from side-to-move POV
     
     🔧 FIXED BINARY FORMAT:
-    [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)]
+    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [ActorElo (2B)]
     """
-    game_data, game_id, min_elo, max_moves_per_game = args
+    game_data, game_id, min_elo, max_moves_per_game, *optional_moves = args
     
     import chess
     import struct
@@ -827,7 +1066,7 @@ def extract_positions_from_game_worker(args):
             return []
         
         # Check game length (drop if too long)
-        moves = game_data['moves']
+        moves = optional_moves[0] if optional_moves else game_data['moves']
         if max_moves_per_game and max_moves_per_game > 0 and len(moves) > max_moves_per_game:
             return []
         
@@ -841,12 +1080,13 @@ def extract_positions_from_game_worker(args):
         positions = []
         move_idx = 0
         
-        for move_uci in moves:
+        moves_are_objects = bool(moves) and isinstance(moves[0], chess.Move)
+        for raw_move in moves:
             try:
-                move = chess.Move.from_uci(move_uci)
-                
-                if move not in board.legal_moves:
-                    break
+                move = raw_move if moves_are_objects else chess.Move.from_uci(raw_move)
+                # chess.pgn already validates mainline moves while parsing SAN.
+                # Re-generating every legal move here costs ~15% of preprocessing
+                # time and does not add safety for these parsed mainlines.
                 
                 # 🔧 CRITICAL FIX: Calculate move_target BEFORE making the move
                 # This is the LABEL the network should predict (0-4671)
@@ -861,13 +1101,15 @@ def extract_positions_from_game_worker(args):
                 )
                 
                 # 🔧 Pack position using helper function (includes move_target)
-                # Format: [Board (32B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)]
+                # Format: [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [ActorElo (2B)]
+                actor_elo = white_elo_int if board.turn == chess.WHITE else black_elo_int
                 position_data = pack_position_data(
                     board=board,
                     game_id=game_id,
                     move_idx=move_idx,
                     move_target=move_target,  # 🔧 NEW: The label to predict
                     outcome=outcome,
+                    actor_elo=actor_elo,
                 )
                 
                 positions.append(position_data)
@@ -1018,6 +1260,7 @@ def process_pgn_files(pgn_files, config):
     Returns:
         metadata dict for combined dataset
     """
+    config = normalize_data_config(config)
     data_dir = Path(config['paths']['data_dir'])
     preprocessing_dir = data_dir / "preprocessing"
     preprocessing_dir.mkdir(parents=True, exist_ok=True)
@@ -1064,50 +1307,35 @@ def process_pgn_files(pgn_files, config):
     new_metadatas = []
     
     if new_pgn_files:
-        phase1_workers = _resolve_workers(config['data'].get('phase1_threads', 1), "phase1_threads")
-        phase2_workers = _resolve_workers(config['data'].get('phase2_threads', 1), "phase2_threads")
-        selection = _get_game_selection_settings(config)
-        max_games = selection['max_games']
+        preprocess_workers = _resolve_workers(
+            config['data'].get('preprocess_threads', config['data'].get('phase1_threads', 'all')),
+            "preprocess_threads",
+        )
         
         total_new = len(new_pgn_files)
         for dataset_idx, pgn_file in enumerate(new_pgn_files, start=1):
             dataset_name = Path(pgn_file).name
             loaded_now = loaded_count + dataset_idx - 1
             print(
-                f"\nPreprocessing {dataset_name} "
-                f"({dataset_idx:,}/{total_new:,}; cache {loaded_now:,}/{total_pgn_files:,})",
+                f"\n[{dataset_idx:02d}/{total_new:02d}] {dataset_name}  "
+                f"|  cache {loaded_now:,}/{total_pgn_files:,}",
                 flush=True,
             )
-            print("=" * 70, flush=True)
             
-            # Phase 1: Extract games
-            games_data = extract_games_from_pgn_parallel(
-                pgn_file,
-                max_games,
-                phase1_workers,
-                config=config,
-            )
-            
-            if not games_data:
-                print("  ⚠️ No games found!")
-                continue
-            
-            # Phase 2: Extract positions
-            positions = extract_positions_parallel(
-                games_data,
-                config,
-                phase2_workers,
-            )
-            
-            if not positions:
-                print("  ⚠️ No positions extracted!")
-                continue
-            
-            # Phase 3: Write to disk
             binary_file = preprocessing_dir / f"{Path(pgn_file).stem}_positions.bin"
-            write_positions_to_disk(positions, binary_file)
+            position_count = _stream_pgn_to_binary(
+                pgn_file,
+                binary_file,
+                config,
+                preprocess_workers,
+            )
+            if position_count <= 0:
+                print("  ⚠️ No positions extracted!")
+                if binary_file.exists():
+                    binary_file.unlink()
+                continue
             
-            # Phase 4: Create metadata
+            # The final binary is atomically ready; now persist its metadata.
             metadata = get_dataset_metadata(binary_file, config)
             metadata_file = preprocessing_dir / f"{Path(pgn_file).stem}_meta.pkl"
             
@@ -1121,9 +1349,8 @@ def process_pgn_files(pgn_files, config):
             new_metadatas.append(metadata_file)
             
             print(
-                f"  Done: {Path(pgn_file).name} "
-                f"({metadata['total_positions']:,} positions, "
-                f"{binary_file.stat().st_size / (1024**2):.1f} MB)",
+                f"  Done | {metadata['total_positions']:,} positions | "
+                f"{binary_file.stat().st_size / (1024**2):.1f} MB",
                 flush=True,
             )
     

@@ -27,6 +27,7 @@ import threading
 import logging
 import csv
 import json
+import os
 from pathlib import Path
 import numpy as np
 import gc
@@ -41,7 +42,8 @@ from src.model import (
     save_checkpoint,
 )
 from src.data import process_pgn_files, create_dataloaders
-from src.utils.data_helpers import ACTION_SIZE
+from src.utils.data_helpers import ACTION_SIZE, get_position_size
+from src.utils.config import normalize_data_config
 
 # Import from utils
 from utils.shared.logger import TrainingLogger
@@ -82,6 +84,17 @@ from utils.shared.model_view import (
 
 _LAST_RUN_LOG_CSV = None
 _LAST_RUN_LOG_PNG = None
+
+
+def _is_fatal_cuda_error(exc):
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "cuda error: unknown error" in text
+        or "cuda error: device-side assert" in text
+        or "cuda error: an illegal memory access" in text
+        or "cuda error: unspecified launch failure" in text
+        or "cudnn_status_not_initialized" in text
+    )
 
 
 def _pct(part, total):
@@ -149,6 +162,41 @@ def _format_plot_million_positions(value):
     return f"{value / 1000.0:.0f}k"
 
 
+def _format_il_data_volume_plan(config, target_positions):
+    data_cfg = config.get('data', {}) or {}
+    split = _safe_float(data_cfg.get('train_split', 0.85), default=0.85)
+    split = min(0.999, max(0.001, split))
+    selection_cfg = data_cfg.get('target_selection', {}) or {}
+    try:
+        pool_multiplier = max(1.0, float(selection_cfg.get('train_pool_multiplier', 1.0) or 1.0))
+    except (TypeError, ValueError):
+        pool_multiplier = 1.0
+
+    if isinstance(target_positions, str) and target_positions.strip().lower() in {'max', 'all', 'wszystkie'}:
+        return (
+            "IL data plan: per-epoch samples=max; actual train pool will be shown "
+            "after cache/dedup selection."
+        )
+
+    try:
+        target_total = max(1, int(target_positions))
+    except (TypeError, ValueError):
+        return None
+
+    train_epoch = max(1, int(round(target_total * split)))
+    val_count = max(0, target_total - train_epoch)
+    planned_train_pool = int(round(train_epoch * pool_multiplier))
+    planned_total_pool = planned_train_pool + val_count
+    return (
+        "IL data plan: "
+        f"per epoch={_format_plot_million_positions(target_total)} "
+        f"(train={_format_plot_million_positions(train_epoch)}, "
+        f"val={_format_plot_million_positions(val_count)}); "
+        f"pool up to={_format_plot_million_positions(planned_total_pool)} "
+        f"(train x{pool_multiplier:g}, capped by dedup/cache)."
+    )
+
+
 def _checkpoint_resume_tag(checkpoint_path):
     if checkpoint_path is None:
         return None
@@ -167,7 +215,9 @@ def _checkpoint_resume_tag(checkpoint_path):
 
 def _build_il_run_summary(config, *, model_version=None, start_mode=None, source_label=None,
                           pgn_count=None, train_count=None, val_count=None,
-                          batch_size=None, soft_train=None, soft_val=None):
+                          train_epoch_count=None, total_epoch_count=None,
+                          total_pool_count=None, batch_size=None,
+                          soft_train=None, soft_val=None):
     data_cfg = config.get('data', {}) or {}
     model_cfg = config.get('model', {}) or {}
     il_cfg = config.get('imitation_learning', {}) or {}
@@ -197,6 +247,9 @@ def _build_il_run_summary(config, *, model_version=None, start_mode=None, source
         'pgn_files': pgn_count,
         'train_positions': train_count,
         'val_positions': val_count,
+        'train_epoch_positions': train_epoch_count,
+        'total_epoch_positions': total_epoch_count,
+        'total_pool_positions': total_pool_count,
         'batch_size': batch_size or il_cfg.get('batch_size'),
         'history_positions': model_cfg.get('history_positions'),
         'positions_per_game': {
@@ -376,6 +429,14 @@ def _il_monitor_loss(val_losses, il_cfg):
     monitor = policy + value_weight * value + mlh_weight * moves_left
     label = f"value_aware(policy + {value_weight:g}*value + {mlh_weight:g}*mlh)"
     return monitor, label
+
+
+def _resolve_lr_plateau_patience(raw_value, max_patience):
+    max_patience = max(1, int(max_patience))
+    if raw_value is None or str(raw_value).strip().lower() in {"", "auto"}:
+        upper = max(1, max_patience - 1)
+        return max(1, min(upper, int(math.ceil(max_patience * 0.6))))
+    return max(1, int(raw_value))
 
 
 def _format_il_epoch_profile(
@@ -581,6 +642,7 @@ def main():
     print(f"Loading config from: {config_path}")
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+    config = normalize_data_config(config)
 
     model_version = config.get('model', {}).get('version', 'v?.?')
     model_file_tag = build_model_file_tag(config)
@@ -683,6 +745,9 @@ def main():
         default_millions=_target_positions_default_millions(config.get('data', {}), default=15)
     )
     config.setdefault('data', {})['target_positions'] = target_positions
+    data_volume_plan = _format_il_data_volume_plan(config, target_positions)
+    if data_volume_plan:
+        print(data_volume_plan)
 
     startup_plan = plan_il_startup(
         model=model,
@@ -1130,7 +1195,7 @@ def main():
 
     # Verify binary format compatibility.
     actual_position_size = metadata.get('position_size')
-    expected_position_size = 50
+    expected_position_size = get_position_size()
 
     if actual_position_size != expected_position_size:
         print(f"\n⚠️ WARNING: Position size mismatch!")
@@ -1163,7 +1228,9 @@ def main():
             pass
     print(
         "DataLoaders ready: "
-        f"train={len(train_loader.dataset):,}, val={len(val_loader.dataset):,}"
+        f"train_pool={len(train_loader.dataset):,}, "
+        f"train_epoch={len(train_sampler) if train_sampler is not None else len(train_loader.dataset):,}, "
+        f"val={len(val_loader.dataset):,}"
     )
 
     def _resolve_loader_batch_size(loader, fallback):
@@ -1197,6 +1264,13 @@ def main():
 
     train_final = _stat(train_stats, 'final_count', len(train_loader.dataset))
     val_final = _stat(val_stats, 'final_count', len(val_loader.dataset))
+    train_epoch_samples = _stat(
+        train_stats,
+        'epoch_sample_count',
+        len(getattr(train_loader, 'sampler', []) or train_loader.dataset)
+        if getattr(train_loader, 'sampler', None) is not None
+        else len(train_loader.dataset),
+    )
 
     def _stage_total(stats, stage_name, default=None):
         stages = stats.get('selection_stages', []) if isinstance(stats, dict) else []
@@ -1208,6 +1282,16 @@ def main():
         return default
 
     total_final = train_final + val_final
+    total_epoch_samples = train_epoch_samples + val_final
+    print(
+        "IL data actual: "
+        f"per epoch={_format_plot_million_positions(total_epoch_samples)} "
+        f"(train={_format_plot_million_positions(train_epoch_samples)}, "
+        f"val={_format_plot_million_positions(val_final)}); "
+        f"pool total={_format_plot_million_positions(total_final)} "
+        f"(train_pool={_format_plot_million_positions(train_final)}, "
+        f"val={_format_plot_million_positions(val_final)})."
+    )
     raw_total = _stage_total(train_stats, 'raw_split', _stat(train_stats, 'binary_positions', total_final))
     ppg_total = _stage_total(train_stats, 'positions_per_game')
     dedup_total = _stage_total(train_stats, 'sample_dedup')
@@ -1220,8 +1304,10 @@ def main():
     if dedup_total is not None:
         data_parts.append(f"dedup={_format_plot_million_positions(dedup_total)}")
     data_parts.extend([
-        f"selected={_format_plot_million_positions(total_final)}",
-        f"train/val={_format_plot_million_positions(train_final)}/{_format_plot_million_positions(val_final)}",
+        f"train_each_epoch={_format_plot_million_positions(train_epoch_samples)}",
+        f"epoch_total={_format_plot_million_positions(total_epoch_samples)}",
+        f"pool_total={_format_plot_million_positions(total_final)}",
+        f"train_pool/val={_format_plot_million_positions(train_final)}/{_format_plot_million_positions(val_final)}",
     ])
     data_context = (
         "Data: " + " | ".join(data_parts)
@@ -1390,6 +1476,9 @@ def main():
         pgn_count=len(pgn_files),
         train_count=train_final,
         val_count=val_final,
+        train_epoch_count=train_epoch_samples,
+        total_epoch_count=total_epoch_samples,
+        total_pool_count=total_final,
         batch_size=trained_batch_size,
         soft_train=train_soft_basic,
         soft_val=val_soft_basic,
@@ -1743,10 +1832,13 @@ def main():
     total_epochs = config['imitation_learning']['epochs']
     monitor_label = _il_monitor_loss({'total': 0.0}, config['imitation_learning'])[1]
     lr_plateau_enabled = bool(config['imitation_learning'].get('lr_plateau_decay', True))
-    lr_plateau_patience = max(1, int(config['imitation_learning'].get('lr_plateau_patience', 2)))
-    lr_plateau_factor = float(config['imitation_learning'].get('lr_plateau_factor', 0.5))
+    lr_plateau_patience = _resolve_lr_plateau_patience(
+        config['imitation_learning'].get('lr_plateau_patience', 'auto'),
+        max_patience,
+    )
+    lr_plateau_factor = float(config['imitation_learning'].get('lr_plateau_factor', 0.7))
     lr_plateau_factor = max(0.05, min(0.95, lr_plateau_factor))
-    lr_plateau_min_scale = float(config['imitation_learning'].get('lr_plateau_min_scale', 0.25))
+    lr_plateau_min_scale = float(config['imitation_learning'].get('lr_plateau_min_scale', 0.35))
     lr_plateau_min_scale = max(0.01, min(1.0, lr_plateau_min_scale))
     lr_plateau_cooldown_epochs = max(0, int(config['imitation_learning'].get('lr_plateau_cooldown', 1)))
     lr_plateau_reset_patience = bool(config['imitation_learning'].get('lr_plateau_reset_patience', True))
@@ -2743,3 +2835,18 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         cleanup_interrupted_log_csv(_LAST_RUN_LOG_CSV, _LAST_RUN_LOG_PNG, "IL")
         print("\nCtrl+C detected. IL training stopped gracefully.")
+    except Exception as exc:
+        if _is_fatal_cuda_error(exc):
+            print(
+                "\nFatal CUDA error detected during IL training. "
+                "This usually means the Windows/NVIDIA driver reset the CUDA context "
+                "(for example after display sleep/wake or device change)."
+            )
+            print(
+                "The current Python process cannot safely recover this CUDA context. "
+                "Use the latest completed-epoch checkpoint to resume."
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(90)
+        raise

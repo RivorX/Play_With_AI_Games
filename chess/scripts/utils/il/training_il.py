@@ -8,8 +8,13 @@ import time
 import torch
 from tqdm import tqdm
 
+from src.utils.data_helpers import ACTION_SIZE, build_hflip_inverse_index_map
+
 from .loss import CombinedLoss
 from ..shared.metrics import MetricsCalculator
+
+
+_IL_HFLIP_FORWARD_INDEX_MAP = None
 
 
 class _DataLoaderTailSkip(StopIteration):
@@ -74,6 +79,52 @@ def _prepare_boards_for_model(boards, use_amp, amp_dtype):
             return boards.to(dtype=amp_dtype) if boards.dtype != amp_dtype else boards
         return boards
     return boards.float() if boards.dtype != torch.float32 else boards
+
+
+def _il_hflip_forward_index_map(device):
+    global _IL_HFLIP_FORWARD_INDEX_MAP
+    if _IL_HFLIP_FORWARD_INDEX_MAP is None:
+        inverse = torch.from_numpy(build_hflip_inverse_index_map()).long()
+        if int(inverse.numel()) != int(ACTION_SIZE):
+            raise ValueError(f"IL horizontal-flip map length mismatch: {inverse.numel()} != {ACTION_SIZE}")
+        forward = torch.empty_like(inverse)
+        forward[inverse] = torch.arange(inverse.numel(), dtype=inverse.dtype)
+        _IL_HFLIP_FORWARD_INDEX_MAP = forward
+    return _IL_HFLIP_FORWARD_INDEX_MAP.to(device=device, non_blocking=True)
+
+
+def _maybe_augment_il_batch(boards, moves, policy_indices, config):
+    """Apply exact horizontal board/policy symmetry to a random train subset."""
+    aug_cfg = (config.get('imitation_learning', {}) or {}).get('augmentation', {}) or {}
+    if not aug_cfg.get('enabled', False):
+        return boards, moves, policy_indices
+    try:
+        probability = float(aug_cfg.get('horizontal_flip_prob', 0.0) or 0.0)
+    except (TypeError, ValueError):
+        probability = 0.0
+    probability = max(0.0, min(1.0, probability))
+    if probability <= 0.0 or boards.size(0) <= 0:
+        return boards, moves, policy_indices
+
+    flip_mask = torch.rand(boards.size(0), device=boards.device) < probability
+    if not bool(flip_mask.any()):
+        return boards, moves, policy_indices
+
+    boards[flip_mask] = torch.flip(boards[flip_mask], dims=[3])
+    forward_map = _il_hflip_forward_index_map(boards.device)
+    if moves is not None:
+        valid_moves = (moves >= 0) & (moves < int(ACTION_SIZE))
+        active_moves = flip_mask.reshape(-1, *([1] * (moves.dim() - 1))) & valid_moves
+        if bool(active_moves.any()):
+            moves[active_moves] = forward_map[moves[active_moves].long()].to(dtype=moves.dtype)
+    if policy_indices is not None:
+        valid_policy = (policy_indices >= 0) & (policy_indices < int(ACTION_SIZE))
+        active_policy = flip_mask.unsqueeze(1) & valid_policy
+        if bool(active_policy.any()):
+            policy_indices[active_policy] = forward_map[policy_indices[active_policy].long()].to(
+                dtype=policy_indices.dtype
+            )
+    return boards, moves, policy_indices
 
 
 def _iter_prefetched_batches(loader, device, non_blocking=True, enabled=True, queue_size=2):
@@ -437,6 +488,13 @@ def train_epoch_il(
             moves_left_log = moves_left_log.to(device, non_blocking=non_blocking)
         if policy_mass_kept is not None:
             policy_mass_kept = policy_mass_kept.to(device, non_blocking=non_blocking)
+
+        boards, moves, policy_indices = _maybe_augment_il_batch(
+            boards,
+            moves,
+            policy_indices,
+            config,
+        )
         
 
         # đź”Ť DIAGNOSTIC: Print distributions for first batch

@@ -34,6 +34,21 @@ def _clean_elo_ci95(ci95):
     return low, high
 
 
+def _format_million_count(value):
+    try:
+        value = int(float(value))
+    except (TypeError, ValueError):
+        return "n/a"
+    if value <= 0:
+        return "0M"
+    millions = value / 1_000_000.0
+    if millions >= 10.0:
+        return f"{millions:.0f}M"
+    if millions >= 1.0:
+        return f"{millions:.1f}M"
+    return f"{value / 1000.0:.0f}k"
+
+
 def _is_metadata_row(row):
     return bool(row) and str(row[0]).strip().startswith("#")
 
@@ -5604,49 +5619,44 @@ class TrainingLogger:
         val_target_eff_latest = _latest_finite(self.val_policy_target_effective_moves)
         train_target_top1_latest = _latest_finite(self.train_policy_target_mass_top1)
         val_target_top1_latest = _latest_finite(self.val_policy_target_mass_top1)
-        train_soft_rate_latest = None
-        val_soft_rate_latest = None
+        pool_train_occ = None
+        pool_val_occ = None
+        pool_train_target_eff = None
+        pool_val_target_eff = None
+        pool_train_soft_rate = None
+        pool_val_soft_rate = None
         soft_stats = (self.run_summary_metadata or {}).get('soft_stats', {}) or {}
         train_soft_stats = soft_stats.get('train') or {}
         val_soft_stats = soft_stats.get('val') or {}
+        train_epoch_positions = (self.run_summary_metadata or {}).get('train_epoch_positions')
+        total_epoch_positions = (self.run_summary_metadata or {}).get('total_epoch_positions')
+        total_pool_positions = (self.run_summary_metadata or {}).get('total_pool_positions')
         if train_soft_stats.get('policy_occ_avg') is not None:
-            train_occ_latest = float(train_soft_stats.get('policy_occ_avg') or 0.0)
+            pool_train_occ = float(train_soft_stats.get('policy_occ_avg') or 0.0)
         if val_soft_stats.get('policy_occ_avg') is not None:
-            val_occ_latest = float(val_soft_stats.get('policy_occ_avg') or 0.0)
-        if train_soft_stats.get('policy_weight_avg') is not None:
-            train_weight_latest = float(train_soft_stats.get('policy_weight_avg') or 0.0)
-        if val_soft_stats.get('policy_weight_avg') is not None:
-            val_weight_latest = float(val_soft_stats.get('policy_weight_avg') or 0.0)
-        if train_soft_stats.get('policy_occ_max') is not None:
-            train_occ_max_latest = float(train_soft_stats.get('policy_occ_max') or 0.0)
-        if val_soft_stats.get('policy_occ_max') is not None:
-            val_occ_max_latest = float(val_soft_stats.get('policy_occ_max') or 0.0)
+            pool_val_occ = float(val_soft_stats.get('policy_occ_avg') or 0.0)
         if train_soft_stats.get('policy_target_effective_moves') is not None:
-            train_target_eff_latest = float(train_soft_stats.get('policy_target_effective_moves') or 1.0)
+            pool_train_target_eff = float(train_soft_stats.get('policy_target_effective_moves') or 1.0)
         if val_soft_stats.get('policy_target_effective_moves') is not None:
-            val_target_eff_latest = float(val_soft_stats.get('policy_target_effective_moves') or 1.0)
-        if train_soft_stats.get('policy_target_top1_mass') is not None:
-            train_target_top1_latest = float(train_soft_stats.get('policy_target_top1_mass') or 1.0)
-        if val_soft_stats.get('policy_target_top1_mass') is not None:
-            val_target_top1_latest = float(val_soft_stats.get('policy_target_top1_mass') or 1.0)
+            pool_val_target_eff = float(val_soft_stats.get('policy_target_effective_moves') or 1.0)
         if train_soft_stats.get('policy_soft_rate') is not None:
-            train_soft_rate_latest = float(train_soft_stats.get('policy_soft_rate') or 0.0)
+            pool_train_soft_rate = float(train_soft_stats.get('policy_soft_rate') or 0.0)
         if val_soft_stats.get('policy_soft_rate') is not None:
-            val_soft_rate_latest = float(val_soft_stats.get('policy_soft_rate') or 0.0)
+            pool_val_soft_rate = float(val_soft_stats.get('policy_soft_rate') or 0.0)
         if train_occ_latest is not None or val_occ_latest is not None:
             info_lines = [
-                "avg_occ: "
-                f"T={train_occ_latest:.2f}" if train_occ_latest is not None else "avg_occ: T=-",
+                "sampled avg_occ: "
+                f"T={train_occ_latest:.2f}" if train_occ_latest is not None else "sampled avg_occ: T=-",
                 f"V={val_occ_latest:.2f}" if val_occ_latest is not None else "V=-",
             ]
             weight_line = (
-                "sample_weight: "
-                f"T={train_weight_latest:.2f}" if train_weight_latest is not None else "sample_weight: T=-"
+                "sampled weight: "
+                f"T={train_weight_latest:.2f}" if train_weight_latest is not None else "sampled weight: T=-"
             )
             weight_line += f", V={val_weight_latest:.2f}" if val_weight_latest is not None else ", V=-"
             max_line = (
-                "max_occ: "
-                f"T={train_occ_max_latest:.0f}" if train_occ_max_latest is not None else "max_occ: T=-"
+                "sampled max_occ: "
+                f"T={train_occ_max_latest:.0f}" if train_occ_max_latest is not None else "sampled max_occ: T=-"
             )
             max_line += f", V={val_occ_max_latest:.0f}" if val_occ_max_latest is not None else ", V=-"
             eff_line = (
@@ -5659,24 +5669,43 @@ class TrainingLogger:
                 f"T={train_target_top1_latest:.3f}" if train_target_top1_latest is not None else "target_top1_mass: T=-"
             )
             top1_line += f", V={val_target_top1_latest:.3f}" if val_target_top1_latest is not None else ", V=-"
-            soft_rate_line = None
-            if train_soft_rate_latest is not None or val_soft_rate_latest is not None:
-                soft_rate_line = (
-                    "soft_rows: "
-                    f"T={100.0 * train_soft_rate_latest:.1f}%" if train_soft_rate_latest is not None else "soft_rows: T=-"
+            pool_lines = []
+            if pool_train_occ is not None or pool_val_occ is not None:
+                pool_line = (
+                    "pool avg_occ: "
+                    f"T={pool_train_occ:.2f}" if pool_train_occ is not None else "pool avg_occ: T=-"
                 )
-                soft_rate_line += (
-                    f", V={100.0 * val_soft_rate_latest:.1f}%" if val_soft_rate_latest is not None else ", V=-"
+                pool_line += f", V={pool_val_occ:.2f}" if pool_val_occ is not None else ", V=-"
+                pool_lines.append(pool_line)
+            if pool_train_soft_rate is not None or pool_val_soft_rate is not None:
+                pool_line = (
+                    "pool soft_rows: "
+                    f"T={100.0 * pool_train_soft_rate:.1f}%" if pool_train_soft_rate is not None else "pool soft_rows: T=-"
                 )
+                pool_line += (
+                    f", V={100.0 * pool_val_soft_rate:.1f}%" if pool_val_soft_rate is not None else ", V=-"
+                )
+                pool_lines.append(pool_line)
+            if pool_train_target_eff is not None or pool_val_target_eff is not None:
+                pool_line = (
+                    "pool eff_moves: "
+                    f"T={pool_train_target_eff:.2f}" if pool_train_target_eff is not None else "pool eff_moves: T=-"
+                )
+                pool_line += f", V={pool_val_target_eff:.2f}" if pool_val_target_eff is not None else ", V=-"
+                pool_lines.append(pool_line)
             detail_lines = [
+                (
+                    "data: "
+                    f"train/epoch={_format_million_count(train_epoch_positions)}, "
+                    f"epoch_total={_format_million_count(total_epoch_positions)}, "
+                    f"pool_total={_format_million_count(total_pool_positions)}"
+                ),
                 f"{info_lines[0]}, {info_lines[1]}",
                 eff_line,
                 top1_line,
                 weight_line,
-                max_line,
             ]
-            if soft_rate_line:
-                detail_lines.insert(1, soft_rate_line)
+            detail_lines[1:1] = pool_lines[:2]
             ax.text(
                 0.02,
                 0.04,

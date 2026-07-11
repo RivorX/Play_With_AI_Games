@@ -21,146 +21,99 @@ paths:
 
 # ------------------------------------------------------------------------------
 # DATA
-# Data/cache order:
-#   1. PGN/Binary cache: min_elo, max_games, game_filters, max_moves_per_game
-#   2. Game range cache: binary identity only
-#   3. Split: train_split
-#   4. positions/game cache: train_split + positions_per_game
-#   5. final index cache: positions/game + sample_dedup + target_positions + target_selection
-#   6. soft target cache: final index + soft_targets
-#   7. train_sampling: training only, no dataset cache rebuild
-# Runtime knobs below affect speed only, not cache semantics.
+# Each section below matches exactly one pipeline phase.  The loader flattens
+# this presentation internally, so changing a value still has the cache impact
+# shown in its section title.
 # ------------------------------------------------------------------------------
 data:
-  # 1) PGN -> binary cache. Changing these rebuilds *_positions.bin.
-  min_elo: 2300
-  max_games: "max"           # number per PGN, or "max" for full file
-  max_moves_per_game: 300
+  # Phase 1 — PGN -> binary. Changes rebuild *_positions.bin.
+  phase_1_binary:
+    min_elo: 2300
+    max_games: "max"             # number per PGN, or "max" for full file
+    max_moves_per_game: 300
+    game_filters:
+      enabled: true
+      min_fullmove: 10
+      min_fullmove_draw: 20
+      min_fullmove_resign: 12
+      max_elo_gap: 500
+      exclude_terminations:
+        - "Time forfeit"
+        - "Timeout"
+        - "Flag"
+        - "Abandoned"
+        - "Rules infraction"
 
-  game_filters:
-    enabled: true
-    min_fullmove: 10
-    min_fullmove_draw: 20
-    min_fullmove_resign: 12
-    max_elo_gap: 500
-    exclude_terminations:
-      - "Time forfeit"
-      - "Timeout"
-      - "Flag"
-      - "Abandoned"
-      - "Rules infraction"
+  # Phase 2 — independent train/validation game split.
+  phase_2_split:
+    train_split: 0.85
 
-  # 2) Train/val split. Changing this rebuilds split-specific position/index/soft caches.
-  train_split: 0.85
+  # Phase 3 — positions selected from each game. Main coverage/diversity knob.
+  phase_3_positions:
+    positions_per_game:
+      enabled: true
+      selection_mode: "smart"    # smart | even
+      max_total: 40
+      min_distance: 4
+      opening_pct: 20
+      middlegame_pct: 45
+      endgame_pct: 35
+      rare_or_eventful_pct: 0
 
-  # 3) Per-game selector cache. This is the main "which positions enter IL" knob.
-  positions_per_game:
-    enabled: true
-    selection_mode: "smart"      # smart | even
-    max_total: 40
-    min_distance: 4
-    opening_pct: 20
-    middlegame_pct: 45
-    endgame_pct: 35
-    rare_or_eventful_pct: 0
+  # Phase 4 — final-state dedup. Binary retains full games for history.
+  phase_4_deduplication:
+    sample_dedup:
+      enabled: true
+      mode: "fen"
+      include_turn: true
+      include_history: true
+      max_count: 1
 
-  # 4) Final index dedup cache. Binary still keeps full games/history.
-  sample_dedup:
-    enabled: true
-    mode: "fen"
-    include_turn: true
-    include_history: true
-    max_count: 1
+  # Phase 5 — training candidate pool. Rebuilds final index and soft cache.
+  phase_5_training_pool:
+    target_positions: 20000000
+    target_selection:
+      mode: "count_aware"        # even | count_aware
+      train_pool_multiplier: 3.0 # cache more train rows than one epoch
+      broad_fraction: 0.30       # candidate-pool coverage
+      soft_candidate_selection:
+        enabled: true            # extra train-only candidate keys
+        min_distance: 2          # coverage only; does not change target probabilities
+        max_total: 40
 
-  # 5) Final target size. Changing this rebuilds final index + soft target cache only.
-  target_positions: 20000000
-
-  # 6) Final target selection. Train keeps broad coverage, then prefers rows with stronger raw occurrence.
-  target_selection:
-    mode: "count_aware"          # even | count_aware
-    broad_fraction: 0.40         # supersoft test: 40% broad/even, 60% count-aware compression
-    min_count_for_bonus: 2
-    max_count_score: 256
-    count_power: 0.90
-    max_bonus_rows_per_soft_key: 1
-    bonus_oversample_factor: 2.0
-    min_unique_moves_for_soft_bonus: 2
-    max_single_move_bonus_fraction: 0.25
-    move_diversity_bonus: 6.0
-    single_move_multiplier: 0.02
-    opening_progress_max: 0.25
-    endgame_progress_min: 0.75
-    count_opening_max_fraction: 0.45
-    opening_score_multiplier: 1.50
-    endgame_score_multiplier: 1.05
-
-  # 7) Soft target cache. Aggregates raw split knowledge into final selected rows.
-  soft_targets:
-    enabled: true
-    policy: true
-    value: true
-    source: "raw_split"
-    mode: "fen_no_counters"
-    include_turn: true
-    include_history: false
-    max_policy_moves: 32
-    policy_mass_threshold: 0.995
-
-    value_key:
+  # Phase 6 — aggregate raw split knowledge into policy/WDL soft targets.
+  phase_6_soft_targets:
+    soft_targets:
+      enabled: true
+      source: "raw_split"
       mode: "fen_no_counters"
       include_turn: true
       include_history: false
-    value_wdl_shrinkage_alpha: 1.0
 
-    policy_target:
-      hard_below_count: 2
-      soft_full_count: 12
-      min_soft_alpha_for_multi_move: 0.10
-      opening_progress_max: 0.25
-      endgame_progress_min: 0.75
-      opening_soft_power: 0.85
-      middlegame_soft_power: 1.25
-      endgame_soft_power: 1.35
+      # Store and use the target-mover's Elo; the gain is capped deliberately.
+      policy_rating_weight:
+        enabled: true
+        min_elo: 2300
+        reference_elo: 2800
+        max_multiplier: 1.35
+        apply_to_value: true     # use the same evidence quality for WDL aggregation
 
-    sample_weight:
+
+  # Phase 7 — fixed per-epoch draw from the cached pool. No cache rebuild.
+  phase_7_epoch_sampling:
+    train_sampling:
       enabled: true
-      mode: "sqrt_count"
-      max: 8
-      opening_progress_max: 0.25
-      opening_boost_min_count: 2
-      opening_multiplier: 1.5
-      opening_max: 12
-      single_move_multiplier: 0.75
-      single_move_max: 2.0
-      soft_entropy_bonus: 0.35
-      soft_entropy_bonus_max: 1.35
+      # Every informative soft row appears once per epoch; all remaining rows
+      # are broad, non-soft coverage.
+      soft_max_fraction: 0.28
+      min_soft_moves: 2
+      min_soft_entropy: 0.12     # skip technically multi-move but near-hard targets
 
-    value_sample_weight:
-      enabled: true
-      confidence_min: 0.60
-      confidence_k: 3.0
-      progress_min: 0.25
-      progress_power: 1.5
-      max: 1.0
-
-  # 8) Training sampler. No cache rebuild; affects only epoch sampling.
-  train_sampling:
-    enabled: false
-    mode: "policy_weighted"
-    source: "sample_weight"
-    weight_power: 0.5
-    min_weight: 0.05
-    max_weight: 64
-    epoch_size_multiplier: 1.0
-    opening_floor: 0.0
-
-  # PGN/soft-target preprocessing runtime. Speed only, no cache hash.
-  files_at_once: 1
-  phase1_threads: all
-  phase2_threads: all
-  phase2_chunk_size: 512
-  soft_target_workers: auto
-  soft_target_chunk_size: 500000
+  # Runtime affects preprocessing speed only, never data/cache semantics.
+  runtime:
+    preprocess_threads: all     # ALL logical CPU workers; ~4 balanced shards per worker
+    soft_target_workers: auto
+    soft_target_chunk_size: auto
 
 
 # ------------------------------------------------------------------------------
@@ -168,7 +121,7 @@ data:
 # ------------------------------------------------------------------------------
 model:
   # Model version identifier
-  version: "v9.8"
+  version: "v9.9b"
   # Base architecture
   num_residual_blocks: 8        # Number of residual blocks (6-12 optimal)
   filters: 128                  # Convolutional filters (128-256 for RTX 5060 Ti)
@@ -236,9 +189,9 @@ imitation_learning:
   # LR schedule
   min_lr_ratio: 0.005
   lr_plateau_decay: true
-  lr_plateau_patience: 2
-  lr_plateau_factor: 0.5
-  lr_plateau_min_scale: 0.25
+  lr_plateau_patience: auto     # auto = ~60% of max_patience, clamped below early stop
+  lr_plateau_factor: 0.7
+  lr_plateau_min_scale: 0.35
   lr_plateau_cooldown: 1
   lr_plateau_reset_patience: true
 
@@ -248,6 +201,12 @@ imitation_learning:
   value_scalar_aux_loss_weight: 0.20
   moves_left_loss_weight: 0.05
   wdl_label_smoothing: 0.01
+
+  # Exact horizontal chess symmetry: doubles positional coverage online without
+  # rebuilding data. The policy index map is transformed with the board.
+  augmentation:
+    enabled: true
+    horizontal_flip_prob: 0.5
 
   # Checkpoint selection
   early_stop_monitor: value_aware # total | value_aware
@@ -716,7 +675,7 @@ hardware:
   use_compile: true
 
   # DataLoader throughput
-  num_workers: 6
+  num_workers: 4
   train_prefetch_factor: 1
   cuda_train_prefetch_queue_size: 2
   cuda_eval_prefetch_queue_size: 1

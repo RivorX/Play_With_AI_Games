@@ -176,6 +176,22 @@ def board_to_tensor(board, flip_perspective=None):
     return tensor
 
 
+_COMPACT_PIECE_SPECS = (
+    (chess.PAWN, chess.WHITE, 1),
+    (chess.KNIGHT, chess.WHITE, 2),
+    (chess.BISHOP, chess.WHITE, 3),
+    (chess.ROOK, chess.WHITE, 4),
+    (chess.QUEEN, chess.WHITE, 5),
+    (chess.KING, chess.WHITE, 6),
+    (chess.PAWN, chess.BLACK, 7),
+    (chess.KNIGHT, chess.BLACK, 8),
+    (chess.BISHOP, chess.BLACK, 9),
+    (chess.ROOK, chess.BLACK, 10),
+    (chess.QUEEN, chess.BLACK, 11),
+    (chess.KING, chess.BLACK, 12),
+)
+
+
 def board_to_compact(board):
     """
     Convert board to ultra-compact binary representation
@@ -190,33 +206,22 @@ def board_to_compact(board):
     NOTE: Stores board in ORIGINAL orientation (not POV)
     POV conversion happens at tensor conversion time
     """
-    piece_to_code = {
-        (chess.PAWN, chess.WHITE): 1,
-        (chess.KNIGHT, chess.WHITE): 2,
-        (chess.BISHOP, chess.WHITE): 3,
-        (chess.ROOK, chess.WHITE): 4,
-        (chess.QUEEN, chess.WHITE): 5,
-        (chess.KING, chess.WHITE): 6,
-        (chess.PAWN, chess.BLACK): 7,
-        (chess.KNIGHT, chess.BLACK): 8,
-        (chess.BISHOP, chess.BLACK): 9,
-        (chess.ROOK, chess.BLACK): 10,
-        (chess.QUEEN, chess.BLACK): 11,
-        (chess.KING, chess.BLACK): 12,
-    }
-    
-    codes = [0] * 64
-    for square, piece in board.piece_map().items():
-        codes[square] = piece_to_code[(piece.piece_type, piece.color)]
-    
-    # Pack pairs of codes into bytes (32 bytes for pieces)
-    packed = bytearray(32)
-    for i in range(0, 64, 2):
-        packed[i // 2] = (codes[i] << 4) | codes[i + 1]
-    
-    # === ADD METADATA (6 bytes) ===
-    
-    # Byte 32: Castling rights (4 bits: K, Q, k, q)
+    # Fill nibbles directly from python-chess bitboards.  This avoids building
+    # a 64-entry piece map and then looping over all 64 squares for every ply.
+    packed = bytearray(38)
+    for piece_type, color, code in _COMPACT_PIECE_SPECS:
+        bitboard = board.pieces_mask(piece_type, color)
+        while bitboard:
+            lowest_bit = bitboard & -bitboard
+            square = lowest_bit.bit_length() - 1
+            byte_index = square >> 1
+            if square & 1:
+                packed[byte_index] |= code
+            else:
+                packed[byte_index] |= code << 4
+            bitboard ^= lowest_bit
+
+    # Byte 32: castling rights (K, Q, k, q).
     castling_byte = 0
     if board.has_kingside_castling_rights(chess.WHITE):
         castling_byte |= 0b1000  # K
@@ -226,21 +231,9 @@ def board_to_compact(board):
         castling_byte |= 0b0010  # k
     if board.has_queenside_castling_rights(chess.BLACK):
         castling_byte |= 0b0001  # q
-    packed.append(castling_byte)
-    
-    # Byte 33: En passant square (0-63, 255=none)
-    if board.ep_square is not None:
-        packed.append(board.ep_square)
-    else:
-        packed.append(255)
-    
-    # Bytes 34-35: Halfmove clock (uint16, big-endian)
-    halfmove_bytes = struct.pack('>H', board.halfmove_clock)
-    packed.extend(halfmove_bytes)
-
-    # Bytes 36-37: Fullmove number (uint16, big-endian)
-    fullmove_bytes = struct.pack('>H', board.fullmove_number)
-    packed.extend(fullmove_bytes)
+    packed[32] = castling_byte
+    packed[33] = board.ep_square if board.ep_square is not None else 255
+    struct.pack_into('>HH', packed, 34, board.halfmove_clock, board.fullmove_number)
     
     return bytes(packed)
 
@@ -861,7 +854,7 @@ def get_position_size(history_positions=0):
     Calculate size of binary position record
     
     🆕 v4.4 FORMAT (Extended with metadata):
-    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)]
+    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [ActorElo (2B)]
     
     Board format changed: 32B pieces + 6B metadata (castling, en passant, halfmove, fullmove)
     
@@ -876,16 +869,17 @@ def get_position_size(history_positions=0):
     base_size += 2  # MoveIdx (uint16)
     base_size += 2  # MoveTarget (uint16) - the move label (0-4671)
     base_size += 4  # Outcome (float32)
+    base_size += 2  # ActorElo (uint16) - player who selected MoveTarget
     
     return base_size
 
 
-def pack_position_data(board, game_id, move_idx, move_target, outcome):
+def pack_position_data(board, game_id, move_idx, move_target, outcome, actor_elo=0):
     """
     Pack position data into binary format
     
     v4.4 FORMAT (Extended with metadata):
-    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)]
+    [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [ActorElo (2B)]
     
     Args:
         board: chess.Board
@@ -907,6 +901,7 @@ def pack_position_data(board, game_id, move_idx, move_target, outcome):
     data.extend(struct.pack('H', move_idx))         # MoveIdx (2 bytes)
     data.extend(struct.pack('H', move_target))      # MoveTarget (2 bytes)
     data.extend(struct.pack('f', outcome))          # Outcome (4 bytes)
+    data.extend(struct.pack('H', max(0, min(65535, int(actor_elo or 0)))))
     
     return bytes(data)
 
