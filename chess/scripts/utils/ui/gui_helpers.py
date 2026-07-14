@@ -10,6 +10,7 @@ from urllib.request import urlopen
 import chess
 import chess.pgn
 import chess.svg
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
 from PIL import Image
 

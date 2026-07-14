@@ -95,6 +95,155 @@ def _line(ax, rows, column, label, color=None, *, ls="-", lw=1.8, alpha=1.0):
     return True
 
 
+def _stacked_iteration_bars(ax, rows, specs, value_resolver, *, title, ylabel, legend_columns=3):
+    """Draw a compact stacked decomposition with one bar per iteration."""
+    iterations = []
+    series = {key: [] for key, _, _ in specs}
+    totals = []
+    for row in rows:
+        iteration = _number(row.get("iteration"))
+        if iteration is None:
+            continue
+        resolved = dict(value_resolver(row) or {})
+        values = {
+            key: max(0.0, _number(resolved.get(key)) or 0.0)
+            for key, _, _ in specs
+        }
+        iterations.append(int(iteration))
+        totals.append(sum(values.values()))
+        for key in series:
+            series[key].append(values[key])
+
+    _style(ax, title)
+    if not iterations or not any(totals):
+        _no_data(ax)
+        return False
+
+    bottoms = [0.0] * len(iterations)
+    for key, label, color in specs:
+        values = series[key]
+        if not any(values):
+            continue
+        ax.bar(
+            iterations,
+            values,
+            bottom=bottoms,
+            width=0.76,
+            color=color,
+            label=label,
+            edgecolor="white",
+            linewidth=0.3,
+        )
+        bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
+
+    if len(iterations) <= 12:
+        padding = max(totals) * 0.015
+        for iteration, total in zip(iterations, totals):
+            ax.text(iteration, total + padding, f"{total:.1f}", ha="center", va="bottom", fontsize=6.2, color="#374151")
+    ax.set_ylim(0.0, max(totals) * 1.12)
+    ax.set_ylabel(ylabel, fontsize=8)
+    ax.set_axisbelow(True)
+    ax.legend(
+        fontsize=6.2,
+        frameon=False,
+        ncol=max(1, int(legend_columns)),
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.08),
+    )
+    return True
+
+
+def _average_composition(rows, specs, value_resolver, window=5):
+    """Return last-window component means using the same resolver as stacked bars."""
+    selected_rows = list(rows[-max(1, int(window)):])
+    if not selected_rows:
+        return [], 0
+    sums = {key: 0.0 for key, _, _ in specs}
+    for row in selected_rows:
+        resolved = dict(value_resolver(row) or {})
+        for key in sums:
+            sums[key] += max(0.0, _number(resolved.get(key)) or 0.0)
+    divisor = float(len(selected_rows))
+    averaged = [
+        (key, label, sums[key] / divisor, color)
+        for key, label, color in specs
+    ]
+    return averaged, len(selected_rows)
+
+
+def _composition_donut(
+    ax,
+    averaged,
+    *,
+    title,
+    center_label,
+    unit,
+    decimals=1,
+    min_share=0.005,
+    min_value=0.0,
+    autopct_min=4.0,
+):
+    """Draw a filtered decomposition donut with percentage and absolute cost."""
+    ax.set_title(title, fontsize=10, fontweight="bold", loc="left")
+    raw_total = sum(max(0.0, value) for _, _, value, _ in averaged)
+    visible = [
+        (key, label, value, color)
+        for key, label, value, color in averaged
+        if value > 0.0
+        and (value >= float(min_value) or (raw_total > 0.0 and value / raw_total >= float(min_share)))
+    ]
+    visible_total = sum(value for _, _, value, _ in visible)
+    if visible_total <= 0.0:
+        _no_data(ax)
+        return False
+
+    values = [value for _, _, value, _ in visible]
+    colors = [color for _, _, _, color in visible]
+
+    def _autopct(percent):
+        if percent < float(autopct_min):
+            return ""
+        value = visible_total * percent / 100.0
+        return f"{percent:.1f}%\n{value:.{decimals}f}{unit}"
+
+    ax.grid(False)
+    wedges, _, _ = ax.pie(
+        values,
+        colors=colors,
+        startangle=90,
+        counterclock=False,
+        wedgeprops={"width": 0.46, "edgecolor": "white", "linewidth": 1.0},
+        autopct=_autopct,
+        pctdistance=0.76,
+        textprops={"fontsize": 7, "fontweight": "bold", "color": "#111827"},
+    )
+    ax.text(
+        0,
+        0,
+        f"{center_label}\n{visible_total:.{decimals}f}{unit}",
+        ha="center",
+        va="center",
+        fontsize=8,
+        fontweight="bold",
+        color="#374151",
+    )
+    legend_labels = [
+        f"{label} | {100.0 * value / visible_total:.1f}% | {value:.{decimals}f}{unit}"
+        for _, label, value, _ in visible
+    ]
+    ax.legend(
+        wedges,
+        legend_labels,
+        fontsize=6.2,
+        frameon=False,
+        ncol=2,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.02),
+    )
+    ax.set_aspect("equal")
+    return True
+
+
 def _legend(ax, *, ncol=2, loc="best"):
     handles, labels = ax.get_legend_handles_labels()
     if handles:
@@ -205,7 +354,7 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     if not shown:
         _no_data(ax)
 
-    ax = axes[2, 0]
+    ax = axes[2, 2]
     _style(ax, "Training losses")
     shown = _line(ax, main, "avg_loss", "total", "#111827", lw=2.2)
     shown |= _line(ax, main, "policy_loss", "policy", _COLORS[0])
@@ -214,7 +363,7 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     if not shown:
         _no_data(ax)
 
-    ax = axes[2, 1]
+    ax = axes[2, 0]
     _style(ax, "Training accuracy", percent=True)
     shown = _line(ax, main, "policy_top1_acc", "policy top-1", _COLORS[0])
     shown |= _line(ax, main, "policy_top3_acc", "policy top-3", _COLORS[2])
@@ -276,7 +425,8 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
         ("Value MAE", _fmt(_last(main, "value_mae"))),
         ("Changed top", _fmt(_last(detail, "mcts_prior_changed_rate"), "percent")),
         ("Good MCTS target", _fmt(_last(detail, "mcts_good_target_rate"), "percent")),
-        ("Throughput", f"{_fmt(_last(perf, 'positions_per_sec'), 'integer')} pos/s"),
+        ("Replay throughput", f"{_fmt(_last(perf, 'replay_positions_per_sec', _last(perf, 'positions_per_sec')), 'integer')} pos/s"),
+        ("Played throughput", f"{_fmt(_last(perf, 'played_positions_per_sec'), 'integer')} pos/s"),
     ]
     ax.set_title("Latest checkpoint", fontsize=10, fontweight="bold", loc="left")
     table = ax.table(cellText=summary, colLabels=("Signal", "Latest"), loc="center",
@@ -402,15 +552,21 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
     if not (shown or width): _no_data(ax)
 
     ax = axes[2, 2]
-    _style(ax, "MCTS budget and coverage")
-    shown = _line(ax, rows, "mcts_avg_sims", "simulations", _COLORS[0])
-    shown |= _line(ax, rows, "mcts_avg_budget", "budget", _COLORS[1], ls="--")
-    ax2 = ax.twinx(); ax2.tick_params(labelsize=8); ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
-    coverage = _line(ax2, rows, "mcts_explored_prior_mass_mean", "prior covered", _COLORS[2])
-    coverage |= _line(ax2, rows, "mcts_visit_coverage_ratio_mean", "moves visited", _COLORS[3])
-    h, l = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
-    if h or h2: ax.legend(h + h2, l + l2, fontsize=7, frameon=False, ncol=2)
-    if not (shown or coverage): _no_data(ax)
+    _style(ax, "MCTS simulation allocation")
+    shown = _line(ax, rows, "mcts_budget_min", "min", _COLORS[4], ls=":", lw=1.1, alpha=0.75)
+    shown |= _line(ax, rows, "mcts_budget_p10", "p10", _COLORS[1], ls="--", lw=1.4)
+    shown |= _line(ax, rows, "mcts_budget_p50", "p50", _COLORS[2], lw=1.5)
+    shown |= _line(ax, rows, "mcts_avg_budget", "average", _COLORS[0], lw=2.4)
+    shown |= _line(ax, rows, "mcts_budget_p90", "p90", _COLORS[3], ls="--", lw=1.4)
+    shown |= _line(ax, rows, "mcts_budget_max", "max", _COLORS[4], ls=":", lw=1.1, alpha=0.75)
+    shown |= _line(ax, rows, "mcts_budget_target", "target average", "#222222", ls="--", lw=1.2)
+    p10_x, p10_y = _series(rows, "mcts_budget_p10")
+    p90_x, p90_y = _series(rows, "mcts_budget_p90")
+    if p10_x and p10_x == p90_x:
+        ax.fill_between(p10_x, p10_y, p90_y, color=_COLORS[0], alpha=0.08, linewidth=0)
+    _legend(ax, ncol=3)
+    ax.set_ylabel("simulations / position", fontsize=8)
+    if not shown: _no_data(ax)
 
     ax = axes[3, 0]
     _style(ax, "MCTS visit shape")
@@ -448,27 +604,90 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
     return True
 
 
-def render_rl_performance(performance_csv_path, output_path):
-    """Render the minimum set needed to locate a throughput bottleneck."""
-    rows = _rows(performance_csv_path)
+def render_rl_performance(performance_csv_path, output_path, data_quality_csv_path=None):
+    """Render throughput, latency and CPU/GPU-feed bottlenecks without duplicates."""
+    rows = [dict(row) for row in _rows(performance_csv_path)]
     if not rows:
         return False
-    fig, axes = plt.subplots(3, 3, figsize=(18, 11.5))
+
+    quality_by_iteration = {}
+    for quality_row in _rows(data_quality_csv_path):
+        iteration = _number(quality_row.get("iteration"))
+        if iteration is not None:
+            quality_by_iteration[int(iteration)] = quality_row
+    for row in rows:
+        iteration = _number(row.get("iteration"))
+        quality = quality_by_iteration.get(int(iteration)) if iteration is not None else None
+        replay_rate = _number(row.get("replay_positions_per_sec"))
+        if replay_rate is None:
+            replay_rate = _number(row.get("positions_per_sec"))  # schema <= 6
+        if replay_rate is not None:
+            row["replay_positions_per_sec"] = replay_rate
+
+        played_rate = _number(row.get("played_positions_per_sec"))
+        keep_rate = (
+            _number(quality.get("selfplay_replay_storage_keep_rate"))
+            if quality else None
+        )
+        if played_rate is None and replay_rate is not None and keep_rate and keep_rate > 0.0:
+            played_rate = replay_rate / keep_rate
+            row["played_positions_per_sec"] = played_rate
+
+        average_sims = _number(quality.get("mcts_avg_sims")) if quality else None
+        simulations_rate = _number(row.get("mcts_simulations_per_sec"))
+        if simulations_rate is None and played_rate is not None and average_sims and average_sims > 0.0:
+            simulations_rate = played_rate * average_sims
+            row["mcts_simulations_per_sec"] = simulations_rate
+
+        nn_evaluations_rate = _number(row.get("mcts_nn_evaluations_per_sec"))
+        if nn_evaluations_rate is None:
+            nn_items = _number(row.get("mcts_nn_inference_batch_items"))
+            selfplay_seconds = _number(row.get("stage_selfplay_time_s"))
+            if nn_items is not None and selfplay_seconds and selfplay_seconds > 0.0:
+                row["mcts_nn_evaluations_per_sec"] = nn_items / selfplay_seconds
+
+        traversal_rate = _number(row.get("mcts_selection_node_traversals_per_sec"))
+        if traversal_rate is None:
+            traversal_rate = _number(row.get("mcts_nodes_per_sec"))  # schema <= 6
+            if traversal_rate is not None:
+                row["mcts_selection_node_traversals_per_sec"] = traversal_rate
+        if traversal_rate is not None and simulations_rate is not None and simulations_rate > 0.0:
+            row["mcts_selection_path_length"] = traversal_rate / simulations_rate
+
+    fig, axes = plt.subplots(4, 3, figsize=(18, 15.5))
 
     ax = axes[0, 0]
-    _style(ax, "Throughput and central batch")
-    shown = _line(ax, rows, "positions_per_sec", "positions/s", _COLORS[0])
+    _style(ax, "Self-play throughput")
+    shown = _line(ax, rows, "replay_positions_per_sec", "replay positions/s", _COLORS[0])
+    shown |= _line(ax, rows, "played_positions_per_sec", "played positions/s", _COLORS[2])
     ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
-    batch = _line(ax2, rows, "mcts_central_avg_batch_size", "central batch", _COLORS[2])
+    visits = _line(
+        ax2,
+        rows,
+        "mcts_simulations_per_sec",
+        "completed MCTS visits/s",
+        _COLORS[3],
+    )
+    ax.set_ylabel("positions/s", fontsize=8)
+    if visits:
+        ax2.set_ylabel("completed simulations/s", fontsize=8)
+    else:
+        ax2.set_visible(False)
     h, l = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
     if h or h2: ax.legend(h + h2, l + l2, fontsize=7, frameon=False)
-    if not (shown or batch): _no_data(ax)
+    if not (shown or visits): _no_data(ax)
 
     stage_specs = (
         ("stage_selfplay_time_s", "self-play", "#2563eb"),
         ("stage_replay_time_s", "replay", "#0891b2"),
         ("stage_train_time_s", "train", "#16a34a"),
-        ("stage_eval_log_time_s", "eval/log", "#f59e0b"),
+        ("stage_regular_eval_time_s", "regular eval", "#eab308"),
+        ("stage_promotion_eval_time_s", "promotion eval", "#f59e0b"),
+        ("stage_elo_eval_time_s", "Elo eval", "#ec4899"),
+        ("stage_log_time_s", "decision/log", "#a855f7"),
+        # Schemas <= 7 did not split evaluation. Keep the old value visible
+        # without pretending that historical time belonged to one new bucket.
+        ("stage_eval_log_time_s", "legacy eval/log", "#fbbf24"),
         ("stage_checkpoint_time_s", "checkpoint", "#9333ea"),
         ("stage_setup_time_s", "setup", "#64748b"),
         ("stage_gc_time_s", "gc", "#db2777"),
@@ -497,14 +716,24 @@ def render_rl_performance(performance_csv_path, output_path):
     _style(ax, "Runtime composition per iteration")
     if iterations and any(totals):
         bottoms = [0.0] * len(iterations)
+        runtime_total = sum(totals)
+        visible_stage_count = 0
         for column, label, color in stage_specs:
             values = stage_values[column]
+            component_total = sum(values)
+            if component_total < 1.0 or (
+                runtime_total > 0.0 and component_total / runtime_total < 0.002
+            ):
+                continue
             ax.bar(iterations, values, bottom=bottoms, width=0.76, color=color,
                    label=label, edgecolor="white", linewidth=0.35)
             bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
-        if any(other_values):
+            visible_stage_count += 1
+        other_total = sum(other_values)
+        if other_total >= 1.0 and (runtime_total <= 0.0 or other_total / runtime_total >= 0.002):
             ax.bar(iterations, other_values, bottom=bottoms, width=0.76, color="#d1d5db",
                    label="other/unaccounted", edgecolor="white", linewidth=0.35)
+            visible_stage_count += 1
         if len(iterations) <= 12:
             padding = max(totals) * 0.015
             for iteration, total in zip(iterations, totals):
@@ -513,76 +742,109 @@ def render_rl_performance(performance_csv_path, output_path):
         ax.set_ylim(0.0, max(totals) * 1.10)
         ax.set_ylabel("seconds", fontsize=8)
         ax.set_axisbelow(True)
-        ax.legend(
-            fontsize=6.5,
-            frameon=False,
-            ncol=4,
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.08),
-        )
+        _legend(ax, ncol=min(4, max(1, visible_stage_count)), loc="best")
     else:
         _no_data(ax)
 
     ax = axes[0, 2]
     window = min(5, len(iterations))
-    _style(ax, f"Average runtime composition (last {window})")
-    if window > 0 and any(totals[-window:]):
-        average_specs = []
-        for column, label, color in stage_specs:
-            values = stage_values[column][-window:]
-            average_specs.append((label, sum(values) / window, color))
-        if any(other_values[-window:]):
-            average_specs.append(("other", sum(other_values[-window:]) / window, "#d1d5db"))
-        left = 0.0
-        average_total = sum(value for _, value, _ in average_specs)
-        for label, value, color in average_specs:
-            if value <= 0.0:
-                continue
-            ax.barh([0], [value], left=left, height=0.52, color=color, label=label,
-                    edgecolor="white", linewidth=0.5)
-            if average_total > 0.0 and value / average_total >= 0.08:
-                ax.text(left + value / 2.0, 0, f"{label}\n{value:.0f}s", ha="center", va="center",
-                        fontsize=7, color="white" if color != "#d1d5db" else "#111827",
-                        fontweight="bold")
-            left += value
-        ax.set_yticks([])
-        ax.set_xlabel("seconds", fontsize=8)
-        ax.set_ylim(-0.65, 0.65)
-        _legend(ax, ncol=2, loc="lower center")
-    else:
-        _no_data(ax)
+    runtime_average = [
+        (column, label, sum(stage_values[column][-window:]) / max(1, window), color)
+        for column, label, color in stage_specs
+    ]
+    if window > 0:
+        runtime_average.append(("other", "other", sum(other_values[-window:]) / window, "#d1d5db"))
+    _composition_donut(
+        ax,
+        runtime_average,
+        title=f"Average runtime composition (last {window})",
+        center_label="avg total",
+        unit="s",
+        decimals=0,
+        min_share=0.005,
+        min_value=1.0,
+    )
 
     ax = axes[1, 0]
-    _style(ax, "Central request latency")
-    shown = _line(ax, rows, "central_remote_wait_ms_per_request", "remote wait", _COLORS[1])
-    shown |= _line(ax, rows, "central_server_queue_wait_ms_per_request", "queue", _COLORS[4])
-    shown |= _line(ax, rows, "central_server_forward_ms_per_request", "forward", _COLORS[2])
-    shown |= _line(ax, rows, "central_server_total_ms_per_request", "server total", _COLORS[0], lw=2.2)
-    _legend(ax)
-    if not shown: _no_data(ax)
+    central_specs = (
+        ("queue", "queue", "#f59e0b"),
+        ("concat", "concat", "#0891b2"),
+        ("h2d", "H2D", "#2563eb"),
+        ("forward", "forward", "#16a34a"),
+        ("d2h", "D2H", "#7c3aed"),
+        ("server_other", "server other", "#64748b"),
+        ("ipc_other", "IPC/worker", "#db2777"),
+    )
+
+    def _central_latency_parts(row):
+        remote = max(0.0, _number(row.get("central_remote_wait_ms_per_request")) or 0.0)
+        queue = max(0.0, _number(row.get("central_server_queue_wait_ms_per_request")) or 0.0)
+        server_total = max(0.0, _number(row.get("central_server_total_ms_per_request")) or 0.0)
+        parts = {
+            "queue": queue,
+            "concat": max(0.0, _number(row.get("central_server_concat_ms_per_request")) or 0.0),
+            "h2d": max(0.0, _number(row.get("central_server_h2d_ms_per_request")) or 0.0),
+            "forward": max(0.0, _number(row.get("central_server_forward_ms_per_request")) or 0.0),
+            "d2h": max(0.0, _number(row.get("central_server_d2h_ms_per_request")) or 0.0),
+        }
+        known_server = parts["concat"] + parts["h2d"] + parts["forward"] + parts["d2h"]
+        logged_server_other = _number(row.get("central_server_other_ms_per_request"))
+        logged_ipc_other = _number(row.get("central_worker_ipc_ms_per_request"))
+        parts["server_other"] = max(0.0, logged_server_other if logged_server_other is not None else server_total - known_server)
+        parts["ipc_other"] = max(0.0, logged_ipc_other if logged_ipc_other is not None else remote - queue - server_total)
+        return parts
+
+    _stacked_iteration_bars(
+        ax,
+        rows,
+        central_specs,
+        _central_latency_parts,
+        title="Central request composition",
+        ylabel="ms / request",
+        legend_columns=4,
+    )
 
     ax = axes[1, 1]
-    _style(ax, "Latency per position")
-    shown = _line(ax, rows, "mcts_worker_nn_wait_ms_per_position", "worker wait/pos", _COLORS[1])
-    shown |= _line(ax, rows, "central_server_queue_wait_ms_per_position", "queue/pos", _COLORS[4])
-    shown |= _line(ax, rows, "central_server_forward_ms_per_position", "forward/pos", _COLORS[2])
-    shown |= _line(ax, rows, "central_server_total_ms_per_position", "server total/pos", _COLORS[0], lw=2.2)
-    _legend(ax)
-    if not shown: _no_data(ax)
+    position_latency_specs = (*central_specs, ("local_other", "local/other", "#111827"))
+
+    def _position_latency_parts(row):
+        worker_batch = max(0.0, _number(row.get("mcts_avg_batch_size")) or 0.0)
+        worker_wait = max(0.0, _number(row.get("mcts_worker_nn_wait_ms_per_position")) or 0.0)
+        if worker_batch <= 0.0:
+            return {"local_other": worker_wait}
+        parts = {
+            key: value / worker_batch
+            for key, value in _central_latency_parts(row).items()
+        }
+        parts["local_other"] = max(0.0, worker_wait - sum(parts.values()))
+        return parts
+
+    _stacked_iteration_bars(
+        ax,
+        rows,
+        position_latency_specs,
+        _position_latency_parts,
+        title="Latency composition per position",
+        ylabel="ms / position",
+        legend_columns=4,
+    )
 
     ax = axes[1, 2]
-    _style(ax, "Batching and occupancy")
-    shown = _line(ax, rows, "mcts_avg_batch_size", "worker batch", _COLORS[0])
-    shown |= _line(ax, rows, "mcts_central_avg_batch_size", "central batch", _COLORS[2])
-    ax2 = ax.twinx(); ax2.tick_params(labelsize=8); ax2.yaxis.set_major_formatter(PercentFormatter(100.0))
-    gpu = _line(ax2, rows, "mcts_gpu_busy_proxy_pct", "GPU busy proxy", _COLORS[3])
-    if not gpu:
-        gpu = _line(ax2, rows, "mcts_gpu_utilization_pct", "GPU busy proxy", _COLORS[3])
-    h, l = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
-    if h or h2: ax.legend(h + h2, l + l2, fontsize=7, frameon=False)
-    if not (shown or gpu): _no_data(ax)
+    central_average, _ = _average_composition(
+        rows, central_specs, _central_latency_parts, window=window,
+    )
+    _composition_donut(
+        ax,
+        central_average,
+        title=f"Average central request composition (last {window})",
+        center_label="avg request",
+        unit="ms",
+        decimals=1,
+        min_share=0.01,
+        min_value=0.1,
+    )
 
-    ax = axes[2, 0]
+    ax = axes[2, 2]
     _style(ax, "Inference volume")
     shown = _line(ax, rows, "mcts_nn_inference_calls", "NN calls", _COLORS[0])
     shown |= _line(ax, rows, "mcts_batch_expand_eval_calls", "expand calls", _COLORS[3])
@@ -592,50 +854,181 @@ def render_rl_performance(performance_csv_path, output_path):
     if h or h2: ax.legend(h + h2, l + l2, fontsize=7, frameon=False)
     if not (shown or volume): _no_data(ax)
 
-    ax = axes[2, 1]
-    _style(ax, "MCTS CPU cost (last 5)")
-    cpu_columns = (
-        ("mcts_batch_expand_eval_time_s", "expand/eval"), ("mcts_batch_expand_tensor_pack_time_s", "tensor pack"),
-        ("mcts_search_selection_time_s", "selection"), ("mcts_search_backprop_time_s", "backprop"),
-        ("mcts_policy_target_build_time_s", "target build"), ("mcts_move_selection_time_s", "move select"),
+    ax = axes[2, 0]
+    cpu_specs = (
+        ("board_copy", "board copy/push", "#dc2626"),
+        ("terminal", "terminal/draw", "#f59e0b"),
+        ("legal_mixed", "legal + move encoding", "#ea580c"),
+        ("legal", "python-chess legal", "#fb923c"),
+        ("move_index", "move encoding", "#facc15"),
+        ("legacy_leaf", "legacy leaf prep (mixed)", "#9ca3af"),
+        ("selection", "tree selection", "#2563eb"),
+        ("encoding", "board encoding", "#0891b2"),
+        ("packing", "input packing", "#06b6d4"),
+        ("policy", "CPU policy", "#16a34a"),
+        ("backprop", "backprop/other", "#7c3aed"),
     )
-    pairs = [(label, _mean(rows, column) or 0.0) for column, label in cpu_columns]
-    pairs.sort(key=lambda pair: pair[1])
-    if any(value for _, value in pairs):
-        ax.barh([label for label, _ in pairs], [value for _, value in pairs], color=_COLORS[3], alpha=0.82)
-        ax.set_xlabel("worker-summed seconds", fontsize=8)
-    else: _no_data(ax)
 
-    ax = axes[2, 2]
+    def _mcts_cpu_parts(row):
+        schema_version = _number(row.get("schema_version")) or 0.0
+        tensor_pack = max(0.0, _number(row.get("mcts_batch_expand_tensor_pack_time_s")) or 0.0)
+        legal_index_pack = max(0.0, _number(row.get("mcts_batch_expand_legal_index_pack_time_s")) or 0.0)
+        board_encoding = max(0.0, _number(row.get("mcts_board_to_tensor_time_s")) or 0.0)
+        encoding_in_pack = min(tensor_pack, board_encoding)
+        tree_other = sum(
+            max(0.0, _number(row.get(column)) or 0.0)
+            for column in (
+                "mcts_search_backprop_time_s",
+                "mcts_search_root_setup_time_s",
+                "mcts_search_metadata_time_s",
+                "mcts_batch_expand_dedup_time_s",
+                "mcts_batch_expand_value_fanout_time_s",
+            )
+        )
+        old_leaf_prep = max(0.0, _number(row.get("mcts_batch_expand_legal_moves_time_s")) or 0.0)
+        return {
+            "board_copy": _number(row.get("mcts_board_materialize_time_s")) or 0.0,
+            "terminal": _number(row.get("mcts_terminal_checks_time_s")) or 0.0,
+            # Schema 5 measured legal generation and policy-index encoding together.
+            # Schema 6 separates them; older schemas measured mixed leaf preparation.
+            "legal_mixed": old_leaf_prep if 5.0 <= schema_version < 6.0 else 0.0,
+            "legal": old_leaf_prep if schema_version >= 6.0 else 0.0,
+            "move_index": _number(row.get("mcts_batch_expand_move_index_time_s")) or 0.0,
+            "legacy_leaf": old_leaf_prep if schema_version < 5.0 else 0.0,
+            "selection": _number(row.get("mcts_search_selection_time_s")) or 0.0,
+            "encoding": encoding_in_pack,
+            "packing": max(0.0, tensor_pack - encoding_in_pack) + legal_index_pack,
+            "policy": _number(row.get("mcts_batch_expand_cpu_policy_time_s")) or 0.0,
+            "backprop": tree_other,
+        }
+
+    _stacked_iteration_bars(
+        ax,
+        rows,
+        cpu_specs,
+        _mcts_cpu_parts,
+        title="Measured MCTS CPU composition",
+        ylabel="worker-summed seconds",
+        legend_columns=4,
+    )
+
+    cpu_average, _ = _average_composition(
+        rows, cpu_specs, _mcts_cpu_parts, window=window,
+    )
+    _composition_donut(
+        axes[2, 1],
+        cpu_average,
+        title=f"Average measured MCTS CPU (last {window})",
+        center_label="avg measured",
+        unit="s",
+        decimals=0,
+        min_share=0.01,
+        min_value=1.0,
+        autopct_min=7.0,
+    )
+
+    ax = axes[3, 0]
+    _style(ax, "Search work throughput")
+    shown = _line(ax, rows, "replay_positions_per_sec", "replay positions/s", _COLORS[0])
+    shown |= _line(ax, rows, "played_positions_per_sec", "played positions/s", _COLORS[2])
+    ax.set_ylabel("positions/s", fontsize=8)
+    ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
+    simulations = _line(ax2, rows, "mcts_simulations_per_sec", "simulations/s", _COLORS[3])
+    if simulations:
+        ax2.set_ylabel("simulations/s", fontsize=8)
+    else:
+        ax2.set_visible(False)
+    h, l = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+    if h or h2: ax.legend(h + h2, l + l2, fontsize=7, frameon=False)
+    if not (shown or simulations): _no_data(ax)
+    latest_path = _last(rows, "mcts_selection_path_length")
+    if latest_path is not None:
+        ax.text(
+            0.98, 0.04, f"latest selection path: {latest_path:.2f} traversals/sim",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=7, color="#4b5563",
+        )
+
+    ax = axes[3, 1]
+    _style(ax, "Batching and worker NN wait")
+    shown = _line(ax, rows, "mcts_avg_batch_size", "worker batch", _COLORS[0])
+    shown |= _line(
+        ax,
+        rows,
+        "mcts_central_avg_batch_size",
+        "shared batch seen/request",
+        _COLORS[2],
+    )
+    ax2 = ax.twinx(); ax2.tick_params(labelsize=8); ax2.yaxis.set_major_formatter(PercentFormatter(100.0))
+    wait_share = _line(ax2, rows, "mcts_worker_nn_wait_share_pct", "worker NN wait share", _COLORS[3])
+    if not wait_share:
+        wait_share = _line(ax2, rows, "mcts_gpu_busy_proxy_pct", "worker NN wait share", _COLORS[3])
+    if not wait_share:
+        wait_share = _line(ax2, rows, "mcts_gpu_utilization_pct", "worker NN wait share", _COLORS[3])
+    h, l = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+    if h or h2: ax.legend(h + h2, l + l2, fontsize=7, frameon=False)
+    if not (shown or wait_share): _no_data(ax)
+
+    ax = axes[3, 2]
     ax.axis("off")
     stage = {
         "self-play": _mean(rows, "stage_selfplay_time_s") or 0.0,
         "train": _mean(rows, "stage_train_time_s") or 0.0,
-        "eval/log": _mean(rows, "stage_eval_log_time_s") or 0.0,
+        "promotion eval": _mean(rows, "stage_promotion_eval_time_s") or 0.0,
+        "regular eval": _mean(rows, "stage_regular_eval_time_s") or 0.0,
+        "Elo eval": _mean(rows, "stage_elo_eval_time_s") or 0.0,
+        "decision/log": _mean(rows, "stage_log_time_s") or 0.0,
+        "legacy eval/log": _mean(rows, "stage_eval_log_time_s") or 0.0,
         "replay": _mean(rows, "stage_replay_time_s") or 0.0,
     }
     bottleneck = max(stage, key=stage.get) if any(stage.values()) else "n/a"
+    latest_traversals = _last(rows, "mcts_selection_node_traversals_per_sec")
+    latest_cpu_parts = _mcts_cpu_parts(rows[-1])
+    latest_central_parts = _central_latency_parts(rows[-1])
+    cpu_labels = {key: label for key, label, _ in cpu_specs}
+    central_labels = {key: label for key, label, _ in central_specs}
+    cpu_hotspot = max(latest_cpu_parts, key=latest_cpu_parts.get) if any(latest_cpu_parts.values()) else None
+    central_hotspot = max(latest_central_parts, key=latest_central_parts.get) if any(latest_central_parts.values()) else None
     summary = [
-        ("Latest throughput", f"{_fmt(_last(rows, 'positions_per_sec'), 'integer')} pos/s"),
-        ("5-it throughput", f"{_fmt(_mean(rows, 'positions_per_sec'), 'integer')} pos/s"),
+        ("Replay positions", f"{_fmt(_last(rows, 'replay_positions_per_sec'))} pos/s"),
+        ("Played positions", f"{_fmt(_last(rows, 'played_positions_per_sec'))} pos/s"),
+        ("Completed MCTS visits", f"{_fmt(_last(rows, 'mcts_simulations_per_sec'), 'integer')} visits/s"),
+        ("NN evaluations", f"{_fmt(_last(rows, 'mcts_nn_evaluations_per_sec'), 'integer')} evals/s"),
+        ("Selection traversals", f"{_fmt(latest_traversals, 'integer')} nodes/s"),
+        ("Avg selection path", f"{_fmt(_last(rows, 'mcts_selection_path_length'))} nodes/sim"),
         ("Iteration", _fmt(_last(rows, "iteration_total_time_s"), "seconds")),
-        ("Central batch", _fmt(_last(rows, "mcts_central_avg_batch_size"))),
+        ("Shared batch/request", _fmt(_last(rows, "mcts_central_avg_batch_size"))),
         ("Request latency", f"{_fmt(_last(rows, 'central_remote_wait_ms_per_request'))} ms"),
-        ("Latency / position", f"{_fmt(_last(rows, 'mcts_worker_nn_wait_ms_per_position'))} ms"),
-        ("GPU busy proxy", _fmt((
-            _last(rows, "mcts_gpu_busy_proxy_pct", _last(rows, "mcts_gpu_utilization_pct", 0.0)) or 0.0
+        ("Central bottleneck", (
+            f"{central_labels[central_hotspot]} | {_fmt(latest_central_parts[central_hotspot])} ms"
+            if central_hotspot else "n/a"
+        )),
+        ("CPU hot spot", (
+            f"{cpu_labels[cpu_hotspot]} | {_fmt(latest_cpu_parts[cpu_hotspot])} s"
+            if cpu_hotspot else "n/a"
+        )),
+        ("Worker NN wait share", _fmt((
+            _last(
+                rows,
+                "mcts_worker_nn_wait_share_pct",
+                _last(rows, "mcts_gpu_busy_proxy_pct", _last(rows, "mcts_gpu_utilization_pct", 0.0)),
+            ) or 0.0
         ) / 100.0, "percent")),
         ("Main stage", bottleneck),
     ]
     ax.set_title("Performance snapshot", fontsize=10, fontweight="bold", loc="left")
     table = ax.table(cellText=summary, colLabels=("Signal", "Latest"), loc="center",
                      cellLoc="left", colWidths=(0.58, 0.34))
-    table.auto_set_font_size(False); table.set_fontsize(8); table.scale(1.0, 1.45)
+    table.auto_set_font_size(False); table.set_fontsize(7.5); table.scale(1.0, 1.32)
     for (row, _), cell in table.get_celld().items():
         cell.set_edgecolor("#e5e7eb")
         if row == 0:
             cell.set_facecolor("#eff6ff"); cell.set_text_props(weight="bold")
 
-    _finish(fig, output_path, "RL details - performance",
-            "Each panel answers one question: speed, stage cost, latency, batching or CPU overhead.")
+    _finish(
+        fig,
+        output_path,
+        "RL details - performance",
+        "Completed MCTS visit = one finished simulation; selection traversals count root-to-leaf path elements. "
+        "Worker NN wait share is not hardware GPU utilization.",
+    )
     return True

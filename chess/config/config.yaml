@@ -236,7 +236,7 @@ reinforcement_learning:
   self_play:
     device: "cuda"                 # cpu | cuda | auto
     workers: auto
-    worker_auto_multiplier: 1.10
+    worker_auto_multiplier: 1.50       # RTX 5060 Ti + 12 CPU threads: benchmark optimum = 18 workers
     max_batch_games_per_worker: 30
     max_moves: 190
 
@@ -253,6 +253,14 @@ reinforcement_learning:
   # Search quality. Q values are the verified Q-on benchmark setup.
   search:
     simulations: 192
+    # Test 1: redistribute the same average compute across roots. Every active
+    # root gets 64 sims, then uncertain roots receive additional 64-sim chunks.
+    # Eval/Elo stay fixed-budget so RL30 remains a stable strength baseline.
+    dynamic_budget_enabled: true
+    dynamic_budget_min: 64
+    dynamic_budget_target_avg: 192
+    dynamic_budget_max: 320
+    dynamic_budget_chunk: 64
     c_puct_base: 19652
     c_puct_init: 1.18
     c_puct_max: 1.85
@@ -389,7 +397,7 @@ central_inference:
   auto_workers_per_server: 9
   auto_max_servers: 3
   max_batch_size: 512             # Shared learner/best queue is split by model; 512 keeps each GPU forward closer to a full batch.
-  flush_ms: 2.0
+  flush_ms: 0.0                  # No deliberate coalescing delay: ~5% more pos/s in the 18-worker RTX 5060 Ti smoke benchmark.
   transport_dtype: "float16"
   use_bfloat16: false          # RTX 5060 Ti benchmark: FP16 central forward was ~9% faster; training still uses global BF16.
   timeout_s: 0
@@ -405,8 +413,9 @@ central_inference:
 # PLAY / GUI MATCH RUNTIME
 # ------------------------------------------------------------------------------
 play:
+  # AI-vs-AI uses the same batched evaluator and central GPU server as RL eval.
   match_workers: auto
-  match_active_games_per_worker: auto
+  match_batch_games: auto
   match_max_moves: 220
 
 

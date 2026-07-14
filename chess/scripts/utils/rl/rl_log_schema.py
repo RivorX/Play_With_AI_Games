@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 
 
-RL_LOG_SCHEMA_VERSION = 3
+RL_LOG_SCHEMA_VERSION = 8
 
 
 # One row per training iteration. This is the promotion/strength dashboard source,
@@ -62,7 +62,8 @@ RL_DATA_QUALITY_COLUMNS = (
     "opponent_best_games", "opponent_best_score_rate", "opponent_mix_error",
     "opponent_promotion_transition_progress",
     "mcts_dirichlet_weight", "mcts_avg_sims", "mcts_avg_budget",
-    "mcts_budget_utilization", "mcts_budget_p10", "mcts_budget_p90",
+    "mcts_budget_utilization", "mcts_budget_target", "mcts_budget_min",
+    "mcts_budget_p10", "mcts_budget_p50", "mcts_budget_p90", "mcts_budget_max",
     "mcts_prior_agreement_rate", "mcts_prior_changed_rate",
     "mcts_changed_opening_rate", "mcts_changed_middlegame_rate",
     "mcts_changed_endgame_rate", "mcts_useful_change_rate", "mcts_harmful_change_rate",
@@ -75,26 +76,36 @@ RL_DATA_QUALITY_COLUMNS = (
 )
 
 
-# Throughput and bottleneck diagnosis. Raw totals are kept for stage attribution;
-# latency keeps only request- and position-normalized forms used for decisions.
+# Throughput and bottleneck diagnosis. A completed MCTS simulation/visit is
+# deliberately separate from root->leaf selection traversals and NN leaf
+# evaluations. Replay positions are the retained subset of played positions.
 RL_PERFORMANCE_COLUMNS = (
-    "iteration", "schema_version", "timestamp", "positions_per_sec",
+    "iteration", "schema_version", "timestamp",
+    "replay_positions_per_sec", "played_positions_per_sec",
+    "mcts_simulations_per_sec", "mcts_nn_evaluations_per_sec",
+    "mcts_selection_node_traversals_per_sec",
     "iteration_total_time_s", "bottleneck_stage",
     "stage_setup_time_s", "stage_selfplay_time_s", "stage_replay_time_s",
-    "stage_train_time_s", "stage_eval_log_time_s", "stage_checkpoint_time_s",
+    "stage_train_time_s", "stage_regular_eval_time_s", "stage_promotion_eval_time_s",
+    "stage_elo_eval_time_s", "stage_log_time_s", "stage_checkpoint_time_s",
     "stage_gc_time_s", "avg_game_length",
-    "mcts_avg_batch_size", "mcts_central_avg_batch_size", "mcts_gpu_busy_proxy_pct",
+    "mcts_avg_batch_size", "mcts_central_avg_batch_size", "mcts_worker_nn_wait_share_pct",
     "central_remote_wait_ms_per_request", "central_server_queue_wait_ms_per_request",
-    "central_server_forward_ms_per_request", "central_server_total_ms_per_request",
+    "central_server_concat_ms_per_request", "central_server_h2d_ms_per_request",
+    "central_server_forward_ms_per_request", "central_server_d2h_ms_per_request",
+    "central_server_other_ms_per_request", "central_worker_ipc_ms_per_request",
+    "central_server_total_ms_per_request",
     "mcts_worker_nn_wait_ms_per_position", "mcts_worker_nn_wait_ms_per_batch",
     "central_server_queue_wait_ms_per_position", "central_server_forward_ms_per_position",
     "central_server_total_ms_per_position",
     "mcts_search_many_time_s", "mcts_nn_inference_time_s", "mcts_nn_inference_calls",
     "mcts_nn_inference_batch_items", "mcts_avg_legal_moves_per_position",
-    "result_queue_wait_ms", "mcts_search_selection_time_s", "mcts_search_backprop_time_s",
-    "mcts_search_metadata_time_s", "mcts_batch_expand_eval_time_s",
-    "mcts_batch_expand_eval_calls", "mcts_board_to_tensor_time_s",
-    "mcts_batch_expand_legal_moves_time_s", "mcts_batch_expand_tensor_pack_time_s",
+    "result_queue_wait_ms", "mcts_search_root_setup_time_s", "mcts_search_selection_time_s", "mcts_search_backprop_time_s",
+    "mcts_search_metadata_time_s", "mcts_batch_expand_dedup_time_s", "mcts_batch_expand_eval_time_s",
+    "mcts_batch_expand_eval_calls", "mcts_board_materialize_time_s", "mcts_terminal_checks_time_s",
+    "mcts_board_to_tensor_time_s",
+    "mcts_batch_expand_legal_moves_time_s", "mcts_batch_expand_move_index_time_s",
+    "mcts_batch_expand_tensor_pack_time_s",
     "mcts_batch_expand_history_time_s", "mcts_batch_expand_input_pack_time_s",
     "mcts_batch_expand_legal_index_pack_time_s", "mcts_batch_expand_cpu_policy_time_s",
     "mcts_batch_expand_value_fanout_time_s", "mcts_policy_target_build_time_s",

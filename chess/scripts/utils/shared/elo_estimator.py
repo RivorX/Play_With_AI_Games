@@ -43,7 +43,11 @@ from utils.shared.central_inference_session import CentralInferenceSession, snap
 
 def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict:
     """Build deterministic MCTS settings for Stockfish Elo checks."""
-    return config
+    elo_mcts_config = dict(config or {})
+    rl_config = dict(elo_mcts_config.get('reinforcement_learning', {}) or {})
+    rl_config['mcts_dynamic_budget_enabled'] = False
+    elo_mcts_config['reinforcement_learning'] = rl_config
+    return elo_mcts_config
 
 
 # ---------------------------------------------------------------------------

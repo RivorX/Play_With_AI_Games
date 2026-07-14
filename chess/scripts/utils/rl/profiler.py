@@ -23,8 +23,11 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
     search_selection_time = max(0.0, float(selfplay_profile.get("mcts_search_selection_time", 0.0) or 0.0))
     search_backprop_time = max(0.0, float(selfplay_profile.get("mcts_search_backprop_time", 0.0) or 0.0))
     search_metadata_time = max(0.0, float(selfplay_profile.get("mcts_search_metadata_time", 0.0) or 0.0))
+    board_materialize_time = max(0.0, float(selfplay_profile.get("mcts_board_materialize_time", 0.0) or 0.0))
+    terminal_checks_time = max(0.0, float(selfplay_profile.get("mcts_terminal_checks_time", 0.0) or 0.0))
     batch_dedup_terminal_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_dedup_terminal_time", 0.0) or 0.0))
     batch_legal_moves_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_legal_moves_time", 0.0) or 0.0))
+    batch_move_index_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_move_index_time", 0.0) or 0.0))
     batch_history_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_history_time", 0.0) or 0.0))
     batch_input_pack_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_input_pack_time", 0.0) or 0.0))
     batch_legal_index_pack_time = max(0.0, float(selfplay_profile.get("mcts_batch_expand_legal_index_pack_time", 0.0) or 0.0))
@@ -77,7 +80,10 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
         nn_inference_capped
         + board_to_tensor_capped
         + batch_dedup_terminal_time
+        + board_materialize_time
+        + terminal_checks_time
         + batch_legal_moves_time
+        + batch_move_index_time
         + batch_history_time
         + batch_input_pack_time
         + batch_legal_index_pack_time
@@ -92,10 +98,13 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
         + search_metadata_time
     )
     search_other_time = max(0.0, search_many_time - batch_expand_capped - search_known_outside_expand_time)
-    gpu_utilization_pct_display = 0.0
+    worker_nn_wait_share_pct_display = 0.0
     if search_many_time > 0.0:
-        gpu_utilization_pct_display = 100.0 * (nn_inference_capped / search_many_time)
-    gpu_utilization_pct_display = max(0.0, min(100.0, float(gpu_utilization_pct_display)))
+        worker_nn_wait_share_pct_display = 100.0 * (nn_inference_capped / search_many_time)
+    worker_nn_wait_share_pct_display = max(
+        0.0,
+        min(100.0, float(worker_nn_wait_share_pct_display)),
+    )
     average_batch_size_display = float(nn_batch_items / nn_calls) if nn_calls > 0 else 0.0
     average_legal_moves_display = float(nn_legal_move_items / nn_batch_items) if nn_batch_items > 0 else 0.0
     inference_per_batch_ms_display = (
@@ -167,7 +176,10 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
     _print_search_line("selection", search_selection_time)
     _print_search_line("_batch_expand_eval", batch_expand_capped)
     _print_batch_expand_line("dedup_terminal", batch_dedup_terminal_time)
+    _print_batch_expand_line("board_materialize", board_materialize_time)
+    _print_batch_expand_line("terminal_checks", terminal_checks_time)
     _print_batch_expand_line("legal_moves", batch_legal_moves_time)
+    _print_batch_expand_line("move_index", batch_move_index_time)
     _print_batch_expand_line("history_fetch", batch_history_time)
     _print_batch_expand_line("input_pack", batch_input_pack_time)
     _print_batch_expand_line("nn_inference", nn_inference_capped)
@@ -186,7 +198,10 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
     _print_total_line("syzygy", syzygy_time)
     print("")
     print(f"   Sekcja B: GPU (raw_stage_sum={gpu_stage_total:.2f}s, inference_wall={nn_inference_capped:.2f}s):")
-    print(f"   {'gpu_utilization %':<24} {gpu_utilization_pct_display:7.2f}% (nn_inference/search_many)")
+    print(
+        f"   {'worker NN wait share':<24} {worker_nn_wait_share_pct_display:7.2f}% "
+        "(not hardware GPU use)"
+    )
     print(f"   {'average_batch_size':<24} {average_batch_size_display:7.2f} pos/batch")
     print(f"   {'average_legal_moves':<24} {average_legal_moves_display:7.2f} legal/pos")
     print(f"   {'h2d_transfer':<24} {h2d_raw:7.2f}s ({_pct_of_gpu_stages(h2d_raw):5.1f}% gpu_stages)")

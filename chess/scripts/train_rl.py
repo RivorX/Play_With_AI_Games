@@ -270,6 +270,15 @@ def _print_rl_startup_plan(
     source_text = source_label
     if start_mode == 'resume':
         source_text = f"{source_label}; continue at iteration {start_iteration + 1}"
+    if bool(rl_cfg.get('mcts_dynamic_budget_enabled', False)):
+        search_budget_text = (
+            f"dynamic {int(rl_cfg.get('mcts_dynamic_budget_min', 64))}-"
+            f"{int(rl_cfg.get('mcts_dynamic_budget_max', 320))} sims "
+            f"(target avg {int(rl_cfg.get('mcts_dynamic_budget_target_avg', 192))})"
+        )
+    else:
+        search_budget_text = f"{int(rl_cfg.get('mcts_simulations', 0))} sims"
+
     rows = [
         (
             "model",
@@ -289,7 +298,7 @@ def _print_rl_startup_plan(
         ),
         (
             "search",
-            f"{int(rl_cfg.get('mcts_simulations', 0))} sims | batch {int(rl_cfg.get('mcts_batch_size', 0))} "
+            f"{search_budget_text} | batch {int(rl_cfg.get('mcts_batch_size', 0))} "
             f"| Q={float(rl_cfg.get('mcts_q_selection_weight', 0.0) or 0.0):.3f} "
             f"| c_puct={float(rl_cfg.get('mcts_c_puct_init', 0.0)):.2f}..{float(rl_cfg.get('mcts_c_puct_max', 0.0)):.2f} "
             f"| temp={float(rl_cfg.get('mcts_temperature', 0.0)):.2f}",
@@ -340,7 +349,10 @@ def _print_rl_iteration_profile(
             "selfplay",
             "replay",
             "train",
-            "eval_log",
+            "regular_eval",
+            "promotion_eval",
+            "elo_eval",
+            "log",
             "checkpoint",
             "gc",
         ]
@@ -2052,10 +2064,14 @@ def play_games_parallel_mcts(
     collection_time = time.time() - collection_start
     total_time = time.time() - start_time
     
-    positions_per_sec = total_positions / total_time if total_time > 0 else 0
     avg_length = np.mean(game_lengths) if game_lengths else 0
     filtered_positions = int(total_curriculum_dropped_positions + total_cap_dropped_positions)
     total_generated_positions = total_positions + total_dropped_positions + filtered_positions
+    replay_positions_per_sec = total_positions / total_time if total_time > 0 else 0.0
+    played_positions_per_sec = total_generated_positions / total_time if total_time > 0 else 0.0
+    # Backward-compatible return value: callers historically called this
+    # positions_per_sec, but it has always meant positions retained for replay.
+    positions_per_sec = replay_positions_per_sec
     kept_ratio = (
         100.0 * total_positions / total_generated_positions
         if total_generated_positions > 0
@@ -2133,12 +2149,38 @@ def play_games_parallel_mcts(
         'curriculum_dropped_positions': int(total_curriculum_dropped_positions),
         'cap_dropped_positions': int(total_cap_dropped_positions),
         'resigned_games': int(total_resigned_games),
+        'replay_positions_per_sec': float(replay_positions_per_sec),
+        'played_positions_per_sec': float(played_positions_per_sec),
+        # One completed simulation/visit is one root->leaf selection followed
+        # by terminal/NN evaluation and backpropagation. Do not multiply it by
+        # path length: that separate diagnostic is a traversal counter.
+        'mcts_simulations_per_sec': (
+            float(total_search_simulations_used_sum) / float(total_time)
+            if total_time > 0.0
+            else 0.0
+        ),
+        'mcts_nn_evaluations_per_sec': (
+            float(total_profile_stats.get('mcts_nn_inference_batch_items', 0) or 0) / float(total_time)
+            if total_time > 0.0
+            else 0.0
+        ),
+        'mcts_selection_node_traversals_per_sec': (
+            float(total_profile_stats.get('mcts_selection_node_traversals', 0) or 0) / float(total_time)
+            if total_time > 0.0
+            else 0.0
+        ),
         'search_simulations_used_avg': float(total_search_simulations_used_sum) / float(total_search_samples) if total_search_samples > 0 else 0.0,
         'search_simulations_budget_avg': float(total_search_simulations_budget_sum) / float(total_search_samples) if total_search_samples > 0 else 0.0,
         'search_simulations_budget_p10': float(np.percentile(np.asarray(total_search_simulations_budget_samples, dtype=np.float32), 10)) if total_search_simulations_budget_samples else 0.0,
+        'search_simulations_budget_p50': float(np.percentile(np.asarray(total_search_simulations_budget_samples, dtype=np.float32), 50)) if total_search_simulations_budget_samples else 0.0,
         'search_simulations_budget_p90': float(np.percentile(np.asarray(total_search_simulations_budget_samples, dtype=np.float32), 90)) if total_search_simulations_budget_samples else 0.0,
         'search_simulations_budget_min': float(np.min(np.asarray(total_search_simulations_budget_samples, dtype=np.float32))) if total_search_simulations_budget_samples else 0.0,
         'search_simulations_budget_max': float(np.max(np.asarray(total_search_simulations_budget_samples, dtype=np.float32))) if total_search_simulations_budget_samples else 0.0,
+        'search_simulations_budget_target': float(
+            rl_cfg.get('mcts_dynamic_budget_target_avg', rl_cfg.get('mcts_simulations', 0))
+            if bool(rl_cfg.get('mcts_dynamic_budget_enabled', False))
+            else rl_cfg.get('mcts_simulations', 0)
+        ),
         'search_simulations_used_p10': float(np.percentile(np.asarray(total_search_simulations_used_samples, dtype=np.float32), 10)) if total_search_simulations_used_samples else 0.0,
         'search_samples': int(total_search_samples),
         'mcts_prior_agreement_samples': int(mcts_quality_samples),
@@ -2865,6 +2907,7 @@ def main():
             iteration_stage_times = {}
             iteration_start_time = time.perf_counter()
             iteration_stage_start = iteration_start_time
+            iteration_eval_substage_times = {}
             iteration_notes = []
             promotion_status = "not evaluated"
 
@@ -2882,6 +2925,18 @@ def main():
                 stage_key = str(stage_name)
                 iteration_stage_times[stage_key] = float(iteration_stage_times.get(stage_key, 0.0)) + (now - iteration_stage_start)
                 iteration_stage_start = now
+
+            def _start_eval_substage():
+                _profile_sync()
+                return time.perf_counter()
+
+            def _finish_eval_substage(stage_name, started_at):
+                _profile_sync()
+                elapsed = max(0.0, time.perf_counter() - float(started_at))
+                stage_key = str(stage_name)
+                iteration_eval_substage_times[stage_key] = float(
+                    iteration_eval_substage_times.get(stage_key, 0.0)
+                ) + elapsed
 
             def _emit_iteration_profile():
                 nonlocal iteration_profile_printed
@@ -3007,6 +3062,16 @@ def main():
             if profile_training_enabled and selfplay_profile:
                 print_selfplay_profiler(selfplay_profile, selfplay_time)
             performance_profile = dict(selfplay_profile)
+            for metric_name in (
+                'replay_positions_per_sec',
+                'played_positions_per_sec',
+                'mcts_simulations_per_sec',
+                'mcts_nn_evaluations_per_sec',
+                'mcts_selection_node_traversals_per_sec',
+            ):
+                performance_profile[metric_name] = float(
+                    (selfplay_stats or {}).get(metric_name, 0.0) or 0.0
+                )
             _finish_stage('replay')
 
             avg_policy_entropy = 0.0
@@ -3163,6 +3228,7 @@ def main():
             early_stop_should_stop = False
             should_run_no_mcts_eval = no_mcts_eval_enabled and ((iteration + 1) % no_mcts_eval_every == 0)
             if should_run_no_mcts_eval:
+                regular_eval_t0 = _start_eval_substage()
                 model.eval()
                 if device.type == 'cuda' and torch.cuda.is_available():
                     with contextlib.suppress(Exception):
@@ -3183,9 +3249,11 @@ def main():
                 no_mcts_draws = int((no_mcts_stats or {}).get('draws', 0))
                 no_mcts_losses = int((no_mcts_stats or {}).get('losses', 0))
                 no_mcts_unresolved = int((no_mcts_stats or {}).get('unresolved', 0))
+                _finish_eval_substage('regular_eval', regular_eval_t0)
             iteration_number = iteration + 1
             should_run_mcts_eval = (iteration_number % eval_every) == 0
             if should_run_mcts_eval:
+                promotion_eval_t0 = _start_eval_substage()
                 eval_subject_model = model
                 eval_game_index_offset = 0
                 eval_subject_model.eval()
@@ -3228,6 +3296,7 @@ def main():
                         use_fixed_openings=bool(rl_cfg.get('eval_fixed_openings_enabled', True)),
                         central_runtime=eval_runtime,
                     )
+                _finish_eval_substage('promotion_eval', promotion_eval_t0)
                 score_rate = float((eval_stats or {}).get('score_rate', 0.0))
                 true_win_rate = float((eval_stats or {}).get('win_rate', 0.0))
                 eval_games_total = int((eval_stats or {}).get('num_games', 0) or 0)
@@ -3330,6 +3399,8 @@ def main():
                             anchor_no_mcts_score_rate = no_mcts_score_rate
                         iteration_notes.append("anchor result reused: current best is the IL anchor")
                     else:
+                        anchor_eval_stage = 'promotion_eval' if anchor_candidate_due else 'regular_eval'
+                        anchor_eval_t0 = _start_eval_substage()
                         anchor_eval_config = _build_eval_config_with_exact_simulations(
                             config,
                             anchor_eval_simulations,
@@ -3378,7 +3449,9 @@ def main():
                         anchor_draws = int((anchor_stats or {}).get('draws', 0))
                         anchor_losses = int((anchor_stats or {}).get('losses', 0))
                         anchor_eval_games_total = int((anchor_stats or {}).get('num_games', 0) or 0)
+                        _finish_eval_substage(anchor_eval_stage, anchor_eval_t0)
                         if should_run_no_mcts_eval:
+                            anchor_regular_eval_t0 = _start_eval_substage()
                             anchor_no_mcts_stats = evaluate_models_no_mcts(
                                 eval_subject_model,
                                 anchor_model,
@@ -3396,6 +3469,7 @@ def main():
                             anchor_no_mcts_score_rate = float(
                                 (anchor_no_mcts_stats or {}).get('score_rate', 0.0) or 0.0
                             )
+                            _finish_eval_substage('regular_eval', anchor_regular_eval_t0)
                     if anchor_score_rate is not None and anchor_no_mcts_score_rate is not None:
                         anchor_mcts_no_mcts_gap = (
                             float(anchor_score_rate) - float(anchor_no_mcts_score_rate)
@@ -3530,7 +3604,9 @@ def main():
                 promotion_candidate_streak = 1 if is_new_best_candidate else 0
                 estimated_elo = None
                 if is_new_best_candidate:
+                    elo_eval_t0 = _start_eval_substage()
                     estimated_elo = elo_coordinator.evaluate_promoted_best(iteration + 1)
+                    _finish_eval_substage('elo_eval', elo_eval_t0)
                 
                 # Log with all metrics
                 logger.log(
@@ -3657,6 +3733,13 @@ def main():
                 )
                 last_logged_iteration = iteration + 1
             _finish_stage('eval_log')
+            eval_region_total = float(iteration_stage_times.pop('eval_log', 0.0) or 0.0)
+            measured_eval_total = 0.0
+            for stage_name in ('regular_eval', 'promotion_eval', 'elo_eval'):
+                stage_seconds = float(iteration_eval_substage_times.get(stage_name, 0.0) or 0.0)
+                iteration_stage_times[stage_name] = stage_seconds
+                measured_eval_total += stage_seconds
+            iteration_stage_times['log'] = max(0.0, eval_region_total - measured_eval_total)
 
             latest_metadata = {
                 'win_rate': true_win_rate,
@@ -3702,7 +3785,7 @@ def main():
             iteration_total_time_s = time.perf_counter() - iteration_start_time
             logger.log_rl_performance(
                 iteration + 1,
-                positions_per_sec=positions_per_sec,
+                replay_positions_per_sec=positions_per_sec,
                 iteration_total_time=iteration_total_time_s,
                 avg_game_length=avg_game_length,
                 profile=performance_profile,
@@ -3735,7 +3818,17 @@ def main():
 
             sims_used = float((selfplay_stats or {}).get('search_simulations_used_avg', 0.0) or 0.0)
             sims_budget = float((selfplay_stats or {}).get('search_simulations_budget_avg', 0.0) or 0.0)
+            completed_visits_per_sec = float(
+                (selfplay_stats or {}).get('mcts_simulations_per_sec', 0.0) or 0.0
+            )
+            nn_evaluations_per_sec = float(
+                (selfplay_stats or {}).get('mcts_nn_evaluations_per_sec', 0.0) or 0.0
+            )
             budget_utilization = sims_used / sims_budget if sims_budget > 0.0 else 0.0
+            budget_p10 = float((selfplay_stats or {}).get('search_simulations_budget_p10', 0.0) or 0.0)
+            budget_p50 = float((selfplay_stats or {}).get('search_simulations_budget_p50', 0.0) or 0.0)
+            budget_p90 = float((selfplay_stats or {}).get('search_simulations_budget_p90', 0.0) or 0.0)
+            budget_spread = f"p10/50/90 {budget_p10:.0f}/{budget_p50:.0f}/{budget_p90:.0f}"
             changed_rate = float((selfplay_stats or {}).get('mcts_prior_changed_rate', 0.0) or 0.0)
             useful_rate = changed_rate * float(
                 (selfplay_stats or {}).get('mcts_changed_to_higher_q_rate', 0.0) or 0.0
@@ -3746,14 +3839,21 @@ def main():
             mcts_samples = int((selfplay_stats or {}).get('mcts_prior_agreement_samples', 0) or 0)
             if mcts_samples > 0:
                 search_summary = (
-                    f"{sims_used:.0f}/{sims_budget:.0f} sims ({budget_utilization:.0%}) | "
+                    f"{completed_visits_per_sec:,.0f} completed visits/s, "
+                    f"{nn_evaluations_per_sec:,.0f} NN evals/s | "
+                    f"{sims_used:.0f}/{sims_budget:.0f} avg sims ({budget_utilization:.0%}), {budget_spread} | "
                     f"top changed {changed_rate:.1%}: useful {useful_rate:.1%}, harmful {harmful_rate:.1%} | "
                     f"KL {float((selfplay_stats or {}).get('mcts_policy_kl_mean', 0.0) or 0.0):.3f} | "
                     f"visited {float((selfplay_stats or {}).get('mcts_visited_move_count_mean', 0.0) or 0.0):.1f}/"
                     f"{float((selfplay_stats or {}).get('mcts_legal_move_count_mean', 0.0) or 0.0):.1f}"
                 )
             else:
-                search_summary = f"{sims_used:.0f}/{sims_budget:.0f} sims ({budget_utilization:.0%}); no quality sample"
+                search_summary = (
+                    f"{completed_visits_per_sec:,.0f} completed visits/s, "
+                    f"{nn_evaluations_per_sec:,.0f} NN evals/s | "
+                    f"{sims_used:.0f}/{sims_budget:.0f} avg sims ({budget_utilization:.0%}), "
+                    f"{budget_spread}; no quality sample"
+                )
 
             replay_coverage = float(replay_quality_stats.get('train_replay_coverage', 0.0) or 0.0)
             train_summary = (
@@ -3812,7 +3912,9 @@ def main():
                     (
                         "self-play",
                         f"{completed_games} games | +{positions_added:,} positions ({storage_keep_rate:.0%} kept) | "
-                        f"{positions_per_sec:.1f} pos/s | replay {len(replay_buffer):,}/{replay_buffer.max_size:,} | "
+                        f"replay {positions_per_sec:.1f} pos/s | "
+                        f"played {float((selfplay_stats or {}).get('played_positions_per_sec', 0.0) or 0.0):.1f} pos/s | "
+                        f"buffer {len(replay_buffer):,}/{replay_buffer.max_size:,} | "
                         f"decisive/draw {decisive_rate:.1%}/{completed_draw_rate:.1%}",
                     ),
                     ("search", search_summary),

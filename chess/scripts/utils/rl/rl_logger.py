@@ -17,7 +17,7 @@ class RLLoggerMixin:
     def log_rl_performance(
         self,
         iteration,
-        positions_per_sec=None,
+        replay_positions_per_sec=None,
         iteration_total_time=None,
         avg_game_length=None,
         profile=None,
@@ -67,7 +67,10 @@ class RLLoggerMixin:
             for raw_key, avg_key in [
                 ('mcts_central_inference_remote_wait_time', 'central_remote_wait_ms_per_request'),
                 ('mcts_central_inference_server_queue_wait_time', 'central_server_queue_wait_ms_per_request'),
+                ('mcts_central_inference_server_concat_time', 'central_server_concat_ms_per_request'),
+                ('mcts_central_inference_server_h2d_time', 'central_server_h2d_ms_per_request'),
                 ('mcts_central_inference_server_forward_time', 'central_server_forward_ms_per_request'),
+                ('mcts_central_inference_server_d2h_time', 'central_server_d2h_ms_per_request'),
                 ('mcts_central_inference_server_total_time', 'central_server_total_ms_per_request'),
             ]:
                 raw_value = _float_or_none(profile.get(raw_key))
@@ -77,7 +80,10 @@ class RLLoggerMixin:
         search_time = _float_or_none(profile.get('mcts_search_many_time'))
         nn_time = _float_or_none(profile.get('mcts_nn_inference_time'))
         if search_time and search_time > 0.0 and nn_time is not None:
-            profile['gpu_utilization_pct'] = max(0.0, min(100.0, 100.0 * float(nn_time) / float(search_time)))
+            profile['worker_nn_wait_share_pct'] = max(
+                0.0,
+                min(100.0, 100.0 * float(nn_time) / float(search_time)),
+            )
 
         worker_wait_batch_ms = _float_or_none(profile.get('inference_time_per_batch_ms'))
         worker_wait_pos_ms = _float_or_none(profile.get('inference_time_per_position_ms'))
@@ -86,15 +92,30 @@ class RLLoggerMixin:
         if worker_wait_pos_ms is not None:
             profile.setdefault('worker_nn_wait_ms_per_position', worker_wait_pos_ms)
 
-        central_avg_batch = _float_or_none(profile.get('central_average_batch_size'))
+        worker_avg_batch = _float_or_none(profile.get('average_batch_size'))
         for src_key, dst_key in [
             ('central_server_queue_wait_ms_per_request', 'central_server_queue_wait_ms_per_position'),
             ('central_server_forward_ms_per_request', 'central_server_forward_ms_per_position'),
             ('central_server_total_ms_per_request', 'central_server_total_ms_per_position'),
         ]:
             value = _float_or_none(profile.get(src_key))
-            if value is not None and central_avg_batch and central_avg_batch > 0.0:
-                profile.setdefault(dst_key, float(value) / float(central_avg_batch))
+            if value is not None and worker_avg_batch and worker_avg_batch > 0.0:
+                profile.setdefault(dst_key, float(value) / float(worker_avg_batch))
+
+        remote_ms = _float_or_none(profile.get('central_remote_wait_ms_per_request')) or 0.0
+        queue_ms = _float_or_none(profile.get('central_server_queue_wait_ms_per_request')) or 0.0
+        server_total_ms = _float_or_none(profile.get('central_server_total_ms_per_request')) or 0.0
+        server_stage_ms = {
+            key: _float_or_none(profile.get(key)) or 0.0
+            for key in (
+                'central_server_concat_ms_per_request',
+                'central_server_h2d_ms_per_request',
+                'central_server_forward_ms_per_request',
+                'central_server_d2h_ms_per_request',
+            )
+        }
+        server_other_ms = max(0.0, server_total_ms - sum(server_stage_ms.values()))
+        worker_ipc_ms = max(0.0, remote_ms - queue_ms - server_total_ms)
 
         def _value(key, default=''):
             value = profile.get(key, default)
@@ -102,7 +123,11 @@ class RLLoggerMixin:
 
         stage_values = {
             key: _float_or_none(stage_times.get(key))
-            for key in ('setup', 'selfplay', 'replay', 'train', 'eval_log', 'checkpoint', 'gc')
+            for key in (
+                'setup', 'selfplay', 'replay', 'train',
+                'regular_eval', 'promotion_eval', 'elo_eval', 'log',
+                'checkpoint', 'gc',
+            )
         }
         measured_stages = {key: value for key, value in stage_values.items() if value is not None}
         bottleneck_stage = max(measured_stages, key=measured_stages.get) if measured_stages else ''
@@ -110,16 +135,31 @@ class RLLoggerMixin:
             'iteration': int(iteration),
             'schema_version': RL_LOG_SCHEMA_VERSION,
             'timestamp': datetime.now().isoformat(timespec='seconds'),
-            'positions_per_sec': positions_per_sec,
+            'replay_positions_per_sec': replay_positions_per_sec,
+            'played_positions_per_sec': _value('played_positions_per_sec'),
+            'mcts_simulations_per_sec': _value('mcts_simulations_per_sec'),
+            'mcts_nn_evaluations_per_sec': _value('mcts_nn_evaluations_per_sec'),
+            'mcts_selection_node_traversals_per_sec': _value(
+                'mcts_selection_node_traversals_per_sec'
+            ),
             'iteration_total_time_s': iteration_total_time,
             'bottleneck_stage': bottleneck_stage,
             'avg_game_length': avg_game_length,
             'mcts_avg_batch_size': _value('average_batch_size'),
             'mcts_central_avg_batch_size': _value('central_average_batch_size'),
-            'mcts_gpu_busy_proxy_pct': _value('gpu_utilization_pct'),
+            # This is worker wall-time spent waiting for NN replies, not NVML GPU use.
+            'mcts_worker_nn_wait_share_pct': _value(
+                'worker_nn_wait_share_pct',
+                _value('gpu_utilization_pct'),
+            ),
             'central_remote_wait_ms_per_request': _value('central_remote_wait_ms_per_request'),
             'central_server_queue_wait_ms_per_request': _value('central_server_queue_wait_ms_per_request'),
+            'central_server_concat_ms_per_request': _value('central_server_concat_ms_per_request'),
+            'central_server_h2d_ms_per_request': _value('central_server_h2d_ms_per_request'),
             'central_server_forward_ms_per_request': _value('central_server_forward_ms_per_request'),
+            'central_server_d2h_ms_per_request': _value('central_server_d2h_ms_per_request'),
+            'central_server_other_ms_per_request': server_other_ms,
+            'central_worker_ipc_ms_per_request': worker_ipc_ms,
             'central_server_total_ms_per_request': _value('central_server_total_ms_per_request'),
             'mcts_worker_nn_wait_ms_per_position': _value('worker_nn_wait_ms_per_position'),
             'mcts_worker_nn_wait_ms_per_batch': _value('worker_nn_wait_ms_per_batch'),
@@ -132,13 +172,18 @@ class RLLoggerMixin:
             'mcts_nn_inference_batch_items': _value('mcts_nn_inference_batch_items'),
             'mcts_avg_legal_moves_per_position': _value('average_legal_moves_per_position'),
             'result_queue_wait_ms': _value('queue_wait_time_ms'),
+            'mcts_search_root_setup_time_s': _value('mcts_search_root_setup_time'),
             'mcts_search_selection_time_s': _value('mcts_search_selection_time'),
             'mcts_search_backprop_time_s': _value('mcts_search_backprop_time'),
             'mcts_search_metadata_time_s': _value('mcts_search_metadata_time'),
+            'mcts_batch_expand_dedup_time_s': _value('mcts_batch_expand_dedup_terminal_time'),
             'mcts_batch_expand_eval_time_s': _value('mcts_batch_expand_eval_time'),
             'mcts_batch_expand_eval_calls': _value('mcts_batch_expand_eval_calls'),
+            'mcts_board_materialize_time_s': _value('mcts_board_materialize_time'),
+            'mcts_terminal_checks_time_s': _value('mcts_terminal_checks_time'),
             'mcts_board_to_tensor_time_s': _value('mcts_board_to_tensor_time'),
             'mcts_batch_expand_legal_moves_time_s': _value('mcts_batch_expand_legal_moves_time'),
+            'mcts_batch_expand_move_index_time_s': _value('mcts_batch_expand_move_index_time'),
             'mcts_batch_expand_tensor_pack_time_s': _value('mcts_batch_expand_tensor_pack_time'),
             'mcts_batch_expand_history_time_s': _value('mcts_batch_expand_history_time'),
             'mcts_batch_expand_input_pack_time_s': _value('mcts_batch_expand_input_pack_time'),
@@ -163,7 +208,11 @@ class RLLoggerMixin:
         if not self.performance_log_path.exists():
             return
 
-        render_rl_performance(self.performance_log_path, self.performance_plot_path)
+        render_rl_performance(
+            self.performance_log_path,
+            self.performance_plot_path,
+            self.data_quality_log_path,
+        )
         return
 
     def log_rl_data_quality(
@@ -347,8 +396,12 @@ class RLLoggerMixin:
             'mcts_avg_sims': mcts_avg_sims,
             'mcts_avg_budget': mcts_avg_budget,
             'mcts_budget_utilization': _ratio(mcts_avg_sims, mcts_avg_budget),
+            'mcts_budget_target': _value(selfplay_stats, 'search_simulations_budget_target'),
+            'mcts_budget_min': _value(selfplay_stats, 'search_simulations_budget_min'),
             'mcts_budget_p10': _value(selfplay_stats, 'search_simulations_budget_p10'),
+            'mcts_budget_p50': _value(selfplay_stats, 'search_simulations_budget_p50'),
             'mcts_budget_p90': _value(selfplay_stats, 'search_simulations_budget_p90'),
+            'mcts_budget_max': _value(selfplay_stats, 'search_simulations_budget_max'),
             'mcts_prior_agreement_rate': _value(selfplay_stats, 'mcts_prior_agreement_rate'),
             'mcts_prior_changed_rate': changed_rate,
             'mcts_changed_opening_rate': _value(selfplay_stats, 'mcts_changed_opening_rate'),

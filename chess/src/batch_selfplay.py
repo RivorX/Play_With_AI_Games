@@ -14,6 +14,7 @@ import chess
 import numpy as np
 import math
 import pickle
+import shutil
 import time
 import logging
 import queue
@@ -21,6 +22,7 @@ from pathlib import Path
 from src.data import board_to_tensor, move_to_index
 from src.utils.data_helpers import MAX_LEGAL_MOVES, _move_to_index_cached
 from src.utils.q_delta import (
+    Q_DELTA_HIST_BINS as _Q_DELTA_HIST_BINS,
     q_delta_histogram as _q_delta_histogram,
     q_delta_percentile_from_histogram as _q_delta_percentile_from_histogram,
 )
@@ -57,6 +59,67 @@ _POLICY_UPTAKE_CHANGED_UNCERTAIN_WEIGHT = 0.75
 _POLICY_UPTAKE_CHANGED_OPENING_MAX_WEIGHT = 0.75
 _POLICY_UPTAKE_HARMFUL_WEIGHT = 0.20
 _POLICY_UPTAKE_LOW_THRESHOLD = 0.75
+_DYNAMIC_BUDGET_MARGINAL_PENALTY = 0.18
+
+
+def _allocate_dynamic_simulation_budgets(
+    difficulty_scores,
+    *,
+    minimum=64,
+    target_average=192,
+    maximum=320,
+    chunk=64,
+):
+    """Allocate fixed-size simulation chunks while preserving mean compute.
+
+    Each possible extra chunk receives a diminishing marginal score. Selecting
+    the globally best chunks naturally gives hard roots more work without
+    starving easy roots, and the total allocation stays at the requested mean.
+    """
+    scores = [float(max(0.0, min(1.0, score))) for score in difficulty_scores]
+    if not scores:
+        return []
+    minimum = max(1, int(minimum))
+    maximum = max(minimum, int(maximum))
+    chunk = max(1, int(chunk))
+    target_average = max(minimum, min(maximum, int(target_average)))
+    max_chunks = max(0, (maximum - minimum) // chunk)
+    target_chunks = int(round((target_average - minimum) * len(scores) / float(chunk)))
+    target_chunks = max(0, min(max_chunks * len(scores), target_chunks))
+
+    marginal_chunks = []
+    for root_idx, score in enumerate(scores):
+        for chunk_idx in range(max_chunks):
+            marginal_score = score - _DYNAMIC_BUDGET_MARGINAL_PENALTY * float(chunk_idx)
+            marginal_chunks.append((marginal_score, -root_idx, chunk_idx, root_idx))
+    marginal_chunks.sort(reverse=True)
+
+    allocated_chunks = [0] * len(scores)
+    for _, _, _, root_idx in marginal_chunks[:target_chunks]:
+        allocated_chunks[root_idx] += 1
+    return [minimum + chunk * count for count in allocated_chunks]
+
+
+def _dynamic_root_difficulty(search_summary):
+    """Estimate whether a 64-simulation root deserves more search compute."""
+    summary = search_summary if isinstance(search_summary, dict) else {}
+    legal_count = int(summary.get('legal_move_count', 0) or 0)
+    if legal_count <= 1:
+        return 0.0
+    entropy = float(summary.get('visit_entropy', 1.0) or 0.0)
+    visit_gap = float(summary.get('visit_gap', 0.0) or 0.0)
+    top_prob = float(summary.get('top_visit_prob', 0.0) or 0.0)
+    explored_mass = float(summary.get('explored_prior_mass', 0.0) or 0.0)
+    agreement = summary.get('prior_mcts_agree', None)
+    disagreement = 1.0 if agreement is not None and float(agreement) < 0.5 else 0.0
+    difficulty = (
+        0.35 * entropy
+        + 0.25 * (1.0 - visit_gap)
+        + 0.20 * (1.0 - top_prob)
+        + 0.15 * (1.0 - explored_mass)
+        + 0.05 * disagreement
+    )
+    return float(max(0.0, min(1.0, difficulty)))
 
 
 def _replay_source_code(learner_turn, game_opponent_mcts, opponent_label):
@@ -326,6 +389,32 @@ def _configure_selfplay_compile_cache(rank, device):
     return root
 
 
+def _reset_selfplay_compile_cache(rank, device):
+    """Discard only this worker's temporary Inductor/Triton cache.
+
+    A rank gets its own directory, so a failed compiled graph can be rebuilt
+    without touching project files or cache entries owned by another worker.
+    """
+    if device.type != 'cuda':
+        return False
+    root = Path(tempfile.gettempdir()) / "play_with_ai_games" / "torch_compile_cache"
+    worker_dir = root / f"cuda_worker_{int(rank)}"
+    try:
+        # Keep the destructive operation constrained to the known temporary
+        # cache layout even if this helper is called with an unexpected rank.
+        if worker_dir.resolve().parent != root.resolve():
+            return False
+        shutil.rmtree(worker_dir, ignore_errors=True)
+        _configure_selfplay_compile_cache(rank, device)
+        try:
+            torch._dynamo.reset()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 def _configure_inductor_for_selfplay(config):
     rl_cfg = config.get('reinforcement_learning', {})
 
@@ -392,38 +481,48 @@ def _maybe_compile_selfplay_model(model, config, device, rank, model_label="lear
         except Exception:
             pass
 
-    try:
-        def _compile_and_warmup(target_model):
-            compiled_model = torch.compile(target_model, mode='default', dynamic=True)
-            dummy_input = torch.zeros(
-                1,
-                expected_input_planes,
-                8,
-                8,
-                device=device,
-                dtype=torch.float32,
-            )
-            if device.type == 'cuda':
-                dummy_input = dummy_input.to(memory_format=torch.channels_last)
-            with torch.inference_mode():
-                with torch.autocast(
-                    device_type='cuda',
-                    enabled=use_amp,
-                    dtype=amp_dtype,
-                ):
-                    compiled_model(dummy_input, apply_log_softmax=False)
-            return compiled_model
+    def _compile_and_warmup(target_model):
+        compiled_model = torch.compile(target_model, mode='default', dynamic=True)
+        dummy_input = torch.zeros(
+            1,
+            expected_input_planes,
+            8,
+            8,
+            device=device,
+            dtype=torch.float32,
+        )
+        if device.type == 'cuda':
+            dummy_input = dummy_input.to(memory_format=torch.channels_last)
+        with torch.inference_mode():
+            with torch.autocast(
+                device_type='cuda',
+                enabled=use_amp,
+                dtype=amp_dtype,
+            ):
+                compiled_model(dummy_input, apply_log_softmax=False)
+        return compiled_model
 
+    def _compile_once():
         if use_compile_lock:
             with _SelfPlayCompileLock(lock_path, timeout_s=timeout_s):
-                compiled = _compile_and_warmup(model)
-        else:
-            compiled = _compile_and_warmup(model)
+                return _compile_and_warmup(model)
+        return _compile_and_warmup(model)
 
-        return compiled
-    except Exception as exc:
+    try:
+        return _compile_once()
+    except Exception as first_exc:
+        # A stale or partially written Triton artifact is recoverable. Rebuild
+        # this process's cache once before abandoning compile for the run.
+        if _reset_selfplay_compile_cache(rank, device):
+            try:
+                return _compile_once()
+            except Exception as retry_exc:
+                exc = retry_exc
+        else:
+            exc = first_exc
         print(
-            f"WARNING: Self-play worker {rank}: torch.compile skipped for {model_label} "
+            f"WARNING: Self-play worker {rank}: torch.compile cache rebuild failed for {model_label}; "
+            f"using eager inference "
             f"({type(exc).__name__}: {exc})"
         )
         return model
@@ -919,11 +1018,15 @@ class MCTSNode:
             self._position_key_cache = _board_position_key(self.board)
         return self._position_key_cache
 
-    def get_legal_moves_and_indices(self):
-        if self._legal_moves is None or self._legal_indices is None:
-            board = self.board
-            is_black_turn = board.turn == chess.BLACK
-            legal_moves = tuple(board.legal_moves)
+    def get_legal_moves(self):
+        if self._legal_moves is None:
+            self._legal_moves = tuple(self.board.legal_moves)
+        return self._legal_moves
+
+    def get_legal_indices(self):
+        if self._legal_indices is None:
+            legal_moves = self.get_legal_moves()
+            is_black_turn = self.board.turn == chess.BLACK
             legal_indices = np.empty(len(legal_moves), dtype=np.int32)
             move_to_idx = _move_to_index_cached
             for idx, move in enumerate(legal_moves):
@@ -933,9 +1036,11 @@ class MCTSNode:
                     move.promotion or 0,
                     is_black_turn,
                 )
-            self._legal_moves = legal_moves
             self._legal_indices = legal_indices
-        return self._legal_moves, self._legal_indices
+        return self._legal_indices
+
+    def get_legal_moves_and_indices(self):
+        return self.get_legal_moves(), self.get_legal_indices()
 
 
 def _build_sparse_policy_target_from_visits(visit_counts, board):
@@ -1177,6 +1282,28 @@ class MultiGameBatchMCTS:
             self.q_min_fullmove,
             int(config['reinforcement_learning'].get('mcts_q_full_weight_fullmove', self.q_min_fullmove)),
         )
+        self.dynamic_budget_enabled = bool(
+            config['reinforcement_learning'].get('mcts_dynamic_budget_enabled', False)
+        )
+        self.dynamic_budget_min = max(
+            1,
+            int(config['reinforcement_learning'].get('mcts_dynamic_budget_min', 64)),
+        )
+        self.dynamic_budget_max = max(
+            self.dynamic_budget_min,
+            int(config['reinforcement_learning'].get('mcts_dynamic_budget_max', 320)),
+        )
+        self.dynamic_budget_target_avg = max(
+            self.dynamic_budget_min,
+            min(
+                self.dynamic_budget_max,
+                int(config['reinforcement_learning'].get('mcts_dynamic_budget_target_avg', 192)),
+            ),
+        )
+        self.dynamic_budget_chunk = max(
+            1,
+            int(config['reinforcement_learning'].get('mcts_dynamic_budget_chunk', 64)),
+        )
         self.eval_batch_size = config['reinforcement_learning'].get('mcts_batch_size', 32)
         # History configuration (POV)
         self.history_positions = config['model'].get('history_positions', 0)
@@ -1238,8 +1365,8 @@ class MultiGameBatchMCTS:
             and torch.cuda.is_available()
         )
         # Keep lightweight performance counters always on so details/performance CSV/PNG
-        # stays useful even when verbose RL debug profiling is disabled. Detailed MCTS
-        # stage timers are opt-in because they run inside the tight search loop.
+        # stays useful even when verbose RL debug profiling is disabled. Tight-loop leaf
+        # operations are sampled; verbose CUDA/sub-stage timers remain opt-in.
         self.profile_enabled = True
         self.profile_detail_enabled = _debug_bool(
             config,
@@ -1275,14 +1402,22 @@ class MultiGameBatchMCTS:
         self._profile_stats = {
             'search_many_time': 0.0,
             'search_many_calls': 0,
+            # Sum of root->leaf path lengths. This is a selection traversal
+            # counter, not the number of completed MCTS simulations/visits.
+            'selection_node_traversals': 0,
             'search_root_setup_time': 0.0,
             'search_selection_time': 0.0,
             'search_backprop_time': 0.0,
             'search_metadata_time': 0.0,
+            'board_materialize_time': 0.0,
+            'board_materialize_calls': 0,
+            'terminal_checks_time': 0.0,
+            'terminal_checks_calls': 0,
             'batch_expand_eval_time': 0.0,
             'batch_expand_eval_calls': 0,
             'batch_expand_dedup_terminal_time': 0.0,
             'batch_expand_legal_moves_time': 0.0,
+            'batch_expand_move_index_time': 0.0,
             'batch_expand_tensor_pack_time': 0.0,
             'batch_expand_history_time': 0.0,
             'batch_expand_input_pack_time': 0.0,
@@ -1916,6 +2051,7 @@ class MultiGameBatchMCTS:
             return []
         perf_counter = time.perf_counter
         profile_detail = self.profile_detail_enabled
+        profile_timing = self.profile_enabled
         search_t0 = perf_counter()
 
         game_count = len(game_states)
@@ -1932,7 +2068,7 @@ class MultiGameBatchMCTS:
         # Initialize / reuse roots per game.
         # Supports both dict states and packed list states:
         # [board, root, root_synced, board_history, move_count, position_counts].
-        root_setup_t0 = perf_counter() if profile_detail else None
+        root_setup_t0 = perf_counter() if profile_timing else None
         for idx, gs in enumerate(game_states):
             if isinstance(gs, dict):
                 is_mapping_state[idx] = True
@@ -1986,92 +2122,132 @@ class MultiGameBatchMCTS:
                 needs_root_noise_on_expand[idx] = False
             else:
                 needs_root_noise_on_expand[idx] = bool(add_root_noise and not root.expanded)
-        if profile_detail:
+        if profile_timing:
             self._profile_add('search_root_setup_time', perf_counter() - root_setup_t0)
 
-        simulation_budget = max(1, int(num_simulations))
-        remaining = [simulation_budget] * game_count
-        total_remaining = int(sum(remaining))
+        fixed_simulation_budget = max(1, int(num_simulations))
+        dynamic_budget_active = bool(self.dynamic_budget_enabled and game_count > 1)
+        scout_budget = (
+            min(self.dynamic_budget_min, self.dynamic_budget_max)
+            if dynamic_budget_active
+            else fixed_simulation_budget
+        )
+        simulation_budgets = [scout_budget] * game_count
         game_ptr = 0
 
-        while total_remaining > 0:
-            # Cap per-game quota per round so that backprop happens before all
-            # simulations of a single game are consumed  (fixes: when
-            # eval_batch_size >= num_simulations, all sims land in one batch,
-            # root is never traversed after expansion, children stay at 0 visits).
-            max_remaining_any_game = max(remaining) if remaining else 1
-            slots_per_game = max(1, min(
-                self.eval_batch_size // max(1, game_count),
-                max_remaining_any_game // 4,
-            ))
-            batch_size = min(self.eval_batch_size, total_remaining,
-                             slots_per_game * game_count)
-            leaf_nodes = []
-            search_paths = []
-            leaf_game_indices = []
-            selected_this_batch = [0] * game_count
+        def _run_simulation_phase(remaining):
+            nonlocal game_ptr
+            total_remaining = int(sum(remaining))
+            while total_remaining > 0:
+                # Keep decisions in coarse batches. This preserves central GPU
+                # batching even though roots receive different total budgets.
+                active_count = sum(1 for value in remaining if value > 0)
+                max_remaining_any_game = max(remaining) if remaining else 1
+                slots_per_game = max(1, min(
+                    self.eval_batch_size // max(1, active_count),
+                    max(1, max_remaining_any_game // 4),
+                ))
+                batch_size = min(
+                    self.eval_batch_size,
+                    total_remaining,
+                    slots_per_game * max(1, active_count),
+                )
+                leaf_nodes = []
+                search_paths = []
+                leaf_game_indices = []
+                selected_this_batch = [0] * game_count
+                selection_node_traversals_this_batch = 0
 
-            selection_t0 = perf_counter() if profile_detail else None
-            for _ in range(batch_size):
-                # Find next game with remaining sims
-                found = False
-                for _ in range(game_count):
-                    current_root = roots[game_ptr]
-                    if (
-                        remaining[game_ptr] > 0
-                        and not (
-                            selected_this_batch[game_ptr] > 0
-                            and current_root is not None
-                            and not current_root.expanded
-                        )
-                    ):
-                        found = True
+                selection_t0 = perf_counter() if profile_timing else None
+                for _ in range(batch_size):
+                    found = False
+                    for _ in range(game_count):
+                        current_root = roots[game_ptr]
+                        if (
+                            remaining[game_ptr] > 0
+                            and not (
+                                selected_this_batch[game_ptr] > 0
+                                and current_root is not None
+                                and not current_root.expanded
+                            )
+                        ):
+                            found = True
+                            break
+                        game_ptr = (game_ptr + 1) % game_count
+
+                    if not found:
                         break
-                    game_ptr = (game_ptr + 1) % game_count
 
-                if not found:
+                    gs_idx = game_ptr
+                    node = roots[gs_idx]
+                    search_path = [node]
+                    node.add_virtual_loss()
+
+                    while not node.is_leaf():
+                        node = self._select_child(node)
+                        node.add_virtual_loss()
+                        search_path.append(node)
+
+                    search_paths.append(search_path)
+                    selection_node_traversals_this_batch += len(search_path)
+                    leaf_nodes.append(node)
+                    leaf_game_indices.append(gs_idx)
+                    selected_this_batch[gs_idx] += 1
+
+                    remaining[gs_idx] -= 1
+                    total_remaining -= 1
+                    game_ptr = (game_ptr + 1) % game_count
+                if profile_timing:
+                    self._profile_add('search_selection_time', perf_counter() - selection_t0)
+                self._profile_inc(
+                    'selection_node_traversals',
+                    selection_node_traversals_this_batch,
+                )
+
+                if not leaf_nodes:
                     break
 
-                gs_idx = game_ptr
-                node = roots[gs_idx]
-                search_path = [node]
-                node.add_virtual_loss()
+                values = self._batch_expand_and_evaluate(
+                    leaf_nodes,
+                    leaf_game_indices,
+                    board_histories,
+                    roots,
+                    needs_root_noise_on_expand,
+                    root_position_counts,
+                )
 
-                while not node.is_leaf():
-                    node = self._select_child(node)
-                    node.add_virtual_loss()
-                    search_path.append(node)
+                backprop_t0 = perf_counter() if profile_timing else None
+                for search_path, value in zip(search_paths, values):
+                    self._backpropagate(search_path, value)
+                    for node in search_path:
+                        node.remove_virtual_loss()
+                if profile_timing:
+                    self._profile_add('search_backprop_time', perf_counter() - backprop_t0)
 
-                search_paths.append(search_path)
-                leaf_nodes.append(node)
-                leaf_game_indices.append(gs_idx)
-                selected_this_batch[gs_idx] += 1
+        _run_simulation_phase([scout_budget] * game_count)
 
-                remaining[gs_idx] -= 1
-                total_remaining -= 1
-                game_ptr = (game_ptr + 1) % game_count
-            if profile_detail:
-                self._profile_add('search_selection_time', perf_counter() - selection_t0)
-
-            if not leaf_nodes:
-                break
-
-            values = self._batch_expand_and_evaluate(
-                leaf_nodes,
-                leaf_game_indices,
-                board_histories,
-                roots,
-                needs_root_noise_on_expand,
-                root_position_counts,
+        scout_difficulties = [0.0] * game_count
+        if dynamic_budget_active:
+            scout_summaries = [
+                self._summarize_root_search(
+                    root,
+                    scout_budget,
+                    initial_root_visits=initial_root_visits[idx],
+                )
+                for idx, root in enumerate(roots)
+            ]
+            scout_difficulties = [_dynamic_root_difficulty(summary) for summary in scout_summaries]
+            simulation_budgets = _allocate_dynamic_simulation_budgets(
+                scout_difficulties,
+                minimum=self.dynamic_budget_min,
+                target_average=self.dynamic_budget_target_avg,
+                maximum=self.dynamic_budget_max,
+                chunk=self.dynamic_budget_chunk,
             )
-
-            backprop_t0 = perf_counter() if profile_detail else None
-            for search_path, value in zip(search_paths, values):
-                self._backpropagate(search_path, value)
-                for node in search_path:
-                    node.remove_virtual_loss()
-            if profile_detail:
-                self._profile_add('search_backprop_time', perf_counter() - backprop_t0)
+            _run_simulation_phase([
+                max(0, int(budget) - scout_budget)
+                for budget in simulation_budgets
+            ])
 
         # Sync roots back to caller-provided state containers.
         for idx, gs in enumerate(game_states):
@@ -2090,18 +2266,25 @@ class MultiGameBatchMCTS:
             for root in roots
         ]
         search_metadata = []
-        metadata_t0 = perf_counter() if profile_detail else None
+        metadata_t0 = perf_counter() if profile_timing else None
         for idx, root in enumerate(roots):
             metadata = self._summarize_root_search(
                 root,
-                simulation_budget,
+                simulation_budgets[idx],
                 initial_root_visits=initial_root_visits[idx],
+            )
+            metadata['dynamic_budget_enabled'] = bool(dynamic_budget_active)
+            metadata['dynamic_budget_difficulty'] = float(scout_difficulties[idx])
+            metadata['dynamic_budget_target_average'] = (
+                int(self.dynamic_budget_target_avg)
+                if dynamic_budget_active
+                else int(fixed_simulation_budget)
             )
             fresh_visits = self._fresh_child_visit_dict(root, initial_child_visits[idx])
             if fresh_visits:
                 metadata['policy_visit_counts_override'] = fresh_visits
             search_metadata.append(metadata)
-        if profile_detail:
+        if profile_timing:
             self._profile_add('search_metadata_time', perf_counter() - metadata_t0)
         self._profile_add('search_many_time', perf_counter() - search_t0)
         self._profile_inc('search_many_calls', 1)
@@ -2137,6 +2320,8 @@ class MultiGameBatchMCTS:
                 unique_entries.append((node, game_indices[idx]))
             else:
                 node_occurrences[node_id].append(idx)
+        if profile_timing:
+            self._profile_add('batch_expand_dedup_terminal_time', perf_counter() - dedup_t0)
 
         terminal_values = {}
         non_terminal_nodes = []
@@ -2145,16 +2330,18 @@ class MultiGameBatchMCTS:
         legal_indices_per_node = []
         legal_counts = []
         max_legal_count = 0
-        legal_moves_t0 = perf_counter() if profile_timing else None
-
         for node, gi in unique_entries:
+            board_t0, board_scale = self._profile_sample_begin('board_materialize')
             board = node.board
+            self._profile_sample_finish('board_materialize', board_t0, board_scale)
+            terminal_t0, terminal_scale = self._profile_sample_begin('terminal_checks')
             is_check = board.is_check()
             is_path_draw = _is_search_path_draw_candidate(
                 node,
                 board,
                 root_position_counts[gi],
             )
+            self._profile_sample_finish('terminal_checks', terminal_t0, terminal_scale)
             # A non-check draw cannot be checkmate, so avoid generating and
             # encoding legal moves for a leaf whose value is already known.
             if is_path_draw and not is_check:
@@ -2163,7 +2350,12 @@ class MultiGameBatchMCTS:
 
             # Generating legal moves is the dominant CPU operation here. Do it
             # once, after every safe pre-check, and reuse the encoded indices.
-            legal_moves, legal_indices = node.get_legal_moves_and_indices()
+            legal_t0, legal_scale = self._profile_sample_begin('batch_expand_legal_moves')
+            legal_moves = node.get_legal_moves()
+            self._profile_sample_finish('batch_expand_legal_moves', legal_t0, legal_scale)
+            index_t0, index_scale = self._profile_sample_begin('batch_expand_move_index')
+            legal_indices = node.get_legal_indices()
+            self._profile_sample_finish('batch_expand_move_index', index_t0, index_scale)
             legal_count = len(legal_indices)
             if legal_count <= 0:
                 terminal_values[id(node)] = -1.0 if is_check else 0.0
@@ -2190,11 +2382,6 @@ class MultiGameBatchMCTS:
             legal_counts.append(legal_count)
             if legal_count > max_legal_count:
                 max_legal_count = legal_count
-        if profile_timing:
-            self._profile_add('batch_expand_legal_moves_time', perf_counter() - legal_moves_t0)
-        if profile_timing:
-            self._profile_add('batch_expand_dedup_terminal_time', perf_counter() - dedup_t0)
-
         values_by_node_id = {}
 
         if non_terminal_nodes:
@@ -2674,6 +2861,9 @@ class BatchSelfPlayMCTSBatch:
         nn_time = float(aggregated.get('learner_mcts_nn_inference_time', 0.0))
         nn_calls = int(aggregated.get('learner_mcts_nn_inference_calls', 0) or 0)
         nn_batch_items = int(aggregated.get('learner_mcts_nn_inference_batch_items', 0) or 0)
+        selection_node_traversals = int(
+            aggregated.get('learner_mcts_selection_node_traversals', 0) or 0
+        )
         nn_h2d_time = float(aggregated.get('learner_mcts_nn_h2d_time', 0.0))
         nn_gpu_forward_time = float(aggregated.get('learner_mcts_nn_gpu_forward_time', 0.0))
         nn_gpu_postprocess_time = float(aggregated.get('learner_mcts_nn_gpu_postprocess_time', 0.0))
@@ -2699,6 +2889,9 @@ class BatchSelfPlayMCTSBatch:
             nn_time += float(aggregated.get(prefix + 'nn_inference_time', 0.0))
             nn_calls += int(aggregated.get(prefix + 'nn_inference_calls', 0) or 0)
             nn_batch_items += int(aggregated.get(prefix + 'nn_inference_batch_items', 0) or 0)
+            selection_node_traversals += int(
+                aggregated.get(prefix + 'selection_node_traversals', 0) or 0
+            )
             nn_h2d_time += float(aggregated.get(prefix + 'nn_h2d_time', 0.0))
             nn_gpu_forward_time += float(aggregated.get(prefix + 'nn_gpu_forward_time', 0.0))
             nn_gpu_postprocess_time += float(aggregated.get(prefix + 'nn_gpu_postprocess_time', 0.0))
@@ -2722,6 +2915,7 @@ class BatchSelfPlayMCTSBatch:
         aggregated['mcts_nn_inference_time'] = float(nn_time)
         aggregated['mcts_nn_inference_calls'] = int(nn_calls)
         aggregated['mcts_nn_inference_batch_items'] = int(nn_batch_items)
+        aggregated['mcts_selection_node_traversals'] = int(selection_node_traversals)
         aggregated['mcts_nn_h2d_time'] = float(nn_h2d_time)
         aggregated['mcts_nn_gpu_forward_time'] = float(nn_gpu_forward_time)
         aggregated['mcts_nn_gpu_postprocess_time'] = float(nn_gpu_postprocess_time)
@@ -2742,8 +2936,11 @@ class BatchSelfPlayMCTSBatch:
             'search_selection_time',
             'search_backprop_time',
             'search_metadata_time',
+            'board_materialize_time',
+            'terminal_checks_time',
             'batch_expand_dedup_terminal_time',
             'batch_expand_legal_moves_time',
+            'batch_expand_move_index_time',
             'batch_expand_tensor_pack_time',
             'batch_expand_history_time',
             'batch_expand_input_pack_time',
@@ -2796,8 +2993,10 @@ class BatchSelfPlayMCTSBatch:
         aggregated['inference_time_per_position_ms'] = (
             1000.0 * float(nn_time) / float(nn_batch_items) if nn_batch_items > 0 else 0.0
         )
-        gpu_utilization_pct = 100.0 * float(nn_time) / max(1e-8, float(search_many_time))
-        aggregated['gpu_utilization_pct'] = float(max(0.0, min(100.0, gpu_utilization_pct)))
+        worker_nn_wait_share_pct = 100.0 * float(nn_time) / max(1e-8, float(search_many_time))
+        aggregated['worker_nn_wait_share_pct'] = float(
+            max(0.0, min(100.0, worker_nn_wait_share_pct))
+        )
         return aggregated
 
     def _prune_policy_target_visits(self, visit_counts):
@@ -3596,6 +3795,7 @@ class BatchSelfPlayMCTSBatch:
             else None
         )
         p10_search_simulations_budget = float(np.percentile(budget_arr, 10)) if budget_arr is not None else 0.0
+        p50_search_simulations_budget = float(np.percentile(budget_arr, 50)) if budget_arr is not None else 0.0
         p90_search_simulations_budget = float(np.percentile(budget_arr, 90)) if budget_arr is not None else 0.0
         min_search_simulations_budget = float(np.min(budget_arr)) if budget_arr is not None else 0.0
         max_search_simulations_budget = float(np.max(budget_arr)) if budget_arr is not None else 0.0
@@ -3641,9 +3841,15 @@ class BatchSelfPlayMCTSBatch:
                 else 0.0
             ),
             'search_simulations_budget_p10': float(p10_search_simulations_budget),
+            'search_simulations_budget_p50': float(p50_search_simulations_budget),
             'search_simulations_budget_p90': float(p90_search_simulations_budget),
             'search_simulations_budget_min': float(min_search_simulations_budget),
             'search_simulations_budget_max': float(max_search_simulations_budget),
+            'search_simulations_budget_target': float(
+                self.mcts.dynamic_budget_target_avg
+                if self.mcts.dynamic_budget_enabled
+                else self.num_simulations
+            ),
             'search_simulations_used_p10': float(p10_search_simulations_used),
             'search_simulations_used_sum': int(total_search_simulations_used),
             'search_simulations_budget_sum': int(total_search_simulations_budget),
@@ -4949,6 +5155,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
             return warmup_s
 
         def _load_model(label, state):
+            nonlocal central_use_compile
             label = str(label or "learner")
             load_info = {
                 "label": label,
@@ -4980,8 +5187,52 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                     )
                     compiled_base_models[label] = base_model
                     if model is not base_model:
-                        load_info["warmup_s"] = _warmup_central_model(model, label)
-                        compiled_wrappers[label] = model
+                        try:
+                            load_info["warmup_s"] = _warmup_central_model(model, label)
+                            compiled_wrappers[label] = model
+                        except Exception as exc:
+                            # torch.compile is lazy: a cached Triton/Inductor
+                            # artifact can fail only for a later warm-up shape.
+                            # First rebuild only this server's disposable cache
+                            # and retry. A benchmark must still be able to use
+                            # the exact eager model if that retry also fails.
+                            recovered = False
+                            if _reset_selfplay_compile_cache(compile_rank, device):
+                                retry_model = _maybe_compile_selfplay_model(
+                                    base_model,
+                                    config,
+                                    device,
+                                    rank=compile_rank,
+                                    model_label=f"central:{label}:cache-retry",
+                                )
+                                if retry_model is not base_model:
+                                    try:
+                                        load_info["warmup_s"] = _warmup_central_model(retry_model, label)
+                                        compiled_wrappers[label] = retry_model
+                                        model = retry_model
+                                        recovered = True
+                                        print(
+                                            f"Central inference: rebuilt torch.compile cache for '{label}'.",
+                                            flush=True,
+                                        )
+                                    except Exception as retry_exc:
+                                        exc = retry_exc
+                            if not recovered:
+                                print(
+                                    f"WARNING: Central inference: torch.compile disabled for '{label}' "
+                                    f"after cache rebuild failed ({type(exc).__name__}: {exc}). "
+                                    "Continuing with eager inference.",
+                                    flush=True,
+                                )
+                                compiled_wrappers.pop(label, None)
+                                model = base_model
+                                load_info["compiled"] = False
+                                load_info["warmup_s"] = None
+                                central_use_compile = False
+                                try:
+                                    torch._dynamo.reset()
+                                except Exception:
+                                    pass
                     else:
                         load_info["compiled"] = False
             else:
@@ -5017,6 +5268,7 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
             _send_response(_response_queue_for(req), response)
 
         def _infer_group(model_label, requests):
+            nonlocal central_use_compile
             group_t0 = time.perf_counter()
             concat_time = 0.0
             h2d_time = 0.0
@@ -5083,11 +5335,70 @@ def central_inference_server(config, device_id, request_queue, response_queues, 
                 h2d_time += time.perf_counter() - h2d_t0
                 with torch.inference_mode():
                     forward_t0 = time.perf_counter()
-                    if use_amp and device.type == 'cuda':
-                        with torch.autocast(device_type='cuda', dtype=central_amp_dtype):
+                    try:
+                        if use_amp and device.type == 'cuda':
+                            with torch.autocast(device_type='cuda', dtype=central_amp_dtype):
+                                policy_logits, value_logits = model(tensor, apply_log_softmax=False)
+                        else:
                             policy_logits, value_logits = model(tensor, apply_log_softmax=False)
-                    else:
-                        policy_logits, value_logits = model(tensor, apply_log_softmax=False)
+                    except Exception as exc:
+                        eager_model = compiled_base_models.get(model_label)
+                        if eager_model is None or eager_model is model:
+                            raise
+                        # Keep a long benchmark alive if a compiled graph fails
+                        # after startup. First give the exact base model one
+                        # clean-cache recompilation attempt, then use eager.
+                        recovered = False
+                        if _reset_selfplay_compile_cache(compile_rank, device):
+                            retry_model = _maybe_compile_selfplay_model(
+                                eager_model,
+                                config,
+                                device,
+                                rank=compile_rank,
+                                model_label=f"central:{model_label}:cache-retry",
+                            )
+                            if retry_model is not eager_model:
+                                try:
+                                    if use_amp and device.type == 'cuda':
+                                        with torch.autocast(device_type='cuda', dtype=central_amp_dtype):
+                                            policy_logits, value_logits = retry_model(
+                                                tensor, apply_log_softmax=False
+                                            )
+                                    else:
+                                        policy_logits, value_logits = retry_model(
+                                            tensor, apply_log_softmax=False
+                                        )
+                                    model = retry_model
+                                    models[model_label] = retry_model
+                                    compiled_wrappers[model_label] = retry_model
+                                    recovered = True
+                                    print(
+                                        f"Central inference: rebuilt torch.compile cache for '{model_label}'.",
+                                        flush=True,
+                                    )
+                                except Exception as retry_exc:
+                                    exc = retry_exc
+                        if not recovered:
+                            print(
+                                f"WARNING: Central inference: compiled forward failed for '{model_label}' "
+                                f"after cache rebuild ({type(exc).__name__}: {exc}). "
+                                "Continuing with eager inference.",
+                                flush=True,
+                            )
+                            eager_model.eval()
+                            model = eager_model
+                            models[model_label] = eager_model
+                            compiled_wrappers.pop(model_label, None)
+                            central_use_compile = False
+                            try:
+                                torch._dynamo.reset()
+                            except Exception:
+                                pass
+                            if use_amp and device.type == 'cuda':
+                                with torch.autocast(device_type='cuda', dtype=central_amp_dtype):
+                                    policy_logits, value_logits = model(tensor, apply_log_softmax=False)
+                            else:
+                                policy_logits, value_logits = model(tensor, apply_log_softmax=False)
                     if sync_timing and device.type == 'cuda':
                         torch.cuda.synchronize(device)
                     forward_time += time.perf_counter() - forward_t0
@@ -5407,10 +5718,15 @@ def _play_games_with_engine(
     if hasattr(engine, '_progress_file'):
         engine._progress_file = progress_file_path
 
-    wlog(
-        f"Playing {num_games} games with MCTS "
-        f"({config['reinforcement_learning']['mcts_simulations']} sims/move)"
-    )
+    if bool(rl_cfg.get('mcts_dynamic_budget_enabled', False)):
+        search_budget_text = (
+            f"dynamic {int(rl_cfg.get('mcts_dynamic_budget_min', 64))}-"
+            f"{int(rl_cfg.get('mcts_dynamic_budget_max', 320))}, target avg "
+            f"{int(rl_cfg.get('mcts_dynamic_budget_target_avg', 192))} sims/move"
+        )
+    else:
+        search_budget_text = f"{int(rl_cfg.get('mcts_simulations', 0))} sims/move"
+    wlog(f"Playing {num_games} games with MCTS ({search_budget_text})")
 
     save_every = rl_cfg.get('self_play_save_every_games_resolved', None)
     replay_max_policy_targets = _resolve_replay_max_policy_targets(config)
