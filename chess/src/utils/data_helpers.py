@@ -17,23 +17,17 @@ from functools import lru_cache
 # 🆕 TEMPORAL VALUE DISCOUNTING - FIX FOR MAE = 0.8
 # ==============================================================================
 
-def compute_discounted_outcome(move_idx, total_moves, result, current_turn):
+def compute_discounted_outcome(result, current_turn):
     """
     Return final outcome from the side-to-move POV.
 
     Args:
-        move_idx: Unused; kept for API stability.
-        total_moves: Unused; kept for API stability.
         result: Game result ('1-0', '0-1', '1/2-1/2').
         current_turn: Side to move (chess.WHITE or chess.BLACK).
 
     Returns:
         float: Outcome in {-1.0, 0.0, 1.0}.
     """
-    # Keep the signature stable for existing call sites.
-    _ = move_idx
-    _ = total_moves
-
     if result == '1-0':
         return 1.0 if current_turn == chess.WHITE else -1.0
     if result == '0-1':
@@ -50,22 +44,16 @@ _SQUARE_COLS = tuple(square % 8 for square in range(64))
 _SQUARE_ROWS_FLIPPED = tuple(7 - row for row in _SQUARE_ROWS)
 _SQUARE_COLS_FLIPPED = tuple(7 - col for col in _SQUARE_COLS)
 _PIECE_MASKS_WITH_INDEX = (
-    (chess.PAWN, 0),
-    (chess.KNIGHT, 1),
-    (chess.BISHOP, 2),
-    (chess.ROOK, 3),
-    (chess.QUEEN, 4),
-    (chess.KING, 5),
+    ("pawns", 0),
+    ("knights", 1),
+    ("bishops", 2),
+    ("rooks", 3),
+    ("queens", 4),
+    ("kings", 5),
 )
 
 
-def _iter_bitboard_squares(bitboard):
-    while bitboard:
-        lsb = bitboard & -bitboard
-        yield lsb.bit_length() - 1
-        bitboard ^= lsb
-
-def board_to_tensor(board, flip_perspective=None):
+def board_to_tensor(board, flip_perspective=None, dtype=np.float32):
     """
     Convert chess.Board to tensor representation with POV (Point of View)
     
@@ -87,11 +75,13 @@ def board_to_tensor(board, flip_perspective=None):
                          If None, auto-detect from board.turn
                          If True, flip (for black's perspective)
                          If False, don't flip (for white's perspective)
+        dtype: Output dtype. Self-play history uses float16 to avoid creating
+               a temporary float32 tensor only to cast it immediately.
     
     Returns: 
         (16, 8, 8) tensor from current player's perspective (was 12, now 16)
     """
-    tensor = np.zeros((16, 8, 8), dtype=np.float32)
+    tensor = np.zeros((16, 8, 8), dtype=dtype)
     
     # Determine if we need to flip
     if flip_perspective is None:
@@ -105,8 +95,8 @@ def board_to_tensor(board, flip_perspective=None):
     # === PIECE PLANES (0-11) ===
     own_occupied = board.occupied_co[pov_color]
     opp_occupied = board.occupied_co[not pov_color]
-    for piece_type, piece_idx in _PIECE_MASKS_WITH_INDEX:
-        piece_mask = getattr(board, chess.piece_name(piece_type) + "s")
+    for piece_attr, piece_idx in _PIECE_MASKS_WITH_INDEX:
+        piece_mask = getattr(board, piece_attr)
 
         own_bb = piece_mask & own_occupied
         while own_bb:

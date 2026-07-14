@@ -894,16 +894,6 @@ def _select_positions_per_game(binary_file, position_size, game_ranges, cfg, lab
     return indices
 
 
-def _filter_sorted_indices_by_ranges(indices, ranges):
-    indices = np.asarray(indices, dtype=np.uint32)
-    if len(indices) == 0 or not ranges:
-        return np.asarray([], dtype=np.uint32)
-    if len(indices) > 1 and np.any(indices[1:] < indices[:-1]):
-        indices = np.sort(indices)
-    mask = _mask_sorted_indices_by_ranges(indices, ranges)
-    return np.asarray(indices[mask], dtype=np.uint32)
-
-
 def _mask_sorted_indices_by_ranges(indices, ranges):
     indices = np.asarray(indices, dtype=np.uint32)
     mask = np.zeros(len(indices), dtype=bool)
@@ -1699,16 +1689,6 @@ def _sorted_unique_key_hashes(key_bytes):
     return np.unique(hashes)
 
 
-def _key_allowed_by_hash_filter(key, allowed_hashes):
-    if allowed_hashes is None:
-        return True
-    if key is None or len(allowed_hashes) == 0:
-        return False
-    key_hash = np.frombuffer(key[:8], dtype=np.uint64, count=1)[0]
-    pos = int(np.searchsorted(allowed_hashes, key_hash))
-    return pos < len(allowed_hashes) and allowed_hashes[pos] == key_hash
-
-
 def _key_ids_from_key_bytes(key_bytes, unique_hashes):
     key_hashes = _key_hashes_from_bytes(key_bytes)
     unique_hashes = np.asarray(unique_hashes, dtype=np.uint64)
@@ -1778,10 +1758,6 @@ def _policy_rating_params(cfg):
     return min_elo, reference_elo, max_multiplier, bool(weight_cfg.get('apply_to_value', False))
 
 
-def _policy_rating_weight(actor_elo, cfg):
-    return _rating_weight_from_params(actor_elo, _policy_rating_params(cfg))
-
-
 def _rating_weight_from_params(actor_elo, params):
     if params is None:
         return 1.0
@@ -1791,13 +1767,6 @@ def _rating_weight_from_params(actor_elo, params):
         return 1.0
     progress = max(0.0, min(1.0, (rating - min_elo) / (reference_elo - min_elo)))
     return 1.0 + (max_multiplier - 1.0) * progress
-
-
-def _value_rating_weight(actor_elo, cfg):
-    params = _policy_rating_params(cfg)
-    if params is None or not params[3]:
-        return 1.0
-    return _rating_weight_from_params(actor_elo, params)
 
 
 def _signature_key_array_for_indices(binary_file, position_size, indices, cfg, history_positions):
@@ -5214,14 +5183,6 @@ def _save_game_ranges_cache(cache_path, game_ranges):
     starts = np.asarray([int(start) for _, start, _ in game_ranges], dtype=np.uint32)
     ends = np.asarray([int(end) for _, _, end in game_ranges], dtype=np.uint32)
     np.savez(cache_path, game_id=game_ids, start=starts, end=ends)
-
-
-def _build_game_length_map(binary_file, position_size, total_positions):
-    """
-    Build {game_id: total_moves} mapping using contiguous ranges.
-    """
-    ranges = _build_game_ranges(binary_file, position_size, total_positions)
-    return {game_id: end - start for game_id, start, end in ranges}
 
 
 def _split_indices_by_game(metadata, config, return_game_ranges=False, materialize_indices=True,

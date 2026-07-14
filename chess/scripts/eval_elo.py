@@ -20,6 +20,7 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet, transfer_matching_weights
+from src.utils.config import normalize_config
 from utils.shared.elo_estimator import ensure_stockfish
 from utils.shared.elo_runner import (
     build_eval_elo_config,
@@ -138,7 +139,7 @@ def _path_rel(path, base_dir):
 
 def load_config(config_path):
     with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+        config = normalize_config(yaml.safe_load(f))
     config = copy.deepcopy(config)
     config.setdefault("model", {})
     config["model"]["print_summary"] = False

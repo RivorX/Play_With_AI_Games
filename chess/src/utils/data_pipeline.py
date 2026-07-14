@@ -5,7 +5,6 @@ Split from src.data to keep preprocessing separate from dataset/dataloader code.
 
 import chess
 import chess.pgn
-import gc
 import io
 import os
 import hashlib
@@ -13,7 +12,6 @@ import json
 import pickle
 import re
 import shutil
-import struct
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -74,38 +72,6 @@ def _resolve_workers(value, label):
     if value <= 0:
         return max(1, os.cpu_count() or 1)
     return value
-
-
-def _resolve_phase2_chunk_size(config, total_games, phase2_workers):
-    """
-    Resolve how many games are sent to one Phase 2 process task.
-
-    Windows ProcessPool overhead is high when every game is submitted as a
-    separate future, so Phase 2 batches games into deterministic chunks.
-    """
-    data_cfg = config.get('data', {}) if config else {}
-    raw_value = data_cfg.get('phase2_chunk_size', 512)
-
-    if isinstance(raw_value, str):
-        text = raw_value.strip().lower()
-        if text in {'auto', '0', 'none'}:
-            if total_games <= 0:
-                return 1
-            target_chunks = max(phase2_workers * 32, 1)
-            return max(64, min(2048, (total_games + target_chunks - 1) // target_chunks))
-        try:
-            raw_value = int(text)
-        except ValueError as exc:
-            raise ValueError(f"phase2_chunk_size must be an int or 'auto', got: {raw_value}") from exc
-
-    try:
-        chunk_size = int(raw_value)
-    except Exception as exc:
-        raise ValueError(f"phase2_chunk_size must be an int or 'auto', got: {raw_value}") from exc
-
-    if chunk_size <= 0:
-        return _resolve_phase2_chunk_size({'data': {'phase2_chunk_size': 'auto'}}, total_games, phase2_workers)
-    return max(1, chunk_size)
 
 
 def _normalize_max_games(value):
@@ -344,48 +310,6 @@ class DatasetTracker:
 # AUTO-CLEANUP SYSTEM
 # ==============================================================================
 
-def cleanup_intermediate_files(games_data_list, temp_dir):
-    """
-    Clean up intermediate files after position creation
-    
-    Args:
-        games_data_list: List of (pgn_path, games_data, temp_file) tuples
-        temp_dir: Temporary directory containing intermediate files
-    """
-    print(f"\n{'='*70}")
-    print("♻️  Cleaning up intermediate files...")
-    print(f"{'='*70}")
-    
-    cleaned_count = 0
-    freed_mb = 0
-    
-    # Clean up game data temp files
-    for pgn_path, games_data, temp_file in games_data_list:
-        if temp_file and temp_file.exists():
-            size_mb = temp_file.stat().st_size / (1024**2)
-            temp_file.unlink()
-            cleaned_count += 1
-            freed_mb += size_mb
-            print(f"  🗑️  Deleted: {temp_file.name} ({size_mb:.1f} MB)")
-    
-    # Clean up any other temporary files in temp_dir
-    if temp_dir.exists():
-        for temp_file in temp_dir.glob("*.tmp"):
-            if temp_file.exists():
-                size_mb = temp_file.stat().st_size / (1024**2)
-                temp_file.unlink()
-                cleaned_count += 1
-                freed_mb += size_mb
-                print(f"  🗑️  Deleted: {temp_file.name} ({size_mb:.1f} MB)")
-    
-    gc.collect()
-    
-    print(f"\n✅ Cleanup complete!")
-    print(f"  • Files deleted: {cleaned_count}")
-    print(f"  • Space freed: {freed_mb:.1f} MB")
-    print(f"{'='*70}\n")
-
-
 # ==============================================================================
 # SMART DATASET MERGING
 # ==============================================================================
@@ -565,155 +489,6 @@ def _game_data_from_headers_moves(headers, move_objects):
     }
 
 
-def _extract_game_data_with_moves(game):
-    """Return serializable headers/UCI plus the already-parsed move objects."""
-    try:
-        if game is None:
-            return None, None
-        
-        move_objects = list(game.mainline_moves())
-        return _game_data_from_headers_moves(game.headers, move_objects), move_objects
-    except:
-        return None, None
-
-
-def extract_game_data(game):
-    """Extract serializable data from chess.pgn.Game."""
-    game_data, _ = _extract_game_data_with_moves(game)
-    return game_data
-
-
-def parse_games_offset_batch_worker(args):
-    """
-    PHASE 1 WORKER: Parse a batch of games from a byte offset.
-
-    Used for full-file mode to avoid re-scanning from the start of the PGN in
-    every worker.
-    """
-    pgn_path, start_offset, num_games = args
-
-    import chess.pgn
-
-    games_data = []
-
-    try:
-        with open(pgn_path, "rb") as raw_f:
-            raw_f.seek(start_offset)
-            with io.TextIOWrapper(raw_f, encoding="utf-8", errors="ignore", newline="") as f:
-                for _ in range(num_games):
-                    game = chess.pgn.read_game(f)
-                    if game is None:
-                        break
-
-                    game_data = extract_game_data(game)
-                    if game_data:
-                        games_data.append(game_data)
-
-    except Exception as e:
-        print(f"⚠️ Worker error: {e}")
-
-    return games_data
-
-
-def extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_workers):
-    """
-    PHASE 1: Extract games using multi-processing
-    """
-    if phase1_workers <= 1:
-        return extract_games_sequential(pgn_path, max_games)
-
-    if max_games is None:
-        game_offsets = _scan_game_start_offsets(pgn_path)
-        effective_max_games = len(game_offsets)
-    else:
-        game_offsets = _scan_game_start_offsets(pgn_path, max_offsets=max_games)
-        effective_max_games = len(game_offsets)
-        if effective_max_games < max_games:
-            print(
-                f"  • PGN ended early: detected {effective_max_games:,} games "
-                f"(requested {max_games:,})"
-            )
-
-    games_per_worker = (effective_max_games + phase1_workers - 1) // phase1_workers
-    tasks = []
-    for i in range(phase1_workers):
-        start_idx = i * games_per_worker
-        if start_idx >= effective_max_games:
-            break
-        num_games = min(games_per_worker, effective_max_games - start_idx)
-        tasks.append((pgn_path, game_offsets[start_idx], num_games))
-
-    game_chunks = [None] * len(tasks)
-
-    with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
-        futures = {
-            executor.submit(parse_games_offset_batch_worker, task): i
-            for i, task in enumerate(tasks)
-        }
-
-        with tqdm(total=len(futures), desc=_phase_desc("Phase 1: PGN parsing")) as pbar:
-            for future in as_completed(futures):
-                task_idx = futures[future]
-                games_chunk = future.result()
-                game_chunks[task_idx] = games_chunk
-                pbar.update(1)
-                pbar.set_postfix({'games': sum(len(chunk or []) for chunk in game_chunks)})
-
-    all_games = []
-    for chunk in game_chunks:
-        if chunk:
-            all_games.extend(chunk)
-
-    return all_games[:effective_max_games]
-
-
-def extract_games_sequential(pgn_path, max_games):
-    """
-    PHASE 1: Sequential extraction (fallback)
-    """
-    games_data = []
-    
-    with open(pgn_path, 'r', encoding='utf-8', errors='ignore') as f:
-        with tqdm(total=max_games, desc=_phase_desc("Phase 1: PGN parsing")) as pbar:
-            game_count = 0
-            while max_games is None or game_count < max_games:
-                game = chess.pgn.read_game(f)
-                if game is None:
-                    break
-                
-                game_data = extract_game_data(game)
-                if game_data:
-                    games_data.append(game_data)
-                    game_count += 1
-                    pbar.update(1)
-    
-    return games_data
-
-
-def _dedupe_games(games_data):
-    """Remove duplicate games based on moves+result signature."""
-    seen = set()
-    deduped = []
-    dupes = 0
-    
-    for game in games_data:
-        moves = game.get('moves') or []
-        result = game.get('result', '')
-        sig_src = result + "|" + " ".join(moves)
-        sig = hashlib.md5(sig_src.encode('utf-8')).hexdigest()
-        if sig in seen:
-            dupes += 1
-            continue
-        seen.add(sig)
-        deduped.append(game)
-    
-    if dupes:
-        print(f"  Games dedup: -{dupes:,}")
-    return deduped
-
-
-
-
 # ==============================================================================
 # GAME FILTERING (HEADERS + LENGTH)
 # ==============================================================================
@@ -736,73 +511,6 @@ def _contains_any(text, keywords):
 def _fullmoves_from_moves(moves):
     plies = len(moves) if moves else 0
     return (plies + 1) // 2
-
-
-def _filter_games(games_data, config):
-    cfg = config.get('data', {}).get('game_filters', {})
-    
-    filters_enabled = bool(cfg.get('enabled', False))
-    
-    if not filters_enabled:
-        return games_data
-    
-    filtered = []
-    stats = {
-        'total': 0,
-        'kept': 0,
-        'termination': 0,
-        'length': 0,
-        'draw_short': 0,
-        'resign_short': 0,
-        'elo_gap': 0,
-    }
-    
-    for game in games_data:
-        stats['total'] += 1
-        reason = _game_filter_reason(game, cfg)
-        if reason is not None:
-            stats[reason] += 1
-            continue
-        
-        filtered.append(game)
-        stats['kept'] += 1
-    
-    if filters_enabled:
-        removed_parts = []
-        for key, label in (
-            ('termination', 'term'),
-            ('elo_gap', 'elo_gap'),
-            ('draw_short', 'short_draw'),
-            ('resign_short', 'short_resign'),
-            ('length', 'min_len'),
-        ):
-            if stats[key]:
-                removed_parts.append(f"{label}={stats[key]:,}")
-        details = "; " + ", ".join(removed_parts) if removed_parts else ""
-        print(f"  Games filter: {stats['total']:,} -> {stats['kept']:,}{details}")
-    
-    return filtered
-
-
-def extract_games_from_pgn_parallel(pgn_path, max_games, phase1_threads, config=None):
-    """
-    PHASE 1: Extract games from PGN file
-    """
-    max_games = _normalize_max_games(max_games)
-
-    all_games = extract_games_from_pgn_multiprocess(pgn_path, max_games, phase1_threads)
-    
-    if not all_games:
-        return []
-    
-    # Remove duplicate games (same moves + result)
-    all_games = _dedupe_games(all_games)
-    
-    # Apply filters (if enabled)
-    if config:
-        all_games = _filter_games(all_games, config)
-    
-    return all_games
 
 
 # ==============================================================================
@@ -1074,9 +782,6 @@ def extract_positions_from_game_worker(args):
         board = chess.Board()
         result = game_data['result']
         
-        # Kept for API compatibility; WDL target is not temporally discounted.
-        total_moves = len(moves)
-        
         positions = []
         move_idx = 0
         
@@ -1094,8 +799,6 @@ def extract_positions_from_game_worker(args):
                 
                 # WDL-only mode: no temporal discounting.
                 outcome = compute_discounted_outcome(
-                    move_idx=move_idx,
-                    total_moves=total_moves,
                     result=result,
                     current_turn=board.turn,
                 )
@@ -1125,103 +828,6 @@ def extract_positions_from_game_worker(args):
         
     except Exception as e:
         return []
-
-
-def extract_positions_from_game_chunk_worker(args):
-    """
-    PHASE 2 CHUNK WORKER: extract positions from a group of games.
-
-    This keeps game_id stable while avoiding one ProcessPool future per game.
-    """
-    indexed_games, min_elo, max_moves_per_game = args
-    chunk_positions = []
-    for game_id, game_data in indexed_games:
-        positions = extract_positions_from_game_worker(
-            (game_data, game_id, min_elo, max_moves_per_game)
-        )
-        if positions:
-            chunk_positions.extend(positions)
-    return chunk_positions
-
-
-def extract_positions_parallel(games_data, config, phase2_workers):
-    """
-    PHASE 2: Extract positions from games using multi-processing
-    """
-    min_elo = config['data'].get('min_elo', 0)
-    max_moves = config['data'].get('max_moves_per_game', 200)
-    if phase2_workers <= 1:
-        return extract_positions_sequential(games_data, config)
-    
-    chunk_size = _resolve_phase2_chunk_size(config, len(games_data), phase2_workers)
-    indexed_games = list(enumerate(games_data))
-    tasks = [
-        indexed_games[start:start + chunk_size]
-        for start in range(0, len(indexed_games), chunk_size)
-    ]
-
-    # 🔧 v4.3: game_id is uint32 — no modulo needed, supports up to ~4 billion games
-    
-    position_chunks = [None] * len(tasks)
-    positions_done = 0
-    games_done = 0
-
-    with ProcessPoolExecutor(max_workers=phase2_workers) as executor:
-        futures = {
-            executor.submit(
-                extract_positions_from_game_chunk_worker,
-                (task, min_elo, max_moves),
-            ): i
-            for i, task in enumerate(tasks)
-        }
-        
-        with tqdm(total=len(futures), desc=_phase_desc("Phase 2: position extraction")) as pbar:
-            for future in as_completed(futures):
-                task_idx = futures[future]
-                positions = future.result()
-                position_chunks[task_idx] = positions
-                positions_done += len(positions)
-                games_done += len(tasks[task_idx])
-                pbar.update(1)
-                pbar.set_postfix({'games': games_done, 'positions': positions_done})
-
-    all_positions = []
-    for chunk in position_chunks:
-        if chunk:
-            all_positions.extend(chunk)
-    
-    return all_positions
-
-
-def extract_positions_sequential(games_data, config):
-    """
-    PHASE 2: Sequential position extraction (fallback)
-    """
-    min_elo = config['data'].get('min_elo', 0)
-    max_moves = config['data'].get('max_moves_per_game', 200)
-    
-    all_positions = []
-    
-    for game_idx, game in enumerate(tqdm(games_data, desc=_phase_desc("Phase 2: position extraction"))):
-        # 🔧 v4.3: game_id is uint32 — no modulo needed
-        task = (game, game_idx, min_elo, max_moves)
-        positions = extract_positions_from_game_worker(task)
-        all_positions.extend(positions)
-    
-    return all_positions
-
-
-# ==============================================================================
-# PHASE 3 & 4: DISK WRITING & METADATA
-# ==============================================================================
-
-def write_positions_to_disk(positions, binary_file):
-    """
-    PHASE 3: Write positions to binary file
-    """
-    with open(binary_file, 'wb') as f:
-        for pos_data in tqdm(positions, desc=_phase_desc("Phase 3: writing to disk"), unit="pos"):
-            f.write(pos_data)
 
 
 def get_dataset_metadata(binary_file, config):

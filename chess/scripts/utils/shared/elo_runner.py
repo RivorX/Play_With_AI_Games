@@ -135,8 +135,8 @@ def build_il_periodic_elo_config(elo_cfg: dict) -> dict:
     return resolved
 
 
-def build_il_final_elo_config(elo_cfg: dict, *, use_mcts: bool = True) -> dict:
-    """Final IL checks run after training, so they can use standalone/full CPU settings."""
+def build_final_elo_config(elo_cfg: dict, *, use_mcts: bool = True) -> dict:
+    """Build the shared full-strength Elo config used by IL and RL."""
     source = dict(elo_cfg or {})
     simulations = source.get("mcts_eval_simulations", source.get("mcts_simulations", 0))
     workers = source.get("mcts_eval_workers" if use_mcts else "nn_eval_workers", source.get("workers", 0))
@@ -151,10 +151,15 @@ def build_il_final_elo_config(elo_cfg: dict, *, use_mcts: bool = True) -> dict:
     return resolved
 
 
+def build_il_final_elo_config(elo_cfg: dict, *, use_mcts: bool = True) -> dict:
+    """Backward-compatible IL name for the shared final Elo configuration."""
+    return build_final_elo_config(elo_cfg, use_mcts=use_mcts)
+
+
 def build_il_final_elo_configs(elo_cfg: dict) -> tuple[dict, dict]:
     return (
-        build_il_final_elo_config(elo_cfg, use_mcts=False),
-        build_il_final_elo_config(elo_cfg, use_mcts=True),
+        build_final_elo_config(elo_cfg, use_mcts=False),
+        build_final_elo_config(elo_cfg, use_mcts=True),
     )
 
 

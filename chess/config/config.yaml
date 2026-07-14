@@ -202,8 +202,8 @@ imitation_learning:
   moves_left_loss_weight: 0.05
   wdl_label_smoothing: 0.01
 
-  # Exact horizontal chess symmetry: doubles positional coverage online without
-  # rebuilding data. The policy index map is transformed with the board.
+  # Horizontal file symmetry without rebuilding data. Positions whose visible
+  # history still has castling rights are skipped because castling is asymmetric.
   augmentation:
     enabled: true
     horizontal_flip_prob: 0.5
@@ -226,443 +226,133 @@ imitation_learning:
 # REINFORCEMENT LEARNING (RL)
 # ------------------------------------------------------------------------------
 reinforcement_learning:
-  # ---------------------------
-  # Core RL Loop
-  # ---------------------------
-  version: "rl27"                # RL run/version tag added to RL log filenames
-  iterations: 40                # Total RL iterations
-  games_per_iteration: 250      # Update the learner more often so one drifting self-play generation cannot dominate replay
+  # Main run size.
+  run:
+    version: "rl30"
+    iterations: 40
+    games_per_iteration: 350
 
-  # ---------------------------
-  # Self-Play Runtime
-  # ---------------------------
-  self_play_device: "cuda"      # cpu | cuda | auto (auto uses GPU if available)
-  self_play_workers: auto       # Auto = ceil(available CPU threads * self_play_worker_auto_multiplier)
-  self_play_worker_auto_multiplier: 1.10 # 12 CPU threads -> 13 self-play workers; enough batching without hardcoding one machine
-  self_play_worker_cap_multiplier: 1.7 # Safety cap for explicit/auto workers when central inference lets workers block on GPU
-  self_play_torch_threads: 1    # Keep 1 thread per worker; Python MCTS already fans out across many processes
-  self_play_history_fp16: true  # Store active game history in fp16 inside workers; replay tensors are still emitted as fp32/fp16 by replay_fp16
-  self_play_central_inference_enabled: true # Use shared central_inference GPU server settings for persistent self-play workers
-  self_play_compile_lock_timeout_s: 900  # Max wait for another worker to finish compile/cache warmup before falling back
+  # Game generation. Runtime mechanics use tested internal defaults.
+  self_play:
+    device: "cuda"                 # cpu | cuda | auto
+    workers: auto
+    worker_auto_multiplier: 1.10
+    max_batch_games_per_worker: 30
+    max_moves: 190
 
-  self_play_save_every_games: 1  # Multiplier of games_per_iteration (0=off); progress still updates per finished game
+    opening_diversity_fraction: 0.60
+    opening_diversity_min_plies: 2
+    opening_diversity_max_plies: 8
 
-  # ---------------------------
-  # Self-Play Game Flow
-  # ---------------------------
-  use_batch_selfplay: true         # Play multiple games simultaneously (5-10x faster)
-  max_batch_games_per_worker: 30     # Keep total active games/RAM near 16x20 while giving CPU more worker processes
-  self_play_dispatch_chunk_games: 96 # Requested chunk cap; runtime caps it by games/worker so large chunks do not starve workers
-  self_play_max_moves: 190          # Hard cap in plies; keep speed while draw claims below decide only clearly claimable games
-  self_play_auto_claim_draw: true   # Allow manual draw claims from python-chess instead of waiting only for automatic terminal detection
-  self_play_claim_repetition_after_moves: 64  # Plies before claiming repetition; avoid ending useful middlegame cycles too early
-  self_play_claim_draw_after_moves: 120 # Plies before generic claimable draws; lets more value targets resolve naturally
-  syzygy_enabled: true                   # Probe local Syzygy tablebases in tiny endgames and finish them without wasting search
-  syzygy_paths:
-    - "data/syzygy"                      # Relative paths are resolved from chess/ (e.g. chess/data/syzygy)
-  syzygy_auto_download_enabled: true     # If local Syzygy WDL files are missing, bootstrap them automatically on RL startup
-  self_play_progress_interval_games: 5  # Fewer progress file writes on Windows workers
+    opponent_current_fraction: 0.30
+    opponent_best_fraction: 0.70
 
-  # ---------------------------
-  # Self-Play Diversity & Opponents
-  # ---------------------------
-  self_play_opening_diversity_enabled: true   # Start many games from short curated opening prefixes to avoid replaying the same opening shell forever
-  self_play_opening_diversity_fraction: 0.60  # More opening variety so short hour-scale runs cover more structures
-  self_play_opening_diversity_min_plies: 2    # Let sharp curated lines branch early
-  self_play_opening_diversity_max_plies: 8    # Allow enough depth to land in asymmetrical structures
-  self_play_opponent_pool_enabled: true       # Mix current-vs-current with frozen opponents instead of only mirror self-play
-  self_play_opponent_current_fraction: 0.22   # Keep mirror adaptation, but let frozen best drive most hard targets
-  self_play_opponent_best_fraction: 0.72      # Main teacher until current can beat it repeatedly
-  self_play_opponent_recent_fraction: 0.03    # Recent snapshots are probes, not primary teachers
-  self_play_opponent_anchor_fraction: 0.18    # Keep IL anchor as a guardrail without dragging away from the promoted best
-  self_play_recent_snapshots_to_keep: 10       # Keep a wider recent window, then let the smart selector choose the actually useful opponents
-  self_play_recent_candidate_pool_size: 2     # Fewer simultaneous frozen recent models reduces MCTS batch fragmentation
-  self_play_recent_recency_bias: 0.35         # Prefer fresher snapshots, but still let matchup quality dominate the selection
-  self_play_recent_confidence_games: 24       # Avg games needed before a recent snapshot score is treated as high-confidence
-  self_play_recent_uncertainty_bonus: 0.15    # Small exploration bonus for newer/under-tested recent snapshots
-  self_play_recent_in_band_boost: 1.10        # Slight boost for recent snapshots already inside the preferred score band
-  self_play_randomize_learner_color: true     # Let the training model play both colors against frozen opponents
-  self_play_opponent_adaptive_enabled: true   # Reweight opponents cautiously inside bounded shares
-  self_play_opponent_adaptive_update_every: 1 # Update each iteration, but max_share_delta below prevents abrupt swings
-  self_play_opponent_adaptive_min_games: 20   # Ignore tiny matchup samples
-  self_play_opponent_adaptive_history_size: 6 # Smooth score estimates over a longer recent window
-  self_play_opponent_adaptive_target_score: 0.50 # Prefer opponents that are neither too easy nor too hard
-  self_play_opponent_adaptive_band: 0.16      # Use a forgiving band so the scheduler reacts to trends, not one noisy batch
-  self_play_opponent_adaptive_min_factor: 0.75 # Do not fully zero out hard/easy opponents
-  self_play_opponent_adaptive_max_factor: 1.35 # Let the scheduler lean into useful hard opponents
-  self_play_opponent_adaptive_max_share_delta: 0.12 # Max absolute bucket-share move per iteration
-  self_play_opponent_current_min_fraction: 0.20 # Mirror self-play remains a real adaptation channel after promotion
-  self_play_opponent_current_max_fraction: 0.30 # Avoid learner-vs-learner replay dominating before it beats best
-  self_play_opponent_best_min_fraction: 0.50    # Keep the current best as the primary teacher
-  self_play_opponent_best_max_fraction: 0.72
-  self_play_opponent_anchor_min_fraction: 0.08  # Preserve IL-anchor pressure once unlocked
-  self_play_opponent_anchor_max_fraction: 0.20
-  self_play_opponent_recent_max_fraction: 0.05  # Recent snapshots stay diagnostic
-  self_play_opponent_frozen_max_fraction: 0.80  # Best + anchor + recent may not crowd current mirror-play below 20%
-  self_play_post_promotion_transition_iterations: 8 # Ramp anchor pressure slowly so the new best remains the main teacher
-  self_play_post_promotion_current_min_fraction: 0.26 # Give the learner room to settle around the promoted checkpoint
-  self_play_recent_latest_cap_count: 2          # Treat the newest N recent snapshots as one capped echo-chamber bucket
-  self_play_recent_latest_max_fraction: 0.35    # Newest recent snapshots may not exceed this share of all self-play games
-  self_play_opponent_min_score: 0.28            # Avoid opponent buckets that are so hard they mostly generate hopeless targets
-  self_play_opponent_max_score: 0.72            # Avoid buckets that are so easy they stop challenging the policy
-  self_play_opponent_best_min_score: 0.00       # Keep best-opponent channel alive even when it is temporarily hard
-  self_play_opponent_anchor_min_score: 0.00     # Keep the IL-anchor channel alive once unlocked; it is a stability reference
-  self_play_opponent_recent_min_score: 0.32     # Recent snapshots should usually be in the learnable band
-  self_play_opponent_recent_max_score: 0.68     # Also skip recent snapshots that have become too easy
-  self_play_opponent_target_draw_rate: 0.35     # Prefer matchups that stay meaningfully decisive instead of settling into draw-heavy shells
-  self_play_opponent_draw_band: 0.10            # React sooner once an opponent source starts producing too many draws
-  self_play_opponent_draw_penalty_min_factor: 0.45 # Penalize draw-heavy opponent sources more aggressively while still keeping some diversity
-  self_play_store_frozen_best_positions: true   # Distill best-model MCTS replies too, not only learner moves from lost games
-  self_play_store_frozen_anchor_positions: true # Distill stable IL-anchor search targets after RL-best diverges
-  self_play_frozen_opponent_policy_weight: 1.05  # Best replies are high-value MCTS supervision, not just opponent moves
-  self_play_frozen_anchor_policy_weight: 0.85    # Anchor stabilizes without overpowering the promoted best
+    syzygy_paths:
+      - "data/syzygy"
 
-  # ---------------------------
-  # Temperature Schedule
-  # ---------------------------
-  use_temperature_schedule: true      # Enable adaptive temperature
-  temperature_start: 0.65             # RL should start more focused; search, not policy noise, should drive improvement
-  temperature_end: 0.45               # Keep late self-play from becoming too draw-stable while value is still recalibrating
-  temperature_decay_iterations: auto  # Auto: decay spans the full RL run (matches iterations)
-  adaptive_temperature_enabled: true  # Small telemetry-driven corrections on top of the base decay schedule
-  adaptive_temperature_min: 0.42      # Keep controller close to the intended RL sampling regime
-  adaptive_temperature_max: 0.68      # Also avoid over-correcting above the intended search regime
-  adaptive_temperature_max_adjustment: 0.045 # Frequent but small corrections; avoid turning temperature into a moving target
-  adaptive_temperature_draw_target: 0.30    # Moderate draw rate: enough neutral calibration without sterile self-play
-  adaptive_temperature_draw_band: 0.05      # Ignore normal draw-rate noise, react to sustained drift
-  adaptive_temperature_decisive_target: 0.70 # Aim for mostly decisive completed games
-  adaptive_temperature_decisive_band: 0.07   # Ignore ordinary decisive-rate noise
-  adaptive_temperature_min_eval_gain: 0.010  # Treat flat eval as a small sharpening signal
-  adaptive_temperature_draw_step: 0.018      # Max temp move from draw pressure before smoothing
-  adaptive_temperature_low_draw_step: 0.012  # Re-open exploration gently when games are too decisive
-  adaptive_temperature_decisive_step: 0.014  # Small correction from decisive-rate pressure
-  adaptive_temperature_eval_step: 0.010      # Eval stagnation should nudge, not dominate
-  adaptive_temperature_smoothing: 0.25       # More responsive, while max_adjustment keeps it small
-  adaptive_temperature_threshold_step: 1     # Only small threshold movement with adaptive temperature
+  # Search quality. Q values are the verified Q-on benchmark setup.
+  search:
+    simulations: 192
+    c_puct_base: 19652
+    c_puct_init: 1.18
+    c_puct_max: 1.85
+    fpu_reduction: 0.12
+    fpu_absolute: 0.0
 
-  # ---------------------------
-  # MCTS Search
-  # ---------------------------
-  # Core search.
-  mcts_simulations: 192       # Debug showed deeper search helps this learner; train closer to the 320-sim eval regime
-  mcts_batch_size: 192        # Match the 192-sim self-play regime
-  mcts_reuse_tree: true      # Reuse tree across moves (faster, better)
-  mcts_cache_history_tensors: true # Cache simulated history tensors on tree nodes to reduce repeated board_to_tensor work
-  mcts_c_puct_base: 19652    # AZ-style slow growth; keep exploration stable as sims increase
-  mcts_c_puct_init: 1.18     # Let a now-stronger policy prior resist noisy value/Q oversteering
-  mcts_c_puct_max: 1.85      # Keep enough prior pressure once raw policy starts beating search
-  mcts_use_fpu: true         # First Play Urgency baseline for unvisited/low-visit children
-  mcts_fpu_reduction: 0.12   # Used only when mcts_fpu_absolute is null
-  mcts_fpu_absolute: 0.0     # Neutral unvisited Q; avoids punishing exploration while value is still calibrating
+    # Frozen v9.9b direct matches (2026-07-13): Q=2.0 scored 61.7% vs 0.5
+    # and 63.3% vs 1.0. q_max_abs remains the hard search-influence safety cap.
+    q_selection_weight: 2.0
+    q_centered: true
+    q_min_child_visits: 2
+    q_parent_visit_warmup: 36
+    q_tanh_scale: 0.55
+    q_max_abs: 0.055
+    q_min_fullmove: 12
+    q_full_weight_fullmove: 28
 
-  # Fixed Q steering.
-  mcts_q_selection_weight: 0.075 # Q is a tie-breaker while value calibration lags behind raw policy strength
-  mcts_q_centered: true      # Use Q as relative sibling preference, not as poorly calibrated absolute value
-  mcts_q_min_child_visits: 2 # Require a little real child evidence before Q can redirect visits
-  mcts_q_parent_visit_warmup: 36 # Let policy/PUCT compare moves before value challenges a locked prior
-  mcts_q_tanh_scale: 0.55    # Smoothly squash value differences without turning most deltas into the same saturated bonus
-  mcts_q_max_abs: 0.055      # Cap Q redirects tightly while no-MCTS eval is stronger than MCTS eval
-  mcts_q_min_fullmove: 12    # Keep opening and early middlegame mostly policy-led
-  mcts_q_full_weight_fullmove: 28 # Ramp Q slowly so value must prove itself before steering search
-  mcts_q_eval_gap_dampen_enabled: true # Reduce Q next iteration if MCTS eval underperforms raw policy eval
-  mcts_q_eval_gap_dampen_start: -0.03
-  mcts_q_eval_gap_dampen_full: -0.12
-  mcts_q_eval_gap_min_scale: 0.25
+    temperature: 0.65
+    temperature_threshold: 12
+    dirichlet_alpha: 0.30
+    dirichlet_weight: 0.095
 
-  # Root sampling.
-  mcts_temperature: 0.65      # Sharper visit sampling produces better policy targets once the search is strong enough
-  mcts_temperature_threshold: 12  # Quicker shift toward deterministic play helps convert advantages instead of drifting
-  mcts_dirichlet_alpha: 0.3  # Chess-scale root noise concentration
-  mcts_dirichlet_weight: 0.095 # More root exploration so search can challenge the raw prior instead of confirming it
+  # Optimizer and the few regularizers worth tuning between runs.
+  training:
+    batch_size: 8192               # fallback before dynamic sizing
+    train_batch_size_min: 1024
+    train_batch_size_max: 6144
 
-  # Adaptive root noise.
-  adaptive_dirichlet_enabled: true       # Adjust root exploration from draw pressure, eval health, and useful MCTS change yield
-  adaptive_dirichlet_min_weight: 0.015   # Keep a small amount of root noise for exploration even under heavy draw pressure
-  adaptive_dirichlet_max_weight: 0.110   # Low change yield may raise root noise only mildly
-  adaptive_dirichlet_draw_scale: 0.65    # Cut root noise harder when completed draw rate drifts above target
-  adaptive_dirichlet_eval_scale: 0.85    # Also tighten root noise when eval stops improving
+    learning_rate: 0.00002
+    weight_decay: 0.002
+    backbone_lr_factor: 0.75
+    policy_head_lr_factor: 1.15
+    value_head_lr_factor: 1.75
+    head_weight_decay: 0.0005
+    grad_clip: 0.5
 
-  # Tactical prior nudges.
-  mcts_tactical_priors_enabled: true  # Small tactical nudges help low-budget search notice forcing moves sooner
-  mcts_tactical_capture_bonus: 0.06   # Small prior boost for captures
-  mcts_tactical_winning_capture_bonus: 0.05  # Extra nudge for obviously favorable captures
-  mcts_tactical_check_bonus: 0.04     # Checks are often tactically forcing
-  mcts_tactical_promotion_bonus: 0.08 # Promotions are rare and critical
-  mcts_tactical_recapture_bonus: 0.05 # Helps short tactical recapture sequences
+    warmup_pct: 0.05              # 2/40 iterations: pretrained IL + conservative 2e-5 LR do not need a six-iteration ramp.
+    min_lr_ratio: 0.35
+    entropy_weight: 0.0010
+    policy_target_confidence_min_weight: 0.58
+    policy_target_confidence_power: 1.0
+    augment_prob: 0.50             # Applied only where horizontal symmetry is exact
 
-  # Scout Budgeting.
-  mcts_scout_simulations: 96       # Every root gets a cheap scout before deciding whether to stop, continue, or challenge
-  mcts_scout_check_interval: 16    # Reclassify roots in coarse chunks to avoid CPU churn
-  mcts_scout_low_branching_moves: 6
-  mcts_scout_endgame_piece_count: 10
-  mcts_scout_easy_top_visit_prob: 0.70
-  mcts_scout_easy_visit_gap: 0.18
-  mcts_scout_easy_max_entropy: 0.58
-  mcts_scout_easy_min_explored_prior_mass: 0.92
-  mcts_scout_easy_min_visited_moves: 8
-  mcts_scout_target_changed_rate: 0.14 # Ask challenge to help only when normal MCTS is too prior-locked
-  mcts_scout_challenge_band: 0.08
-  mcts_scout_challenge_min_fraction: 0.02 # Keep a small budgeted challenge stream without forcing divergence
-  mcts_scout_challenge_max_fraction: 0.35
-  mcts_scout_avg_budget_target_ratio: 1.15
-  mcts_scout_avg_budget_target_tolerance: 0.015
-  mcts_scout_challenge_fraction: 0.0   # Runtime value; train_rl updates it from recent changed-top telemetry
-  mcts_scout_challenge_budget_multiplier: 1.67 # 192 base -> ~320 sims for selected challenge roots
-  mcts_scout_challenge_min_score: 0.20
-  mcts_scout_challenge_prior_margin_ref: 0.24
-  mcts_scout_challenge_prior_top_ref: 0.45
-  mcts_scout_challenge_min_budget_fraction: 0.92
-  mcts_scout_challenge_prior_temperature: 1.80 # Challenge roots flatten selection prior but keep clean base_priors for targets
-  mcts_scout_challenge_uniform_mix: 0.08
-  mcts_scout_challenge_delta_target_enabled: true # Train policy on challenge-phase visits, not scout+challenge visits that already favor prior top
-  mcts_scout_challenge_delta_target_mix: 0.75
-  mcts_scout_challenge_delta_target_min_visits: 48
-  mcts_scout_challenge_delta_target_min_top_prob: 0.28
-  mcts_scout_sharp_capture_min_gain: 1.0
-  # ---------------------------
-  # Policy Target Shaping
-  # ---------------------------
-  policy_target_pruning_enabled: true           # Drop low-visit exploration noise before training the policy head
-  policy_target_pruning_keep_top_n: 8           # Always keep a broader top slice so uncertain positions retain more searched alternatives
-  policy_target_pruning_max_moves: 28           # Let wider post-search support reach the learner before pruning the long tail
-  policy_target_pruning_min_prob: 0.005         # Still trim only the weakest tail; low-probability tactical moves can survive if search supports them
-  policy_target_pruning_min_fraction_of_max: 0.05 # Keep moves that are closer to the best visit count instead of over-sharpening the target
-  policy_target_pruning_keep_mass: 0.96         # Preserve more of the MCTS distribution when many moves are similarly plausible
-  policy_target_quality_weighting_enabled: true # Downweight flat/ambiguous targets at storage time, not only during training
-  policy_target_quality_min_weight: 0.50        # MCTS targets are now cleaner; do not starve policy gradients on broader roots
-  policy_target_quality_entropy_threshold: 0.78 # Be less punitive to wider MCTS distributions after Q starts changing top moves
-  policy_target_quality_top1_threshold: 0.45    # Let moderately confident MCTS targets train the policy instead of only sharp roots
-  policy_target_uptake_gate_enabled: true       # Keep value learning broad, but let policy absorb mainly real MCTS improvements
-  policy_target_uptake_unchanged_low_kl_max: 0.16 # Same-top low-KL search mostly restates the learner prior
-  policy_target_uptake_unchanged_low_kl_weight: 0.65 # Stable IL-backed moves still teach, but no longer dominate rare MCTS discoveries
-  policy_target_uptake_unchanged_weight: 0.84   # Preserve broad policy structure while leaving more gradient for changed-top targets
-  policy_target_search_change_weighting_enabled: true # Give clean changed-top MCTS targets a modest extra policy push
-  policy_target_search_change_min_q_delta: 0.05       # Require a real Q edge before boosting changed-top targets
-  policy_target_search_change_q_delta_ref: 0.35       # Useful Q deltas should matter before they are huge
-  policy_target_search_change_bonus: 0.24             # Changed-top MCTS targets are rare; give them enough gradient to move raw policy
-  policy_target_search_change_q_bonus: 0.30           # Extra bonus from positive Q delta
-  policy_target_search_change_rank_bonus: 0.12        # Small bonus when the prior top drops below rank 2 in visits
-  policy_target_search_change_allow_q_neutral: true   # Let strong search changes teach policy even when Q is near neutral
-  policy_target_search_change_min_top_visit_prob: 0.55 # Neutral-Q change must have a clear visit winner
-  policy_target_search_change_min_prior_rank: 2       # Prior top must fall behind the MCTS winner
-  policy_target_search_change_neutral_min_q_delta: -0.02 # Do not boost changes that backed-up value clearly dislikes
-  policy_target_search_change_neutral_bonus: 0.09     # Smaller boost for neutral-Q changes than Q-backed changes
-  policy_target_search_change_neutral_rank_bonus: 0.06 # Extra neutral-Q boost when prior top falls clearly in visit rank
-  policy_target_search_change_max_weight: 1.70        # Stronger uptake for rare clean changes without letting one sample explode
+    # Promotion changes only the frozen evaluation/self-play baseline; learner
+    # weights and optimizer state do not jump, so slowing LR here wastes updates.
+    post_promotion_stabilization_iterations: 0
+    post_promotion_lr_scale: 1.00
 
-  # ---------------------------
-  # Optimizer Core
-  # ---------------------------
-  batch_size: 8192           # Fallback only when dynamic RL batch sizing is disabled
-  train_dynamic_batch_size_enabled: true # Grow batch with replay so a full pass stays near a stable optimizer-step budget
-  train_batch_size_min: 1024 # Early RL still needs several updates while replay contains only the first self-play generation
-  train_batch_size_max: 6144 # Cap dynamic RL batches at ~6k even after replay fills
-  train_batch_size_round_to: 256 # Keep GPU-friendly batch shapes without large jumps between iterations
-  train_target_steps_per_iteration: auto # auto targets about 5 steps while replay fits under the batch cap
-  learning_rate: 0.00002     # Strong IL anchor needs smaller RL updates until MCTS discoveries reliably become raw-policy gains
-  weight_decay: 0.002         # L2 regularization (AdamW)
-  backbone_lr_factor: 0.75   # Keep shared IL features stable while RL targets are still noisy
-  policy_head_lr_factor: 1.15 # Let the raw policy absorb clean MCTS discoveries faster
-  value_head_lr_factor: 1.75 # Let the WDL head adapt faster; MCTS strength is limited by value discrimination, not only MAE
-  head_weight_decay: 0.0005    # Heads need less AdamW decay than the shared backbone
-  no_decay_weight_decay: 0.0 # Do not decay BN/norm/bias parameters
-  grad_clip: 0.5             # Gradient clipping
-  train_epochs_per_iteration: 1  # Reduce overfitting to noisy self-play targets
-  train_max_steps_per_iteration: 0  # 0 = always train on the full unique replay pass; do not discard replay samples
-  q_disabled_training_q_threshold: 0.001 # When Q is effectively absent, avoid full-strength policy self-distillation
-  q_disabled_policy_loss_scale: 0.80
-  q_disabled_value_loss_scale: 1.05
-  q_disabled_value_loss_max: 0.54
-  post_promotion_stabilization_iterations: 10 # Keep the learner close to the promoted checkpoint while replay distribution shifts
-  post_promotion_lr_scale: 0.30
-  post_promotion_lr_recovery_iterations: 8 # Return from the stabilization LR gradually instead of jumping back at once
-  post_promotion_policy_loss_scale: 0.65 # Avoid overwriting a freshly promoted policy with noisy early post-promotion targets
-  post_promotion_value_loss_scale: 1.08  # Keep value repair active without letting outcome noise dominate the fresh best
-  post_promotion_best_policy_kl_weight: 0.22 # Distill toward the promoted best policy during stabilization
-  post_promotion_best_value_distill_weight: 0.10 # Keep value scalar close to the promoted best while final-outcome targets settle
-  post_promotion_replay_pre_fraction: 0.50 # Keep a promoted-best baseline in replay batches while those samples still exist
-  post_promotion_train_replay_fraction: 0.65 # During stabilization, do not train a full pass over freshly shifted replay
-  post_promotion_guard_enabled: true       # Restore current to promoted best if early post-promotion eval collapses
-  post_promotion_guard_window: 12
-  post_promotion_guard_min_score_rate: 0.45
-  post_promotion_guard_min_anchor_score_rate: 0.50
-  post_promotion_guard_extend_iterations: 4
-  post_promotion_guard_max_rollbacks: 2
-  rl_diagnostic_ema_alpha: 0.35 # Smoothing for MCTS/no-MCTS and Q ablation control signals
+  # Uniform FIFO replay. Generations controls freshness; caps control coverage.
+  replay:
+    buffer_multiplier: 5
+    max_policy_targets: 28
+    cap_fraction_decisive: 0.65
+    cap_fraction_draw: 0.60
+    cap_min_positions: 24
+    cap_max_positions: 120
 
-  # ---------------------------
-  # Training Schedule & Regularization
-  # ---------------------------
-  # Learning rate schedule.
-  use_lr_schedule: true
-  warmup_pct: 0.15           # Slower RL ramp while the first smaller self-play generations enter replay
-  min_lr_ratio: 0.35         # Keep late policy updates alive while MCTS discoveries become cleaner
+  # Model comparison and promotion. Technical worker/opening settings are fixed.
+  evaluation:
+    eval_every: 2
+    eval_workers: auto
+    eval_batch_games: 32
+    eval_mcts_simulations_multiplier: 1.25
+    eval_max_moves: 320
+    eval_no_mcts_games: 50
 
-  # Entropy regularization.
-  entropy_weight: 0.0010      # Resist raw-policy over-narrowing so MCTS can still challenge top-1 priors
-  policy_target_confidence_weighting_enabled: true # Downweight flat MCTS policy targets instead of treating tiny visit differences as equally authoritative
-  policy_target_confidence_min_weight: 0.58 # Stop under-training broader but useful MCTS distributions
-  policy_target_confidence_power: 1.0       # Higher sharpens the preference for confident targets; lower is more uniform
+    eval_funnel_preliminary_games: 40
+    eval_funnel_preliminary_score_rate: 0.45
+    eval_funnel_medium_games: 60
+    eval_funnel_medium_score_rate: 0.53
+    eval_funnel_advanced_games: 80
+    eval_funnel_later_simulations_multiplier: 1.25
 
-  # Data augmentation.
-  use_augmentation: true
-  augment_horizontal_flip: true   # Mirror board horizontally
-  augment_prob: 0.5               # 50% chance per position
+    score_rate_threshold: 0.55
+    true_win_rate_threshold: 0.02
+    anchor_eval_games: 50
+    # One-sided non-inferiority guard. The point score still has to reach 50%,
+    # and its z=1.28 lower bound may be at most 3 pp below parity.
+    promotion_anchor_score_lower_bound_min: 0.47
+    early_stop_patience: 10
 
-  # ---------------------------
-  # Replay Buffer
-  # ---------------------------
-  replay_buffer_multiplier: 5     # Replay horizon in observed self-play generations; lower means less stale self-distillation
-  replay_buffer_bootstrap_positions_per_iteration: auto
-  replay_buffer_ema_alpha: 0.15   # Smooth capacity changes from observed positions/iteration
-  replay_buffer_min_size: 4096
-  replay_buffer_capacity_round_to: 256
-  replay_fp16: true              # Store replay tensors in fp16 to reduce RAM
-  replay_max_policy_targets: 28  # Stored policy support cap, aligned with target pruning
-
-  # Per-game storage cap before positions enter replay.
-  replay_dynamic_cap_enabled: true
-  replay_cap_fraction_decisive: 0.80
-  replay_cap_fraction_draw: 0.80
-  replay_cap_min_positions: 24
-  replay_cap_max_positions: 120
-
-  # Batch sampling mix.
-  replay_weighted_sampling_power: 0.55
-  replay_decisive_sampling_fraction: 0.08
-  replay_decisive_value_epsilon: 0.05
-  replay_value_balanced_sampling_fraction: 0.30
-  replay_value_balance_epsilon: 0.05
-  replay_recent_sampling_fraction: 0.06
-  replay_recent_window_fraction: 0.25
-  replay_resize_preserve_decisive_fraction: 0.15
-  replay_resize_preserve_decisive_min_count: 1024
-  replay_mcts_reanalyze_enabled: true # True reanalyze: rerun MCTS from stored FENs on a small old-replay sample
-  replay_mcts_reanalyze_every: 1
-  replay_mcts_reanalyze_model: current # Refresh stale replay with the learner that will consume the targets
-  replay_mcts_reanalyze_fraction: 0.025
-  replay_mcts_reanalyze_max_positions: 192
-  replay_mcts_reanalyze_min_age: 2
-  replay_mcts_reanalyze_simulations_multiplier: 1.0 # Match self-play search budget; 192 -> 192 sims
-  replay_mcts_reanalyze_batch_positions: 16
-  replay_mcts_reanalyze_policy_mix: 0.35 # Nudge old targets toward fresh search without overwriting replay too fast
-  replay_mcts_reanalyze_value_mix: 0.00  # Do not refresh value from search while Q/value calibration is being repaired
-  replay_mcts_reanalyze_importance_bonus: 0.00
-  replay_mcts_reanalyze_challenge_fraction: 0.0
-
-  # ---------------------------
-  # Evaluation, Diagnostics & Promotion
-  # ---------------------------
-  eval_workers: auto         # Dynamic MCTS eval workers; small evals use fewer fuller workers, large evals use all CPU
-  eval_worker_restart_limit: 2 # Respawn a crashed MCTS eval worker and replay only unfinished games
-  eval_cpu_threads_to_reserve: 0
-  eval_torch_threads: 1
-  eval_batch_games: 32       # Active MCTS eval games searched together inside each worker
-  eval_min_games_per_worker: 6 # Use more CPU during small evals while keeping central inference batches reasonably full
-  eval_central_inference_enabled: true
-  eval_central_inference_min_games: 2
-  eval_mcts_simulations_multiplier: 1.25 # Generic MCTS eval budget when a caller does not pin exact sims
-  eval_max_moves: 320        # Align eval with self-play so results are not dominated by ultra-long unresolved games
-  eval_auto_claim_draw: true
-  eval_claim_repetition_after_moves: 70
-  eval_claim_draw_after_moves: 180  # Generic claimable draws after ~70 full moves
-  eval_every: 2               # Slightly faster feedback loop while iterating toward surpassing IL
-  # Cheap diagnostics. These do not promote models.
-  eval_no_mcts_enabled: true  # Extra policy-only evaluation: no MCTS, does not affect best-model promotion
-  eval_no_mcts_every: 1       # Run the no-MCTS eval every RL iteration
-  eval_no_mcts_games: 50      # Cheap raw-policy signal every iteration without slowing RL too much
-  eval_no_mcts_use_fixed_openings: true
-
-  # Stockfish Elo after RL promotions. Uses shared elo_estimation NN/MCTS budgets.
+  # Elo reporting after promotions and at shutdown.
   stockfish_elo:
     promoted_use_mcts: true
+    promoted_mcts_every: 3          # Raw NN after every promotion; MCTS every third promotion
     final_enabled: true
     final_use_mcts: true
-    fast_promoted:
-      enabled: true
-      use_mcts: false
-      total_games: 80
-      stockfish_time_limit: 0.06
-      probe_games_per_level: 4
-      focus_games_per_level: 8
-      extra_games_per_level: 2
-      target_focus_levels: 3
 
-  # Three-stage promotion funnel. The current learner is promoted immediately
-  # after passing one strict exam; weights are never frozen across iterations.
-  eval_funnel_preliminary_games: 40
-  eval_funnel_preliminary_simulations: auto
-  eval_funnel_preliminary_simulations_multiplier: 1.0 # Phase 1 uses the same MCTS budget as self-play training
-  eval_funnel_preliminary_score_rate: 0.45 # Permissive filter: tolerate ordinary variance in a small preliminary sample
-  eval_funnel_preliminary_true_win_rate: 0.0
-  eval_funnel_preliminary_result_weight: 0.50 # Count phase 1 in the final verdict, but weaker than full-budget games
-  eval_funnel_medium_games: 60
-  eval_funnel_medium_simulations: auto
-  eval_funnel_later_simulations_multiplier: 1.25 # Phase 2/3 are stricter, but not a different 320-sim regime
-  eval_funnel_medium_score_rate: 0.53
-  eval_funnel_medium_true_win_rate: 0.02
-  eval_funnel_advanced_games: 80
-  eval_funnel_advanced_simulations: auto
-
-  # Shared MCTS eval conditions.
-  eval_fixed_openings_enabled: true
-  eval_fixed_openings_pair_games: true # Compare both colors from the same opening before moving to the next line
-  eval_fixed_openings_max_plies: 6
-
-  # Promotion gate and stability checks.
-  score_rate_threshold: 0.55    # Promote only after medium + advanced score at least 55%
-  true_win_rate_threshold: 0.02 # Also require a real decisive edge, not only draw-heavy scoring
-  promotion_reset_optimizer_state: true # Old Adam moments should not immediately push the promoted baseline away
-  promotion_playoff_enabled: true       # One good eval becomes a candidate; promotion needs a second confirmed pass
-  promotion_playoff_confirmations: 2
-  promotion_stat_gate_enabled: true     # SPRT-lite: require the lower confidence bound to clear parity
-  promotion_stat_gate_z: 1.28           # About 80% one-sided confidence; stricter than raw score, not as slow as full SPRT
-  promotion_score_lower_bound_min: 0.50
-  promotion_require_anchor_non_regression: true # A new RL best must not regress vs the original IL anchor
-  promotion_anchor_min_score_rate: 0.50
-  promotion_anchor_min_true_win_rate: 0.00
-  anchor_eval_enabled: true
-  anchor_eval_every: 1          # Run anchor eval on every RL evaluation cycle
-  anchor_eval_games: 50
-  anchor_eval_mcts_simulations: auto
-  anchor_eval_mcts_simulations_multiplier: 1.25
-  anchor_eval_use_fixed_openings: true
-
-  # Stop prolonged runs without a new useful direction.
-  early_stop_enabled: true
-  early_stop_patience: 10        # Stop RL after 10 eval cycles without meaningful improvement
-  early_stop_patience_increment_on_promotion: 2 # Give each promoted best one extra eval cycle to be surpassed
-  early_stop_min_score_improvement: 0.01   # Require at least +1pp score-rate improvement to reset patience
-  early_stop_min_true_win_improvement: 0.005 # Or at least +0.5pp true-win improvement
-  checkpoint_every: 10        # Save checkpoint every N iterations
-
-  # ---------------------------
-  # Loss Weights
-  # ---------------------------
-  policy_loss_weight: 1.0    # Policy loss weight
-  policy_anchor_kl_weight: 0.14 # Keep the IL-policy floor, but stop it from overpowering clean MCTS discoveries
-  value_loss_weight: 0.78    # Value/Q must become usable enough for deeper MCTS, not only low-loss on outcomes
-  value_aux_scalar_loss_weight: 0.15  # Small optional W-L scalar auxiliary
-  moves_left_loss_weight: 0.05        # Auxiliary SmoothL1 on log1p(remaining plies)
-  value_root_q_target_mix: 0.08       # Blend a little root MCTS Q into final-outcome value targets to reduce outcome noise
-  value_std_floor_loss_weight: 0.85   # Penalize value collapse when pred std falls far below target std
-  value_std_floor_target_ratio: 0.95  # Aim for most of the target value spread before the penalty vanishes
-  value_wdl_label_smoothing: 0.010    # Preserve calibration without encouraging overly flat WDL probabilities
-  value_metric_weight_min: 0.20
-  value_metric_max_fullmove: 80
-  value_phase_opening_max_fullmove: 12
-  value_phase_endgame_min_fullmove: 40
-  value_phase_max_fullmove: 120
-  # Value supervision: start slightly stronger, then taper once scalar calibration improves.
-  value_loss_weight_schedule:
-    start: 0.82
-    end: 0.74
-    power: 1.00
-  value_loss_weight_adaptive_enabled: true
-  value_loss_weight_adaptive_max_adjustment: 0.06
-  value_loss_weight_adaptive_smoothing: 0.40
-  value_loss_weight_q_disabled_bonus: 0.040
-  value_loss_weight_eval_stagnation_bonus: 0.015
+  # Training objective.
+  losses:
+    policy: 1.0
+    # The IL anchor remains an evaluation/promotion gate, while frozen best is the
+    # self-play guardrail. A permanent KL teacher would cap improvement past IL.
+    policy_anchor_kl: 0.00
+    value: 1.00
+    value_scalar_aux: 0.25
+    moves_left: 0.05
+    value_std_floor: 1.50
+    value_std_target_ratio: 0.95
+    wdl_label_smoothing: 0.010
 
 # ------------------------------------------------------------------------------
 # HARDWARE & OPTIMIZATION
@@ -694,20 +384,20 @@ hardware:
 # ------------------------------------------------------------------------------
 central_inference:
   enabled: true
-  servers: auto
+  servers: auto                  # Auto = one central server per available GPU; never split one GPU into competing server processes.
   auto_min_servers: 1
   auto_workers_per_server: 9
   auto_max_servers: 3
-  max_batch_size: 256
+  max_batch_size: 512             # Shared learner/best queue is split by model; 512 keeps each GPU forward closer to a full batch.
   flush_ms: 2.0
   transport_dtype: "float16"
+  use_bfloat16: false          # RTX 5060 Ti benchmark: FP16 central forward was ~9% faster; training still uses global BF16.
   timeout_s: 0
   stall_warning_s: 15
   load_timeout_s: 300
   use_compile: true
-  compile_warmup_batches: [1, 32, 128, 256]
+  compile_warmup_batches: [1, 32, 128, 256, 512]
   cudnn_benchmark: false
-  cache_enabled: false
   sync_timing: false
 
 
@@ -752,7 +442,7 @@ elo_estimation:
 
   # Adaptive ladder
   adaptive_probe_games_per_level: 5
-  adaptive_min_batch_games: 70
+  adaptive_min_batch_games: 24   # Probe in waves; do not pre-schedule the full ladder
   adaptive_focus_games_per_level: 24
   adaptive_extra_games_per_level: 5
   adaptive_target_focus_levels: 3
@@ -761,7 +451,7 @@ elo_estimation:
   adaptive_min_games_for_se_stop: 80
 
   # NN eval: shared by IL periodic checks and RL raw-network checks
-  nn_eval_workers: 2
+  nn_eval_workers: 4             # Local benchmark sweet spot; 6-12 contend on tiny NN forwards
   nn_eval_free_threads_utilization: 0.35
   nn_eval_adaptive_probe_games_per_level: 6
   nn_eval_adaptive_min_batch_games: 84
@@ -783,19 +473,13 @@ elo_estimation:
   # Model move generation
   batch_model_moves: true
   batch_raw_model_moves: false
-  elo_mcts_scout_simulations: 128
-  elo_mcts_scout_easy_top_visit_prob: 0.74
-  elo_mcts_scout_easy_visit_gap: 0.22
-  elo_mcts_scout_easy_max_entropy: 0.54
-  elo_mcts_scout_easy_min_explored_prior_mass: 0.95
-  elo_mcts_scout_easy_min_visited_moves: 6
-
   # MCTS central batching for eval_elo.py and final IL/RL Elo checks
   eval_elo_central_inference_enabled: true
-  eval_elo_central_client_groups: "auto"
-  eval_elo_central_target_active_games_per_client: 6
-  eval_elo_central_min_client_groups: 2
-  eval_elo_central_max_client_groups: 4
+  eval_elo_central_inference_servers: 1
+  eval_elo_central_inference_max_batch_size: 64
+  eval_elo_central_inference_use_compile: true
+  eval_elo_central_inference_compile_warmup_batches: [1, 8, 16]
+  eval_elo_central_client_groups: 1 # One larger MCTS batch beats multiple tiny Python clients
   eval_elo_central_games_per_worker_chunk: 6
   eval_elo_central_target_chunks_per_group: 2
   eval_elo_central_max_chunk_games: 36
@@ -817,8 +501,8 @@ debug:
   # Reinforcement Learning diagnostics
   rl:
     profile_training: false         # Iteration/self-play/train/eval timing breakdown
-    profile_mcts_detail: true       # Detailed CPU MCTS timers for data-quality/performance plots; CUDA sync stays off while profile_training=false
-    profile_mcts_sample_rate: 64     # Approximate low-overhead tensor timing sample rate for data-quality diagnostics
+    profile_mcts_detail: false      # Enable only for diagnostics: per-leaf CPU timers slow self-play.
+    profile_mcts_sample_rate: 64    # Low-overhead sampled tensor timing still feeds aggregate diagnostics.
     log_gpu_memory: false           # GPU memory usage around RL iterations
     central_inference:
       verbose: false                # Per-request/heartbeat logs; summaries still go to console, RL.csv and PNG

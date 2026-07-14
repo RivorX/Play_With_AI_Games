@@ -55,7 +55,7 @@ def _fmt_gib(num_bytes):
     return f"{(float(num_bytes) / (1024.0 ** 3)):.2f} GiB"
 
 
-def build_model_hash(config, include_version=False):
+def build_model_hash(config):
     """Build model hash used to cache auto-tuned IL hyperparameters."""
     model_cfg = dict(config.get("model", {}) or {})
 
@@ -66,9 +66,7 @@ def build_model_hash(config, include_version=False):
 
     # Exclude runtime-only fields from hash.
     model_cfg.pop("print_summary", None)
-    if not include_version:
-        # Keep cache stable across cosmetic version label changes.
-        model_cfg.pop("version", None)
+    model_cfg.pop("version", None)
     payload = json.dumps(model_cfg, sort_keys=True, ensure_ascii=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -126,18 +124,9 @@ def _normalize_runtime_profile(runtime_profile):
 
 
 def _get_auto_tune_cfg(config):
-    """Return shared auto-tune config (top-level) with legacy IL fallback."""
-    shared_cfg = config.get("auto_tune", {}) or {}
-    legacy_cfg = config.get("imitation_learning", {}).get("auto_tune", {}) or {}
-
-    if not isinstance(shared_cfg, dict):
-        shared_cfg = {}
-    if not isinstance(legacy_cfg, dict):
-        legacy_cfg = {}
-
-    merged = dict(legacy_cfg)
-    merged.update(shared_cfg)
-    return merged
+    """Return the shared top-level auto-tune config."""
+    auto_cfg = config.get("auto_tune", {}) or {}
+    return auto_cfg if isinstance(auto_cfg, dict) else {}
 
 
 def _auto_tune_enabled_for(config, target):
@@ -193,25 +182,14 @@ def _ensure_cache_entries(cache):
     return entries
 
 
-def _get_cached_entry_for_device(entries, model_hash, legacy_model_hash, device_key, context_label):
+def _get_cached_entry_for_device(entries, model_hash, device_key):
     hash_entries = entries.get(model_hash)
-    hash_key_used = model_hash
-    if not isinstance(hash_entries, dict) and legacy_model_hash:
-        legacy_entries = entries.get(legacy_model_hash)
-        if isinstance(legacy_entries, dict):
-            hash_entries = legacy_entries
-            hash_key_used = legacy_model_hash
-            print(
-                f"{context_label}: found legacy cache key "
-                "(included model.version); migrating to version-agnostic hash."
-            )
-
     cached_entry = None
     if isinstance(hash_entries, dict):
         maybe_entry = hash_entries.get(device_key)
         if isinstance(maybe_entry, dict):
             cached_entry = maybe_entry
-    return cached_entry, hash_entries, hash_key_used
+    return cached_entry
 
 
 def _read_cache_profile(entry, runtime_profile, fallback_to_eager=True):
@@ -1270,10 +1248,7 @@ def resolve_il_hyperparameters(
 
     requested_profile = _normalize_runtime_profile(runtime_profile)
 
-    model_hash = build_model_hash(config, include_version=False)
-    legacy_model_hash = build_model_hash(config, include_version=True)
-    if legacy_model_hash == model_hash:
-        legacy_model_hash = None
+    model_hash = build_model_hash(config)
 
     result = {
         "algo_version": AUTO_TUNE_ALGO_VERSION,
@@ -1343,13 +1318,8 @@ def resolve_il_hyperparameters(
     entries = _ensure_cache_entries(cache)
 
     device_key = _build_device_key(config, device)
-    cached_entry, hash_entries, hash_key_used = _get_cached_entry_for_device(
-        entries=entries,
-        model_hash=model_hash,
-        legacy_model_hash=legacy_model_hash,
-        device_key=device_key,
-        context_label="IL auto-tune",
-    )
+    cached_entry = _get_cached_entry_for_device(entries, model_hash, device_key)
+    hash_entries = entries.get(model_hash)
 
     cached_profile, cached_profile_key = _read_cache_profile(
         cached_entry,
@@ -1394,13 +1364,6 @@ def resolve_il_hyperparameters(
             f"(hash={model_hash[:12]}, batch_size={int(cached_batch)}, "
             f"lr={float(cached_lr):.6g}{profile_note})."
         )
-        if hash_key_used != model_hash and isinstance(hash_entries, dict):
-            entries[model_hash] = hash_entries
-            cache["entries"] = entries
-            try:
-                _save_cache(cache_path, cache)
-            except Exception:
-                pass
         return result
 
     probe_profile = requested_profile
@@ -1630,10 +1593,7 @@ def resolve_rl_hyperparameters(config, model, device, base_dir, runtime_profile=
         runtime_profile = "eager"
     requested_profile = _normalize_runtime_profile(runtime_profile)
 
-    model_hash = build_model_hash(config, include_version=False)
-    legacy_model_hash = build_model_hash(config, include_version=True)
-    if legacy_model_hash == model_hash:
-        legacy_model_hash = None
+    model_hash = build_model_hash(config)
 
     result = {
         "algo_version": AUTO_TUNE_ALGO_VERSION,
@@ -1667,13 +1627,7 @@ def resolve_rl_hyperparameters(config, model, device, base_dir, runtime_profile=
     cache = _load_cache(cache_path)
     entries = _ensure_cache_entries(cache)
     device_key = _build_device_key(config, device)
-    cached_entry, hash_entries, hash_key_used = _get_cached_entry_for_device(
-        entries=entries,
-        model_hash=model_hash,
-        legacy_model_hash=legacy_model_hash,
-        device_key=device_key,
-        context_label="RL auto-tune",
-    )
+    cached_entry = _get_cached_entry_for_device(entries, model_hash, device_key)
 
     cached_profile, cached_profile_key = _read_cache_profile(
         cached_entry,
@@ -1709,13 +1663,6 @@ def resolve_rl_hyperparameters(config, model, device, base_dir, runtime_profile=
             f"(hash={model_hash[:12]}, batch_size={int(cached_batch)}, "
             f"lr={float(cached_lr):.6g}{profile_note})."
         )
-        if hash_key_used != model_hash and isinstance(hash_entries, dict):
-            entries[model_hash] = hash_entries
-            cache["entries"] = entries
-            try:
-                _save_cache(cache_path, cache)
-            except Exception:
-                pass
         return result
 
     rl_cfg["batch_size"] = configured_batch

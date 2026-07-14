@@ -23,6 +23,8 @@ from src.batch_selfplay import (
     select_move_by_visits,
     _SELFPLAY_OPENING_LINES,
     _RemoteInferenceModel,
+    _board_position_key,
+    _record_position_count,
     central_inference_server,
 )
 from src.data import board_to_tensor, move_to_index
@@ -59,18 +61,7 @@ def _central_inference_config(config):
 
 def _central_inference_option(config, key, default=None):
     central_cfg = _central_inference_config(config)
-    if key in central_cfg:
-        return central_cfg[key]
-    rl_cfg = (config or {}).get("reinforcement_learning", {}) or {}
-    for prefix in (
-        "eval_central_inference_",
-        "self_play_central_inference_",
-        "central_inference_",
-    ):
-        legacy_key = f"{prefix}{key}"
-        if legacy_key in rl_cfg:
-            return rl_cfg[legacy_key]
-    return default
+    return central_cfg.get(key, default)
 
 
 def _resolve_configured_self_play_workers(rl_cfg, cpu_budget):
@@ -122,78 +113,23 @@ def _resolve_eval_workers(config, device, num_games):
     except Exception:
         workers = 1
 
-    if auto_workers and _eval_uses_central_inference(config, device):
-        try:
-            min_games_per_worker = max(1, int(rl_cfg.get("eval_min_games_per_worker", 1) or 1))
-        except Exception:
-            min_games_per_worker = 1
-        if min_games_per_worker > 1:
-            workers = min(workers, max(1, int(np.ceil(float(num_games) / float(min_games_per_worker)))))
-
+    # Keep one stable topology across every funnel stage. Scaling workers down
+    # from the stage's game count made 40/60/80-game evals use 7/10/12 workers,
+    # forcing different batching behavior and making stage timings incomparable.
     return max(1, min(int(num_games), workers))
 
 
-def _build_eval_central_server_config(config):
-    """Project shared central inference knobs onto the RL server implementation keys."""
-    server_config = dict(config)
-    rl_cfg = dict(config.get("reinforcement_learning", {}))
-    shared_to_server = {
-        "flush_ms": "self_play_central_inference_flush_ms",
-        "max_batch_size": "self_play_central_inference_max_batch_size",
-        "transport_dtype": "self_play_central_inference_transport_dtype",
-        "use_compile": "self_play_central_inference_use_compile",
-        "compile_warmup_batches": "self_play_central_inference_compile_warmup_batches",
-        "cudnn_benchmark": "self_play_central_inference_cudnn_benchmark",
-        "cache_enabled": "self_play_central_inference_cache_enabled",
-        "cache_entries": "self_play_central_inference_cache_entries",
-        "sync_timing": "self_play_central_inference_sync_timing",
-        "timeout_s": "self_play_central_inference_timeout_s",
-        "stall_warning_s": "self_play_central_inference_stall_warning_s",
-    }
-    for shared_key, server_key in shared_to_server.items():
-        value = _central_inference_option(config, shared_key, None)
-        if value is not None:
-            rl_cfg[server_key] = value
-    server_config["reinforcement_learning"] = rl_cfg
-    return server_config
-
-
 def _build_eval_mcts_config(config):
-    """Build deterministic full-budget eval MCTS settings."""
-    eval_config = dict(config)
-    rl_cfg = dict(config.get("reinforcement_learning", {}))
-    eval_simulations = max(1, int(rl_cfg.get("mcts_simulations", 1) or 1))
-    rl_cfg["mcts_scout_simulations"] = eval_simulations
-    rl_cfg["mcts_scout_challenge_fraction"] = 0.0
-    eval_config["reinforcement_learning"] = rl_cfg
-    return eval_config
+    """Evaluation uses the same deterministic fixed-budget MCTS contract."""
+    return config
 
 
 def _resolve_eval_central_server_count(config, workers):
-    raw_value = _central_inference_option(config, "servers", "auto")
-    if str(raw_value).strip().lower() not in {"auto", "automatic"}:
-        try:
-            return max(1, int(raw_value))
-        except Exception:
-            return 1
-
-    workers = max(1, int(workers))
-    target_workers = max(3, int(_central_inference_option(config, "auto_workers_per_server", 6) or 6))
-    min_servers = max(1, int(_central_inference_option(config, "auto_min_servers", 1) or 1))
-    max_servers = max(min_servers, int(_central_inference_option(config, "auto_max_servers", 3) or 3))
-    by_workers = max(1, (workers + target_workers - 1) // target_workers)
-    by_vram = max_servers
-    try:
-        total_gib = float(torch.cuda.get_device_properties(0).total_memory) / float(1024 ** 3)
-        if total_gib < 10.0:
-            by_vram = 1
-        elif total_gib < 14.0:
-            by_vram = min(by_vram, 2)
-        elif total_gib < 24.0:
-            by_vram = min(by_vram, 3)
-    except Exception:
-        by_vram = min(by_vram, 2)
-    return max(1, min(max(min_servers, by_workers), max_servers, by_vram))
+    """Eval targets one concrete CUDA device, so it always owns one server."""
+    # More processes on cuda:0 do not add GPU capacity. They duplicate models,
+    # split request batches, consume VRAM and compete for the same kernels.
+    # Worker count controls CPU-side MCTS concurrency; the GPU stays centralized.
+    return 1
 
 
 def _resolve_eval_batch_games(config, num_games):
@@ -297,9 +233,11 @@ def _build_eval_stats(wins, draws, losses, unresolved, num_games):
         "losses": losses,
         "unresolved": unresolved,
         "num_games": num_games,
-        "score_rate": (wins + 0.5 * draws) / num_games if num_games > 0 else 0.0,
+        # A ply-cap timeout has no chess result. Score it neutrally instead of
+        # silently charging the candidate with a loss.
+        "score_rate": (wins + 0.5 * (draws + unresolved)) / num_games if num_games > 0 else 0.0,
         "win_rate": wins / num_games if num_games > 0 else 0.0,
-        "draw_rate": draws / num_games if num_games > 0 else 0.0,
+        "draw_rate": (draws + unresolved) / num_games if num_games > 0 else 0.0,
         "loss_rate": losses / num_games if num_games > 0 else 0.0,
         "resolved_games": num_games - unresolved,
     }
@@ -310,7 +248,7 @@ def _print_eval_unresolved(label, unresolved, num_games, max_moves):
         return
     print(
         f"{label} unresolved at ply cap ({max_moves}, ~{max_moves / 2.0:.1f} full moves): "
-        f"{unresolved}/{num_games} -> excluded from draw count"
+        f"{unresolved}/{num_games} -> scored as 0.5 and tracked separately"
     )
 
 
@@ -360,7 +298,13 @@ def _append_eval_history(board_history, board, config):
         del board_history[:-max_history]
 
 
-def _apply_opening_prefix_for_batched_eval(board, board_history, opening_prefix, config):
+def _apply_opening_prefix_for_batched_eval(
+    board,
+    board_history,
+    opening_prefix,
+    config,
+    position_counts=None,
+):
     if not opening_prefix:
         return 0
 
@@ -377,6 +321,8 @@ def _apply_opening_prefix_for_batched_eval(board, board_history, opening_prefix,
 
         _append_eval_history(board_history, board, config)
         board.push(move)
+        if position_counts is not None:
+            _record_position_count(position_counts, board)
         applied += 1
     return applied
 
@@ -607,12 +553,20 @@ def _evaluate_games_batched(
     def _new_game_state(game_idx):
         board = chess.Board()
         board_history = []
+        position_counts = {_board_position_key(board): 1}
         opening_prefix = _get_eval_opening_prefix(config, game_idx, enabled_override=use_fixed_openings)
-        move_count = _apply_opening_prefix_for_batched_eval(board, board_history, opening_prefix, config)
+        move_count = _apply_opening_prefix_for_batched_eval(
+            board,
+            board_history,
+            opening_prefix,
+            config,
+            position_counts,
+        )
         return {
             "game_idx": int(game_idx),
             "board": board,
             "board_history": board_history,
+            "position_counts": position_counts,
             "move_count": int(move_count),
             "model1_as_white": bool(int(game_idx) % 2 == 0),
             "model1_root": None,
@@ -710,6 +664,7 @@ def _evaluate_games_batched(
                     bool(gs.get(synced_key, False)),
                     gs["board_history"],
                     int(gs.get("move_count", 0) or 0),
+                    gs.get("position_counts"),
                 ])
             visit_counts_group = mcts.search_many(
                 group_states,
@@ -740,6 +695,7 @@ def _evaluate_games_batched(
             gs["model2_root"], gs["model2_synced"] = _advance_eval_root(gs.get("model2_root"), move)
             board.push(move)
             gs["move_count"] += 1
+            _record_position_count(gs["position_counts"], board)
 
             if (
                 board.is_game_over(claim_draw=False)
@@ -757,7 +713,14 @@ def _evaluate_games_batched(
         active_games = next_active
         _fill_active()
 
-    return _build_eval_stats(wins, draws, losses, unresolved, len(game_indices))
+    stats = _build_eval_stats(wins, draws, losses, unresolved, len(game_indices))
+    profile = {}
+    for mcts in (mcts1, mcts2):
+        for key, value in dict(mcts.get_profile_stats() or {}).items():
+            if isinstance(value, (int, float)):
+                profile[key] = profile.get(key, 0) + value
+    stats["profile"] = profile
+    return stats
 
 
 def _result_for_model1(model1_as_white, result):
@@ -831,6 +794,7 @@ def _eval_worker(
                 "draws": int(stats.get("draws", 0)),
                 "losses": int(stats.get("losses", 0)),
                 "unresolved": int(stats.get("unresolved", 0)),
+                "profile": dict(stats.get("profile", {}) or {}),
             }
         )
     except KeyboardInterrupt:
@@ -913,6 +877,7 @@ def _eval_central_worker(
                 "draws": int(stats.get("draws", 0)),
                 "losses": int(stats.get("losses", 0)),
                 "unresolved": int(stats.get("unresolved", 0)),
+                "profile": dict(stats.get("profile", {}) or {}),
             }
         )
     except KeyboardInterrupt:
@@ -921,60 +886,64 @@ def _eval_central_worker(
         result_queue.put({"type": "error", "rank": rank, "error": str(exc)})
 
 
-def _evaluate_models_with_central_inference(
-    model1,
-    model2,
-    config,
-    device,
-    num_games,
-    game_index_offset=0,
-    use_fixed_openings=None,
-    model1_mcts_config=None,
-    model2_mcts_config=None,
-    progress_desc="Eval vs best",
-):
+def _close_eval_central_runtime(runtime):
+    if not runtime or runtime.get("closed"):
+        return
+    runtime["closed"] = True
+    request_queues = list(runtime.get("request_queues", []) or [])
+    for request_queue in request_queues:
+        with contextlib.suppress(Exception):
+            request_queue.put({"cmd": "stop"})
+    _terminate_eval_processes(runtime.get("server_processes", []), timeout_s=1.0)
+    for queue_obj in request_queues + list(runtime.get("control_queues", []) or []):
+        with contextlib.suppress(Exception):
+            queue_obj.close()
+    for recv_conn in dict(runtime.get("worker_response_receivers", {}) or {}).values():
+        with contextlib.suppress(Exception):
+            recv_conn.close()
+    for sender_map in list(runtime.get("server_response_senders", []) or []):
+        for send_conn in dict(sender_map or {}).values():
+            with contextlib.suppress(Exception):
+                send_conn.close()
+
+
+def _start_eval_central_runtime(model1, model2, config, device, num_games):
+    """Start one reusable GPU inference server for all stages of an eval funnel."""
     workers = _resolve_eval_workers(config, device, num_games)
     server_count = _resolve_eval_central_server_count(config, workers)
-    rl_cfg = config.get("reinforcement_learning", {})
-    server_config = _build_eval_central_server_config(config)
-    max_moves = _resolve_eval_max_moves(config)
     ctx = mp.get_context("spawn")
-
-    result_queue = ctx.Queue()
     request_queues = [ctx.Queue() for _ in range(server_count)]
     control_queues = [ctx.Queue() for _ in range(server_count)]
     server_response_senders = [dict() for _ in range(server_count)]
     worker_response_receivers = {}
     worker_server_idx = {}
-
-    game_indices_per_worker = [[] for _ in range(workers)]
-    for offset, game_idx in enumerate(range(game_index_offset, game_index_offset + num_games)):
-        game_indices_per_worker[offset % workers].append(game_idx)
-
-    active_worker_ranks = [
-        rank for rank, game_indices in enumerate(game_indices_per_worker)
-        if game_indices
-    ]
-    for rank in active_worker_ranks:
+    for rank in range(workers):
         server_idx = int(rank) % int(server_count)
         recv_conn, send_conn = ctx.Pipe(duplex=False)
         worker_response_receivers[rank] = recv_conn
         server_response_senders[server_idx][rank] = send_conn
         worker_server_idx[rank] = server_idx
 
-    model1_state = _snapshot_state_dict_cpu_shared(model1)
-    model2_state = _snapshot_state_dict_cpu_shared(model2)
-
-    server_processes = []
-    worker_processes = []
-    task_id = f"eval_{os.getpid()}_{id(model1)}_{game_index_offset}_{num_games}"
+    runtime = {
+        "ctx": ctx,
+        "workers": workers,
+        "server_count": server_count,
+        "request_queues": request_queues,
+        "control_queues": control_queues,
+        "server_response_senders": server_response_senders,
+        "worker_response_receivers": worker_response_receivers,
+        "worker_server_idx": worker_server_idx,
+        "server_processes": [],
+        "closed": False,
+        "stage_count": 0,
+    }
     try:
         for server_idx in range(server_count):
             proc = ctx.Process(
                 target=central_inference_server,
                 args=(
-                    server_config,
-                    0,
+                    config,
+                    int(device.index or 0) if device.type == "cuda" else 0,
                     request_queues[server_idx],
                     server_response_senders[server_idx],
                     control_queues[server_idx],
@@ -983,9 +952,11 @@ def _evaluate_models_with_central_inference(
             )
             proc.daemon = True
             proc.start()
-            server_processes.append(proc)
+            runtime["server_processes"].append(proc)
 
-        load_timeout_s = float(_central_inference_option(config, "load_timeout_s", 300) or 300)
+        task_id = f"eval_runtime_{os.getpid()}_{id(model1)}_{id(model2)}"
+        model1_state = _snapshot_state_dict_cpu_shared(model1)
+        model2_state = _snapshot_state_dict_cpu_shared(model2)
         for request_queue in request_queues:
             request_queue.put({
                 "cmd": "load_models",
@@ -996,7 +967,9 @@ def _evaluate_models_with_central_inference(
                     {"label": "eval_model2", "state": model2_state, "state_path": None},
                 ],
             })
+
         import time
+        load_timeout_s = float(_central_inference_option(config, "load_timeout_s", 300) or 300)
         deadline = time.time() + max(1.0, load_timeout_s)
         pending_servers = set(range(server_count))
         load_messages = []
@@ -1029,17 +1002,77 @@ def _evaluate_models_with_central_inference(
             for message in load_messages
             if message.get("pid") is not None
         )
-        load_summary = f", {model_summary}"
-        if load_times:
-            load_summary += f", load={max(load_times):.2f}s"
-        if pid_summary:
-            load_summary += f", pids={pid_summary}"
+        runtime["model_summary"] = model_summary
+        runtime["load_s"] = max(load_times) if load_times else 0.0
+        runtime["pid_summary"] = pid_summary
         print(
-            "Eval central inference: "
+            "Eval inference runtime: "
+            f"workers={workers}, servers={server_count}, {model_summary}, "
+            f"load={runtime['load_s']:.2f}s, pid={pid_summary or '-'}"
+        )
+        return runtime
+    except Exception:
+        _close_eval_central_runtime(runtime)
+        raise
+
+
+@contextlib.contextmanager
+def eval_central_inference_runtime(model1, model2, config, device, num_games):
+    """Reuse compiled models and one GPU server across sequential eval stages."""
+    if not _eval_uses_central_inference(config, device):
+        yield None
+        return
+    runtime = _start_eval_central_runtime(model1, model2, config, device, num_games)
+    try:
+        yield runtime
+    finally:
+        _close_eval_central_runtime(runtime)
+
+
+def _evaluate_models_with_central_inference(
+    model1,
+    model2,
+    config,
+    device,
+    num_games,
+    game_index_offset=0,
+    use_fixed_openings=None,
+    model1_mcts_config=None,
+    model2_mcts_config=None,
+    progress_desc="Eval vs best",
+    central_runtime=None,
+):
+    owns_runtime = central_runtime is None
+    runtime = central_runtime or _start_eval_central_runtime(model1, model2, config, device, num_games)
+    workers = max(1, min(int(num_games), int(runtime["workers"])))
+    server_count = int(runtime["server_count"])
+    rl_cfg = config.get("reinforcement_learning", {})
+    max_moves = _resolve_eval_max_moves(config)
+    ctx = runtime["ctx"]
+
+    result_queue = ctx.Queue()
+    request_queues = runtime["request_queues"]
+    worker_response_receivers = runtime["worker_response_receivers"]
+    worker_server_idx = runtime["worker_server_idx"]
+    server_processes = runtime["server_processes"]
+
+    game_indices_per_worker = [[] for _ in range(workers)]
+    for offset, game_idx in enumerate(range(game_index_offset, game_index_offset + num_games)):
+        game_indices_per_worker[offset % workers].append(game_idx)
+
+    active_worker_ranks = [
+        rank for rank, game_indices in enumerate(game_indices_per_worker)
+        if game_indices
+    ]
+    worker_processes = []
+    try:
+        runtime["stage_count"] = int(runtime.get("stage_count", 0)) + 1
+        print(
+            "Eval stage: "
             f"workers={len(active_worker_ranks)}, servers={server_count}, "
             f"batch_games={_resolve_eval_batch_games(config, num_games)}, "
-            f"sims={_resolve_eval_mcts_simulations(config)}"
-            f"{load_summary}"
+            f"sims={_resolve_eval_mcts_simulations(config)}, "
+            f"server={'new' if owns_runtime else 'reused'}"
         )
 
         worker_processes_by_rank = {}
@@ -1086,6 +1119,7 @@ def _evaluate_models_with_central_inference(
         unresolved = 0
         completed = 0
         finished_worker_ranks = set()
+        eval_profile = {}
         eval_bar = tqdm(total=num_games, desc=progress_desc, unit="game")
         worker_error = None
         try:
@@ -1175,6 +1209,9 @@ def _evaluate_models_with_central_inference(
                         eval_bar.refresh()
                 elif message_type == "result":
                     rank = int(message.get("rank", -1))
+                    for key, value in dict(message.get("profile", {}) or {}).items():
+                        if isinstance(value, (int, float)):
+                            eval_profile[key] = eval_profile.get(key, 0) + value
                     finished_worker_ranks.add(rank)
                 elif message_type == "interrupt":
                     raise KeyboardInterrupt
@@ -1216,23 +1253,42 @@ def _evaluate_models_with_central_inference(
             raise RuntimeError(f"Eval worker failed: {worker_error}")
         if unresolved > 0:
             _print_eval_unresolved("Eval", unresolved, num_games, max_moves)
-        return _build_eval_stats(wins, draws, losses, unresolved, num_games)
+        stats = _build_eval_stats(wins, draws, losses, unresolved, num_games)
+        stats["profile"] = eval_profile
+        requests = int(eval_profile.get("central_inference_requests", 0) or 0)
+        if requests > 0:
+            remote_ms = 1000.0 * float(
+                eval_profile.get("central_inference_remote_wait_time", 0.0) or 0.0
+            ) / requests
+            queue_ms = 1000.0 * float(
+                eval_profile.get("central_inference_server_queue_wait_time", 0.0) or 0.0
+            ) / requests
+            service_ms = 1000.0 * float(
+                eval_profile.get("central_inference_server_total_time", 0.0) or 0.0
+            ) / requests
+            forward_ms = 1000.0 * float(
+                eval_profile.get("central_inference_server_forward_time", 0.0) or 0.0
+            ) / requests
+            server_batch = float(
+                eval_profile.get("central_inference_server_batch_items", 0.0) or 0.0
+            ) / requests
+            search_time = float(eval_profile.get("search_many_time", 0.0) or 0.0)
+            inference_wait = float(eval_profile.get("nn_inference_time", 0.0) or 0.0)
+            wait_share = inference_wait / search_time if search_time > 0.0 else 0.0
+            print(
+                "Eval pipeline: "
+                f"batch={server_batch:.1f} | response={remote_ms:.2f}ms "
+                f"(queue/IPC={queue_ms:.2f}ms, server GPU+copies={service_ms:.2f}ms, "
+                f"forward async={forward_ms:.2f}ms) | "
+                f"MCTS waiting for inference={wait_share:.0%}"
+            )
+        return stats
     finally:
         _terminate_eval_processes(worker_processes)
-        for request_queue in request_queues:
-            with contextlib.suppress(Exception):
-                request_queue.put({"cmd": "stop"})
-        _terminate_eval_processes(server_processes, timeout_s=1.0)
-        for queue_obj in list(request_queues) + list(control_queues) + [result_queue]:
-            with contextlib.suppress(Exception):
-                queue_obj.close()
-        for recv_conn in worker_response_receivers.values():
-            with contextlib.suppress(Exception):
-                recv_conn.close()
-        for sender_map in server_response_senders:
-            for send_conn in sender_map.values():
-                with contextlib.suppress(Exception):
-                    send_conn.close()
+        with contextlib.suppress(Exception):
+            result_queue.close()
+        if owns_runtime:
+            _close_eval_central_runtime(runtime)
 
 
 def _get_hflip_inverse_index_map():
@@ -1259,35 +1315,88 @@ def _get_hflip_forward_index_map():
     return _HFLIP_FWD_INDEX_MAP
 
 
-def _maybe_augment_batch(boards, policy_indices, policy_values, policy_mask, config):
+def _horizontal_flip_eligible_mask(boards):
+    """Return rows where file mirroring is an exact chess symmetry.
+
+    Castling is asymmetric around the a<->h reflection (the king starts on the
+    e-file, not on the centre line).  Plane 12 in every 16-plane history frame
+    marks castling rights, so exclude any row where that state is visible.
+    """
+    if boards.dim() != 4 or int(boards.size(1)) < 16:
+        return torch.ones(int(boards.size(0)), dtype=torch.bool, device=boards.device)
+    castling_planes = boards[:, 12::16]
+    has_castling_rights = castling_planes.abs().flatten(1).amax(dim=1) > 0
+    return ~has_castling_rights
+
+
+def _maybe_augment_batch(
+    boards,
+    policy_indices,
+    policy_values,
+    policy_mask,
+    legal_indices,
+    legal_mask,
+    config,
+):
     rl_cfg = config.get("reinforcement_learning", {})
     if not rl_cfg.get("use_augmentation", False):
-        return boards, policy_indices, policy_values, policy_mask
+        return boards, policy_indices, policy_values, policy_mask, legal_indices, legal_mask
     if not rl_cfg.get("augment_horizontal_flip", False):
-        return boards, policy_indices, policy_values, policy_mask
+        return boards, policy_indices, policy_values, policy_mask, legal_indices, legal_mask
 
     prob = rl_cfg.get("augment_prob", 0.5)
     if prob <= 0:
-        return boards, policy_indices, policy_values, policy_mask
+        return boards, policy_indices, policy_values, policy_mask, legal_indices, legal_mask
 
     batch_size = boards.size(0)
     if batch_size == 0:
-        return boards, policy_indices, policy_values, policy_mask
+        return boards, policy_indices, policy_values, policy_mask, legal_indices, legal_mask
 
-    flip_mask = torch.rand(batch_size) < prob
+    flip_mask = (
+        torch.rand(batch_size, device=boards.device) < prob
+    ) & _horizontal_flip_eligible_mask(boards)
     if not flip_mask.any():
-        return boards, policy_indices, policy_values, policy_mask
+        return boards, policy_indices, policy_values, policy_mask, legal_indices, legal_mask
 
     boards[flip_mask] = torch.flip(boards[flip_mask], dims=[3])
 
     if policy_indices.numel() > 0:
-        forward_map = _get_hflip_forward_index_map()
-        active = flip_mask.unsqueeze(1) & policy_mask
+        forward_map = _get_hflip_forward_index_map().to(device=policy_indices.device)
+        active = (
+            flip_mask.unsqueeze(1)
+            & policy_mask
+            & (policy_indices >= 0)
+            & (policy_indices < int(ACTION_SIZE))
+        )
         if active.any():
             remapped = forward_map[policy_indices[active].long()].to(dtype=policy_indices.dtype)
             policy_indices[active] = remapped
 
-    return boards, policy_indices, policy_values, policy_mask
+        # Older replay rows use policy support as their legal support and may
+        # therefore alias the same tensor.  Do not mirror shared storage twice.
+        shares_policy_storage = (
+            legal_indices is policy_indices
+            or (
+                legal_indices is not None
+                and legal_indices.numel() > 0
+                and policy_indices.numel() > 0
+                and legal_indices.data_ptr() == policy_indices.data_ptr()
+            )
+        )
+        if legal_indices is not None and legal_indices.numel() > 0 and not shares_policy_storage:
+            active_legal = (
+                flip_mask.unsqueeze(1)
+                & legal_mask
+                & (legal_indices >= 0)
+                & (legal_indices < int(ACTION_SIZE))
+            )
+            if active_legal.any():
+                remapped_legal = forward_map[legal_indices[active_legal].long()].to(
+                    dtype=legal_indices.dtype
+                )
+                legal_indices[active_legal] = remapped_legal
+
+    return boards, policy_indices, policy_values, policy_mask, legal_indices, legal_mask
 
 
 def _final_outcome_targets(value_targets, epsilon=1e-6):
@@ -1362,6 +1471,22 @@ def _legal_only_sparse_policy_loss(
     return -(legal_targets * legal_log_probs).sum(dim=1).to(dtype=policy_logits.dtype)
 
 
+def _legal_only_log_probs(policy_logits, legal_indices, legal_mask):
+    """Normalize policy logits over each position's legal action set."""
+    num_classes = int(policy_logits.size(1))
+    safe_legal_indices = legal_indices.long().clamp(0, num_classes - 1)
+    valid_legal_mask = legal_mask & (legal_indices >= 0) & (legal_indices < num_classes)
+    legal_logits = torch.gather(policy_logits.float(), 1, safe_legal_indices)
+    legal_logits = legal_logits.masked_fill(~valid_legal_mask, -1.0e9)
+    legal_log_probs = F.log_softmax(legal_logits, dim=1)
+    legal_log_probs = torch.where(
+        valid_legal_mask,
+        legal_log_probs,
+        torch.zeros_like(legal_log_probs),
+    )
+    return legal_log_probs, valid_legal_mask, safe_legal_indices
+
+
 def _weighted_mean(losses, weights):
     weights = torch.clamp(weights.to(dtype=losses.dtype), min=0.0)
     weight_total = weights.sum()
@@ -1381,9 +1506,6 @@ def train_on_batch_rl(
     value_weight_override=None,
     policy_weight_override=None,
     anchor_model=None,
-    best_model_anchor=None,
-    best_policy_kl_weight_override=None,
-    best_value_distill_weight_override=None,
 ):
     if len(batch) >= 10:
         boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask = batch[:10]
@@ -1408,8 +1530,14 @@ def train_on_batch_rl(
         value_targets = value_targets.float()
         moves_left_targets = moves_left_targets.float()
 
-    boards, policy_indices, policy_values, policy_mask = _maybe_augment_batch(
-        boards, policy_indices, policy_values, policy_mask, config
+    boards, policy_indices, policy_values, policy_mask, legal_indices, legal_mask = _maybe_augment_batch(
+        boards,
+        policy_indices,
+        policy_values,
+        policy_mask,
+        legal_indices,
+        legal_mask,
+        config,
     )
     boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
     policy_indices = policy_indices.to(device, non_blocking=True)
@@ -1421,7 +1549,6 @@ def train_on_batch_rl(
     policy_sample_weights = policy_sample_weights.to(device, non_blocking=True)
     value_sample_weights = value_sample_weights.to(device, non_blocking=True)
     moves_left_targets = moves_left_targets.to(device, non_blocking=True)
-    value_sample_weights = torch.ones_like(value_sample_weights, dtype=torch.float32, device=device)
     effective_policy_mask = policy_mask & (policy_sample_weights.unsqueeze(1) > 0)
 
     optimizer.zero_grad(set_to_none=True)
@@ -1446,23 +1573,6 @@ def train_on_batch_rl(
         0.0,
         float(rl_cfg.get("policy_anchor_kl_weight", 0.0)),
     )
-    best_policy_kl_weight = max(
-        0.0,
-        float(
-            rl_cfg.get("post_promotion_best_policy_kl_weight", 0.0)
-            if best_policy_kl_weight_override is None
-            else best_policy_kl_weight_override
-        ),
-    )
-    best_value_distill_weight = max(
-        0.0,
-        float(
-            rl_cfg.get("post_promotion_best_value_distill_weight", 0.0)
-            if best_value_distill_weight_override is None
-            else best_value_distill_weight_override
-        ),
-    )
-
     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
         policy_logits, value_pred, moves_left_pred = model(
             boards,
@@ -1470,28 +1580,33 @@ def train_on_batch_rl(
             return_moves_left=True,
         )
         policy_pred = F.log_softmax(policy_logits.float(), dim=1)
+        legal_policy_log_probs, valid_legal_mask, safe_legal_indices = _legal_only_log_probs(
+            policy_logits,
+            legal_indices,
+            legal_mask,
+        )
         policy_anchor_kl_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
-        best_policy_kl_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
-        best_value_distill_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
-        best_policy_pred = None
-        best_value_pred = None
         if anchor_model is not None and policy_anchor_kl_weight > 0.0:
             with torch.no_grad():
                 anchor_policy_pred, _anchor_value_pred = anchor_model(boards)
-            anchor_policy_probs = torch.exp(anchor_policy_pred.detach())
-            policy_anchor_kl_loss = (
-                anchor_policy_probs * (anchor_policy_pred.detach() - policy_pred)
-            ).sum(dim=1).mean()
-        if best_model_anchor is not None and (
-            best_policy_kl_weight > 0.0 or best_value_distill_weight > 0.0
-        ):
-            with torch.no_grad():
-                best_policy_pred, best_value_pred = best_model_anchor(boards)
-            if best_policy_kl_weight > 0.0:
-                best_policy_probs = torch.exp(best_policy_pred.detach())
-                best_policy_kl_loss = (
-                    best_policy_probs * (best_policy_pred.detach() - policy_pred)
-                ).sum(dim=1).mean()
+                anchor_legal_logits = torch.gather(
+                    anchor_policy_pred.detach().float(),
+                    1,
+                    safe_legal_indices,
+                ).masked_fill(~valid_legal_mask, -1.0e9)
+                anchor_legal_log_probs = F.log_softmax(anchor_legal_logits, dim=1)
+                anchor_legal_log_probs = torch.where(
+                    valid_legal_mask,
+                    anchor_legal_log_probs,
+                    torch.zeros_like(anchor_legal_log_probs),
+                )
+            anchor_legal_probs = torch.exp(anchor_legal_log_probs) * valid_legal_mask
+            legal_kl_per_row = (
+                anchor_legal_probs * (anchor_legal_log_probs - legal_policy_log_probs)
+            ).sum(dim=1)
+            rows_with_legal_moves = valid_legal_mask.any(dim=1)
+            if rows_with_legal_moves.any():
+                policy_anchor_kl_loss = legal_kl_per_row[rows_with_legal_moves].mean()
         value_pred_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
         target_value_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
         value_std_floor_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
@@ -1567,21 +1682,6 @@ def train_on_batch_rl(
                 target_std_floor = target_value_std.detach().to(dtype=value_scalar_std.dtype) * value_std_floor_target_ratio
                 std_shortfall = torch.relu(target_std_floor - value_scalar_std)
                 value_std_floor_loss = std_shortfall * std_shortfall
-            if best_value_pred is not None and best_value_distill_weight > 0.0:
-                if best_value_pred.dim() == 2 and best_value_pred.size(1) == 3:
-                    best_value_probs = torch.softmax(best_value_pred.detach(), dim=1)
-                    best_value_scalar = best_value_probs[:, 0] - best_value_probs[:, 2]
-                else:
-                    best_value_scalar = best_value_pred.detach().squeeze()
-                best_value_distill_loss = _weighted_mean(
-                    F.smooth_l1_loss(
-                        value_scalar,
-                        best_value_scalar.to(dtype=value_scalar.dtype),
-                        reduction="none",
-                        beta=0.20,
-                    ),
-                    effective_value_sample_weights,
-                )
         else:
             value_loss = (value_pred.squeeze() - target_scalar) ** 2
             value_scalar = value_pred.squeeze()
@@ -1591,21 +1691,6 @@ def train_on_batch_rl(
                 target_std_floor = target_value_std.detach().to(dtype=value_scalar_std.dtype) * value_std_floor_target_ratio
                 std_shortfall = torch.relu(target_std_floor - value_scalar_std)
                 value_std_floor_loss = std_shortfall * std_shortfall
-            if best_value_pred is not None and best_value_distill_weight > 0.0:
-                if best_value_pred.dim() == 2 and best_value_pred.size(1) == 3:
-                    best_value_probs = torch.softmax(best_value_pred.detach(), dim=1)
-                    best_value_scalar = best_value_probs[:, 0] - best_value_probs[:, 2]
-                else:
-                    best_value_scalar = best_value_pred.detach().squeeze()
-                best_value_distill_loss = _weighted_mean(
-                    F.smooth_l1_loss(
-                        value_scalar,
-                        best_value_scalar.to(dtype=value_scalar.dtype),
-                        reduction="none",
-                        beta=0.20,
-                    ),
-                    effective_value_sample_weights,
-                )
 
         if policy_loss.numel() == 0:
             policy_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
@@ -1639,12 +1724,18 @@ def train_on_batch_rl(
             + moves_left_loss_weight * moves_left_loss
             + value_std_floor_loss_weight * value_std_floor_loss
             + policy_anchor_kl_weight * policy_anchor_kl_loss
-            + best_policy_kl_weight * best_policy_kl_loss
-            + best_value_distill_weight * best_value_distill_loss
         )
 
-        policy_probs = torch.exp(policy_pred)
-        policy_entropy = -(policy_probs * policy_pred).sum(dim=1).mean()
+        legal_policy_probs = torch.exp(legal_policy_log_probs) * valid_legal_mask
+        legal_entropy_per_row = -(
+            legal_policy_probs * legal_policy_log_probs
+        ).sum(dim=1)
+        rows_with_legal_moves = valid_legal_mask.any(dim=1)
+        policy_entropy = (
+            legal_entropy_per_row[rows_with_legal_moves].mean()
+            if rows_with_legal_moves.any()
+            else torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        )
         entropy_weight = config["reinforcement_learning"].get("entropy_weight", 0.0)
         if entropy_weight > 0:
             loss = loss - entropy_weight * policy_entropy
@@ -1708,6 +1799,7 @@ def evaluate_models(
     model1_mcts_config=None,
     model2_mcts_config=None,
     progress_desc="Eval vs best",
+    central_runtime=None,
 ):
     config = _build_eval_mcts_config(config)
     model1_mcts_config = _build_eval_mcts_config(model1_mcts_config or config)
@@ -1726,6 +1818,7 @@ def evaluate_models(
             model1_mcts_config=model1_mcts_config,
             model2_mcts_config=model2_mcts_config,
             progress_desc=progress_desc,
+            central_runtime=central_runtime,
         )
 
     workers = _resolve_eval_workers(config, device, num_games)

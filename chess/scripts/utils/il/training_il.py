@@ -107,6 +107,12 @@ def _maybe_augment_il_batch(boards, moves, policy_indices, config):
         return boards, moves, policy_indices
 
     flip_mask = torch.rand(boards.size(0), device=boards.device) < probability
+    if boards.dim() == 4 and int(boards.size(1)) >= 16:
+        # File mirroring is not an exact symmetry while castling rights are
+        # present: the king starts on the e-file rather than on the centre line.
+        castling_planes = boards[:, 12::16]
+        has_castling_rights = castling_planes.abs().flatten(1).amax(dim=1) > 0
+        flip_mask &= ~has_castling_rights
     if not bool(flip_mask.any()):
         return boards, moves, policy_indices
 

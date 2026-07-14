@@ -12,9 +12,9 @@ from utils.shared.model_catalog import (
 
 
 def _print_block_title(title):
-    line = "=" * 92
+    line = "=" * 76
     print(f"\n{line}")
-    print(title)
+    print(f" {title}")
     print(line)
 
 
@@ -164,13 +164,13 @@ def _choose_start_mode(has_checkpoints, default_choice="2", default_hint=None):
         print("No checkpoints found. Starting new RL training.")
         return "new"
 
-    _print_block_title("RL Startup")
-    print("1) New RL training (init from best IL if available)")
-    print("2) Resume full state (model + optimizer/scaler)")
-    print("3) Transfer matching weights only")
+    _print_block_title("RL STARTUP | choose how to initialize the learner")
+    print(" [1] NEW       fresh RL run; initialize from the best IL checkpoint")
+    print(" [2] RESUME    continue model, optimizer, scaler and iteration counter")
+    print(" [3] TRANSFER  copy compatible weights; reset optimizer and schedule")
 
     if default_hint:
-        print(default_hint)
+        print(f"\n Recommended: [{default_choice}]  {default_hint}")
 
     mapping = {
         "1": "new",
@@ -183,7 +183,7 @@ def _choose_start_mode(has_checkpoints, default_choice="2", default_hint=None):
 
     while True:
         try:
-            choice = input(f"Choose [1/2/3] (default {default_choice}): ").strip().lower()
+            choice = input(f"\n Start mode [1/2/3, Enter={default_choice}]: ").strip().lower()
         except EOFError:
             choice = default_choice
         if not choice:
@@ -199,14 +199,12 @@ def _choose_new_init_mode(has_default_init, has_checkpoints):
     if not has_checkpoints:
         return "default" if has_default_init else "scratch"
 
-    print("\nNew RL init source:")
-    print("1) Default init checkpoint")
-    if has_default_init:
-        print("   Usually best IL checkpoint if available")
-    else:
-        print("   No default init checkpoint found, will fall back to scratch")
-    print("2) Choose any checkpoint manually")
-    print("3) Scratch")
+    print("\n Initialization source")
+    print(" [1] DEFAULT   best IL checkpoint selected by the project")
+    if not has_default_init:
+        print("               no default checkpoint found; falls back to scratch")
+    print(" [2] SELECT    choose another checkpoint manually")
+    print(" [3] SCRATCH   random model weights")
 
     default_choice = "1" if has_default_init else "3"
     mapping = {
@@ -219,7 +217,7 @@ def _choose_new_init_mode(has_default_init, has_checkpoints):
     }
     while True:
         try:
-            choice = input(f"Choose [1/2/3] (default {default_choice}): ").strip().lower()
+            choice = input(f" Init source [1/2/3, Enter={default_choice}]: ").strip().lower()
         except EOFError:
             choice = default_choice
         if not choice:
@@ -338,25 +336,47 @@ def _print_transfer_report(report):
     print(f"  unexpected keys:  {len(report['unexpected_keys'])}")
 
 
-def plan_rl_startup(model, device, models_dir, best_model_rl_path, rl_dir, default_new_checkpoint=None):
-    """Interactive startup menu + checkpoint selection for RL."""
-    available_checkpoints = _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir)
+def plan_rl_startup(
+    model,
+    device,
+    models_dir,
+    best_model_rl_path,
+    rl_dir,
+    default_new_checkpoint=None,
+    initial_plan=None,
+):
+    """Choose the startup mode first, then finalize it once the model exists."""
+    initial_plan = dict(initial_plan or {})
+    available_checkpoints = initial_plan.get("available_checkpoints")
+    if available_checkpoints is None:
+        available_checkpoints = _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir)
     selected_checkpoint = None
     checkpoint_catalog = []
-    new_init_mode = "default"
+    start_mode = initial_plan.get("start_mode")
+    new_init_mode = initial_plan.get("new_init_mode", "default")
 
-    default_choice, default_hint = _suggest_start_mode_default(best_model_rl_path, rl_dir)
-    start_mode = _choose_start_mode(
-        has_checkpoints=(len(available_checkpoints) > 0),
-        default_choice=default_choice,
-        default_hint=default_hint,
-    )
-    if start_mode == "new":
-        has_default_init = bool(default_new_checkpoint is not None and Path(default_new_checkpoint).exists())
-        new_init_mode = _choose_new_init_mode(
-            has_default_init=has_default_init,
+    if start_mode is None:
+        default_choice, default_hint = _suggest_start_mode_default(best_model_rl_path, rl_dir)
+        start_mode = _choose_start_mode(
             has_checkpoints=(len(available_checkpoints) > 0),
+            default_choice=default_choice,
+            default_hint=default_hint,
         )
+        if start_mode == "new":
+            has_default_init = bool(default_new_checkpoint is not None and Path(default_new_checkpoint).exists())
+            new_init_mode = _choose_new_init_mode(
+                has_default_init=has_default_init,
+                has_checkpoints=(len(available_checkpoints) > 0),
+            )
+
+    if model is None:
+        return {
+            "start_mode": start_mode,
+            "new_init_mode": new_init_mode,
+            "available_checkpoints": available_checkpoints,
+        }
+
+    if start_mode == "new":
         if new_init_mode == "select":
             print("\nScanning checkpoints (metrics + compatibility)...")
             checkpoint_catalog = _build_checkpoint_catalog(available_checkpoints, model, device, models_dir)

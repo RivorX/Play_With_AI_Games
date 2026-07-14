@@ -166,29 +166,27 @@ python chess/scripts/train_rl.py
    - Batch sampling z **replay buffer**
    - Policy target: MCTS visit distribution (nie legal moves!)
    - Value target: game outcome (WDL)
-   - Prioritized replay (opcjonalnie)
+   - Jednolity sampling z krótkiego FIFO replayu
 
 4. **Evaluation**:
    - Co `eval_every` iteracji: AI vs Best Model
    - Win rate > threshold → promote current to best
    - Zapis: `best_model_rl.pt`
 
-5. **Temperature schedule**:
-   - Early game: high temp (exploration)
-   - Late game: low temp (exploitation)
-   - Per iteration decay
+5. **Fixed MCTS sampling**:
+   - Stała temperatura do `mcts_temperature_threshold` plies
+   - Deterministyczny wybór później
 
 ### Replay Buffer
 
-- **Capacity**: `games_per_iteration * replay_buffer_multiplier`
+- **Capacity**: `run.games_per_iteration * replay.buffer_multiplier`
 - **FIFO**: stare pozycje wypierane przez nowe
-- **Prioritized** (opcjonalnie): sample trudniejsze pozycje
+- **Uniform sampling**: każda pozycja w aktywnym FIFO ma równą szansę
 
 ### Checkpointy
 
-- Co `checkpoint_every` iteracji
-- Folder: `models/RL/`
-- Format: `rl_iter_XXXX.pt (tylko zbiera średnią)
+- Po każdej iteracji: najnowszy stan ze stanem optymalizatora w `models/RL/*_latest.pt`
+- Po promocji: `best_model_rl.pt` oraz wersjonowany `models/RL/*_best.pt`
 
 ### Start
 
@@ -338,12 +336,22 @@ python chess/scripts/train_rl.py
 Najwazniejsze zachowania:
 - RL startuje od `best_model_il.pt` (jesli plik istnieje)
 - Samogra przez `batch_selfplay` + MCTS worker
-- Replay buffer (w tym prioritized replay)
-- Temperature schedule i LR schedule (wg config)
+- Krótki, jednolicie próbkowany replay buffer
+- Stałe parametry MCTS oraz LR schedule
 - Eval vs best model co `eval_every`
 - Zapisy:
   - `best_model_rl.pt`
-  - checkpointy co `checkpoint_every`
+  - `models/RL/*_latest.pt` po każdej iteracji
+
+### Logi RL (`schema_version=2`)
+
+- główny CSV: uczenie, eval, lower bound promocji, anchor i Elo,
+- `*_data_quality.csv`: replay, targety, miks przeciwników i zachowanie MCTS,
+- `*_performance.csv`: throughput, czasy etapów, batching, latency i bottleneck.
+
+Metryka ma jednego właściciela: eval nie jest kopiowany do data-quality, a czasy
+profilera nie trafiają do głównego CSV. Schematy są zdefiniowane w
+`scripts/utils/shared/rl_log_schema.py`.
 
 ## Ewaluacja Elo
 

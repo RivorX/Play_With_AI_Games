@@ -102,6 +102,11 @@ class CentralInferenceSession:
             return float(default)
 
     def resolve_server_count(self) -> int:
+        # A session is bound to one concrete CUDA device. Never allow an
+        # explicit override to create competing model-server processes there.
+        if self.device.type == "cuda":
+            return 1
+
         raw_value = self._option("central_inference_servers", "auto")
         if isinstance(raw_value, str) and raw_value.strip().lower() == "auto":
             target = max(1, int(self._option("central_inference_auto_workers_per_server", 10) or 10))
@@ -117,37 +122,37 @@ class CentralInferenceSession:
 
     def _server_config(self) -> dict:
         server_config = copy.deepcopy(self.config)
-        rl_cfg = server_config.setdefault("reinforcement_learning", {})
-        rl_cfg["self_play_central_inference_max_batch_size"] = int(
+        central_cfg = server_config.setdefault("central_inference", {})
+        central_cfg["max_batch_size"] = int(
             self._option(
                 "central_inference_max_batch_size",
-                rl_cfg.get("self_play_central_inference_max_batch_size", rl_cfg.get("mcts_batch_size", 256)),
+                central_cfg.get("max_batch_size", 256),
             )
             or 256
         )
-        rl_cfg["self_play_central_inference_flush_ms"] = float(
+        central_cfg["flush_ms"] = float(
             self._option(
                 "central_inference_flush_ms",
-                rl_cfg.get("self_play_central_inference_flush_ms", 2.0),
+                central_cfg.get("flush_ms", 2.0),
             )
             or 2.0
         )
-        rl_cfg["self_play_central_inference_cache_enabled"] = bool(
+        central_cfg["cache_enabled"] = bool(
             self._option("central_inference_cache_enabled", False)
         )
-        rl_cfg["self_play_central_inference_use_compile"] = bool(
+        central_cfg["use_compile"] = bool(
             self._option("central_inference_use_compile", False)
         )
         warmup_batches = self._option("central_inference_compile_warmup_batches", None)
         if warmup_batches is not None:
-            rl_cfg["self_play_central_inference_compile_warmup_batches"] = warmup_batches
-        rl_cfg["self_play_central_inference_transport_dtype"] = str(
+            central_cfg["compile_warmup_batches"] = warmup_batches
+        central_cfg["transport_dtype"] = str(
             self._option("central_inference_transport_dtype", "float16") or "float16"
         )
-        rl_cfg["self_play_central_inference_cudnn_benchmark"] = bool(
+        central_cfg["cudnn_benchmark"] = bool(
             self._option("central_inference_cudnn_benchmark", False)
         )
-        rl_cfg["self_play_central_inference_sync_timing"] = bool(
+        central_cfg["sync_timing"] = bool(
             self._option("central_inference_sync_timing", False)
         )
         return server_config
@@ -324,7 +329,7 @@ class CentralInferenceSession:
         if not session:
             return "not started"
         server_config = session.get("server_config", {}) or {}
-        rl_cfg = server_config.get("reinforcement_learning", {}) or {}
+        central_cfg = server_config.get("central_inference", {}) or {}
         load_messages = list(session.get("load_messages", []) or [])
         load_times = [
             float(message.get("load_s", 0.0) or 0.0)
@@ -351,7 +356,7 @@ class CentralInferenceSession:
             f"servers={int(session.get('server_count', 0) or 0)}, "
             f"workers={self.workers}, "
             f"target_workers/server={self._option('central_inference_auto_workers_per_server', 10)}, "
-            f"max_batch={rl_cfg.get('self_play_central_inference_max_batch_size')}, "
-            f"flush={rl_cfg.get('self_play_central_inference_flush_ms')}ms"
+            f"max_batch={central_cfg.get('max_batch_size')}, "
+            f"flush={central_cfg.get('flush_ms')}ms"
             f"{load_summary}"
         )

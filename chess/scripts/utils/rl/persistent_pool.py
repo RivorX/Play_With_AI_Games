@@ -4,7 +4,7 @@ import contextlib
 import os
 import signal
 import subprocess
-import tempfile
+import time
 from pathlib import Path
 
 import torch
@@ -28,9 +28,13 @@ def _resolve_central_inference_server_count(config, worker_specs, device_type):
     if not central_enabled:
         return 0
 
+    # One central server owns one CUDA context.  Multiple server processes on
+    # the same device fragment queues and batches instead of increasing GPU
+    # parallelism, so cap the topology at one server per visible GPU.
+    gpu_count = max(1, int(torch.cuda.device_count() or 1))
     raw_value = central_cfg.get('servers', rl_cfg.get('self_play_central_inference_servers', 'auto'))
     if str(raw_value).strip().lower() not in {'auto', 'automatic'}:
-        return max(1, int(raw_value or 1))
+        return min(max(1, int(raw_value or 1)), gpu_count)
 
     worker_count = max(1, len(list(worker_specs)))
     target_workers_per_server = max(
@@ -64,7 +68,7 @@ def _resolve_central_inference_server_count(config, worker_specs, device_type):
         by_vram = min(by_vram, 2)
 
     desired = max(by_workers, min_auto)
-    return max(1, min(desired, by_vram, max_auto))
+    return max(1, min(desired, by_vram, max_auto, gpu_count))
 
 
 class _PersistentSelfPlayPool:
@@ -209,12 +213,13 @@ class _PersistentSelfPlayPool:
                 recv_conn, send_conn = self.mp_ctx.Pipe(duplex=False)
                 self.inference_response_receivers[int(rank)] = recv_conn
                 self.inference_response_senders[int(rank)] = send_conn
+            gpu_count = max(1, int(torch.cuda.device_count() or 1))
             for server_idx in range(self.central_inference_server_count):
                 inference_process = self.mp_ctx.Process(
                     target=central_inference_server,
                     args=(
                         self.config,
-                        0,
+                        server_idx % gpu_count,
                         self.inference_request_queues[server_idx],
                         self.inference_response_senders,
                         self.inference_control_queues[server_idx],
@@ -260,6 +265,7 @@ class _PersistentSelfPlayPool:
             self._central_loaded_labels.add(label)
 
         if models_to_load or clear:
+            request_t0 = time.perf_counter()
             for request_queue in self.inference_request_queues:
                 request_queue.put({
                     "cmd": "load_models",
@@ -273,7 +279,6 @@ class _PersistentSelfPlayPool:
                 'load_timeout_s',
                 rl_cfg.get('self_play_central_inference_load_timeout_s', 300.0),
             ))
-            import time
             end_time = time.time() + max(1.0, timeout_s)
             pending_servers = set(range(len(self.inference_control_queues)))
             load_messages = []
@@ -293,11 +298,14 @@ class _PersistentSelfPlayPool:
                         load_messages.append(dict(message))
                         pending_servers.discard(server_idx)
             if load_messages:
+                ready_wait_s = time.perf_counter() - request_t0
                 load_times = [
                     float(message.get("load_s", 0.0) or 0.0)
                     for message in load_messages
                     if message.get("load_s") is not None
                 ]
+                max_load_s = max(load_times) if load_times else 0.0
+                startup_wait_s = max(0.0, ready_wait_s - max_load_s)
                 model_summary = next(
                     (str(message.get("model_summary")) for message in load_messages if message.get("model_summary")),
                     "models ready",
@@ -310,7 +318,8 @@ class _PersistentSelfPlayPool:
                 print(
                     "Central inference: "
                     f"servers={len(load_messages)}, {model_summary}"
-                    f"{f', load={max(load_times):.2f}s' if load_times else ''}"
+                    f"{f', load={max_load_s:.2f}s' if load_times else ''}"
+                    f", startup_wait={startup_wait_s:.2f}s"
                     f"{f', pids={pid_summary}' if pid_summary else ''}.",
                     flush=True,
                 )

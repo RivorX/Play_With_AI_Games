@@ -34,6 +34,7 @@ sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet
 from src.batch_selfplay import MCTS, MultiGameBatchMCTS, select_move_by_visits
+from src.utils.config import normalize_config
 
 #  v4.2: Import board_to_tensor from data_helpers
 #  v4.4: Added move_to_index for POV-aware move encoding
@@ -114,65 +115,6 @@ def _headless_raw_move(model, board, board_history, device, inference_lock=None)
             best_score = float(policy[idx])
             best_move = move
     return best_move
-
-
-def _headless_ai_game(
-    white_model,
-    black_model,
-    config,
-    device,
-    *,
-    use_mcts_white=False,
-    use_mcts_black=False,
-    mcts_simulations_white=100,
-    mcts_simulations_black=100,
-    max_moves=220,
-    stop_event=None,
-    inference_lock=None,
-):
-    board = chess.Board()
-    board_history = []
-    mcts_white = MCTS(white_model, config, device) if use_mcts_white else None
-    mcts_black = MCTS(black_model, config, device) if use_mcts_black else None
-    if mcts_white is not None:
-        mcts_white.history_positions = int(getattr(white_model, "history_positions", 0) or 0)
-    if mcts_black is not None:
-        mcts_black.history_positions = int(getattr(black_model, "history_positions", 0) or 0)
-
-    for _ply in range(max(1, int(max_moves))):
-        if stop_event is not None and stop_event.is_set():
-            return None, len(board_history)
-        if board.is_game_over(claim_draw=True):
-            break
-
-        moving_color = board.turn
-        model = white_model if moving_color == chess.WHITE else black_model
-        mcts = mcts_white if moving_color == chess.WHITE else mcts_black
-        sims = mcts_simulations_white if moving_color == chess.WHITE else mcts_simulations_black
-
-        if mcts is not None:
-            visit_counts = mcts.search(board, max(1, int(sims)))
-            if visit_counts:
-                move, _ = select_move_by_visits(visit_counts, temperature=0.0)
-            else:
-                move = _headless_raw_move(model, board, board_history, device, inference_lock)
-        else:
-            move = _headless_raw_move(model, board, board_history, device, inference_lock)
-
-        if move is None or move not in board.legal_moves:
-            move = next(iter(board.legal_moves), None)
-        if move is None:
-            break
-
-        board_history.append(board.copy())
-        for mcts_obj in (mcts_white, mcts_black):
-            if mcts_obj is not None:
-                mcts_obj.update_history(board)
-                mcts_obj.advance_root(move)
-        board.push(move)
-
-    result = board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "1/2-1/2"
-    return result, len(board_history)
 
 
 def _advance_detached_root(root, move):
@@ -3367,7 +3309,7 @@ def main():
     config_path = script_dir.parent / "config" / "config.yaml"
     print(f"Loading config from: {config_path}")
     with open(config_path, "r", encoding="utf-8") as file_obj:
-        config = yaml.safe_load(file_obj)
+        config = normalize_config(yaml.safe_load(file_obj))
 
     verbose_console = bool(args.verbose)
     config.setdefault("model", {})

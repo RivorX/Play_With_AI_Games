@@ -25,6 +25,7 @@ sys.path.insert(0, str(chess_dir))
 
 from src.batch_selfplay import MCTS, select_move_by_visits
 from src.model import ChessNet
+from src.utils.config import normalize_config
 from src.utils.data_helpers import board_to_tensor, move_to_index
 
 
@@ -336,7 +337,7 @@ class UCIChessEngine:
 
 def load_config(config_path):
     with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+        config = normalize_config(yaml.safe_load(f))
     config = copy.deepcopy(config)
     config.setdefault("model", {})
     config["model"]["print_summary"] = False

@@ -864,16 +864,3 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
         "transfer_trainable_param_names": transfer_trainable_param_names,
         "transfer_post_unfreeze_lr": transfer_post_unfreeze_lr,
     }
-
-
-def resolve_il_startup(model, optimizer, scheduler, scaler, device, base_dir, best_model_path, il_dir):
-    """Compatibility wrapper: plan + apply startup in one call."""
-    plan = plan_il_startup(
-        model,
-        device,
-        base_dir,
-        best_model_path,
-        il_dir,
-        base_learning_rate=None,
-    )
-    return apply_il_startup_plan(plan, model, optimizer, scheduler, scaler, device)

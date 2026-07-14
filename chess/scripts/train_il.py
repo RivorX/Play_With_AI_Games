@@ -43,7 +43,7 @@ from src.model import (
 )
 from src.data import process_pgn_files, create_dataloaders
 from src.utils.data_helpers import ACTION_SIZE, get_position_size
-from src.utils.config import normalize_data_config
+from src.utils.config import normalize_config
 
 # Import from utils
 from utils.shared.logger import TrainingLogger
@@ -134,16 +134,6 @@ def _format_target_positions(value):
         return "max"
     if value % 1_000_000 == 0:
         return f"{value // 1_000_000}M"
-    return f"{value / 1_000_000:.2f}M"
-
-
-def _format_million_positions(value):
-    try:
-        value = int(value)
-    except (TypeError, ValueError):
-        return "n/a"
-    if value <= 0:
-        return "0M"
     return f"{value / 1_000_000:.2f}M"
 
 
@@ -307,30 +297,6 @@ def _safe_int(value, default=None):
         return int(float(value))
     except (TypeError, ValueError):
         return default
-
-
-def _best_existing_nn_elo_from_logger(logger):
-    """Return existing periodic NN Elo closest to the best validation epoch."""
-    estimated_elos = list(getattr(logger, "estimated_elos", []) or [])
-    if not estimated_elos:
-        return None
-    try:
-        if getattr(logger, "val_losses", None):
-            best_idx = min(range(len(logger.val_losses)), key=lambda i: logger.val_losses[i])
-            best_epoch = int(logger.val_iterations[best_idx]) if best_idx < len(logger.val_iterations) else int(logger.iterations[best_idx])
-        else:
-            best_epoch = int(estimated_elos[-1][0])
-    except (TypeError, ValueError, IndexError):
-        best_epoch = int(estimated_elos[-1][0])
-    source_epoch, elo = min(estimated_elos, key=lambda pair: abs(int(pair[0]) - best_epoch))
-    error_info = (getattr(logger, "estimated_elo_errors", {}) or {}).get(int(source_epoch), {}) or {}
-    return {
-        "source_epoch": int(source_epoch),
-        "best_epoch": int(best_epoch),
-        "elo": float(elo),
-        "std_error": error_info.get("se"),
-        "ci95": error_info.get("ci95"),
-    }
 
 
 def _read_csv_metadata_and_epochs(csv_path):
@@ -642,7 +608,7 @@ def main():
     print(f"Loading config from: {config_path}")
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    config = normalize_data_config(config)
+    config = normalize_config(config)
 
     model_version = config.get('model', {}).get('version', 'v?.?')
     model_file_tag = build_model_file_tag(config)
@@ -841,13 +807,6 @@ def main():
                     stale_profile.unlink()
                 except OSError:
                     pass
-        legacy_debug_dir = logs_dir / "debug"
-        for stale_profile in legacy_debug_dir.glob("training_profile_*.txt"):
-            try:
-                stale_profile.unlink()
-            except OSError:
-                pass
-
         profile_debug_enabled = bool(il_debug_cfg.get('profile_training', debug_cfg.get('profile_training', False)))
         profile_mode_label = "every epoch" if profile_debug_enabled else "first epoch of each training phase"
         print(
@@ -1926,7 +1885,7 @@ def main():
     elo_coordinator.print_startup_summary(verbose=debug_enabled)
     if debug_enabled and final_il_elo_enabled:
         print(
-            "Elo final (IL): enabled for SWA and best_model_il MCTS, "
+            "Elo final (IL): exact best_model_il Raw NN + MCTS, plus SWA checks, "
             f"levels={final_elo_config_il.get('levels')}, "
             f"cap={final_elo_config_il_mcts.get('adaptive_max_total_games')} games, "
             f"time={float(final_elo_config_il_mcts.get('stockfish_time_limit', 0.0)):.2f}s, "
@@ -2728,29 +2687,20 @@ def main():
             final_model_label = f"best IL: {best_elo_label}" if best_checkpoint_loaded else "current model"
             final_marker_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
             final_note_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
-            if best_checkpoint_loaded:
-                best_nn = _best_existing_nn_elo_from_logger(logger)
-                if best_nn is not None:
-                    logger.record_best_final_elo(final_epoch_num, best_nn["elo"])
-                    logger.record_il_mode_elo(
-                        final_epoch_num,
-                        best_nn["elo"],
-                        mode="nn",
-                        simulations=0,
-                        label="Best NN",
-                        update_csv=True,
-                        std_error=best_nn.get("std_error"),
-                        ci95=best_nn.get("ci95"),
-                    )
-                    logger.append_final_note(
-                        f"{final_note_label} NN: {int(round(float(best_nn['elo'])))} "
-                        f"(reused epoch {best_nn['source_epoch']})"
-                    )
-                    logger.plot()
+            print("\n" + "=" * 88)
+            print("Final best IL strength check")
+            print(f"Checkpoint: {best_elo_label}")
+            print(
+                "Fresh evaluation: Raw NN, then "
+                f"MCTS ({int(final_elo_config_il_mcts.get('mcts_simulations', 0) or 0)} sims)"
+            )
+            print("=" * 88)
             final_best_elo_results = []
-            for mode_cfg, mode_suffix in (
+            final_best_mode_plan = (
+                (final_elo_config_il, "Raw NN"),
                 (final_elo_config_il_mcts, "MCTS"),
-            ):
+            )
+            for mode_cfg, mode_suffix in final_best_mode_plan:
                 mode_marker = f"{final_marker_label} {mode_suffix}"
                 final_best_elo_result = _run_il_final_elo(
                     model=best_elo_model,
@@ -2768,11 +2718,38 @@ def main():
                 if final_best_elo_result.get("cancelled"):
                     break
                 if final_best_elo_result.get("estimated_elo") is not None:
+                    if mode_suffix == "Raw NN":
+                        logger.record_best_final_elo(
+                            final_epoch_num,
+                            final_best_elo_result["estimated_elo"],
+                        )
                     logger.append_final_note(
                         f"{final_note_label} {mode_suffix}: "
                         f"{int(round(float(final_best_elo_result['estimated_elo'])))}"
                     )
                     logger.plot()
+            successful_final_modes = [
+                (mode_suffix, result)
+                for (_, mode_suffix), result in zip(final_best_mode_plan, final_best_elo_results)
+                if result.get("estimated_elo") is not None
+            ]
+            if successful_final_modes:
+                print("\n" + "-" * 88)
+                print("Final best IL results")
+                for mode_suffix, result in successful_final_modes:
+                    elo_value = int(round(float(result["estimated_elo"])))
+                    uncertainty = ""
+                    if result.get("elo_std_error") is not None:
+                        uncertainty = f" +/-{float(result['elo_std_error']):.1f} SE"
+                    ci95 = result.get("elo_ci95")
+                    if isinstance(ci95, (list, tuple)) and len(ci95) == 2:
+                        uncertainty += f", 95% CI {ci95[0]}-{ci95[1]}"
+                    print(f"  {mode_suffix:<8} {elo_value:>5}{uncertainty}")
+                if len(successful_final_modes) == 2:
+                    nn_elo = float(successful_final_modes[0][1]["estimated_elo"])
+                    mcts_elo = float(successful_final_modes[1][1]["estimated_elo"])
+                    print(f"  MCTS gain over Raw NN: {mcts_elo - nn_elo:+.0f} Elo")
+                print("-" * 88)
             final_best_elo_result = next(
                 (r for r in final_best_elo_results if r.get("estimated_elo") is not None),
                 final_best_elo_results[-1] if final_best_elo_results else {},

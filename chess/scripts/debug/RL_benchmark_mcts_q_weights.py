@@ -26,6 +26,7 @@ sys.path.insert(0, str(project_dir))
 sys.path.insert(0, str(scripts_dir))
 
 from src.model import load_model
+from src.utils.config import normalize_config
 from utils.rl.training_rl import evaluate_models
 
 
@@ -101,8 +102,9 @@ def _score_ci95(wins, draws, losses, unresolved=0):
     games = int(wins) + int(draws) + int(losses) + int(unresolved)
     if games <= 0:
         return 0.0, 0.0
-    score = (float(wins) + 0.5 * float(draws)) / float(games)
-    second_moment = (float(wins) + 0.25 * float(draws)) / float(games)
+    neutral = float(draws) + float(unresolved)
+    score = (float(wins) + 0.5 * neutral) / float(games)
+    second_moment = (float(wins) + 0.25 * neutral) / float(games)
     variance = max(0.0, second_moment - score * score)
     margin = 1.96 * math.sqrt(variance / float(games))
     return max(0.0, score - margin), min(1.0, score + margin)
@@ -137,7 +139,7 @@ def _summarize_rows(rows, group_fields):
         losses = sum(int(row['losses']) for row in group_rows)
         unresolved = sum(int(row['unresolved']) for row in group_rows)
         games = wins + draws + losses + unresolved
-        score_rate = (wins + 0.5 * draws) / games if games > 0 else 0.0
+        score_rate = (wins + 0.5 * (draws + unresolved)) / games if games > 0 else 0.0
         decisive_games = wins + losses
         ci_low, ci_high = _score_ci95(wins, draws, losses, unresolved)
         repeat_scores = [float(row['score_rate']) for row in group_rows]
@@ -265,7 +267,7 @@ def main():
     project_dir = script_dir.parent.parent
     config_path = project_dir / 'config' / 'config.yaml'
     with open(config_path, 'r', encoding='utf-8') as file_obj:
-        config = yaml.safe_load(file_obj) or {}
+        config = normalize_config(yaml.safe_load(file_obj) or {})
 
     preset = PRESETS[args.preset]
     games = max(2, int(args.games if args.games is not None else preset['games']))

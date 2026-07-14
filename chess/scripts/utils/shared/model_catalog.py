@@ -166,6 +166,84 @@ def _sync_legacy_elo_from_nn(checkpoint):
     )
 
 
+def _current_elo_history_entry(checkpoint, mode):
+    """Snapshot the current mode metadata before a newer measurement replaces it."""
+    mode_prefix = "estimated_elo_mcts" if mode == "mcts" else "estimated_elo_nn"
+    elo = _safe_float(checkpoint.get(mode_prefix, checkpoint.get(f"last_{mode_prefix}")))
+    if elo is None:
+        return None
+
+    entry = {
+        "mode": mode,
+        "elo": float(elo),
+        "timestamp": checkpoint.get(f"{mode_prefix}_timestamp"),
+        "source": checkpoint.get(f"{mode_prefix}_source", "legacy_checkpoint_metadata"),
+    }
+    epoch = _safe_int(checkpoint.get(f"{mode_prefix}_epoch"))
+    if epoch is not None:
+        entry["epoch"] = int(epoch)
+    settings = checkpoint.get(f"{mode_prefix}_settings")
+    if isinstance(settings, dict):
+        entry["settings"] = dict(settings)
+    std_error = _safe_float(checkpoint.get(f"{mode_prefix}_se"))
+    if std_error is not None:
+        entry["se"] = float(std_error)
+    ci_low = _safe_float(checkpoint.get(f"{mode_prefix}_ci95_low"))
+    ci_high = _safe_float(checkpoint.get(f"{mode_prefix}_ci95_high"))
+    if ci_low is not None and ci_high is not None:
+        entry["ci95"] = [float(ci_low), float(ci_high)]
+    if mode == "mcts" and "settings" not in entry:
+        simulations = _safe_int(checkpoint.get("estimated_elo_mcts_simulations"))
+        if simulations is not None:
+            entry["settings"] = {"use_mcts": True, "simulations": int(simulations)}
+    return entry
+
+
+def _append_elo_history(checkpoint, *entries, limit=64):
+    history = [dict(item) for item in checkpoint.get("elo_evaluation_history", []) if isinstance(item, dict)]
+
+    def signature(item):
+        settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
+        return (
+            str(item.get("mode", "")),
+            _safe_float(item.get("elo")),
+            str(item.get("timestamp") or ""),
+            str(item.get("source") or ""),
+            _safe_int(item.get("epoch")),
+            _safe_int(settings.get("simulations")),
+        )
+
+    known = {signature(item) for item in history}
+    for entry in entries:
+        if not isinstance(entry, dict) or _safe_float(entry.get("elo")) is None:
+            continue
+        key = signature(entry)
+        if key in known:
+            continue
+        history.append(dict(entry))
+        known.add(key)
+    checkpoint["elo_evaluation_history"] = history[-max(1, int(limit)):]
+
+
+def _is_manual_elo_source(source):
+    return str(source or "").strip().lower() in {"eval_elo_manual", "manual"}
+
+
+def _set_training_elo_snapshot(checkpoint, mode, entry):
+    """Keep the last training-produced result separate from manual re-evaluations."""
+    if not isinstance(entry, dict) or _safe_float(entry.get("elo")) is None:
+        return
+    prefix = "training_estimated_elo_mcts" if mode == "mcts" else "training_estimated_elo_nn"
+    checkpoint[prefix] = float(entry["elo"])
+    for field in ("timestamp", "source", "epoch", "settings", "se", "ci95"):
+        key = f"{prefix}_{field}"
+        if field in entry and entry[field] is not None:
+            value = dict(entry[field]) if field == "settings" and isinstance(entry[field], dict) else entry[field]
+            checkpoint[key] = value
+        else:
+            checkpoint.pop(key, None)
+
+
 def format_elo_summary(entry, *, legacy_label=True):
     """Format checkpoint Elo as separate NN and MCTS values when available."""
     if not entry or entry.get("error"):
@@ -244,6 +322,7 @@ def persist_checkpoint_elo_metadata(
 
     mode = "mcts" if bool(use_mcts) else "nn"
     mode_prefix = "estimated_elo_mcts" if mode == "mcts" else "estimated_elo_nn"
+    previous_history_entry = _current_elo_history_entry(checkpoint, mode)
     now = datetime.now().isoformat(timespec="seconds")
     settings = {
         "levels": [int(x) for x in levels],
@@ -303,6 +382,27 @@ def persist_checkpoint_elo_metadata(
     if epoch_idx is not None:
         checkpoint[f"{mode_prefix}_epoch"] = epoch_idx + 1
     mode_epoch = _safe_int(checkpoint.get(f"{mode_prefix}_epoch"))
+
+    current_history_entry = {
+        "mode": mode,
+        "elo": float(elo_value),
+        "timestamp": now,
+        "source": str(source),
+        "settings": dict(settings),
+    }
+    if mode_epoch is not None:
+        current_history_entry["epoch"] = int(mode_epoch)
+    if elo_std_error is not None:
+        current_history_entry["se"] = float(elo_std_error)
+    if ci_low is not None and ci_high is not None:
+        current_history_entry["ci95"] = [float(ci_low), float(ci_high)]
+    _append_elo_history(checkpoint, previous_history_entry, current_history_entry)
+    if _is_manual_elo_source(source):
+        training_prefix = "training_estimated_elo_mcts" if mode == "mcts" else "training_estimated_elo_nn"
+        if checkpoint.get(training_prefix) is None and previous_history_entry is not None:
+            _set_training_elo_snapshot(checkpoint, mode, previous_history_entry)
+    else:
+        _set_training_elo_snapshot(checkpoint, mode, current_history_entry)
 
     if mode == "nn":
         _set_legacy_nn_elo(
@@ -410,10 +510,17 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
     entry["elo_mcts"] = _safe_float(
         checkpoint.get("estimated_elo_mcts", checkpoint.get("last_estimated_elo_mcts"))
     )
+    entry["training_elo_nn"] = _safe_float(checkpoint.get("training_estimated_elo_nn"))
+    entry["training_elo_mcts"] = _safe_float(checkpoint.get("training_estimated_elo_mcts"))
     entry["elo_mcts_simulations"] = _safe_int(checkpoint.get("estimated_elo_mcts_simulations"))
     entry["elo_mcts_by_simulations"] = _normalize_mcts_elo_by_sims(
         checkpoint.get("estimated_elo_mcts_by_simulations")
     )
+    entry["elo_history"] = [
+        dict(item)
+        for item in checkpoint.get("elo_evaluation_history", [])
+        if isinstance(item, dict)
+    ]
     if legacy_elo is not None:
         mode = _checkpoint_elo_mode(checkpoint)
         if mode == "mcts" and entry["elo_mcts"] is None:

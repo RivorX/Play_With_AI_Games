@@ -43,22 +43,7 @@ from utils.shared.central_inference_session import CentralInferenceSession, snap
 
 def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict:
     """Build deterministic MCTS settings for Stockfish Elo checks."""
-    eval_config = dict(config)
-    elo_config = dict(elo_config or {})
-    rl_cfg = dict(config.get("reinforcement_learning", {}))
-    scout_overrides = {
-        "elo_mcts_scout_simulations": "mcts_scout_simulations",
-        "elo_mcts_scout_easy_top_visit_prob": "mcts_scout_easy_top_visit_prob",
-        "elo_mcts_scout_easy_visit_gap": "mcts_scout_easy_visit_gap",
-        "elo_mcts_scout_easy_max_entropy": "mcts_scout_easy_max_entropy",
-        "elo_mcts_scout_easy_min_explored_prior_mass": "mcts_scout_easy_min_explored_prior_mass",
-        "elo_mcts_scout_easy_min_visited_moves": "mcts_scout_easy_min_visited_moves",
-    }
-    for elo_key, mcts_key in scout_overrides.items():
-        rl_cfg[mcts_key] = elo_config[elo_key]
-    rl_cfg["mcts_scout_challenge_fraction"] = 0.0
-    eval_config["reinforcement_learning"] = rl_cfg
-    return eval_config
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -366,12 +351,14 @@ class _ModelPlayer:
 
     def record_state(self, board: chess.Board):
         """Call BEFORE making a move to keep board history."""
-        self.board_history.append(board.copy())
-        max_keep = self.history_positions + 4
-        if len(self.board_history) > max_keep:
-            self.board_history = self.board_history[-max_keep:]
         if self.mcts is not None:
             self.mcts.update_history(board)
+        if self.history_positions <= 0:
+            return
+        self.board_history.append(board.copy(stack=False))
+        max_keep = self.history_positions
+        if len(self.board_history) > max_keep:
+            self.board_history = self.board_history[-max_keep:]
 
     def _build_input_tensor(self, board: chess.Board) -> np.ndarray:
         """Build (C, 8, 8) input tensor including history planes."""
@@ -414,15 +401,13 @@ class _ModelPlayer:
             )
 
         policy = policy_logits.squeeze(0).float().cpu().numpy()
-
         best_move = None
         best_score = -float('inf')
         for move in board.legal_moves:
             idx = move_to_index(move, board)
-            if idx is not None and 0 <= idx < len(policy):
-                if policy[idx] > best_score:
-                    best_score = policy[idx]
-                    best_move = move
+            if idx is not None and 0 <= idx < len(policy) and policy[idx] > best_score:
+                best_score = policy[idx]
+                best_move = move
         return best_move
     
     def _best_move_mcts(self, board: chess.Board) -> chess.Move | None:
@@ -472,9 +457,11 @@ class _BatchedModelPlayer:
         state["_root_synced"] = False
 
     def record_state(self, state: dict, board: chess.Board):
+        if self.history_positions <= 0:
+            return
         history = state.setdefault("board_history", [])
         history.append(self._encode_history_entry(board))
-        max_keep = self.history_positions + 10
+        max_keep = self.history_positions
         if len(history) > max_keep:
             state["board_history"] = history[-max_keep:]
 
@@ -628,6 +615,8 @@ class EloEstimator:
         self._thread_local = threading.local()
         self._worker_engines: list[chess.engine.SimpleEngine] = []
         self._worker_engines_lock = threading.Lock()
+        self._batched_engine_pool = deque()
+        self._batched_engine_pool_lock = threading.Lock()
         self._central_inference_session = None
         self._local_cancel_event = threading.Event()
         self._printed_central_mcts_clients = False
@@ -906,24 +895,6 @@ class EloEstimator:
             merged["worker_game_counts"].extend(list(stats.get("worker_game_counts", []) or []))
         return merged
 
-    @staticmethod
-    def _format_central_batch_stats(stats: dict) -> str:
-        requests = int(stats.get("central_inference_requests", 0) or 0)
-        items = int(stats.get("central_inference_server_batch_items", 0) or 0)
-        if requests <= 0:
-            return ""
-        avg_batch = float(items) / float(requests)
-
-        def _ms_per_request(key: str) -> float:
-            return 1000.0 * float(stats.get(key, 0.0) or 0.0) / float(requests)
-
-        return (
-            f", central_batch={avg_batch:.1f}, "
-            f"remote_wait={_ms_per_request('central_inference_remote_wait_time'):.1f}ms/req, "
-            f"server={_ms_per_request('central_inference_server_total_time'):.1f}ms/req, "
-            f"fwd={_ms_per_request('central_inference_server_forward_time'):.1f}ms/req"
-        )
-
     def _estimate_central_batched_groups(
         self,
         tasks: list[tuple[int, int, bool]],
@@ -1033,18 +1004,6 @@ class EloEstimator:
                 executor.shutdown(wait=True, cancel_futures=False)
 
         merged_stats = self._merge_batched_stats(stats_items)
-        calls = int(merged_stats.get("model_move_calls", 0) or 0)
-        positions = int(merged_stats.get("model_move_positions", 0) or 0)
-        if calls > 0:
-            avg_batch = float(positions) / float(calls)
-            central_part = self._format_central_batch_stats(merged_stats)
-            print(
-                "  Info: Elo model batching: "
-                f"avg_batch={avg_batch:.1f}, calls={calls}, "
-                f"model_time={float(merged_stats.get('model_move_time_s', 0.0)):.1f}s, "
-                f"stockfish_wait={float(merged_stats.get('stockfish_move_time_s', 0.0)):.1f}s"
-                f"{central_part}"
-            )
         worker_counts = list(merged_stats.get("worker_game_counts", []) or [])
         self._last_elo_batch_stats = dict(merged_stats)
         if sum(worker_counts) > 0 and bool(self.elo_config.get("elo_verbose_worker_stats", False)):
@@ -1054,6 +1013,19 @@ class EloEstimator:
     def _register_worker_engine(self, engine: chess.engine.SimpleEngine):
         with self._worker_engines_lock:
             self._worker_engines.append(engine)
+
+    def _acquire_batched_engines(self, count: int, stockfish_path: str):
+        engines = []
+        with self._batched_engine_pool_lock:
+            while self._batched_engine_pool and len(engines) < count:
+                engines.append(self._batched_engine_pool.popleft())
+        while len(engines) < count:
+            engines.append(self._open_stockfish_engine(stockfish_path))
+        return engines
+
+    def _release_batched_engines(self, engines):
+        with self._batched_engine_pool_lock:
+            self._batched_engine_pool.extend(engine for engine in engines if engine is not None)
 
     def _unregister_worker_engines(self, engines):
         engine_ids = {id(engine) for engine in engines if engine is not None}
@@ -1115,6 +1087,8 @@ class EloEstimator:
                     proc.wait(timeout=0.2)
 
     def _close_worker_engines(self):
+        with self._batched_engine_pool_lock:
+            self._batched_engine_pool.clear()
         with self._worker_engines_lock:
             engines = self._worker_engines
             self._worker_engines = []
@@ -1245,6 +1219,7 @@ class EloEstimator:
         batch_model_moves: bool,
         central_inference_enabled: bool,
         progress_bar,
+        parallel_executor=None,
     ) -> tuple[list[float], list[float], bool]:
         """Run an already chosen list of Elo games through the shared executor."""
         all_opponent_elos: list[float] = []
@@ -1269,8 +1244,6 @@ class EloEstimator:
                 interrupted_by_user = True
                 self._request_cancel()
                 print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
-            finally:
-                self._close_worker_engines()
         elif batch_model_moves and workers > 1:
             try:
                 all_opponent_elos, all_scores = self._estimate_batched_games(
@@ -1287,8 +1260,6 @@ class EloEstimator:
                 interrupted_by_user = True
                 self._request_cancel()
                 print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
-            finally:
-                self._close_worker_engines()
         elif workers > 1:
             parallel_thread_slots: dict[int, int] = {}
             parallel_game_counts: list[int] = []
@@ -1321,7 +1292,8 @@ class EloEstimator:
                 )
                 return result, threading.get_ident()
 
-            executor = ThreadPoolExecutor(max_workers=workers)
+            owns_executor = parallel_executor is None
+            executor = parallel_executor or ThreadPoolExecutor(max_workers=workers)
             futures = {}
             try:
                 for level, game_idx, model_is_white in tasks:
@@ -1369,12 +1341,12 @@ class EloEstimator:
                 if cancelled:
                     for future in futures:
                         future.cancel()
-                    self._close_worker_engines()
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    self._close_worker_engines()
-                else:
+                    if owns_executor:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                elif owns_executor:
                     executor.shutdown(wait=True, cancel_futures=False)
-                self._close_worker_engines()
+                if owns_executor:
+                    self._close_worker_engines()
                 self._last_elo_batch_stats = {"worker_game_counts": list(parallel_game_counts)}
                 if sum(parallel_game_counts) > 0 and bool(self.elo_config.get("elo_verbose_worker_stats", False)):
                     print(f"  Info: Elo games/worker: {_format_worker_game_counts(parallel_game_counts)}")
@@ -1414,7 +1386,7 @@ class EloEstimator:
 
         return all_opponent_elos, all_scores, interrupted_by_user
 
-    def _print_elo_completion_summary(self, result: dict, *, use_mcts: bool):
+    def _print_elo_completion_summary(self, result: dict):
         if not bool(self.elo_config.get("elo_print_completion_summary", True)):
             return
         total_games = int(result.get("total_games", 0) or 0)
@@ -1425,18 +1397,6 @@ class EloEstimator:
             f"({rate:.2f} games/s, adaptive)"
         )
         stats = self._last_elo_batch_stats or {}
-        calls = int(stats.get("model_move_calls", 0) or 0)
-        positions = int(stats.get("model_move_positions", 0) or 0)
-        if use_mcts and calls > 0:
-            avg_batch = float(positions) / float(calls)
-            central_part = self._format_central_batch_stats(stats)
-            print(
-                "  Elo model batching: "
-                f"avg_batch={avg_batch:.1f}, calls={calls}, "
-                f"model_time={float(stats.get('model_move_time_s', 0.0) or 0.0):.1f}s, "
-                f"stockfish_wait={float(stats.get('stockfish_move_time_s', 0.0) or 0.0):.1f}s"
-                f"{central_part}"
-            )
         worker_counts = list(stats.get("worker_game_counts", []) or [])
         if worker_counts and bool(self.elo_config.get("elo_print_worker_summary", False)):
             print(f"  Elo workers: {_format_worker_game_counts(worker_counts)}")
@@ -1530,6 +1490,7 @@ class EloEstimator:
             }
 
         t0 = time.perf_counter()
+        self._last_elo_batch_stats = None
         all_opponent_elos: list[float] = []
         all_scores: list[float] = []
         results_per_level: dict[int, dict] = {}
@@ -1636,6 +1597,10 @@ class EloEstimator:
         interrupted_by_user = False
         played_by_level: dict[int, int] = {int(level): 0 for level in levels}
         scores_by_level: dict[int, list[float]] = {int(level): [] for level in levels}
+        phase_profile_stats: list[dict] = []
+        shared_parallel_executor = None
+        if workers > 1 and not central_inference_enabled and not batch_model_moves:
+            shared_parallel_executor = ThreadPoolExecutor(max_workers=workers)
 
         def _run_selected_tasks(tasks: list[tuple[int, int, bool]], phase: str = "") -> bool:
             nonlocal interrupted_by_user
@@ -1653,7 +1618,10 @@ class EloEstimator:
                 batch_model_moves=batch_model_moves,
                 central_inference_enabled=central_inference_enabled,
                 progress_bar=progress_bar,
+                parallel_executor=shared_parallel_executor,
             )
+            if self._last_elo_batch_stats:
+                phase_profile_stats.append(dict(self._last_elo_batch_stats))
             interrupted_by_user = interrupted_by_user or batch_interrupted
             for level_f, score in zip(batch_elos, batch_scores):
                 level = int(level_f)
@@ -1959,11 +1927,21 @@ class EloEstimator:
                         f"({summary['score']:.0%}, games={summary['total']})"
                     )
         finally:
+            if shared_parallel_executor is not None:
+                if self._is_cancelled() or interrupted_by_user:
+                    shared_parallel_executor.shutdown(wait=False, cancel_futures=True)
+                else:
+                    shared_parallel_executor.shutdown(wait=True, cancel_futures=False)
+                self._close_worker_engines()
             self._stop_central_inference_for_elo()
+            self._close_worker_engines()
             if progress_bar is not None:
                 progress_bar.total = progress_bar.n
                 progress_bar.refresh()
                 progress_bar.close()
+
+        if phase_profile_stats:
+            self._last_elo_batch_stats = self._merge_batched_stats(phase_profile_stats)
 
         if interrupted_by_user:
             return {
@@ -2021,7 +1999,7 @@ class EloEstimator:
             result["elo_std_error"] = round(float(elo_se), 1)
         if elo_ci95 is not None:
             result["elo_ci95"] = elo_ci95
-        self._print_elo_completion_summary(result, use_mcts=use_mcts)
+        self._print_elo_completion_summary(result)
         return result
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -2101,10 +2079,8 @@ class EloEstimator:
         worker_slots = max(1, workers)
         worker_game_counts = [0 for _ in range(worker_slots)]
         idle_engines: list[tuple[int, chess.engine.SimpleEngine]] = []
-        opened_engines: list[chess.engine.SimpleEngine] = []
-        for worker_slot in range(worker_slots):
-            engine = self._open_stockfish_engine(stockfish_path)
-            opened_engines.append(engine)
+        opened_engines = self._acquire_batched_engines(worker_slots, stockfish_path)
+        for worker_slot, engine in enumerate(opened_engines):
             idle_engines.append((worker_slot, engine))
 
         pending_tasks = deque(tasks)
@@ -2160,6 +2136,9 @@ class EloEstimator:
                     if progress_bar is not None:
                         progress_bar.update(1)
                     self._force_close_engine(engine)
+                    self._unregister_worker_engines([engine])
+                    with contextlib.suppress(ValueError):
+                        opened_engines.remove(engine)
                     engine = self._open_stockfish_engine(stockfish_path)
                     opened_engines.append(engine)
                     continue
@@ -2287,14 +2266,12 @@ class EloEstimator:
                 executor.shutdown(wait=False, cancel_futures=True)
             else:
                 executor.shutdown(wait=True, cancel_futures=False)
-            seen_engines = set()
-            for engine in opened_engines:
-                engine_id = id(engine)
-                if engine_id in seen_engines:
-                    continue
-                seen_engines.add(engine_id)
-                self._force_close_engine(engine)
-            self._unregister_worker_engines(opened_engines)
+            if self._is_cancelled():
+                for engine in opened_engines:
+                    self._force_close_engine(engine)
+                self._unregister_worker_engines(opened_engines)
+            else:
+                self._release_batched_engines(opened_engines)
             idle_engines.clear()
             active_games.clear()
 
@@ -2374,17 +2351,6 @@ class EloEstimator:
                     }
                 )
 
-        if (
-            model_move_calls > 0
-            and stats_out is None
-            and bool(self.elo_config.get("elo_verbose_batch_stats", False))
-        ):
-            avg_model_batch = float(model_move_positions) / float(model_move_calls)
-            print(
-                "  Info: Elo model batching: "
-                f"avg_batch={avg_model_batch:.1f}, calls={model_move_calls}, "
-                f"model_time={model_move_time_s:.1f}s, stockfish_wait={stockfish_move_time_s:.1f}s"
-            )
         if (
             sum(worker_game_counts) > 0
             and stats_out is None
