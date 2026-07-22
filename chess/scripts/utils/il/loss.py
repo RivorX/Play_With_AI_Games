@@ -168,12 +168,13 @@ class CombinedLoss(nn.Module):
     2. Value: WDL classification (Win/Draw/Loss)
     """
     
-    def __init__(self, config):
+    def __init__(self, config, capture_task_objectives=False):
         """
         Args:
             config: Training configuration dict
         """
         super().__init__()
+        self.capture_task_objectives = bool(capture_task_objectives)
         
         # Extract weights
         self.policy_weight = config['imitation_learning']['policy_loss_weight']
@@ -317,6 +318,14 @@ class CombinedLoss(nn.Module):
             'value': value_loss.item(),
             'moves_left': moves_left_loss.item(),
         }
+        if self.capture_task_objectives:
+            # Training diagnostics consume these tensors before backward.  They
+            # are deliberately absent from validation to avoid retaining graphs.
+            loss_dict['_policy_objective'] = self.policy_weight * policy_loss
+            loss_dict['_value_objective'] = (
+                self.value_weight * value_loss
+                + self.moves_left_weight * moves_left_loss
+            )
         
         loss_dict['total'] = total_loss.item()
         return total_loss, loss_dict

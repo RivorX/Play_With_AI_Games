@@ -165,7 +165,9 @@ python chess/scripts/train_rl.py
 3. **Training loop**:
    - Batch sampling z **replay buffer**
    - Policy target: MCTS visit distribution (nie legal moves!)
-   - Value target: game outcome (WDL)
+   - Value target: końcowy wynik partii (główny WDL) + pomocnicza lokalna ocena `root_q`
+   - Value error focus: do 25% największych bieżących błędów `|value-root_q|`
+     dostaje maksymalnie `1.5x` względnej wagi (bez duplikowania próbek)
    - Jednolity sampling z krótkiego FIFO replayu
 
 4. **Evaluation**:
@@ -182,6 +184,17 @@ python chess/scripts/train_rl.py
 - **Capacity**: `run.games_per_iteration * replay.buffer_multiplier`
 - **FIFO**: stare pozycje wypierane przez nowe
 - **Uniform sampling**: każda pozycja w aktywnym FIFO ma równą szansę
+- **Error-focused value loss**: sampling pozostaje równomierny, ale trudne
+  pozycje z wiarygodnym `root_q` otrzymują umiarkowanie większą wagę value
+- **Difficulty-aware MCTS**: trudność pozycji łączy niepewność policy, względną
+  różnicę dwóch najlepszych ruchów, branching i niepewność value. Najłatwiejsze
+  pozycje PCR dostają 16 symulacji, pełne search'e 64-320, a średnia grupy
+  pozostaje dokładnie równa `search.simulations`
+- **Shared tree + tree reuse**: w zwykłym guarded-actor self-play obie strony
+  używają jednego drzewa. Po ruchu odwiedzony podwęzeł zostaje nowym rootem,
+  a niepotrzebni przodkowie i rodzeństwo są od razu zwalniani. Partie dwóch
+  różnych checkpointów zachowują osobne drzewa, aby nie mieszać ich priorytetów
+  ani ocen pozycji
 
 ### Checkpointy
 
@@ -335,23 +348,28 @@ python chess/scripts/train_rl.py
 
 Najwazniejsze zachowania:
 - RL startuje od `best_model_il.pt` (jesli plik istnieje)
-- Samogra przez `batch_selfplay` + MCTS worker
-- Krótki, jednolicie próbkowany replay buffer
+- Samogra przez `batch_selfplay` + MCTS worker, zawsze bez zewnętrznego silnika
+- Guarded actor gra przeciwko sobie; learner nie generuje danych, dopóki nie
+  przejdzie lekkiej bramki non-inferiority względem zaakceptowanego best
+- Replay łączy świeże dane actora z przypiętym archiwum ostatniego championa
 - Stałe parametry MCTS oraz LR schedule
 - Eval vs best model co `eval_every`
 - Zapisy:
   - `best_model_rl.pt`
   - `models/RL/*_latest.pt` po każdej iteracji
 
-### Logi RL (`schema_version=2`)
+Stockfish jest wyłącznie niezależnym estymatorem Elo. Nigdy nie jest
+przeciwnikiem self-play i nie dostarcza replayu, ruchów nauczyciela ani targetów.
+
+### Logi RL (`schema_version=12`)
 
 - główny CSV: uczenie, eval, lower bound promocji, anchor i Elo,
-- `*_data_quality.csv`: replay, targety, miks przeciwników i zachowanie MCTS,
+- `*_data_quality.csv`: replay, champion reservoir, targety i zachowanie MCTS,
 - `*_performance.csv`: throughput, czasy etapów, batching, latency i bottleneck.
 
 Metryka ma jednego właściciela: eval nie jest kopiowany do data-quality, a czasy
 profilera nie trafiają do głównego CSV. Schematy są zdefiniowane w
-`scripts/utils/shared/rl_log_schema.py`.
+`scripts/utils/rl/rl_log_schema.py`.
 
 ## Ewaluacja Elo
 

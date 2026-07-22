@@ -14,7 +14,6 @@ import copy
 import sys
 from pathlib import Path
 
-import chess
 import torch
 import yaml
 
@@ -24,6 +23,7 @@ chess_dir = script_dir.parents[2]
 sys.path.insert(0, str(chess_dir))
 
 from src.batch_selfplay import MCTS, select_move_by_visits
+from src import chess_backend as chess
 from src.model import ChessNet
 from src.utils.config import normalize_config
 from src.utils.data_helpers import board_to_tensor, move_to_index
@@ -38,7 +38,7 @@ class UCIChessEngine:
         self.version = self.config.get("model", {}).get("version", "v?.?")
         self.history_positions = int(self.config.get("model", {}).get("history_positions", 0))
 
-        self.board = chess.Board()
+        self.board = chess.new_board()
         self.board_history = []
         self.stop_requested = False
 
@@ -82,7 +82,7 @@ class UCIChessEngine:
             self.mcts = MCTS(self.model, self.config, self.device)
 
     def _record_pre_move_state(self):
-        self.board_history.append(self.board.copy())
+        self.board_history.append(chess.copy_board(self.board))
         max_history = self.history_positions + 20
         if len(self.board_history) > max_history:
             self.board_history = self.board_history[-max_history:]
@@ -90,7 +90,7 @@ class UCIChessEngine:
             self.mcts.update_history(self.board)
 
     def _new_game(self):
-        self.board = chess.Board()
+        self.board = chess.new_board()
         self.board_history = []
         self.stop_requested = False
         if self.mcts:
@@ -134,7 +134,7 @@ class UCIChessEngine:
 
         best_move = None
         best_score = -float("inf")
-        for move in self.board.legal_moves:
+        for move in chess.legal_moves(self.board):
             idx = move_to_index(move, self.board)
             score = float(policy[idx])
             if score > best_score:
@@ -204,7 +204,7 @@ class UCIChessEngine:
 
         idx = 0
         if args[0] == "startpos":
-            self.board = chess.Board()
+            self.board = chess.new_board()
             idx = 1
         elif args[0] == "fen":
             if len(args) < 7:
@@ -212,10 +212,10 @@ class UCIChessEngine:
                 return
             fen = " ".join(args[1:7])
             try:
-                self.board = chess.Board(fen)
+                self.board = chess.board_from_fen(fen)
             except ValueError:
                 self._send("info string invalid fen")
-                self.board = chess.Board()
+                self.board = chess.new_board()
                 return
             idx = 7
         else:
@@ -225,15 +225,15 @@ class UCIChessEngine:
         if idx < len(args) and args[idx] == "moves":
             for move_uci in args[idx + 1 :]:
                 try:
-                    move = chess.Move.from_uci(move_uci)
+                    move = chess.move_from_uci(move_uci)
                 except ValueError:
                     self._send(f"info string invalid move format: {move_uci}")
                     break
-                if move not in self.board.legal_moves:
+                if move is None or move not in chess.legal_moves(self.board):
                     self._send(f"info string illegal move in position: {move_uci}")
                     break
                 self._record_pre_move_state()
-                self.board.push(move)
+                chess.apply_move(self.board, move)
 
     def _set_option(self, args):
         name = ""
@@ -279,7 +279,7 @@ class UCIChessEngine:
                 self._send("info string invalid Temperature value")
 
     def _go(self, args):
-        if self.board.is_game_over():
+        if chess.is_game_over(self.board, claim_draw=True):
             self._send("bestmove 0000")
             return
 

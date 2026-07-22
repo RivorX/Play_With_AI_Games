@@ -11,9 +11,65 @@ import torch
 import torch.multiprocessing as mp
 
 from src.batch_selfplay import persistent_selfplay_worker, central_inference_server
+from src.utils.data_helpers import MAX_LEGAL_MOVES
+from src.utils.shared_inference import (
+    create_shared_inference_buffer,
+    shared_inference_bytes,
+)
 
 WORKER_INTERRUPT_EXIT_CODE = 130
 _SELFPLAY_POOL = None
+
+
+def borrow_selfplay_central_runtime():
+    """Expose the idle self-play GPU server to promotion eval.
+
+    Self-play and evaluation never run concurrently in the training loop.  A
+    borrowed view lets eval reuse the same CUDA context, compiled wrappers and
+    per-rank pipes instead of starting a second server on the same GPU.
+    """
+    pool = _SELFPLAY_POOL
+    if not (
+        pool is not None
+        and pool.started
+        and pool.central_inference_enabled
+        and pool.central_inference_server_count > 0
+        and pool.inference_processes
+        and all(process.is_alive() for process in pool.inference_processes)
+    ):
+        return None
+
+    workers = len(pool.inference_response_receivers)
+    server_count = int(pool.central_inference_server_count)
+    worker_server_idx = {
+        int(rank): int(rank) % server_count
+        for rank in pool.inference_response_receivers
+    }
+    sender_maps = [dict() for _ in range(server_count)]
+    for rank, sender in pool.inference_response_senders.items():
+        sender_maps[worker_server_idx[int(rank)]][int(rank)] = sender
+    return {
+        "borrowed": True,
+        "closed": False,
+        "ctx": pool.mp_ctx,
+        "workers": workers,
+        "server_count": server_count,
+        "request_queues": pool.inference_request_queues,
+        "control_queues": pool.inference_control_queues,
+        "server_processes": pool.inference_processes,
+        "server_response_senders": sender_maps,
+        "worker_response_receivers": pool.inference_response_receivers,
+        "worker_shared_buffers": pool.inference_shared_buffers,
+        "worker_server_idx": worker_server_idx,
+        # These labels already have compiled wrappers in the self-play server.
+        "model_labels": ("learner", "best"),
+        "model_summary": "self-play server borrowed",
+        "pid_summary": ",".join(str(process.pid) for process in pool.inference_processes),
+        "load_s": 0.0,
+        "snapshot_s": 0.0,
+        "startup_s": 0.0,
+        "stage_count": 0,
+    }
 
 
 def _resolve_central_inference_server_count(config, worker_specs, device_type):
@@ -104,10 +160,33 @@ class _PersistentSelfPlayPool:
         self.inference_control_queue = self.inference_control_queues[0] if self.inference_control_queues else None
         self.inference_response_receivers = {}
         self.inference_response_senders = {}
+        self.inference_shared_buffers = {}
         self.inference_processes = []
         self.inference_process = None
         self._central_task_id = None
         self._central_loaded_labels = set()
+        self.shared_memory_enabled = bool(
+            self.central_inference_enabled
+            and central_cfg.get('shared_memory_enabled', True)
+        )
+        if self.shared_memory_enabled:
+            raw_capacity = central_cfg.get(
+                'shared_memory_slot_batch_size',
+                rl_cfg.get('mcts_batch_size', rl_cfg.get('mcts_simulations', 192)),
+            )
+            if isinstance(raw_capacity, str) and raw_capacity.strip().lower() == 'auto':
+                raw_capacity = rl_cfg.get('mcts_batch_size', rl_cfg.get('mcts_simulations', 192))
+            slot_capacity = max(1, int(raw_capacity or 192))
+            slot_count = max(1, int(central_cfg.get('shared_memory_slots_per_worker', 2) or 2))
+            input_planes = 16 * (1 + int(config.get('model', {}).get('history_positions', 0) or 0))
+            for rank, _games in self.worker_specs:
+                self.inference_shared_buffers[int(rank)] = create_shared_inference_buffer(
+                    self.mp_ctx,
+                    slots=slot_count,
+                    capacity=slot_capacity,
+                    input_planes=input_planes,
+                    max_legal_moves=MAX_LEGAL_MOVES,
+                )
         self.started = False
 
     def _worker_runtime_args(self, rank):
@@ -129,13 +208,14 @@ class _PersistentSelfPlayPool:
             else None
         )
         inference_response_queue = self.inference_response_receivers.get(rank)
-        return device_id, inference_request_queue, inference_response_queue
+        shared_buffer = self.inference_shared_buffers.get(rank)
+        return device_id, inference_request_queue, inference_response_queue, shared_buffer
 
     def _spawn_worker(self, rank, task_queue=None):
         rank = int(rank)
         if task_queue is None:
             task_queue = self.mp_ctx.Queue()
-        device_id, inference_request_queue, inference_response_queue = self._worker_runtime_args(rank)
+        device_id, inference_request_queue, inference_response_queue, shared_buffer = self._worker_runtime_args(rank)
         process = self.mp_ctx.Process(
             target=persistent_selfplay_worker,
             args=(
@@ -146,6 +226,7 @@ class _PersistentSelfPlayPool:
                 self.result_queue,
                 inference_request_queue,
                 inference_response_queue,
+                shared_buffer,
             ),
         )
         process.daemon = True
@@ -196,8 +277,13 @@ class _PersistentSelfPlayPool:
             and central_cfg.get('enabled', True)
         )
         wanted_servers = _resolve_central_inference_server_count(self.config, worker_specs, device_type)
+        # Persistent processes do not own a fixed game quota.  Reuse the pool
+        # when ranks/topology are unchanged even if a later task distributes a
+        # different number of games per worker.
+        current_ranks = [int(rank) for rank, _games in self.worker_specs]
+        wanted_ranks = [int(rank) for rank, _games in list(worker_specs)]
         return (
-            self.worker_specs == list(worker_specs)
+            current_ranks == wanted_ranks
             and self.device_type == device_type
             and self.temp_dir == Path(temp_dir)
             and self.central_inference_enabled == wanted_central
@@ -215,6 +301,11 @@ class _PersistentSelfPlayPool:
                 self.inference_response_senders[int(rank)] = send_conn
             gpu_count = max(1, int(torch.cuda.device_count() or 1))
             for server_idx in range(self.central_inference_server_count):
+                server_shared_buffers = {
+                    int(rank): buffer_spec
+                    for rank, buffer_spec in self.inference_shared_buffers.items()
+                    if int(rank) % self.central_inference_server_count == server_idx
+                }
                 inference_process = self.mp_ctx.Process(
                     target=central_inference_server,
                     args=(
@@ -224,6 +315,7 @@ class _PersistentSelfPlayPool:
                         self.inference_response_senders,
                         self.inference_control_queues[server_idx],
                         9000 + (int(os.getpid()) % 100000) * 10 + int(server_idx),
+                        server_shared_buffers,
                     ),
                 )
                 inference_process.daemon = True
@@ -320,7 +412,8 @@ class _PersistentSelfPlayPool:
                     f"servers={len(load_messages)}, {model_summary}"
                     f"{f', load={max_load_s:.2f}s' if load_times else ''}"
                     f", startup_wait={startup_wait_s:.2f}s"
-                    f"{f', pids={pid_summary}' if pid_summary else ''}.",
+                    f"{f', pids={pid_summary}' if pid_summary else ''}"
+                    f"{f', shared_memory={sum(shared_inference_bytes(spec) for spec in self.inference_shared_buffers.values()) / (1024 ** 2):.1f} MiB' if self.inference_shared_buffers else ''}.",
                     flush=True,
                 )
 
@@ -358,11 +451,11 @@ class _PersistentSelfPlayPool:
         model_state_path,
         temperature,
         num_games,
-        q_selection_weight=None,
         runtime_overrides=None,
         opponent_payload=None,
         model_state=None,
         stream_results_to_queue=False,
+        hard_start_positions=None,
     ):
         result_file, progress_file = self._prepare_task_files(rank, task_id)
         self._prepare_central_inference_models(task_id, model_state, model_state_path, opponent_payload)
@@ -377,9 +470,9 @@ class _PersistentSelfPlayPool:
             'num_games': int(num_games),
             'result_file_path': str(result_file),
             'mcts_temperature': temperature,
-            'mcts_q_selection_weight': q_selection_weight,
             'rl_runtime_overrides': dict(runtime_overrides or {}),
             'stream_results_to_queue': bool(stream_results_to_queue),
+            'hard_start_positions': list(hard_start_positions or []),
         })
         return result_file, progress_file
 
@@ -388,17 +481,18 @@ class _PersistentSelfPlayPool:
         task_id,
         model_state_path,
         temperature,
-        q_selection_weight=None,
         runtime_overrides=None,
         worker_model_state_paths=None,
         worker_opponent_payloads=None,
         model_state=None,
         stream_results_to_queue=False,
+        worker_hard_start_positions=None,
     ):
         result_files = []
         progress_files = []
         worker_model_state_paths = worker_model_state_paths or {}
         worker_opponent_payloads = worker_opponent_payloads or {}
+        worker_hard_start_positions = worker_hard_start_positions or {}
 
         for rank, games_for_worker in self.worker_specs:
             opponent_payload = worker_opponent_payloads.get(rank) or {}
@@ -407,12 +501,12 @@ class _PersistentSelfPlayPool:
                 task_id=task_id,
                 model_state_path=worker_model_state_paths.get(rank, model_state_path),
                 temperature=temperature,
-                q_selection_weight=q_selection_weight,
                 runtime_overrides=runtime_overrides,
                 num_games=int(games_for_worker),
                 opponent_payload=opponent_payload,
                 model_state=model_state,
                 stream_results_to_queue=stream_results_to_queue,
+                hard_start_positions=worker_hard_start_positions.get(rank, []),
             )
             result_files.append(result_file)
             progress_files.append(progress_file)
@@ -467,6 +561,7 @@ class _PersistentSelfPlayPool:
         self.processes.clear()
         self.inference_response_receivers.clear()
         self.inference_response_senders.clear()
+        self.inference_shared_buffers.clear()
         self.inference_request_queues = []
         self.inference_control_queues = []
         self.inference_request_queue = None

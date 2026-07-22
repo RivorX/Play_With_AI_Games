@@ -67,6 +67,14 @@ class RLLoggerMixin:
             for raw_key, avg_key in [
                 ('mcts_central_inference_remote_wait_time', 'central_remote_wait_ms_per_request'),
                 ('mcts_central_inference_server_queue_wait_time', 'central_server_queue_wait_ms_per_request'),
+                (
+                    'mcts_central_inference_server_descriptor_queue_wait_time',
+                    'central_descriptor_queue_wait_ms_per_request',
+                ),
+                (
+                    'mcts_central_inference_server_batch_coalesce_wait_time',
+                    'central_batch_coalesce_wait_ms_per_request',
+                ),
                 ('mcts_central_inference_server_concat_time', 'central_server_concat_ms_per_request'),
                 ('mcts_central_inference_server_h2d_time', 'central_server_h2d_ms_per_request'),
                 ('mcts_central_inference_server_forward_time', 'central_server_forward_ms_per_request'),
@@ -76,6 +84,74 @@ class RLLoggerMixin:
                 raw_value = _float_or_none(profile.get(raw_key))
                 if raw_value is not None:
                     profile[avg_key] = 1000.0 * float(raw_value) / float(central_requests)
+        if central_requests and central_requests > 0:
+            shared_requests = _int_or_none(
+                profile.get('mcts_central_inference_shared_requests')
+            ) or 0
+            cache_queries = _int_or_none(
+                profile.get('mcts_central_inference_cache_queries')
+            ) or 0
+            cache_bypassed = _int_or_none(
+                profile.get('mcts_central_inference_cache_bypassed_positions')
+            ) or 0
+            cache_hits = _int_or_none(
+                profile.get('mcts_central_inference_cache_hits')
+            ) or 0
+            dedup_hits = _int_or_none(
+                profile.get('mcts_central_inference_dedup_hits')
+            ) or 0
+            cache_scope = cache_queries + cache_bypassed
+            profile.setdefault(
+                'central_shared_memory_request_fraction',
+                float(shared_requests) / float(central_requests),
+            )
+            profile.setdefault(
+                'central_shared_memory_mib_avoided',
+                float(profile.get('mcts_central_inference_shared_bytes_avoided', 0) or 0)
+                / float(1024 ** 2),
+            )
+            profile.setdefault(
+                'central_shared_slot_wait_ms_per_request',
+                1000.0 * float(profile.get('mcts_central_inference_shared_slot_wait_time', 0.0) or 0.0)
+                / float(max(1, shared_requests)),
+            )
+            profile.setdefault(
+                'central_cache_hit_rate',
+                float(cache_hits) / float(cache_queries) if cache_queries > 0 else 0.0,
+            )
+            profile.setdefault(
+                'central_dedup_hit_rate',
+                float(dedup_hits) / float(cache_queries) if cache_queries > 0 else 0.0,
+            )
+            profile.setdefault(
+                'central_nn_saved_rate',
+                float(cache_hits + dedup_hits) / float(cache_queries)
+                if cache_queries > 0 else 0.0,
+            )
+            profile.setdefault(
+                'central_cache_active_fraction',
+                float(cache_queries) / float(cache_scope) if cache_scope > 0 else 0.0,
+            )
+            profile.setdefault(
+                'central_nn_saved_overall_rate',
+                float(cache_hits + dedup_hits) / float(cache_scope)
+                if cache_scope > 0 else 0.0,
+            )
+            profile.setdefault(
+                'central_server_cache_lookup_ms_per_request',
+                1000.0 * float(profile.get('mcts_central_inference_server_cache_lookup_time', 0.0) or 0.0)
+                / float(central_requests),
+            )
+            profile.setdefault(
+                'central_server_staging_copy_ms_per_request',
+                1000.0 * float(profile.get('mcts_central_inference_server_staging_copy_time', 0.0) or 0.0)
+                / float(central_requests),
+            )
+            profile.setdefault(
+                'central_gpu_batch_fill',
+                float(profile.get('mcts_central_inference_gpu_batch_fill_sum', 0.0) or 0.0)
+                / float(central_requests),
+            )
 
         search_time = _float_or_none(profile.get('mcts_search_many_time'))
         nn_time = _float_or_none(profile.get('mcts_nn_inference_time'))
@@ -112,6 +188,8 @@ class RLLoggerMixin:
                 'central_server_h2d_ms_per_request',
                 'central_server_forward_ms_per_request',
                 'central_server_d2h_ms_per_request',
+                'central_server_cache_lookup_ms_per_request',
+                'central_server_staging_copy_ms_per_request',
             )
         }
         server_other_ms = max(0.0, server_total_ms - sum(server_stage_ms.values()))
@@ -135,9 +213,14 @@ class RLLoggerMixin:
             'iteration': int(iteration),
             'schema_version': RL_LOG_SCHEMA_VERSION,
             'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'selfplay_worker_count': _value('worker_count'),
+            'selfplay_games_per_worker_mean': _value('games_per_worker_mean'),
             'replay_positions_per_sec': replay_positions_per_sec,
             'played_positions_per_sec': _value('played_positions_per_sec'),
             'mcts_simulations_per_sec': _value('mcts_simulations_per_sec'),
+            'mcts_effective_simulations_per_sec': _value(
+                'mcts_effective_simulations_per_sec'
+            ),
             'mcts_nn_evaluations_per_sec': _value('mcts_nn_evaluations_per_sec'),
             'mcts_selection_node_traversals_per_sec': _value(
                 'mcts_selection_node_traversals_per_sec'
@@ -154,6 +237,12 @@ class RLLoggerMixin:
             ),
             'central_remote_wait_ms_per_request': _value('central_remote_wait_ms_per_request'),
             'central_server_queue_wait_ms_per_request': _value('central_server_queue_wait_ms_per_request'),
+            'central_descriptor_queue_wait_ms_per_request': _value(
+                'central_descriptor_queue_wait_ms_per_request'
+            ),
+            'central_batch_coalesce_wait_ms_per_request': _value(
+                'central_batch_coalesce_wait_ms_per_request'
+            ),
             'central_server_concat_ms_per_request': _value('central_server_concat_ms_per_request'),
             'central_server_h2d_ms_per_request': _value('central_server_h2d_ms_per_request'),
             'central_server_forward_ms_per_request': _value('central_server_forward_ms_per_request'),
@@ -161,6 +250,30 @@ class RLLoggerMixin:
             'central_server_other_ms_per_request': server_other_ms,
             'central_worker_ipc_ms_per_request': worker_ipc_ms,
             'central_server_total_ms_per_request': _value('central_server_total_ms_per_request'),
+            'central_shared_memory_request_fraction': _value('central_shared_memory_request_fraction'),
+            'central_shared_memory_mib_avoided': _value('central_shared_memory_mib_avoided'),
+            'central_shared_slot_wait_ms_per_request': _value('central_shared_slot_wait_ms_per_request'),
+            'central_cache_hit_rate': _value('central_cache_hit_rate'),
+            'central_dedup_hit_rate': _value('central_dedup_hit_rate'),
+            'central_nn_saved_rate': _value('central_nn_saved_rate'),
+            'central_cache_active_fraction': _value('central_cache_active_fraction'),
+            'central_nn_saved_overall_rate': _value('central_nn_saved_overall_rate'),
+            'central_cache_suspensions': _value(
+                'mcts_central_inference_cache_suspensions'
+            ),
+            'central_cache_reactivations': _value(
+                'mcts_central_inference_cache_reactivations'
+            ),
+            'central_nn_evaluated_positions': _value(
+                'mcts_central_inference_nn_evaluated_positions'
+            ),
+            'central_server_cache_lookup_ms_per_request': _value(
+                'central_server_cache_lookup_ms_per_request'
+            ),
+            'central_server_staging_copy_ms_per_request': _value(
+                'central_server_staging_copy_ms_per_request'
+            ),
+            'central_gpu_batch_fill': _value('central_gpu_batch_fill'),
             'mcts_worker_nn_wait_ms_per_position': _value('worker_nn_wait_ms_per_position'),
             'mcts_worker_nn_wait_ms_per_batch': _value('worker_nn_wait_ms_per_batch'),
             'central_server_queue_wait_ms_per_position': _value('central_server_queue_wait_ms_per_position'),
@@ -214,6 +327,91 @@ class RLLoggerMixin:
             self.data_quality_log_path,
         )
         return
+
+    def add_final_elo_runtime(self, iteration, elapsed_seconds):
+        """Charge the post-loop final Elo evaluation to the final iteration.
+
+        The final Stockfish check runs after the normal iteration row has
+        already been written. Patch that row instead of appending a duplicate
+        iteration, and keep the aggregate iteration time/bottleneck coherent.
+        """
+        if self.mode != "rl":
+            return
+        try:
+            iteration = int(iteration)
+            elapsed_seconds = max(0.0, float(elapsed_seconds))
+        except (TypeError, ValueError):
+            return
+        if iteration <= 0 or elapsed_seconds <= 0.0:
+            return
+
+        paths = [self.performance_log_path, getattr(self, 'latest_training_profile_path', None)]
+        seen_paths = set()
+        for path in paths:
+            if path is None or path in seen_paths or not path.exists():
+                continue
+            seen_paths.add(path)
+            try:
+                metadata_rows, rows = _read_csv_rows_preserving_metadata(path)
+                if not rows:
+                    continue
+                header = list(rows[0])
+                required = (
+                    'stage_elo_eval_time_s',
+                    'iteration_total_time_s',
+                    'bottleneck_stage',
+                )
+                for column in required:
+                    if column not in header:
+                        header.append(column)
+                        for row in rows[1:]:
+                            row.append('')
+
+                iter_column = 'iteration' if 'iteration' in header else 'epoch'
+                iter_idx = header.index(iter_column)
+                target_row = None
+                for row in reversed(rows[1:]):
+                    while len(row) < len(header):
+                        row.append('')
+                    try:
+                        if int(float(row[iter_idx])) == iteration:
+                            target_row = row
+                            break
+                    except (TypeError, ValueError):
+                        continue
+                if target_row is None:
+                    continue
+
+                def _number_at(column):
+                    try:
+                        return float(target_row[header.index(column)] or 0.0)
+                    except (TypeError, ValueError, IndexError):
+                        return 0.0
+
+                elo_idx = header.index('stage_elo_eval_time_s')
+                total_idx = header.index('iteration_total_time_s')
+                target_row[elo_idx] = str(_number_at('stage_elo_eval_time_s') + elapsed_seconds)
+                target_row[total_idx] = str(_number_at('iteration_total_time_s') + elapsed_seconds)
+
+                stage_columns = [
+                    column
+                    for column in header
+                    if column.startswith('stage_') and column.endswith('_time_s')
+                ]
+                if stage_columns:
+                    target_row[header.index('bottleneck_stage')] = max(
+                        stage_columns,
+                        key=_number_at,
+                    )[len('stage_'):-len('_time_s')]
+
+                rows[0] = header
+                with open(path, 'w', newline='') as handle:
+                    writer = csv.writer(handle)
+                    writer.writerows(metadata_rows)
+                    writer.writerows(rows)
+            except Exception:
+                # Runtime backfill is diagnostic only; never fail a completed run.
+                continue
 
     def log_rl_data_quality(
         self,
@@ -332,6 +530,9 @@ class RLLoggerMixin:
         )
         mcts_avg_sims = _float(selfplay_stats, 'search_simulations_used_avg')
         mcts_avg_budget = _float(selfplay_stats, 'search_simulations_budget_avg')
+        hard_start_games = _float(selfplay_stats, 'hard_start_games')
+        full_search_samples = _float(selfplay_stats, 'playout_cap_full_search_samples')
+        fast_search_samples = _float(selfplay_stats, 'playout_cap_fast_search_samples')
         changed_rate = _float(selfplay_stats, 'mcts_prior_changed_rate')
         higher_q_rate = _float(selfplay_stats, 'mcts_changed_to_higher_q_rate')
         lower_q_rate = _float(selfplay_stats, 'mcts_changed_to_lower_q_when_changed_rate')
@@ -342,6 +543,18 @@ class RLLoggerMixin:
             'schema_version': RL_LOG_SCHEMA_VERSION,
             'timestamp': datetime.now().isoformat(timespec='seconds'),
             'positions_added': positions_added,
+            'replay_candidate_positions': _value(selfplay_stats, 'replay_candidate_positions'),
+            'played_positions': _value(selfplay_stats, 'played_positions'),
+            'replay_cap_dropped_positions': _value(selfplay_stats, 'cap_dropped_positions'),
+            'replay_overwritten_positions': _value(
+                replay_stats,
+                'overwritten_positions_iteration',
+            ),
+            'replay_resize_dropped_positions': _value(
+                replay_stats,
+                'resize_dropped_positions_iteration',
+            ),
+            'replay_evicted_positions_total': _value(replay_stats, 'evicted_positions'),
             'replay_size': _value(replay_stats, 'size'),
             'replay_capacity': _value(replay_stats, 'capacity'),
             'replay_fill_rate': _value(replay_stats, 'fill_rate'),
@@ -349,6 +562,19 @@ class RLLoggerMixin:
             'train_steps': _value(replay_stats, 'train_steps'),
             'train_selected_samples': _value(replay_stats, 'train_selected_samples'),
             'train_replay_coverage': _value(replay_stats, 'train_replay_coverage'),
+            'train_replay_passes': _value(replay_stats, 'train_replay_passes'),
+            'champion_replay_size': _value(replay_stats, 'champion_replay_size'),
+            'champion_replay_capacity': _value(replay_stats, 'champion_replay_capacity'),
+            'champion_replay_added': _value(replay_stats, 'champion_replay_added'),
+            'champion_replay_selected_samples': _value(
+                replay_stats, 'champion_replay_selected_samples'
+            ),
+            'champion_replay_selected_fraction': _value(
+                replay_stats, 'champion_replay_selected_fraction'
+            ),
+            'champion_replay_target_fraction': _value(
+                replay_stats, 'champion_replay_target_fraction'
+            ),
             'replay_decisive_fraction': _value(replay_stats, 'decisive_fraction'),
             'replay_draw_fraction': _value(replay_stats, 'draw_fraction'),
             'replay_value_mean': _value(replay_stats, 'value_mean'),
@@ -363,6 +589,16 @@ class RLLoggerMixin:
             'value_weight_mean': _value(replay_stats, 'value_weight_mean'),
             'value_weight_p10': _value(replay_stats, 'value_weight_p10'),
             'value_weight_low_fraction': _value(replay_stats, 'value_weight_low_fraction'),
+            'root_q_coverage': _value(replay_stats, 'root_q_coverage'),
+            'root_q_mean': _value(replay_stats, 'root_q_mean'),
+            'root_q_std': _value(replay_stats, 'root_q_std'),
+            'best_q_coverage': _value(replay_stats, 'best_q_coverage'),
+            'best_q_mean': _value(replay_stats, 'best_q_mean'),
+            'played_q_coverage': _value(replay_stats, 'played_q_coverage'),
+            'orig_q_coverage': _value(replay_stats, 'orig_q_coverage'),
+            'policy_kld_coverage': _value(replay_stats, 'policy_kld_coverage'),
+            'policy_kld_mean': _value(replay_stats, 'policy_kld_mean'),
+            'deblunder_value_fraction': _value(replay_stats, 'deblunder_value_fraction'),
             'replay_source_learner_fraction': _value(replay_stats, 'source_learner_fraction'),
             'replay_source_frozen_best_fraction': _value(replay_stats, 'source_frozen_best_fraction'),
             'replay_policy_weight_learner_share': _value(replay_stats, 'source_learner_policy_weight_share'),
@@ -374,12 +610,33 @@ class RLLoggerMixin:
             'policy_target_top3_prob_mean': _value(replay_stats, 'policy_target_top3_prob_mean'),
             'policy_target_effective_moves': _value(replay_stats, 'policy_target_effective_moves'),
             'policy_entropy_ratio': policy_entropy_ratio,
+            'replay_policy_correction_fraction': _value(
+                replay_stats, 'policy_correction_fraction'
+            ),
+            'replay_policy_correction_q_delta_mean': _value(
+                replay_stats, 'policy_correction_q_delta_mean'
+            ),
+            'replay_policy_correction_weight_share': _value(
+                replay_stats, 'policy_correction_weight_share'
+            ),
             'sample_age_avg': _value(replay_stats, 'sample_age_avg'),
             'sample_age_p50': _value(replay_stats, 'sample_age_p50'),
             'sample_age_p90': _value(replay_stats, 'sample_age_p90'),
             'sample_age_new_fraction': _value(replay_stats, 'sample_age_new_fraction'),
             'sample_age_le1_fraction': _value(replay_stats, 'sample_age_le1_fraction'),
             'iterations_since_promotion': _value(replay_stats, 'iterations_since_promotion'),
+            'recent_sample_age_avg': _value(replay_stats, 'recent_sample_age_avg'),
+            'recent_sample_age_p50': _value(replay_stats, 'recent_sample_age_p50'),
+            'recent_sample_age_p90': _value(replay_stats, 'recent_sample_age_p90'),
+            'recent_sample_age_new_fraction': _value(
+                replay_stats, 'recent_sample_age_new_fraction'
+            ),
+            'recent_sample_age_le1_fraction': _value(
+                replay_stats, 'recent_sample_age_le1_fraction'
+            ),
+            'champion_sample_age_avg': _value(replay_stats, 'champion_sample_age_avg'),
+            'champion_sample_age_p50': _value(replay_stats, 'champion_sample_age_p50'),
+            'champion_sample_age_p90': _value(replay_stats, 'champion_sample_age_p90'),
             'selfplay_completed_games': _value(selfplay_stats, 'completed_games'),
             'selfplay_draw_rate': _value(selfplay_stats, 'completed_draw_rate'),
             'selfplay_decisive_rate': _value(selfplay_stats, 'decisive_rate'),
@@ -388,13 +645,30 @@ class RLLoggerMixin:
             'selfplay_avg_game_value': _value(selfplay_stats, 'avg_game_value'),
             'selfplay_value_std': _value(selfplay_stats, 'value_std'),
             'selfplay_replay_storage_keep_rate': replay_storage_keep_rate,
+            'selfplay_hard_start_games': hard_start_games if hard_start_games is not None else '',
+            'selfplay_hard_start_fraction': _ratio(
+                hard_start_games,
+                (_float(selfplay_stats, 'completed_games') or 0.0)
+                + (_float(selfplay_stats, 'truncated_games') or 0.0),
+            ),
             'opponent_mix_error': opponent_mix_error,
             'opponent_promotion_transition_progress': opponent_adaptive_factors.get(
                 '_promotion_transition_progress', ''
             ),
-            'mcts_dirichlet_weight': _value(selfplay_stats, 'mcts_dirichlet_weight'),
             'mcts_avg_sims': mcts_avg_sims,
+            'mcts_fresh_sims': _value(
+                selfplay_stats, 'search_fresh_simulations_used_avg'
+            ),
+            'mcts_inherited_visit_credit': _value(
+                selfplay_stats, 'search_inherited_visit_credit_avg'
+            ),
             'mcts_avg_budget': mcts_avg_budget,
+            'mcts_full_search_samples': full_search_samples if full_search_samples is not None else '',
+            'mcts_fast_search_samples': fast_search_samples if fast_search_samples is not None else '',
+            'mcts_full_search_fraction': _ratio(
+                full_search_samples,
+                (full_search_samples or 0.0) + (fast_search_samples or 0.0),
+            ),
             'mcts_budget_utilization': _ratio(mcts_avg_sims, mcts_avg_budget),
             'mcts_budget_target': _value(selfplay_stats, 'search_simulations_budget_target'),
             'mcts_budget_min': _value(selfplay_stats, 'search_simulations_budget_min'),
@@ -402,6 +676,51 @@ class RLLoggerMixin:
             'mcts_budget_p50': _value(selfplay_stats, 'search_simulations_budget_p50'),
             'mcts_budget_p90': _value(selfplay_stats, 'search_simulations_budget_p90'),
             'mcts_budget_max': _value(selfplay_stats, 'search_simulations_budget_max'),
+            'mcts_difficulty_mean': _value(selfplay_stats, 'search_difficulty_mean'),
+            'mcts_full_search_difficulty_mean': _value(
+                selfplay_stats, 'full_search_difficulty_mean'
+            ),
+            'mcts_fast_search_difficulty_mean': _value(
+                selfplay_stats, 'fast_search_difficulty_mean'
+            ),
+            'mcts_difficulty_budget_correlation': _value(
+                selfplay_stats, 'search_difficulty_budget_correlation'
+            ),
+            'mcts_tree_reuse_hit_rate': _value(selfplay_stats, 'tree_reuse_hit_rate'),
+            'mcts_tree_inherited_visits_avg': _value(
+                selfplay_stats, 'tree_inherited_visits_avg'
+            ),
+            'mcts_tree_reuse_credit_samples': _value(
+                selfplay_stats, 'tree_reuse_credit_samples'
+            ),
+            'mcts_tree_reuse_credit_fraction': _ratio(
+                _float(selfplay_stats, 'tree_reuse_credit_samples'),
+                full_search_samples,
+            ),
+            'mcts_tree_reuse_quality_avg': _value(
+                selfplay_stats, 'tree_reuse_quality_avg'
+            ),
+            'mcts_tree_reuse_candidate_coverage_avg': _value(
+                selfplay_stats, 'tree_reuse_candidate_coverage_avg'
+            ),
+            'mcts_tree_reuse_visited_prior_mass_avg': _value(
+                selfplay_stats, 'tree_reuse_visited_prior_mass_avg'
+            ),
+            'mcts_tree_reuse_fresh_floor_avg': _value(
+                selfplay_stats, 'tree_reuse_fresh_floor_avg'
+            ),
+            'mcts_tree_reuse_scout_stability_avg': _value(
+                selfplay_stats, 'tree_reuse_scout_stability_avg'
+            ),
+            'mcts_tree_reuse_scout_extra_credit_avg': _value(
+                selfplay_stats, 'tree_reuse_scout_extra_credit_avg'
+            ),
+            'mcts_tree_reuse_scout_reduction_rate': _value(
+                selfplay_stats, 'tree_reuse_scout_reduction_rate'
+            ),
+            'mcts_shared_tree_search_fraction': _value(
+                selfplay_stats, 'shared_tree_search_fraction'
+            ),
             'mcts_prior_agreement_rate': _value(selfplay_stats, 'mcts_prior_agreement_rate'),
             'mcts_prior_changed_rate': changed_rate,
             'mcts_changed_opening_rate': _value(selfplay_stats, 'mcts_changed_opening_rate'),
@@ -606,15 +925,61 @@ class RLLoggerMixin:
             'avg_loss': kwargs.get('avg_loss', ''),
             'policy_loss': kwargs.get('policy_loss', ''),
             'value_loss': kwargs.get('value_loss', ''),
+            'value_primary_loss': train_metrics.get('value_primary_loss', '') if train_metrics else '',
+            'value_scalar_aux_loss': train_metrics.get('value_scalar_aux_loss', '') if train_metrics else '',
+            'moves_left_loss': train_metrics.get('moves_left_loss', '') if train_metrics else '',
+            'search_q_loss': train_metrics.get('search_q_loss', '') if train_metrics else '',
+            'search_error_loss': train_metrics.get('search_error_loss', '') if train_metrics else '',
+            'search_q_coverage': train_metrics.get('search_q_coverage', '') if train_metrics else '',
+            'search_q_mae': train_metrics.get('search_q_mae', '') if train_metrics else '',
+            'search_error_mae': train_metrics.get('search_error_mae', '') if train_metrics else '',
+            'search_error_pred_mean': train_metrics.get('search_error_pred_mean', '') if train_metrics else '',
+            'search_error_target_mean': train_metrics.get('search_error_target_mean', '') if train_metrics else '',
             'learning_rate': kwargs.get('learning_rate', kwargs.get('lr', '')),
             'value_loss_weight': kwargs.get('value_loss_weight', ''),
-            'mcts_q_selection_weight': kwargs.get('mcts_q_selection_weight', ''),
-            'mcts_q_effective_weight': kwargs.get('mcts_q_effective_weight', ''),
             'temperature': kwargs.get('temperature', ''),
             'policy_top1_acc': train_metrics.get('policy_top1_acc', '') if train_metrics else '',
             'policy_top3_acc': train_metrics.get('policy_top3_acc', '') if train_metrics else '',
+            'policy_correction_loss': train_metrics.get('policy_correction_loss', '') if train_metrics else '',
+            'policy_correction_top1_acc': train_metrics.get('policy_correction_top1_acc', '') if train_metrics else '',
+            'policy_correction_fraction': train_metrics.get('policy_correction_fraction', '') if train_metrics else '',
+            'policy_correction_weight_share': train_metrics.get('policy_correction_weight_share', '') if train_metrics else '',
+            'grad_total_norm': train_metrics.get('grad_total_norm', '') if train_metrics else '',
+            'grad_clip_fraction': train_metrics.get('grad_clip_fraction', '') if train_metrics else '',
+            'grad_clip_scale_mean': train_metrics.get('grad_clip_scale_mean', '') if train_metrics else '',
+            'grad_backbone_norm': train_metrics.get('grad_backbone_norm', '') if train_metrics else '',
+            'grad_policy_head_norm': train_metrics.get('grad_policy_head_norm', '') if train_metrics else '',
+            'grad_value_head_norm': train_metrics.get('grad_value_head_norm', '') if train_metrics else '',
+            'grad_policy_probe_norm': train_metrics.get('grad_policy_probe_norm', '') if train_metrics else '',
+            'grad_value_probe_norm': train_metrics.get('grad_value_probe_norm', '') if train_metrics else '',
+            'grad_policy_value_cosine': train_metrics.get('grad_policy_value_cosine', '') if train_metrics else '',
             'value_mae': train_metrics.get('value_mae', '') if train_metrics else '',
             'value_wdl_acc': train_metrics.get('value_wdl_acc', '') if train_metrics else '',
+            'value_wdl_brier': train_metrics.get('value_wdl_brier', '') if train_metrics else '',
+            'value_wdl_ece': train_metrics.get('value_wdl_ece', '') if train_metrics else '',
+            'value_pred_win_probability': train_metrics.get('value_pred_win_probability', '') if train_metrics else '',
+            'value_pred_draw_probability': train_metrics.get('value_pred_draw_probability', '') if train_metrics else '',
+            'value_pred_loss_probability': train_metrics.get('value_pred_loss_probability', '') if train_metrics else '',
+            'value_target_win_fraction': train_metrics.get('value_target_win_fraction', '') if train_metrics else '',
+            'value_target_draw_fraction': train_metrics.get('value_target_draw_fraction', '') if train_metrics else '',
+            'value_target_loss_fraction': train_metrics.get('value_target_loss_fraction', '') if train_metrics else '',
+            'value_draw_probability_opening': train_metrics.get('value_draw_probability_opening', '') if train_metrics else '',
+            'value_draw_probability_middlegame': train_metrics.get('value_draw_probability_middlegame', '') if train_metrics else '',
+            'value_draw_probability_endgame': train_metrics.get('value_draw_probability_endgame', '') if train_metrics else '',
+            'value_draw_target_fraction_opening': train_metrics.get('value_draw_target_fraction_opening', '') if train_metrics else '',
+            'value_draw_target_fraction_middlegame': train_metrics.get('value_draw_target_fraction_middlegame', '') if train_metrics else '',
+            'value_draw_target_fraction_endgame': train_metrics.get('value_draw_target_fraction_endgame', '') if train_metrics else '',
+            'value_error_priority_fraction': train_metrics.get('value_error_priority_fraction', '') if train_metrics else '',
+            'value_error_priority_weight_share': train_metrics.get('value_error_priority_weight_share', '') if train_metrics else '',
+            'value_error_priority_mae': train_metrics.get('value_error_priority_mae', '') if train_metrics else '',
+            'value_prediction_mean': train_metrics.get('value_prediction_mean', '') if train_metrics else '',
+            'value_target_mean': train_metrics.get('value_target_mean', '') if train_metrics else '',
+            'value_mean_bias': train_metrics.get('value_mean_bias', '') if train_metrics else '',
+            'value_root_q_pred_mean': train_metrics.get('value_root_q_pred_mean', '') if train_metrics else '',
+            'value_root_q_target_mean': train_metrics.get('value_root_q_target_mean', '') if train_metrics else '',
+            'value_root_q_bias': train_metrics.get('value_root_q_bias', '') if train_metrics else '',
+            'value_root_q_mae': train_metrics.get('value_root_q_mae', '') if train_metrics else '',
+            'value_root_q_correlation': train_metrics.get('value_root_q_correlation', '') if train_metrics else '',
             'value_mae_opening': train_metrics.get('value_mae_opening', '') if train_metrics else '',
             'value_mae_middlegame': train_metrics.get('value_mae_middlegame', '') if train_metrics else '',
             'value_mae_endgame': train_metrics.get('value_mae_endgame', '') if train_metrics else '',
@@ -639,6 +1004,31 @@ class RLLoggerMixin:
             'no_mcts_win_rate': kwargs.get('no_mcts_win_rate', kwargs.get('no_mcts_true_win_rate', '')),
             'no_mcts_score_lower_bound': _score_lower_bound(no_mcts_score, no_mcts_games),
             'mcts_no_mcts_gap': mcts_no_mcts_gap,
+            'eval_mcts_move_samples': kwargs.get('eval_mcts_move_samples', ''),
+            'eval_mcts_avg_simulations': kwargs.get('eval_mcts_avg_simulations', ''),
+            'eval_mcts_reduced_budget_rate': kwargs.get(
+                'eval_mcts_reduced_budget_rate', ''
+            ),
+            'eval_mcts_changed_rate': kwargs.get('eval_mcts_changed_rate', ''),
+            'eval_mcts_higher_q_when_changed_rate': kwargs.get(
+                'eval_mcts_higher_q_when_changed_rate', ''
+            ),
+            'eval_mcts_lower_q_when_changed_rate': kwargs.get(
+                'eval_mcts_lower_q_when_changed_rate', ''
+            ),
+            'eval_mcts_changed_q_delta_mean': kwargs.get('eval_mcts_changed_q_delta_mean', ''),
+            'eval_reference_mcts_changed_rate': kwargs.get(
+                'eval_reference_mcts_changed_rate', ''
+            ),
+            'eval_reference_mcts_avg_simulations': kwargs.get(
+                'eval_reference_mcts_avg_simulations', ''
+            ),
+            'eval_reference_mcts_reduced_budget_rate': kwargs.get(
+                'eval_reference_mcts_reduced_budget_rate', ''
+            ),
+            'eval_reference_mcts_higher_q_when_changed_rate': kwargs.get(
+                'eval_reference_mcts_higher_q_when_changed_rate', ''
+            ),
             'anchor_games': anchor_games,
             'anchor_score_rate': anchor_score,
             'anchor_true_win_rate': kwargs.get('anchor_true_win_rate', ''),
@@ -647,13 +1037,19 @@ class RLLoggerMixin:
             ),
             'anchor_no_mcts_games': anchor_no_mcts_games,
             'anchor_no_mcts_score_rate': anchor_no_mcts_score,
-            'anchor_no_mcts_score_lower_bound': _score_lower_bound(
-                anchor_no_mcts_score, anchor_no_mcts_games
+            'anchor_no_mcts_score_lower_bound': kwargs.get(
+                'anchor_no_mcts_score_lower_bound',
+                _score_lower_bound(anchor_no_mcts_score, anchor_no_mcts_games),
             ),
             'anchor_mcts_no_mcts_gap': kwargs.get('anchor_mcts_no_mcts_gap', ''),
-            'early_stop_streak': kwargs.get('early_stop_streak', ''),
-            'promotion_candidate_streak': kwargs.get('promotion_candidate_streak', ''),
-            'early_stop_reset_reason': kwargs.get('early_stop_reset_reason', ''),
+            'actor_status': kwargs.get('actor_status', ''),
+            'actor_iteration': kwargs.get('actor_iteration', ''),
+            'actor_reference_score_rate': kwargs.get('actor_reference_score_rate', ''),
+            'actor_reference_no_mcts_score_rate': kwargs.get('actor_reference_no_mcts_score_rate', ''),
+            'actor_score_delta': kwargs.get('actor_score_delta', ''),
+            'actor_no_mcts_score_delta': kwargs.get('actor_no_mcts_score_delta', ''),
+            'actor_updated': 1 if bool(kwargs.get('actor_updated', False)) else '',
+            'actor_anchor_verified': 1 if bool(kwargs.get('actor_anchor_verified', False)) else '',
             'rl_best_model': 1 if bool(kwargs.get('rl_best_model', False)) else '',
             'estimated_elo_nn': estimated_elo_nn,
             'estimated_elo_nn_se': estimated_elo_nn_se,

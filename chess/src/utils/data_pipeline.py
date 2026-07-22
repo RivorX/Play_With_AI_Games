@@ -749,8 +749,8 @@ def extract_positions_from_game_worker(args):
     """
     game_data, game_id, min_elo, max_moves_per_game, *optional_moves = args
     
-    import chess
     import struct
+    from src import chess_backend as native_chess
     
     # Import helpers locally
     from src.utils.data_helpers import (
@@ -779,7 +779,7 @@ def extract_positions_from_game_worker(args):
             return []
         
         # Replay game
-        board = chess.Board()
+        board = native_chess.new_board()
         result = game_data['result']
         
         positions = []
@@ -788,7 +788,10 @@ def extract_positions_from_game_worker(args):
         moves_are_objects = bool(moves) and isinstance(moves[0], chess.Move)
         for raw_move in moves:
             try:
-                move = raw_move if moves_are_objects else chess.Move.from_uci(raw_move)
+                move_uci = raw_move.uci() if moves_are_objects else str(raw_move)
+                move = native_chess.move_from_uci(move_uci)
+                if move is None:
+                    break
                 # chess.pgn already validates mainline moves while parsing SAN.
                 # Re-generating every legal move here costs ~15% of preprocessing
                 # time and does not add safety for these parsed mainlines.
@@ -805,7 +808,7 @@ def extract_positions_from_game_worker(args):
                 
                 # 🔧 Pack position using helper function (includes move_target)
                 # Format: [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [ActorElo (2B)]
-                actor_elo = white_elo_int if board.turn == chess.WHITE else black_elo_int
+                actor_elo = white_elo_int if board.turn == native_chess.WHITE else black_elo_int
                 position_data = pack_position_data(
                     board=board,
                     game_id=game_id,
@@ -818,7 +821,7 @@ def extract_positions_from_game_worker(args):
                 positions.append(position_data)
                 
                 # Make move and increment index
-                board.push(move)
+                native_chess.apply_move(board, move)
                 move_idx += 1
                 
             except Exception as e:

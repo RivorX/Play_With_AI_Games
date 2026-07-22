@@ -35,12 +35,23 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.model import ChessNet
-from src.batch_selfplay import MCTS
+from src.batch_selfplay import MCTS, select_move_by_visits
+from src import chess_backend as native_chess
 from src.utils.config import normalize_config
 
 #  v4.2: Import board_to_tensor from data_helpers
 #  v4.4: Added move_to_index for POV-aware move encoding
 from src.utils.data_helpers import board_to_tensor, move_to_index
+
+
+def _native_board(board):
+    """One explicit UI -> search conversion; never used inside MCTS."""
+    return native_chess.board_from_fen(board.fen())
+
+
+def _python_move(move):
+    """Convert a native search result back to the python-chess UI board."""
+    return None if move is None else chess.Move.from_uci(native_chess.move_uci(move))
 
 # Import from utils
 from utils.shared.model_match import run_model_match
@@ -1315,8 +1326,9 @@ class ChessGUI:
         mcts.reset_tree()
         max_history = int(self.config.get("model", {}).get("history_positions", 0) or 0) + 10
         for hist_board in list(self.board_history)[-max_history:]:
-            mcts.update_history(hist_board)
-        visit_counts = mcts.search(self.board, sims)
+            mcts.update_history(_native_board(hist_board))
+        native_board = _native_board(self.board)
+        visit_counts = mcts.search(native_board, sims)
         if not visit_counts:
             return []
 
@@ -1325,7 +1337,8 @@ class ChessGUI:
             return []
 
         rows = []
-        for move, visits in sorted(visit_counts.items(), key=lambda item: float(item[1]), reverse=True):
+        for native_move, visits in sorted(visit_counts.items(), key=lambda item: float(item[1]), reverse=True):
+            move = _python_move(native_move)
             try:
                 san = self.board.san(move)
             except Exception:
@@ -1386,7 +1399,8 @@ class ChessGUI:
                     )
                 logits = policy_logits.float().cpu().numpy()[0]
 
-            legal_moves = list(self.board.legal_moves)
+            native_board = _native_board(self.board)
+            legal_moves = native_chess.legal_moves(native_board)
             if not legal_moves:
                 self.analysis_cache = {"fen": current_fen, "rows": [], "side": analysis_color, "label": side_label}
                 self.analysis_cache_by_color[analysis_color] = {"rows": [], "label": side_label, "fen": current_fen}
@@ -1394,7 +1408,7 @@ class ChessGUI:
 
             scored_moves = []
             for move in legal_moves:
-                idx = move_to_index(move, self.board)
+                idx = move_to_index(move, native_board)
                 scored_moves.append((move, float(logits[idx])))
 
             max_logit = max(score for _, score in scored_moves)
@@ -1407,7 +1421,8 @@ class ChessGUI:
 
             rows = []
             sorted_exp_scores = sorted(exp_scores, key=lambda item: item[1], reverse=True)
-            for move, exp_score in sorted_exp_scores:
+            for native_move, exp_score in sorted_exp_scores:
+                move = _python_move(native_move)
                 probability = (exp_score / score_sum) if score_sum > 0 else 0.0
                 rows.append(
                     {
@@ -2451,9 +2466,9 @@ class ChessGUI:
         """Store pre-move state for history-aware inference."""
         self.board_history.append(self.board.copy())
         if self.mcts1:
-            self.mcts1.update_history(self.board)
+            self.mcts1.update_history(_native_board(self.board))
         if self.mcts2:
-            self.mcts2.update_history(self.board)
+            self.mcts2.update_history(_native_board(self.board))
 
     def _sync_mcts_histories(self):
         """Rebuild MCTS histories after undoing moves."""
@@ -2461,7 +2476,7 @@ class ChessGUI:
             if mcts:
                 mcts.reset_tree()
                 for hist_board in self.board_history:
-                    mcts.update_history(hist_board)
+                    mcts.update_history(_native_board(hist_board))
 
     def _rewind_to_ply(self, target_ply):
         try:
@@ -2575,7 +2590,7 @@ class ChessGUI:
         # Move is known here, so we can advance cached MCTS roots directly.
         for mcts in (self.mcts1, self.mcts2):
             if mcts:
-                mcts.advance_root(move)
+                mcts.advance_root(native_chess.move_from_uci(move.uci()))
         self.board.push(move)
         self.move_history.append(move)
         self.move_san_history.append(san_move)
@@ -2669,7 +2684,7 @@ class ChessGUI:
         if history_positions == 0:
             # No history - just current board
             # board_to_tensor automatically handles POV
-            return board_to_tensor(current_board)
+            return board_to_tensor(_native_board(current_board))
         
         # Build history tensors
         tensors = []
@@ -2679,7 +2694,10 @@ class ChessGUI:
             history_boards = self.board_history[-history_positions:]
             # Convert history boards to tensors with POV
             for hist_board in history_boards:
-                hist_tensor = board_to_tensor(hist_board, flip_perspective=(current_board.turn == chess.BLACK))
+                hist_tensor = board_to_tensor(
+                    _native_board(hist_board),
+                    flip_perspective=(current_board.turn == chess.BLACK),
+                )
                 tensors.append(hist_tensor)
         
         # Pad with ZEROS if not enough history (matching training data!)
@@ -2689,7 +2707,7 @@ class ChessGUI:
             tensors.insert(0, empty_tensor)
         
         # Add current board
-        current_tensor = board_to_tensor(current_board)
+        current_tensor = board_to_tensor(_native_board(current_board))
         tensors.append(current_tensor)
         
         # Stack: [oldest_history, ..., newest_history, current]
@@ -2720,12 +2738,13 @@ class ChessGUI:
         # Find best legal move
         best_score = -float('inf')
         best_move = None
-        for move in self.board.legal_moves:
+        native_board = _native_board(self.board)
+        for native_move in native_chess.legal_moves(native_board):
             #  v4.4 FIX: Use POV-aware move_to_index (handles black's perspective)
-            idx = move_to_index(move, self.board)
+            idx = move_to_index(native_move, native_board)
             if policy[idx] > best_score:
                 best_score = policy[idx]
-                best_move = move
+                best_move = _python_move(native_move)
         
         return best_move
     
@@ -2766,11 +2785,13 @@ class ChessGUI:
             move = self._get_cached_mcts_top_move(self.board.turn)
             if move is None:
                 current_mcts_sims = self.mcts_simulations_white if self.board.turn == chess.WHITE else self.mcts_simulations_black
+                native_board = _native_board(self.board)
                 visit_counts = current_mcts.search(
-                    self.board,
+                    native_board,
                     current_mcts_sims
                 )
-                move, _ = select_move_by_visits(visit_counts, temperature=0)
+                native_move, _ = select_move_by_visits(visit_counts, temperature=0)
+                move = _python_move(native_move)
         else:
             #  v4.2: Network-only mode with POV support
             move = self._get_network_move(current_model)

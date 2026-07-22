@@ -39,86 +39,6 @@ def build_runtime_state(
     return state
 
 
-def save_swa_snapshot_checkpoint(
-    epoch_idx,
-    fallback_loss,
-    ref_val_losses,
-    ref_val_metrics,
-    use_swa,
-    swa_model,
-    swa_start,
-    il_dir,
-    history_positions,
-    expected_input_planes,
-    model_version,
-    start_mode,
-    use_bfloat16,
-    model_file_tag,
-    model_architecture,
-    training_batch_size=None,
-):
-    """Save SWA snapshot checkpoint (raw SWA weights, without BN refresh)."""
-    if not use_swa or swa_model is None:
-        return
-    if (epoch_idx + 1) < swa_start:
-        return
-
-    model_tag = str(model_file_tag or "model").strip() or "model"
-    # Keep exactly one rolling SWA snapshot to avoid file proliferation.
-    checkpoint_name = f"{model_tag}_latest_swa.pt"
-
-    ref_val_loss = None
-    ref_top1 = None
-    if ref_val_losses is not None:
-        ref_val_loss = ref_val_losses.get("total")
-    if ref_val_metrics is not None:
-        ref_top1 = ref_val_metrics.get("policy_top1_acc")
-
-    checkpoint_path = il_dir / checkpoint_name
-    metadata = {
-        "swa_enabled": True,
-        "swa_snapshot": True,
-        "swa_bn_updated": False,
-        "swa_start_epoch": swa_start,
-        "history_positions": history_positions,
-        "input_planes": expected_input_planes,
-        "pov_enabled": True,
-        "version": model_version,
-        "startup_mode": start_mode,
-        "model_architecture": dict(model_architecture or {}),
-    }
-    if training_batch_size is not None:
-        try:
-            metadata["training_batch_size"] = int(training_batch_size)
-        except (TypeError, ValueError):
-            pass
-    if ref_val_loss is not None:
-        metadata["val_loss"] = float(ref_val_loss)
-        metadata["val_policy_loss"] = ref_val_losses.get("policy")
-        metadata["val_value_loss"] = ref_val_losses.get("value")
-    if ref_top1 is not None:
-        metadata["val_policy_top1"] = float(ref_top1)
-    if ref_val_metrics is not None:
-        metadata["val_policy_top3"] = ref_val_metrics.get("policy_top3_acc")
-        metadata["val_value_mae"] = ref_val_metrics.get("value_mae")
-
-    save_checkpoint(
-        swa_model.module,
-        None,
-        epoch_idx,
-        float(fallback_loss),
-        str(checkpoint_path),
-        metadata,
-        save_optimizer=False,
-        save_dtype=torch.bfloat16 if use_bfloat16 else None,
-    )
-    size_mb = checkpoint_path.stat().st_size / (1024 ** 2)
-    print(
-        f"Saved SWA snapshot: {checkpoint_path.name} ({size_mb:.1f} MB, "
-        "BN stats refresh pending)"
-    )
-
-
 def _loader_batch_size(base_loader, preferred_batch_size=None):
     if preferred_batch_size is not None:
         try:
@@ -619,6 +539,22 @@ def finalize_swa_model(
         metadata["val_policy_loss"] = float(swa_val_losses["policy"])
     if swa_val_losses.get("value") is not None:
         metadata["val_value_loss"] = float(swa_val_losses["value"])
+    monitor_mode = str(swa_cfg.get("early_stop_monitor", "total") or "total").strip().lower()
+    if monitor_mode in {"value_aware", "value-aware", "value"}:
+        value_weight = max(0.0, float(swa_cfg.get("early_stop_value_loss_weight", 1.25)))
+        mlh_weight = max(0.0, float(swa_cfg.get("early_stop_moves_left_loss_weight", 0.03)))
+        monitor_loss = (
+            float(swa_val_losses.get("policy") or 0.0)
+            + value_weight * float(swa_val_losses.get("value") or 0.0)
+            + mlh_weight * float(swa_val_losses.get("moves_left") or 0.0)
+        )
+        metadata["early_stop_monitor"] = (
+            f"value_aware(policy + {value_weight:g}*value + {mlh_weight:g}*mlh)"
+        )
+        metadata["early_stop_monitor_loss"] = float(monitor_loss)
+    elif swa_val_losses.get("total") is not None:
+        metadata["early_stop_monitor"] = "val_loss"
+        metadata["early_stop_monitor_loss"] = float(swa_val_losses["total"])
     if swa_val_metrics.get("policy_top1_acc") is not None:
         metadata["val_policy_top1"] = float(swa_val_metrics["policy_top1_acc"])
     if swa_val_metrics.get("policy_top3_acc") is not None:

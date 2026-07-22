@@ -4,6 +4,8 @@ import csv
 import shutil
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 
@@ -22,7 +24,27 @@ from ..shared.logger_common import (
 )
 
 
+IL_GRADIENT_METRIC_KEYS = (
+    'grad_total_norm',
+    'grad_clip_fraction',
+    'grad_clip_scale_mean',
+    'grad_backbone_norm',
+    'grad_policy_head_norm',
+    'grad_value_head_norm',
+    'grad_policy_probe_norm',
+    'grad_value_probe_norm',
+    'grad_policy_value_cosine',
+)
+IL_GRADIENT_COLUMNS = tuple(f'train_{key}' for key in IL_GRADIENT_METRIC_KEYS)
+
+
 class ILLoggerMixin:
+    def _ensure_il_gradient_storage(self):
+        for key in IL_GRADIENT_METRIC_KEYS:
+            attr = f'train_{key}'
+            if not hasattr(self, attr):
+                setattr(self, attr, [])
+
     def import_il_history_from_csv(self, source_csv_path, completed_epoch):
         """Seed this IL logger from a previous CSV and keep rows up to completed_epoch."""
         if self.mode != "il" or source_csv_path is None:
@@ -63,6 +85,19 @@ class ILLoggerMixin:
 
         if not kept_rows:
             return False
+
+        # Older runs predate optimizer telemetry.  Extend both the copied
+        # header and historical rows so resumed epochs remain column-aligned.
+        missing_gradient_columns = [
+            column for column in IL_GRADIENT_COLUMNS if column not in header
+        ]
+        if missing_gradient_columns:
+            old_width = len(header)
+            header.extend(missing_gradient_columns)
+            for row in kept_rows:
+                if len(row) < old_width:
+                    row.extend([''] * (old_width - len(row)))
+                row.extend([''] * len(missing_gradient_columns))
 
         try:
             shutil.copy2(source_csv_path, self.csv_path.with_suffix(self.csv_path.suffix + ".pre_resume_copy"))
@@ -166,6 +201,8 @@ class ILLoggerMixin:
         self.estimated_elos = []
         self.estimated_elo_errors = {}
         self.il_mode_elo_markers = []
+        for key in IL_GRADIENT_METRIC_KEYS:
+            setattr(self, f'train_{key}', [])
 
     def _load_il_plot_history(self, rows):
         for row in rows:
@@ -267,6 +304,9 @@ class ILLoggerMixin:
                 ('train_soft_policy_mass_kept_min', 'train_soft_policy_mass_kept_min'),
             ]:
                 getattr(self, attr).append(_csv_float(row, col, 0.0))
+            self._ensure_il_gradient_storage()
+            for key, column in zip(IL_GRADIENT_METRIC_KEYS, IL_GRADIENT_COLUMNS):
+                getattr(self, f'train_{key}').append(_csv_float(row, column, 0.0))
             if _csv_float(row, 'val_loss') is not None:
                 for attr, col in [
                     ('val_policy_top1', 'val_policy_top1'),
@@ -1165,7 +1205,7 @@ class ILLoggerMixin:
 
     def _plot_il(self):
         """Plot IL training progress"""
-        fig, axes = plt.subplots(5, 3, figsize=(19, 19.6))
+        fig, axes = plt.subplots(6, 3, figsize=(19, 23.2))
         fig.patch.set_facecolor('#F7F8FA')
 
         fig.suptitle('IL Training Progress', fontsize=21, fontweight='bold', y=0.992)
@@ -1351,6 +1391,26 @@ class ILLoggerMixin:
                 if value == value:
                     return value
             return None
+
+        def _legend_below(ax, *extra_axes, ncol=3):
+            handles, labels = [], []
+            for legend_ax in (ax,) + extra_axes:
+                current_handles, current_labels = legend_ax.get_legend_handles_labels()
+                handles.extend(current_handles)
+                labels.extend(current_labels)
+                existing = legend_ax.get_legend()
+                if existing is not None:
+                    existing.remove()
+            if handles:
+                ax.legend(
+                    handles,
+                    labels,
+                    loc='upper center',
+                    bbox_to_anchor=(0.5, -0.18),
+                    ncol=max(1, min(int(ncol), len(labels))),
+                    fontsize=7.5,
+                    frameon=False,
+                )
 
         # IL plot layout is grouped by topic for scanning: losses, policy,
         # value, moves-left, data diagnostics, and final run summary. Keep
@@ -1569,8 +1629,68 @@ class ILLoggerMixin:
         else:
             _show_no_data(ax, 'Needs new CSV columns')
 
-        # Row 5: data diagnostics, Elo, and final summary
+        # Row 5: optimizer diagnostics.  The shared-tower probe is sampled once
+        # per epoch; clipping statistics cover every optimizer batch.
+        self._ensure_il_gradient_storage()
+
         ax = axes[4, 0]
+        _style_axis(ax, 'Policy vs Value Gradient Interaction', 'Shared gradient norm (log)')
+        policy_probe = self.train_grad_policy_probe_norm
+        value_probe = self.train_grad_value_probe_norm
+        cosine_values = self.train_grad_policy_value_cosine
+        has_task_gradient = any(float(v or 0.0) != 0.0 for v in policy_probe + value_probe)
+        if has_task_gradient:
+            _plot_line(ax, self.iterations, policy_probe, 'Policy @ shared tower', colors['train'], smooth=False)
+            _plot_line(ax, self.iterations, value_probe, 'Value @ shared tower', colors['value'], smooth=False)
+            ax.set_yscale('log')
+            cosine_ax = ax.twinx()
+            _plot_line(cosine_ax, self.iterations, cosine_values, 'Policy/value cosine', colors['gap'], style='--', smooth=False)
+            cosine_ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.0)
+            cosine_ax.set_ylim(-1.05, 1.05)
+            cosine_ax.tick_params(axis='y', labelcolor=colors['gap'])
+            cosine_ax.spines['right'].set_alpha(0.18)
+            ax.text(
+                0.02, 0.96, 'cosine: + support   0 neutral   - conflict',
+                transform=ax.transAxes, ha='left', va='top', fontsize=7.5, color='#475569',
+            )
+            _legend_below(ax, cosine_ax, ncol=3)
+        else:
+            _show_no_data(ax, 'Gradient telemetry is available in the next epoch')
+
+        ax = axes[4, 1]
+        _style_axis(ax, 'Gradient Norms by Parameter Family', 'Gradient norm (log)')
+        family_values = (
+            self.train_grad_backbone_norm
+            + self.train_grad_policy_head_norm
+            + self.train_grad_value_head_norm
+        )
+        if any(float(v or 0.0) > 0.0 for v in family_values):
+            _plot_line(ax, self.iterations, self.train_grad_backbone_norm, 'Shared tower', colors['train'], smooth=False)
+            _plot_line(ax, self.iterations, self.train_grad_policy_head_norm, 'Policy head', colors['policy'], smooth=False)
+            _plot_line(ax, self.iterations, self.train_grad_value_head_norm, 'Value heads', colors['value'], smooth=False)
+            ax.set_yscale('log')
+            _legend_below(ax, ncol=3)
+        else:
+            _show_no_data(ax, 'Gradient telemetry is available in the next epoch')
+
+        ax = axes[4, 2]
+        _style_axis(ax, 'Optimizer Step and Clipping', 'Total gradient norm (log)')
+        if any(float(v or 0.0) > 0.0 for v in self.train_grad_total_norm):
+            _plot_line(ax, self.iterations, self.train_grad_total_norm, 'Total before clip', '#111827', smooth=False)
+            ax.set_yscale('log')
+            clip_ax = ax.twinx()
+            _plot_line(clip_ax, self.iterations, self.train_grad_clip_fraction, 'Batches clipped', colors['val'], style='--', smooth=False)
+            _plot_line(clip_ax, self.iterations, self.train_grad_clip_scale_mean, 'Mean applied scale', colors['elo'], style=':', smooth=False)
+            clip_ax.set_ylim(0.0, 1.05)
+            clip_ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+            clip_ax.set_ylabel('Fraction / scale')
+            clip_ax.spines['right'].set_alpha(0.18)
+            _legend_below(ax, clip_ax, ncol=3)
+        else:
+            _show_no_data(ax, 'Gradient telemetry is available in the next epoch')
+
+        # Row 6: data diagnostics, Elo, and final summary
+        ax = axes[5, 0]
         _plot_line(ax, self.iterations, self.train_soft_occurrence_avg, 'Train occurrence', colors['train'])
         _plot_line(ax, val_epochs, self.val_soft_occurrence_avg, 'Val occurrence', colors['val'], marker='o')
         _plot_line(ax, self.iterations, self.train_soft_occurrence_max, 'Train max occurrence', colors['train'], style=':', alpha=0.7)
@@ -1697,11 +1817,11 @@ class ILLoggerMixin:
                 bbox=dict(boxstyle='round,pad=0.35', fc='white', ec='#CBD5E1', alpha=0.92),
             )
 
-        ax = axes[4, 1]
+        ax = axes[5, 1]
         self._plot_il_elo_panel(ax)
         ax.set_facecolor('#FFFFFF')
 
-        ax = axes[4, 2]
+        ax = axes[5, 2]
         self._plot_il_summary_panel(ax)
 
         for marker_ax in axes.flat[:-1]:
@@ -1836,6 +1956,8 @@ class ILLoggerMixin:
             kwargs.get('estimated_elo_mcts_ci95_low', ''),
             kwargs.get('estimated_elo_mcts_ci95_high', ''),
             kwargs.get('estimated_elo_mcts_simulations', ''),
+            kwargs.get('estimated_elo_nn_label', ''),
+            kwargs.get('estimated_elo_mcts_label', ''),
         ])
 
         def _metric_value(metrics, key):
@@ -1889,6 +2011,10 @@ class ILLoggerMixin:
             best_val_top1_so_far,
             best_val_mae_so_far,
         ])
+        row.extend([
+            train_metrics.get(key, '') if train_metrics else ''
+            for key in IL_GRADIENT_METRIC_KEYS
+        ])
 
         # Store for plotting
         self.iterations.append(iteration)
@@ -1896,6 +2022,11 @@ class ILLoggerMixin:
         self.train_policy_losses.append(train_losses['policy'])
         self.train_value_losses.append(train_losses['value'])
         self.train_moves_left_losses.append(train_losses.get('moves_left', 0.0))
+        self._ensure_il_gradient_storage()
+        for key in IL_GRADIENT_METRIC_KEYS:
+            getattr(self, f'train_{key}').append(
+                train_metrics.get(key, 0.0) if train_metrics else 0.0
+            )
 
         if train_metrics:
             self.train_policy_top1.append(train_metrics.get('policy_top1_acc', 0))

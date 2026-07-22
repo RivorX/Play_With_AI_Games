@@ -6,10 +6,11 @@ import os
 import sys
 import contextlib
 import concurrent.futures
+import math
+import threading
 import time
 from pathlib import Path
 
-import chess
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -29,13 +30,99 @@ from src.batch_selfplay import (
     _record_position_count,
     central_inference_server,
 )
+from src import chess_backend as chess
 from src.data import board_to_tensor, move_to_index
 from src.model import ChessNet
-from src.utils.data_helpers import ACTION_SIZE, build_hflip_inverse_index_map
+from src.utils.data_helpers import (
+    ACTION_SIZE,
+    MAX_LEGAL_MOVES,
+    board_to_tensor_pair,
+    build_hflip_inverse_index_map,
+)
+from src.utils.q_delta import USEFUL_SEARCH_Q_DELTA_MIN
+from src.utils.shared_inference import create_shared_inference_buffer
 
 
 _HFLIP_INV_INDEX_MAP = None
 _HFLIP_FWD_INDEX_MAP = None
+# Self-play persists the correction identity and its bounded replay weight.
+# Training uses the metadata only for uptake diagnostics; it must not multiply
+# these rows a second time or the actual objective would diverge from the
+# replay weights reported in CSV/PNG.
+
+
+def _gradient_family(name):
+    lowered = str(name).lower()
+    if lowered.startswith('policy_') or '.policy_' in lowered:
+        return 'policy'
+    if (
+        lowered.startswith('value_')
+        or '.value_' in lowered
+        or lowered.startswith('moves_left_')
+        or '.moves_left_' in lowered
+        or lowered.startswith('search_q_')
+        or '.search_q_' in lowered
+        or lowered.startswith('search_error_')
+        or '.search_error_' in lowered
+    ):
+        return 'value'
+    return 'backbone'
+
+
+def _gradient_family_norms(model):
+    sums = {'backbone': None, 'policy': None, 'value': None}
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        family = _gradient_family(name)
+        squared = parameter.grad.detach().float().pow(2).sum()
+        sums[family] = squared if sums[family] is None else sums[family] + squared
+    return {
+        family: (0.0 if squared is None else float(torch.sqrt(squared).item()))
+        for family, squared in sums.items()
+    }
+
+
+def _task_gradient_probe(policy_objective, value_objective, model):
+    """Measure task conflict at the shared tower output once per iteration."""
+    probe_owner = getattr(model, '_orig_mod', model)
+    probe = getattr(getattr(probe_owner, 'final_bn', None), 'weight', None)
+    empty = {
+        'policy_probe_norm': 0.0,
+        'value_probe_norm': 0.0,
+        'policy_value_cosine': 0.0,
+    }
+    if probe is None or not probe.requires_grad:
+        return empty
+    policy_grad = torch.autograd.grad(
+        policy_objective,
+        probe,
+        retain_graph=True,
+        allow_unused=True,
+    )[0]
+    value_grad = torch.autograd.grad(
+        value_objective,
+        probe,
+        retain_graph=True,
+        allow_unused=True,
+    )[0]
+    if policy_grad is None or value_grad is None:
+        return empty
+    policy_flat = policy_grad.detach().float().reshape(-1)
+    value_flat = value_grad.detach().float().reshape(-1)
+    policy_norm = torch.linalg.vector_norm(policy_flat)
+    value_norm = torch.linalg.vector_norm(value_flat)
+    denominator = policy_norm * value_norm
+    cosine = (
+        torch.dot(policy_flat, value_flat) / denominator
+        if float(denominator.item()) > 0.0
+        else torch.zeros((), device=policy_flat.device)
+    )
+    return {
+        'policy_probe_norm': float(policy_norm.item()),
+        'value_probe_norm': float(value_norm.item()),
+        'policy_value_cosine': float(torch.clamp(cosine, -1.0, 1.0).item()),
+    }
 
 
 def _snapshot_state_dict_cpu_shared(model):
@@ -122,9 +209,12 @@ def _resolve_eval_workers(config, device, num_games):
 
 
 def _build_eval_mcts_config(config):
-    """Evaluation uses the same deterministic fixed-budget MCTS contract."""
+    """Evaluation stays deterministic and may lightly trim only easy roots."""
     eval_config = dict(config or {})
     rl_config = dict(eval_config.get('reinforcement_learning', {}) or {})
+    # Self-play's zero-sum redistribution is not an evaluation speedup. Eval's
+    # dedicated easy-cut mode spends less total compute and never exceeds the
+    # configured simulation count on uncertain positions.
     rl_config['mcts_dynamic_budget_enabled'] = False
     eval_config['reinforcement_learning'] = rl_config
     return eval_config
@@ -273,30 +363,6 @@ def _get_eval_opening_prefix(config, game_idx, enabled_override=None):
     return tuple(line[: min(len(line), max_plies)])
 
 
-def _apply_opening_prefix_for_eval(board, opening_prefix, mcts_white, mcts_black):
-    if not opening_prefix:
-        return 0
-
-    applied = 0
-    for uci in opening_prefix:
-        if board.is_game_over(claim_draw=False):
-            break
-        try:
-            move = chess.Move.from_uci(uci)
-        except Exception:
-            break
-        if move not in board.legal_moves:
-            break
-
-        mcts_white.update_history(board)
-        mcts_black.update_history(board)
-        mcts_white.advance_root(move)
-        mcts_black.advance_root(move)
-        board.push(move)
-        applied += 1
-    return applied
-
-
 def _append_eval_history(board_history, board, config):
     board_history.append(_encode_eval_history_entry(board))
     max_history = int(config.get("model", {}).get("history_positions", 0) or 0) + 10
@@ -316,17 +382,17 @@ def _apply_opening_prefix_for_batched_eval(
 
     applied = 0
     for uci in opening_prefix:
-        if board.is_game_over(claim_draw=False):
+        if chess.is_game_over(board, claim_draw=False):
             break
         try:
-            move = chess.Move.from_uci(uci)
+            move = chess.move_from_uci(uci)
         except Exception:
             break
-        if move not in board.legal_moves:
+        if move is None or move not in chess.legal_moves(board):
             break
 
         _append_eval_history(board_history, board, config)
-        board.push(move)
+        chess.apply_move(board, move)
         if position_counts is not None:
             _record_position_count(position_counts, board)
         applied += 1
@@ -334,10 +400,7 @@ def _apply_opening_prefix_for_batched_eval(
 
 
 def _encode_eval_history_entry(board):
-    return (
-        board_to_tensor(board, flip_perspective=False),
-        board_to_tensor(board, flip_perspective=True),
-    )
+    return board_to_tensor_pair(board)
 
 
 def _build_no_mcts_eval_input(board, board_history, config):
@@ -383,7 +446,7 @@ def _select_no_mcts_policy_moves_batched(model, game_states, config, device):
     for state in states:
         board = state["board"]
         inputs.append(_build_no_mcts_eval_input(board, state.get("board_history", []), config))
-        legal_moves = tuple(board.legal_moves)
+        legal_moves = tuple(chess.legal_moves(board))
         legal_indices = [move_to_index(move, board) for move in legal_moves]
         legal_moves_by_row.append(legal_moves)
         legal_indices_by_row.append(legal_indices)
@@ -450,16 +513,16 @@ def _apply_opening_prefix_for_no_mcts_eval(board, board_history, opening_prefix)
 
     applied = 0
     for uci in opening_prefix:
-        if board.is_game_over(claim_draw=False):
+        if chess.is_game_over(board, claim_draw=False):
             break
         try:
-            move = chess.Move.from_uci(uci)
+            move = chess.move_from_uci(uci)
         except Exception:
             break
-        if move not in board.legal_moves:
+        if move is None or move not in chess.legal_moves(board):
             break
         board_history.append(_encode_eval_history_entry(board))
-        board.push(move)
+        chess.apply_move(board, move)
         applied += 1
     return applied
 
@@ -475,13 +538,13 @@ def _evaluate_single_game_no_mcts(
     claim_repetition_after_moves=0,
     opening_prefix=(),
 ):
-    board = chess.Board()
+    board = chess.new_board()
     board_history = []
     move_count = _apply_opening_prefix_for_no_mcts_eval(board, board_history, opening_prefix)
     ended_by_auto_claim_draw = False
 
     while move_count < max_moves:
-        if board.is_game_over(claim_draw=False):
+        if chess.is_game_over(board, claim_draw=False):
             break
 
         model = model_white if board.turn == chess.WHITE else model_black
@@ -490,79 +553,24 @@ def _evaluate_single_game_no_mcts(
             break
 
         board_history.append(_encode_eval_history_entry(board))
-        board.push(move)
+        chess.apply_move(board, move)
         move_count += 1
 
         if auto_claim_draw:
-            try:
-                if move_count >= claim_repetition_after_moves:
-                    claim_threefold = getattr(board, "can_claim_threefold_repetition", None)
-                    if callable(claim_threefold) and bool(claim_threefold()):
-                        ended_by_auto_claim_draw = True
-                        break
-                if move_count >= claim_draw_after_moves and board.can_claim_draw():
-                    ended_by_auto_claim_draw = True
-                    break
-            except Exception:
-                pass
+            if (
+                move_count >= claim_repetition_after_moves
+                and chess.can_claim_threefold_repetition(board)
+            ):
+                ended_by_auto_claim_draw = True
+                break
+            if move_count >= claim_draw_after_moves and chess.can_claim_draw(board):
+                ended_by_auto_claim_draw = True
+                break
 
     if ended_by_auto_claim_draw:
         return "1/2-1/2", False
 
-    result = board.result(claim_draw=False)
-    return result, (result == "*")
-
-
-def _evaluate_single_game(
-    mcts_white,
-    mcts_black,
-    sims,
-    max_moves,
-    auto_claim_draw,
-    claim_draw_after_moves,
-    claim_repetition_after_moves=0,
-    opening_prefix=(),
-):
-    board = chess.Board()
-    move_count = _apply_opening_prefix_for_eval(board, opening_prefix, mcts_white, mcts_black)
-    ended_by_auto_claim_draw = False
-
-    while move_count < max_moves:
-        if board.is_game_over(claim_draw=False):
-            break
-
-        mcts = mcts_white if board.turn == chess.WHITE else mcts_black
-        visit_counts = mcts.search(board, num_simulations=sims, add_root_noise=False)
-        move, _ = select_move_by_visits(visit_counts, temperature=0)
-
-        mcts_white.update_history(board)
-        mcts_black.update_history(board)
-        mcts_white.advance_root(move)
-        mcts_black.advance_root(move)
-
-        board.push(move)
-        move_count += 1
-
-        if auto_claim_draw:
-            try:
-                if move_count >= claim_repetition_after_moves:
-                    claim_threefold = getattr(board, "can_claim_threefold_repetition", None)
-                    if callable(claim_threefold) and bool(claim_threefold()):
-                        ended_by_auto_claim_draw = True
-                        break
-                if move_count >= claim_draw_after_moves and board.can_claim_draw():
-                    ended_by_auto_claim_draw = True
-                    break
-            except Exception:
-                pass
-
-    mcts_white.reset_tree()
-    mcts_black.reset_tree()
-
-    if ended_by_auto_claim_draw:
-        return "1/2-1/2", False
-
-    result = board.result(claim_draw=False)
+    result = chess.result(board, claim_draw=False)
     return result, (result == "*")
 
 
@@ -613,9 +621,56 @@ def _evaluate_games_batched(
     completed = 0
     cursor = 0
     active_games = []
+    eval_search_profile = {}
+
+    def _record_eval_search(prefix, metadata):
+        if not isinstance(metadata, dict):
+            return
+        budget = int(metadata.get('simulation_budget', 0) or 0)
+        requested_budget = int(metadata.get('eval_easy_cut_requested_budget', budget) or budget)
+        budget_samples_key = f"eval_mcts_{prefix}_budget_samples"
+        budget_sum_key = f"eval_mcts_{prefix}_budget_sum"
+        reduced_key = f"eval_mcts_{prefix}_reduced_budget_count"
+        eval_search_profile[budget_samples_key] = int(
+            eval_search_profile.get(budget_samples_key, 0)
+        ) + 1
+        eval_search_profile[budget_sum_key] = float(
+            eval_search_profile.get(budget_sum_key, 0.0)
+        ) + float(budget)
+        if budget < requested_budget:
+            eval_search_profile[reduced_key] = int(
+                eval_search_profile.get(reduced_key, 0)
+            ) + 1
+        agreement = metadata.get("selected_prior_agree")
+        if agreement is None:
+            return
+        sample_key = f"eval_mcts_{prefix}_move_samples"
+        changed_key = f"eval_mcts_{prefix}_changed_count"
+        eval_search_profile[sample_key] = int(eval_search_profile.get(sample_key, 0)) + 1
+        changed = float(agreement) < 0.5
+        if not changed:
+            return
+        eval_search_profile[changed_key] = int(eval_search_profile.get(changed_key, 0)) + 1
+        q_delta = metadata.get("selected_q_delta")
+        try:
+            q_delta = float(q_delta)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(q_delta):
+            return
+        q_samples_key = f"eval_mcts_{prefix}_changed_q_samples"
+        q_sum_key = f"eval_mcts_{prefix}_changed_q_delta_sum"
+        eval_search_profile[q_samples_key] = int(eval_search_profile.get(q_samples_key, 0)) + 1
+        eval_search_profile[q_sum_key] = float(eval_search_profile.get(q_sum_key, 0.0)) + q_delta
+        if q_delta > USEFUL_SEARCH_Q_DELTA_MIN:
+            key = f"eval_mcts_{prefix}_higher_q_count"
+            eval_search_profile[key] = int(eval_search_profile.get(key, 0)) + 1
+        elif q_delta < -USEFUL_SEARCH_Q_DELTA_MIN:
+            key = f"eval_mcts_{prefix}_lower_q_count"
+            eval_search_profile[key] = int(eval_search_profile.get(key, 0)) + 1
 
     def _new_game_state(game_idx):
-        board = chess.Board()
+        board = chess.new_board()
         board_history = []
         position_counts = {_board_position_key(board): 1}
         opening_prefix = _get_eval_opening_prefix(config, game_idx, enabled_override=use_fixed_openings)
@@ -637,7 +692,7 @@ def _evaluate_games_batched(
             "model1_synced": False,
             "model2_root": None,
             "model2_synced": False,
-            "done": bool(board.is_game_over(claim_draw=False) or move_count >= max_moves),
+            "done": bool(chess.is_game_over(board, claim_draw=False) or move_count >= max_moves),
             "auto_claim_draw": False,
         }
 
@@ -654,7 +709,7 @@ def _evaluate_games_batched(
             result = "1/2-1/2"
             was_unresolved = False
         else:
-            result = board.result(claim_draw=False)
+            result = chess.result(board, claim_draw=False)
             was_unresolved = (result == "*")
 
         if was_unresolved:
@@ -687,17 +742,15 @@ def _evaluate_games_batched(
         if not auto_claim_draw:
             return False
         board = gs["board"]
-        try:
-            if gs["move_count"] >= claim_repetition_after_moves:
-                claim_threefold = getattr(board, "can_claim_threefold_repetition", None)
-                if callable(claim_threefold) and bool(claim_threefold()):
-                    gs["auto_claim_draw"] = True
-                    return True
-            if gs["move_count"] >= claim_draw_after_moves and board.can_claim_draw():
-                gs["auto_claim_draw"] = True
-                return True
-        except Exception:
-            return False
+        if (
+            gs["move_count"] >= claim_repetition_after_moves
+            and chess.can_claim_threefold_repetition(board)
+        ):
+            gs["auto_claim_draw"] = True
+            return True
+        if gs["move_count"] >= claim_draw_after_moves and chess.can_claim_draw(board):
+            gs["auto_claim_draw"] = True
+            return True
         return False
 
     _fill_active()
@@ -708,7 +761,7 @@ def _evaluate_games_batched(
             if gs["done"]:
                 continue
             board = gs["board"]
-            if board.is_game_over(claim_draw=False) or gs["move_count"] >= max_moves:
+            if chess.is_game_over(board, claim_draw=False) or gs["move_count"] >= max_moves:
                 gs["done"] = True
                 continue
             model1_turn = bool(board.turn == chess.WHITE) == bool(gs["model1_as_white"])
@@ -719,7 +772,7 @@ def _evaluate_games_batched(
 
         moves_by_index = {}
 
-        def _run_group(indices, model, search_config, mcts, sims, root_key, synced_key):
+        def _run_group(indices, model, search_config, mcts, sims, root_key, synced_key, profile_prefix):
             if not indices:
                 return
             group_states = []
@@ -735,17 +788,26 @@ def _evaluate_games_batched(
                 ])
             if mcts is not None:
                 moves = []
-                visit_counts_group = mcts.search_many(
+                visit_counts_group, metadata_group = mcts.search_many(
                     group_states,
                     num_simulations=sims,
                     add_root_noise=False,
+                    return_search_metadata=True,
                 )
-                for visit_counts in visit_counts_group:
-                    if visit_counts:
+                for visit_counts, metadata in zip(visit_counts_group, metadata_group):
+                    selected_move = (
+                        metadata.get("selected_move_override")
+                        if isinstance(metadata, dict)
+                        else None
+                    )
+                    if selected_move in visit_counts:
+                        move = selected_move
+                    elif visit_counts:
                         move, _ = select_move_by_visits(visit_counts, temperature=0)
                     else:
                         move = None
                     moves.append(move)
+                    _record_eval_search(profile_prefix, metadata)
             else:
                 moves = _select_no_mcts_policy_moves_batched(
                     model,
@@ -763,8 +825,14 @@ def _evaluate_games_batched(
                 gs[synced_key] = bool(local_state[2])
                 moves_by_index[idx] = move
 
-        _run_group(model1_indices, model1, model1_search_config, mcts1, sims1, "model1_root", "model1_synced")
-        _run_group(model2_indices, model2, model2_search_config, mcts2, sims2, "model2_root", "model2_synced")
+        _run_group(
+            model1_indices, model1, model1_search_config, mcts1, sims1,
+            "model1_root", "model1_synced", "model1",
+        )
+        _run_group(
+            model2_indices, model2, model2_search_config, mcts2, sims2,
+            "model2_root", "model2_synced", "model2",
+        )
 
         for idx, gs in enumerate(active_games):
             if gs["done"]:
@@ -778,12 +846,12 @@ def _evaluate_games_batched(
             _append_eval_history(gs["board_history"], board, config)
             gs["model1_root"], gs["model1_synced"] = _advance_eval_root(gs.get("model1_root"), move)
             gs["model2_root"], gs["model2_synced"] = _advance_eval_root(gs.get("model2_root"), move)
-            board.push(move)
+            chess.apply_move(board, move)
             gs["move_count"] += 1
             _record_position_count(gs["position_counts"], board)
 
             if (
-                board.is_game_over(claim_draw=False)
+                chess.is_game_over(board, claim_draw=False)
                 or gs["move_count"] >= max_moves
                 or _claim_draw_if_needed(gs)
             ):
@@ -812,6 +880,8 @@ def _evaluate_games_batched(
         for key, value in dict(mcts.get_profile_stats() or {}).items():
             if isinstance(value, (int, float)):
                 profile[key] = profile.get(key, 0) + value
+    for key, value in eval_search_profile.items():
+        profile[key] = profile.get(key, 0) + value
     stats["profile"] = profile
     return stats
 
@@ -915,6 +985,9 @@ def _eval_central_worker(
     model2_mcts_config=None,
     use_mcts_model1=True,
     use_mcts_model2=True,
+    model1_label="eval_model1",
+    model2_label="eval_model2",
+    shared_buffer=None,
 ):
     try:
         rl_cfg = config.get("reinforcement_learning", {})
@@ -928,9 +1001,10 @@ def _eval_central_worker(
         stall_warning_s = float(_central_inference_option(config, "stall_warning_s", 15) or 0)
         transport_dtype = str(_central_inference_option(config, "transport_dtype", "float16") or "float16")
         debug_enabled = bool(rl_cfg.get("eval_central_inference_debug", False))
+        shared_call_lock = threading.Lock()
 
         model1 = _RemoteInferenceModel(
-            "eval_model1",
+            str(model1_label),
             request_queue,
             response_receiver,
             worker_rank=int(rank),
@@ -938,9 +1012,11 @@ def _eval_central_worker(
             stall_warning_s=stall_warning_s,
             debug_enabled=debug_enabled,
             transport_dtype=transport_dtype,
+            shared_buffer=shared_buffer,
+            shared_call_lock=shared_call_lock,
         )
         model2 = _RemoteInferenceModel(
-            "eval_model2",
+            str(model2_label),
             request_queue,
             response_receiver,
             worker_rank=int(rank),
@@ -948,6 +1024,8 @@ def _eval_central_worker(
             stall_warning_s=stall_warning_s,
             debug_enabled=debug_enabled,
             transport_dtype=transport_dtype,
+            shared_buffer=shared_buffer,
+            shared_call_lock=shared_call_lock,
         )
 
         stats = _evaluate_games_batched(
@@ -996,6 +1074,9 @@ def _eval_central_worker(
 def _close_eval_central_runtime(runtime):
     if not runtime or runtime.get("closed"):
         return
+    if runtime.get("borrowed"):
+        # The persistent self-play pool owns this process and all pipe handles.
+        return
     runtime["closed"] = True
     request_queues = list(runtime.get("request_queues", []) or [])
     for request_queue in request_queues:
@@ -1012,6 +1093,7 @@ def _close_eval_central_runtime(runtime):
         for send_conn in dict(sender_map or {}).values():
             with contextlib.suppress(Exception):
                 send_conn.close()
+    runtime.get("worker_shared_buffers", {}).clear()
 
 
 def _start_eval_central_runtime(
@@ -1041,6 +1123,34 @@ def _start_eval_central_runtime(
         server_response_senders[server_idx][rank] = send_conn
         worker_server_idx[rank] = server_idx
 
+    central_cfg = config.get("central_inference", {}) or {}
+    rl_cfg = config.get("reinforcement_learning", {}) or {}
+    shared_memory_enabled = bool(
+        central_cfg.get("shared_memory_enabled", True)
+        and str(central_cfg.get("transport_dtype", "float16")).lower() in {"float16", "fp16"}
+    )
+    worker_shared_buffers = {}
+    if shared_memory_enabled:
+        raw_capacity = central_cfg.get(
+            "shared_memory_slot_batch_size",
+            rl_cfg.get("mcts_batch_size", rl_cfg.get("mcts_simulations", 192)),
+        )
+        if isinstance(raw_capacity, str) and raw_capacity.strip().lower() == "auto":
+            raw_capacity = rl_cfg.get("mcts_batch_size", rl_cfg.get("mcts_simulations", 192))
+        capacity = max(1, int(raw_capacity or 192))
+        slots = max(1, int(central_cfg.get("shared_memory_slots_per_worker", 2) or 2))
+        input_planes = 16 * (1 + int(config.get("model", {}).get("history_positions", 0) or 0))
+        worker_shared_buffers = {
+            int(rank): create_shared_inference_buffer(
+                ctx,
+                slots=slots,
+                capacity=capacity,
+                input_planes=input_planes,
+                max_legal_moves=MAX_LEGAL_MOVES,
+            )
+            for rank in range(workers)
+        }
+
     runtime = {
         "ctx": ctx,
         "workers": workers,
@@ -1050,6 +1160,8 @@ def _start_eval_central_runtime(
         "server_response_senders": server_response_senders,
         "worker_response_receivers": worker_response_receivers,
         "worker_server_idx": worker_server_idx,
+        "worker_shared_buffers": worker_shared_buffers,
+        "model_labels": ("eval_model1", "eval_model2"),
         "server_processes": [],
         "closed": False,
         "stage_count": 0,
@@ -1070,6 +1182,12 @@ def _start_eval_central_runtime(
                     server_response_senders[server_idx],
                     control_queues[server_idx],
                     compile_rank,
+                    {
+                        int(rank): worker_shared_buffers[int(rank)]
+                        for rank, assigned_server in worker_server_idx.items()
+                        if int(assigned_server) == int(server_idx)
+                        and int(rank) in worker_shared_buffers
+                    },
                 ),
             )
             proc.daemon = True
@@ -1153,17 +1271,127 @@ def _start_eval_central_runtime(
         raise
 
 
-@contextlib.contextmanager
-def eval_central_inference_runtime(model1, model2, config, device, num_games):
-    """Reuse compiled models and one GPU server across sequential eval stages."""
+def _refresh_eval_central_runtime(
+    runtime,
+    model1,
+    model2,
+    config,
+    *,
+    verbose=True,
+    ready_callback=None,
+):
+    """Replace weights while preserving compiled eval models and GPU process."""
+    refresh_t0 = time.perf_counter()
+    task_id = f"eval_refresh_{os.getpid()}_{time.time_ns()}"
+    snapshot_t0 = time.perf_counter()
+    model1_state = _snapshot_state_dict_cpu_shared(model1)
+    model2_state = _snapshot_state_dict_cpu_shared(model2)
+    model1_label, model2_label = runtime.get(
+        "model_labels", ("eval_model1", "eval_model2")
+    )
+    snapshot_s = time.perf_counter() - snapshot_t0
+    for request_queue in runtime["request_queues"]:
+        request_queue.put({
+            "cmd": "load_models",
+            "task_id": task_id,
+            "clear": True,
+            "models": [
+                {"label": model1_label, "state": model1_state, "state_path": None},
+                {"label": model2_label, "state": model2_state, "state_path": None},
+            ],
+        })
+
+    load_timeout_s = float(_central_inference_option(config, "load_timeout_s", 300) or 300)
+    deadline = time.time() + max(1.0, load_timeout_s)
+    pending_servers = set(range(int(runtime["server_count"])))
+    load_messages = []
+    while pending_servers:
+        if time.time() >= deadline:
+            raise TimeoutError(
+                "Eval central inference did not acknowledge refreshed models "
+                f"from servers {sorted(pending_servers)}."
+            )
+        for server_idx in list(pending_servers):
+            try:
+                message = runtime["control_queues"][server_idx].get(timeout=0.25)
+            except Exception:
+                continue
+            if message.get("type") == "models_loaded" and str(message.get("task_id")) == task_id:
+                load_messages.append(dict(message))
+                pending_servers.discard(server_idx)
+
+    load_times = [
+        float(message.get("load_s", 0.0) or 0.0)
+        for message in load_messages
+        if message.get("load_s") is not None
+    ]
+    runtime["model_summary"] = next(
+        (str(message.get("model_summary")) for message in load_messages if message.get("model_summary")),
+        "models ready",
+    )
+    runtime["pid_summary"] = ",".join(
+        str(int(message.get("pid")))
+        for message in load_messages
+        if message.get("pid") is not None
+    )
+    runtime["load_s"] = max(load_times) if load_times else 0.0
+    runtime["snapshot_s"] = snapshot_s
+    runtime["startup_s"] = time.perf_counter() - refresh_t0
+    if ready_callback is not None:
+        ready_callback({
+            "ready": False,
+            "models_ready": True,
+            "workers": int(runtime["workers"]),
+            "server_count": int(runtime["server_count"]),
+            "central_inference": True,
+            "load_s": float(runtime["load_s"]),
+            "startup_s": float(runtime["startup_s"]),
+            "snapshot_s": float(snapshot_s),
+        })
+    if verbose:
+        print(
+            "Eval inference runtime: "
+            f"workers={runtime['workers']}, servers={runtime['server_count']}, "
+            f"{runtime['model_summary']}, load={runtime['load_s']:.2f}s, "
+            f"pid={runtime['pid_summary'] or '-'}"
+        )
+    return runtime
+
+
+def prepare_eval_central_runtime(runtime, model1, model2, config, device, num_games):
+    """Start once, then refresh weights without recompiling between iterations."""
     if not _eval_uses_central_inference(config, device):
-        yield None
-        return
-    runtime = _start_eval_central_runtime(model1, model2, config, device, num_games)
-    try:
-        yield runtime
-    finally:
-        _close_eval_central_runtime(runtime)
+        if runtime is not None:
+            _close_eval_central_runtime(runtime)
+        return None
+
+    workers = _resolve_eval_workers(config, device, num_games)
+    server_count = _resolve_eval_central_server_count(config, workers)
+    runtime_workers = int(runtime.get("workers", 0)) if runtime is not None else 0
+    worker_topology_matches = bool(
+        runtime_workers == int(workers)
+        or (
+            runtime is not None
+            and runtime.get("borrowed")
+            and runtime_workers >= int(workers)
+        )
+    )
+    reusable = bool(
+        runtime is not None
+        and not runtime.get("closed", False)
+        and worker_topology_matches
+        and int(runtime.get("server_count", 0)) == int(server_count)
+        and all(process.is_alive() for process in runtime.get("server_processes", []))
+    )
+    if not reusable:
+        if runtime is not None:
+            _close_eval_central_runtime(runtime)
+        return _start_eval_central_runtime(model1, model2, config, device, num_games)
+    return _refresh_eval_central_runtime(runtime, model1, model2, config)
+
+
+def close_eval_central_runtime(runtime):
+    _close_eval_central_runtime(runtime)
 
 
 def _evaluate_models_with_central_inference(
@@ -1223,6 +1451,9 @@ def _evaluate_models_with_central_inference(
         request_queues = active_runtime["request_queues"]
         worker_response_receivers = active_runtime["worker_response_receivers"]
         worker_server_idx = active_runtime["worker_server_idx"]
+        model1_label, model2_label = active_runtime.get(
+            "model_labels", ("eval_model1", "eval_model2")
+        )
         return ctx.Process(
             target=_eval_central_worker,
             args=(
@@ -1237,6 +1468,9 @@ def _evaluate_models_with_central_inference(
                 model2_mcts_config,
                 use_mcts_model1,
                 use_mcts_model2,
+                model1_label,
+                model2_label,
+                dict(active_runtime.get("worker_shared_buffers", {}) or {}).get(int(rank)),
             ),
         )
 
@@ -1656,6 +1890,65 @@ def _apply_wdl_label_smoothing(target_wdl, smoothing):
     return target_wdl * (1.0 - smoothing) + (1.0 - target_wdl) * off_value
 
 
+def _value_error_focus_weights(
+    base_weights,
+    value_scalar,
+    priority_targets,
+    *,
+    focus_fraction=0.25,
+    max_multiplier=1.50,
+    min_abs_error=0.05,
+):
+    """Raise value-loss weight for the largest current supervised errors.
+
+    The selection is batch-local and detached from autograd.  This gives the
+    trainer a fresh error-prioritized signal without an extra replay inference
+    pass or duplicate samples. ``priority_targets`` must be the same reliable
+    target optimized by the weighted loss. In RL this is the final W/D/L
+    outcome, not the model-generated root-Q auxiliary target.
+    """
+    weights = torch.clamp(base_weights.reshape(-1).float(), min=0.0)
+    focus_mask = torch.zeros_like(weights, dtype=torch.bool)
+    abs_errors = torch.zeros_like(weights)
+    fraction = max(0.0, min(1.0, float(focus_fraction)))
+    multiplier_cap = max(1.0, float(max_multiplier))
+    if fraction <= 0.0 or multiplier_cap <= 1.0 or weights.numel() <= 0:
+        return weights, focus_mask, abs_errors
+
+    with torch.no_grad():
+        valid_mask = torch.isfinite(priority_targets.reshape(-1))
+        clipped_targets = torch.clamp(
+            priority_targets.reshape(-1).float(),
+            -1.0,
+            1.0,
+        )
+        abs_errors[valid_mask] = torch.abs(
+            value_scalar.detach().reshape(-1).float()[valid_mask]
+            - clipped_targets[valid_mask]
+        )
+        candidate_mask = valid_mask & (abs_errors >= max(0.0, float(min_abs_error)))
+        valid_indices = torch.nonzero(candidate_mask, as_tuple=False).reshape(-1)
+        if valid_indices.numel() <= 0:
+            return weights, focus_mask, abs_errors
+        focus_count = min(
+            int(valid_indices.numel()),
+            max(1, int(round(fraction * int(weights.numel())))),
+        )
+        selected_local = torch.topk(
+            abs_errors[valid_indices],
+            k=focus_count,
+            largest=True,
+            sorted=False,
+        ).indices
+        selected = valid_indices[selected_local]
+        focus_mask[selected] = True
+        selected_errors = abs_errors[selected]
+        error_scale = torch.clamp(selected_errors.max(), min=1e-6)
+        relative_error = torch.clamp(selected_errors / error_scale, 0.0, 1.0)
+        weights[selected] *= 1.0 + (multiplier_cap - 1.0) * relative_error
+    return weights, focus_mask, abs_errors
+
+
 def _legal_only_sparse_policy_loss(
     policy_logits,
     policy_indices,
@@ -1737,9 +2030,23 @@ def train_on_batch_rl(
     metrics_calc=None,
     value_weight_override=None,
     policy_weight_override=None,
-    anchor_model=None,
+    collect_gradient_diagnostics=False,
 ):
-    if len(batch) >= 10:
+    root_q_targets = None
+    search_changed_top = None
+    search_q_deltas = None
+    best_q_targets = None
+    played_q_targets = None
+    orig_q_targets = None
+    policy_kld_targets = None
+    search_visits = None
+    if len(batch) >= 18:
+        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask, root_q_targets, search_changed_top, search_q_deltas, best_q_targets, played_q_targets, orig_q_targets, policy_kld_targets, search_visits = batch[:18]
+    elif len(batch) >= 13:
+        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask, root_q_targets, search_changed_top, search_q_deltas = batch[:13]
+    elif len(batch) >= 11:
+        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask, root_q_targets = batch[:11]
+    elif len(batch) >= 10:
         boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask = batch[:10]
     elif len(batch) >= 8:
         boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets = batch[:8]
@@ -1781,6 +2088,30 @@ def train_on_batch_rl(
     policy_sample_weights = policy_sample_weights.to(device, non_blocking=True)
     value_sample_weights = value_sample_weights.to(device, non_blocking=True)
     moves_left_targets = moves_left_targets.to(device, non_blocking=True)
+    if root_q_targets is None:
+        root_q_targets = torch.full_like(value_targets, float("nan"), dtype=torch.float32)
+    root_q_targets = root_q_targets.to(device, non_blocking=True).reshape(-1)
+    if search_changed_top is None:
+        search_changed_top = torch.zeros_like(policy_sample_weights, dtype=torch.bool)
+    if search_q_deltas is None:
+        search_q_deltas = torch.full_like(policy_sample_weights, float("nan"), dtype=torch.float32)
+    search_changed_top = search_changed_top.to(device, non_blocking=True).reshape(-1).bool()
+    search_q_deltas = search_q_deltas.to(device, non_blocking=True).reshape(-1).float()
+    if best_q_targets is None:
+        best_q_targets = torch.full_like(value_targets, float("nan"), dtype=torch.float32)
+    if played_q_targets is None:
+        played_q_targets = torch.full_like(value_targets, float("nan"), dtype=torch.float32)
+    if orig_q_targets is None:
+        orig_q_targets = torch.full_like(value_targets, float("nan"), dtype=torch.float32)
+    if policy_kld_targets is None:
+        policy_kld_targets = torch.full_like(policy_sample_weights, float("nan"), dtype=torch.float32)
+    if search_visits is None:
+        search_visits = torch.zeros_like(policy_sample_weights, dtype=torch.int32)
+    best_q_targets = best_q_targets.to(device, non_blocking=True).reshape(-1).float()
+    played_q_targets = played_q_targets.to(device, non_blocking=True).reshape(-1).float()
+    orig_q_targets = orig_q_targets.to(device, non_blocking=True).reshape(-1).float()
+    policy_kld_targets = policy_kld_targets.to(device, non_blocking=True).reshape(-1).float()
+    search_visits = search_visits.to(device, non_blocking=True).reshape(-1).float()
     effective_policy_mask = policy_mask & (policy_sample_weights.unsqueeze(1) > 0)
 
     optimizer.zero_grad(set_to_none=True)
@@ -1792,24 +2123,25 @@ def train_on_batch_rl(
     value_aux_scalar_loss_weight = float(
         rl_cfg.get("value_aux_scalar_loss_weight", 0.25)
     )
-    value_std_floor_loss_weight = max(
-        0.0,
-        float(rl_cfg.get("value_std_floor_loss_weight", 0.0)),
-    )
-    value_std_floor_target_ratio = max(
-        0.0,
-        float(rl_cfg.get("value_std_floor_target_ratio", 0.70)),
-    )
     moves_left_loss_weight = max(0.0, float(rl_cfg.get("moves_left_loss_weight", 0.05)))
-    policy_anchor_kl_weight = max(
+    search_q_loss_weight = max(0.0, float(rl_cfg.get("search_q_loss_weight", 0.20)))
+    search_error_loss_weight = max(
+        0.0, float(rl_cfg.get("search_error_loss_weight", 0.05))
+    )
+    value_error_focus_fraction = max(
         0.0,
-        float(rl_cfg.get("policy_anchor_kl_weight", 0.0)),
+        min(1.0, float(rl_cfg.get("value_error_focus_fraction", 0.25))),
+    )
+    value_error_focus_max_multiplier = max(
+        1.0,
+        float(rl_cfg.get("value_error_focus_max_multiplier", 1.50)),
     )
     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-        policy_logits, value_pred, moves_left_pred = model(
+        policy_logits, value_pred, moves_left_pred, search_q_pred, search_error_pred = model(
             boards,
             apply_log_softmax=False,
             return_moves_left=True,
+            return_search_aux=True,
         )
         policy_pred = F.log_softmax(policy_logits.float(), dim=1)
         legal_policy_log_probs, valid_legal_mask, safe_legal_indices = _legal_only_log_probs(
@@ -1817,36 +2149,28 @@ def train_on_batch_rl(
             legal_indices,
             legal_mask,
         )
-        policy_anchor_kl_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
-        if anchor_model is not None and policy_anchor_kl_weight > 0.0:
-            with torch.no_grad():
-                anchor_policy_pred, _anchor_value_pred = anchor_model(boards)
-                anchor_legal_logits = torch.gather(
-                    anchor_policy_pred.detach().float(),
-                    1,
-                    safe_legal_indices,
-                ).masked_fill(~valid_legal_mask, -1.0e9)
-                anchor_legal_log_probs = F.log_softmax(anchor_legal_logits, dim=1)
-                anchor_legal_log_probs = torch.where(
-                    valid_legal_mask,
-                    anchor_legal_log_probs,
-                    torch.zeros_like(anchor_legal_log_probs),
-                )
-            anchor_legal_probs = torch.exp(anchor_legal_log_probs) * valid_legal_mask
-            legal_kl_per_row = (
-                anchor_legal_probs * (anchor_legal_log_probs - legal_policy_log_probs)
-            ).sum(dim=1)
-            rows_with_legal_moves = valid_legal_mask.any(dim=1)
-            if rows_with_legal_moves.any():
-                policy_anchor_kl_loss = legal_kl_per_row[rows_with_legal_moves].mean()
         value_pred_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
         target_value_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
-        value_std_floor_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
 
+        policy_rows_mask = effective_policy_mask.any(dim=1)
+        correction_policy_mask = (
+            policy_rows_mask
+            & search_changed_top
+            & torch.isfinite(search_q_deltas)
+            & (search_q_deltas > USEFUL_SEARCH_Q_DELTA_MIN)
+        )
+        policy_effective_weights = torch.clamp(
+            policy_sample_weights.to(dtype=policy_pred.dtype),
+            min=0.0,
+        )
         if policy_indices.numel() == 0:
-            policy_loss = torch.zeros(policy_pred.size(0), device=policy_pred.device, dtype=policy_pred.dtype)
+            policy_loss_per_row = torch.zeros(
+                policy_pred.size(0),
+                device=policy_pred.device,
+                dtype=policy_pred.dtype,
+            )
         else:
-            policy_loss = _legal_only_sparse_policy_loss(
+            policy_loss_per_row = _legal_only_sparse_policy_loss(
                 policy_logits,
                 policy_indices,
                 policy_values,
@@ -1854,44 +2178,12 @@ def train_on_batch_rl(
                 legal_indices,
                 legal_mask,
             )
-            rl_cfg = config.get("reinforcement_learning", {})
-            if bool(rl_cfg.get("policy_target_confidence_weighting_enabled", False)):
-                valid_targets = torch.where(
-                    effective_policy_mask,
-                    torch.clamp(policy_values, min=0.0),
-                    torch.zeros_like(policy_values),
-                )
-                target_mass = valid_targets.sum(dim=1).clamp_min(1e-8)
-                normalized_targets = valid_targets / target_mass.unsqueeze(1)
-                target_lengths = effective_policy_mask.sum(dim=1).to(dtype=policy_loss.dtype)
-                target_entropy = -(
-                    normalized_targets
-                    * torch.log(torch.clamp(normalized_targets, min=1e-12))
-                ).sum(dim=1)
-                max_entropy = torch.log(torch.clamp(target_lengths, min=2.0))
-                entropy_confidence = 1.0 - torch.clamp(target_entropy / max_entropy, 0.0, 1.0)
-                top1_confidence = normalized_targets.max(dim=1).values.to(dtype=policy_loss.dtype)
-                confidence = torch.maximum(entropy_confidence, top1_confidence)
-                confidence_power = max(
-                    0.05,
-                    float(rl_cfg.get("policy_target_confidence_power", 1.0)),
-                )
-                if confidence_power != 1.0:
-                    confidence = torch.pow(torch.clamp(confidence, min=0.0), confidence_power)
-                min_weight = max(
-                    0.0,
-                    min(1.0, float(rl_cfg.get("policy_target_confidence_min_weight", 0.35))),
-                )
-                confidence_weight = min_weight + (1.0 - min_weight) * confidence
-                policy_loss = policy_loss * confidence_weight.to(dtype=policy_loss.dtype)
-            policy_loss = policy_loss * policy_sample_weights.to(dtype=policy_loss.dtype)
 
         target_scalar = _final_outcome_targets(value_targets)
         target_value_std = target_scalar.std(unbiased=False)
-        effective_value_sample_weights = value_sample_weights
-
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
-            target_wdl = _wdl_targets_from_final_outcome(target_scalar)
+            hard_target_wdl = _wdl_targets_from_final_outcome(target_scalar)
+            target_wdl = hard_target_wdl
             target_wdl = _apply_wdl_label_smoothing(
                 target_wdl,
                 rl_cfg.get("value_wdl_label_smoothing", 0.0),
@@ -1907,32 +2199,99 @@ def train_on_batch_rl(
                 reduction="none",
                 beta=0.25,
             )
-            value_loss = value_ce_loss + value_aux_scalar_loss_weight * value_scalar_aux_loss
-            value_scalar_std = value_scalar.std(unbiased=False)
-            value_pred_std = value_scalar_std.detach()
-            if value_std_floor_loss_weight > 0.0 and value_scalar.numel() > 1:
-                target_std_floor = target_value_std.detach().to(dtype=value_scalar_std.dtype) * value_std_floor_target_ratio
-                std_shortfall = torch.relu(target_std_floor - value_scalar_std)
-                value_std_floor_loss = std_shortfall * std_shortfall
+            value_primary_loss_rows = value_ce_loss
+            value_scalar_aux_loss_rows = value_scalar_aux_loss
+            value_pred_std = value_scalar.std(unbiased=False).detach()
         else:
-            value_loss = (value_pred.squeeze() - target_scalar) ** 2
+            hard_target_wdl = None
+            value_probs = None
+            value_primary_loss_rows = (value_pred.squeeze() - target_scalar) ** 2
+            value_scalar_aux_loss_rows = torch.zeros_like(value_primary_loss_rows)
             value_scalar = value_pred.squeeze()
-            value_scalar_std = value_scalar.std(unbiased=False)
-            value_pred_std = value_scalar_std.detach()
-            if value_std_floor_loss_weight > 0.0 and value_scalar.numel() > 1:
-                target_std_floor = target_value_std.detach().to(dtype=value_scalar_std.dtype) * value_std_floor_target_ratio
-                std_shortfall = torch.relu(target_std_floor - value_scalar_std)
-                value_std_floor_loss = std_shortfall * std_shortfall
+            value_pred_std = value_scalar.std(unbiased=False).detach()
 
-        if policy_loss.numel() == 0:
+        (
+            effective_value_sample_weights,
+            value_error_focus_mask,
+            value_priority_abs_errors,
+        ) = _value_error_focus_weights(
+            value_sample_weights,
+            value_scalar,
+            target_scalar,
+            focus_fraction=value_error_focus_fraction,
+            max_multiplier=value_error_focus_max_multiplier,
+        )
+
+        if policy_loss_per_row.numel() == 0:
             policy_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
         else:
-            policy_weight_total = policy_sample_weights.to(dtype=policy_loss.dtype).sum()
+            policy_weight_total = policy_effective_weights.sum()
             if float(policy_weight_total.detach().item()) > 0.0:
-                policy_loss = policy_loss.sum() / policy_weight_total
+                policy_loss = (
+                    policy_loss_per_row * policy_effective_weights
+                ).sum() / policy_weight_total
             else:
-                policy_loss = policy_loss.sum() * 0.0
-        value_loss = _weighted_mean(value_loss, effective_value_sample_weights)
+                policy_loss = policy_loss_per_row.sum() * 0.0
+        value_primary_loss = _weighted_mean(
+            value_primary_loss_rows,
+            effective_value_sample_weights,
+        )
+        value_scalar_aux_loss = _weighted_mean(
+            value_scalar_aux_loss_rows,
+            effective_value_sample_weights,
+        )
+        value_loss = (
+            value_primary_loss
+            + value_aux_scalar_loss_weight * value_scalar_aux_loss
+        )
+        # Search-Q is a separate local target. Never pull the final-result WDL
+        # logits toward a self-generated MCTS estimate.
+        root_q_mask = torch.isfinite(root_q_targets)
+        search_q_mask = torch.isfinite(best_q_targets)
+        search_q_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        search_error_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        search_error_targets = torch.full_like(target_scalar, float("nan"))
+        if search_q_mask.any():
+            search_q_values = search_q_pred.reshape(-1)
+            search_error_values = search_error_pred.reshape(-1)
+            bounded_best_q = torch.clamp(
+                best_q_targets.to(dtype=search_q_values.dtype), -1.0, 1.0
+            )
+            visit_confidence = torch.clamp(
+                torch.log1p(torch.clamp(search_visits, min=0.0)) / math.log1p(192.0),
+                min=0.25,
+                max=1.0,
+            ).to(dtype=search_q_values.dtype)
+            search_q_loss_rows = F.smooth_l1_loss(
+                search_q_values[search_q_mask],
+                bounded_best_q[search_q_mask],
+                beta=0.15,
+                reduction="none",
+            )
+            search_q_loss = _weighted_mean(
+                search_q_loss_rows,
+                visit_confidence[search_q_mask],
+            )
+            # This is a reliability label for search, not the current head's
+            # instantaneous regression residual. It remains stable as Q learns.
+            search_error_targets = torch.abs(
+                bounded_best_q - target_scalar.to(dtype=bounded_best_q.dtype)
+            ).detach()
+            search_error_loss_rows = F.smooth_l1_loss(
+                search_error_values[search_q_mask],
+                search_error_targets[search_q_mask],
+                beta=0.15,
+                reduction="none",
+            )
+            search_error_loss = _weighted_mean(
+                search_error_loss_rows,
+                visit_confidence[search_q_mask]
+                * torch.clamp(
+                    value_sample_weights[search_q_mask].to(dtype=visit_confidence.dtype),
+                    min=0.0,
+                    max=1.0,
+                ),
+            )
         moves_left_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
         if moves_left_loss_weight > 0.0 and moves_left_pred is not None:
             pred_mlh = moves_left_pred.reshape(-1)
@@ -1950,14 +2309,6 @@ def train_on_batch_rl(
             if value_weight_override is None
             else float(value_weight_override)
         )
-        loss = (
-            policy_weight * policy_loss
-            + value_weight * value_loss
-            + moves_left_loss_weight * moves_left_loss
-            + value_std_floor_loss_weight * value_std_floor_loss
-            + policy_anchor_kl_weight * policy_anchor_kl_loss
-        )
-
         legal_policy_probs = torch.exp(legal_policy_log_probs) * valid_legal_mask
         legal_entropy_per_row = -(
             legal_policy_probs * legal_policy_log_probs
@@ -1968,27 +2319,161 @@ def train_on_batch_rl(
             if rows_with_legal_moves.any()
             else torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
         )
-        entropy_weight = config["reinforcement_learning"].get("entropy_weight", 0.0)
-        if entropy_weight > 0:
-            loss = loss - entropy_weight * policy_entropy
+        policy_objective = policy_weight * policy_loss
+        value_objective = (
+            value_weight * value_loss
+            + moves_left_loss_weight * moves_left_loss
+            + search_q_loss_weight * search_q_loss
+            + search_error_loss_weight * search_error_loss
+        )
+        loss = policy_objective + value_objective
 
+    task_gradient_diagnostics = (
+        _task_gradient_probe(policy_objective, value_objective, model)
+        if collect_gradient_diagnostics
+        else {
+            'policy_probe_norm': 0.0,
+            'value_probe_norm': 0.0,
+            'policy_value_cosine': 0.0,
+        }
+    )
     scaler.scale(loss).backward()
 
     grad_clip = config["reinforcement_learning"].get("grad_clip", 1.0)
-    if grad_clip > 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    scaler.unscale_(optimizer)
+    gradient_family_norms = (
+        _gradient_family_norms(model)
+        if collect_gradient_diagnostics
+        else {'backbone': 0.0, 'policy': 0.0, 'value': 0.0}
+    )
+    clip_limit = float(grad_clip) if float(grad_clip) > 0.0 else float('inf')
+    total_grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_limit)
+    total_grad_norm = float(total_grad_norm_tensor.detach().item())
+    grad_clip_scale = (
+        min(1.0, clip_limit / max(total_grad_norm, 1e-12))
+        if math.isfinite(clip_limit)
+        else 1.0
+    )
+    grad_was_clipped = bool(grad_clip_scale < 1.0)
 
     scaler.step(optimizer)
     scaler.update()
+    if search_q_loss_weight > 0.0 and bool(search_q_mask.any().item()):
+        model_owner = getattr(model, '_orig_mod', model)
+        ready = getattr(model_owner, 'search_value_ready', None)
+        if ready is not None:
+            ready.fill_(1.0)
+
+    with torch.no_grad():
+        if policy_indices.numel() == 0:
+            target_moves = torch.zeros(policy_pred.size(0), dtype=torch.long, device=policy_pred.device)
+        else:
+            best_sparse_idx = policy_values.argmax(dim=1, keepdim=True)
+            target_moves = torch.gather(policy_indices.long(), 1, best_sparse_idx).squeeze(1)
+        legal_top_slots = legal_policy_log_probs.masked_fill(
+            ~valid_legal_mask,
+            -1.0e9,
+        ).argmax(dim=1, keepdim=True)
+        predicted_legal_moves = torch.gather(
+            safe_legal_indices.long(),
+            1,
+            legal_top_slots,
+        ).squeeze(1)
+        correction_count = int(correction_policy_mask.sum().item())
+        policy_row_count = int(policy_rows_mask.sum().item())
+        correction_loss_sum = float(
+            policy_loss_per_row[correction_policy_mask].sum().detach().item()
+        ) if correction_count > 0 else 0.0
+        correction_top1_correct = int(
+            (predicted_legal_moves[correction_policy_mask] == target_moves[correction_policy_mask]).sum().item()
+        ) if correction_count > 0 else 0
+        policy_effective_weight_sum = float(policy_effective_weights.sum().detach().item())
+        correction_effective_weight_sum = float(
+            policy_effective_weights[correction_policy_mask].sum().detach().item()
+        ) if correction_count > 0 else 0.0
+        value_scalar_f32 = value_scalar.detach().float().reshape(-1)
+        search_q_mask_f32 = search_q_mask.detach()
+        search_q_pred_f32 = search_q_pred.detach().float().reshape(-1)[search_q_mask_f32]
+        search_q_target_f32 = torch.clamp(
+            best_q_targets.detach().float().reshape(-1)[search_q_mask_f32],
+            -1.0,
+            1.0,
+        )
+        search_error_pred_f32 = search_error_pred.detach().float().reshape(-1)[search_q_mask_f32]
+        search_error_target_f32 = search_error_targets.detach().float().reshape(-1)[search_q_mask_f32]
+        target_scalar_f32 = target_scalar.detach().float().reshape(-1)
+        value_row_count = int(value_scalar_f32.numel())
+        value_weight_f32 = effective_value_sample_weights.detach().float().reshape(-1)
+        value_error_focus_count = int(value_error_focus_mask.sum().item())
+        value_error_focus_weight_sum = float(
+            value_weight_f32[value_error_focus_mask].sum().item()
+        ) if value_error_focus_count > 0 else 0.0
+        value_effective_weight_sum = float(value_weight_f32.sum().item())
+        value_error_focus_abs_error_sum = float(
+            value_priority_abs_errors[value_error_focus_mask].sum().item()
+        ) if value_error_focus_count > 0 else 0.0
+        wdl_pred_sums = [0.0, 0.0, 0.0]
+        wdl_target_sums = [0.0, 0.0, 0.0]
+        wdl_brier_sum = 0.0
+        wdl_ece_counts = [0] * 10
+        wdl_ece_confidence_sums = [0.0] * 10
+        wdl_ece_correct_sums = [0.0] * 10
+        value_phase_wdl = {}
+        if value_probs is not None and hard_target_wdl is not None:
+            value_probs_f32 = value_probs.detach().float()
+            hard_target_wdl_f32 = hard_target_wdl.detach().float()
+            wdl_pred_sums = value_probs_f32.sum(dim=0).cpu().tolist()
+            wdl_target_sums = hard_target_wdl_f32.sum(dim=0).cpu().tolist()
+            wdl_brier_sum = float(
+                torch.square(value_probs_f32 - hard_target_wdl_f32).sum(dim=1).sum().item()
+            )
+            confidence, predicted_class = value_probs_f32.max(dim=1)
+            target_class = hard_target_wdl_f32.argmax(dim=1)
+            correct = predicted_class.eq(target_class).float()
+            bin_indices = torch.clamp((confidence * 10.0).long(), min=0, max=9)
+            for bin_idx in range(10):
+                bin_mask = bin_indices == bin_idx
+                if bin_mask.any():
+                    wdl_ece_counts[bin_idx] = int(bin_mask.sum().item())
+                    wdl_ece_confidence_sums[bin_idx] = float(confidence[bin_mask].sum().item())
+                    wdl_ece_correct_sums[bin_idx] = float(correct[bin_mask].sum().item())
+
+            if boards.dim() >= 4 and boards.size(1) > 15:
+                fullmoves = torch.clamp(
+                    torch.round(boards[:, 15, 0, 0].float() * 100.0),
+                    min=1.0,
+                    max=float(rl_cfg.get("value_phase_max_fullmove", 120)),
+                )
+                opening_max = int(rl_cfg.get("value_phase_opening_max_fullmove", 12))
+                endgame_min = int(rl_cfg.get("value_phase_endgame_min_fullmove", 40))
+                phase_masks = {
+                    "opening": fullmoves <= opening_max,
+                    "middlegame": (fullmoves > opening_max) & (fullmoves < endgame_min),
+                    "endgame": fullmoves >= endgame_min,
+                }
+                for phase_name, phase_mask in phase_masks.items():
+                    phase_count = int(phase_mask.sum().item())
+                    value_phase_wdl[phase_name] = {
+                        "rows": phase_count,
+                        "draw_pred_sum": float(value_probs_f32[phase_mask, 1].sum().item()),
+                        "draw_target_sum": float(hard_target_wdl_f32[phase_mask, 1].sum().item()),
+                    }
+        root_q_row_count = int(root_q_mask.sum().item())
+        if root_q_row_count > 0:
+            root_q_pred_f32 = value_scalar_f32[root_q_mask]
+            root_q_target_f32 = torch.clamp(
+                root_q_targets.detach().float().reshape(-1)[root_q_mask],
+                -1.0,
+                1.0,
+            )
+            root_q_error_f32 = root_q_pred_f32 - root_q_target_f32
+        else:
+            root_q_pred_f32 = value_scalar_f32[:0]
+            root_q_target_f32 = target_scalar_f32[:0]
+            root_q_error_f32 = value_scalar_f32[:0]
 
     if metrics_calc is not None:
         with torch.no_grad():
-            if policy_indices.numel() == 0:
-                target_moves = torch.zeros(policy_pred.size(0), dtype=torch.long, device=policy_pred.device)
-            else:
-                best_sparse_idx = policy_values.argmax(dim=1, keepdim=True)
-                target_moves = torch.gather(policy_indices.long(), 1, best_sparse_idx).squeeze(1)
             rl_cfg = config.get("reinforcement_learning", {})
             if boards.dim() >= 4 and boards.size(1) > 15:
                 fullmove_indices = torch.clamp(
@@ -2010,6 +2495,62 @@ def train_on_batch_rl(
                 value_phase_endgame_min=int(rl_cfg.get("value_phase_endgame_min_fullmove", 40)),
             )
 
+    policy_diagnostics = {
+        "correction_rows": correction_count,
+        "policy_rows": policy_row_count,
+        "correction_loss_sum": correction_loss_sum,
+        "correction_top1_correct": correction_top1_correct,
+        "effective_weight_sum": policy_effective_weight_sum,
+        "correction_effective_weight_sum": correction_effective_weight_sum,
+        "value_primary_loss": float(value_primary_loss.detach().item()),
+        "value_scalar_aux_loss": float(value_scalar_aux_loss.detach().item()),
+        "moves_left_loss": float(moves_left_loss.detach().item()),
+        "search_q_loss": float(search_q_loss.detach().item()),
+        "search_error_loss": float(search_error_loss.detach().item()),
+        "search_q_rows": int(search_q_mask.sum().item()),
+        "search_q_pred_sum": float(search_q_pred_f32.sum().item()),
+        "search_q_target_sum": float(search_q_target_f32.sum().item()),
+        "search_q_abs_error_sum": float(
+            (search_q_pred_f32 - search_q_target_f32).abs().sum().item()
+        ),
+        "search_error_pred_sum": float(search_error_pred_f32.sum().item()),
+        "search_error_target_sum": float(search_error_target_f32.sum().item()),
+        "search_error_abs_error_sum": float(
+            (search_error_pred_f32 - search_error_target_f32).abs().sum().item()
+        ),
+        "value_error_focus_rows": value_error_focus_count,
+        "value_error_focus_weight_sum": value_error_focus_weight_sum,
+        "value_effective_weight_sum": value_effective_weight_sum,
+        "value_error_focus_abs_error_sum": value_error_focus_abs_error_sum,
+        "wdl_pred_sums": wdl_pred_sums,
+        "wdl_target_sums": wdl_target_sums,
+        "wdl_brier_sum": wdl_brier_sum,
+        "wdl_ece_counts": wdl_ece_counts,
+        "wdl_ece_confidence_sums": wdl_ece_confidence_sums,
+        "wdl_ece_correct_sums": wdl_ece_correct_sums,
+        "value_phase_wdl": value_phase_wdl,
+        # Raw sufficient statistics let the iteration logger aggregate exact
+        # means/correlation across uneven final batches without retaining any
+        # per-position tensors.
+        "value_rows": value_row_count,
+        "value_pred_sum": float(value_scalar_f32.sum().item()),
+        "value_target_sum": float(target_scalar_f32.sum().item()),
+        "root_q_rows": root_q_row_count,
+        "root_q_pred_sum": float(root_q_pred_f32.sum().item()),
+        "root_q_target_sum": float(root_q_target_f32.sum().item()),
+        "root_q_abs_error_sum": float(root_q_error_f32.abs().sum().item()),
+        "root_q_error_sum": float(root_q_error_f32.sum().item()),
+        "root_q_pred_sq_sum": float((root_q_pred_f32 * root_q_pred_f32).sum().item()),
+        "root_q_target_sq_sum": float((root_q_target_f32 * root_q_target_f32).sum().item()),
+        "root_q_cross_sum": float((root_q_pred_f32 * root_q_target_f32).sum().item()),
+        "total_grad_norm": total_grad_norm,
+        "grad_clip_scale": grad_clip_scale,
+        "grad_was_clipped": 1 if grad_was_clipped else 0,
+        "grad_backbone_norm": gradient_family_norms['backbone'],
+        "grad_policy_head_norm": gradient_family_norms['policy'],
+        "grad_value_head_norm": gradient_family_norms['value'],
+        **task_gradient_diagnostics,
+    }
     return (
         loss.item(),
         policy_loss.item(),
@@ -2017,6 +2558,7 @@ def train_on_batch_rl(
         float(policy_entropy.detach().item()),
         float(value_pred_std.detach().item()),
         float(target_value_std.detach().item()),
+        policy_diagnostics,
     )
 
 
@@ -2155,6 +2697,7 @@ def evaluate_models(
     losses = 0
     unresolved = 0
     completed = 0
+    eval_profile = {}
     eval_bar = tqdm(total=num_games, desc=progress_desc, unit="game", disable=not show_progress)
     worker_error = None
     cancelled = False
@@ -2191,6 +2734,9 @@ def evaluate_models(
                 draws += int(message.get("draws", 0))
                 losses += int(message.get("losses", 0))
                 unresolved += int(message.get("unresolved", 0))
+                for key, value in dict(message.get("profile", {}) or {}).items():
+                    if isinstance(value, (int, float)):
+                        eval_profile[key] = eval_profile.get(key, 0) + value
                 finished_workers += 1
             elif message_type == "interrupt":
                 raise KeyboardInterrupt
@@ -2212,6 +2758,7 @@ def evaluate_models(
         _print_eval_unresolved("Eval", unresolved, num_games, max_moves)
 
     stats = _build_eval_stats(wins, draws, losses, unresolved, num_games)
+    stats["profile"] = eval_profile
     stats["cancelled"] = bool(cancelled)
     stats["completed"] = int(completed)
     return stats

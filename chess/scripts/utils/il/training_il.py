@@ -17,6 +17,70 @@ from ..shared.metrics import MetricsCalculator
 _IL_HFLIP_FORWARD_INDEX_MAP = None
 
 
+def _gradient_family(name):
+    lowered = str(name).lower()
+    if lowered.startswith('policy_') or '.policy_' in lowered:
+        return 'policy'
+    if (
+        lowered.startswith('value_')
+        or '.value_' in lowered
+        or lowered.startswith('moves_left_')
+        or '.moves_left_' in lowered
+    ):
+        return 'value'
+    return 'backbone'
+
+
+def _gradient_family_norms(model):
+    sums = {'backbone': None, 'policy': None, 'value': None}
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        family = _gradient_family(name)
+        squared = parameter.grad.detach().float().pow(2).sum()
+        sums[family] = squared if sums[family] is None else sums[family] + squared
+    return {
+        family: (0.0 if squared is None else float(torch.sqrt(squared).item()))
+        for family, squared in sums.items()
+    }
+
+
+def _task_gradient_probe(policy_objective, value_objective, model):
+    """Measure policy/value agreement at the output of the shared tower."""
+    probe_owner = getattr(model, '_orig_mod', model)
+    probe = getattr(getattr(probe_owner, 'final_bn', None), 'weight', None)
+    empty = {
+        'policy_probe_norm': 0.0,
+        'value_probe_norm': 0.0,
+        'policy_value_cosine': 0.0,
+    }
+    if probe is None or not probe.requires_grad:
+        return empty
+    policy_grad = torch.autograd.grad(
+        policy_objective, probe, retain_graph=True, allow_unused=True,
+    )[0]
+    value_grad = torch.autograd.grad(
+        value_objective, probe, retain_graph=True, allow_unused=True,
+    )[0]
+    if policy_grad is None or value_grad is None:
+        return empty
+    policy_flat = policy_grad.detach().float().reshape(-1)
+    value_flat = value_grad.detach().float().reshape(-1)
+    policy_norm = torch.linalg.vector_norm(policy_flat)
+    value_norm = torch.linalg.vector_norm(value_flat)
+    denominator = policy_norm * value_norm
+    cosine = (
+        torch.dot(policy_flat, value_flat) / denominator
+        if float(denominator.item()) > 0.0
+        else torch.zeros((), device=policy_flat.device)
+    )
+    return {
+        'policy_probe_norm': float(policy_norm.item()),
+        'value_probe_norm': float(value_norm.item()),
+        'policy_value_cosine': float(torch.clamp(cosine, -1.0, 1.0).item()),
+    }
+
+
 class _DataLoaderTailSkip(StopIteration):
     def __init__(self, skipped_batches):
         super().__init__(skipped_batches)
@@ -331,13 +395,22 @@ def train_epoch_il(
     log_grad_diagnostics = bool(debug_enabled)
     
     # WDL-only path
-    criterion = CombinedLoss(config)
+    criterion = CombinedLoss(config, capture_task_objectives=True)
     
     # Accumulators
     total_loss = 0
     total_policy_loss = 0
     total_value_loss = 0
     total_moves_left_loss = 0
+    grad_total_norm_sum = 0.0
+    grad_clip_scale_sum = 0.0
+    grad_clipped_batches = 0
+    gradient_family_norms = {'backbone': 0.0, 'policy': 0.0, 'value': 0.0}
+    task_gradient_diagnostics = {
+        'policy_probe_norm': 0.0,
+        'value_probe_norm': 0.0,
+        'policy_value_cosine': 0.0,
+    }
     
     metrics_calc = MetricsCalculator()
     
@@ -582,6 +655,15 @@ def train_epoch_il(
             # Single loss computation
             loss, loss_dict = criterion(predictions, targets)
 
+        policy_objective = loss_dict.pop('_policy_objective')
+        value_objective = loss_dict.pop('_value_objective')
+        if batch_idx == 0:
+            task_gradient_diagnostics = _task_gradient_probe(
+                policy_objective,
+                value_objective,
+                model,
+            )
+
         if profile_enabled:
             _sync()
             timers['forward'] += time.perf_counter() - t0
@@ -596,10 +678,17 @@ def train_epoch_il(
             t0 = time.perf_counter()
         
         # Gradient clipping
-        grad_clip = config['imitation_learning'].get('grad_clip', 1.0)
-        if grad_clip > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        grad_clip = float(config['imitation_learning'].get('grad_clip', 1.0) or 0.0)
+        scaler.unscale_(optimizer)
+        if batch_idx == 0:
+            gradient_family_norms = _gradient_family_norms(model)
+        clip_limit = grad_clip if grad_clip > 0.0 else float('inf')
+        total_grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_limit)
+        total_grad_norm = float(total_grad_norm_tensor.detach().item())
+        clip_scale = min(1.0, clip_limit / max(total_grad_norm, 1.0e-12))
+        grad_total_norm_sum += total_grad_norm
+        grad_clip_scale_sum += clip_scale
+        grad_clipped_batches += int(clip_scale < 1.0 - 1.0e-6)
 
         if log_grad_diagnostics and not grad_diag_logged:
             trainable_tensors = 0
@@ -729,6 +818,17 @@ def train_epoch_il(
     }
     
     metrics = metrics_calc.compute()
+    metrics.update({
+        'grad_total_norm': grad_total_norm_sum / n,
+        'grad_clip_fraction': grad_clipped_batches / n,
+        'grad_clip_scale_mean': grad_clip_scale_sum / n,
+        'grad_backbone_norm': gradient_family_norms['backbone'],
+        'grad_policy_head_norm': gradient_family_norms['policy'],
+        'grad_value_head_norm': gradient_family_norms['value'],
+        'grad_policy_probe_norm': task_gradient_diagnostics['policy_probe_norm'],
+        'grad_value_probe_norm': task_gradient_diagnostics['value_probe_norm'],
+        'grad_policy_value_cosine': task_gradient_diagnostics['policy_value_cosine'],
+    })
 
     if profile_enabled:
         total_profile_time = sum(timers.values())

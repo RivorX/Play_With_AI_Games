@@ -8,6 +8,7 @@ import numpy as np
 Q_DELTA_HIST_MIN = -2.0
 Q_DELTA_HIST_MAX = 2.0
 Q_DELTA_HIST_BINS = 200
+USEFUL_SEARCH_Q_DELTA_MIN = 0.02
 
 
 def q_delta_histogram(values):

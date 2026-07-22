@@ -5,7 +5,7 @@ import textwrap
 from datetime import datetime
 from pathlib import Path
 
-from ..il.il_logger import ILLoggerMixin
+from ..il.il_logger import IL_GRADIENT_COLUMNS, ILLoggerMixin
 from ..rl.rl_log_schema import RL_DATA_QUALITY_COLUMNS, RL_MAIN_COLUMNS, RL_PERFORMANCE_COLUMNS
 from ..rl.rl_logger import RLLoggerMixin
 from .logger_common import (
@@ -109,6 +109,7 @@ class TrainingLogger(RLLoggerMixin, ILLoggerMixin):
                     'best_val_loss_so_far',
                     'best_val_policy_top1_so_far',
                     'best_val_value_mae_so_far',
+                    *IL_GRADIENT_COLUMNS,
                 ]
             
             else:  # RL mode
@@ -213,6 +214,7 @@ class TrainingLogger(RLLoggerMixin, ILLoggerMixin):
         self.val_soft_sample_weight_avg = []
         self.val_soft_policy_mass_kept_avg = []
         self.val_soft_policy_mass_kept_min = []
+        self._ensure_il_gradient_storage()
         
         # Elo estimation storage
         self.estimated_elos = []  # (epoch, elo) tuples

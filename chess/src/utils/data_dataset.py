@@ -3,7 +3,7 @@ Chess dataset and dataloader utilities.
 Split from src.data to keep dataset logic separate from preprocessing.
 """
 
-import chess
+from src import chess_backend as chess
 from collections import defaultdict
 import gc
 import hashlib
@@ -294,25 +294,28 @@ def _is_rare_or_eventful_record(record):
     turn = get_turn_from_move_idx(move_idx)
     board = compact_to_board(compact_board, turn=turn)
     move = index_to_move(move_target, is_black_turn=(turn == chess.BLACK), board=board)
-    if move == chess.Move.null() or move not in board.legal_moves:
+    legal_moves = chess.legal_moves(board)
+    if move is None or move not in legal_moves:
         return False
 
     if move.promotion is not None:
         return True
-    if board.is_en_passant(move) or board.is_castling(move):
+    if chess.is_en_passant(board, move) or chess.is_castling(board, move):
         return True
-    if board.is_check() or board.gives_check(move):
+    if chess.is_check(board) or chess.gives_check(board, move):
         return True
-    if board.legal_moves.count() <= 2:
+    if len(legal_moves) <= 2:
         return True
-    if len(board.piece_map()) <= 7:
+    if chess.piece_count(board) <= 7:
         return True
     if int(board.halfmove_clock) >= 80:
         return True
 
-    after = board.copy(stack=False)
-    after.push(move)
-    return after.is_game_over(claim_draw=True)
+    chess.apply_move(board, move)
+    try:
+        return chess.is_game_over(board, claim_draw=True)
+    finally:
+        chess.undo_move(board)
 
 
 def _compact_piece_stats(compact_board):

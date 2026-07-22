@@ -345,6 +345,23 @@ class ChessNet(nn.Module):
         self.value_fc1 = nn.Linear(value_in_dim, value_hidden)
         self.value_fc2 = nn.Linear(value_hidden, 3)  # đź†• 3 outputs: [Win, Draw, Loss]
         self.value_dropout = nn.Dropout(dropout)
+        # Search targets are not final game results. Keep a dedicated scalar-Q
+        # head and a second head that estimates its expected absolute error.
+        self.search_q_fc = nn.Linear(value_hidden, 1)
+        self.search_error_fc = nn.Linear(value_hidden, 1)
+        rl_cfg = config.get('reinforcement_learning', {}) or {}
+        self.search_value_blend_max = max(
+            0.0, min(0.50, float(rl_cfg.get('search_value_blend_max', 0.25)))
+        )
+        self.search_value_uncertainty_temperature = max(
+            1e-3, float(rl_cfg.get('search_value_uncertainty_temperature', 0.35))
+        )
+        # Old checkpoints start with a strict winner-WDL-only inference path.
+        self.register_buffer(
+            'search_value_ready',
+            torch.zeros((), dtype=torch.float32),
+            persistent=True,
+        )
         mlh_hidden = int(config['model'].get('moves_left_hidden_dim', 128))
         self.moves_left_fc1 = nn.Linear(filters, mlh_hidden)
         self.moves_left_ln = nn.LayerNorm(mlh_hidden)
@@ -390,6 +407,11 @@ class ChessNet(nn.Module):
             nn.init.zeros_(self.policy_logits_conv.bias)
         nn.init.normal_(self.value_fc2.weight, std=0.01)
         nn.init.zeros_(self.value_fc2.bias)
+        nn.init.zeros_(self.search_q_fc.weight)
+        nn.init.zeros_(self.search_q_fc.bias)
+        nn.init.zeros_(self.search_error_fc.weight)
+        # softplus(0.5413) ~= 1.0: an uncalibrated head has negligible influence.
+        nn.init.constant_(self.search_error_fc.bias, 0.541324854612918)
         nn.init.normal_(self.moves_left_fc2.weight, std=0.01)
         nn.init.zeros_(self.moves_left_fc2.bias)
 
@@ -418,6 +440,10 @@ class ChessNet(nn.Module):
             self._count_parameters(self.value_fc1) +
             self._count_parameters(self.value_fc2)
         )
+        search_value_params = (
+            self._count_parameters(self.search_q_fc) +
+            self._count_parameters(self.search_error_fc)
+        )
         moves_left_params = (
             self._count_parameters(self.moves_left_fc1) +
             self._count_parameters(self.moves_left_ln) +
@@ -435,13 +461,46 @@ class ChessNet(nn.Module):
         print(f"    - Final BN: {final_bn_params:,}")
         print(f"    - Policy head: {policy_params:,}")
         print(f"    - Value head: {value_params:,}")
+        print(f"    - Search Q/error heads: {search_value_params:,}")
         print(f"    - Moves-left head: {moves_left_params:,}")
         print(f"    - Trainable params: {trainable_params:,}")
         if frozen_params > 0:
             print(f"    - Frozen params: {frozen_params:,}")
         print(f"    - Total params: {total_params:,}")
 
-    def forward(self, x, apply_log_softmax=True, policy_only=False, return_moves_left=False):
+    def _blend_wdl_with_search(self, value_logits, search_q_raw, search_error_raw):
+        """Mix winner WDL with search-Q only when its predicted error is low."""
+        winner_probs = F.softmax(value_logits.float(), dim=1)
+        search_q = torch.tanh(search_q_raw.float()).reshape(-1)
+        search_error = F.softplus(search_error_raw.float()).reshape(-1)
+        confidence = torch.exp(-search_error / self.search_value_uncertainty_temperature)
+        alpha = (
+            self.search_value_blend_max
+            * confidence
+            * self.search_value_ready.to(device=value_logits.device, dtype=torch.float32)
+        ).clamp(0.0, self.search_value_blend_max)
+        search_probs = torch.stack(
+            (
+                0.5 * (1.0 + search_q),
+                torch.zeros_like(search_q),
+                0.5 * (1.0 - search_q),
+            ),
+            dim=1,
+        )
+        mixed_probs = (
+            winner_probs * (1.0 - alpha.unsqueeze(1))
+            + search_probs * alpha.unsqueeze(1)
+        )
+        return torch.log(mixed_probs.clamp_min(1e-8)).to(dtype=value_logits.dtype)
+
+    def forward(
+        self,
+        x,
+        apply_log_softmax=True,
+        policy_only=False,
+        return_moves_left=False,
+        return_search_aux=False,
+    ):
         """Forward pass (policy as log-probs by default, raw logits when apply_log_softmax=False)."""
         if not x.is_contiguous(memory_format=torch.channels_last):
             x = x.contiguous(memory_format=torch.channels_last)
@@ -470,6 +529,10 @@ class ChessNet(nn.Module):
         else:
             policy = policy_logits
         if policy_only:
+            if return_search_aux and return_moves_left:
+                return policy, None, None, None, None
+            if return_search_aux:
+                return policy, None, None, None
             return (policy, None, None) if return_moves_left else (policy, None)
 
         trunk_global = self.shared_gap(x).flatten(1)
@@ -482,16 +545,39 @@ class ChessNet(nn.Module):
         value = torch.cat([value, trunk_global], dim=1)
         value = self.value_ln(value)
         value_hidden = F.silu(self.value_fc1(value), inplace=True)
-        value_hidden = self.value_dropout(value_hidden)
-        value = self.value_fc2(value_hidden)  # (B, 3) WDL logits
+        value = self.value_fc2(self.value_dropout(value_hidden))  # (B, 3) WDL logits
+        search_q_raw = self.search_q_fc(value_hidden)
+        search_error_raw = self.search_error_fc(value_hidden)
 
-        if not return_moves_left:
-            return policy, value
+        # Training receives the untouched final-result logits. In eval mode all
+        # ordinary two-output callers transparently use the same safe blend.
+        inference_value = value
+        if not self.training and not return_search_aux:
+            inference_value = self._blend_wdl_with_search(
+                value,
+                search_q_raw,
+                search_error_raw,
+            )
 
-        moves_left = F.relu(self.moves_left_fc1(trunk_global), inplace=True)
-        moves_left = self.moves_left_ln(moves_left)
-        moves_left = self.moves_left_fc2(moves_left)
-        return policy, value, moves_left
+        if not return_moves_left and not return_search_aux:
+            return policy, inference_value
+
+        moves_left = None
+        if return_moves_left:
+            moves_left = F.relu(self.moves_left_fc1(trunk_global), inplace=True)
+            moves_left = self.moves_left_ln(moves_left)
+            moves_left = self.moves_left_fc2(moves_left)
+        if return_search_aux and return_moves_left:
+            return (
+                policy,
+                value,
+                moves_left,
+                torch.tanh(search_q_raw),
+                F.softplus(search_error_raw),
+            )
+        if return_search_aux:
+            return policy, value, torch.tanh(search_q_raw), F.softplus(search_error_raw)
+        return policy, inference_value, moves_left
 
     def predict(self, board_tensor):
         """

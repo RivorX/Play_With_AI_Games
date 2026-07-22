@@ -61,7 +61,6 @@ from utils.il.auto_tune import resolve_il_hyperparameters
 from utils.il.elo_async import ILEloCoordinator
 from utils.il.checkpointing import (
     build_runtime_state,
-    save_swa_snapshot_checkpoint,
     finalize_swa_model,
 )
 from utils.shared.runtime_helpers import (
@@ -2502,25 +2501,6 @@ def main():
 
             latest_size_mb = saved_latest_path.stat().st_size / (1024 ** 2)
             print(f"💾 Latest checkpoint updated: {saved_latest_path.name} ({latest_size_mb:.1f} MB)")
-
-            save_swa_snapshot_checkpoint(
-                epoch_idx=epoch,
-                fallback_loss=train_losses['total'],
-                ref_val_losses=val_losses,
-                ref_val_metrics=val_metrics,
-                use_swa=use_swa,
-                swa_model=swa_model,
-                swa_start=swa_start,
-                il_dir=il_dir,
-                history_positions=history_positions,
-                expected_input_planes=expected_input_planes,
-                model_version=model_version,
-                start_mode=start_mode,
-                use_bfloat16=use_bfloat16,
-                model_file_tag=model_file_tag,
-                model_architecture=model_architecture,
-                training_batch_size=trained_batch_size,
-            )
 
             if should_stop:
                 break

@@ -87,7 +87,12 @@ def build_eval_elo_config(
     if levels is not None:
         runtime_cfg["levels"] = list(levels)
     if games_per_level is not None:
-        runtime_cfg["games_per_level"] = int(games_per_level)
+        focus_games = max(1, int(games_per_level))
+        runtime_cfg["games_per_level"] = focus_games
+        runtime_cfg["adaptive_focus_games_per_level"] = max(
+            int(runtime_cfg.get("adaptive_probe_games_per_level", 1) or 1),
+            focus_games,
+        )
     if sf_time is not None:
         runtime_cfg["stockfish_time_limit"] = float(sf_time)
     if max_moves is not None:

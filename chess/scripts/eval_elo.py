@@ -417,7 +417,7 @@ def choose_model_entries(catalog, best_path):
 
 def choose_eval_settings(elo_cfg):
     levels = list(elo_cfg.get("levels", [1320, 1500, 1700, 1900, 2200]))
-    default_games = int(elo_cfg.get("games_per_level", 6))
+    default_games = int(elo_cfg.get("adaptive_focus_games_per_level", 20))
     default_use_mcts = False
     default_sims = int(elo_cfg.get("mcts_eval_simulations", 100))
     default_sf_time = float(elo_cfg.get("stockfish_time_limit", 0.05))
@@ -428,7 +428,7 @@ def choose_eval_settings(elo_cfg):
     if _is_tty():
         _print_block("Evaluation Settings")
         print(f"Levels (from config): {levels}")
-    games_label = "Max games per useful level"
+    games_label = "Focus cap per selected level"
     games_per_level = _prompt_int(games_label, default_games, min_value=1)
     workers = default_workers
 
@@ -593,7 +593,22 @@ def format_results_table(all_results: list[dict]) -> str:
         if result.get("elo_std_error") is not None:
             ci = result.get("elo_ci95")
             ci_str = f", 95% CI {ci[0]}-{ci[1]}" if isinstance(ci, list) and len(ci) == 2 else ""
-            lines.append(f"  Uncertainty: ±{result['elo_std_error']} Elo SE{ci_str} (adaptive ladder)")
+            lines.append(f"  Uncertainty: +/-{result['elo_std_error']} Elo SE{ci_str} (adaptive ladder)")
+        rating_games = int(result.get("rating_games", result.get("total_games", 0)) or 0)
+        probe_only_games = int(result.get("probe_only_games", 0) or 0)
+        rating_levels = list(result.get("rating_levels") or [])
+        if rating_levels and probe_only_games > 0:
+            lines.append(
+                f"  Rating fit: {rating_games} focused games on levels {rating_levels}; "
+                f"{probe_only_games} probe games used only for level selection."
+            )
+        if result.get("fit_warning"):
+            model_se = result.get("elo_model_std_error")
+            model_se_text = f"; ideal-curve SE would be {model_se}" if model_se is not None else ""
+            lines.append(
+                "  Fit warning: non-monotonic level results; uncertainty was inflated "
+                f"(dispersion {float(result.get('elo_overdispersion', 1.0)):.2f}{model_se_text})."
+            )
 
         if result.get("results"):
             parts = []
@@ -601,8 +616,11 @@ def format_results_table(all_results: list[dict]) -> str:
                 if lvl in result["results"]:
                     r = result["results"][lvl]
                     games = int(r.get("games", r.get("wins", 0) + r.get("draws", 0) + r.get("losses", 0)) or 0)
+                    local_elo = r.get("local_performance_elo")
+                    local_text = f", local~{local_elo}" if local_elo is not None and games >= 8 else ""
                     parts.append(
-                        f"vs {lvl}: W{r['wins']}/D{r['draws']}/L{r['losses']} ({r['score']:.0%}, n={games})"
+                        f"vs {lvl}: W{r['wins']}/D{r['draws']}/L{r['losses']} "
+                        f"({r['score']:.0%}, n={games}{local_text})"
                     )
             lines.append("  " + " | ".join(parts))
 
@@ -691,17 +709,29 @@ def main():
 
     selected_paths = [entry["path"] for entry in selected_entries]
 
-    default_max_games_per_run = len(levels) * games_per_level
+    def _resolved_mode_config(mode_name):
+        mode_use_mcts = mode_name == "mcts"
+        return build_eval_elo_config(
+            elo_cfg,
+            levels=levels,
+            games_per_level=games_per_level,
+            use_mcts=mode_use_mcts,
+            simulations=simulations,
+            sf_time=sf_time,
+            max_moves=max_moves,
+            sf_path=sf_path,
+            workers=resolve_eval_workers(workers, mode_use_mcts, elo_cfg),
+            standalone=True,
+        )
 
-    def _mode_max_games(mode_name):
-        mode_prefix = "mcts_eval" if mode_name == "mcts" else "nn_eval"
-        cap = elo_cfg.get(f"{mode_prefix}_adaptive_max_total_games", elo_cfg.get("adaptive_max_total_games"))
-        try:
-            return min(default_max_games_per_run, int(cap or default_max_games_per_run))
-        except (TypeError, ValueError):
-            return default_max_games_per_run
-
-    total_games = len(selected_paths) * sum(_mode_max_games(mode) for mode in eval_modes)
+    mode_runtime_configs = {
+        mode_name: _resolved_mode_config(mode_name)
+        for mode_name in eval_modes
+    }
+    total_games = len(selected_paths) * sum(
+        int(runtime_cfg.get("adaptive_max_total_games", 0) or 0)
+        for runtime_cfg in mode_runtime_configs.values()
+    )
     mode_labels = []
     if "nn" in eval_modes:
         mode_labels.append("Raw NN")
@@ -716,11 +746,19 @@ def main():
     _print_block("Elo Estimation Plan")
     print(f"Models:         {len(selected_paths)}")
     print(f"Levels:         {levels}")
-    print(f"Games/level:    adaptive probe/focus, cap {games_per_level}/useful level")
     print(f"Total games:    <= {total_games}")
     print(f"Mode:           {mode_str}")
     if "mcts" in eval_modes:
         print(f"MCTS sims:      {simulations}")
+    for mode_name in eval_modes:
+        runtime_cfg = mode_runtime_configs[mode_name]
+        label = "MCTS adaptive" if mode_name == "mcts" else "NN adaptive"
+        print(
+            f"{label + ':':<16} probe {int(runtime_cfg.get('adaptive_probe_games_per_level', 0) or 0)}/level"
+            f" · focus <= {int(runtime_cfg.get('adaptive_focus_games_per_level', 0) or 0)}"
+            f" · target SE {float(runtime_cfg.get('adaptive_target_standard_error', 0.0) or 0.0):.0f}"
+            f" · cap {int(runtime_cfg.get('adaptive_max_total_games', 0) or 0)}"
+        )
     print(f"Workers:        {workers_str}")
     if workers <= 0 and "nn" in eval_modes:
         raw_workers = resolve_eval_workers(workers, False, elo_cfg)
@@ -741,6 +779,13 @@ def main():
             print("MCTS central:   disabled")
     print(f"SF time/move:   {sf_time}s")
     print(f"Max moves:      {max_moves}")
+    if bool(elo_cfg.get("paired_openings_enabled", True)):
+        print(
+            "Openings:       paired colors · "
+            f"{int(elo_cfg.get('paired_openings_max_plies', 6) or 0)} fixed plies"
+        )
+    else:
+        print("Openings:       start position only")
 
     # Ensure Stockfish is available
     sf_path = ensure_stockfish(sf_path)
@@ -748,7 +793,8 @@ def main():
     all_results = []
     t0 = time.perf_counter()
 
-    for idx, model_path in enumerate(selected_paths, start=1):
+    for idx, entry in enumerate(selected_entries, start=1):
+        model_path = entry["path"]
         print(f"\n[{idx}/{len(selected_paths)}] {model_path.name}")
 
         model = load_model(model_path, config, device)
@@ -761,18 +807,16 @@ def main():
             print(f"  Mode: {mode_label_text}")
 
             mode_workers = resolve_eval_workers(workers, mode_use_mcts, elo_cfg)
-            mode_elo_cfg = build_eval_elo_config(
-                elo_cfg,
-                levels=levels,
-                games_per_level=games_per_level,
-                use_mcts=mode_use_mcts,
-                simulations=simulations,
-                sf_time=sf_time,
-                max_moves=max_moves,
-                sf_path=sf_path,
-                workers=mode_workers,
-                standalone=True,
-            )
+            mode_elo_cfg = dict(mode_runtime_configs[eval_mode])
+            mode_elo_cfg["workers"] = int(mode_workers)
+            initial_elo = entry.get("elo_mcts" if mode_use_mcts else "elo_nn")
+            if mode_use_mcts:
+                by_sims = dict(entry.get("elo_mcts_by_simulations") or {})
+                sims_entry = by_sims.get(int(simulations)) or by_sims.get(str(int(simulations)))
+                if isinstance(sims_entry, dict) and _safe_float(sims_entry.get("elo")) is not None:
+                    initial_elo = _safe_float(sims_entry.get("elo"))
+            if _safe_float(initial_elo) is not None:
+                mode_elo_cfg["adaptive_initial_elo"] = float(initial_elo)
 
             result = run_elo_check(model, config, device, mode_elo_cfg)
             if result.get("cancelled"):

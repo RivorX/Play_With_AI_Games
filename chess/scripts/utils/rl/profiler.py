@@ -52,6 +52,24 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
         0.0,
         float(selfplay_profile.get("mcts_central_inference_server_queue_wait_time", 0.0) or 0.0),
     )
+    central_descriptor_queue_wait_time = max(
+        0.0,
+        float(
+            selfplay_profile.get(
+                "mcts_central_inference_server_descriptor_queue_wait_time",
+                0.0,
+            ) or 0.0
+        ),
+    )
+    central_batch_coalesce_wait_time = max(
+        0.0,
+        float(
+            selfplay_profile.get(
+                "mcts_central_inference_server_batch_coalesce_wait_time",
+                0.0,
+            ) or 0.0
+        ),
+    )
     central_server_forward_time = max(
         0.0,
         float(selfplay_profile.get("mcts_central_inference_server_forward_time", 0.0) or 0.0),
@@ -221,6 +239,12 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
         central_remote_ms = 1000.0 * central_remote_wait_time / max(1, central_requests)
         central_put_ms = 1000.0 * central_request_put_time / max(1, central_requests)
         central_queue_ms = 1000.0 * central_server_queue_wait_time / max(1, central_requests)
+        central_descriptor_queue_ms = (
+            1000.0 * central_descriptor_queue_wait_time / max(1, central_requests)
+        )
+        central_batch_coalesce_ms = (
+            1000.0 * central_batch_coalesce_wait_time / max(1, central_requests)
+        )
         central_concat_ms = 1000.0 * central_server_concat_time / max(1, central_requests)
         central_h2d_ms = 1000.0 * central_server_h2d_time / max(1, central_requests)
         central_forward_ms = 1000.0 * central_server_forward_time / max(1, central_requests)
@@ -234,7 +258,9 @@ def print_selfplay_profiler(selfplay_profile, selfplay_time):
         print(f"   {'central_avg_batch':<32} {central_avg_batch:7.2f} pos/batch")
         print(f"   {'worker_remote_wait':<32} {central_remote_ms:7.2f} ms/request")
         print(f"   {'worker_queue_put':<32} {central_put_ms:7.2f} ms/request")
-        print(f"   {'server_queue_wait':<32} {central_queue_ms:7.2f} ms/request ({central_queue_share:5.1f}% remote_wait)")
+        print(f"   {'server_queue_total':<32} {central_queue_ms:7.2f} ms/request ({central_queue_share:5.1f}% remote_wait)")
+        print(f"   {'descriptor_queue_backlog':<32} {central_descriptor_queue_ms:7.2f} ms/request")
+        print(f"   {'batch_coalesce_wait':<32} {central_batch_coalesce_ms:7.2f} ms/request")
         print(f"   {'server_concat_ipc':<32} {central_concat_ms:7.2f} ms/request")
         print(f"   {'server_h2d':<32} {central_h2d_ms:7.2f} ms/request")
         print(f"   {'server_forward':<32} {central_forward_ms:7.2f} ms/request ({central_forward_share:5.1f}% remote_wait)")

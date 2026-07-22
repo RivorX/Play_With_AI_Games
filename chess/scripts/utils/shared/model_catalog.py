@@ -467,6 +467,9 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
         "top1": None,
         "val_loss": None,
         "policy_loss": None,
+        "value_loss": None,
+        "early_stop_monitor": None,
+        "early_stop_monitor_loss": None,
         "elo": None,
         "elo_nn": None,
         "elo_mcts": None,
@@ -503,6 +506,9 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
     entry["top1"] = _safe_float(checkpoint.get("val_policy_top1", checkpoint.get("policy_top1_acc")))
     entry["val_loss"] = _safe_float(checkpoint.get("val_loss", checkpoint.get("loss")))
     entry["policy_loss"] = _safe_float(checkpoint.get("val_policy_loss", checkpoint.get("policy_loss")))
+    entry["value_loss"] = _safe_float(checkpoint.get("val_value_loss", checkpoint.get("value_loss")))
+    entry["early_stop_monitor"] = checkpoint.get("early_stop_monitor")
+    entry["early_stop_monitor_loss"] = _safe_float(checkpoint.get("early_stop_monitor_loss"))
     legacy_elo = _safe_float(checkpoint.get("estimated_elo", checkpoint.get("last_estimated_elo")))
     entry["elo_nn"] = _safe_float(
         checkpoint.get("estimated_elo_nn", checkpoint.get("last_estimated_elo_nn"))

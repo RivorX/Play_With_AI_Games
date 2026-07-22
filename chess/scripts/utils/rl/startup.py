@@ -32,6 +32,61 @@ def _safe_int(value):
         return None
 
 
+def select_best_il_checkpoint(best_checkpoint, swa_checkpoint=None):
+    """Choose SWA only when it beats canonical best on the same IL monitor.
+
+    ``best_model_il.pt`` is selected during IL by the configured validation
+    monitor. An SWA file is optional and must carry a directly comparable
+    monitor result; its mere existence is not evidence that it is stronger.
+    """
+    best_path = Path(best_checkpoint)
+    swa_path = Path(swa_checkpoint) if swa_checkpoint is not None else (
+        best_path.parent / "best_model_il_swa.pt"
+    )
+    candidates = []
+    for kind, path in (("best", best_path), ("swa", swa_path)):
+        if not path.exists():
+            continue
+        metadata = load_checkpoint_metadata(path)
+        if metadata.get("error"):
+            continue
+        candidates.append((kind, path, metadata))
+
+    if not candidates:
+        return best_path, "no readable IL checkpoint metadata; using configured best path"
+
+    canonical = next((item for item in candidates if item[0] == "best"), None)
+    swa = next((item for item in candidates if item[0] == "swa"), None)
+    if canonical is None:
+        return swa[1], "canonical best missing; using available SWA checkpoint"
+    if swa is None:
+        return canonical[1], "SWA checkpoint unavailable; using canonical IL best"
+
+    best_meta = canonical[2]
+    swa_meta = swa[2]
+    best_monitor = str(best_meta.get("early_stop_monitor") or "").strip()
+    swa_monitor = str(swa_meta.get("early_stop_monitor") or "").strip()
+    best_loss = _safe_float(best_meta.get("early_stop_monitor_loss"))
+    swa_loss = _safe_float(swa_meta.get("early_stop_monitor_loss"))
+    if (
+        best_loss is not None
+        and swa_loss is not None
+        and best_monitor
+        and best_monitor == swa_monitor
+    ):
+        if swa_loss < best_loss:
+            return swa[1], (
+                f"SWA wins IL monitor: {swa_loss:.5f} < {best_loss:.5f}"
+            )
+        return canonical[1], (
+            f"canonical best wins IL monitor: {best_loss:.5f} <= {swa_loss:.5f}"
+        )
+
+    return canonical[1], (
+        "SWA has no directly comparable IL monitor; using canonical best_model_il.pt"
+    )
+
+
 def _path_relative_to_base(path, base_dir):
     try:
         return str(path.resolve().relative_to(base_dir.resolve()))
@@ -167,6 +222,7 @@ def _choose_start_mode(has_checkpoints, default_choice="2", default_hint=None):
     _print_block_title("RL STARTUP | choose how to initialize the learner")
     print(" [1] NEW       fresh RL run; initialize from the best IL checkpoint")
     print(" [2] RESUME    continue model, optimizer, scaler and iteration counter")
+    print("               replay/champion buffers rebuild from newly generated games")
     print(" [3] TRANSFER  copy compatible weights; reset optimizer and schedule")
 
     if default_hint:
@@ -442,7 +498,24 @@ def apply_rl_startup_plan(
                 model_state = checkpoint.get("model_state_dict")
                 if not isinstance(model_state, dict):
                     raise KeyError("missing model_state_dict")
-                model.load_state_dict(model_state)
+                try:
+                    model.load_state_dict(model_state)
+                except RuntimeError:
+                    report = transfer_matching_weights(model, checkpoint)
+                    allowed_missing = (
+                        'search_q_fc.',
+                        'search_error_fc.',
+                        'search_value_ready',
+                    )
+                    if report.get('shape_mismatch') or any(
+                        not str(key).startswith(allowed_missing)
+                        for key in report.get('missing_keys', [])
+                    ):
+                        raise
+                    print(
+                        "Resume upgrade: initialized the new search Q/error heads; "
+                        "winner-WDL inference stays active until they receive RL targets."
+                    )
 
                 checkpoint_epoch = _safe_int(checkpoint.get("epoch"))
                 if checkpoint_epoch is not None:

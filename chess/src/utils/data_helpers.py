@@ -7,7 +7,7 @@ v4.3: POV (Point of View) + Dynamic Sliding Window
 - Value targets use final W/D/L outcomes from side-to-move POV.
 """
 
-import chess
+from src import chess_backend as chess
 import numpy as np
 import struct
 from functools import lru_cache
@@ -39,18 +39,59 @@ def compute_discounted_outcome(result, current_turn):
 # POV (POINT OF VIEW) BOARD REPRESENTATION
 # ==============================================================================
 
-_SQUARE_ROWS = tuple(square // 8 for square in range(64))
-_SQUARE_COLS = tuple(square % 8 for square in range(64))
-_SQUARE_ROWS_FLIPPED = tuple(7 - row for row in _SQUARE_ROWS)
-_SQUARE_COLS_FLIPPED = tuple(7 - col for col in _SQUARE_COLS)
-_PIECE_MASKS_WITH_INDEX = (
-    ("pawns", 0),
-    ("knights", 1),
-    ("bishops", 2),
-    ("rooks", 3),
-    ("queens", 4),
-    ("kings", 5),
+_PIECE_TYPES_WITH_INDEX = (
+    (chess.PAWN, 0),
+    (chess.KNIGHT, 1),
+    (chess.BISHOP, 2),
+    (chess.ROOK, 3),
+    (chess.QUEEN, 4),
+    (chess.KING, 5),
 )
+
+
+def _canonical_piece_planes(board):
+    """Return white pieces followed by black pieces in board orientation."""
+    masks = np.asarray(
+        [
+            chess.piece_mask(board, piece_type, color)
+            for color in (chess.WHITE, chess.BLACK)
+            for piece_type, _piece_idx in _PIECE_TYPES_WITH_INDEX
+        ],
+        dtype='<u8',
+    )
+    return np.unpackbits(
+        masks.view(np.uint8),
+        bitorder='little',
+    ).reshape(12, 8, 8)
+
+
+def _fill_metadata_planes(tensor, board, pov_color, should_flip):
+    tensor[12:14].fill(0.0)
+
+    kingside = chess.has_kingside_castling_rights(board, pov_color)
+    queenside = chess.has_queenside_castling_rights(board, pov_color)
+    if kingside or queenside:
+        king_sq = chess.king_square(board, pov_color)
+        if king_sq is not None:
+            king_sq = chess.square_index(king_sq)
+            king_row, king_col = divmod(king_sq, 8)
+            if should_flip:
+                king_row, king_col = 7 - king_row, 7 - king_col
+            tensor[12, king_row, king_col] = 1.0
+            if kingside:
+                tensor[12, king_row, 0 if should_flip else 7] = 1.0
+            if queenside:
+                tensor[12, king_row, 7 if should_flip else 0] = 1.0
+
+    if board.en_passant_square is not None:
+        ep_square = chess.square_index(board.en_passant_square)
+        ep_row, ep_col = divmod(ep_square, 8)
+        if should_flip:
+            ep_row, ep_col = 7 - ep_row, 7 - ep_col
+        tensor[13, ep_row, ep_col] = 1.0
+
+    tensor[14].fill(min(board.halfmove_clock / 50.0, 1.0))
+    tensor[15].fill(min(board.fullmove_number / 100.0, 1.0))
 
 
 def board_to_tensor(board, flip_perspective=None, dtype=np.float32):
@@ -81,89 +122,35 @@ def board_to_tensor(board, flip_perspective=None, dtype=np.float32):
     Returns: 
         (16, 8, 8) tensor from current player's perspective (was 12, now 16)
     """
-    tensor = np.zeros((16, 8, 8), dtype=dtype)
-    
     # Determine if we need to flip
     if flip_perspective is None:
         should_flip = (board.turn == chess.BLACK)
     else:
         should_flip = flip_perspective
-    pov_color = chess.BLACK if should_flip else chess.WHITE
-    rows = _SQUARE_ROWS_FLIPPED if should_flip else _SQUARE_ROWS
-    cols = _SQUARE_COLS_FLIPPED if should_flip else _SQUARE_COLS
-    
-    # === PIECE PLANES (0-11) ===
-    own_occupied = board.occupied_co[pov_color]
-    opp_occupied = board.occupied_co[not pov_color]
-    for piece_attr, piece_idx in _PIECE_MASKS_WITH_INDEX:
-        piece_mask = getattr(board, piece_attr)
-
-        own_bb = piece_mask & own_occupied
-        while own_bb:
-            lsb = own_bb & -own_bb
-            square = lsb.bit_length() - 1
-            tensor[piece_idx, rows[square], cols[square]] = 1.0
-            own_bb ^= lsb
-
-        opp_bb = piece_mask & opp_occupied
-        while opp_bb:
-            lsb = opp_bb & -opp_bb
-            square = lsb.bit_length() - 1
-            tensor[piece_idx + 6, rows[square], cols[square]] = 1.0
-            opp_bb ^= lsb
-    
-    # === METADATA PLANES (12-15) ===
-    
-    # Channel 12: Castling rights
-    # Mark squares where castling is possible (king position + rook position)
-    # When flip_perspective is forced (history/eval paths), metadata must follow
-    # the requested POV color rather than the historical side-to-move.
-    if board.has_kingside_castling_rights(pov_color):
-        # Kingside: mark king and h-rook squares
-        king_sq = board.king(pov_color)
-        if king_sq is not None:
-            king_row, king_col = king_sq // 8, king_sq % 8
-            if should_flip:
-                king_row, king_col = 7 - king_row, 7 - king_col
-            tensor[12, king_row, king_col] = 1.0
-            # Rook on h-file (col=7 for white, flipped for black)
-            rook_col = 7
-            if should_flip:
-                rook_col = 7 - rook_col
-            tensor[12, king_row, rook_col] = 1.0
-    
-    if board.has_queenside_castling_rights(pov_color):
-        # Queenside: mark king and a-rook squares
-        king_sq = board.king(pov_color)
-        if king_sq is not None:
-            king_row, king_col = king_sq // 8, king_sq % 8
-            if should_flip:
-                king_row, king_col = 7 - king_row, 7 - king_col
-            tensor[12, king_row, king_col] = 1.0
-            # Rook on a-file (col=0 for white, flipped for black)
-            rook_col = 0
-            if should_flip:
-                rook_col = 7 - rook_col
-            tensor[12, king_row, rook_col] = 1.0
-    
-    # Channel 13: En passant square
-    if board.ep_square is not None:
-        ep_row, ep_col = board.ep_square // 8, board.ep_square % 8
-        if should_flip:
-            ep_row, ep_col = 7 - ep_row, 7 - ep_col
-        tensor[13, ep_row, ep_col] = 1.0
-    
-    # Channel 14: Halfmove clock (normalized to 0-1, scaled by 50-move rule)
-    # Uniform plane with value = halfmove_clock / 50
-    halfmove_normalized = min(board.halfmove_clock / 50.0, 1.0)
-    tensor[14].fill(halfmove_normalized)
-
-    # Channel 15: Fullmove number (normalized to 0-1)
-    # Fullmove starts at 1 and increments after Black's move
-    fullmove_normalized = min(board.fullmove_number / 100.0, 1.0)
-    tensor[15].fill(fullmove_normalized)
-    
+    canonical = _canonical_piece_planes(board)
+    tensor = np.empty((16, 8, 8), dtype=dtype)
+    if should_flip:
+        tensor[:6] = canonical[6:12, ::-1, ::-1]
+        tensor[6:12] = canonical[:6, ::-1, ::-1]
+        pov_color = chess.BLACK
+    else:
+        tensor[:12] = canonical
+        pov_color = chess.WHITE
+    _fill_metadata_planes(tensor, board, pov_color, should_flip)
     return tensor
+
+
+def board_to_tensor_pair(board, dtype=np.float32):
+    """Encode both POVs while reading and unpacking native bitboards once."""
+    canonical = _canonical_piece_planes(board)
+    white = np.empty((16, 8, 8), dtype=dtype)
+    black = np.empty((16, 8, 8), dtype=dtype)
+    white[:12] = canonical
+    black[:6] = canonical[6:12, ::-1, ::-1]
+    black[6:12] = canonical[:6, ::-1, ::-1]
+    _fill_metadata_planes(white, board, chess.WHITE, False)
+    _fill_metadata_planes(black, board, chess.BLACK, True)
+    return white, black
 
 
 _COMPACT_PIECE_SPECS = (
@@ -196,11 +183,11 @@ def board_to_compact(board):
     NOTE: Stores board in ORIGINAL orientation (not POV)
     POV conversion happens at tensor conversion time
     """
-    # Fill nibbles directly from python-chess bitboards.  This avoids building
+    # Fill nibbles directly from native bitboards.  This avoids building
     # a 64-entry piece map and then looping over all 64 squares for every ply.
     packed = bytearray(38)
     for piece_type, color, code in _COMPACT_PIECE_SPECS:
-        bitboard = board.pieces_mask(piece_type, color)
+        bitboard = chess.piece_mask(board, piece_type, color)
         while bitboard:
             lowest_bit = bitboard & -bitboard
             square = lowest_bit.bit_length() - 1
@@ -213,68 +200,64 @@ def board_to_compact(board):
 
     # Byte 32: castling rights (K, Q, k, q).
     castling_byte = 0
-    if board.has_kingside_castling_rights(chess.WHITE):
+    if chess.has_kingside_castling_rights(board, chess.WHITE):
         castling_byte |= 0b1000  # K
-    if board.has_queenside_castling_rights(chess.WHITE):
+    if chess.has_queenside_castling_rights(board, chess.WHITE):
         castling_byte |= 0b0100  # Q
-    if board.has_kingside_castling_rights(chess.BLACK):
+    if chess.has_kingside_castling_rights(board, chess.BLACK):
         castling_byte |= 0b0010  # k
-    if board.has_queenside_castling_rights(chess.BLACK):
+    if chess.has_queenside_castling_rights(board, chess.BLACK):
         castling_byte |= 0b0001  # q
     packed[32] = castling_byte
-    packed[33] = board.ep_square if board.ep_square is not None else 255
+    packed[33] = (
+        chess.square_index(board.en_passant_square)
+        if board.en_passant_square is not None
+        else 255
+    )
     struct.pack_into('>HH', packed, 34, board.halfmove_clock, board.fullmove_number)
     
     return bytes(packed)
 
 
 def compact_to_board(compact_board, turn=chess.WHITE):
-    """Reconstruct a python-chess board from the compact 38-byte encoding."""
+    """Reconstruct a native bulletchess board from the compact encoding."""
     if len(compact_board) != 38:
         raise ValueError(f"Invalid compact board size: {len(compact_board)} (expected 38)")
 
     code_to_piece = {
-        1: chess.Piece(chess.PAWN, chess.WHITE),
-        2: chess.Piece(chess.KNIGHT, chess.WHITE),
-        3: chess.Piece(chess.BISHOP, chess.WHITE),
-        4: chess.Piece(chess.ROOK, chess.WHITE),
-        5: chess.Piece(chess.QUEEN, chess.WHITE),
-        6: chess.Piece(chess.KING, chess.WHITE),
-        7: chess.Piece(chess.PAWN, chess.BLACK),
-        8: chess.Piece(chess.KNIGHT, chess.BLACK),
-        9: chess.Piece(chess.BISHOP, chess.BLACK),
-        10: chess.Piece(chess.ROOK, chess.BLACK),
-        11: chess.Piece(chess.QUEEN, chess.BLACK),
-        12: chess.Piece(chess.KING, chess.BLACK),
+        1: chess.Piece(chess.WHITE, chess.PAWN),
+        2: chess.Piece(chess.WHITE, chess.KNIGHT),
+        3: chess.Piece(chess.WHITE, chess.BISHOP),
+        4: chess.Piece(chess.WHITE, chess.ROOK),
+        5: chess.Piece(chess.WHITE, chess.QUEEN),
+        6: chess.Piece(chess.WHITE, chess.KING),
+        7: chess.Piece(chess.BLACK, chess.PAWN),
+        8: chess.Piece(chess.BLACK, chess.KNIGHT),
+        9: chess.Piece(chess.BLACK, chess.BISHOP),
+        10: chess.Piece(chess.BLACK, chess.ROOK),
+        11: chess.Piece(chess.BLACK, chess.QUEEN),
+        12: chess.Piece(chess.BLACK, chess.KING),
     }
 
-    board = chess.Board(None)
+    board = chess.empty_board()
     for i in range(32):
         byte = compact_board[i]
         codes = ((byte >> 4) & 0x0F, byte & 0x0F)
         for offset, code in enumerate(codes):
             piece = code_to_piece.get(code)
             if piece is not None:
-                board.set_piece_at(i * 2 + offset, piece)
+                board[chess.square_from_index(i * 2 + offset)] = piece
 
     castling_byte = compact_board[32]
-    castling_rights = 0
-    if castling_byte & 0b1000:
-        castling_rights |= chess.BB_H1
-    if castling_byte & 0b0100:
-        castling_rights |= chess.BB_A1
-    if castling_byte & 0b0010:
-        castling_rights |= chess.BB_H8
-    if castling_byte & 0b0001:
-        castling_rights |= chess.BB_A8
-    board.castling_rights = castling_rights
+    board.castling_rights = chess.castling_rights_from_flags(castling_byte)
 
+    # bulletchess validates an en-passant square against the side to move, so
+    # turn must be restored before assigning that square.
+    board.turn = turn
     ep_square = compact_board[33]
-    board.ep_square = None if ep_square == 255 else int(ep_square)
+    board.en_passant_square = None if ep_square == 255 else chess.square_from_index(ep_square)
     board.halfmove_clock = int(struct.unpack('>H', compact_board[34:36])[0])
     board.fullmove_number = int(struct.unpack('>H', compact_board[36:38])[0])
-    board.turn = bool(turn)
-    board.clear_stack()
     return board
 
 
@@ -586,8 +569,8 @@ def move_to_index(move, board):
     """
     is_black_turn = (board.turn == chess.BLACK)
     az_index = _move_to_az_index_cached(
-        move.from_square,
-        move.to_square,
+        chess.move_origin_index(move),
+        chess.move_destination_index(move),
         move.promotion or 0,
         is_black_turn,
     )
@@ -649,7 +632,7 @@ def index_to_move(index, is_black_turn=False, board=None):
         board: Optional board; if provided, queen promotions are reconstructed when applicable.
     """
     if index < 0 or index >= ACTION_SIZE:
-        return chess.Move.null()
+        return None
     index = policy_index_to_az_index(index)
 
     from_square_pov = index // ACTION_PLANES
@@ -671,7 +654,7 @@ def index_to_move(index, is_black_turn=False, board=None):
         piece_idx = promo_plane // 3
         dir_idx = promo_plane % 3
         if piece_idx < 0 or piece_idx >= len(_UNDERPROMOTION_PIECES):
-            return chess.Move.null()
+            return None
         dr, dc = _UNDERPROMOTION_DELTAS[dir_idx]
         to_row = from_row + dr
         to_col = from_col + dc
@@ -679,20 +662,20 @@ def index_to_move(index, is_black_turn=False, board=None):
 
     to_square_pov = _coords_to_square(to_row, to_col)
     if to_square_pov is None:
-        return chess.Move.null()
+        return None
 
     from_square = _from_pov_square(from_square_pov, is_black_turn)
     to_square = _from_pov_square(to_square_pov, is_black_turn)
 
     # Queen promotions are encoded in queen-like planes; reconstruct when board is available.
     if promotion is None and board is not None:
-        piece = board.piece_at(from_square)
+        piece = chess.piece_at(board, from_square)
         if piece is not None and piece.piece_type == chess.PAWN:
             to_rank = chess.square_rank(to_square)
             if to_rank == 0 or to_rank == 7:
                 promotion = chess.QUEEN
 
-    return chess.Move(from_square, to_square, promotion=promotion)
+    return chess.new_move(from_square, to_square, promotion=promotion)
 
 
 def _mirror_file_pov_square(square):
@@ -770,17 +753,14 @@ def compute_material_balance(board):
         chess.KING: 0
     }
     
-    white_material = 0
-    black_material = 0
-    
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            value = piece_values[piece.piece_type]
-            if piece.color == chess.WHITE:
-                white_material += value
-            else:
-                black_material += value
+    white_material = sum(
+        value * len(board[chess.WHITE, piece_type])
+        for piece_type, value in piece_values.items()
+    )
+    black_material = sum(
+        value * len(board[chess.BLACK, piece_type])
+        for piece_type, value in piece_values.items()
+    )
     
     # From current player's perspective
     if board.turn == chess.WHITE:
@@ -799,7 +779,7 @@ def is_in_check(board):
     Returns:
         float: 1.0 if in check, 0.0 otherwise
     """
-    return 1.0 if board.is_check() else 0.0
+    return 1.0 if chess.is_check(board) else 0.0
 
 
 def will_win(board, game_result):

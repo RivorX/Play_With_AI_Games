@@ -36,9 +36,34 @@ except ImportError:
     _HAS_URLLIB = False
 
 # Imports are resolved at runtime (script_dir-based sys.path setup in train_il.py)
-from src.utils.data_helpers import board_to_tensor, move_to_index
-from src.batch_selfplay import MCTS, MultiGameBatchMCTS, select_move_by_visits
+from src.utils.data_helpers import board_to_tensor, board_to_tensor_pair, move_to_index
+from src.batch_selfplay import (
+    MCTS,
+    MultiGameBatchMCTS,
+    _SELFPLAY_OPENING_LINES,
+    select_move_by_visits,
+)
+from src import chess_backend as native_chess
 from utils.shared.central_inference_session import CentralInferenceSession, snapshot_model_state_cpu
+from utils.shared.elo_rating import (
+    elo_fit_diagnostics as _elo_fit_diagnostics,
+    local_performance_rating as _local_performance_rating,
+    performance_rating as _performance_rating,
+)
+from utils.shared.elo_schedule import AdaptiveEloSchedule
+
+
+def _native_board(board):
+    """Explicit Stockfish/python-chess -> native model boundary."""
+    if isinstance(board, native_chess.Board):
+        return board
+    return native_chess.board_from_fen(board.fen())
+
+
+def _python_move(move):
+    if move is None or isinstance(move, chess.Move):
+        return move
+    return chess.Move.from_uci(native_chess.move_uci(move))
 
 
 def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict:
@@ -249,7 +274,7 @@ def ensure_stockfish(configured_path: str = "stockfish") -> str:
     if engines_dir.exists():
         for candidate in engines_dir.rglob("stockfish*"):
             if candidate.is_file() and candidate.stat().st_size > 1_000_000:
-                print(f"  \u265a Using cached Stockfish: {candidate}")
+                print(f"  Using cached Stockfish: {candidate}")
                 return str(candidate)
 
     # 4. Download
@@ -260,63 +285,6 @@ def ensure_stockfish(configured_path: str = "stockfish") -> str:
     except Exception as e:
         print(f"  \u26a0\ufe0f  Failed to auto-download Stockfish: {e}")
         return configured_path  # Return original (will fail later with friendly message)
-
-
-# ---------------------------------------------------------------------------
-# Elo math helpers
-# ---------------------------------------------------------------------------
-
-def _expected_score(elo_a: float, elo_b: float) -> float:
-    """Expected score of player A against player B (logistic model)."""
-    return 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / 400.0))
-
-
-def _performance_rating(opponent_elos: list[float], scores: list[float]) -> float | None:
-    """
-    Compute performance rating via MLE (maximum-likelihood estimate).
-
-    Given a list of opponent Elo values and per-game scores (1/0.5/0),
-    find the rating R that maximises the likelihood of the observed results.
-
-    Returns None if the data is degenerate (all wins or all losses at every
-    level, making the MLE unbounded).
-    """
-    total_score = sum(scores)
-    n = len(scores)
-    if n == 0:
-        return None
-    score_pct = total_score / n
-    # Edge cases: perfect score or zero score -> cap at +/-800 from avg opponent
-    avg_opp = sum(opponent_elos) / len(opponent_elos)
-    if score_pct <= 0.0:
-        return avg_opp - 800
-    if score_pct >= 1.0:
-        return avg_opp + 800
-
-    # Binary search for R that gives the observed score
-    lo, hi = avg_opp - 1000, avg_opp + 1000
-    for _ in range(64):
-        mid = (lo + hi) / 2.0
-        expected = sum(_expected_score(mid, opp) for opp in opponent_elos) / n
-        if expected < score_pct:
-            lo = mid
-        else:
-            hi = mid
-    return (lo + hi) / 2.0
-
-
-def _elo_standard_error(opponent_elos: list[float], estimated_elo: float | None) -> float | None:
-    """Approximate rating standard error from logistic Fisher information."""
-    if estimated_elo is None or not opponent_elos:
-        return None
-    scale = math.log(10.0) / 400.0
-    info = 0.0
-    for opp in opponent_elos:
-        p = _expected_score(float(estimated_elo), float(opp))
-        info += (scale * scale) * max(1e-6, p * (1.0 - p))
-    if info <= 0.0:
-        return None
-    return 1.0 / math.sqrt(info)
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +309,10 @@ class _ModelPlayer:
             if config.get('hardware', {}).get('use_bfloat16', False)
             else torch.float16
         )
-        # Running board history (chess.Board copies)
-        self.board_history: list[chess.Board] = []
+        # Pre-encoded native history; python-chess remains only on the
+        # Stockfish boundary and each past board is encoded exactly once.
+        self.board_history: list[tuple[np.ndarray, np.ndarray]] = []
+        self._current_native_board = None
         # MCTS instance (lazy init)
         self.mcts = None
         if use_mcts:
@@ -350,30 +320,35 @@ class _ModelPlayer:
 
     def reset(self):
         self.board_history = []
+        self._current_native_board = None
         if self.mcts is not None:
             self.mcts.reset_tree()
 
     def record_state(self, board: chess.Board):
         """Call BEFORE making a move to keep board history."""
+        native_board = self._current_native_board
+        if native_board is None:
+            native_board = _native_board(board)
+            self._current_native_board = native_board
         if self.mcts is not None:
-            self.mcts.update_history(board)
+            self.mcts.update_history(native_board)
         if self.history_positions <= 0:
             return
-        self.board_history.append(board.copy(stack=False))
+        self.board_history.append(board_to_tensor_pair(native_board))
         max_keep = self.history_positions
         if len(self.board_history) > max_keep:
             self.board_history = self.board_history[-max_keep:]
 
-    def _build_input_tensor(self, board: chess.Board) -> np.ndarray:
+    def _build_input_tensor(self, board: native_chess.Board) -> np.ndarray:
         """Build (C, 8, 8) input tensor including history planes."""
         tensors: list[np.ndarray] = []
-        flip_history = (board.turn == chess.BLACK)
+        flip_history = (board.turn == native_chess.BLACK)
 
-        if self.history_positions > 0 and self.board_history:
+        if self.history_positions > 0:
             # Collect up to history_positions past boards (most recent last)
             history = self.board_history[-(self.history_positions):]
-            for hb in history:
-                tensors.append(board_to_tensor(hb, flip_perspective=flip_history))
+            for white_pov, black_pov in history:
+                tensors.append(black_pov if flip_history else white_pov)
             # Pad with zeros if not enough history
             while len(tensors) < self.history_positions:
                 tensors.insert(0, np.zeros((16, 8, 8), dtype=np.float32))
@@ -392,7 +367,11 @@ class _ModelPlayer:
     
     def _best_move_raw(self, board: chess.Board) -> chess.Move | None:
         """Raw network only (fast)."""
-        inp = self._build_input_tensor(board)
+        native_board = self._current_native_board
+        if native_board is None:
+            native_board = _native_board(board)
+            self._current_native_board = native_board
+        inp = self._build_input_tensor(native_board)
         t = (
             torch.from_numpy(inp)
             .unsqueeze(0)
@@ -407,25 +386,32 @@ class _ModelPlayer:
         policy = policy_logits.squeeze(0).float().cpu().numpy()
         best_move = None
         best_score = -float('inf')
-        for move in board.legal_moves:
-            idx = move_to_index(move, board)
+        for move in native_chess.legal_moves(native_board):
+            idx = move_to_index(move, native_board)
             if idx is not None and 0 <= idx < len(policy) and policy[idx] > best_score:
                 best_score = policy[idx]
                 best_move = move
-        return best_move
+        return _python_move(best_move)
     
     def _best_move_mcts(self, board: chess.Board) -> chess.Move | None:
         """MCTS search (slower but stronger)."""
-        visit_counts = self.mcts.search(board, self.simulations, temperature=0.0)
+        native_board = self._current_native_board
+        if native_board is None:
+            native_board = _native_board(board)
+            self._current_native_board = native_board
+        visit_counts = self.mcts.search(native_board, self.simulations, temperature=0.0)
         if not visit_counts:
             return self._best_move_raw(board)  # Fallback
         move, _ = select_move_by_visits(visit_counts, temperature=0.0)
-        return move
+        return _python_move(move)
 
     def on_move_played(self, move: chess.Move):
         """Keep MCTS tree synchronized with the actual played move."""
+        native_move = native_chess.move_from_uci(move.uci())
         if self.mcts is not None:
-            self.mcts.advance_root(move)
+            self.mcts.advance_root(native_move)
+        if self._current_native_board is not None:
+            native_chess.apply_move(self._current_native_board, native_move)
 
 
 class _BatchedModelPlayer:
@@ -451,37 +437,40 @@ class _BatchedModelPlayer:
     def create_state(self) -> dict:
         return {
             "board_history": [],
+            "native_board": None,
             "root": None,
             "_root_synced": False,
         }
 
     def reset_state(self, state: dict):
         state["board_history"] = []
+        state["native_board"] = None
         state["root"] = None
         state["_root_synced"] = False
 
     def record_state(self, state: dict, board: chess.Board):
+        native_board = state.get("native_board")
+        if native_board is None:
+            native_board = _native_board(board)
+            state["native_board"] = native_board
         if self.history_positions <= 0:
             return
         history = state.setdefault("board_history", [])
-        history.append(self._encode_history_entry(board))
+        history.append(self._encode_history_entry(native_board))
         max_keep = self.history_positions
         if len(history) > max_keep:
             state["board_history"] = history[-max_keep:]
 
     @staticmethod
     def _encode_history_entry(board: chess.Board):
-        return (
-            board_to_tensor(board, flip_perspective=False),
-            board_to_tensor(board, flip_perspective=True),
-        )
+        return board_to_tensor_pair(board)
 
     def _build_input_tensor(self, board: chess.Board, state: dict) -> np.ndarray:
         tensors: list[np.ndarray] = []
-        use_black_pov = board.turn == chess.BLACK
+        use_black_pov = board.turn == native_chess.BLACK
         history = state.get("board_history", [])
 
-        if self.history_positions > 0 and history:
+        if self.history_positions > 0:
             recent_history = history[-self.history_positions:]
             for hist_entry in recent_history:
                 hist_tensor = hist_entry[1] if use_black_pov else hist_entry[0]
@@ -496,9 +485,18 @@ class _BatchedModelPlayer:
     def best_moves(self, boards: list[chess.Board], states: list[dict]) -> list[chess.Move | None]:
         if not boards:
             return []
+        native_boards = []
+        for board, state in zip(boards, states):
+            native_board = state.get("native_board")
+            if native_board is None:
+                native_board = _native_board(board)
+                state["native_board"] = native_board
+            native_boards.append(native_board)
         if self.use_mcts and self.multi_mcts is not None:
-            return self._best_moves_mcts(boards, states)
-        return self._best_moves_raw(boards, states)
+            moves = self._best_moves_mcts(native_boards, states)
+        else:
+            moves = self._best_moves_raw(native_boards, states)
+        return [_python_move(move) for move in moves]
 
     def _best_moves_raw(self, boards: list[chess.Board], states: list[dict]) -> list[chess.Move | None]:
         inputs = np.stack(
@@ -522,7 +520,7 @@ class _BatchedModelPlayer:
             best_move = None
             best_score = -float('inf')
             policy = policy_batch[row_idx]
-            for move in board.legal_moves:
+            for move in native_chess.legal_moves(board):
                 idx = move_to_index(move, board)
                 if idx is not None and 0 <= idx < len(policy) and policy[idx] > best_score:
                     best_score = policy[idx]
@@ -573,12 +571,16 @@ class _BatchedModelPlayer:
         return moves
 
     def on_move_played(self, state: dict, move: chess.Move):
+        native_move = native_chess.move_from_uci(move.uci())
+        native_board = state.get("native_board")
+        if native_board is not None:
+            native_chess.apply_move(native_board, native_move)
         if self.multi_mcts is None:
             return
         root = state.get("root")
         if root is None:
             return
-        child = root.get_child_for_move(move)
+        child = root.get_child_for_move(native_move)
         if child is None:
             state["root"] = None
             state["_root_synced"] = False
@@ -1159,22 +1161,38 @@ class EloEstimator:
             return 0.0 if model_is_white else 1.0
         return 0.5
 
-    @staticmethod
-    def _build_level_tasks(level: int, start_game_idx: int, count: int) -> list[tuple[int, int, bool]]:
-        tasks: list[tuple[int, int, bool]] = []
-        for offset in range(max(0, int(count))):
-            game_idx = int(start_game_idx) + offset
-            tasks.append((int(level), game_idx, (game_idx % 2 == 0)))
-        return tasks
+    def _opening_prefix(self, game_idx: int) -> tuple[str, ...]:
+        if not bool(self.elo_config.get("paired_openings_enabled", True)):
+            return ()
+        if not _SELFPLAY_OPENING_LINES:
+            return ()
+        try:
+            max_plies = max(0, int(self.elo_config.get("paired_openings_max_plies", 6) or 0))
+        except (TypeError, ValueError):
+            max_plies = 6
+        if max_plies <= 0:
+            return ()
+        pair_idx = max(0, int(game_idx)) // 2
+        line = _SELFPLAY_OPENING_LINES[pair_idx % len(_SELFPLAY_OPENING_LINES)]
+        return tuple(line[: min(max_plies, len(line))])
 
-    @staticmethod
-    def _summarize_scores(scores: list[float]) -> dict:
-        wins = sum(1 for s in scores if s == 1.0)
-        draws = sum(1 for s in scores if s == 0.5)
-        losses = sum(1 for s in scores if s == 0.0)
-        total = wins + draws + losses
-        score_pct = (wins + 0.5 * draws) / total if total else 0.0
-        return {"wins": wins, "draws": draws, "losses": losses, "score": score_pct, "total": total}
+    def _initial_board(self, game_idx: int, record_state=None, on_move_played=None) -> chess.Board:
+        board = chess.Board()
+        for uci in self._opening_prefix(game_idx):
+            if board.is_game_over(claim_draw=False):
+                break
+            try:
+                move = chess.Move.from_uci(uci)
+            except ValueError:
+                break
+            if move not in board.legal_moves:
+                break
+            if record_state is not None:
+                record_state(board)
+            board.push(move)
+            if on_move_played is not None:
+                on_move_played(move)
+        return board
 
     @staticmethod
     def _extend_progress_total(progress_bar, count: int, *, cap: int | None = None, phase: str | None = None):
@@ -1189,26 +1207,6 @@ class EloEstimator:
         if postfix:
             progress_bar.set_postfix(postfix, refresh=False)
         progress_bar.refresh()
-
-    @staticmethod
-    def _interleaved_ladder_order(levels: list[int]) -> list[int]:
-        """Probe low/high/mid levels in one wave so adaptive Elo still fills workers."""
-        values = [int(level) for level in levels]
-        n = len(values)
-        if n <= 2:
-            return values
-        mid = n // 2
-        indices: list[int] = []
-        seen: set[int] = set()
-        for offset in range(n):
-            candidates = [offset, n - 1 - offset, mid + offset, mid - offset]
-            for idx in candidates:
-                if 0 <= idx < n and idx not in seen:
-                    seen.add(idx)
-                    indices.append(idx)
-            if len(indices) >= n:
-                break
-        return [values[idx] for idx in indices]
 
     def _run_task_batch(
         self,
@@ -1278,6 +1276,7 @@ class EloEstimator:
 
             def _run_parallel_game(
                 level: int,
+                game_idx: int,
                 model_is_white: bool,
                 use_mcts: bool,
                 simulations: int,
@@ -1287,6 +1286,7 @@ class EloEstimator:
             ):
                 result = self._play_single_game_worker(
                     level,
+                    game_idx,
                     model_is_white,
                     use_mcts,
                     simulations,
@@ -1306,6 +1306,7 @@ class EloEstimator:
                     future = executor.submit(
                         _run_parallel_game,
                         level,
+                        game_idx,
                         model_is_white,
                         use_mcts,
                         simulations,
@@ -1331,8 +1332,6 @@ class EloEstimator:
                             all_scores.append(float(result))
                         except Exception as exc:
                             self._log_limited("parallel_game_fail", f"  Warning: game at level {level} failed: {exc}")
-                            all_opponent_elos.append(float(level))
-                            all_scores.append(0.0)
                         finally:
                             if progress_bar is not None:
                                 progress_bar.update(1)
@@ -1372,6 +1371,7 @@ class EloEstimator:
                         result = self._play_game(
                             engine,
                             player,
+                            game_idx,
                             model_is_white,
                             stockfish_time_limit,
                             max_moves,
@@ -1404,6 +1404,11 @@ class EloEstimator:
         worker_counts = list(stats.get("worker_game_counts", []) or [])
         if worker_counts and bool(self.elo_config.get("elo_print_worker_summary", False)):
             print(f"  Elo workers: {_format_worker_game_counts(worker_counts)}")
+        if result.get("fit_warning"):
+            print(
+                "  Warning: ladder results are more inconsistent than the Elo curve expects; "
+                f"uncertainty inflated x{math.sqrt(float(result.get('elo_overdispersion', 1.0))):.2f}."
+            )
 
     # -----------------------------------------------------------------------
     # Public API
@@ -1495,8 +1500,6 @@ class EloEstimator:
 
         t0 = time.perf_counter()
         self._last_elo_batch_stats = None
-        all_opponent_elos: list[float] = []
-        all_scores: list[float] = []
         results_per_level: dict[int, dict] = {}
 
         try:
@@ -1524,6 +1527,17 @@ class EloEstimator:
         max_total_games = max(1, max_total_games)
 
         workers = self._resolve_workers(workers, total_games=max_total_games)
+        schedule = AdaptiveEloSchedule(
+            levels,
+            self.elo_config,
+            max_total_games=max_total_games,
+            workers=workers,
+            probe_games=probe_games_cfg,
+            focus_games=focus_games_cfg,
+            extra_round=extra_round_cfg,
+        )
+        all_opponent_elos = schedule.all_opponent_elos
+        all_scores = schedule.all_scores
         batch_model_moves = bool(self.elo_config.get("batch_model_moves", True))
         if not use_mcts:
             # Raw NN inference is usually much cheaper than the Stockfish move.
@@ -1553,6 +1567,11 @@ class EloEstimator:
             f"probe={probe_games_cfg}, "
             f"focus<= {focus_games_cfg}/level"
         )
+        if bool(self.elo_config.get("paired_openings_enabled", True)):
+            print(
+                "  Info: Elo openings: paired colors, "
+                f"{int(self.elo_config.get('paired_openings_max_plies', 6) or 0)} fixed plies."
+            )
         if batch_model_moves and workers > 1:
             model_path = "batched_mcts" if use_mcts else "batched_raw"
             print(f"  Info: Elo model path: {model_path} (shared batch scheduling enabled).")
@@ -1599,8 +1618,6 @@ class EloEstimator:
             )
 
         interrupted_by_user = False
-        played_by_level: dict[int, int] = {int(level): 0 for level in levels}
-        scores_by_level: dict[int, list[float]] = {int(level): [] for level in levels}
         phase_profile_stats: list[dict] = []
         shared_parallel_executor = None
         if workers > 1 and not central_inference_enabled and not batch_model_moves:
@@ -1627,304 +1644,98 @@ class EloEstimator:
             if self._last_elo_batch_stats:
                 phase_profile_stats.append(dict(self._last_elo_batch_stats))
             interrupted_by_user = interrupted_by_user or batch_interrupted
-            for level_f, score in zip(batch_elos, batch_scores):
-                level = int(level_f)
-                all_opponent_elos.append(float(level_f))
-                all_scores.append(float(score))
-                played_by_level[level] = int(played_by_level.get(level, 0)) + 1
-                scores_by_level.setdefault(level, []).append(float(score))
+            schedule.record_batch(batch_elos, batch_scores)
             return batch_interrupted or self._is_cancelled()
 
         try:
             if central_inference_enabled:
                 self._start_central_inference_for_elo(workers)
-            probe_games = probe_games_cfg
-            focus_games = focus_games_cfg
-            extra_round = extra_round_cfg
-            high_skip = float(self.elo_config.get("adaptive_skip_high_score", 0.92) or 0.92)
-            low_stop = float(self.elo_config.get("adaptive_stop_low_score", 0.08) or 0.08)
-            focus_min = float(self.elo_config.get("adaptive_focus_min_score", 0.20) or 0.20)
-            focus_max = float(self.elo_config.get("adaptive_focus_max_score", 0.80) or 0.80)
-            target_focus = max(1, int(self.elo_config.get("adaptive_target_focus_levels", 4) or 4))
-            focus_min_games = min(focus_games, max(probe_games * 2, 16))
-            target_se = float(self.elo_config.get("adaptive_target_standard_error", 0.0) or 0.0)
-            min_games_for_se_stop = max(
-                probe_games * target_focus,
-                int(self.elo_config.get("adaptive_min_games_for_se_stop", 0) or 0),
-            )
-            min_batch_games_raw = self.elo_config.get("adaptive_min_batch_games", 0)
-            try:
-                min_batch_games = int(min_batch_games_raw or 0)
-            except (TypeError, ValueError):
-                min_batch_games = 0
-            if min_batch_games <= 0:
-                min_batch_games = max(int(workers) * 2, probe_games * 3)
-            min_batch_games = max(probe_games, min(max_total_games, min_batch_games))
-            probe_levels_per_wave = max(
-                1,
-                min(len(levels), int(math.ceil(float(min_batch_games) / float(max(1, probe_games))))),
-            )
-            total_scheduled = 0
-
-            probe_order = self._interleaved_ladder_order(levels)
-
-            def _score_for_level(level: int) -> float:
-                return float(self._summarize_scores(scores_by_level.get(int(level), []))["score"])
-
-            def _games_for_level(level: int) -> int:
-                return int(played_by_level.get(int(level), 0) or 0)
-
-            def _played_candidate_levels() -> list[int]:
-                return [
-                    int(level)
-                    for level in levels
-                    if played_by_level.get(int(level), 0) > 0
-                ]
-
-            def _useful_candidate_count() -> int:
-                count = 0
-                for level in _played_candidate_levels():
-                    score = _score_for_level(level)
-                    if focus_min <= score <= focus_max:
-                        count += 1
-                return count
-
-            def _estimate_precise_enough() -> bool:
-                if target_se <= 0.0 or len(all_scores) < min_games_for_se_stop:
-                    return False
-                estimated = _performance_rating(all_opponent_elos, all_scores)
-                se = _elo_standard_error(all_opponent_elos, estimated)
-                return bool(se is not None and float(se) <= target_se)
-
-            def _current_standard_error() -> float | None:
-                if not all_scores:
-                    return None
-                estimated = _performance_rating(all_opponent_elos, all_scores)
-                if estimated is None:
-                    return None
-                return _elo_standard_error(all_opponent_elos, estimated)
-
-            def _current_estimated_elo() -> float | None:
-                if not all_scores:
-                    return None
-                estimated = _performance_rating(all_opponent_elos, all_scores)
-                if estimated is None:
-                    return None
-                return float(estimated)
-
-            def _expected_score_for_level(level: int) -> float:
-                center = _current_estimated_elo()
-                if center is None:
-                    return 0.5
-                return 1.0 / (1.0 + math.pow(10.0, (float(level) - center) / 400.0))
-
-            def _stable_score_for_level(level: int) -> float:
-                observed = _score_for_level(level)
-                games = _games_for_level(level)
-                if games <= 0:
-                    return _expected_score_for_level(level)
-                prior_games = float(self.elo_config.get("adaptive_focus_score_prior_games", 4.0) or 4.0)
-                prior_games = max(0.0, min(16.0, prior_games))
-                expected = _expected_score_for_level(level)
-                return float((observed * games + expected * prior_games) / max(1.0, games + prior_games))
-
-            def _focus_sort_key(level: int):
-                score = _stable_score_for_level(level)
-                center = _current_estimated_elo()
-                center_penalty = 0.0
-                if center is not None:
-                    # A random 5-game probe can make a far-away level look close
-                    # to 50%. Bias focus toward the current global estimate so
-                    # adaptive games land around the actual rating band.
-                    center_penalty = abs(float(level) - center) / 400.0
-                return (
-                    center_penalty + abs(score - 0.5),
-                    played_by_level.get(int(level), 0),
-                    abs(score - 0.5),
-                )
-
-            def _precision_candidate_levels() -> list[int]:
-                candidates = [
-                    int(level)
-                    for level in _played_candidate_levels()
-                    if low_stop < _stable_score_for_level(level) < high_skip
-                ]
-                if not candidates:
-                    candidates = list(focus_levels)
-                if not candidates:
-                    candidates = _played_candidate_levels()
-                return sorted(
-                    candidates,
-                    key=_focus_sort_key,
-                )[:target_focus]
-
+            if schedule.initial_elo is not None:
+                print(f"  Adaptive Elo seed: {schedule.initial_elo:.0f}; probing nearest levels first.")
             if bool(self.elo_config.get("elo_verbose_adaptive", False)):
+                order = schedule.probe_order
+                preview_count = schedule.probe_levels_per_wave * 2
                 print(
                     "  Adaptive probe waves: "
-                    f"levels/wave={probe_levels_per_wave}, min_batch_games={min_batch_games}, "
-                    f"order={probe_order[:min(len(probe_order), probe_levels_per_wave * 2)]}"
-                    f"{'...' if len(probe_order) > probe_levels_per_wave * 2 else ''}"
+                    f"levels/wave={schedule.probe_levels_per_wave}, "
+                    f"min_batch_games={schedule.min_batch_games}, "
+                    f"order={order[:preview_count]}{'...' if len(order) > preview_count else ''}"
                 )
-            stop_after_wave = False
-            for wave_start in range(0, len(probe_order), probe_levels_per_wave):
-                if self._is_cancelled() or total_scheduled >= max_total_games or stop_after_wave:
+
+            for wave_levels in schedule.probe_waves():
+                if self._is_cancelled() or schedule.total_scheduled >= max_total_games:
                     break
-                wave_levels = probe_order[wave_start: wave_start + probe_levels_per_wave]
-                tasks = []
-                for level in wave_levels:
-                    games_to_add = min(probe_games, max_total_games - total_scheduled - len(tasks))
-                    if games_to_add <= 0:
-                        break
-                    tasks.extend(self._build_level_tasks(level, played_by_level.get(level, 0), games_to_add))
-                total_scheduled += len(tasks)
+                tasks = schedule.probe_tasks(wave_levels)
                 if _run_selected_tasks(tasks, phase="probe"):
                     break
-                for level in wave_levels:
-                    summary = self._summarize_scores(scores_by_level.get(int(level), []))
-                    if summary["total"] <= 0:
-                        continue
-                    if bool(self.elo_config.get("elo_verbose_adaptive", False)):
-                        print(
-                            f"  Adaptive probe vs SF {level}: "
-                            f"W{summary['wins']}/D{summary['draws']}/L{summary['losses']} "
-                            f"({summary['score']:.0%})"
-                        )
-                    if summary["score"] >= high_skip and bool(self.elo_config.get("elo_verbose_adaptive", False)):
-                        print(f"  Adaptive ladder: SF {level} is saturated (score >= {high_skip:.0%}); probing higher.")
+                if bool(self.elo_config.get("elo_verbose_adaptive", False)):
+                    for level in wave_levels:
+                        summary = schedule.summarize(schedule.scores_by_level.get(int(level), []))
+                        if summary["total"] > 0:
+                            print(
+                                f"  Adaptive probe vs SF {level}: "
+                                f"W{summary['wins']}/D{summary['draws']}/L{summary['losses']} "
+                                f"({summary['score']:.0%})"
+                            )
+                if schedule.should_stop_probing(wave_levels):
+                    break
 
-                # Stop probing above a clearly too-strong level only after we
-                # already have enough non-saturated candidates. Otherwise the
-                # first interleaved wave can lock focus onto useless extremes
-                # such as 1320/2800 and spend most of the budget there.
-                for level in sorted(wave_levels):
-                    summary = self._summarize_scores(scores_by_level.get(int(level), []))
-                    if summary["total"] > 0 and summary["score"] <= low_stop:
-                        if _useful_candidate_count() >= target_focus:
-                            if bool(self.elo_config.get("elo_verbose_adaptive", False)):
-                                print(
-                                    f"  Adaptive ladder: stopping above {level} after this wave "
-                                    f"(score <= {low_stop:.0%})."
-                                )
-                            stop_after_wave = True
-                        break
-
-            candidate_levels = _played_candidate_levels()
-            focus_levels = [
-                level
-                for level in candidate_levels
-                if focus_min <= _stable_score_for_level(level) <= focus_max
-            ]
-            focus_levels = sorted(
-                focus_levels,
-                key=_focus_sort_key,
-            )
-            if len(focus_levels) < target_focus:
-                extras = sorted(
-                    (
-                        level
-                        for level in candidate_levels
-                        if level not in focus_levels and low_stop < _stable_score_for_level(level) < high_skip
-                    ),
-                    key=_focus_sort_key,
-                )
-                focus_levels.extend(extras[: max(0, target_focus - len(focus_levels))])
-            if not focus_levels and candidate_levels:
-                focus_levels = sorted(
-                    candidate_levels,
-                    key=_focus_sort_key,
-                )[:1]
-            focus_levels = focus_levels[:target_focus]
-
+            focus_levels = schedule.select_rating_levels()
             if focus_levels and bool(self.elo_config.get("elo_verbose_adaptive", False)):
                 print(f"  Adaptive focus levels: {focus_levels}")
             while (
                 not self._is_cancelled()
-                and total_scheduled < max_total_games
-                and any(played_by_level.get(level, 0) < focus_games for level in focus_levels)
+                and schedule.total_scheduled < max_total_games
+                and not schedule.focus_complete()
             ):
-                tasks = []
-                for level in focus_levels:
-                    if total_scheduled + len(tasks) >= max_total_games:
-                        break
-                    if played_by_level.get(level, 0) >= focus_games:
-                        continue
-                    if played_by_level.get(level, 0) >= focus_min_games:
-                        score = _score_for_level(level)
-                        if score <= low_stop or score >= high_skip:
-                            continue
-                    remaining_level = focus_games - int(played_by_level.get(level, 0))
-                    games_to_add = min(extra_round, remaining_level, max_total_games - total_scheduled - len(tasks))
-                    if games_to_add <= 0:
-                        continue
-                    tasks.extend(self._build_level_tasks(level, played_by_level.get(level, 0), games_to_add))
-                if not tasks:
+                tasks = schedule.focus_tasks()
+                if not tasks or _run_selected_tasks(tasks, phase="focus"):
                     break
-                total_scheduled += len(tasks)
-                if _run_selected_tasks(tasks, phase="focus"):
+                if schedule.precise_enough():
                     break
-                if _estimate_precise_enough():
+                if len(tasks) < schedule.min_batch_games and schedule.focus_complete():
                     break
-                if len(tasks) < min_batch_games:
-                    # Final partial focus wave; no need to spin another tiny wave
-                    # unless some level still has meaningful capacity and budget.
-                    if not any(played_by_level.get(level, 0) < focus_games for level in focus_levels):
-                        break
 
-            refine_until_target = bool(
-                self.elo_config.get("adaptive_refine_until_target_se", True)
-            )
+            refine_until_target = bool(self.elo_config.get("adaptive_refine_until_target_se", True))
             refinement_started = False
             while (
                 refine_until_target
-                and target_se > 0.0
-                and len(all_scores) >= min_games_for_se_stop
-                and total_scheduled < max_total_games
+                and schedule.target_se > 0.0
+                and len(schedule.rating_observations()[1]) >= schedule.min_games_for_se_stop
+                and schedule.total_scheduled < max_total_games
                 and not self._is_cancelled()
-                and not _estimate_precise_enough()
+                and not schedule.precise_enough()
             ):
-                refine_levels = _precision_candidate_levels()
-                if not refine_levels:
+                refine_levels, tasks = schedule.precision_tasks()
+                if not tasks:
                     break
-                current_se = _current_standard_error()
+                current_se = schedule.current_standard_error()
                 if current_se is not None and not refinement_started:
                     print(
                         "  Adaptive Elo: uncertainty still high "
-                        f"(SE={float(current_se):.1f} > target {target_se:.1f}); "
+                        f"(SE={float(current_se):.1f} > target {schedule.target_se:.1f}); "
                         f"adding games on levels {refine_levels}."
                     )
                     refinement_started = True
-                tasks = []
-                for level in refine_levels:
-                    if total_scheduled + len(tasks) >= max_total_games:
-                        break
-                    games_to_add = min(
-                        extra_round,
-                        max_total_games - total_scheduled - len(tasks),
-                    )
-                    if games_to_add <= 0:
-                        continue
-                    tasks.extend(self._build_level_tasks(level, played_by_level.get(level, 0), games_to_add))
-                if not tasks:
-                    break
-                total_scheduled += len(tasks)
                 if _run_selected_tasks(tasks, phase="precision"):
                     break
+
             if (
                 refine_until_target
-                and target_se > 0.0
-                and len(all_scores) >= min_games_for_se_stop
-                and total_scheduled >= max_total_games
+                and schedule.target_se > 0.0
+                and len(schedule.rating_observations()[1]) >= schedule.min_games_for_se_stop
+                and schedule.total_scheduled >= max_total_games
             ):
-                current_se = _current_standard_error()
-                if current_se is not None and float(current_se) > target_se:
+                current_se = schedule.current_standard_error()
+                if current_se is not None and float(current_se) > schedule.target_se:
                     print(
                         "  Adaptive Elo: reached game cap "
                         f"({max_total_games}) with SE={float(current_se):.1f} "
-                        f"> target {target_se:.1f}."
+                        f"> target {schedule.target_se:.1f}."
                     )
-            for level in focus_levels:
-                if bool(self.elo_config.get("elo_verbose_adaptive", False)):
-                    summary = self._summarize_scores(scores_by_level.get(level, []))
+            if bool(self.elo_config.get("elo_verbose_adaptive", False)):
+                for level in focus_levels:
+                    summary = schedule.summarize(schedule.scores_by_level.get(level, []))
                     print(
                         f"  Adaptive focus vs SF {level}: "
                         f"W{summary['wins']}/D{summary['draws']}/L{summary['losses']} "
@@ -1974,17 +1785,22 @@ class EloEstimator:
             score_pct = (wins + 0.5 * draws) / total if total else 0.0
             if total <= 0:
                 continue
+            local_elo, local_elo_se = _local_performance_rating(float(level), level_scores)
             results_per_level[level] = {
                 "wins": wins,
                 "draws": draws,
                 "losses": losses,
                 "score": score_pct,
                 "games": total,
+                "local_performance_elo": round(local_elo) if local_elo is not None else None,
+                "local_elo_std_error": round(float(local_elo_se), 1) if local_elo_se is not None else None,
             }
 
         elapsed = time.perf_counter() - t0
-        estimated_elo = _performance_rating(all_opponent_elos, all_scores)
-        elo_se = _elo_standard_error(all_opponent_elos, estimated_elo)
+        rating_opponent_elos, rating_scores = schedule.rating_observations()
+        estimated_elo = _performance_rating(rating_opponent_elos, rating_scores)
+        fit_diagnostics = _elo_fit_diagnostics(rating_opponent_elos, rating_scores, estimated_elo)
+        elo_se = fit_diagnostics.get("standard_error")
         elo_ci95 = None
         if estimated_elo is not None and elo_se is not None:
             elo_ci95 = [round(estimated_elo - 1.96 * elo_se), round(estimated_elo + 1.96 * elo_se)]
@@ -1997,8 +1813,20 @@ class EloEstimator:
             "adaptive": True,
             "levels_requested": [int(x) for x in levels],
             "games_per_level_requested": int(games_per_level or 0),
-            "actual_games_per_level": {int(k): int(v) for k, v in played_by_level.items() if int(v) > 0},
+            "actual_games_per_level": {
+                int(level): int(games)
+                for level, games in schedule.played_by_level.items()
+                if int(games) > 0
+            },
+            "rating_levels": sorted({int(round(level)) for level in rating_opponent_elos}),
+            "rating_games": len(rating_scores),
+            "probe_only_games": max(0, len(all_scores) - len(rating_scores)),
+            "elo_overdispersion": round(float(fit_diagnostics.get("overdispersion", 1.0)), 3),
+            "fit_warning": bool(fit_diagnostics.get("fit_warning", False)),
         }
+        model_se = fit_diagnostics.get("model_standard_error")
+        if model_se is not None:
+            result["elo_model_std_error"] = round(float(model_se), 1)
         if elo_se is not None:
             result["elo_std_error"] = round(float(elo_se), 1)
         if elo_ci95 is not None:
@@ -2012,6 +1840,7 @@ class EloEstimator:
     def _play_single_game_worker(
         self,
         level: int,
+        game_idx: int,
         model_is_white: bool,
         use_mcts: bool,
         simulations: int,
@@ -2040,16 +1869,23 @@ class EloEstimator:
             if self._is_cancelled():
                 return None
             self._log_limited("stockfish_open_fail", f"  Warning: worker failed to open Stockfish: {exc}")
-            return 0.0  # Count as loss
+            return None
 
         try:
-            result = self._play_game(engine, player, model_is_white, sf_time_limit, max_moves)
+            result = self._play_game(
+                engine,
+                player,
+                game_idx,
+                model_is_white,
+                sf_time_limit,
+                max_moves,
+            )
         except Exception as exc:
             if self._is_cancelled():
                 result = None
             else:
                 self._log_limited("stockfish_game_fail", f"  Warning: game failed: {exc}")
-                result = 0.0
+                result = None
 
         return result
 
@@ -2108,10 +1944,12 @@ class EloEstimator:
             return False
 
         def finalize_game(game: dict, score: float | None = None):
-            if score is None:
+            valid_result = not bool(game.get("invalid", False))
+            if score is None and valid_result:
                 score = self._score_game_result(game["board"], bool(game["model_is_white"]))
-            all_opponent_elos.append(float(game["level"]))
-            all_scores.append(float(score))
+            if valid_result and score is not None:
+                all_opponent_elos.append(float(game["level"]))
+                all_scores.append(float(score))
             worker_slot = int(game.get("worker_slot", -1))
             if 0 <= worker_slot < len(worker_game_counts):
                 worker_game_counts[worker_slot] += 1
@@ -2125,7 +1963,7 @@ class EloEstimator:
                     break
                 if not pending_tasks:
                     break
-                level, _, model_is_white = pending_tasks.popleft()
+                level, game_idx, model_is_white = pending_tasks.popleft()
                 try:
                     self._configure_stockfish_engine(engine, level)
                 except Exception as exc:
@@ -2133,8 +1971,6 @@ class EloEstimator:
                         "stockfish_config_fail",
                         f"  Warning: failed to configure Stockfish at level {level}: {exc}",
                     )
-                    all_opponent_elos.append(float(level))
-                    all_scores.append(0.0)
                     if 0 <= worker_slot < len(worker_game_counts):
                         worker_game_counts[worker_slot] += 1
                     if progress_bar is not None:
@@ -2149,11 +1985,16 @@ class EloEstimator:
 
                 state = batched_player.create_state()
                 batched_player.reset_state(state)
+                board = self._initial_board(
+                    game_idx,
+                    record_state=lambda current: batched_player.record_state(state, current),
+                    on_move_played=lambda move: batched_player.on_move_played(state, move),
+                )
                 active_games.append(
                     {
                         "level": level,
                         "model_is_white": bool(model_is_white),
-                        "board": chess.Board(),
+                        "board": board,
                         "state": state,
                         "engine": engine,
                         "worker_slot": int(worker_slot),
@@ -2191,7 +2032,6 @@ class EloEstimator:
                 model_turn_games: list[dict] = []
                 stockfish_turn_games: list[dict] = []
                 for game in active_games:
-                    batched_player.record_state(game["state"], game["board"])
                     model_turn = (game["board"].turn == chess.WHITE) == game["model_is_white"]
                     if model_turn:
                         model_turn_games.append(game)
@@ -2225,6 +2065,7 @@ class EloEstimator:
                         if move is None:
                             game["ply_count"] = max_half_moves
                             continue
+                        batched_player.record_state(game["state"], game["board"])
                         game["board"].push(move)
                         batched_player.on_move_played(game["state"], move)
                         game["ply_count"] += 1
@@ -2240,10 +2081,13 @@ class EloEstimator:
                                 "stockfish_batch_play_fail",
                                 f"  Warning: Stockfish move failed at level {game['level']}: {exc}",
                             )
+                            game["invalid"] = True
                             move = None
                         if move is None or move not in game["board"].legal_moves:
+                            game["invalid"] = True
                             game["ply_count"] = max_half_moves
                             continue
+                        batched_player.record_state(game["state"], game["board"])
                         game["board"].push(move)
                         batched_player.on_move_played(game["state"], move)
                         game["ply_count"] += 1
@@ -2368,6 +2212,7 @@ class EloEstimator:
         self,
         engine: chess.engine.SimpleEngine,
         player: _ModelPlayer,
+        game_idx: int,
         model_is_white: bool,
         sf_time_limit: float,
         max_moves: int,
@@ -2379,18 +2224,18 @@ class EloEstimator:
         if self._is_cancelled():
             return None
 
-        board = chess.Board()
         player.reset()
+        board = self._initial_board(
+            game_idx,
+            record_state=player.record_state,
+            on_move_played=player.on_move_played,
+        )
 
         for _ in range(max_moves * 2):  # max half-moves
             if self._is_cancelled():
                 return None
             if board.is_game_over(claim_draw=True):
                 break
-
-            # Keep the model-side history aligned with the real game, not only
-            # with plies where the model is to move.
-            player.record_state(board)
 
             model_turn = (board.turn == chess.WHITE) == model_is_white
 
@@ -2409,6 +2254,9 @@ class EloEstimator:
                 if move is None:
                     break
 
+            # Store the position only after move selection, so the history
+            # contains prior positions rather than duplicating the current one.
+            player.record_state(board)
             board.push(move)
             player.on_move_played(move)
 
