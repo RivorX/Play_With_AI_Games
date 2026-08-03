@@ -1,0 +1,16 @@
+# ==============================================================================
+# PLAY, REPORTING AND ELO EVALUATION
+# Rarely changed and shared by IL/RL evaluation entry points.
+# ==============================================================================
+
+logging:
+  tensorboard: true          # Enable TensorBoard logging
+
+
+elo_estimation:
+  # The estimator reads UCI_Elo min/max directly from the installed Stockfish
+  # and chooses opponents around the checkpoint's previous rating.
+  stockfish_time_limit: 0.10
+  mcts_eval_simulations: 192
+  final_mcts_profile_multipliers: [0.5, 1.0, 2.0]
+  il_eval_every: 2

@@ -2,7 +2,6 @@
 
 import torch
 import chess
-import yaml
 import sys
 import io
 import math
@@ -34,14 +33,13 @@ import argparse
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
-from src.model import ChessNet
-from src.batch_selfplay import MCTS, select_move_by_visits
-from src import chess_backend as native_chess
-from src.utils.config import normalize_config
+from src.mcts.single_game import SingleGameMCTS
+from src.game import backend as native_chess
+from src.config import default_config_path, load_project_config
 
 #  v4.2: Import board_to_tensor from data_helpers
 #  v4.4: Added move_to_index for POV-aware move encoding
-from src.utils.data_helpers import board_to_tensor, move_to_index
+from src.models.data.se_cnn_v9.helpers import board_to_tensor, move_to_index
 
 
 def _native_board(board):
@@ -53,18 +51,18 @@ def _python_move(move):
     """Convert a native search result back to the python-chess UI board."""
     return None if move is None else chess.Move.from_uci(native_chess.move_uci(move))
 
-# Import from utils
-from utils.shared.model_match import run_model_match
-from utils.shared.model_catalog import format_elo_summary, load_checkpoint_metadata
+# Import application modules
+from src.evaluation.model_match import run_model_match
+from src.models.catalog import format_elo_summary, load_checkpoint_metadata
 if not _IS_MULTIPROCESSING_CHILD:
-    from utils.ui.game_setup import (
+    from src.ui.game_setup import (
         ModelCompatibilityError,
         load_model_from_checkpoint,
         select_models,
         show_model_load_error,
         write_setup_log,
     )
-    from utils.ui.gui_helpers import (
+    from src.ui.gui_helpers import (
         build_pgn_game,
         create_piece_surfaces,
         get_game_mode_labels,
@@ -74,7 +72,7 @@ if not _IS_MULTIPROCESSING_CHILD:
         save_game_to_pgn,
         start_piece_asset_prefetch,
     )
-    from utils.ui.theme import (
+    from src.ui.theme import (
         ACCENT as UI_ACCENT,
         BORDER as UI_BORDER,
         MUTED as UI_MUTED,
@@ -159,31 +157,6 @@ def _get_default_window_size():
     default_width = max(WINDOW_MIN_WIDTH, min(screen_width, default_width))
     default_height = max(WINDOW_MIN_HEIGHT, min(screen_height, default_height))
     return default_width, default_height
-
-
-def _get_display_window_size():
-    """Resolve the desktop resolution for maximized mode."""
-    default_width, default_height = _get_default_window_size()
-    try:
-        user32 = ctypes.windll.user32
-        screen_width = int(user32.GetSystemMetrics(0) or 0)
-        screen_height = int(user32.GetSystemMetrics(1) or 0)
-    except Exception:
-        try:
-            info = pygame.display.Info()
-            screen_width = int(getattr(info, "current_w", 0) or 0)
-            screen_height = int(getattr(info, "current_h", 0) or 0)
-        except Exception:
-            screen_width = 0
-            screen_height = 0
-
-    if screen_width <= 0 or screen_height <= 0:
-        return default_width, default_height
-
-    return (
-        max(WINDOW_MIN_WIDTH, screen_width),
-        max(WINDOW_MIN_HEIGHT, screen_height),
-    )
 
 
 def _normalize_window_size(value):
@@ -301,9 +274,7 @@ class ChessGUI:
         self.match_generation = 0
         self.inference_lock = threading.Lock()
         self.match_stats = self._new_match_stats()
-        # Start as soon as the selected models and match options are known.
-        # Server/model loading can overlap MCTS and window initialization.
-        self._start_background_match_games()
+        self.match_autostart_pending = self._match_enabled()
         
         # History depth can differ per loaded checkpoint architecture.
         default_history = int(config['model'].get('history_positions', 0))
@@ -312,22 +283,16 @@ class ChessGUI:
         
         # Only create MCTS if enabled
         if model1 and self.mcts_enabled:
-            self.mcts1 = MCTS(model1, config, device)
+            self.mcts1 = SingleGameMCTS(model1, config, device)
             self.mcts1.history_positions = self.model1_history_positions
-            self.analysis_mcts1 = MCTS(model1, config, device)
-            self.analysis_mcts1.history_positions = self.model1_history_positions
         else:
             self.mcts1 = None
-            self.analysis_mcts1 = None
             
         if model2 and self.mcts_enabled:
-            self.mcts2 = MCTS(model2, config, device)
+            self.mcts2 = SingleGameMCTS(model2, config, device)
             self.mcts2.history_positions = self.model2_history_positions
-            self.analysis_mcts2 = MCTS(model2, config, device)
-            self.analysis_mcts2.history_positions = self.model2_history_positions
         else:
             self.mcts2 = None
-            self.analysis_mcts2 = None
 
         default_window_width, default_window_height = _get_default_window_size()
         self.base_width = max(CANVAS_MIN_WIDTH, default_window_width)
@@ -683,12 +648,9 @@ class ChessGUI:
         if enabled:
             if not self.maximized:
                 self.restore_window_size = self.screen.get_size()
-            maximized_size = _get_display_window_size()
-            self.screen = pygame.display.set_mode(maximized_size, self.display_flags)
+            self.maximized = bool(_maximize_native_window())
             pygame.event.pump()
-            _position_native_window(*maximized_size)
-            _maximize_native_window()
-            self.maximized = True
+            self._sync_window_surface()
         else:
             self.screen = pygame.display.set_mode(self.restore_window_size, self.display_flags)
             pygame.event.pump()
@@ -1288,56 +1250,30 @@ class ChessGUI:
             return bool(self.use_mcts_white if color == chess.WHITE else self.use_mcts_black)
         return bool(self.use_mcts)
 
-    def _analysis_mcts_for_color(self, color):
-        if not self._side_uses_mcts(color):
-            return None
-        if self.game_mode == "ai_vs_ai":
-            return self.analysis_mcts1 if color == chess.WHITE else self.analysis_mcts2
-        return self.analysis_mcts1
-
-    def _analysis_mcts_simulations(self, color):
-        if self.game_mode == "ai_vs_ai":
-            return self.mcts_simulations_white if color == chess.WHITE else self.mcts_simulations_black
-        return self.mcts_simulations_white
-
-    def _get_cached_mcts_top_move(self, color):
-        cache = self.mcts_analysis_cache_by_color.get(color, {})
-        if cache.get("fen") != self.board.fen():
-            return None
-        rows = list(cache.get("rows", []))
-        if not rows:
-            return None
-
-        move_uci = rows[0].get("move")
-        if not move_uci:
-            return None
-        try:
-            move = chess.Move.from_uci(str(move_uci))
-        except ValueError:
-            return None
-        return move if move in self.board.legal_moves else None
-
-    def _build_mcts_analysis_rows(self, color):
-        mcts = self._analysis_mcts_for_color(color)
-        if mcts is None:
+    def _build_mcts_analysis_rows(self, search_result):
+        """Format the exact search that selected the played move."""
+        if not search_result or not search_result.visits:
             return []
 
-        sims = max(1, int(self._analysis_mcts_simulations(color)))
-        mcts.reset_tree()
-        max_history = int(self.config.get("model", {}).get("history_positions", 0) or 0) + 10
-        for hist_board in list(self.board_history)[-max_history:]:
-            mcts.update_history(_native_board(hist_board))
-        native_board = _native_board(self.board)
-        visit_counts = mcts.search(native_board, sims)
-        if not visit_counts:
-            return []
-
+        visit_counts = search_result.visits
         total_visits = float(sum(max(0.0, float(v)) for v in visit_counts.values()))
         if total_visits <= 0.0:
             return []
 
+        selected_move = search_result.selected_move
+        selection_scores = search_result.selection_score
+
+        def _row_order(item):
+            native_move, visits = item
+            score = float(selection_scores.get(native_move, -float("inf")))
+            return (
+                native_move == selected_move,
+                float(visits),
+                score,
+            )
+
         rows = []
-        for native_move, visits in sorted(visit_counts.items(), key=lambda item: float(item[1]), reverse=True):
+        for native_move, visits in sorted(visit_counts.items(), key=_row_order, reverse=True):
             move = _python_move(native_move)
             try:
                 san = self.board.san(move)
@@ -1350,6 +1286,9 @@ class ChessGUI:
                     "san": san,
                     "probability": visit_value / total_visits,
                     "visits": int(round(visit_value)),
+                    "completed_q": search_result.completed_q.get(native_move),
+                    "selection_score": selection_scores.get(native_move),
+                    "selected": native_move == selected_move,
                 }
             )
             if len(rows) >= ANALYSIS_DISPLAY_ROWS:
@@ -1374,10 +1313,6 @@ class ChessGUI:
                 "label": side_label,
             }
             return
-
-        for color, label in ((chess.WHITE, "White"), (chess.BLACK, "Black")):
-            self.analysis_cache_by_color[color] = {"rows": [], "label": label, "fen": current_fen}
-            self.mcts_analysis_cache_by_color[color] = {"rows": [], "label": label, "fen": current_fen}
 
         model = self._current_analysis_model()
         analysis_color = self._analysis_target_color()
@@ -1435,8 +1370,11 @@ class ChessGUI:
                     break
             self.analysis_cache = {"fen": current_fen, "rows": rows, "side": analysis_color, "label": side_label}
             self.analysis_cache_by_color[analysis_color] = {"rows": rows, "label": side_label, "fen": current_fen}
+            # MCTS rows are filled by ai_move from the exact search used to
+            # choose the move. A second display-only tree used to reset every
+            # position and could disagree with the played MCTS.
             self.mcts_analysis_cache_by_color[analysis_color] = {
-                "rows": self._build_mcts_analysis_rows(analysis_color),
+                "rows": [],
                 "label": side_label,
                 "fen": current_fen,
             }
@@ -1546,7 +1484,9 @@ class ChessGUI:
                 total_height += line_gap
         return total_height
 
-    def _analysis_row_height(self):
+    def _analysis_row_height(self, show_details=False):
+        if show_details:
+            return max(34, self.tiny_font.get_height() * 2 + 8)
         return max(22, self.tiny_font.get_height() + 8)
 
     def _analysis_card_height(self, color, row_limit=None):
@@ -1558,7 +1498,7 @@ class ChessGUI:
             row_limit = ANALYSIS_DISPLAY_ROWS
         row_limit = max(1, int(row_limit))
         row_count = max(1, min(row_limit, max(len(policy_rows), len(mcts_rows))))
-        row_h = self._analysis_row_height()
+        row_h = self._analysis_row_height(show_details=self._side_uses_mcts(color))
         return 18 + self.small_font.get_height() + 12 + self.tiny_font.get_height() + 8 + row_count * (row_h + 2) + 10
 
     def _draw_analysis_column(self, rect, rows, cache_fen, color, label, row_limit, fill_color, show_visits=False):
@@ -1576,7 +1516,7 @@ class ChessGUI:
             return
 
         y = rect.top + self.tiny_font.get_height() + 8
-        row_h = self._analysis_row_height()
+        row_h = self._analysis_row_height(show_details=show_visits)
         visible_rows = rows[:row_limit]
         for idx, row in enumerate(visible_rows, start=1):
             row_rect = pygame.Rect(rect.left, y - 2, rect.width, row_h)
@@ -1591,23 +1531,72 @@ class ChessGUI:
             if self.selected_analysis_move == (color, row.get("move")):
                 pygame.draw.rect(self.canvas, (160, 205, 255), row_rect, width=2, border_radius=6)
 
-            self.canvas.blit(
-                self.tiny_font.render(f"{idx}.", True, (140, 154, 179)),
-                (row_rect.left + 8, y),
-            )
-
             if show_visits:
-                visits_text = f"{int(row.get('visits', 0))}v"
-                meta_surface = self.tiny_font.render(visits_text, True, (164, 201, 238))
+                top_y = row_rect.top + 3
+                bottom_y = row_rect.bottom - self.tiny_font.get_height() - 3
+                text_left = row_rect.left + 22
+                if row.get("selected"):
+                    star_points = []
+                    center_x = row_rect.left + 11
+                    center_y = top_y + self.tiny_font.get_height() // 2
+                    for point_idx in range(10):
+                        radius = 6 if point_idx % 2 == 0 else 2.7
+                        angle = -math.pi / 2.0 + point_idx * math.pi / 5.0
+                        star_points.append(
+                            (
+                                center_x + math.cos(angle) * radius,
+                                center_y + math.sin(angle) * radius,
+                            )
+                        )
+                    pygame.draw.polygon(self.canvas, (255, 213, 92), star_points)
+                else:
+                    self.canvas.blit(
+                        self.tiny_font.render(f"{idx}.", True, (140, 154, 179)),
+                        (row_rect.left + 6, top_y),
+                    )
+
+                san_width = max(0, row_rect.right - text_left - 6)
+                san_surface = self.tiny_font.render(
+                    self._fit_text(self.tiny_font, row["san"], san_width),
+                    True,
+                    (216, 226, 239),
+                )
+                self.canvas.blit(san_surface, (text_left, top_y))
+
+                visits_surface = self.tiny_font.render(
+                    f"{int(row.get('visits', 0))}v",
+                    True,
+                    (164, 201, 238),
+                )
+                self.canvas.blit(visits_surface, (row_rect.left + 8, bottom_y))
+
+                completed_q = row.get("completed_q")
+                if completed_q is not None and math.isfinite(float(completed_q)):
+                    q_surface = self.tiny_font.render(
+                        f"Q {float(completed_q):+.2f}",
+                        True,
+                        (164, 201, 238),
+                    )
+                    q_x = row_rect.right - q_surface.get_width() - 6
+                    if q_x > row_rect.left + 12 + visits_surface.get_width():
+                        self.canvas.blit(q_surface, (q_x, bottom_y))
             else:
+                self.canvas.blit(
+                    self.tiny_font.render(f"{idx}.", True, (140, 154, 179)),
+                    (row_rect.left + 8, y),
+                )
                 meta_surface = self.tiny_font.render(f"{probability * 100:4.1f}%", True, (164, 201, 238))
-            meta_x = row_rect.right - meta_surface.get_width() - 8
-            san_width = max(32, meta_x - (row_rect.left + 28) - 8)
-            self.canvas.blit(
-                self.tiny_font.render(self._fit_text(self.tiny_font, row["san"], san_width), True, (216, 226, 239)),
-                (row_rect.left + 28, y),
-            )
-            self.canvas.blit(meta_surface, (meta_x, y))
+                meta_x = row_rect.right - meta_surface.get_width() - 8
+                san_width = max(0, meta_x - (row_rect.left + 28) - 8)
+                self.canvas.blit(
+                    self.tiny_font.render(
+                        self._fit_text(self.tiny_font, row["san"], san_width),
+                        True,
+                        (216, 226, 239),
+                    ),
+                    (row_rect.left + 28, y),
+                )
+                self.canvas.blit(meta_surface, (meta_x, y))
             self.analysis_entry_buttons.append(
                 {
                     "rect": row_rect.copy(),
@@ -1666,7 +1655,7 @@ class ChessGUI:
                 mcts_rows,
                 mcts_cache.get("fen"),
                 color,
-                "MCTS visits",
+                "MCTS visits / Q",
                 row_limit,
                 mcts_fill,
                 show_visits=True,
@@ -2472,7 +2461,7 @@ class ChessGUI:
 
     def _sync_mcts_histories(self):
         """Rebuild MCTS histories after undoing moves."""
-        for mcts in (self.mcts1, self.mcts2, self.analysis_mcts1, self.analysis_mcts2):
+        for mcts in (self.mcts1, self.mcts2):
             if mcts:
                 mcts.reset_tree()
                 for hist_board in self.board_history:
@@ -2781,17 +2770,23 @@ class ChessGUI:
         
         #  Get AI move - with MCTS or network-only
         if self._side_uses_mcts(self.board.turn) and current_mcts is not None:
-            # MCTS mode: prefer the exact move shown in the current MCTS panel snapshot.
-            move = self._get_cached_mcts_top_move(self.board.turn)
-            if move is None:
-                current_mcts_sims = self.mcts_simulations_white if self.board.turn == chess.WHITE else self.mcts_simulations_black
-                native_board = _native_board(self.board)
-                visit_counts = current_mcts.search(
-                    native_board,
-                    current_mcts_sims
-                )
-                native_move, _ = select_move_by_visits(visit_counts, temperature=0)
-                move = _python_move(native_move)
+            current_color = self.board.turn
+            current_fen = self.board.fen()
+            current_mcts_sims = self.mcts_simulations_white if current_color == chess.WHITE else self.mcts_simulations_black
+            native_board = _native_board(self.board)
+            search_result = current_mcts.search(
+                native_board,
+                current_mcts_sims
+            )
+            self.mcts_analysis_cache_by_color[current_color] = {
+                "rows": self._build_mcts_analysis_rows(search_result),
+                "label": "White" if current_color == chess.WHITE else "Black",
+                "fen": current_fen,
+            }
+            native_move = search_result.selected_move
+            if native_move is None:
+                native_move = next(iter(native_chess.legal_moves(native_board)), None)
+            move = _python_move(native_move)
         else:
             #  v4.2: Network-only mode with POV support
             move = self._get_network_move(current_model)
@@ -2830,10 +2825,6 @@ class ChessGUI:
             self.mcts1.reset_tree()
         if self.mcts2:
             self.mcts2.reset_tree()
-        if self.analysis_mcts1:
-            self.analysis_mcts1.reset_tree()
-        if self.analysis_mcts2:
-            self.analysis_mcts2.reset_tree()
         with self.match_lock:
             self.match_generation += 1
             self.match_stats = self._new_match_stats()
@@ -2940,6 +2931,11 @@ class ChessGUI:
                 self.screen.blit(scaled, self.viewport_rect.topleft)
 
             pygame.display.flip()
+            if self.match_autostart_pending:
+                # The first frame is now visible; launch the paired benchmark
+                # immediately instead of competing with window/model setup.
+                self.match_autostart_pending = False
+                self._start_background_match_games()
         self._update_mouse_cursor(False)
         self._stop_background_match()
         return exit_action
@@ -2962,9 +2958,8 @@ def main():
     )
     args = parser.parse_args()
 
-    config_path = script_dir.parent / "config" / "config.yaml"
-    with open(config_path, "r", encoding="utf-8") as file_obj:
-        config = normalize_config(yaml.safe_load(file_obj))
+    config_path = default_config_path()
+    config = load_project_config()
 
     verbose_console = bool(args.verbose)
     config.setdefault("model", {})
@@ -3049,7 +3044,7 @@ def main():
             loading_model_path = model1_path
             try:
                 model1 = load_model_from_checkpoint(
-                    model1_path, config, device, ChessNet, verbose=verbose_console
+                    model1_path, config, device, verbose=verbose_console
                 )
                 if game_mode == "ai_vs_ai":
                     if model2_path is None:
@@ -3057,7 +3052,7 @@ def main():
                         break
                     loading_model_path = model2_path
                     model2 = load_model_from_checkpoint(
-                        model2_path, config, device, ChessNet, verbose=verbose_console
+                        model2_path, config, device, verbose=verbose_console
                     )
             except Exception as exc:
                 if isinstance(exc, ModelCompatibilityError):

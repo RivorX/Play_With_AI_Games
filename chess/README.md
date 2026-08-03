@@ -31,13 +31,22 @@ Silnik szachowy oparty na deep learning (CNN) i MCTS, inspirowany AlphaZero.
 
 ## Architektura modelu
 
-`ChessNet` (`chess/src/model.py`) to pre-activation ResNet z:
+Aktualna architektura `se_cnn_v9` znajduje sie w
+`chess/src/models/architecture/se_cnn_v9.py`. Rejestr w
+`src/models/registry.py`
+pozwala dodac np. transformer bez zmiany loaderow IL, RL, play i Elo.
+
+Checkpoint zapisuje `model_spec`: identyfikator architektury, argumenty modelu,
+enkoder wejscia oraz codec policy. Numer runu/checkpointu nie jest wersja
+architektury.
+
+`se_cnn_v9` to pre-activation ResNet z:
 - wejscie: `16 * (1 + history_positions)` kanalow
 - trunk: bloki residualne
 - policy head: `1x1 conv + BN + FC` (AZ-like, `8x8x73`)
 - value head: 3 klasy WDL
 
-Opcjonalne elementy (zaleznie od `config.yaml`):
+Opcjonalne elementy (zaleznie od profilu modelu):
 - `SEBlock` (Squeeze-and-Excitation)
 - `CoordConv2d`
 - `LayerScale`
@@ -47,7 +56,12 @@ Opcjonalne elementy (zaleznie od `config.yaml`):
 
 ```text
 chess/
-|- config/config.yaml
+|- config/
+|  |- default.yaml            # trening, hardware i central inference
+|  |- data.yaml               # sciezki i pipeline danych
+|  |- evaluation.yaml         # play, logging i estymacja Elo
+|  `- models/
+|     `- se_cnn_v9.yaml       # profil architektury
 |- data/                     # PGN + preprocessing cache
 |- engines/                  # Stockfish cache (auto-download)
 |- logs/                     # CSV i PNG z treningu
@@ -62,17 +76,30 @@ chess/
 |  |- eval_elo.py
 |  |- download_nikonoel_pgns.py
 |  |- play.py
-|  |- utils/
-|     |- il/
-|     |- rl/
-|     |- shared/
-|     |- ui/
+|  `- debug/                  # uruchamialne benchmarki i diagnostyka
 |- src/
-   |- model.py
-   |- mcts.py
-   |- data.py
-   |- batch_selfplay.py
-   |- utils/
+   |- model.py                # publiczne API modeli/checkpointow
+   |- models/
+   |  |- architecture/
+   |  `- data/se_cnn_v9/     # encoder, policy, dataset i preprocessing
+   |- training/
+   |  |- il/
+   |  `- rl/
+   |- evaluation/
+   |- game/
+   |  `- backend.py            # natywny kontrakt bulletchess
+   |- inference/
+   |  `- central.py            # wspolny klient/serwer GPU
+   |- mcts/
+   |  |- search.py             # drzewo i batched Gumbel MCTS
+   |  |- single_game.py        # adapter Play/UCI/Elo
+   |  |- native.py             # binding do C++
+   |  `- cpp/mcts_kernels.cpp
+   |- selfplay/
+   |  |- engine.py             # przebieg gier i targety replay
+   |  `- workers.py            # multiprocessing i streaming
+   |- common/
+   `- ui/
 ```
 
 ## Szybki start
@@ -98,7 +125,8 @@ python chess/scripts/download_nikonoel_pgns.py
 - bez argumentow skrypt przechodzi w tryb interaktywny i pyta, co pokazac / pobrac
 - rozpakowane pliki `.pgn` trafiaja zawsze do `chess/data`
 - archiwa tymczasowe sa trzymane pod `chess/data/_archives/nikonoel`
-- w `config.yaml` `data.max_games` moze byc liczbą albo `"max"` dla calego PGN
+- w `config/data.yaml` `data.phase_1_binary.max_games` moze byc liczba albo
+  `"max"` dla calego PGN
 
 ## IL (Imitation Learning)
 
@@ -188,9 +216,9 @@ python chess/scripts/train_rl.py
   pozycje z wiarygodnym `root_q` otrzymują umiarkowanie większą wagę value
 - **Difficulty-aware MCTS**: trudność pozycji łączy niepewność policy, względną
   różnicę dwóch najlepszych ruchów, branching i niepewność value. Najłatwiejsze
-  pozycje PCR dostają 16 symulacji, pełne search'e 64-320, a średnia grupy
-  pozostaje dokładnie równa `search.simulations`
-- **Shared tree + tree reuse**: w zwykłym guarded-actor self-play obie strony
+  pozycje dostają 64 symulacje, najtrudniejsze do 320, a średnia grupy pozostaje
+  dokładnie równa `search.simulations`; każdy root uczy policy
+- **Shared tree + tree reuse**: w zwykłym learner-snapshot self-play obie strony
   używają jednego drzewa. Po ruchu odwiedzony podwęzeł zostaje nowym rootem,
   a niepotrzebni przodkowie i rodzeństwo są od razu zwalniani. Partie dwóch
   różnych checkpointów zachowują osobne drzewa, aby nie mieszać ich priorytetów
@@ -348,10 +376,11 @@ python chess/scripts/train_rl.py
 
 Najwazniejsze zachowania:
 - RL startuje od `best_model_il.pt` (jesli plik istnieje)
-- Samogra przez `batch_selfplay` + MCTS worker, zawsze bez zewnętrznego silnika
-- Guarded actor gra przeciwko sobie; learner nie generuje danych, dopóki nie
-  przejdzie lekkiej bramki non-inferiority względem zaakceptowanego best
-- Replay łączy świeże dane actora z przypiętym archiwum ostatniego championa
+- Samogra przez `src/selfplay` + `src/mcts`, zawsze bez zewnętrznego silnika
+- Każda iteracja zamraża aktualnego learnera na czas self-play; zaakceptowany
+  best pozostaje punktem odniesienia i przejmuje self-play tylko podczas
+  bootstrapu archiwum championa albo po zadziałaniu guardu bezpieczeństwa
+- Replay łączy świeże dane learnera z przypiętym archiwum ostatniego championa
 - Stałe parametry MCTS oraz LR schedule
 - Eval vs best model co `eval_every`
 - Zapisy:
@@ -369,7 +398,7 @@ przeciwnikiem self-play i nie dostarcza replayu, ruchów nauczyciela ani target�
 
 Metryka ma jednego właściciela: eval nie jest kopiowany do data-quality, a czasy
 profilera nie trafiają do głównego CSV. Schematy są zdefiniowane w
-`scripts/utils/rl/rl_log_schema.py`.
+`src/training/rl/log_schema.py`.
 
 ## Ewaluacja Elo
 
@@ -407,7 +436,7 @@ python chess/scripts/play.py
 UCI adapter:
 
 ```bash
-python chess/scripts/utils/ui/uci_engine.py
+python chess/scripts/uci_engine.py
 ```
 
 ## Logi i checkpointy
@@ -430,18 +459,26 @@ PGN wrzuc do:
 - `chess/data/`
 
 Projekt byl przygotowywany pod zbiory typu Lichess Elite (wysokie Elo).
-Filtry jak `min_elo`, sampling i deduplikacje ustawiasz w `chess/config/config.yaml`.
+Filtry jak `min_elo`, sampling i deduplikacje ustawiasz w
+`chess/config/data.yaml`.
 
 ## Konfiguracja
 
-Glowne sekcje:
-- `data`
-- `model`
-- `imitation_learning`
-- `reinforcement_learning`
-- `elo_estimation`
-- `hardware`
-- `debug`
+Ustawienia sa podzielone wedlug odpowiedzialnosci:
 
-Punkt startowy konfiguracji:
-- `chess/config/config.yaml`
+- `config/default.yaml`: czesto strojone ustawienia IL, RL, hardware i inference
+- `config/data.yaml`: sciezki oraz wszystkie fazy przygotowania danych
+- `config/evaluation.yaml`: play, logging i wspolna estymacja Elo
+- `config/models/se_cnn_v9.yaml`: struktura modelu i kontrakt danych
+
+`load_project_config()` automatycznie scala wszystkie trzy pliki projektu.
+Opcjonalny `config_path` jest nakladany na nie jako jednorazowy override, wiec
+nie trzeba kopiowac calej konfiguracji do pliku eksperymentu.
+
+Zmiana pliku nie zmienia zasad cache: komentarze faz w `data.yaml` nadal
+okreslaja, czy dana wartosc przebudowuje binary, indeks, soft-target cache, czy
+tylko sampling epoki.
+
+Loader: `src.config.load_project_config()`. Aby dodac architekture, dodaj modul
+w `src/models/architecture`, dane w `src/models/data/<architecture_id>`, wpis
+w `MODEL_REGISTRY` i odpowiadajacy profil YAML.

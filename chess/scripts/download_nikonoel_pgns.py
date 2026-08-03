@@ -20,9 +20,6 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-import yaml
-
-
 script_dir = Path(__file__).resolve().parent
 chess_dir = script_dir.parent
 sys.path.insert(0, str(chess_dir))
@@ -37,9 +34,9 @@ ARCHIVE_LINK_RE = re.compile(
 
 
 def _load_config() -> dict:
-    config_path = chess_dir / "config" / "config.yaml"
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    from src.config import load_project_config
+
+    return load_project_config()
 
 
 def _resolve_data_dir(config: dict) -> Path:

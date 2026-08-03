@@ -15,7 +15,7 @@ import sys
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
-from utils.shared.model_catalog import (
+from src.models.catalog import (
     load_checkpoint_metadata,
     print_model_table,
     sort_entries_by_folder_and_version,
