@@ -1,0 +1,26 @@
+# Architecture profile. A new file is needed only when the model/data contract
+# changes, not for every IL/RL checkpoint.
+model:
+  architecture_id: "se_cnn_v9"
+  version: "v9.9b"              # Trained-model/run label, not architecture identity.
+
+  num_residual_blocks: 8
+  filters: 128
+  policy_head_channels: 96
+  value_head_filters: 16
+  value_hidden_dim: 384
+  moves_left_hidden_dim: 128
+  dropout: 0.08
+
+  history_positions: 4
+  input_encoder_id: "planes_history_v1"
+  policy_codec_id: "lc0_1858_v1"
+  value_head_id: "wdl_search_aux_v1"
+
+  use_se_blocks: true
+  use_se_bottleneck: true
+  se_reduction: 4
+  drop_path_rate: 0.05
+  use_coord_conv: true
+  use_layer_scale: true
+  layer_scale_init: 1e-5

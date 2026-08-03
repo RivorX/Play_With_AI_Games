@@ -18,7 +18,6 @@ Imitation Learning Training Script - v4.5
 import torch
 import torch.optim as optim
 import torch._dynamo
-import yaml
 import sys
 import time
 import math
@@ -37,18 +36,19 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.model import (
-    ChessNet,
+    create_model,
     load_model,
     save_checkpoint,
 )
-from src.data import process_pgn_files, create_dataloaders
-from src.utils.data_helpers import ACTION_SIZE, get_position_size
-from src.utils.config import normalize_data_config
+from src.models.data import create_dataloaders, process_pgn_files
+from src.models.data.se_cnn_v9.helpers import ACTION_SIZE, get_position_size
+from src.config import default_config_path, load_project_config
 
-# Import from utils
-from utils.shared.logger import TrainingLogger
-from utils.il.training_il import train_epoch_il, evaluate_il
-from utils.il.startup import (
+# Import training modules
+from src.common.logger import TrainingLogger
+from src.common.torch_cache import configure_torch_compile_cache
+from src.training.il.trainer import train_epoch_il, evaluate_il
+from src.training.il.startup import (
     plan_il_startup,
     apply_il_startup_plan,
     ask_resume_additional_epochs,
@@ -57,25 +57,26 @@ from utils.il.startup import (
     ask_il_start_mode,
     has_il_checkpoints,
 )
-from utils.il.auto_tune import resolve_il_hyperparameters
-from utils.il.elo_async import ILEloCoordinator
-from utils.il.checkpointing import (
+from src.training.il.auto_tune import resolve_il_hyperparameters
+from src.training.il.elo_async import ILEloCoordinator
+from src.training.il.checkpointing import (
     build_runtime_state,
-    save_swa_snapshot_checkpoint,
     finalize_swa_model,
 )
-from utils.shared.runtime_helpers import (
+from src.common.runtime import (
     build_model_file_tag,
     build_model_architecture_metadata,
     cleanup_interrupted_log_csv,
 )
-from utils.shared.elo_runner import (
+from src.evaluation.elo_runner import (
+    apply_checkpoint_elo_seed,
+    build_final_mcts_elo_configs,
     build_il_final_elo_configs,
     build_il_periodic_elo_config,
     persist_estimated_elo,
     run_elo_check,
 )
-from utils.shared.model_view import (
+from src.models.view import (
     print_active_model_summary,
     print_status_table,
     print_multi_column_table,
@@ -134,16 +135,6 @@ def _format_target_positions(value):
         return "max"
     if value % 1_000_000 == 0:
         return f"{value // 1_000_000}M"
-    return f"{value / 1_000_000:.2f}M"
-
-
-def _format_million_positions(value):
-    try:
-        value = int(value)
-    except (TypeError, ValueError):
-        return "n/a"
-    if value <= 0:
-        return "0M"
     return f"{value / 1_000_000:.2f}M"
 
 
@@ -307,30 +298,6 @@ def _safe_int(value, default=None):
         return int(float(value))
     except (TypeError, ValueError):
         return default
-
-
-def _best_existing_nn_elo_from_logger(logger):
-    """Return existing periodic NN Elo closest to the best validation epoch."""
-    estimated_elos = list(getattr(logger, "estimated_elos", []) or [])
-    if not estimated_elos:
-        return None
-    try:
-        if getattr(logger, "val_losses", None):
-            best_idx = min(range(len(logger.val_losses)), key=lambda i: logger.val_losses[i])
-            best_epoch = int(logger.val_iterations[best_idx]) if best_idx < len(logger.val_iterations) else int(logger.iterations[best_idx])
-        else:
-            best_epoch = int(estimated_elos[-1][0])
-    except (TypeError, ValueError, IndexError):
-        best_epoch = int(estimated_elos[-1][0])
-    source_epoch, elo = min(estimated_elos, key=lambda pair: abs(int(pair[0]) - best_epoch))
-    error_info = (getattr(logger, "estimated_elo_errors", {}) or {}).get(int(source_epoch), {}) or {}
-    return {
-        "source_epoch": int(source_epoch),
-        "best_epoch": int(best_epoch),
-        "elo": float(elo),
-        "std_error": error_info.get("se"),
-        "ci95": error_info.get("ci95"),
-    }
 
 
 def _read_csv_metadata_and_epochs(csv_path):
@@ -522,11 +489,18 @@ def _run_il_final_elo(
     checkpoint_path=None,
 ):
     """Run a blocking final IL Elo check; Ctrl+C cancels only this check."""
-    if not isinstance(elo_config, dict) or not elo_config.get("enabled", False):
+    if not isinstance(elo_config, dict):
         return {"skipped": True}
 
     timing_label = "after Ctrl+C" if interrupted else "at training end"
     print(f"\nFinal IL Elo check {timing_label} ({model_label}). Press Ctrl+C to cancel this check.")
+    elo_config = dict(elo_config or {})
+    apply_checkpoint_elo_seed(
+        elo_config,
+        checkpoint_path,
+        use_mcts=bool(elo_config.get("use_mcts", False)),
+        simulations=int(elo_config.get("mcts_simulations", 0) or 0),
+    )
     stop_event = threading.Event()
     was_training = bool(getattr(model, "training", False))
     try:
@@ -581,7 +555,7 @@ def _run_il_final_elo(
             persist_estimated_elo(
                 checkpoint_path,
                 estimated_elo,
-                levels=list(elo_config.get("levels", [])),
+                levels=list(elo_result.get("levels_requested", []) or []),
                 games_per_level=int(elo_config.get("games_per_level", 0) or 0),
                 use_mcts=use_mcts,
                 simulations=simulations,
@@ -637,12 +611,10 @@ def main():
             pass
 
     # Load config
-    config_path = script_dir.parent / 'config' / 'config.yaml'
+    config_path = default_config_path()
     
     print(f"Loading config from: {config_path}")
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    config = normalize_data_config(config)
+    config = load_project_config()
 
     model_version = config.get('model', {}).get('version', 'v?.?')
     model_file_tag = build_model_file_tag(config)
@@ -657,7 +629,7 @@ def main():
 
     # Default to compact model logging in IL unless debug mode is enabled.
     config.setdefault('model', {})
-    # Keep ChessNet constructor quiet; startup summary is printed via shared table view.
+    # Keep the architecture constructor quiet; startup summary uses the shared table.
     config['model']['print_summary'] = False
     
     # Set seed
@@ -733,7 +705,7 @@ def main():
     # Create model early so startup menu appears before any data processing.
     print("\nPreparing model for startup menu...")
 
-    model = ChessNet(config).to(device)
+    model = create_model(config).to(device)
     model = model.to(memory_format=torch.channels_last)
     print("Model ready")
 
@@ -841,13 +813,6 @@ def main():
                     stale_profile.unlink()
                 except OSError:
                     pass
-        legacy_debug_dir = logs_dir / "debug"
-        for stale_profile in legacy_debug_dir.glob("training_profile_*.txt"):
-            try:
-                stale_profile.unlink()
-            except OSError:
-                pass
-
         profile_debug_enabled = bool(il_debug_cfg.get('profile_training', debug_cfg.get('profile_training', False)))
         profile_mode_label = "every epoch" if profile_debug_enabled else "first epoch of each training phase"
         print(
@@ -899,7 +864,7 @@ def main():
     # Initialize logger after startup menu selection.
     logger = TrainingLogger(
         logs_dir,
-        experiment_name=f"il_training_{model_version}",
+        experiment_name=f"IL_{model_version}",
         mode="il",
         verbose=debug_enabled,
     )
@@ -1911,10 +1876,8 @@ def main():
         print("Note: IL forces elo_estimation.use_mcts=False for speed.")
     elo_config_il["use_mcts"] = False
     final_elo_config_il, final_elo_config_il_mcts = build_il_final_elo_configs(elo_config)
-    final_il_elo_enabled = bool(
-        final_elo_config_il.get("enabled", False)
-        and final_elo_config_il.get("final_on_il_shutdown", True)
-    )
+    final_elo_config_il_mcts_profile = build_final_mcts_elo_configs(elo_config)
+    final_il_elo_enabled = True
 
     elo_coordinator = ILEloCoordinator(
         model=model,
@@ -1926,11 +1889,15 @@ def main():
     elo_coordinator.print_startup_summary(verbose=debug_enabled)
     if debug_enabled and final_il_elo_enabled:
         print(
-            "Elo final (IL): enabled for SWA and best_model_il MCTS, "
-            f"levels={final_elo_config_il.get('levels')}, "
+            "Elo final (IL): exact best_model_il Raw NN + MCTS, plus SWA checks, "
+            "levels=auto from Stockfish UCI_Elo, "
             f"cap={final_elo_config_il_mcts.get('adaptive_max_total_games')} games, "
             f"time={float(final_elo_config_il_mcts.get('stockfish_time_limit', 0.0)):.2f}s, "
-            f"mcts_sims={int(final_elo_config_il_mcts.get('mcts_simulations', 0) or 0)}"
+            "mcts_profile="
+            + "/".join(
+                str(int(cfg.get("mcts_simulations", 0) or 0))
+                for cfg in final_elo_config_il_mcts_profile
+            )
         )
 
     # torch.compile: fuses Conv+BN+ReLU kernels → fewer GPU kernel launches.
@@ -1960,6 +1927,8 @@ def main():
         if not torch.cuda.is_available():
             print("⚠️ torch.compile pominięty: CUDA niedostępna")
             return current_model
+
+        configure_torch_compile_cache(torch, device, "il_learner")
 
         # Important for transfer warmup → unfreeze.
         # Without resetting Dynamo, a new compile call may still reuse guards/
@@ -2105,7 +2074,7 @@ def main():
                     swa_model_state = swa_model.state_dict() if swa_model is not None else None
                     swa_scheduler_state = swa_scheduler.state_dict() if swa_scheduler is not None else None
 
-                    new_eager_model = ChessNet(config).to(device)
+                    new_eager_model = create_model(config).to(device)
                     new_eager_model = new_eager_model.to(memory_format=torch.channels_last)
                     new_eager_model.load_state_dict(eager_state, strict=True)
                     for param in new_eager_model.parameters():
@@ -2544,25 +2513,6 @@ def main():
             latest_size_mb = saved_latest_path.stat().st_size / (1024 ** 2)
             print(f"💾 Latest checkpoint updated: {saved_latest_path.name} ({latest_size_mb:.1f} MB)")
 
-            save_swa_snapshot_checkpoint(
-                epoch_idx=epoch,
-                fallback_loss=train_losses['total'],
-                ref_val_losses=val_losses,
-                ref_val_metrics=val_metrics,
-                use_swa=use_swa,
-                swa_model=swa_model,
-                swa_start=swa_start,
-                il_dir=il_dir,
-                history_positions=history_positions,
-                expected_input_planes=expected_input_planes,
-                model_version=model_version,
-                start_mode=start_mode,
-                use_bfloat16=use_bfloat16,
-                model_file_tag=model_file_tag,
-                model_architecture=model_architecture,
-                training_batch_size=trained_batch_size,
-            )
-
             if should_stop:
                 break
 
@@ -2728,29 +2678,27 @@ def main():
             final_model_label = f"best IL: {best_elo_label}" if best_checkpoint_loaded else "current model"
             final_marker_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
             final_note_label = "Best IL final Elo" if best_checkpoint_loaded else "Current IL final Elo"
-            if best_checkpoint_loaded:
-                best_nn = _best_existing_nn_elo_from_logger(logger)
-                if best_nn is not None:
-                    logger.record_best_final_elo(final_epoch_num, best_nn["elo"])
-                    logger.record_il_mode_elo(
-                        final_epoch_num,
-                        best_nn["elo"],
-                        mode="nn",
-                        simulations=0,
-                        label="Best NN",
-                        update_csv=True,
-                        std_error=best_nn.get("std_error"),
-                        ci95=best_nn.get("ci95"),
-                    )
-                    logger.append_final_note(
-                        f"{final_note_label} NN: {int(round(float(best_nn['elo'])))} "
-                        f"(reused epoch {best_nn['source_epoch']})"
-                    )
-                    logger.plot()
+            print("\n" + "=" * 88)
+            print("Final best IL strength check")
+            print(f"Checkpoint: {best_elo_label}")
+            print(
+                "Fresh evaluation: Raw NN, then final-only MCTS profile "
+                + "/".join(
+                    str(int(cfg.get("mcts_simulations", 0) or 0))
+                    for cfg in final_elo_config_il_mcts_profile
+                )
+            )
+            print("=" * 88)
             final_best_elo_results = []
-            for mode_cfg, mode_suffix in (
-                (final_elo_config_il_mcts, "MCTS"),
-            ):
+            final_best_mode_plan = [(final_elo_config_il, "Raw NN")]
+            final_best_mode_plan.extend(
+                (
+                    mode_cfg,
+                    f"MCTS @{int(mode_cfg.get('mcts_simulations', 0) or 0)}",
+                )
+                for mode_cfg in final_elo_config_il_mcts_profile
+            )
+            for mode_cfg, mode_suffix in final_best_mode_plan:
                 mode_marker = f"{final_marker_label} {mode_suffix}"
                 final_best_elo_result = _run_il_final_elo(
                     model=best_elo_model,
@@ -2768,11 +2716,48 @@ def main():
                 if final_best_elo_result.get("cancelled"):
                     break
                 if final_best_elo_result.get("estimated_elo") is not None:
+                    if mode_suffix == "Raw NN":
+                        logger.record_best_final_elo(
+                            final_epoch_num,
+                            final_best_elo_result["estimated_elo"],
+                        )
                     logger.append_final_note(
                         f"{final_note_label} {mode_suffix}: "
                         f"{int(round(float(final_best_elo_result['estimated_elo'])))}"
                     )
                     logger.plot()
+            successful_final_modes = [
+                (mode_suffix, result)
+                for (_, mode_suffix), result in zip(final_best_mode_plan, final_best_elo_results)
+                if result.get("estimated_elo") is not None
+            ]
+            if successful_final_modes:
+                print("\n" + "-" * 88)
+                print("Final best IL results")
+                for mode_suffix, result in successful_final_modes:
+                    elo_value = int(round(float(result["estimated_elo"])))
+                    uncertainty = ""
+                    if result.get("elo_std_error") is not None:
+                        uncertainty = f" +/-{float(result['elo_std_error']):.1f} SE"
+                    ci95 = result.get("elo_ci95")
+                    if isinstance(ci95, (list, tuple)) and len(ci95) == 2:
+                        uncertainty += f", 95% CI {ci95[0]}-{ci95[1]}"
+                    print(f"  {mode_suffix:<8} {elo_value:>5}{uncertainty}")
+                nn_result = next(
+                    (result for label, result in successful_final_modes if label == "Raw NN"),
+                    None,
+                )
+                if nn_result is not None:
+                    nn_elo = float(nn_result["estimated_elo"])
+                    for mode_suffix, result in successful_final_modes:
+                        if not mode_suffix.startswith("MCTS"):
+                            continue
+                        mcts_elo = float(result["estimated_elo"])
+                        print(
+                            f"  {mode_suffix} gain over Raw NN: "
+                            f"{mcts_elo - nn_elo:+.0f} Elo"
+                        )
+                print("-" * 88)
             final_best_elo_result = next(
                 (r for r in final_best_elo_results if r.get("estimated_elo") is not None),
                 final_best_elo_results[-1] if final_best_elo_results else {},

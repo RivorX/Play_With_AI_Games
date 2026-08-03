@@ -1,0 +1,244 @@
+# ==============================================================================
+# CHESS AI CONFIGURATION - OPTIMIZED FOR RTX 5060Ti 16GB
+# ==============================================================================
+
+project:
+  # Used for new IL/RL models. Existing checkpoints use their own model_spec.
+  # se_cnn_v9, ...
+  active_architecture: "se_cnn_v9"
+
+# ------------------------------------------------------------------------------
+# IMITATION LEARNING (IL)
+# ------------------------------------------------------------------------------
+imitation_learning:
+  # Core training
+  epochs: 50
+  batch_size: 8192              # fallback; auto-tune may override
+  learning_rate: 0.001          # fallback/base LR
+  weight_decay: 0.002
+
+  # LR schedule
+  min_lr_ratio: 0.005
+  lr_plateau_decay: true
+
+  # Losses
+  policy_loss_weight: 1.0
+  value_loss_weight: 1.0
+  value_scalar_aux_loss_weight: 0.20
+  moves_left_loss_weight: 0.05
+  wdl_label_smoothing: 0.01
+
+  # Horizontal file symmetry without rebuilding data. Positions whose visible
+  # history still has castling rights are skipped because castling is asymmetric.
+  augmentation:
+    enabled: true
+    horizontal_flip_prob: 0.5
+
+  # Checkpoint selection
+  early_stop_monitor: value_aware # total | value_aware
+  max_patience: 5
+  min_delta: 0.0015
+
+  # SWA
+  use_swa: true
+
+# ------------------------------------------------------------------------------
+# REINFORCEMENT LEARNING (RL)
+# ------------------------------------------------------------------------------
+reinforcement_learning:
+  # Main run size.
+  run:
+    version: "rl49"
+    iterations: 60
+    games_per_iteration: 1000
+    # RL49 recommends NEW from the canonical IL best with empty replay. The
+    # normal startup menu remains available so resume/transfer can be selected
+    # explicitly when this is not the controlled comparison run.
+    fresh_il_start: true
+
+  # Game generation. Runtime mechanics use tested internal defaults.
+  self_play:
+    workers: auto
+    max_moves: 190
+    # Revisit difficult replay states as complete games. FEN is decoded once at
+    # game start; search stays entirely on native bulletchess boards.
+    hard_start_fraction: 0.18
+    hard_start_min_age: 1
+
+    opening_diversity_fraction: 0.60
+    opening_diversity_min_plies: 2
+    opening_diversity_max_plies: 8
+
+    # One frozen learner snapshot plays both colours. During the four-iteration
+    # correction-loss warm-up it is the only self-play source; best bootstrap
+    # and safety fallback become eligible afterwards.
+    learner_only_bootstrap_iterations: 4
+
+    syzygy_paths:
+      - "data/syzygy"
+
+  # Full Gumbel AlphaZero search with Sequential Halving at the root and
+  # completed-Q policy improvement below it.
+  search:
+    simulations: 192
+    # Assign the complete budget before Sequential Halving. `simulations` is
+    # the exact group average. Difficulty combines prior ambiguity/entropy,
+    # branching and value uncertainty on a smooth 16-sim grid in the strict
+    # 64-320 range. Every root produces a complete policy target.
+    dynamic_budget_enabled: true
+    dynamic_budget_min: 64
+    dynamic_budget_max_multiplier: 1.6666667
+    gumbel_max_considered_actions: 16
+    gumbel_scale: 1.0              # self-play exploration
+    gumbel_eval_scale: 0.0         # deterministic perfect-information eval
+    # Earlier Q influence is valuable with the compensated dynamic budget:
+    # paired ablations beat c_visit=50 at 64/192 sims and tied it at 320 sims.
+    gumbel_c_visit: 100.0
+    gumbel_c_scale: 0.10
+    # Do not stretch tiny, noisy sibling-Q differences to the full [0, 1]
+    # interval. The current value head is strongly under-dispersed in openings.
+    gumbel_q_range_floor: 0.25
+    gumbel_use_mixed_value: true
+    # The completed-Q policy is already soft. Do not flatten it a second time:
+    # the last run's target top-1 fell from 65.7% to 53.7%, while useful
+    # correction top-1 stayed near 10%.
+    gumbel_target_temperature: 1.00
+
+  # Optimizer and the few regularizers worth tuning between runs.
+  training:
+    # Four-generation rolling-replay A/B (1,000 self-play + 256 holdout games):
+    # three passes beat one by 59.4% raw NN and 57.3% MCTS. Four passes kept
+    # lowering supervised loss but raw NN fell back to 50%, so three is the
+    # measured quality/overfit boundary rather than simply using the maximum.
+    train_epochs_per_iteration: 3
+
+    learning_rate: 0.00002
+    weight_decay: 0.002
+    # One AdamW LR for the shared tower and every head. Task balance is defined
+    # only by the explicit losses below, so resume/new runs use the same contract.
+    # The measured pre-clip norm in rl33 stayed around 0.76-0.98, so 0.5
+    # attenuated every optimizer step to only 51-66% of its intended size.
+    # Keep clipping as a spike guard instead of making it the normal update.
+    grad_clip: 1.0
+
+    warmup_pct: 0.05              # pretrained IL + conservative 2e-5 LR
+    min_lr_ratio: 0.35
+    augment_prob: 0.50            # Applied only where horizontal symmetry is exact
+
+  # Uniform FIFO replay. Keep a little more unique game coverage, but shorten
+  # the horizon so RAM/training volume stays close to the previous setup.
+  replay:
+    buffer_multiplier: 3.2
+    # Refresh difficult/old policy and root-Q targets after promotion and every
+    # ten stalled iterations. This keeps search distillation active even when a
+    # run has not yet produced a new champion.
+    reanalyse_enabled: true
+    reanalyse_stall_interval: 10
+    reanalyse_fraction: 0.02
+    reanalyse_max_positions: 4096
+    reanalyse_min_age: 1
+    reanalyse_simulations: 256
+    reanalyse_batch_positions: 32
+    # A refreshed target must describe one search exactly; mixing it with a
+    # stale target destroys the correction/Q relationship used by the learner.
+    reanalyse_policy_mix: 1.0
+
+  # Model comparison and promotion. Technical worker/opening settings are fixed.
+  evaluation:
+    eval_every: 2
+    # Promotion and anchor evaluation are exact: both models receive 192 fresh
+    # root simulations, without self-play redistribution or easy-root cuts.
+    # Raw policy is cheap to test. 96 paired games makes the promotion safety
+    # guard materially less noisy for only a small fraction of iteration time.
+    eval_no_mcts_games: 96
+
+    # Weak learners stop early, while a plausible promotion candidate is
+    # decided on 256 paired games in total. A point-score winner whose confidence
+    # bound narrowly misses parity receives 128 extra confirmation games.
+    eval_funnel_preliminary_games: 64
+    eval_funnel_preliminary_score_rate: 0.45
+    eval_funnel_medium_games: 64
+    eval_funnel_medium_score_rate: 0.50
+    eval_funnel_advanced_games: 128
+
+    score_rate_threshold: 0.52
+    true_win_rate_threshold: 0.02
+    # Run only after a candidate passes learner-vs-best. Start with 96 and
+    # extend an inconclusive direct IL-anchor match to at most 256 games.
+    # There are no periodic anchor matches between promotion attempts.
+    anchor_eval_games: 96
+    # One-sided non-inferiority guard. The point score still has to reach 50%,
+    # and its z=1.28 lower bound may be at most 3 pp below parity.
+    promotion_anchor_score_lower_bound_min: 0.47
+    # Search may not hide a raw-policy regression against the immutable IL
+    # anchor. Borderline results extend cheaply from 96 -> 256 -> 512 games.
+    promotion_anchor_no_mcts_gate_enabled: true
+    promotion_anchor_no_mcts_score_rate_min: 0.50
+    promotion_anchor_no_mcts_score_lower_bound_min: 0.47
+    anchor_no_mcts_max_games: 512
+
+  # Elo reporting after promotions and at shutdown.
+  stockfish_elo:
+    # Reporting only. Stockfish never generates replay, targets or opponents.
+    # Promotion-time raw NN Elo is automatic. MCTS Elo is allowed only for a
+    # newly promoted RL best; an unchanged IL/startup best is never measured
+    # periodically by RL. The gap only rate-limits close consecutive promotions.
+    promoted_use_mcts: true
+    promoted_mcts_min_iteration_gap: 10
+    final_enabled: true
+    final_use_mcts: true
+
+  # Training objective. Policy CE and WDL value CE are the two equal primary
+  # tasks. Remaining terms are dimensionally different auxiliary regularizers;
+  # their coefficients scale those penalties, not separate optimizer speeds.
+  losses:
+    policy: 1.0
+    value: 1.00
+    value_scalar_aux: 0.25
+    moves_left: 0.05
+    # Distil search diagnostics into a separate auxiliary head, but never feed
+    # its self-generated target back into MCTS leaf value.
+    search_q: 0.20
+    # The same MCTS correction is already emphasized by weighted policy CE.
+    # Ramp the separate ranking term from 0.00/0.083/0.167 to 0.25 in iterations
+    # 1-4, then keep it fixed, giving the weak initial WDL head time to settle.
+    policy_correction_rank_weight: 0.25
+    policy_correction_rank_warmup_iterations: 4
+    # Reduce final-outcome supervision before a later exploratory blunder, while
+    # emphasizing only reliable policy corrections found by a complete search.
+    deblunder_threshold: 0.15
+    deblunder_width: 0.10
+    deblunder_value_min_weight: 0.35
+    # The correction rows receive a bounded 2x ceiling; non-improving/noisy
+    # changes remain excluded.
+    deblunder_policy_boost_max: 2.00
+    # Focus value learning on the largest current error against the final game
+    # outcome. Up to the hardest 25% of each batch receive at most 1.5x weight.
+    value_error_focus_fraction: 0.25
+    value_error_focus_max_multiplier: 1.50
+    wdl_label_smoothing: 0.010
+
+# ------------------------------------------------------------------------------
+# HARDWARE & OPTIMIZATION
+# ------------------------------------------------------------------------------
+hardware:
+  # User-facing hardware choices. Other transport/prefetch settings are fixed
+  # in code to their measured fastest values.
+  device: "cuda"
+  use_bfloat16: true
+  num_workers: 4
+
+
+# ------------------------------------------------------------------------------
+# SHARED CENTRAL GPU INFERENCE
+# ------------------------------------------------------------------------------
+central_inference:
+  max_batch_size: 384            # Production 192-sim throughput optimum.
+  flush_ms: 0.5                  # Coalesce concurrent MCTS requests.
+
+
+# ------------------------------------------------------------------------------
+# DEBUG
+# ------------------------------------------------------------------------------
+debug:
+  enabled: false

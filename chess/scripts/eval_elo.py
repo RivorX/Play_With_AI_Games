@@ -4,6 +4,7 @@ This script intentionally does not accept CLI arguments.
 Run it without parameters and use the menu.
 """
 
+import argparse
 import contextlib
 import copy
 import math
@@ -13,15 +14,20 @@ import time
 from pathlib import Path
 
 import torch
-import yaml
-
 # Add src to path
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
-from src.model import ChessNet, transfer_matching_weights
-from utils.shared.elo_estimator import ensure_stockfish
-from utils.shared.elo_runner import (
+from src.config import default_config_path, load_project_config
+from src.model import (
+    create_model,
+    load_checkpoint_file,
+    normalize_state_dict_keys,
+    resolve_model_spec,
+    transfer_matching_weights,
+)
+from src.evaluation.elo_estimator import ensure_stockfish
+from src.evaluation.elo_runner import (
     build_eval_elo_config,
     mode_label,
     persist_estimated_elo,
@@ -30,12 +36,12 @@ from utils.shared.elo_runner import (
     safe_float as _safe_float,
     safe_int as _safe_int,
 )
-from utils.shared.model_catalog import (
+from src.models.catalog import (
     load_checkpoint_metadata,
     print_model_table,
     sort_entries_by_folder_and_elo,
 )
-from utils.shared.model_view import print_selected_models_table
+from src.models.view import print_selected_models_table
 
 
 def _is_tty():
@@ -137,8 +143,7 @@ def _path_rel(path, base_dir):
 
 
 def load_config(config_path):
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    config = load_project_config(config_path=config_path)
     config = copy.deepcopy(config)
     config.setdefault("model", {})
     config["model"]["print_summary"] = False
@@ -415,8 +420,7 @@ def choose_model_entries(catalog, best_path):
 
 
 def choose_eval_settings(elo_cfg):
-    levels = list(elo_cfg.get("levels", [1320, 1500, 1700, 1900, 2200]))
-    default_games = int(elo_cfg.get("games_per_level", 6))
+    default_games = int(elo_cfg.get("adaptive_focus_games_per_level", 20))
     default_use_mcts = False
     default_sims = int(elo_cfg.get("mcts_eval_simulations", 100))
     default_sf_time = float(elo_cfg.get("stockfish_time_limit", 0.05))
@@ -426,9 +430,10 @@ def choose_eval_settings(elo_cfg):
 
     if _is_tty():
         _print_block("Evaluation Settings")
-        print(f"Levels (from config): {levels}")
-    games_label = "Max games per useful level"
-    games_per_level = _prompt_int(games_label, default_games, min_value=1)
+        print("Stockfish levels: detected automatically from UCI_Elo")
+        print(f"Adaptive focus:  {default_games} initial games/selected level; precision adds more")
+    levels = None
+    games_per_level = None
     workers = default_workers
 
     if _is_tty():
@@ -474,7 +479,7 @@ def load_model(checkpoint_path: Path, config: dict, device: torch.device):
         return None
 
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        checkpoint = load_checkpoint_file(checkpoint_path, device)
         source_state = checkpoint.get("model_state_dict")
         if not isinstance(source_state, dict):
             print(f"  x Invalid checkpoint (missing model_state_dict): {checkpoint_path.name}")
@@ -486,11 +491,16 @@ def load_model(checkpoint_path: Path, config: dict, device: torch.device):
     load_mode = "strict_current"
     model = None
 
-    # 1) Fast path: strict load with current config
+    # 1) Canonical path: the checkpoint selects its own architecture/data contract.
     try:
-        model = ChessNet(config).to(device)
+        spec = resolve_model_spec(config, checkpoint)
+        model = create_model(config, model_spec=spec).to(device)
         model = model.to(memory_format=torch.channels_last)
-        model.load_state_dict(source_state)
+        normalized = normalize_state_dict_keys(
+            source_state, target_keys=set(model.state_dict())
+        )
+        model.load_state_dict(normalized)
+        load_mode = f"strict_{spec['architecture_id']}"
     except Exception:
         model = None
 
@@ -504,7 +514,7 @@ def load_model(checkpoint_path: Path, config: dict, device: torch.device):
         if combined_overrides:
             try:
                 cfg_arch = _apply_model_overrides(config, combined_overrides)
-                model = ChessNet(cfg_arch).to(device)
+                model = create_model(cfg_arch).to(device)
                 model = model.to(memory_format=torch.channels_last)
                 try:
                     model.load_state_dict(source_state)
@@ -519,7 +529,7 @@ def load_model(checkpoint_path: Path, config: dict, device: torch.device):
     # 3) Last resort: transfer into current architecture
     if model is None:
         try:
-            model = ChessNet(config).to(device)
+            model = create_model(config).to(device)
             model = model.to(memory_format=torch.channels_last)
             report = transfer_matching_weights(model, checkpoint)
             load_mode = f"transfer_current ({report.get('match_ratio', 0.0):.1%})"
@@ -592,7 +602,22 @@ def format_results_table(all_results: list[dict]) -> str:
         if result.get("elo_std_error") is not None:
             ci = result.get("elo_ci95")
             ci_str = f", 95% CI {ci[0]}-{ci[1]}" if isinstance(ci, list) and len(ci) == 2 else ""
-            lines.append(f"  Uncertainty: ±{result['elo_std_error']} Elo SE{ci_str} (adaptive ladder)")
+            lines.append(f"  Uncertainty: +/-{result['elo_std_error']} Elo SE{ci_str} (adaptive ladder)")
+        rating_games = int(result.get("rating_games", result.get("total_games", 0)) or 0)
+        probe_only_games = int(result.get("probe_only_games", 0) or 0)
+        rating_levels = list(result.get("rating_levels") or [])
+        if rating_levels and probe_only_games > 0:
+            lines.append(
+                f"  Rating fit: {rating_games} focused games on levels {rating_levels}; "
+                f"{probe_only_games} probe games used only for level selection."
+            )
+        if result.get("fit_warning"):
+            model_se = result.get("elo_model_std_error")
+            model_se_text = f"; ideal-curve SE would be {model_se}" if model_se is not None else ""
+            lines.append(
+                "  Fit warning: non-monotonic level results; uncertainty was inflated "
+                f"(dispersion {float(result.get('elo_overdispersion', 1.0)):.2f}{model_se_text})."
+            )
 
         if result.get("results"):
             parts = []
@@ -600,8 +625,11 @@ def format_results_table(all_results: list[dict]) -> str:
                 if lvl in result["results"]:
                     r = result["results"][lvl]
                     games = int(r.get("games", r.get("wins", 0) + r.get("draws", 0) + r.get("losses", 0)) or 0)
+                    local_elo = r.get("local_performance_elo")
+                    local_text = f", local~{local_elo}" if local_elo is not None and games >= 8 else ""
                     parts.append(
-                        f"vs {lvl}: W{r['wins']}/D{r['draws']}/L{r['losses']} ({r['score']:.0%}, n={games})"
+                        f"vs {lvl}: W{r['wins']}/D{r['draws']}/L{r['losses']} "
+                        f"({r['score']:.0%}, n={games}{local_text})"
                     )
             lines.append("  " + " | ".join(parts))
 
@@ -641,14 +669,12 @@ def format_results_table(all_results: list[dict]) -> str:
 
 
 def main():
-    if len(sys.argv) > 1:
-        print("CLI arguments are disabled in this script.")
-        print("Run without arguments and use the interactive menu:")
-        print("  python chess/scripts/eval_elo.py")
-        sys.exit(2)
+    parser = argparse.ArgumentParser(description="Estimate NN/MCTS Elo against Stockfish")
+    parser.add_argument("--model", action="append", default=[], help="checkpoint path to preselect")
+    args = parser.parse_args()
 
     chess_dir = script_dir.parent
-    config_path = chess_dir / "config" / "config.yaml"
+    config_path = default_config_path()
     print(f"Loading config: {config_path}")
     config = load_config(config_path)
 
@@ -682,7 +708,26 @@ def main():
     catalog = build_model_catalog(model_paths, models_dir)
     print_model_catalog(catalog)
 
-    selected_entries = choose_model_entries(catalog, best_path)
+    if args.model:
+        requested = []
+        for raw_path in args.model:
+            candidate = Path(raw_path).expanduser()
+            candidate = (
+                (chess_dir / candidate).resolve()
+                if not candidate.is_absolute()
+                else candidate.resolve()
+            )
+            requested.append(candidate)
+        catalog_by_path = {Path(entry["path"]).resolve(): entry for entry in catalog}
+        missing = [path for path in requested if path not in catalog_by_path]
+        if missing:
+            print("Unknown checkpoint(s):")
+            for path in missing:
+                print(f"  {path}")
+            sys.exit(2)
+        selected_entries = [catalog_by_path[path] for path in requested]
+    else:
+        selected_entries = choose_model_entries(catalog, best_path)
     if not selected_entries:
         print("No valid models selected.")
         sys.exit(1)
@@ -690,17 +735,35 @@ def main():
 
     selected_paths = [entry["path"] for entry in selected_entries]
 
-    default_max_games_per_run = len(levels) * games_per_level
+    def _resolved_mode_config(mode_name):
+        mode_use_mcts = mode_name == "mcts"
+        return build_eval_elo_config(
+            elo_cfg,
+            levels=levels,
+            games_per_level=games_per_level,
+            use_mcts=mode_use_mcts,
+            simulations=simulations,
+            sf_time=sf_time,
+            max_moves=max_moves,
+            sf_path=sf_path,
+            workers=resolve_eval_workers(workers, mode_use_mcts, elo_cfg),
+            standalone=True,
+        )
 
-    def _mode_max_games(mode_name):
-        mode_prefix = "mcts_eval" if mode_name == "mcts" else "nn_eval"
-        cap = elo_cfg.get(f"{mode_prefix}_adaptive_max_total_games", elo_cfg.get("adaptive_max_total_games"))
-        try:
-            return min(default_max_games_per_run, int(cap or default_max_games_per_run))
-        except (TypeError, ValueError):
-            return default_max_games_per_run
-
-    total_games = len(selected_paths) * sum(_mode_max_games(mode) for mode in eval_modes)
+    mode_runtime_configs = {
+        mode_name: _resolved_mode_config(mode_name)
+        for mode_name in eval_modes
+    }
+    total_games = len(selected_paths) * sum(
+        int(
+            runtime_cfg.get(
+                "adaptive_hard_max_total_games",
+                runtime_cfg.get("adaptive_max_total_games", 0),
+            )
+            or 0
+        )
+        for runtime_cfg in mode_runtime_configs.values()
+    )
     mode_labels = []
     if "nn" in eval_modes:
         mode_labels.append("Raw NN")
@@ -714,12 +777,21 @@ def main():
 
     _print_block("Elo Estimation Plan")
     print(f"Models:         {len(selected_paths)}")
-    print(f"Levels:         {levels}")
-    print(f"Games/level:    adaptive probe/focus, cap {games_per_level}/useful level")
-    print(f"Total games:    <= {total_games}")
+    print("Levels:         auto from Stockfish UCI_Elo")
+    print(f"Total games:    <= {total_games} hard safety cap (usually stops earlier)")
     print(f"Mode:           {mode_str}")
     if "mcts" in eval_modes:
         print(f"MCTS sims:      {simulations}")
+    for mode_name in eval_modes:
+        runtime_cfg = mode_runtime_configs[mode_name]
+        label = "MCTS adaptive" if mode_name == "mcts" else "NN adaptive"
+        print(
+            f"{label + ':':<16} probe {int(runtime_cfg.get('adaptive_probe_games_per_level', 0) or 0)}/level"
+            f" · focus >= {int(runtime_cfg.get('adaptive_focus_games_per_level', 0) or 0)}"
+            f" · target SE {float(runtime_cfg.get('adaptive_target_standard_error', 0.0) or 0.0):.0f}"
+            f" · budget {int(runtime_cfg.get('adaptive_max_total_games', 0) or 0)}"
+            f"/{int(runtime_cfg.get('adaptive_hard_max_total_games', runtime_cfg.get('adaptive_max_total_games', 0)) or 0)}"
+        )
     print(f"Workers:        {workers_str}")
     if workers <= 0 and "nn" in eval_modes:
         raw_workers = resolve_eval_workers(workers, False, elo_cfg)
@@ -740,6 +812,13 @@ def main():
             print("MCTS central:   disabled")
     print(f"SF time/move:   {sf_time}s")
     print(f"Max moves:      {max_moves}")
+    if bool(elo_cfg.get("paired_openings_enabled", True)):
+        print(
+            "Openings:       paired colors · "
+            f"{int(elo_cfg.get('paired_openings_max_plies', 6) or 0)} fixed plies"
+        )
+    else:
+        print("Openings:       start position only")
 
     # Ensure Stockfish is available
     sf_path = ensure_stockfish(sf_path)
@@ -747,7 +826,8 @@ def main():
     all_results = []
     t0 = time.perf_counter()
 
-    for idx, model_path in enumerate(selected_paths, start=1):
+    for idx, entry in enumerate(selected_entries, start=1):
+        model_path = entry["path"]
         print(f"\n[{idx}/{len(selected_paths)}] {model_path.name}")
 
         model = load_model(model_path, config, device)
@@ -760,18 +840,19 @@ def main():
             print(f"  Mode: {mode_label_text}")
 
             mode_workers = resolve_eval_workers(workers, mode_use_mcts, elo_cfg)
-            mode_elo_cfg = build_eval_elo_config(
-                elo_cfg,
-                levels=levels,
-                games_per_level=games_per_level,
-                use_mcts=mode_use_mcts,
-                simulations=simulations,
-                sf_time=sf_time,
-                max_moves=max_moves,
-                sf_path=sf_path,
-                workers=mode_workers,
-                standalone=True,
-            )
+            mode_elo_cfg = dict(mode_runtime_configs[eval_mode])
+            mode_elo_cfg["workers"] = int(mode_workers)
+            initial_elo = entry.get("elo_mcts" if mode_use_mcts else "elo_nn")
+            if mode_use_mcts:
+                by_sims = dict(entry.get("elo_mcts_by_simulations") or {})
+                sims_entry = by_sims.get(int(simulations)) or by_sims.get(str(int(simulations)))
+                if isinstance(sims_entry, dict) and _safe_float(sims_entry.get("elo")) is not None:
+                    initial_elo = _safe_float(sims_entry.get("elo"))
+            if _safe_float(initial_elo) is not None:
+                mode_elo_cfg["adaptive_initial_elo"] = float(initial_elo)
+                mode_elo_cfg["adaptive_initial_elo_source"] = (
+                    f"{model_path.name} stored {mode_label_text}"
+                )
 
             result = run_elo_check(model, config, device, mode_elo_cfg)
             if result.get("cancelled"):
@@ -797,8 +878,8 @@ def main():
             persist_estimated_elo(
                 model_path,
                 elo,
-                levels=levels,
-                games_per_level=games_per_level,
+                levels=list(result.get("levels_requested", []) or []),
+                games_per_level=int(result.get("games_per_level_requested", 0) or 0),
                 use_mcts=mode_use_mcts,
                 simulations=simulations,
                 sf_time=sf_time,

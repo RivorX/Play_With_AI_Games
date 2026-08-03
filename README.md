@@ -32,21 +32,19 @@ Każdy projekt zawiera własne instrukcje uruchomieniowe i opis konfiguracji.
 
 ## Wymagania
 
-- Python 3.10+
+- Python 3.13
 - pip
-- (opcjonalnie) środowisko wirtualne, np. `venv`
+- środowisko wirtualne, np. `venv`
 
 ## Szybka instalacja
 
 Przykład (Windows PowerShell):
 
 ```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
+python -m venv venv    /    py -3.13 -m venv venv
+venv\Scripts\activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-# Jeśli potrzebujesz konkretnej wersji torch (dostosuj do swojej konfiguracji GPU/CPU):
-pip uninstall torch
-pip install torch>=2.7 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 Szczegóły dotyczące uruchamiania i konfiguracji znajdziesz w README odpowiedniego podprojektu.

@@ -5,11 +5,14 @@ Download local Syzygy WDL tablebases into chess/data/... using config defaults.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-import yaml
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils.shared.syzygy_manager import (
+from src.config import load_project_config
+
+from src.common.syzygy import (
     describe_syzygy_status,
     ensure_syzygy_tables,
     get_project_chess_dir,
@@ -17,9 +20,7 @@ from utils.shared.syzygy_manager import (
 
 
 def _load_config(chess_dir: Path) -> dict:
-    config_path = chess_dir / "config" / "config.yaml"
-    with open(config_path, "r", encoding="utf-8") as file_obj:
-        return yaml.safe_load(file_obj) or {}
+    return load_project_config()
 
 
 def main() -> None:
@@ -31,7 +32,7 @@ def main() -> None:
         "--preset",
         choices=("wdl_345", "wdl_345_6"),
         default=None,
-        help="Preset to download. Default comes from config.yaml.",
+        help="Preset to download. Default comes from config/default.yaml.",
     )
     parser.add_argument(
         "--force",
