@@ -1,484 +1,163 @@
-﻿# Chess AI
+# Chess AI — CNN, Gumbel MCTS i self-play
 
-Silnik szachowy oparty na deep learning (CNN) i MCTS, inspirowany AlphaZero.
+Silnik szachowy inspirowany AlphaZero. Model uczy się najpierw z partii mistrzowskich (**Imitation Learning, IL**), a później poprawia przez **Reinforcement Learning, RL**: self-play, Gumbel MCTS, replay i kontrolowaną promocję najlepszego checkpointu.
 
-## Etapy treningu
-
-1. **IL** (Imitation Learning) - nauka z partii mistrzowskich (PGN)
-2. **RL** (Reinforcement Learning) - samogra z MCTS i self-play
-3. **Evaluation** - pomiar siły gry (Elo vs Stockfish)
-
-## Funkcjonalności
-
-### Model
-- **Policy head**: AZ-like classic chess (`8x8x73`)
-- **Value head**: WDL classification (Win/Draw/Loss)
-- **POV**: wszystkie pozycje z perspektywy gracza na ruchu
-- **Historia**: `history_positions` pozycji wstecz (sliding window)
-- **Metadane szachowe**: castling, en passant, halfmove, fullmove
-- **Promocje**: przestrzeń akcji AlphaZero (`ACTION_SIZE = 4672`)
-
-### Trening
-- **SWA** (Stochastic Weight Averaging): uśrednianie wag od epoch 15
-- **Elo tracking**: asynchroniczna ewaluacja podczas IL
-- **Mixed precision**: AMP (float16/bfloat16)
-- **Resume/Transfer**: menu startowe z kompatybilnością checkpointów
-
-### Gra
-- **GUI**: pygame interface (Human vs AI, AI vs AI, Human vs Human)
-- **MCTS**: opcjonalny (toggle klawiszem `M` w GUI)
-- **UCI**: adapter do silników szachowych
-
-## Architektura modelu
-
-Aktualna architektura `se_cnn_v9` znajduje sie w
-`chess/src/models/architecture/se_cnn_v9.py`. Rejestr w
-`src/models/registry.py`
-pozwala dodac np. transformer bez zmiany loaderow IL, RL, play i Elo.
-
-Checkpoint zapisuje `model_spec`: identyfikator architektury, argumenty modelu,
-enkoder wejscia oraz codec policy. Numer runu/checkpointu nie jest wersja
-architektury.
-
-`se_cnn_v9` to pre-activation ResNet z:
-- wejscie: `16 * (1 + history_positions)` kanalow
-- trunk: bloki residualne
-- policy head: `1x1 conv + BN + FC` (AZ-like, `8x8x73`)
-- value head: 3 klasy WDL
-
-Opcjonalne elementy (zaleznie od profilu modelu):
-- `SEBlock` (Squeeze-and-Excitation)
-- `CoordConv2d`
-- `LayerScale`
-- `Stochastic Depth`
-
-## Struktura katalogow
-
-```text
-chess/
-|- config/
-|  |- default.yaml            # trening, hardware i central inference
-|  |- data.yaml               # sciezki i pipeline danych
-|  |- evaluation.yaml         # play, logging i estymacja Elo
-|  `- models/
-|     `- se_cnn_v9.yaml       # profil architektury
-|- data/                     # PGN + preprocessing cache
-|- engines/                  # Stockfish cache (auto-download)
-|- logs/                     # CSV i PNG z treningu
-|- models/
-|  |- best_model_il.pt
-|  |- best_model_rl.pt
-|  |- IL/                    # checkpointy IL
-|  |- RL/                    # checkpointy RL
-|- scripts/
-|  |- train_il.py
-|  |- train_rl.py
-|  |- eval_elo.py
-|  |- download_nikonoel_pgns.py
-|  |- play.py
-|  `- debug/                  # uruchamialne benchmarki i diagnostyka
-|- src/
-   |- model.py                # publiczne API modeli/checkpointow
-   |- models/
-   |  |- architecture/
-   |  `- data/se_cnn_v9/     # encoder, policy, dataset i preprocessing
-   |- training/
-   |  |- il/
-   |  `- rl/
-   |- evaluation/
-   |- game/
-   |  `- backend.py            # natywny kontrakt bulletchess
-   |- inference/
-   |  `- central.py            # wspolny klient/serwer GPU
-   |- mcts/
-   |  |- search.py             # drzewo i batched Gumbel MCTS
-   |  |- single_game.py        # adapter Play/UCI/Elo
-   |  |- native.py             # binding do C++
-   |  `- cpp/mcts_kernels.cpp
-   |- selfplay/
-   |  |- engine.py             # przebieg gier i targety replay
-   |  `- workers.py            # multiprocessing i streaming
-   |- common/
-   `- ui/
-```
+Projekt zawiera gotowe GUI Pygame, adapter UCI, narzędzia do treningu i ewaluacji Elo oraz trzy osobne dashboardy RL: wynik/promotion, jakość danych i wydajność.
 
 ## Szybki start
 
-Uruchamiaj z root repo (`Play_With_AI_Games`):
+Po instalacji zależności zgodnie z [głównym README](../README.md), komendy uruchamiaj z głównego katalogu repozytorium.
 
-```bash
-pip install -r requirements.txt
-python chess/scripts/download_nikonoel_pgns.py
-python chess/scripts/train_il.py
-python chess/scripts/train_rl.py
-python chess/scripts/play.py
+```powershell
+# Pobranie partii PGN do chess/data/
+python .\chess\scripts\download_nikonoel_pgns.py
+
+# Trening nadzorowany z PGN
+python .\chess\scripts\train_il.py
+
+# Syzygy WDL dla końcówek 3–5 bierek używane przez self-play RL
+python .\chess\scripts\download_syzygy.py --preset wdl_345
+
+# Self-play i trening RL od checkpointu IL
+python .\chess\scripts\train_rl.py
 ```
 
-## Pobieranie PGN
+## Gra w GUI
 
-Datasety z `https://database.nikonoel.fr` mozna listowac i pobierac skryptem:
-
-```bash
-python chess/scripts/download_nikonoel_pgns.py
+```powershell
+# Otwiera konfigurator Play
+python .\chess\scripts\play.py
 ```
 
-- bez argumentow skrypt przechodzi w tryb interaktywny i pyta, co pokazac / pobrac
-- rozpakowane pliki `.pgn` trafiaja zawsze do `chess/data`
-- archiwa tymczasowe sa trzymane pod `chess/data/_archives/nikonoel`
-- w `config/data.yaml` `data.phase_1_binary.max_games` moze byc liczba albo
-  `"max"` dla calego PGN
+Konfigurator Play pozwala wybrać Human vs AI, AI vs AI lub Human vs Human, kolory i checkpointy. Dla każdej strony AI ustawia się tam użycie MCTS oraz jego budżet, więc nie trzeba zmieniać tego ręcznie flagą CLI.
 
-## IL (Imitation Learning)
+W trybie AI vs AI można ustawić liczbę partii — użyj większego meczu zamiast pojedynczej gry, gdy chcesz obiektywnie porównać dwa checkpointy. W czasie gry `Spacja` pauzuje/wznawia AI vs AI, `R` rozpoczyna nową partię, a `U` cofa ruch. Partie są zapisywane jako PGN w `chess/games/`.
 
-### Start
+### Nagranie demo AI vs AI
 
-```bash
-python chess/scripts/train_il.py
+```powershell
+python .\chess\scripts\utils\record_play_demo.py
 ```
 
-### Workflow
+Skrypt uruchamia `play.py` i nagrywa całe okno. W konfiguracji wybierz **AI vs AI**, modele i **Start Game**; po wyjściu z Play zapisze GIF jako `chess/docs/play-ai-vs-ai.gif`. Domyślnie nagrywa w 6 FPS i maksymalnej szerokości 960 px; dla lepszej jakości użyj `--fps 10 --max-width 1280`.
 
-1. **Menu startowe** (jeśli istnieją checkpointy):
-   ```
-   ━━━ IL STARTUP MENU ━━━
-   
-   [1] New training from scratch
-   [2] Resume full state (optimizer + scheduler + scaler)
-   [3] Transfer matching weights only
-   
-   Select option [1-3]:
-   ```
+Pozostałe wejścia:
 
-2. **Lista checkpointów** (dla resume/transfer):
-   ```
-   ID  Epoch  Top1     Val Loss  Compat  Size    Path
-   ─────────────────────────────────────────────────────
-   1   ep 20  67.84%   0.8234   100.0%   45.2MB  v5.1_epoch_20.pt
-   2   ep 15  65.12%   0.8891    98.7%   45.1MB  v5.0_epoch_15.pt
-   3   ep 10  62.45%   0.9123    85.3%   38.4MB  v4.9_epoch_10.pt
-   ```
-   - **Compat**: % kompatybilności architektury (matching tensors)
-   - Resume wymaga 100% (strict load), transfer działa z <100%
-
-3. **Resume mode**:
-### Start
-
-```bash
-python chess/scripts/train_rl.py
+```powershell
+python .\chess\scripts\eval_elo.py       # ocena checkpointów vs Stockfish
+python .\chess\scripts\list_models.py    # checkpointy i metadane
+python .\chess\scripts\uci_engine.py     # adapter UCI
 ```
 
-### Workflow
+## Jak działa model
 
-1. **Inicjalizacja**:
-   - Ładuje `best_model_il.pt` (jeśli istnieje)
-   - Menu startowe: new/resume/transfer (jak w IL)
+Aktualna architektura to `se_cnn_v9`: pre-activation ResNet z blokami residualnymi, opcjonalnymi elementami SE/CoordConv/LayerScale/Stochastic Depth oraz trzema głowami:
 
-2. **Self-play** (parallel MCTS):
-   ```
-   🎯 Parallel MCTS Self-Play:
-      Self-play device: cuda
-      Workers: 4
-      Games per worker: 25, 25, 25, 25 (balanced)
-      Total games: 100
-      MCTS simulations: 200
-   
-   ✅ MCTS Self-play completed:
-      Positions: 4,832
-      Games: 100
-      Self-play time: 45.3s
-      Speed: 106.7 positions/s
-      Avg game length: 48.3 moves
-   ```
+- **policy** — głowa konwolucyjna tworzy `73 × 8 × 8 = 4672` logitów ruchów; stała mapa odrzuca niewykorzystywane pola i zwraca kompaktowy codec LC0 `lc0_1858_v1` z `1858` indeksami ruchów,
+- **value** — klasyfikacja WDL: wygrana/remis/przegrana,
+- **moves left** — lekka głowa pomocnicza przewidująca liczbę pozostałych półruchów.
 
-3. **Training loop**:
-   - Batch sampling z **replay buffer**
-   - Policy target: MCTS visit distribution (nie legal moves!)
-   - Value target: końcowy wynik partii (główny WDL) + pomocnicza lokalna ocena `root_q`
-   - Value error focus: do 25% największych bieżących błędów `|value-root_q|`
-     dostaje maksymalnie `1.5x` względnej wagi (bez duplikowania próbek)
-   - Jednolity sampling z krótkiego FIFO replayu
+Wejście zawiera bieżącą pozycję, historię pozycji oraz metadane szachowe (m.in. roszady i en passant). Checkpoint przechowuje `model_spec`, więc loader zna architekturę, encoder i codec polityki niezależnie od nazwy runu.
 
-4. **Evaluation**:
-   - Co `eval_every` iteracji: AI vs Best Model
-   - Win rate > threshold → promote current to best
-   - Zapis: `best_model_rl.pt`
+## Dwa etapy uczenia
 
-5. **Fixed MCTS sampling**:
-   - Stała temperatura do `mcts_temperature_threshold` plies
-   - Deterministyczny wybór później
+| Etap | Źródło danych | Cel |
+| --- | --- | --- |
+| **IL** | Partie PGN graczy o wysokim Elo | Nauczyć politykę legalnych, ludzkich ruchów i ocenę WDL. |
+| **RL** | Partie self-play z Gumbel MCTS | Destylować poprawki wyszukiwania do sieci i poprawiać grę względem poprzedniego najlepszego modelu. |
 
-### Replay Buffer
+### IL — Imitation Learning
 
-- **Capacity**: `run.games_per_iteration * replay.buffer_multiplier`
-- **FIFO**: stare pozycje wypierane przez nowe
-- **Uniform sampling**: każda pozycja w aktywnym FIFO ma równą szansę
-- **Error-focused value loss**: sampling pozostaje równomierny, ale trudne
-  pozycje z wiarygodnym `root_q` otrzymują umiarkowanie większą wagę value
-- **Difficulty-aware MCTS**: trudność pozycji łączy niepewność policy, względną
-  różnicę dwóch najlepszych ruchów, branching i niepewność value. Najłatwiejsze
-  pozycje dostają 64 symulacje, najtrudniejsze do 320, a średnia grupy pozostaje
-  dokładnie równa `search.simulations`; każdy root uczy policy
-- **Shared tree + tree reuse**: w zwykłym learner-snapshot self-play obie strony
-  używają jednego drzewa. Po ruchu odwiedzony podwęzeł zostaje nowym rootem,
-  a niepotrzebni przodkowie i rodzeństwo są od razu zwalniani. Partie dwóch
-  różnych checkpointów zachowują osobne drzewa, aby nie mieszać ich priorytetów
-  ani ocen pozycji
+`train_il.py` buduje dane binarne i cache z PGN, a potem trenuje model w mixed precision. Najlepszy checkpoint jest wybierany przez monitor walidacyjny; SWA tworzy dodatkowy, uśredniony checkpoint. Ustawienia treningu są w `chess/config/default.yaml`, a przygotowanie danych w `chess/config/data.yaml`.
 
-### Checkpointy
+Najważniejsze artefakty:
 
-- Po każdej iteracji: najnowszy stan ze stanem optymalizatora w `models/RL/*_latest.pt`
-- Po promocji: `best_model_rl.pt` oraz wersjonowany `models/RL/*_best.pt`
+- `chess/models/best_model_il.pt` — najlepszy checkpoint IL,
+- `chess/models/IL/` — checkpointy etapowe i stany do resume,
+- `chess/logs/csv/il_training_*.csv` — pełne metryki,
+- `chess/logs/il_training_*.png` — wykres generowany po treningu.
 
-### Start
+### RL — Reinforcement Learning
 
-```bash
-python chess/scripts/eval_elo.py
+`train_rl.py` generuje partie jednym zamrożonym snapshotem learnera dla obu stron. Każda pozycja dostaje target polityki z pełnego Gumbel MCTS i wynik WDL; dane trafiają do FIFO replayu. Co pewien czas learner rozgrywa sparingi z najlepszym checkpointem, a promotion wymaga przejścia bramek jakości i bezpieczeństwa.
+
+Stockfish nie jest uczestnikiem treningu: służy wyłącznie do niezależnego raportowania Elo. Self-play, targety i promotion pozostają całkowicie wewnętrzne dla modelu i MCTS.
+
+Najważniejsze artefakty:
+
+- `chess/models/best_model_rl.pt` — aktualnie promowany model RL,
+- `chess/models/RL/` — latest/best checkpointy i stan wznowienia,
+- `chess/logs/csv/RL_*.csv` — główne metryki treningu,
+- `chess/logs/csv/*_data_quality.csv` — replay, targety i zachowanie MCTS,
+- `chess/logs/csv/*_performance.csv` — throughput, czasy i batching.
+
+## Statystyki treningu
+
+Poniższe obrazy są zapisanymi artefaktami konkretnych zakończonych runów, przeniesionymi z ignorowanego `chess/logs/` do wersjonowanego `chess/docs/training/`. To przykład monitoringu, a nie porównanie A/B ani ogólna deklaracja siły silnika.
+
+### IL — v9.9b
+
+Run obejmuje 42 epoki modelu o 3.13 mln parametrów i 8 blokach. Najlepszy punkt walidacyjny miał `val loss = 2.0950`, `policy top-1 = 65.31%` i `value MAE = 0.3084`; dashboard raportuje także MCTS Elo `2015` dla najlepszego checkpointu.
+
+![IL training progress](docs/training/il-v9.9b.png)
+
+### RL — rl62
+
+Run RL62 startował od nowego treningu, z docelowym budżetem 192 symulacji MCTS na pozycję i adaptacyjnym zakresem 64–320. Trzy wykresy rozdzielają decyzje o promotion, zdrowie danych oraz koszt generowania self-play.
+
+#### Wynik, promotion i uczenie
+
+Pokazuje mecze learnera z promoted best i niezmiennym anchorem IL, estymacje Elo, udział czasu etapów oraz trendy policy/value.
+
+![RL overview](docs/training/rl62-overview.png)
+
+#### Jakość replayu i MCTS
+
+Pokazuje dopływ i rotację replayu, balans wyników, targety policy, absorpcję poprawek MCTS oraz to, jak często MCTS zmienia ruch sieci.
+
+![RL data quality](docs/training/rl62-data-quality.png)
+
+#### Wydajność
+
+Pokazuje throughput self-play, czas etapów iteracji, skład opóźnienia central inference oraz udział oczekiwania workerów na sieć.
+
+![RL performance](docs/training/rl62-performance.png)
+
+### Jak czytać dashboardy RL
+
+- **Learner vs best / IL anchor** — wynik sparingów i dolna granica ufności. Promotion jest decyzją opartą na kilku bramkach, a nie na samym lossie.
+- **MCTS changed top / useful change** — jak często wyszukiwanie zmienia ruch polityki oraz ile z tych zmian ma lepszą ocenę Q.
+- **Replay i policy target shape** — czy replay pozostaje świeży i zróżnicowany, a targety MCTS zachowują sensowną ostrość.
+- **positions/s i completed MCTS visits/s** — przepustowość generowania danych; latency central inference pomaga odróżnić problem GPU, kolejkowania lub workerów.
+
+## Konfiguracja i katalogi
+
+```text
+chess/
+├── config/
+│   ├── default.yaml          # IL, RL, MCTS, hardware i central inference
+│   ├── data.yaml             # PGN, preprocessing, cache i sampling
+│   ├── evaluation.yaml       # play, logging i Elo
+│   └── models/se_cnn_v9.yaml # profil architektury
+├── data/                     # PGN i cache przygotowania danych
+├── docs/training/            # wersjonowane wykresy IL/RL z README
+├── models/                   # best checkpointy oraz IL/ i RL/
+├── scripts/                  # entry pointy CLI
+├── src/
+│   ├── models/               # architektura, encoder i dane
+│   ├── training/             # pętle IL i RL
+│   ├── mcts/                 # Gumbel MCTS i binding natywny
+│   ├── selfplay/             # generowanie partii i workery
+│   ├── inference/            # centralny serwer GPU
+│   ├── evaluation/           # mecze i Elo
+│   └── ui/                   # GUI Pygame
+└── logs/                     # bieżące CSV/PNG, ignorowane przez Git
 ```
 
-**Brak argumentów CLI** - wszystko przez interaktywne menu.
+`load_project_config()` scala trzy pliki konfiguracji projektu. Do pojedynczego eksperymentu można podać dodatkowy YAML jako override bez kopiowania pełnej konfiguracji.
 
-### Workflow
+## Dane i cache
 
-1. **Wybór modeli**:
-   ```
-   ━━━ Model Selection ━━━
-   
-   Select model scope:
-   [1] Best model only (best_model_il.pt + SWA)
-   [2] Choose model IDs (custom selection)
-   [3] All listed models
-   
-   Narzędzia
+Skrypt pobierający PGN zapisuje rozpakowane partie w `chess/data/`; archiwa tymczasowe są w `chess/data/_archives/nikonoel/`. `data.yaml` dzieli ustawienia według kosztu zmiany: część parametrów przebudowuje binarny dataset, część tylko indeksy/cache, a sampling epoki może zmieniać się bez pełnego preprocessingu.
 
-### List Models
-
-```bash
-python chess/scripts/list_models.py
-```
-
-Wyświetla wszystkie checkpointy z metadanymi:
-
-```
-═══════════════════════════════════════════════════════════════════════════
-Model Checkpoints
-═══════════════════════════════════════════════════════════════════════════
- ID  Folder  Version  Epoch   Top1      ValLoss    PolLoss      Elo   SWA  Opt   SizeMB  Updated           Checkpoint
----- ------- -------- ------ -------- ---------- ---------- -------- ---- ---- ------- ----------------- ---------
--- root --
-  1  root    v5.1        20   67.84%     0.8234     0.6123     1847   no   yes   45.2  2026-02-17 14:23  best_model_il.pt
-  2  root    v5.1        20   68.12%     0.8156     0.6089     1923   yes  yes   45.3  2026-02-17 14:30  best_model_il_swa.pt
--- IL --
-  3  IL      v5.1        20   67.84%     0.8234     0.6123     1847   no   yes   45.2  2026-02-17 14:23  v5.1_epoch_20.pt
-  4  IL      v5.1        15   65.12%     0.8891     0.6445     1756   no   yes   45.1  2026-02-17 12:45  v5.1_epoch_15.pt
-  5  IL      v5.0        15   62.89%     0.9234     0.6789     1689   no   yes   45.0  2026-02-12 18:34  v5.0_epoch_15.pt
--- RL --
-  6  RL      v5.1       143   69.34%     0.7845     0.5923     2034   no   yes   45.4  2026-02-16 22:11  rl_iter_0143.pt
-───────────────────────────────────────────────────────────────────────────
-Total: 6 | Valid: 6 | With Elo: 6 | With optimizer: 6 | SWA-tagged: 1
-═══════════════════════════════════════════════════════════════════════════
-```
-
-**Kolumny**:
-- **Compat**: % kompatybilności z obecną architekturą
-- **SWA**: czy checkpoint powstał z SWA finalization
-- **Opt**: czy zawiera optimizer state (resume vs transfer)
-- **Elo**: estimated Elo (jeśli był mierzony)
-
-### GUI
-
-```bash
-python chess/scripts/play.py
-```
-
-**Tryby gry**:
-- Human vs AI
-- AI vs AI
-- Human vs Human
-
-**Klawisze**:
-- `M` - toggle MCTS (network-only ↔ MCTS)
-- `R` - restart game
-- `U` - cofnij ruch
-
-**Flagi**:
-- `--no-mcts` - uruchom bez MCTS (tylko raw network)
-
-**Autosave**:
-- Zapisuje gry do `chess/games/*.pgn`
-- PGN z metadanymi (model, Elo, MCTS settings)
-
-### UCI Adapter
-
-### Struktura
-
-```
-chess/logs/
-├── il_training_v5.1_20260217_143025.csv    # Metryki IL
-├── il_training_v5.1_20260217_143025.png    # Wykresy IL
-├── elo_comparison_20260217_153045.csv      # Wyniki Elo
-└── debug/
-    └── training_profile_*.txt              # Profile (jeśli debug=True)
-
-chess/models/
-├── best_model_il.pt                        # Najlepszy IL
-├── best_model_il_swa.pt                    # Najlepszy IL SWA
-├── best_model_rl.pt                        # Najlepszy RL
-├── IL/
-│   ├── v5.1_epoch_05.pt
-│   ├── v5.1_epoch_10.pt
-│   ├── v5.1_epoch_10_swa.pt                # SWA snapshot
-│   └── v5.1_epoch_15.pt
-└── RL/
-    ├── rl_iter_0100.pt
-    └── rl_iter_0200.pt
-```
-
-### CSV Format (IL)
-
-```csv
-epoch,train_loss,val_loss,train_policy,val_policy,train_top1,val_top1,val_mae,lr,estimated_elo
-1,2.3456,2.4567,1.8234,1.8923,0.4523,0.4312,0.3456,0.001,
-5,1.2345,1.3456,0.9123,0.9456,0.6234,0.6123,0.2345,0.0009,1623
-10,0.9876,1.0234,0.7234,0.7456,0.6789,0.6623,0.1987,0.0007,1745
-```
-
-### Przerwanie (`Ctrl+C`)
-
-- **Graceful shutdown**: finalizacja SWA, zapis ostatniego checkpointu
-- **Cleanup**: usuwa incomplete CSV (jeśli PNG nie powstał)
-- **Resume**: możliwe od ostatniego zapisanego epocha
-   ```
-
-### Format wyniku
-
-```
-Model                    Elo  ±Conf  vs1320  vs1500  vs1700  vs1900  vs2200
-─────────────────────────────────────────────────────────────────────────────
-v5.1_epoch_20.pt        1847   ±45   6/6     6/6     5/6     3/6     1/6
-v5.1_epoch_20_swa.pt    1923   ±38   6/6     6/6     6/6     4/6     2/6
-best_model_il.pt        1805   ±52   6/6     6/6     4/6     2/6     1/6
-```
-
-### Automatyczna aktualizacja checkpointu
-
-- Zapisuje `estimated_elo` do pliku `.pt`
-- Widoczne w `list_models.py` i IL resume menuhutdown
-- Finalizacja SWA (jeśli zebrane dane)
-- Cleanup incomplete logs
-
-## RL (Reinforcement Learning)
-
-Start:
-
-```bash
-python chess/scripts/train_rl.py
-```
-
-Najwazniejsze zachowania:
-- RL startuje od `best_model_il.pt` (jesli plik istnieje)
-- Samogra przez `src/selfplay` + `src/mcts`, zawsze bez zewnętrznego silnika
-- Każda iteracja zamraża aktualnego learnera na czas self-play; zaakceptowany
-  best pozostaje punktem odniesienia i przejmuje self-play tylko podczas
-  bootstrapu archiwum championa albo po zadziałaniu guardu bezpieczeństwa
-- Replay łączy świeże dane learnera z przypiętym archiwum ostatniego championa
-- Stałe parametry MCTS oraz LR schedule
-- Eval vs best model co `eval_every`
-- Zapisy:
-  - `best_model_rl.pt`
-  - `models/RL/*_latest.pt` po każdej iteracji
-
-Stockfish jest wyłącznie niezależnym estymatorem Elo. Nigdy nie jest
-przeciwnikiem self-play i nie dostarcza replayu, ruchów nauczyciela ani targetów.
-
-### Logi RL (`schema_version=12`)
-
-- główny CSV: uczenie, eval, lower bound promocji, anchor i Elo,
-- `*_data_quality.csv`: replay, champion reservoir, targety i zachowanie MCTS,
-- `*_performance.csv`: throughput, czasy etapów, batching, latency i bottleneck.
-
-Metryka ma jednego właściciela: eval nie jest kopiowany do data-quality, a czasy
-profilera nie trafiają do głównego CSV. Schematy są zdefiniowane w
-`src/training/rl/log_schema.py`.
-
-## Ewaluacja Elo
-
-Start:
-
-```bash
-python chess/scripts/eval_elo.py
-```
-
-Przy recznym uruchomieniu skrypt pyta, czy test ma byc:
-- raw network
-- MCTS
-
-Przydatne flagi:
-- `--model` (wspiera wildcard)
-- `--quick`
-- `--mcts` / `--no-mcts`
-- `--simulations`
-- `--levels`
-- `--games`
-- `--output`
-
-## GUI i UCI
-
-GUI:
-
-```bash
-python chess/scripts/play.py
-```
-
-- obsluga Human vs AI / AI vs AI / Human vs Human
-- mozliwosc gry z lub bez MCTS (`--no-mcts`)
-- podczas Human vs AI mozna przelaczyc tryb klawiszem `M`
-
-UCI adapter:
-
-```bash
-python chess/scripts/uci_engine.py
-```
-
-## Logi i checkpointy
-
-`chess/logs/`:
-- `*.csv` metryki treningu
-- `*.png` wykresy treningu
-
-`chess/models/`:
-- best modele (`best_model_il.pt`, `best_model_rl.pt`)
-- checkpointy etapowe (`models/IL`, `models/RL`)
-
-Przerwanie treningu (`Ctrl+C`):
-- IL i RL koncza sie graceful
-- jesli dla danego runu nie powstal jeszcze PNG, tymczasowy CSV moze zostac usuniety
-
-## Dane
-
-PGN wrzuc do:
-- `chess/data/`
-
-Projekt byl przygotowywany pod zbiory typu Lichess Elite (wysokie Elo).
-Filtry jak `min_elo`, sampling i deduplikacje ustawiasz w
-`chess/config/data.yaml`.
-
-## Konfiguracja
-
-Ustawienia sa podzielone wedlug odpowiedzialnosci:
-
-- `config/default.yaml`: czesto strojone ustawienia IL, RL, hardware i inference
-- `config/data.yaml`: sciezki oraz wszystkie fazy przygotowania danych
-- `config/evaluation.yaml`: play, logging i wspolna estymacja Elo
-- `config/models/se_cnn_v9.yaml`: struktura modelu i kontrakt danych
-
-`load_project_config()` automatycznie scala wszystkie trzy pliki projektu.
-Opcjonalny `config_path` jest nakladany na nie jako jednorazowy override, wiec
-nie trzeba kopiowac calej konfiguracji do pliku eksperymentu.
-
-Zmiana pliku nie zmienia zasad cache: komentarze faz w `data.yaml` nadal
-okreslaja, czy dana wartosc przebudowuje binary, indeks, soft-target cache, czy
-tylko sampling epoki.
-
-Loader: `src.config.load_project_config()`. Aby dodac architekture, dodaj modul
-w `src/models/architecture`, dane w `src/models/data/<architecture_id>`, wpis
-w `MODEL_REGISTRY` i odpowiadajacy profil YAML.
+Cache kompilacji i natywnego MCTS trafia do `chess/.cache/` i jest ignorowany przez Git.
