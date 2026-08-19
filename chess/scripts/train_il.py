@@ -541,6 +541,18 @@ def _run_il_final_elo(
         )
         mode_label = f"MCTS {simulations} sims" if use_mcts else "raw NN"
         print(f"Final IL Estimated Elo ({model_label}, {mode_label}): {int(round(float(estimated_elo)))}")
+        if elo_result.get("local_rating_level") is not None:
+            print(
+                f"  local calibration: SF {elo_result['local_rating_level']} "
+                f"({int(elo_result.get('local_rating_games', 0) or 0)} games nearest 50%)"
+            )
+        rating_bracket = elo_result.get("rating_bracket")
+        if elo_result.get("rating_bracketed") and isinstance(rating_bracket, list):
+            print(f"  rating bracket: SF {rating_bracket[0]}-{rating_bracket[1]} (crosses 50% score)")
+        elif elo_result.get("rating_censored"):
+            bound = elo_result.get("elo_lower_bound", elo_result.get("elo_upper_bound"))
+            relation = ">" if elo_result.get("elo_lower_bound") is not None else "<"
+            print(f"  warning: rating is range-censored ({relation}{bound}); no 50% Stockfish bracket")
         if elo_result.get("elo_std_error") is not None:
             ci = elo_result.get("elo_ci95")
             ci_str = f", 95% CI {ci[0]}-{ci[1]}" if isinstance(ci, list) and len(ci) == 2 else ""

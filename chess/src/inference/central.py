@@ -163,7 +163,6 @@ class RemoteInferenceClient:
         self.last_transport_shared = False
         transport_dtype = str(transport_dtype or "float16").lower()
         self.transport_dtype = "float32" if transport_dtype in {"float32", "fp32"} else "float16"
-        self._transport_torch_dtype = torch.float32 if self.transport_dtype == "float32" else torch.float16
         self._transport_np_dtype = np.float32 if self.transport_dtype == "float32" else np.float16
         self.shared_buffer = shared_buffer
         self._shared_arrays = None
@@ -1543,9 +1542,13 @@ def central_inference_server(
                     try:
                         if use_amp and device.type == 'cuda':
                             with torch.autocast(device_type='cuda', dtype=central_amp_dtype):
-                                policy_logits, value_logits = model(tensor, apply_log_softmax=False)
+                                policy_logits, value_logits = model(
+                                    tensor, apply_log_softmax=False
+                                )
                         else:
-                            policy_logits, value_logits = model(tensor, apply_log_softmax=False)
+                            policy_logits, value_logits = model(
+                                tensor, apply_log_softmax=False
+                            )
                     except Exception as exc:
                         eager_model = compiled_base_models.get(model_label)
                         if eager_model is None or eager_model is model:
@@ -1568,9 +1571,13 @@ def central_inference_server(
                         model = eager_model
                         if use_amp and device.type == 'cuda':
                             with torch.autocast(device_type='cuda', dtype=central_amp_dtype):
-                                policy_logits, value_logits = model(tensor, apply_log_softmax=False)
+                                policy_logits, value_logits = eager_model(
+                                    tensor, apply_log_softmax=False
+                                )
                         else:
-                            policy_logits, value_logits = model(tensor, apply_log_softmax=False)
+                            policy_logits, value_logits = eager_model(
+                                tensor, apply_log_softmax=False
+                            )
                     if int(policy_logits.shape[0]) != actual_batch_size:
                         policy_logits = policy_logits[:actual_batch_size]
                         value_logits = value_logits[:actual_batch_size]

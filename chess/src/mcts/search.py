@@ -22,6 +22,7 @@ from src.common.syzygy import resolve_syzygy_paths, syzygy_piece_counts
 from src.game import backend as chess
 from src.common.torch_cache import configure_torch_compile_cache, torch_compile_cache_paths
 from src.models.data.se_cnn_v9.helpers import (
+    ACTION_SIZE,
     MAX_LEGAL_MOVES,
     _move_to_index_cached,
     board_to_tensor,
@@ -29,7 +30,6 @@ from src.models.data.se_cnn_v9.helpers import (
     move_to_index,
 )
 from src.mcts.native import get_native_mcts
-from src.mcts.q_delta import USEFUL_SEARCH_Q_DELTA_MIN as _POLICY_CORRECTION_Q_DELTA_MIN
 from src.mcts.result import SearchResult
 
 
@@ -66,13 +66,11 @@ _REPLAY_SOURCE_UNKNOWN = 0
 _REPLAY_SOURCE_LEARNER = 1
 _REPLAY_SOURCE_FROZEN_BEST = 2
 
-# Gumbel search is the policy-improvement operator. Inside each complete target,
-# give a modest extra weight only when search changes the best's top
-# move and both visited moves show a positive Q delta.  This focuses limited
-# policy capacity on actual improvements without discarding agreement rows or
-# letting a noisy Q estimate dominate the objective.
-_POLICY_UPTAKE_LOW_THRESHOLD = 0.75
-_POLICY_CORRECTION_WEIGHT_MULTIPLIER = 2.00
+# Gumbel search is the policy-improvement operator. Target confidence controls
+# the regular policy CE weight, while useful top-move changes are handled by the
+# separate bounded rank objective. Do not boost the same correction again here:
+# doing so stacks with policy-surprise sampling and lets a minority of rows own
+# most of the policy gradient.
 _DYNAMIC_BUDGET_MARGINAL_PENALTY = 0.35
 _DYNAMIC_BUDGET_TARGET_CHUNKS = 12
 _TREE_REUSE_MIN_FRESH_SIMULATIONS = 64
@@ -489,47 +487,8 @@ def _replay_source_code(learner_turn, game_opponent_mcts, opponent_label):
     return _REPLAY_SOURCE_UNKNOWN
 
 
-def _policy_uptake_weight(
-    search_metadata,
-    *,
-    good_target_min_top_visit_prob=0.55,
-    good_target_min_visit_gap=0.12,
-):
-    """Weight full-search policy targets by their decision confidence.
-
-    A complete but nearly tied Gumbel target remains useful, so it keeps a 35%
-    floor. Targets whose top probability and winner margin both reach the
-    established good-target thresholds receive full weight. This stops a
-    growing population of diffuse roots from dominating policy CE while every
-    searched root keeps outcome-value supervision.
-    """
-    metadata = search_metadata if isinstance(search_metadata, dict) else {}
-    try:
-        completeness = float(metadata.get('policy_weight', 1.0) or 0.0)
-    except (TypeError, ValueError):
-        completeness = 1.0
-    completeness = max(0.0, min(1.0, completeness))
-    try:
-        top_probability = float(metadata.get("top_visit_prob", float("nan")))
-        visit_gap = float(metadata.get("visit_gap", float("nan")))
-    except (TypeError, ValueError):
-        return completeness
-    if not math.isfinite(top_probability) or not math.isfinite(visit_gap):
-        return completeness
-
-    top_threshold = max(1e-6, float(good_target_min_top_visit_prob))
-    gap_threshold = max(1e-6, float(good_target_min_visit_gap))
-    confidence = min(
-        max(0.0, min(1.0, top_probability / top_threshold)),
-        max(0.0, min(1.0, visit_gap / gap_threshold)),
-    )
-    confidence = confidence * confidence * (3.0 - 2.0 * confidence)
-    quality_weight = 0.35 + 0.65 * confidence
-    return completeness * quality_weight
-
-
 def _search_correction_metadata(search_metadata):
-    """Return persisted correction flag, Q delta and bounded policy weight."""
+    """Return the persisted top-change flag and measured Q delta."""
     metadata = search_metadata if isinstance(search_metadata, dict) else {}
     try:
         changed_top = float(metadata.get('prior_mcts_agree', 1.0) or 0.0) < 0.5
@@ -539,13 +498,7 @@ def _search_correction_metadata(search_metadata):
         q_delta = float(metadata.get('mcts_q_delta', float('nan')))
     except (TypeError, ValueError):
         q_delta = float('nan')
-    useful_correction = bool(
-        changed_top
-        and math.isfinite(q_delta)
-        and q_delta > _POLICY_CORRECTION_Q_DELTA_MIN
-    )
-    multiplier = _POLICY_CORRECTION_WEIGHT_MULTIPLIER if useful_correction else 1.0
-    return changed_top, q_delta, multiplier
+    return changed_top, q_delta
 
 
 def _debug_scope(config, name):
@@ -1529,6 +1482,8 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     orig_q_targets = torch.full((batch_size, 1), float('nan'), dtype=torch.float32)
     policy_kld_targets = torch.full((batch_size,), float('nan'), dtype=torch.float32)
     search_visits = torch.zeros((batch_size,), dtype=torch.int32)
+    game_ids = torch.full((batch_size,), -1, dtype=torch.int64)
+    game_ply_indices = torch.full((batch_size,), -1, dtype=torch.int16)
     fens = []
     history_fens = []
 
@@ -1564,6 +1519,10 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
             policy_kld_targets[row_idx] = float(pos[18])
         if len(pos) > 19 and pos[19] is not None:
             search_visits[row_idx] = int(pos[19])
+        if len(pos) > 20 and pos[20] is not None:
+            game_ids[row_idx] = int(pos[20])
+        if len(pos) > 21 and pos[21] is not None:
+            game_ply_indices[row_idx] = int(pos[21])
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -1593,6 +1552,8 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         'orig_q_targets': orig_q_targets,
         'policy_kld_targets': policy_kld_targets,
         'search_visits': search_visits,
+        'game_ids': game_ids,
+        'game_ply_indices': game_ply_indices,
         'num_positions': batch_size,
     }
 
@@ -1930,6 +1891,8 @@ class MultiGameBatchMCTS:
             'nn_legal_move_items': 0,
             'central_inference_shared_requests': 0,
             'central_inference_shared_bytes_avoided': 0,
+            'central_inference_compact_policy_requests': 0,
+            'central_inference_compact_output_bytes_avoided': 0,
             'central_inference_shared_slot_wait_time': 0.0,
             'central_inference_cache_queries': 0,
             'central_inference_cache_bypassed_positions': 0,
@@ -4130,6 +4093,12 @@ class MultiGameBatchMCTS:
             )
             if remote_request_seen:
                 self._profile_inc('central_inference_requests', 1)
+                if compact_policy_response:
+                    self._profile_inc('central_inference_compact_policy_requests', 1)
+                    self._profile_inc(
+                        'central_inference_compact_output_bytes_avoided',
+                        max(0, batch_n * (ACTION_SIZE - max_legal_count) * 2),
+                    )
                 self._profile_inc('central_inference_server_batch_items', server_batch_size)
                 self._profile_add(
                     'central_inference_remote_wait_time',

@@ -599,10 +599,26 @@ def format_results_table(all_results: list[dict]) -> str:
         elo_str = str(elo) if elo is not None else "N/A"
         lines.append(f"- {name} [{mode_label}]")
         lines.append(f"  Estimated Elo: {elo_str}")
+        rating_bracket = result.get("rating_bracket")
+        if result.get("rating_bracketed") and isinstance(rating_bracket, list):
+            lines.append(
+                f"  Rating bracket: SF {rating_bracket[0]}-{rating_bracket[1]} "
+                "(crosses 50% score)"
+            )
+        elif result.get("rating_censored"):
+            bound = result.get("elo_lower_bound", result.get("elo_upper_bound"))
+            relation = ">" if result.get("elo_lower_bound") is not None else "<"
+            lines.append(f"  Rating is range-censored: {relation}{bound}; no 50% Stockfish bracket.")
         if result.get("elo_std_error") is not None:
             ci = result.get("elo_ci95")
             ci_str = f", 95% CI {ci[0]}-{ci[1]}" if isinstance(ci, list) and len(ci) == 2 else ""
             lines.append(f"  Uncertainty: +/-{result['elo_std_error']} Elo SE{ci_str} (adaptive ladder)")
+        local_level = result.get("local_rating_level")
+        local_games = int(result.get("local_rating_games", 0) or 0)
+        if local_level is not None:
+            lines.append(
+                f"  Calibration point: SF {local_level}, {local_games} games nearest 50% score."
+            )
         rating_games = int(result.get("rating_games", result.get("total_games", 0)) or 0)
         probe_only_games = int(result.get("probe_only_games", 0) or 0)
         rating_levels = list(result.get("rating_levels") or [])
@@ -611,12 +627,12 @@ def format_results_table(all_results: list[dict]) -> str:
                 f"  Rating fit: {rating_games} focused games on levels {rating_levels}; "
                 f"{probe_only_games} probe games used only for level selection."
             )
-        if result.get("fit_warning"):
-            model_se = result.get("elo_model_std_error")
-            model_se_text = f"; ideal-curve SE would be {model_se}" if model_se is not None else ""
+        if result.get("calibration_warning"):
+            curve_elo = result.get("elo_curve_estimate")
+            curve_text = f"; fixed-slope curve would report {curve_elo}" if curve_elo is not None else ""
             lines.append(
-                "  Fit warning: non-monotonic level results; uncertainty was inflated "
-                f"(dispersion {float(result.get('elo_overdispersion', 1.0)):.2f}{model_se_text})."
+                "  Calibration note: Stockfish level scores do not follow the textbook Elo slope "
+                f"at this time control (dispersion {float(result.get('elo_overdispersion', 1.0)):.2f}{curve_text})."
             )
 
         if result.get("results"):

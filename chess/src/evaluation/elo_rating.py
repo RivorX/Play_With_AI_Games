@@ -53,12 +53,42 @@ def local_performance_rating(opponent_elo: float, scores: list[float]) -> tuple[
     return rating, standard_error
 
 
+def nearest_level_rating(
+    opponent_elos: list[float],
+    scores: list[float],
+) -> tuple[float | None, float | None, int | None, int]:
+    """Estimate strength from the tested level carrying the most local evidence.
+
+    Stockfish ``UCI_Elo`` levels are not guaranteed to follow the textbook Elo
+    slope under a fixed, short time control. The level closest to a 50% score is
+    therefore the honest local calibration point; distant levels remain useful
+    for bracketing but must not pull the reported rating away from that crossing.
+    """
+    if not scores or len(opponent_elos) != len(scores):
+        return None, None, None, 0
+    grouped: dict[int, list[float]] = {}
+    for opponent, score in zip(opponent_elos, scores):
+        grouped.setdefault(int(round(float(opponent))), []).append(float(score))
+    if not grouped:
+        return None, None, None, 0
+
+    def local_key(item):
+        level, level_scores = item
+        n = len(level_scores)
+        smoothed_score = (float(sum(level_scores)) + 0.5) / float(n + 1)
+        return abs(smoothed_score - 0.5), -n, level
+
+    level, level_scores = min(grouped.items(), key=local_key)
+    rating, standard_error = local_performance_rating(float(level), level_scores)
+    return rating, standard_error, int(level), int(len(level_scores))
+
+
 def elo_fit_diagnostics(
     opponent_elos: list[float],
     scores: list[float],
     estimated_elo: float | None,
 ) -> dict:
-    """Return conservative uncertainty when level results are non-monotonic."""
+    """Diagnose how well a fixed-slope textbook Elo curve fits the ladder."""
     model_se = elo_standard_error(opponent_elos, estimated_elo)
     result = {
         "model_standard_error": model_se,
@@ -67,6 +97,7 @@ def elo_fit_diagnostics(
         "pearson_chi2": 0.0,
         "degrees_of_freedom": 0,
         "fit_warning": False,
+        "calibration_warning": False,
     }
     if estimated_elo is None or not opponent_elos or len(opponent_elos) != len(scores):
         return result
@@ -91,6 +122,7 @@ def elo_fit_diagnostics(
             "pearson_chi2": pearson,
             "degrees_of_freedom": degrees_of_freedom,
             "fit_warning": raw_dispersion >= 1.5,
+            "calibration_warning": raw_dispersion >= 1.5,
         }
     )
     return result

@@ -50,7 +50,11 @@ def torch_compile_cache_paths(torch_module, device, role: str):
         compute_capability = "sm_unknown"
     environment = "-".join(
         (
-            "v2",
+            # v3 invalidates v2 central graphs that were compiled while the
+            # legacy relative .torch_compile_cache path was active. Some
+            # autotune artifacts retain that absolute path and otherwise
+            # recreate the old directory even after the environment is fixed.
+            "v3",
             f"py{sys.version_info.major}{sys.version_info.minor}",
             f"torch{_token(torch_module.__version__)}",
             f"cuda{_token(torch_module.version.cuda)}",

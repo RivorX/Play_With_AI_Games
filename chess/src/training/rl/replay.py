@@ -6,7 +6,11 @@ import numpy as np
 import torch
 
 from src.models.data.se_cnn_v9.helpers import MAX_LEGAL_MOVES
-from src.mcts.q_delta import USEFUL_SEARCH_Q_DELTA_MIN
+from src.mcts.q_delta import (
+    RELIABLE_POLICY_TARGET_GAP_MIN,
+    RELIABLE_POLICY_TARGET_TOP1_MIN,
+    USEFUL_SEARCH_Q_DELTA_MIN,
+)
 
 
 _DEFAULT_MAX_POLICY_TARGETS = 256
@@ -20,6 +24,20 @@ REPLAY_SOURCE_LABELS = {
     REPLAY_SOURCE_LEARNER: "learner",
     REPLAY_SOURCE_FROZEN_BEST: "frozen_best",
 }
+
+
+def _fen_resets_repetition_history(fen):
+    """Return True when prior positions cannot affect repetition from this FEN.
+
+    A zero halfmove clock follows a pawn move or capture, so no position before
+    the FEN can legally recur.  This makes a FEN-only hard start exact without
+    retaining a full Python move stack for every replay row.
+    """
+    try:
+        parts = str(fen or "").split()
+        return len(parts) >= 5 and int(parts[4]) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 class ReplayBuffer:
@@ -63,6 +81,8 @@ class ReplayBuffer:
         self._orig_q_targets = None
         self._policy_kld_targets = None
         self._search_visits = None
+        self._game_ids = None
+        self._game_ply_indices = None
         self._fens = []
         self._history_fens = []
         self._scratch = {}
@@ -127,6 +147,8 @@ class ReplayBuffer:
         self._orig_q_targets = torch.full((self.max_size, 1), float("nan"), dtype=torch.float32)
         self._policy_kld_targets = torch.full((self.max_size,), float("nan"), dtype=torch.float32)
         self._search_visits = torch.zeros((self.max_size,), dtype=torch.int32)
+        self._game_ids = torch.full((self.max_size,), -1, dtype=torch.int64)
+        self._game_ply_indices = torch.full((self.max_size,), -1, dtype=torch.int16)
         self._fens = [None] * self.max_size
         self._history_fens = [None] * self.max_size
 
@@ -214,6 +236,8 @@ class ReplayBuffer:
         orig_q = float(position[17]) if len(position) > 17 and position[17] is not None else float("nan")
         policy_kld = float(position[18]) if len(position) > 18 and position[18] is not None else float("nan")
         search_visits = int(position[19]) if len(position) > 19 and position[19] is not None else 0
+        game_id = int(position[20]) if len(position) > 20 and position[20] is not None else -1
+        game_ply_index = int(position[21]) if len(position) > 21 and position[21] is not None else -1
         if self.use_fp16:
             board = board.half().contiguous()
             policy_values = policy_values.half().contiguous()
@@ -233,6 +257,7 @@ class ReplayBuffer:
             value_weight, source_code, moves_left, legal_indices, fen, root_q, history_fens,
             search_changed_top, search_q_delta,
             best_q, played_q, orig_q, policy_kld, search_visits,
+            game_id, game_ply_index,
         )
 
     def _store_at_slot(self, slot, position):
@@ -257,6 +282,8 @@ class ReplayBuffer:
             orig_q,
             policy_kld,
             search_visits,
+            game_id,
+            game_ply_index,
         ) = self._normalize_position(position)
 
         count = int(policy_indices.numel())
@@ -292,6 +319,8 @@ class ReplayBuffer:
         self._orig_q_targets[slot] = float(orig_q)
         self._policy_kld_targets[slot] = float(policy_kld)
         self._search_visits[slot] = max(0, int(search_visits))
+        self._game_ids[slot] = int(game_id)
+        self._game_ply_indices[slot] = int(game_ply_index)
         self._fens[slot] = fen
         self._history_fens[slot] = tuple(history_fens)
 
@@ -389,6 +418,8 @@ class ReplayBuffer:
         orig_q_targets=None,
         policy_kld_targets=None,
         search_visits=None,
+        game_ids=None,
+        game_ply_indices=None,
     ):
         if boards is None or int(boards.shape[0]) <= 0:
             return
@@ -461,6 +492,14 @@ class ReplayBuffer:
             search_visits = torch.zeros((batch_size,), dtype=torch.int32)
         else:
             search_visits = search_visits.reshape(-1).to(dtype=torch.int32).contiguous()
+        if game_ids is None:
+            game_ids = torch.full((batch_size,), -1, dtype=torch.int64)
+        else:
+            game_ids = game_ids.reshape(-1).to(dtype=torch.int64).contiguous()
+        if game_ply_indices is None:
+            game_ply_indices = torch.full((batch_size,), -1, dtype=torch.int16)
+        else:
+            game_ply_indices = game_ply_indices.reshape(-1).to(dtype=torch.int16).contiguous()
         fens = list(fens or [None] * batch_size)
         history_fens = list(history_fens or [()] * batch_size)
         max_len = int(policy_indices.shape[1]) if policy_indices.dim() == 2 else 0
@@ -514,6 +553,8 @@ class ReplayBuffer:
             self._orig_q_targets[dst_slice].copy_(orig_q_targets[src_slice])
             self._policy_kld_targets[dst_slice].copy_(policy_kld_targets[src_slice])
             self._search_visits[dst_slice].copy_(search_visits[src_slice])
+            self._game_ids[dst_slice].copy_(game_ids[src_slice])
+            self._game_ply_indices[dst_slice].copy_(game_ply_indices[src_slice])
             for offset in range(count):
                 src_idx = src_start + offset
                 dst_idx = dst_start + offset
@@ -539,6 +580,128 @@ class ReplayBuffer:
             raise ValueError("Cannot sample from an empty replay buffer.")
         sample_size = max(1, min(int(sample_size), int(self.size)))
         return self._sample_indices_uniform(sample_size)
+
+    def select_game_balanced_indices(self, sample_size, *, seed=None):
+        """Interleave games and draw at most one row per game in each round.
+
+        This is a small-run counterpart of Hanse sampling. It retains multiple
+        positions per game, which is necessary with only about 1k new games per
+        generation, but prevents long games from arriving as correlated runs
+        and gives every represented game equal opportunity before taking a
+        second position from any game.
+        """
+        if self.size <= 0:
+            raise ValueError("Cannot sample from an empty replay buffer.")
+        sample_size = max(1, min(int(sample_size), int(self.size)))
+        if self._game_ids is None or self._insertion_iterations is None:
+            return self._sample_indices_uniform(sample_size)
+
+        rng = np.random.default_rng(seed)
+        game_ids = self._game_ids[:self.size].cpu().numpy().astype(np.int64, copy=False)
+        iterations = self._insertion_iterations[:self.size].cpu().numpy().astype(np.int64, copy=False)
+        groups = {}
+        for index, (iteration, game_id) in enumerate(zip(iterations, game_ids)):
+            # Legacy/unknown rows remain independently sampleable instead of
+            # collapsing into one enormous pseudo-game.
+            key = (int(iteration), int(game_id)) if int(game_id) >= 0 else (int(iteration), -index - 1)
+            groups.setdefault(key, []).append(index)
+
+        pools = []
+        for rows in groups.values():
+            rows = np.asarray(rows, dtype=np.int64)
+            rng.shuffle(rows)
+            pools.append(rows)
+        rng.shuffle(pools)
+
+        selected = []
+        offsets = np.zeros(len(pools), dtype=np.int32)
+        active = np.arange(len(pools), dtype=np.int64)
+        while active.size > 0 and len(selected) < sample_size:
+            rng.shuffle(active)
+            next_active = []
+            for pool_idx in active.tolist():
+                offset = int(offsets[pool_idx])
+                pool = pools[pool_idx]
+                if offset >= int(pool.size):
+                    continue
+                selected.append(int(pool[offset]))
+                offsets[pool_idx] = offset + 1
+                if offset + 1 < int(pool.size):
+                    next_active.append(pool_idx)
+                if len(selected) >= sample_size:
+                    break
+            active = np.asarray(next_active, dtype=np.int64)
+        return np.asarray(selected, dtype=np.int64)
+
+    def game_diversity_stats(self, selection=None):
+        """Summarize independent-game coverage for replay diagnostics."""
+        if self.size <= 0 or self._game_ids is None:
+            return {
+                "replay_games": 0,
+                "replay_positions_per_game_mean": 0.0,
+                "replay_positions_per_game_p90": 0.0,
+                "train_game_coverage": 0.0,
+            }
+        game_ids = self._game_ids[:self.size].cpu().numpy().astype(np.int64, copy=False)
+        iterations = self._insertion_iterations[:self.size].cpu().numpy().astype(np.int64, copy=False)
+        known = game_ids >= 0
+        if not np.any(known):
+            return {
+                "replay_games": int(self.size),
+                "replay_positions_per_game_mean": 1.0,
+                "replay_positions_per_game_p90": 1.0,
+                "train_game_coverage": 1.0,
+            }
+        keys = np.column_stack((iterations[known], game_ids[known]))
+        unique_keys, counts = np.unique(keys, axis=0, return_counts=True)
+        selected_coverage = 0.0
+        if selection is not None and unique_keys.size > 0:
+            selected = np.asarray(selection)
+            if selected.dtype == np.bool_:
+                selected_rows = np.flatnonzero(selected[:self.size])
+            else:
+                selected_rows = selected.astype(np.int64, copy=False).reshape(-1)
+            selected_rows = selected_rows[(selected_rows >= 0) & (selected_rows < self.size)]
+            selected_known = selected_rows[game_ids[selected_rows] >= 0]
+            if selected_known.size > 0:
+                selected_keys = np.column_stack(
+                    (iterations[selected_known], game_ids[selected_known])
+                )
+                selected_coverage = float(np.unique(selected_keys, axis=0).shape[0]) / float(
+                    unique_keys.shape[0]
+                )
+        return {
+            "replay_games": int(unique_keys.shape[0]),
+            "replay_positions_per_game_mean": float(np.mean(counts)),
+            "replay_positions_per_game_p90": float(np.percentile(counts, 90)),
+            "train_game_coverage": selected_coverage,
+        }
+
+    @staticmethod
+    def _reliable_policy_target_mask(policy_values, policy_lengths):
+        """Apply the shared target top-1/gap contract to stored sparse targets."""
+        values = torch.clamp(policy_values.float(), min=0.0)
+        if values.dim() != 2 or values.size(1) <= 0:
+            return torch.zeros(int(values.size(0)), dtype=torch.bool)
+        columns = torch.arange(values.size(1), dtype=torch.long).unsqueeze(0)
+        valid = columns < policy_lengths.long().reshape(-1, 1)
+        values = torch.where(valid, values, torch.zeros_like(values))
+        mass = values.sum(dim=1, keepdim=True)
+        normalized = values / mass.clamp_min(1e-8)
+        top2 = torch.topk(normalized, k=min(2, normalized.size(1)), dim=1).values
+        top1 = top2[:, 0]
+        second = top2[:, 1] if top2.size(1) > 1 else torch.zeros_like(top1)
+        return (
+            (mass.reshape(-1) > 0.0)
+            & (top1 >= float(RELIABLE_POLICY_TARGET_TOP1_MIN))
+            & ((top1 - second) >= float(RELIABLE_POLICY_TARGET_GAP_MIN))
+        )
+
+    def _reliable_policy_target_mask_for_indices(self, indices):
+        return self._reliable_policy_target_mask(
+            self._policy_values[indices],
+            self._policy_lengths[indices],
+        )
 
     def select_iteration_indices(
         self,
@@ -566,7 +729,17 @@ class ReplayBuffer:
                 idx_tensor = torch.as_tensor(indices, dtype=torch.long)
                 changed = self._search_changed_top[idx_tensor].cpu().numpy().astype(bool, copy=False)
                 q_delta = self._search_q_deltas[idx_tensor].cpu().numpy()
-                useful_mask = changed & np.isfinite(q_delta) & (q_delta > 0.02)
+                reliable_target = (
+                    self._reliable_policy_target_mask_for_indices(idx_tensor)
+                    .cpu()
+                    .numpy()
+                )
+                useful_mask = (
+                    changed
+                    & reliable_target
+                    & np.isfinite(q_delta)
+                    & (q_delta > USEFUL_SEARCH_Q_DELTA_MIN)
+                )
                 useful = indices[useful_mask]
                 useful_quota = min(useful.size, int(round(0.5 * max_count)))
                 selected_useful = (
@@ -624,6 +797,8 @@ class ReplayBuffer:
                 orig_q_targets=self._orig_q_targets[idx],
                 policy_kld_targets=self._policy_kld_targets[idx],
                 search_visits=self._search_visits[idx],
+                game_ids=self._game_ids[idx],
+                game_ply_indices=self._game_ply_indices[idx],
             )
             copied += int(idx.numel())
         return copied
@@ -645,7 +820,12 @@ class ReplayBuffer:
         *,
         seed=0,
     ):
-        """Select a deterministic cohort of useful corrections seen by training."""
+        """Select the exact useful top-move corrections seen by training.
+
+        Keep this cohort aligned with the correction rank objective. Mixing in
+        high-KL rows whose winner already agrees with the prior made the audit
+        start near 50% top-1 and hid whether changed winners were absorbed.
+        """
         candidates = np.asarray(candidate_indices, dtype=np.int64).reshape(-1)
         if candidates.size <= 0 or self.size <= 0:
             return np.empty(0, dtype=np.int64)
@@ -654,14 +834,19 @@ class ReplayBuffer:
             return candidates
 
         idx = torch.as_tensor(candidates, dtype=torch.long)
-        eligible = (
+        confirmed_target = self._reliable_policy_target_mask_for_indices(idx)
+        base_eligible = (
             (self._policy_lengths[idx] > 0)
             & (self._legal_lengths[idx] > 0)
             & (self._policy_sample_weights[idx] > 0.0)
-            & self._search_changed_top[idx]
+        )
+        useful_top_change = (
+            self._search_changed_top[idx]
             & torch.isfinite(self._search_q_deltas[idx])
             & (self._search_q_deltas[idx] > USEFUL_SEARCH_Q_DELTA_MIN)
-        ).cpu().numpy()
+            & confirmed_target
+        )
+        eligible = (base_eligible & useful_top_change).cpu().numpy()
         selected = candidates[eligible]
         max_count = max(0, int(max_count))
         if max_count <= 0 or selected.size <= max_count:
@@ -674,7 +859,11 @@ class ReplayBuffer:
         if self.size <= 0 or not self._fens:
             return np.empty(0, dtype=np.int64)
         eligible = np.asarray(
-            [idx for idx in range(self.size) if self._fens[idx]],
+            [
+                idx
+                for idx in range(self.size)
+                if self._fens[idx] and _fen_resets_repetition_history(self._fens[idx])
+            ],
             dtype=np.int64,
         )
         if eligible.size <= 0:
@@ -686,19 +875,32 @@ class ReplayBuffer:
         if eligible.size <= 0:
             return eligible
         sample_size = min(max(1, int(sample_size)), int(eligible.size))
-        importance = self._importance[:self.size].float().cpu().numpy()
-        changed = self._search_changed_top[:self.size].cpu().numpy()
-        q_deltas = self._search_q_deltas[:self.size].float().cpu().numpy()
+        eligible_idx = torch.as_tensor(eligible, dtype=torch.long)
+        importance = self._importance[eligible_idx].float().cpu().numpy()
+        changed = self._search_changed_top[eligible_idx].cpu().numpy()
+        q_deltas = self._search_q_deltas[eligible_idx].float().cpu().numpy()
+        reliable_target = np.zeros(eligible.size, dtype=np.bool_)
+        for start in range(0, eligible.size, 8192):
+            stop = min(eligible.size, start + 8192)
+            chunk_idx = eligible_idx[start:stop]
+            reliable_target[start:stop] = (
+                self._reliable_policy_target_mask_for_indices(chunk_idx)
+                .cpu()
+                .numpy()
+            )
         correction_strength = np.where(
-            changed & np.isfinite(q_deltas) & (q_deltas > USEFUL_SEARCH_Q_DELTA_MIN),
+            changed
+            & reliable_target
+            & np.isfinite(q_deltas)
+            & (q_deltas > USEFUL_SEARCH_Q_DELTA_MIN),
             np.clip(q_deltas, 0.0, 0.50) / 0.20,
             0.0,
         )
         # Reanalyse exists primarily to refresh decisions where search corrected
         # the policy. Keep importance for tactical diversity, but make a useful
         # correction several times more likely than an equally important row.
-        weights = np.square(np.maximum(0.0, importance[eligible]) + 0.10)
-        weights *= 1.0 + 3.0 * np.clip(correction_strength[eligible], 0.0, 1.0)
+        weights = np.square(np.maximum(0.0, importance) + 0.10)
+        weights *= 1.0 + 3.0 * np.clip(correction_strength, 0.0, 1.0)
         weights /= max(1e-12, float(weights.sum()))
         return np.random.choice(eligible, sample_size, replace=False, p=weights).astype(np.int64)
 
@@ -711,102 +913,6 @@ class ReplayBuffer:
                 "importance": float(self._importance[int(idx)].item()),
             })
         return result
-
-    def update_reanalyzed_targets(
-        self,
-        indices,
-        policy_targets,
-        root_q_values,
-        policy_mix=0.60,
-        *,
-        policy_weight_values=None,
-        search_changed_top_values=None,
-        search_q_delta_values=None,
-        best_q_values=None,
-        orig_q_values=None,
-        policy_kld_values=None,
-        search_visit_values=None,
-    ):
-        """Refresh policy and auxiliary search-value targets without changing game outcomes."""
-        updated = 0
-        mix = max(0.0, min(1.0, float(policy_mix)))
-        for row, idx in enumerate(np.asarray(indices, dtype=np.int64).tolist()):
-            if idx < 0 or idx >= self.size or row >= len(policy_targets):
-                continue
-            policy_indices, policy_values = policy_targets[row]
-            policy_indices = torch.as_tensor(policy_indices, dtype=torch.int16).reshape(-1)
-            policy_values = torch.as_tensor(policy_values, dtype=torch.float32).reshape(-1)
-            count = min(policy_indices.numel(), policy_values.numel(), self.max_policy_targets)
-            if count <= 0:
-                continue
-            old_count = int(self._policy_lengths[idx].item())
-            merged = {}
-            if mix < 1.0 and old_count > 0:
-                for move_idx, probability in zip(
-                    self._policy_indices[idx, :old_count].tolist(),
-                    self._policy_values[idx, :old_count].float().tolist(),
-                ):
-                    merged[int(move_idx)] = merged.get(int(move_idx), 0.0) + (1.0 - mix) * float(probability)
-            for move_idx, probability in zip(policy_indices[:count].tolist(), policy_values[:count].tolist()):
-                merged[int(move_idx)] = merged.get(int(move_idx), 0.0) + mix * float(probability)
-            ordered = sorted(merged.items(), key=lambda item: item[1], reverse=True)[:self.max_policy_targets]
-            mass = sum(max(0.0, value) for _, value in ordered)
-            if mass <= 0.0:
-                continue
-            self._policy_indices[idx].fill_(-1)
-            self._policy_values[idx].zero_()
-            for col, (move_idx, probability) in enumerate(ordered):
-                self._policy_indices[idx, col] = int(move_idx)
-                self._policy_values[idx, col] = float(max(0.0, probability) / mass)
-            self._policy_lengths[idx] = len(ordered)
-            # A full replacement retains the new search decision and its
-            # confidence. A mixed target has no unambiguous winner relationship,
-            # so it deliberately drops correction metadata.
-            full_replacement = mix >= 1.0 - 1e-8
-            if (
-                full_replacement
-                and policy_weight_values is not None
-                and row < len(policy_weight_values)
-            ):
-                self._policy_sample_weights[idx] = max(
-                    0.0, float(policy_weight_values[row])
-                )
-            else:
-                self._policy_sample_weights[idx] = 1.0
-            if (
-                full_replacement
-                and search_changed_top_values is not None
-                and row < len(search_changed_top_values)
-            ):
-                self._search_changed_top[idx] = bool(search_changed_top_values[row])
-            else:
-                self._search_changed_top[idx] = False
-            if (
-                full_replacement
-                and search_q_delta_values is not None
-                and row < len(search_q_delta_values)
-            ):
-                self._search_q_deltas[idx] = float(search_q_delta_values[row])
-            else:
-                self._search_q_deltas[idx] = float("nan")
-            self._played_q_targets[idx] = float("nan")
-            self._orig_q_targets[idx] = float("nan")
-            self._policy_kld_targets[idx] = float("nan")
-            self._search_visits[idx] = 0
-            if row < len(root_q_values):
-                self._root_q_targets[idx] = float(root_q_values[row])
-            if best_q_values is not None and row < len(best_q_values):
-                self._best_q_targets[idx] = float(best_q_values[row])
-            else:
-                self._best_q_targets[idx] = float("nan")
-            if orig_q_values is not None and row < len(orig_q_values):
-                self._orig_q_targets[idx] = float(orig_q_values[row])
-            if policy_kld_values is not None and row < len(policy_kld_values):
-                self._policy_kld_targets[idx] = float(policy_kld_values[row])
-            if search_visit_values is not None and row < len(search_visit_values):
-                self._search_visits[idx] = max(0, int(search_visit_values[row]))
-            updated += 1
-        return updated
 
     def _record_sample_age_stats(self, indices):
         if self._insertion_iterations is None:
@@ -869,6 +975,8 @@ class ReplayBuffer:
         old_orig_q_targets = self._orig_q_targets
         old_policy_kld_targets = self._policy_kld_targets
         old_search_visits = self._search_visits
+        old_game_ids = self._game_ids
+        old_game_ply_indices = self._game_ply_indices
         old_fens = self._fens
         old_history_fens = self._history_fens
 
@@ -909,6 +1017,8 @@ class ReplayBuffer:
         self._orig_q_targets = torch.full((self.max_size, 1), float("nan"), dtype=torch.float32)
         self._policy_kld_targets = torch.full((self.max_size,), float("nan"), dtype=torch.float32)
         self._search_visits = torch.zeros((self.max_size,), dtype=torch.int32)
+        self._game_ids = torch.full((self.max_size,), -1, dtype=torch.int64)
+        self._game_ply_indices = torch.full((self.max_size,), -1, dtype=torch.int16)
         self._fens = [None] * self.max_size
         self._history_fens = [None] * self.max_size
 
@@ -935,6 +1045,8 @@ class ReplayBuffer:
             self._orig_q_targets[:keep_size].copy_(old_orig_q_targets[idx])
             self._policy_kld_targets[:keep_size].copy_(old_policy_kld_targets[idx])
             self._search_visits[:keep_size].copy_(old_search_visits[idx])
+            self._game_ids[:keep_size].copy_(old_game_ids[idx])
+            self._game_ply_indices[:keep_size].copy_(old_game_ply_indices[idx])
             for dst_idx, src_idx in enumerate(keep_indices.tolist()):
                 self._fens[dst_idx] = old_fens[int(src_idx)]
                 self._history_fens[dst_idx] = old_history_fens[int(src_idx)]
@@ -967,6 +1079,13 @@ class ReplayBuffer:
 
         values = self._values[:self.size].reshape(-1).float()
         policy_lengths = self._policy_lengths[:self.size].to(dtype=torch.float32)
+        reliable_policy_targets = torch.zeros(self.size, dtype=torch.bool)
+        for start in range(0, self.size, 8192):
+            stop = min(self.size, start + 8192)
+            reliable_policy_targets[start:stop] = self._reliable_policy_target_mask(
+                self._policy_values[start:stop],
+                self._policy_lengths[start:stop],
+            )
         policy_weights = self._policy_sample_weights[:self.size].float()
         value_weights = self._value_sample_weights[:self.size].float()
         importance = self._importance[:self.size].float()
@@ -989,6 +1108,7 @@ class ReplayBuffer:
             & search_changed_top
             & torch.isfinite(search_q_deltas)
             & (search_q_deltas > USEFUL_SEARCH_Q_DELTA_MIN)
+            & reliable_policy_targets
         )
         source_codes = self._source_codes[:self.size].to(dtype=torch.int16)
         decisive_mask = torch.abs(values) > float(self.decisive_value_epsilon)

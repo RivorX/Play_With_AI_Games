@@ -21,6 +21,10 @@ class CorrectionAuditSnapshot:
     rank: torch.Tensor
     target_probability: torch.Tensor
     logit_margin: torch.Tensor
+    target_kl: torch.Tensor
+    value_wdl_ce: torch.Tensor
+    value_brier: torch.Tensor
+    value_mae: torch.Tensor
 
     @property
     def rows(self) -> int:
@@ -33,7 +37,7 @@ def freeze_replay_batch(batch: Iterable[torch.Tensor]) -> tuple[torch.Tensor, ..
     return tuple(tensor.detach().cpu().clone() for tensor in batch)
 
 
-def _model_policy_logits(model, boards: torch.Tensor) -> torch.Tensor:
+def _model_outputs(model, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
     output = model(
         boards,
         apply_log_softmax=False,
@@ -41,8 +45,9 @@ def _model_policy_logits(model, boards: torch.Tensor) -> torch.Tensor:
         return_search_aux=True,
     )
     if isinstance(output, (tuple, list)):
-        return output[0]
-    return output
+        value = output[1] if len(output) > 1 else None
+        return output[0], value
+    return output, None
 
 
 def evaluate_correction_cohort(
@@ -59,13 +64,16 @@ def evaluate_correction_cohort(
     if len(batch) < 10:
         raise ValueError("Correction audit requires policy and legal-move replay fields.")
 
-    boards, policy_indices, policy_values, policy_mask = batch[:4]
+    boards, policy_indices, policy_values, policy_mask, value_targets = batch[:5]
     legal_indices, legal_mask = batch[8:10]
     row_count = int(boards.shape[0])
     if row_count <= 0:
         empty_bool = torch.empty(0, dtype=torch.bool)
         empty_float = torch.empty(0, dtype=torch.float32)
-        return CorrectionAuditSnapshot(empty_bool, empty_float, empty_float, empty_float)
+        return CorrectionAuditSnapshot(
+            empty_bool, empty_float, empty_float, empty_float, empty_float,
+            empty_float, empty_float, empty_float,
+        )
 
     device = torch.device(device)
     chunk_size = max(1, int(batch_size))
@@ -78,6 +86,10 @@ def evaluate_correction_cohort(
     rank_parts = []
     probability_parts = []
     margin_parts = []
+    target_kl_parts = []
+    value_wdl_ce_parts = []
+    value_brier_parts = []
+    value_mae_parts = []
     try:
         with torch.inference_mode():
             for start in range(0, row_count, chunk_size):
@@ -92,13 +104,17 @@ def evaluate_correction_cohort(
                 policy_mask_chunk = policy_mask[start:end].to(device, non_blocking=True).bool()
                 legal_index_chunk = legal_indices[start:end].to(device, non_blocking=True).long()
                 legal_mask_chunk = legal_mask[start:end].to(device, non_blocking=True).bool()
+                value_target_chunk = value_targets[start:end].to(device, non_blocking=True).float().view(-1)
 
                 with torch.amp.autocast(
                     "cuda",
                     enabled=amp_enabled,
                     dtype=amp_dtype,
                 ):
-                    policy_logits = _model_policy_logits(model, board_chunk).float()
+                    policy_logits, value_logits = _model_outputs(model, board_chunk)
+                    policy_logits = policy_logits.float()
+                    if value_logits is not None:
+                        value_logits = value_logits.float()
 
                 policy_size = int(policy_logits.shape[1])
                 valid_policy = (
@@ -123,6 +139,77 @@ def evaluate_correction_cohort(
                     ~valid_legal,
                     -torch.inf,
                 )
+                dense_targets = torch.zeros_like(policy_logits)
+                dense_targets.scatter_add_(
+                    1,
+                    safe_policy_indices,
+                    torch.where(
+                        valid_policy,
+                        torch.clamp(policy_value_chunk, min=0.0),
+                        torch.zeros_like(policy_value_chunk),
+                    ),
+                )
+                legal_targets = torch.gather(dense_targets, 1, safe_legal_indices)
+                legal_targets = torch.where(
+                    valid_legal, legal_targets, torch.zeros_like(legal_targets)
+                )
+                legal_targets = legal_targets / legal_targets.sum(
+                    dim=1, keepdim=True
+                ).clamp_min(1e-8)
+                legal_log_probs = torch.log_softmax(legal_logits, dim=1)
+                # Padded legal slots have log-probability -inf. Multiplying
+                # those by a zero target yields 0*inf -> NaN, which poisoned
+                # every logged KL despite otherwise valid rows.
+                legal_log_probs = torch.where(
+                    valid_legal,
+                    legal_log_probs,
+                    torch.zeros_like(legal_log_probs),
+                )
+                positive_targets = legal_targets > 0.0
+                safe_target_logs = torch.where(
+                    positive_targets,
+                    torch.log(legal_targets.clamp_min(1e-12)),
+                    torch.zeros_like(legal_targets),
+                )
+                target_kl = (
+                    legal_targets * (safe_target_logs - legal_log_probs)
+                ).sum(dim=1)
+                if (
+                    value_logits is not None
+                    and value_logits.ndim == 2
+                    and int(value_logits.shape[1]) == 3
+                ):
+                    target_scalar = torch.where(
+                        value_target_chunk.abs() <= 1e-6,
+                        torch.zeros_like(value_target_chunk),
+                        torch.sign(value_target_chunk),
+                    )
+                    target_class = torch.where(
+                        target_scalar > 0.0,
+                        torch.zeros_like(target_scalar, dtype=torch.long),
+                        torch.where(
+                            target_scalar < 0.0,
+                            torch.full_like(target_scalar, 2, dtype=torch.long),
+                            torch.ones_like(target_scalar, dtype=torch.long),
+                        ),
+                    )
+                    value_log_probs = torch.log_softmax(value_logits, dim=1)
+                    value_probs = torch.softmax(value_logits, dim=1)
+                    value_wdl_ce = -torch.gather(
+                        value_log_probs, 1, target_class.unsqueeze(1)
+                    ).squeeze(1)
+                    value_target_wdl = torch.nn.functional.one_hot(
+                        target_class, num_classes=3
+                    ).float()
+                    value_brier = torch.square(value_probs - value_target_wdl).sum(dim=1)
+                    value_scalar = value_probs[:, 0] - value_probs[:, 2]
+                    value_mae = torch.abs(value_scalar - target_scalar)
+                else:
+                    value_wdl_ce = torch.full(
+                        (end - start,), float("nan"), device=device
+                    )
+                    value_brier = torch.full_like(value_wdl_ce, float("nan"))
+                    value_mae = torch.full_like(value_wdl_ce, float("nan"))
                 target_is_legal = (
                     valid_legal & (safe_legal_indices == target_moves.unsqueeze(1))
                 ).any(dim=1)
@@ -159,19 +246,83 @@ def evaluate_correction_cohort(
                 rank_parts.append(ranks[valid_rows].cpu())
                 probability_parts.append(target_probabilities[valid_rows].cpu())
                 margin_parts.append(margins[valid_rows].cpu())
+                target_kl_parts.append(target_kl[valid_rows].cpu())
+                value_wdl_ce_parts.append(value_wdl_ce[valid_rows].cpu())
+                value_brier_parts.append(value_brier[valid_rows].cpu())
+                value_mae_parts.append(value_mae[valid_rows].cpu())
     finally:
         model.train(was_training)
 
     if not top1_parts:
         empty_bool = torch.empty(0, dtype=torch.bool)
         empty_float = torch.empty(0, dtype=torch.float32)
-        return CorrectionAuditSnapshot(empty_bool, empty_float, empty_float, empty_float)
+        return CorrectionAuditSnapshot(
+            empty_bool, empty_float, empty_float, empty_float, empty_float,
+            empty_float, empty_float, empty_float,
+        )
     return CorrectionAuditSnapshot(
         torch.cat(top1_parts),
         torch.cat(rank_parts),
         torch.cat(probability_parts),
         torch.cat(margin_parts),
+        torch.cat(target_kl_parts),
+        torch.cat(value_wdl_ce_parts),
+        torch.cat(value_brier_parts),
+        torch.cat(value_mae_parts),
     )
+
+
+def holdout_metrics(
+    before: CorrectionAuditSnapshot | None,
+    after: CorrectionAuditSnapshot | None,
+) -> dict[str, float | int]:
+    """Measure generalization on fresh positions excluded from optimizer replay."""
+    metrics: dict[str, float | int] = {
+        "holdout_rows": 0,
+        "holdout_policy_kl_before": float("nan"),
+        "holdout_policy_kl_after": float("nan"),
+        "holdout_policy_kl_reduction": float("nan"),
+        "holdout_value_wdl_ce_before": float("nan"),
+        "holdout_value_wdl_ce_after": float("nan"),
+        "holdout_value_wdl_ce_reduction": float("nan"),
+        "holdout_value_brier_before": float("nan"),
+        "holdout_value_brier_after": float("nan"),
+        "holdout_value_brier_reduction": float("nan"),
+        "holdout_value_mae_before": float("nan"),
+        "holdout_value_mae_after": float("nan"),
+        "holdout_value_mae_reduction": float("nan"),
+    }
+    if before is None or after is None or before.rows != after.rows or after.rows <= 0:
+        return metrics
+
+    def _mean(tensor):
+        finite = tensor[torch.isfinite(tensor)]
+        return float(finite.mean().item()) if finite.numel() else float("nan")
+
+    policy_before = _mean(before.target_kl)
+    policy_after = _mean(after.target_kl)
+    value_ce_before = _mean(before.value_wdl_ce)
+    value_ce_after = _mean(after.value_wdl_ce)
+    value_brier_before = _mean(before.value_brier)
+    value_brier_after = _mean(after.value_brier)
+    value_mae_before = _mean(before.value_mae)
+    value_mae_after = _mean(after.value_mae)
+    metrics.update({
+        "holdout_rows": int(after.rows),
+        "holdout_policy_kl_before": policy_before,
+        "holdout_policy_kl_after": policy_after,
+        "holdout_policy_kl_reduction": policy_before - policy_after,
+        "holdout_value_wdl_ce_before": value_ce_before,
+        "holdout_value_wdl_ce_after": value_ce_after,
+        "holdout_value_wdl_ce_reduction": value_ce_before - value_ce_after,
+        "holdout_value_brier_before": value_brier_before,
+        "holdout_value_brier_after": value_brier_after,
+        "holdout_value_brier_reduction": value_brier_before - value_brier_after,
+        "holdout_value_mae_before": value_mae_before,
+        "holdout_value_mae_after": value_mae_after,
+        "holdout_value_mae_reduction": value_mae_before - value_mae_after,
+    })
+    return metrics
 
 
 def correction_audit_metrics(
@@ -197,6 +348,10 @@ def correction_audit_metrics(
         "correction_audit_logit_margin_before": float("nan"),
         "correction_audit_logit_margin_after": float("nan"),
         "correction_audit_logit_margin_gain": float("nan"),
+        "correction_audit_target_kl_before": float("nan"),
+        "correction_audit_target_kl_after": float("nan"),
+        "correction_audit_target_kl_reduction": float("nan"),
+        "correction_audit_target_kl_closed_fraction": float("nan"),
         "correction_audit_retention": float("nan"),
         "correction_audit_retention_rows": 0,
     }
@@ -209,6 +364,9 @@ def correction_audit_metrics(
         probability_after = float(after.target_probability.mean().item())
         margin_before = float(before.logit_margin.mean().item())
         margin_after = float(after.logit_margin.mean().item())
+        target_kl_before = float(before.target_kl.mean().item())
+        target_kl_after = float(after.target_kl.mean().item())
+        target_kl_reduction = target_kl_before - target_kl_after
         metrics.update({
             "correction_audit_rows": after.rows,
             "correction_audit_top1_before": top1_before,
@@ -223,6 +381,12 @@ def correction_audit_metrics(
             "correction_audit_logit_margin_before": margin_before,
             "correction_audit_logit_margin_after": margin_after,
             "correction_audit_logit_margin_gain": margin_after - margin_before,
+            "correction_audit_target_kl_before": target_kl_before,
+            "correction_audit_target_kl_after": target_kl_after,
+            "correction_audit_target_kl_reduction": target_kl_reduction,
+            "correction_audit_target_kl_closed_fraction": (
+                target_kl_reduction / max(1e-8, target_kl_before)
+            ),
         })
 
     if (

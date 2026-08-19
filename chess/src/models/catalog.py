@@ -286,6 +286,13 @@ def persist_checkpoint_elo_metadata(
             settings["elo_std_error"] = float(elo_result.get("elo_std_error"))
         if elo_result.get("elo_ci95") is not None:
             settings["elo_ci95"] = list(elo_result.get("elo_ci95") or [])
+        for key in (
+            "rating_bracketed", "rating_bracket", "rating_range_status",
+            "rating_censored", "elo_lower_bound", "elo_upper_bound",
+            "rating_levels", "rating_games", "probe_only_games",
+        ):
+            if elo_result.get(key) is not None:
+                settings[key] = elo_result.get(key)
     elo_std_error = _safe_float(settings.get("elo_std_error"))
     elo_ci95 = settings.get("elo_ci95")
     ci_low = _safe_float(elo_ci95[0]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None

@@ -51,6 +51,7 @@ from src.evaluation.central_inference import CentralInferenceSession, snapshot_m
 from src.evaluation.elo_rating import (
     elo_fit_diagnostics as _elo_fit_diagnostics,
     local_performance_rating as _local_performance_rating,
+    nearest_level_rating as _nearest_level_rating,
     performance_rating as _performance_rating,
 )
 from src.evaluation.elo_schedule import AdaptiveEloSchedule, build_stockfish_elo_levels
@@ -1410,10 +1411,10 @@ class EloEstimator:
         worker_counts = list(stats.get("worker_game_counts", []) or [])
         if worker_counts and bool(self.elo_config.get("elo_print_worker_summary", False)):
             print(f"  Elo workers: {_format_worker_game_counts(worker_counts)}")
-        if result.get("fit_warning"):
+        if result.get("calibration_warning"):
             print(
-                "  Warning: ladder results are more inconsistent than the Elo curve expects; "
-                f"uncertainty inflated x{math.sqrt(float(result.get('elo_overdispersion', 1.0))):.2f}."
+                "  Note: Stockfish levels have a flatter/steeper score curve than textbook Elo "
+                "at this time control; the reported rating uses the local 50% level."
             )
 
     # -----------------------------------------------------------------------
@@ -1598,10 +1599,13 @@ class EloEstimator:
         )
         print(
             "  Info: Adaptive Elo ladder enabled: "
-            f"levels={levels}, initial_budget={max_total_games}, hard_cap={hard_max_total_games}, "
+            f"{len(levels)} candidates in SF {min(levels)}-{max(levels)}, "
+            f"initial_budget={max_total_games}, hard_cap={hard_max_total_games}, "
             f"probe={probe_games_cfg}, "
             f"focus>={focus_games_cfg}/selected level, then precision rounds"
         )
+        if bool(self.elo_config.get("elo_verbose_adaptive", False)):
+            print(f"  Info: Elo candidate levels: {levels}")
         if bool(self.elo_config.get("paired_openings_enabled", True)):
             print(
                 "  Info: Elo openings: paired colors, "
@@ -1726,6 +1730,14 @@ class EloEstimator:
                             )
                 if schedule.should_stop_probing(wave_levels):
                     break
+                next_levels = schedule.next_probe_levels()
+                if next_levels:
+                    direction = schedule.probe_direction()
+                    direction_text = "upward" if direction > 0 else "downward" if direction < 0 else "around estimate"
+                    print(
+                        "  Adaptive Elo: 50% rating bracket not found; "
+                        f"expanding {direction_text} to levels {next_levels}."
+                    )
 
             focus_levels = schedule.select_rating_levels()
             if focus_levels and bool(self.elo_config.get("elo_verbose_adaptive", False)):
@@ -1858,9 +1870,14 @@ class EloEstimator:
 
         elapsed = time.perf_counter() - t0
         rating_opponent_elos, rating_scores = schedule.rating_observations()
-        estimated_elo = _performance_rating(rating_opponent_elos, rating_scores)
-        fit_diagnostics = _elo_fit_diagnostics(rating_opponent_elos, rating_scores, estimated_elo)
-        elo_se = fit_diagnostics.get("standard_error")
+        curve_elo = _performance_rating(rating_opponent_elos, rating_scores)
+        fit_diagnostics = _elo_fit_diagnostics(rating_opponent_elos, rating_scores, curve_elo)
+        estimated_elo, elo_se, local_level, local_games = _nearest_level_rating(
+            rating_opponent_elos,
+            rating_scores,
+        )
+        bracket_status = schedule.bracket_status()
+        bracket_lower, bracket_upper = schedule.rating_bracket()
         elo_ci95 = None
         if estimated_elo is not None and elo_se is not None:
             elo_ci95 = [round(estimated_elo - 1.96 * elo_se), round(estimated_elo + 1.96 * elo_se)]
@@ -1886,7 +1903,27 @@ class EloEstimator:
             "hard_max_total_games": int(hard_max_total_games),
             "elo_overdispersion": round(float(fit_diagnostics.get("overdispersion", 1.0)), 3),
             "fit_warning": bool(fit_diagnostics.get("fit_warning", False)),
+            "calibration_warning": bool(fit_diagnostics.get("calibration_warning", False)),
+            "rating_method": "nearest_50pct_stockfish_level",
+            "local_rating_level": local_level,
+            "local_rating_games": local_games,
+            "elo_curve_estimate": round(curve_elo) if curve_elo is not None else None,
+            "rating_bracketed": bracket_status == "bracketed",
+            "rating_bracket": (
+                [int(bracket_lower), int(bracket_upper)]
+                if bracket_lower is not None and bracket_upper is not None
+                else None
+            ),
+            "rating_range_status": bracket_status,
+            "rating_censored": bracket_status in {
+                "above_stockfish_range",
+                "below_stockfish_range",
+            },
         }
+        if bracket_status == "above_stockfish_range":
+            result["elo_lower_bound"] = int(max(levels))
+        elif bracket_status == "below_stockfish_range":
+            result["elo_upper_bound"] = int(min(levels))
         model_se = fit_diagnostics.get("model_standard_error")
         if model_se is not None:
             result["elo_model_std_error"] = round(float(model_se), 1)

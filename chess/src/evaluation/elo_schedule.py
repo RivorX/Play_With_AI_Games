@@ -10,9 +10,8 @@ import math
 from collections.abc import Iterable
 
 from src.evaluation.elo_rating import (
-    elo_fit_diagnostics,
     expected_score,
-    performance_rating,
+    nearest_level_rating,
 )
 
 
@@ -45,6 +44,10 @@ def build_stockfish_elo_levels(
         center = None
     if center is not None and math.isfinite(center):
         center = max(float(minimum), min(float(maximum), center))
+        # A stored estimate such as 1906 is only a scheduling hint. Using it as
+        # a literal UCI level created redundant pairs such as 1800/1806 and
+        # 2000/2006, splitting evidence between indistinguishable opponents.
+        center = float(int(round(center / 100.0)) * 100)
         # Dense local opponents give much more information than another sweep
         # over saturated 0%/100% levels. Wider offsets still recover if strength
         # changed substantially since the previous checkpoint measurement.
@@ -73,7 +76,10 @@ class AdaptiveEloSchedule:
         self.probe_games = max(2, int(probe_games))
         self.focus_games = max(self.probe_games, int(focus_games))
         self.extra_round = max(2, int(extra_round))
-        self.target_focus = max(1, int(self.config.get("adaptive_target_focus_levels", 4) or 4))
+        self.target_focus = max(
+            1 if len(self.levels) == 1 else 2,
+            int(self.config.get("adaptive_target_focus_levels", 4) or 4),
+        )
         self.high_skip = float(self.config.get("adaptive_skip_high_score", 0.92) or 0.92)
         self.low_stop = float(self.config.get("adaptive_stop_low_score", 0.08) or 0.08)
         self.focus_min = float(self.config.get("adaptive_focus_min_score", 0.20) or 0.20)
@@ -172,9 +178,88 @@ class AdaptiveEloSchedule:
         return order
 
     def probe_waves(self):
-        order = self.probe_order
-        for start in range(0, len(order), self.probe_levels_per_wave):
-            yield order[start : start + self.probe_levels_per_wave]
+        while True:
+            levels = self.next_probe_levels()
+            if not levels:
+                return
+            yield levels
+
+    def _score_sides(self) -> tuple[list[int], list[int]]:
+        played = self.played_levels()
+        at_or_above = [level for level in played if self._stable_score(level) >= 0.5]
+        at_or_below = [level for level in played if self._stable_score(level) <= 0.5]
+        return at_or_above, at_or_below
+
+    def has_rating_bracket(self) -> bool:
+        """Whether played opponents place the model on both sides of 50%."""
+        at_or_above, at_or_below = self._score_sides()
+        return bool(at_or_above and at_or_below)
+
+    def rating_bracket(self) -> tuple[int | None, int | None]:
+        """Return the most informative >=50% and <=50% opponent levels."""
+        at_or_above, at_or_below = self._score_sides()
+        if not at_or_above or not at_or_below:
+            return None, None
+        center = self.current_rating()
+        if center is None:
+            center = self.initial_elo
+        if center is None:
+            center = 0.5 * (min(self.levels) + max(self.levels))
+        lower = min(at_or_above, key=lambda level: (abs(float(level) - center), -level))
+        upper = min(at_or_below, key=lambda level: (abs(float(level) - center), level))
+        return int(lower), int(upper)
+
+    def probe_direction(self) -> int:
+        """Return +1 above the probed range, -1 below it, else 0."""
+        at_or_above, at_or_below = self._score_sides()
+        if at_or_above and not at_or_below:
+            return 1
+        if at_or_below and not at_or_above:
+            return -1
+        return 0
+
+    def bracket_status(self) -> str:
+        if self.has_rating_bracket():
+            return "bracketed"
+        played = self.played_levels()
+        if not played:
+            return "unprobed"
+        direction = self.probe_direction()
+        if direction > 0 and max(self.levels) in played:
+            return "above_stockfish_range"
+        if direction < 0 and min(self.levels) in played:
+            return "below_stockfish_range"
+        return "unbracketed"
+
+    def next_probe_levels(self) -> list[int]:
+        """Choose the next wave around the rating, expanding toward 50% evidence."""
+        played = set(self.played_levels())
+        unplayed = [level for level in self.levels if level not in played]
+        if not unplayed:
+            return []
+        count = min(self.probe_levels_per_wave, len(unplayed))
+        if not played:
+            return self.probe_order[:count]
+
+        direction = self.probe_direction()
+        center = self.current_rating()
+        if center is None:
+            center = self.initial_elo
+        if center is None:
+            center = 0.5 * (min(self.levels) + max(self.levels))
+
+        if direction > 0:
+            directional = [level for level in unplayed if level > max(played)]
+            directional.sort(key=lambda level: (abs(float(level) - center), level))
+        elif direction < 0:
+            directional = [level for level in unplayed if level < min(played)]
+            directional.sort(key=lambda level: (abs(float(level) - center), -level))
+        else:
+            directional = sorted(
+                unplayed,
+                key=lambda level: (abs(float(level) - center), level),
+            )
+        return directional[:count]
 
     def _build_level_tasks(self, level: int, count: int) -> list[GameTask]:
         game_index = max(0, self.scheduled_by_level.get(int(level), 0))
@@ -225,13 +310,12 @@ class AdaptiveEloSchedule:
 
     def should_stop_probing(self, wave_levels: Iterable[int]) -> bool:
         enough = self.useful_candidate_count() >= self.target_focus
-        if self.initial_elo is not None and enough:
+        if enough and self.has_rating_bracket():
             return True
-        return enough and any(
-            self.summarize(self.scores_by_level.get(int(level), []))["total"] > 0
-            and self.score(level) <= self.low_stop
-            for level in sorted(int(level) for level in wave_levels)
-        )
+        # At an engine boundary there is nowhere else to probe. The caller will
+        # report the result as range-censored instead of pretending it is a
+        # normally bracketed point estimate.
+        return not self.next_probe_levels()
 
     def rating_observations(self) -> tuple[list[float], list[float]]:
         if not self.rating_levels:
@@ -248,12 +332,13 @@ class AdaptiveEloSchedule:
 
     def current_rating(self) -> float | None:
         opponents, scores = self.rating_observations()
-        return performance_rating(opponents, scores)
+        rating, _, _, _ = nearest_level_rating(opponents, scores)
+        return rating
 
     def current_standard_error(self) -> float | None:
         opponents, scores = self.rating_observations()
-        rating = performance_rating(opponents, scores)
-        return elo_fit_diagnostics(opponents, scores, rating).get("standard_error")
+        _, standard_error, _, _ = nearest_level_rating(opponents, scores)
+        return standard_error
 
     def precise_enough(self) -> bool:
         _, scores = self.rating_observations()
@@ -302,7 +387,16 @@ class AdaptiveEloSchedule:
             selected.extend(extras[: max(0, self.target_focus - len(selected))])
         if not selected and candidates:
             selected = sorted(candidates, key=self._focus_sort_key)[:1]
-        self.rating_levels = selected[: self.target_focus]
+        lower, upper = self.rating_bracket()
+        required = []
+        for level in (lower, upper):
+            if level is not None and level not in required:
+                required.append(level)
+        ordered = required + [level for level in selected if level not in required]
+        self.rating_levels = sorted(
+            ordered[: self.target_focus],
+            key=self._focus_sort_key,
+        )
         return list(self.rating_levels)
 
     def focus_tasks(self) -> list[GameTask]:
@@ -329,7 +423,10 @@ class AdaptiveEloSchedule:
         candidates = [
             level for level in self.rating_levels if self.low_stop < self._stable_score(level) < self.high_skip
         ] or list(self.rating_levels) or self.played_levels()
-        return sorted(candidates, key=self._focus_sort_key)[: self.target_focus]
+        # Once the crossing is bracketed, every extra pair belongs at the most
+        # informative near-50% level. Repeating both neighbours only increases
+        # cost without tightening the local calibration used for the result.
+        return sorted(candidates, key=self._focus_sort_key)[:1]
 
     def precision_tasks(self) -> tuple[list[int], list[GameTask]]:
         levels = self.precision_levels()

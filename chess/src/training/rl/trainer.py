@@ -38,19 +38,23 @@ from src.models.data.se_cnn_v9.helpers import (
     build_hflip_inverse_index_map,
     move_to_index,
 )
-from src.mcts.q_delta import USEFUL_SEARCH_Q_DELTA_MIN
+from src.mcts.q_delta import (
+    RELIABLE_POLICY_TARGET_GAP_MIN,
+    RELIABLE_POLICY_TARGET_TOP1_MIN,
+    USEFUL_SEARCH_Q_DELTA_MIN,
+)
 from src.inference.shared_memory import create_shared_inference_buffer
 
 
 _HFLIP_INV_INDEX_MAP = None
 _HFLIP_FWD_INDEX_MAP = None
-# A soft completed-Q target preserves useful alternatives, but by itself it
-# does not guarantee that a higher-Q MCTS correction overtakes the learner's
-# old top move. Keep a bounded ranking term for that exact failure mode.
-_POLICY_CORRECTION_RANK_MARGIN = 0.15
+# CE learns the complete soft Gumbel target, but a deeply wrong prior can lower
+# KL without ever changing its top move. This bounded term acts only on measured
+# higher-Q search corrections and is normalized by every policy row, preventing
+# the correction cohort from taking over the gradient as it did in RL56.
+_POLICY_CORRECTION_RANK_MARGIN = 0.10
+_POLICY_CORRECTION_RANK_WEIGHT = 0.25
 _POLICY_CORRECTION_Q_DELTA_FULL_STRENGTH = 0.20
-_POLICY_CORRECTION_SHARPEN_Q_DELTA_MIN = 0.04
-_POLICY_CORRECTION_SHARPEN_MAX_MIX = 0.40
 
 
 _TRANSIENT_CUDA_ERROR_MARKERS = (
@@ -258,24 +262,6 @@ def _build_eval_mcts_config(config):
     rl_config['eval_mcts_dynamic_budget_enabled'] = False
     eval_config['reinforcement_learning'] = rl_config
     return eval_config
-
-
-def resolve_policy_correction_rank_loss_weight(config):
-    """Resolve RL49's iteration-level 0 -> target correction-rank warm-up."""
-    rl_cfg = (config or {}).get("reinforcement_learning", {}) or {}
-    target = max(0.0, float(rl_cfg.get("policy_correction_rank_weight", 0.25)))
-    warmup_iterations = max(
-        0,
-        int(rl_cfg.get("policy_correction_rank_warmup_iterations", 4) or 0),
-    )
-    iteration = max(1, int(rl_cfg.get("current_iteration", 1) or 1))
-    if warmup_iterations <= 1:
-        return target
-    progress = max(
-        0.0,
-        min(1.0, float(iteration - 1) / float(warmup_iterations - 1)),
-    )
-    return target * progress
 
 
 def _resolve_eval_central_server_count(config, workers):
@@ -1169,7 +1155,7 @@ def _start_eval_central_runtime(
     device,
     num_games,
     *,
-    verbose=True,
+    verbose=False,
     ready_callback=None,
 ):
     """Start one reusable GPU inference server for all stages of an eval funnel."""
@@ -1347,7 +1333,7 @@ def _refresh_eval_central_runtime(
     model2,
     config,
     *,
-    verbose=True,
+    verbose=False,
     ready_callback=None,
 ):
     """Replace weights while preserving compiled eval models and GPU process."""
@@ -1481,7 +1467,7 @@ def _evaluate_models_with_central_inference(
     use_mcts_model2=True,
     stop_event=None,
     show_progress=True,
-    verbose=True,
+    verbose=False,
     runtime_ready_callback=None,
 ):
     owns_runtime = central_runtime is None
@@ -1992,73 +1978,6 @@ def _wdl_targets_from_final_outcome(target_scalar):
     return torch.stack((target_win, target_draw, target_loss), dim=1)
 
 
-def _apply_wdl_label_smoothing(target_wdl, smoothing):
-    smoothing = max(0.0, min(0.30, float(smoothing or 0.0)))
-    if smoothing <= 0.0:
-        return target_wdl
-    off_value = smoothing / max(1, target_wdl.size(1) - 1)
-    return target_wdl * (1.0 - smoothing) + (1.0 - target_wdl) * off_value
-
-
-def _value_error_focus_weights(
-    base_weights,
-    value_scalar,
-    priority_targets,
-    *,
-    focus_fraction=0.25,
-    max_multiplier=1.50,
-    min_abs_error=0.05,
-):
-    """Raise value-loss weight for the largest current supervised errors.
-
-    The selection is batch-local and detached from autograd.  This gives the
-    trainer a fresh error-prioritized signal without an extra replay inference
-    pass or duplicate samples. ``priority_targets`` must be the same reliable
-    target optimized by the weighted loss. In RL this is the final W/D/L
-    outcome, not the model-generated root-Q auxiliary target.
-    """
-    weights = torch.clamp(base_weights.reshape(-1).float(), min=0.0)
-    focus_mask = torch.zeros_like(weights, dtype=torch.bool)
-    abs_errors = torch.zeros_like(weights)
-    fraction = max(0.0, min(1.0, float(focus_fraction)))
-    multiplier_cap = max(1.0, float(max_multiplier))
-    if fraction <= 0.0 or multiplier_cap <= 1.0 or weights.numel() <= 0:
-        return weights, focus_mask, abs_errors
-
-    with torch.no_grad():
-        valid_mask = torch.isfinite(priority_targets.reshape(-1))
-        clipped_targets = torch.clamp(
-            priority_targets.reshape(-1).float(),
-            -1.0,
-            1.0,
-        )
-        abs_errors[valid_mask] = torch.abs(
-            value_scalar.detach().reshape(-1).float()[valid_mask]
-            - clipped_targets[valid_mask]
-        )
-        candidate_mask = valid_mask & (abs_errors >= max(0.0, float(min_abs_error)))
-        valid_indices = torch.nonzero(candidate_mask, as_tuple=False).reshape(-1)
-        if valid_indices.numel() <= 0:
-            return weights, focus_mask, abs_errors
-        focus_count = min(
-            int(valid_indices.numel()),
-            max(1, int(round(fraction * int(weights.numel())))),
-        )
-        selected_local = torch.topk(
-            abs_errors[valid_indices],
-            k=focus_count,
-            largest=True,
-            sorted=False,
-        ).indices
-        selected = valid_indices[selected_local]
-        focus_mask[selected] = True
-        selected_errors = abs_errors[selected]
-        error_scale = torch.clamp(selected_errors.max(), min=1e-6)
-        relative_error = torch.clamp(selected_errors / error_scale, 0.0, 1.0)
-        weights[selected] *= 1.0 + (multiplier_cap - 1.0) * relative_error
-    return weights, focus_mask, abs_errors
-
-
 def _legal_only_sparse_policy_loss(
     policy_logits,
     policy_indices,
@@ -2130,73 +2049,6 @@ def _weighted_mean(losses, weights):
     return (losses * weights).sum() / weight_total
 
 
-def _sharpen_reliable_policy_corrections(
-    policy_values,
-    policy_mask,
-    correction_mask,
-    search_q_deltas,
-):
-    """Concentrate only high-confidence MCTS corrections toward their winner.
-
-    The regular target remains the complete softened Gumbel distribution. For a
-    full-search correction with a material positive Q gain, blend at most 40%
-    one-hot mass into its already-leading target move. The blend grows smoothly
-    with Q gain, so borderline or missing-Q rows are unchanged.
-    """
-    batch_size = int(policy_values.size(0))
-    if batch_size <= 0:
-        empty_rows = torch.zeros(
-            0,
-            device=policy_values.device,
-            dtype=policy_values.dtype,
-        )
-        return policy_values, correction_mask.bool(), empty_rows, empty_rows
-    normalized = torch.where(
-        policy_mask,
-        torch.clamp(policy_values.float(), min=0.0),
-        torch.zeros_like(policy_values.float()),
-    )
-    target_mass = normalized.sum(dim=1, keepdim=True)
-    normalized = torch.where(
-        target_mass > 0.0,
-        normalized / target_mass.clamp_min(1e-8),
-        normalized,
-    )
-    before_top1 = normalized.max(dim=1).values
-    reliable_mask = (
-        correction_mask
-        & (target_mass.reshape(-1) > 0.0)
-        & torch.isfinite(search_q_deltas)
-        & (search_q_deltas >= float(_POLICY_CORRECTION_SHARPEN_Q_DELTA_MIN))
-    )
-    if not bool(reliable_mask.any().item()):
-        return policy_values, reliable_mask, before_top1, before_top1
-
-    denominator = max(
-        1e-6,
-        float(_POLICY_CORRECTION_Q_DELTA_FULL_STRENGTH)
-        - float(_POLICY_CORRECTION_SHARPEN_Q_DELTA_MIN),
-    )
-    strength = torch.clamp(
-        (
-            search_q_deltas.to(dtype=normalized.dtype)
-            - float(_POLICY_CORRECTION_SHARPEN_Q_DELTA_MIN)
-        )
-        / denominator,
-        min=0.0,
-        max=1.0,
-    )
-    mix = (
-        strength * float(_POLICY_CORRECTION_SHARPEN_MAX_MIX)
-    ).masked_fill(~reliable_mask, 0.0)
-    target_slots = normalized.argmax(dim=1, keepdim=True)
-    sharpened = normalized * (1.0 - mix.unsqueeze(1))
-    sharpened.scatter_add_(1, target_slots, mix.unsqueeze(1))
-    result = torch.where(reliable_mask.unsqueeze(1), sharpened, normalized)
-    after_top1 = result.max(dim=1).values
-    return result.to(dtype=policy_values.dtype), reliable_mask, before_top1, after_top1
-
-
 def _useful_policy_correction_rank_loss(
     legal_log_probs,
     valid_legal_mask,
@@ -2206,13 +2058,7 @@ def _useful_policy_correction_rank_loss(
     search_q_deltas,
     policy_weights,
 ):
-    """Make a reliable MCTS correction the legal-policy winner.
-
-    The normal policy CE still learns the complete softened Gumbel target. This
-    auxiliary only acts when a full search changed the top move and measured a
-    positive Q improvement. Once the target move leads every legal alternative
-    by the small margin, its loss is exactly zero.
-    """
+    """Give a verified MCTS winner a small margin over the best alternative."""
     batch_size = int(legal_log_probs.size(0))
     zero = legal_log_probs.sum() * 0.0
     per_row = torch.zeros(
@@ -2223,16 +2069,9 @@ def _useful_policy_correction_rank_loss(
     if batch_size <= 0 or not bool(correction_mask.any().item()):
         return zero, per_row, torch.zeros_like(correction_mask)
 
-    target_slots = (
-        valid_legal_mask
-        & safe_legal_indices.eq(target_moves.reshape(-1, 1))
-    )
+    target_slots = valid_legal_mask & safe_legal_indices.eq(target_moves.reshape(-1, 1))
     other_slots = valid_legal_mask & ~target_slots
-    valid_rows = (
-        correction_mask
-        & target_slots.any(dim=1)
-        & other_slots.any(dim=1)
-    )
+    valid_rows = correction_mask & target_slots.any(dim=1) & other_slots.any(dim=1)
     if not bool(valid_rows.any().item()):
         return zero, per_row, valid_rows
 
@@ -2244,19 +2083,133 @@ def _useful_policy_correction_rank_loss(
         + strongest_other[valid_rows]
         - target_scores[valid_rows]
     )
-
     q_strength = torch.clamp(
         search_q_deltas.to(dtype=legal_log_probs.dtype)
         / float(_POLICY_CORRECTION_Q_DELTA_FULL_STRENGTH),
         min=0.0,
         max=1.0,
     )
-    effective_weights = (
-        torch.clamp(policy_weights.to(dtype=legal_log_probs.dtype), min=0.0)
-        * q_strength
-    )
-    loss = _weighted_mean(per_row[valid_rows], effective_weights[valid_rows])
+    effective_weights = torch.clamp(
+        policy_weights.to(dtype=legal_log_probs.dtype), min=0.0
+    ) * q_strength
+    # Include every policy row in the denominator. A small correction cohort can
+    # no longer receive the full strength of an independently averaged loss.
+    denominator = torch.clamp(policy_weights.sum(), min=1e-8)
+    loss = (per_row * effective_weights).sum() / denominator
     return loss, per_row, valid_rows
+
+
+def _reliable_sparse_policy_target_mask(policy_values, policy_mask):
+    """Return rows whose normalized soft target has a decisive winner."""
+    batch_size = int(policy_values.size(0))
+    if batch_size <= 0 or policy_values.dim() != 2 or policy_values.size(1) <= 0:
+        return torch.zeros(
+            batch_size,
+            device=policy_values.device,
+            dtype=torch.bool,
+        )
+    values = torch.where(
+        policy_mask,
+        torch.clamp(policy_values.float(), min=0.0),
+        torch.zeros_like(policy_values, dtype=torch.float32),
+    )
+    mass = values.sum(dim=1, keepdim=True)
+    normalized = values / mass.clamp_min(1e-8)
+    top2 = torch.topk(normalized, k=min(2, normalized.size(1)), dim=1).values
+    top1 = top2[:, 0]
+    second = top2[:, 1] if top2.size(1) > 1 else torch.zeros_like(top1)
+    return (
+        (mass.reshape(-1) > 0.0)
+        & (top1 >= float(RELIABLE_POLICY_TARGET_TOP1_MIN))
+        & ((top1 - second) >= float(RELIABLE_POLICY_TARGET_GAP_MIN))
+    )
+
+
+def _search_q_auxiliary_loss(
+    search_q_pred,
+    root_q_targets,
+    search_visits,
+    value_sample_weights,
+    *,
+    reference_visits=320,
+):
+    """Distil the searched *state* value into the auxiliary value head.
+
+    ``best_q`` is an action-value selected with an optimistic max and is not a
+    valid leaf-state evaluator.  The auxiliary head is consumed as a scalar
+    value for the whole position, so its matching target is the MCTS root-Q.
+    Replay value weights remain part of this objective; previously they were
+    accidentally ignored by the search-Q loss.
+    """
+    predictions = search_q_pred.reshape(-1)
+    targets = root_q_targets.reshape(-1).to(dtype=predictions.dtype)
+    visits = search_visits.reshape(-1).to(dtype=predictions.dtype)
+    sample_weights = value_sample_weights.reshape(-1).to(dtype=predictions.dtype)
+    valid_mask = torch.isfinite(targets) & (sample_weights > 0.0)
+    if not valid_mask.any():
+        return predictions.sum() * 0.0, valid_mask, torch.zeros_like(predictions)
+
+    bounded_targets = torch.clamp(targets, -1.0, 1.0)
+    reference_visits = max(1.0, float(reference_visits))
+    visit_confidence = torch.clamp(
+        torch.log1p(torch.clamp(visits, min=0.0)) / math.log1p(reference_visits),
+        min=0.25,
+        max=1.0,
+    )
+    effective_weights = torch.clamp(sample_weights, min=0.0) * visit_confidence
+    loss_rows = F.smooth_l1_loss(
+        predictions[valid_mask],
+        bounded_targets[valid_mask],
+        beta=0.15,
+        reduction="none",
+    )
+    loss = _weighted_mean(loss_rows, effective_weights[valid_mask])
+    return loss, valid_mask, bounded_targets
+
+
+def _value_search_consistency_loss(
+    value_scalar,
+    root_q_targets,
+    search_visits,
+    value_sample_weights,
+    *,
+    reference_visits=320,
+):
+    """Give the production WDL value a small, confidence-weighted search signal.
+
+    Final W/D/L remains the primary target.  A scalar root-Q cannot reconstruct
+    a W/D/L distribution, so this auxiliary constrains only ``P(win)-P(loss)``
+    and never fabricates draw labels from search.
+    """
+    predictions = value_scalar.reshape(-1)
+    targets = root_q_targets.reshape(-1).to(dtype=predictions.dtype)
+    visits = search_visits.reshape(-1).to(dtype=predictions.dtype)
+    sample_weights = value_sample_weights.reshape(-1).to(dtype=predictions.dtype)
+    valid_mask = (
+        torch.isfinite(predictions)
+        & torch.isfinite(targets)
+        & torch.isfinite(visits)
+        & (sample_weights > 0.0)
+    )
+    if not valid_mask.any():
+        return predictions.sum() * 0.0, valid_mask, torch.zeros_like(predictions)
+
+    bounded_targets = torch.clamp(targets, -1.0, 1.0)
+    reference_visits = max(1.0, float(reference_visits))
+    visit_confidence = torch.clamp(
+        torch.log1p(torch.clamp(visits, min=0.0)) / math.log1p(reference_visits),
+        min=0.25,
+        max=1.0,
+    )
+    effective_weights = torch.clamp(sample_weights, min=0.0) * visit_confidence
+    loss_rows = F.smooth_l1_loss(
+        predictions[valid_mask],
+        bounded_targets[valid_mask],
+        beta=0.15,
+        reduction="none",
+    )
+    loss = _weighted_mean(loss_rows, effective_weights[valid_mask])
+    return loss, valid_mask, bounded_targets
 
 
 def train_on_batch_rl(
@@ -2351,27 +2304,19 @@ def train_on_batch_rl(
     orig_q_targets = orig_q_targets.to(device, non_blocking=True).reshape(-1).float()
     policy_kld_targets = policy_kld_targets.to(device, non_blocking=True).reshape(-1).float()
     search_visits = search_visits.to(device, non_blocking=True).reshape(-1).float()
-    effective_policy_mask = policy_mask & (policy_sample_weights.unsqueeze(1) > 0)
+    effective_policy_mask = policy_mask
 
     optimizer.zero_grad(set_to_none=True)
 
     rl_cfg = config.get("reinforcement_learning", {})
-    policy_correction_rank_weight = resolve_policy_correction_rank_loss_weight(config)
     use_amp = config["hardware"].get("use_amp", True)
     amp_dtype = torch.bfloat16 if config["hardware"].get("use_bfloat16", False) else torch.float16
 
-    value_aux_scalar_loss_weight = float(
-        rl_cfg.get("value_aux_scalar_loss_weight", 0.25)
-    )
     moves_left_loss_weight = max(0.0, float(rl_cfg.get("moves_left_loss_weight", 0.05)))
-    search_q_loss_weight = max(0.0, float(rl_cfg.get("search_q_loss_weight", 0.20)))
-    value_error_focus_fraction = max(
+    search_q_loss_weight = max(0.0, float(rl_cfg.get("search_q_loss_weight", 0.0)))
+    value_search_consistency_loss_weight = max(
         0.0,
-        min(1.0, float(rl_cfg.get("value_error_focus_fraction", 0.25))),
-    )
-    value_error_focus_max_multiplier = max(
-        1.0,
-        float(rl_cfg.get("value_error_focus_max_multiplier", 1.50)),
+        float(rl_cfg.get("value_search_consistency_loss_weight", 0.0)),
     )
     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
         policy_logits, value_pred, moves_left_pred, search_q_pred = model(
@@ -2390,23 +2335,20 @@ def train_on_batch_rl(
         target_value_std = torch.tensor(0.0, device=policy_pred.device, dtype=policy_pred.dtype)
 
         policy_rows_mask = effective_policy_mask.any(dim=1)
+        reliable_policy_target_mask = _reliable_sparse_policy_target_mask(
+            policy_values,
+            effective_policy_mask,
+        )
         correction_policy_mask = (
             policy_rows_mask
             & search_changed_top
             & torch.isfinite(search_q_deltas)
             & (search_q_deltas > USEFUL_SEARCH_Q_DELTA_MIN)
+            & reliable_policy_target_mask
         )
-        (
-            policy_training_values,
-            correction_sharpen_mask,
-            correction_target_top1_before,
-            correction_target_top1_after,
-        ) = _sharpen_reliable_policy_corrections(
-            policy_values,
-            effective_policy_mask,
-            correction_policy_mask,
-            search_q_deltas,
-        )
+        # Keep the exact stored Gumbel improved-policy distribution. Direct CE
+        # is the complete policy objective; do not add a second winner-only loss.
+        policy_training_values = policy_values
         if policy_indices.numel() == 0:
             target_moves = torch.zeros(
                 policy_pred.size(0),
@@ -2420,10 +2362,7 @@ def train_on_batch_rl(
                 1,
                 best_sparse_idx,
             ).squeeze(1)
-        policy_effective_weights = torch.clamp(
-            policy_sample_weights.to(dtype=policy_pred.dtype),
-            min=0.0,
-        )
+        policy_effective_weights = policy_rows_mask.to(dtype=policy_pred.dtype)
         if policy_indices.numel() == 0:
             policy_loss_per_row = torch.zeros(
                 policy_pred.size(0),
@@ -2439,60 +2378,6 @@ def train_on_batch_rl(
                 legal_indices,
                 legal_mask,
             )
-
-        target_scalar = _final_outcome_targets(value_targets)
-        target_value_std = target_scalar.std(unbiased=False)
-        if value_pred.dim() == 2 and value_pred.size(1) == 3:
-            hard_target_wdl = _wdl_targets_from_final_outcome(target_scalar)
-            target_wdl = hard_target_wdl
-            target_wdl = _apply_wdl_label_smoothing(
-                target_wdl,
-                rl_cfg.get("value_wdl_label_smoothing", 0.0),
-            )
-
-            value_log_probs = F.log_softmax(value_pred, dim=1)
-            value_ce_loss = -(target_wdl * value_log_probs).sum(dim=1)
-            value_probs = torch.softmax(value_pred, dim=1)
-            value_scalar = value_probs[:, 0] - value_probs[:, 2]
-            value_scalar_aux_loss = F.smooth_l1_loss(
-                value_scalar,
-                target_scalar,
-                reduction="none",
-                beta=0.25,
-            )
-            value_primary_loss_rows = value_ce_loss
-            value_scalar_aux_loss_rows = value_scalar_aux_loss
-            value_pred_std = value_scalar.std(unbiased=False).detach()
-        else:
-            hard_target_wdl = None
-            value_probs = None
-            value_primary_loss_rows = (value_pred.squeeze() - target_scalar) ** 2
-            value_scalar_aux_loss_rows = torch.zeros_like(value_primary_loss_rows)
-            value_scalar = value_pred.squeeze()
-            value_pred_std = value_scalar.std(unbiased=False).detach()
-
-        (
-            effective_value_sample_weights,
-            value_error_focus_mask,
-            value_priority_abs_errors,
-        ) = _value_error_focus_weights(
-            value_sample_weights,
-            value_scalar,
-            target_scalar,
-            focus_fraction=value_error_focus_fraction,
-            max_multiplier=value_error_focus_max_multiplier,
-        )
-
-        if policy_loss_per_row.numel() == 0:
-            policy_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
-        else:
-            policy_weight_total = policy_effective_weights.sum()
-            if float(policy_weight_total.detach().item()) > 0.0:
-                policy_loss = (
-                    policy_loss_per_row * policy_effective_weights
-                ).sum() / policy_weight_total
-            else:
-                policy_loss = policy_loss_per_row.sum() * 0.0
         (
             policy_correction_rank_loss,
             policy_correction_rank_loss_per_row,
@@ -2506,43 +2391,74 @@ def train_on_batch_rl(
             search_q_deltas,
             policy_effective_weights,
         )
+
+        target_scalar = _final_outcome_targets(value_targets)
+        target_value_std = target_scalar.std(unbiased=False)
+        if value_pred.dim() == 2 and value_pred.size(1) == 3:
+            hard_target_wdl = _wdl_targets_from_final_outcome(target_scalar)
+            target_wdl = hard_target_wdl
+
+            value_log_probs = F.log_softmax(value_pred, dim=1)
+            value_ce_loss = -(target_wdl * value_log_probs).sum(dim=1)
+            value_probs = torch.softmax(value_pred, dim=1)
+            value_scalar = value_probs[:, 0] - value_probs[:, 2]
+            value_primary_loss_rows = value_ce_loss
+            value_pred_std = value_scalar.std(unbiased=False).detach()
+        else:
+            hard_target_wdl = None
+            value_probs = None
+            value_primary_loss_rows = (value_pred.squeeze() - target_scalar) ** 2
+            value_scalar = value_pred.squeeze()
+            value_pred_std = value_scalar.std(unbiased=False).detach()
+
+        effective_value_sample_weights = torch.ones_like(
+            value_sample_weights.reshape(-1), dtype=torch.float32
+        )
+        value_error_focus_mask = torch.zeros_like(
+            effective_value_sample_weights, dtype=torch.bool
+        )
+        value_priority_abs_errors = torch.zeros_like(effective_value_sample_weights)
+
+        if policy_loss_per_row.numel() == 0:
+            policy_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
+        else:
+            policy_weight_total = policy_effective_weights.sum()
+            if float(policy_weight_total.detach().item()) > 0.0:
+                policy_loss = (
+                    policy_loss_per_row * policy_effective_weights
+                ).sum() / policy_weight_total
+            else:
+                policy_loss = policy_loss_per_row.sum() * 0.0
         value_primary_loss = _weighted_mean(
             value_primary_loss_rows,
             effective_value_sample_weights,
         )
-        value_scalar_aux_loss = _weighted_mean(
-            value_scalar_aux_loss_rows,
-            effective_value_sample_weights,
+        value_loss = value_primary_loss
+        search_reference_visits = max(
+            192,
+            int(round(
+                float(rl_cfg.get("mcts_simulations", 192) or 192)
+                * float(rl_cfg.get("mcts_dynamic_budget_max_multiplier", 1.0) or 1.0)
+            )),
         )
-        value_loss = (
-            value_primary_loss
-            + value_aux_scalar_loss_weight * value_scalar_aux_loss
+        value_search_consistency_loss, _, _ = _value_search_consistency_loss(
+            value_scalar,
+            root_q_targets,
+            search_visits,
+            value_sample_weights,
+            reference_visits=search_reference_visits,
         )
-        # Search-Q is a separate local target. Never pull the final-result WDL
-        # logits toward a self-generated MCTS estimate.
+        # Keep a separate Q head for diagnostics/distillation. Production MCTS
+        # still consumes only WDL; the small consistency term above is the only
+        # route by which searched state value regularizes that production head.
         root_q_mask = torch.isfinite(root_q_targets)
-        search_q_mask = torch.isfinite(best_q_targets)
-        search_q_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
-        if search_q_mask.any():
-            search_q_values = search_q_pred.reshape(-1)
-            bounded_best_q = torch.clamp(
-                best_q_targets.to(dtype=search_q_values.dtype), -1.0, 1.0
-            )
-            visit_confidence = torch.clamp(
-                torch.log1p(torch.clamp(search_visits, min=0.0)) / math.log1p(192.0),
-                min=0.25,
-                max=1.0,
-            ).to(dtype=search_q_values.dtype)
-            search_q_loss_rows = F.smooth_l1_loss(
-                search_q_values[search_q_mask],
-                bounded_best_q[search_q_mask],
-                beta=0.15,
-                reduction="none",
-            )
-            search_q_loss = _weighted_mean(
-                search_q_loss_rows,
-                visit_confidence[search_q_mask],
-            )
+        search_q_loss, search_q_mask, bounded_root_q = _search_q_auxiliary_loss(
+            search_q_pred,
+            root_q_targets,
+            search_visits,
+            value_sample_weights,
+            reference_visits=search_reference_visits,
+        )
         moves_left_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
         if moves_left_loss_weight > 0.0 and moves_left_pred is not None:
             pred_mlh = moves_left_pred.reshape(-1)
@@ -2572,10 +2488,11 @@ def train_on_batch_rl(
         )
         policy_objective = policy_weight * (
             policy_loss
-            + policy_correction_rank_weight * policy_correction_rank_loss
+            + float(_POLICY_CORRECTION_RANK_WEIGHT) * policy_correction_rank_loss
         )
         value_objective = (
             value_weight * value_loss
+            + value_search_consistency_loss_weight * value_search_consistency_loss
             + moves_left_loss_weight * moves_left_loss
             + search_q_loss_weight * search_q_loss
         )
@@ -2633,16 +2550,12 @@ def train_on_batch_rl(
             .detach()
             .item()
         ) if correction_rank_count > 0 else 0.0
+        # These logits come from the forward that produced this optimizer step.
+        # Keep the cheap batch diagnostic explicitly pre-step; the fixed audit
+        # is the authoritative before/after absorption measurement.
         correction_top1_correct = int(
             (predicted_legal_moves[correction_policy_mask] == target_moves[correction_policy_mask]).sum().item()
         ) if correction_count > 0 else 0
-        correction_sharpen_count = int(correction_sharpen_mask.sum().item())
-        correction_sharpen_top1_before_sum = float(
-            correction_target_top1_before[correction_sharpen_mask].sum().item()
-        ) if correction_sharpen_count > 0 else 0.0
-        correction_sharpen_top1_after_sum = float(
-            correction_target_top1_after[correction_sharpen_mask].sum().item()
-        ) if correction_sharpen_count > 0 else 0.0
         policy_effective_weight_sum = float(policy_effective_weights.sum().detach().item())
         correction_effective_weight_sum = float(
             policy_effective_weights[correction_policy_mask].sum().detach().item()
@@ -2650,11 +2563,7 @@ def train_on_batch_rl(
         value_scalar_f32 = value_scalar.detach().float().reshape(-1)
         search_q_mask_f32 = search_q_mask.detach()
         search_q_pred_f32 = search_q_pred.detach().float().reshape(-1)[search_q_mask_f32]
-        search_q_target_f32 = torch.clamp(
-            best_q_targets.detach().float().reshape(-1)[search_q_mask_f32],
-            -1.0,
-            1.0,
-        )
+        search_q_target_f32 = bounded_root_q.detach().float().reshape(-1)[search_q_mask_f32]
         target_scalar_f32 = target_scalar.detach().float().reshape(-1)
         value_row_count = int(value_scalar_f32.numel())
         value_weight_f32 = effective_value_sample_weights.detach().float().reshape(-1)
@@ -2755,20 +2664,18 @@ def train_on_batch_rl(
         "correction_loss_sum": correction_loss_sum,
         "correction_rank_rows": correction_rank_count,
         "correction_rank_loss_sum": correction_rank_loss_sum,
-        "correction_rank_objective": float(
-            policy_correction_rank_loss.detach().item()
-        ),
-        "correction_rank_weight": float(policy_correction_rank_weight),
+        "correction_rank_objective": float(policy_correction_rank_loss.detach().item()),
+        "correction_rank_weight": float(_POLICY_CORRECTION_RANK_WEIGHT),
         "correction_top1_correct": correction_top1_correct,
-        "correction_sharpen_rows": correction_sharpen_count,
-        "correction_sharpen_top1_before_sum": correction_sharpen_top1_before_sum,
-        "correction_sharpen_top1_after_sum": correction_sharpen_top1_after_sum,
         "effective_weight_sum": policy_effective_weight_sum,
         "correction_effective_weight_sum": correction_effective_weight_sum,
         "value_primary_loss": float(value_primary_loss.detach().item()),
-        "value_scalar_aux_loss": float(value_scalar_aux_loss.detach().item()),
+        "value_search_consistency_loss": float(
+            value_search_consistency_loss.detach().item()
+        ),
         "moves_left_loss": float(moves_left_loss.detach().item()),
         "search_q_loss": float(search_q_loss.detach().item()),
+        "search_q_weight": float(search_q_loss_weight),
         "search_q_rows": int(search_q_mask.sum().item()),
         "search_q_pred_sum": float(search_q_pred_f32.sum().item()),
         "search_q_target_sum": float(search_q_target_f32.sum().item()),
@@ -2836,7 +2743,7 @@ def evaluate_models(
     use_mcts_model2=True,
     stop_event=None,
     show_progress=True,
-    verbose=True,
+    verbose=False,
     runtime_ready_callback=None,
 ):
     config = _build_eval_mcts_config(config)

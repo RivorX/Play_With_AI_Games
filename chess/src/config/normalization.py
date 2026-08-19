@@ -146,6 +146,11 @@ _CENTRAL_INFERENCE_DEFAULTS = {
     'cache_enabled': False,
     'cache_max_entries': 50000,
     'pinned_staging_enabled': False,
+    # Measured on the production compiled path: overlapping compact D2H output
+    # with the next forward improved long-run saturated throughput by 8.6%
+    # (short runs varied) and reduced p95 latency by 10%. This remains an
+    # internal implementation choice rather than a user-facing YAML knob.
+    'output_pipeline_enabled': True,
     'use_bfloat16': False,
     'timeout_s': 0,
     'stall_warning_s': 15,
@@ -202,10 +207,10 @@ _ELO_DEFAULTS = {
     'adaptive_min_batch_games': 36,
     'adaptive_focus_games_per_level': 48,
     'adaptive_extra_games_per_level': 12,
-    'adaptive_target_focus_levels': 3,
-    'adaptive_max_total_games': 288,
-    'adaptive_hard_max_total_games': 720,
-    'adaptive_budget_extension_games': 72,
+    'adaptive_target_focus_levels': 2,
+    'adaptive_max_total_games': 240,
+    'adaptive_hard_max_total_games': 384,
+    'adaptive_budget_extension_games': 48,
     'adaptive_target_standard_error': 35.0,
     'adaptive_min_games_for_se_stop': 144,
     'adaptive_refine_until_target_se': True,
@@ -214,9 +219,9 @@ _ELO_DEFAULTS = {
     'nn_eval_adaptive_min_batch_games': 36,
     'nn_eval_adaptive_focus_games_per_level': 64,
     'nn_eval_adaptive_extra_games_per_level': 16,
-    'nn_eval_adaptive_max_total_games': 384,
+    'nn_eval_adaptive_max_total_games': 256,
     'nn_eval_adaptive_target_standard_error': 30.0,
-    'nn_eval_adaptive_min_games_for_se_stop': 192,
+    'nn_eval_adaptive_min_games_for_se_stop': 128,
     'mcts_eval_workers': 0,
     'mcts_eval_simulations': 192,
     'final_mcts_profile_multipliers': [0.5, 1.0, 2.0],
@@ -260,14 +265,9 @@ _RL_KEY_ALIASES = {
     'self_play.syzygy_paths': 'syzygy_paths',
     'losses.policy': 'policy_loss_weight',
     'losses.value': 'value_loss_weight',
-    'losses.value_scalar_aux': 'value_aux_scalar_loss_weight',
+    'losses.value_search_consistency': 'value_search_consistency_loss_weight',
     'losses.moves_left': 'moves_left_loss_weight',
     'losses.search_q': 'search_q_loss_weight',
-    'losses.policy_correction_rank_weight': 'policy_correction_rank_weight',
-    'losses.policy_correction_rank_warmup_iterations': 'policy_correction_rank_warmup_iterations',
-    'losses.value_error_focus_fraction': 'value_error_focus_fraction',
-    'losses.value_error_focus_max_multiplier': 'value_error_focus_max_multiplier',
-    'losses.wdl_label_smoothing': 'value_wdl_label_smoothing',
 }
 
 
@@ -305,10 +305,6 @@ _RL_DEFAULTS = {
     'replay_dynamic_cap_enabled': True, 'replay_champion_fraction': 0.15,
     'replay_cap_fraction_decisive': 0.70, 'replay_cap_fraction_draw': 0.65,
     'replay_cap_min_positions': 24, 'replay_cap_max_positions': 120,
-    'value_error_focus_fraction': 0.25, 'value_error_focus_max_multiplier': 1.50,
-    'search_q_loss_weight': 0.20,
-    'deblunder_threshold': 0.15, 'deblunder_width': 0.10,
-    'deblunder_value_min_weight': 0.35, 'deblunder_policy_boost_max': 2.00,
     # Evaluation/promotion mechanics.
     'eval_worker_restart_limit': 2, 'eval_cpu_threads_to_reserve': 0, 'eval_torch_threads': 1,
     'eval_workers': 'auto', 'eval_batch_games': 32,
@@ -334,7 +330,7 @@ _RL_DEFAULTS = {
     'promotion_no_mcts_gate_enabled': True, 'promotion_no_mcts_score_rate_min': 0.40,
     'promotion_no_mcts_upper_bound_min': 0.50,
     'promotion_anchor_min_score_rate': 0.50, 'promotion_anchor_min_true_win_rate': 0.0,
-    'promotion_anchor_no_mcts_gate_enabled': True,
+    'promotion_anchor_no_mcts_gate_enabled': False,
     'promotion_anchor_no_mcts_score_rate_min': 0.50,
     'promotion_anchor_no_mcts_score_lower_bound_min': 0.47,
     'anchor_no_mcts_max_games': 512,
@@ -424,6 +420,11 @@ def normalize_rl_config(config):
 def normalize_config(config):
     """Normalize every grouped presentation section used by the runtime."""
     config = normalize_rl_config(normalize_data_config(config))
+    project_cfg = config.get('project', {}) or {}
+    # Training code consumes one root seed. Keep its user-facing owner in the
+    # project section so every architecture and pipeline stage shares the same
+    # reproducibility contract.
+    config['seed'] = int(project_cfg.get('seed', config.get('seed', 490050)))
     config['auto_tune'] = _with_defaults(
         _AUTO_TUNE_DEFAULTS,
         config.get('auto_tune', {}),

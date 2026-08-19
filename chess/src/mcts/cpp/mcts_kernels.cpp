@@ -16,7 +16,7 @@
 
 namespace {
 
-constexpr std::int32_t kApiVersion = 6;
+constexpr std::int32_t kApiVersion = 7;
 
 inline bool valid_size(std::int32_t size) noexcept {
     return size > 0;
@@ -364,8 +364,39 @@ inline bool valid_node(const NativeForest& forest, const std::int32_t node_id) n
     return node_id >= 0 && static_cast<std::size_t>(node_id) < forest.nodes.size();
 }
 
+inline bool valid_edge_span(const NativeForest& forest, const NativeNode& node) noexcept {
+    if (node.edge_count < 0) {
+        return false;
+    }
+    if (node.edge_count == 0) {
+        return node.edge_begin < 0 ||
+               static_cast<std::size_t>(node.edge_begin) <= forest.edges.size();
+    }
+    if (node.edge_begin < 0) {
+        return false;
+    }
+    const auto begin = static_cast<std::size_t>(node.edge_begin);
+    const auto count = static_cast<std::size_t>(node.edge_count);
+    return begin <= forest.edges.size() && count <= forest.edges.size() - begin;
+}
+
+inline bool valid_parent_link(
+    const NativeForest& forest,
+    const NativeNode& node
+) noexcept {
+    if (node.parent < 0) {
+        return true;
+    }
+    if (!valid_node(forest, node.parent)) {
+        return false;
+    }
+    const auto& parent = forest.nodes[static_cast<std::size_t>(node.parent)];
+    return valid_edge_span(forest, parent) &&
+           node.parent_edge >= 0 && node.parent_edge < parent.edge_count;
+}
+
 inline NativeEdge* node_edges(NativeForest& forest, const NativeNode& node) noexcept {
-    if (node.edge_count <= 0 || node.edge_begin < 0) {
+    if (node.edge_count <= 0 || !valid_edge_span(forest, node)) {
         return nullptr;
     }
     return forest.edges.data() + node.edge_begin;
@@ -375,14 +406,14 @@ inline const NativeEdge* node_edges(
     const NativeForest& forest,
     const NativeNode& node
 ) noexcept {
-    if (node.edge_count <= 0 || node.edge_begin < 0) {
+    if (node.edge_count <= 0 || !valid_edge_span(forest, node)) {
         return nullptr;
     }
     return forest.edges.data() + node.edge_begin;
 }
 
 inline double node_value_sum(const NativeForest& forest, const NativeNode& node) noexcept {
-    if (node.parent >= 0 && valid_node(forest, node.parent)) {
+    if (node.parent >= 0 && valid_parent_link(forest, node)) {
         const auto& parent = forest.nodes[static_cast<std::size_t>(node.parent)];
         if (node.parent_edge >= 0 && node.parent_edge < parent.edge_count) {
             return static_cast<double>(
@@ -397,7 +428,7 @@ inline std::int32_t node_visits(
     const NativeForest& forest,
     const NativeNode& node
 ) noexcept {
-    if (node.parent >= 0 && valid_node(forest, node.parent)) {
+    if (node.parent >= 0 && valid_parent_link(forest, node)) {
         const auto& parent = forest.nodes[static_cast<std::size_t>(node.parent)];
         if (node.parent_edge >= 0 && node.parent_edge < parent.edge_count) {
             return forest.edges[
@@ -636,13 +667,31 @@ inline std::int32_t ensure_child(
     const std::int32_t parent_id,
     const std::int32_t local_edge
 ) {
-    auto& parent = forest.nodes[static_cast<std::size_t>(parent_id)];
-    auto& edge = forest.edges[
-        static_cast<std::size_t>(parent.edge_begin + local_edge)
-    ];
-    if (edge.child >= 0) {
-        return edge.child;
+    if (!valid_node(forest, parent_id)) {
+        return -1;
     }
+    auto& parent = forest.nodes[static_cast<std::size_t>(parent_id)];
+    if (
+        !valid_edge_span(forest, parent) ||
+        local_edge < 0 || local_edge >= parent.edge_count
+    ) {
+        return -1;
+    }
+    const auto edge_index = static_cast<std::size_t>(parent.edge_begin + local_edge);
+    auto& edge = forest.edges[edge_index];
+    if (edge.child >= 0) {
+        if (valid_node(forest, edge.child)) {
+            return edge.child;
+        }
+        // A stale child id must never become an unchecked vector index. Repair
+        // the edge in place and rematerialize the child below.
+        edge.child = -1;
+    }
+    // Reserve both parallel node arrays only when a child really needs to be
+    // materialized. Allocation happens before changing either vector's size,
+    // so a failure leaves the forest valid without taxing the common hit path.
+    reserve_geometric(forest.nodes, 1U);
+    reserve_geometric(forest.root_states, 1U);
     NativeNode child;
     child.parent = parent_id;
     child.parent_edge = local_edge;
@@ -812,6 +861,8 @@ MCTS_API std::int32_t mcts_forest_add_node(
         node.root_visits = root_visits;
         node.root_value_sum = root_value_sum;
         node.root_virtual_loss = root_virtual_loss;
+        reserve_geometric(forest->nodes, 1U);
+        reserve_geometric(forest->root_states, 1U);
         forest->nodes.push_back(node);
         forest->root_states.emplace_back();
         return static_cast<std::int32_t>(forest->nodes.size() - 1);
@@ -841,6 +892,7 @@ MCTS_API std::int32_t mcts_forest_set_edges(
         return -2;
     }
     try {
+        reserve_geometric(forest->edges, static_cast<std::size_t>(count));
         auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
         if (node.edge_begin >= 0) {
             return -3;
@@ -848,7 +900,6 @@ MCTS_API std::int32_t mcts_forest_set_edges(
         node.edge_begin = static_cast<std::int32_t>(forest->edges.size());
         node.edge_count = count;
         node.expanded = true;
-        reserve_geometric(forest->edges, static_cast<std::size_t>(count));
         for (std::int32_t index = 0; index < count; ++index) {
             NativeEdge edge;
             edge.prior = priors[index];
@@ -965,9 +1016,9 @@ MCTS_API std::int32_t mcts_forest_select_batch(
             forest->selection_paths.push_back(root_id);
             forest->nodes[static_cast<std::size_t>(root_id)].root_virtual_loss += 1;
             auto node_id = root_id;
-            while (forest->nodes[static_cast<std::size_t>(node_id)].expanded) {
+            while (valid_node(*forest, node_id) && forest->nodes[static_cast<std::size_t>(node_id)].expanded) {
                 const auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
-                if (node.edge_count <= 0) {
+                if (node.edge_count <= 0 || !valid_edge_span(*forest, node)) {
                     break;
                 }
                 const auto& root_state = forest->root_states[static_cast<std::size_t>(root_id)];
@@ -983,8 +1034,15 @@ MCTS_API std::int32_t mcts_forest_select_batch(
                 ];
                 edge.virtual_loss = static_cast<std::int16_t>(edge.virtual_loss + 1);
                 const auto child_id = ensure_child(*forest, node_id, selected);
+                if (!valid_node(*forest, child_id)) {
+                    edge.virtual_loss = static_cast<std::int16_t>(edge.virtual_loss - 1);
+                    return -4;
+                }
                 forest->selection_paths.push_back(child_id);
                 node_id = child_id;
+            }
+            if (!valid_node(*forest, node_id)) {
+                return -5;
             }
             selection.path_count = static_cast<std::int32_t>(
                 forest->selection_paths.size()
@@ -1019,6 +1077,7 @@ MCTS_API std::int32_t mcts_forest_expand(
         return -1;
     }
     try {
+        reserve_geometric(forest->edges, static_cast<std::size_t>(count));
         auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
         if (node.expanded) {
             return 1;
@@ -1027,7 +1086,6 @@ MCTS_API std::int32_t mcts_forest_expand(
         node.expanded = true;
         node.edge_begin = static_cast<std::int32_t>(forest->edges.size());
         node.edge_count = count;
-        reserve_geometric(forest->edges, static_cast<std::size_t>(count));
         for (std::int32_t index = 0; index < count; ++index) {
             NativeEdge edge;
             edge.prior = priors[index];
@@ -1114,6 +1172,9 @@ MCTS_API std::int32_t mcts_forest_backup_batch(
     ) {
         return -1;
     }
+    // Validate every path before mutating any visit/value counters. Besides
+    // turning native corruption into a recoverable Python exception, this
+    // avoids leaving a half-backed-up batch when one path is invalid.
     for (std::int32_t slot = 0; slot < count; ++slot) {
         const auto selection_id = selection_ids[slot];
         if (
@@ -1130,6 +1191,22 @@ MCTS_API std::int32_t mcts_forest_backup_batch(
         ) {
             return -3;
         }
+        for (std::int32_t offset = 0; offset < selection.path_count; ++offset) {
+            const auto node_id = forest->selection_paths[
+                static_cast<std::size_t>(selection.path_begin + offset)
+            ];
+            if (!valid_node(*forest, node_id)) {
+                return -4;
+            }
+            const auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
+            if (!valid_parent_link(*forest, node)) {
+                return -5;
+            }
+        }
+    }
+    for (std::int32_t slot = 0; slot < count; ++slot) {
+        const auto selection_id = selection_ids[slot];
+        auto& selection = forest->selections[static_cast<std::size_t>(selection_id)];
         double value = values[slot];
         for (std::int32_t offset = selection.path_count - 1; offset >= 0; --offset) {
             const auto node_id = forest->selection_paths[
@@ -1298,6 +1375,9 @@ MCTS_API std::int32_t mcts_forest_compact(
         std::vector<std::int32_t> compact_parent_edges;
 
         auto enqueue = [&](const std::int32_t old_id) -> std::int32_t {
+            if (!valid_node(*forest, old_id)) {
+                return -1;
+            }
             auto& mapped = old_to_new[old_id];
             if (mapped >= 0) {
                 return mapped;
@@ -1317,14 +1397,22 @@ MCTS_API std::int32_t mcts_forest_compact(
                 return -3;
             }
             is_root[static_cast<std::size_t>(root_id)] = 1;
-            enqueue(root_id);
+            if (enqueue(root_id) < 0) {
+                return -4;
+            }
         }
 
         std::size_t cursor = 0;
         while (cursor < pending.size()) {
             const auto old_id = pending[cursor++];
+            if (!valid_node(*forest, old_id)) {
+                return -5;
+            }
             const auto new_id = old_to_new[old_id];
             const auto& old_node = forest->nodes[static_cast<std::size_t>(old_id)];
+            if (!valid_edge_span(*forest, old_node)) {
+                return -6;
+            }
             NativeNode new_node = old_node;
             new_node.edge_begin = (
                 old_node.edge_count > 0
@@ -1346,6 +1434,9 @@ MCTS_API std::int32_t mcts_forest_compact(
                 if (edge.child >= 0 && valid_node(*forest, edge.child)) {
                     const auto old_child = edge.child;
                     const auto new_child = enqueue(old_child);
+                    if (new_child < 0) {
+                        return -7;
+                    }
                     edge.child = new_child;
                     if (
                         is_root[static_cast<std::size_t>(old_child)] == 0 &&

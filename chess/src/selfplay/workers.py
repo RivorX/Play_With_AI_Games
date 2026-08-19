@@ -1,9 +1,11 @@
 """Multiprocessing workers and result streaming for RL self-play."""
 
 import pickle
+import random
 import threading
 import time
 
+import numpy as np
 import torch
 
 from src.inference.central import (
@@ -21,6 +23,17 @@ from src.mcts.search import (
     _resolve_replay_max_policy_targets,
 )
 from src.selfplay.engine import SelfPlayEngine
+
+
+def _seed_selfplay_worker(rank, task_seed):
+    """Seed opening, Gumbel and framework RNGs for one persistent task."""
+    worker_seed = int(task_seed) + int(rank) * 100_003
+    random.seed(worker_seed)
+    np.random.seed(worker_seed % (2 ** 32))
+    torch.manual_seed(worker_seed)
+    # Workers are intentionally CPU-only. Calling a CUDA RNG API here may
+    # initialize a CUDA context in every process and duplicate driver memory.
+    return worker_seed
 
 
 def _build_worker_logger(rank, worker_verbose):
@@ -158,8 +171,13 @@ def _play_games_with_engine(
         streamed_positions = 0
         streamed_games = 0
 
-        def _emit_completed_chunk(chunk_positions, chunk_lengths):
+        def _emit_completed_chunk(chunk_positions, chunk_lengths, chunk_job_ids):
             nonlocal streamed_positions, streamed_games
+            if len(chunk_job_ids) != len(chunk_lengths):
+                raise RuntimeError(
+                    "streamed self-play chunk lost its game identity: "
+                    f"{len(chunk_job_ids)} ids for {len(chunk_lengths)} games"
+                )
             streamed_positions += len(chunk_positions)
             streamed_games += len(chunk_lengths)
             if stream_results_to_queue and result_queue is not None:
@@ -172,6 +190,7 @@ def _play_games_with_engine(
                         max_policy_targets=replay_max_policy_targets,
                     ),
                     'game_lengths': list(chunk_lengths),
+                    'game_job_ids': list(chunk_job_ids),
                     'stats': {},
                 })
 
@@ -202,6 +221,7 @@ def _play_games_with_engine(
                     max_policy_targets=replay_max_policy_targets,
                 ),
                 'game_lengths': list(game_lengths),
+                'game_job_ids': [],
                 'stats': stats,
             })
         else:
@@ -388,6 +408,14 @@ def persistent_selfplay_worker(
                         if value is not None
                     })
                     rl_cfg = config.get('reinforcement_learning', {})
+                worker_seed = _seed_selfplay_worker(
+                    rank,
+                    runtime_overrides.get(
+                        'self_play_task_seed',
+                        config.get('seed', 490050),
+                    ),
+                )
+                wlog(f"RNG seed for task: {worker_seed}")
                 if central_inference_enabled and central_debug_enabled:
                     opponent_payload_preview = task.get('opponent_payload') or {}
                     preview_labels = sorted({
@@ -535,6 +563,11 @@ def run_selfplay_worker(
     wlog = _build_worker_logger(rank, worker_verbose)
 
     try:
+        worker_seed = _seed_selfplay_worker(
+            rank,
+            rl_cfg.get('self_play_task_seed', config.get('seed', 490050)),
+        )
+        wlog(f"RNG seed for task: {worker_seed}")
         device = _configure_selfplay_worker_runtime(config, device_id)
         wlog(f"Starting on {device}")
 

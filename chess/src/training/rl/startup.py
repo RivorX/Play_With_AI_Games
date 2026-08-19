@@ -462,7 +462,7 @@ def plan_rl_startup(
     if start_mode is None:
         if prefer_fresh_il:
             default_choice = "1"
-            default_hint = "RL49 quality experiment: NEW from canonical IL with empty replay"
+            default_hint = "RL quality experiment: NEW from canonical IL with empty replay"
         else:
             default_choice, default_hint = _suggest_start_mode_default(best_model_rl_path, rl_dir)
         start_mode = _choose_start_mode(
@@ -518,8 +518,10 @@ def plan_rl_startup(
         selected_checkpoint = _choose_checkpoint_path(checkpoint_catalog)
 
     if start_mode in {"resume", "transfer"} and selected_checkpoint is None:
-        print("WARNING: No valid checkpoint available. Falling back to new RL training.")
-        start_mode = "new"
+        raise RuntimeError(
+            f"No valid checkpoint was selected for RL startup mode {start_mode!r}. "
+            "Choose NEW explicitly if a fresh run is intended."
+        )
 
     selected_entry = _find_checkpoint_entry(checkpoint_catalog, selected_checkpoint)
     selected_checkpoint_label = None
@@ -558,8 +560,9 @@ def apply_rl_startup_plan(
     best_win_rate = 0.0
 
     if start_mode in {"resume", "transfer"} and selected_checkpoint is None:
-        print("WARNING: Startup plan has no checkpoint. Falling back to new RL training.")
-        start_mode = "new"
+        raise RuntimeError(
+            f"RL startup mode {start_mode!r} requires an explicit compatible checkpoint."
+        )
 
     if start_mode in {"resume", "transfer"} and selected_checkpoint is not None:
         print(f"\nLoading startup checkpoint: {selected_checkpoint_label}")
@@ -574,21 +577,7 @@ def apply_rl_startup_plan(
                     model_state,
                     target_keys=set(model.state_dict()),
                 )
-                try:
-                    model.load_state_dict(model_state)
-                except RuntimeError:
-                    report = transfer_matching_weights(model, checkpoint)
-                    allowed_missing = (
-                        'search_q_fc.',
-                    )
-                    if report.get('shape_mismatch') or any(
-                        not str(key).startswith(allowed_missing)
-                        for key in report.get('missing_keys', [])
-                    ):
-                        raise
-                    print(
-                        "Resume upgrade: initialized the optional search-Q head."
-                    )
+                model.load_state_dict(model_state)
 
                 checkpoint_epoch = _safe_int(checkpoint.get("epoch"))
                 if checkpoint_epoch is not None:
@@ -600,35 +589,26 @@ def apply_rl_startup_plan(
 
                 if optimizer is not None:
                     optimizer_state = checkpoint.get("optimizer_state_dict")
-                    if isinstance(optimizer_state, dict):
-                        try:
-                            optimizer.load_state_dict(optimizer_state)
-                        except ValueError as exc:
-                            print(
-                                "Resume warning: optimizer_state_dict is incompatible with the "
-                                f"current RL optimizer groups; optimizer reset. ({exc})"
-                            )
-                    else:
-                        print("Resume warning: optimizer_state_dict not found; optimizer reset.")
+                    if not isinstance(optimizer_state, dict):
+                        raise KeyError("missing optimizer_state_dict for full resume")
+                    optimizer.load_state_dict(optimizer_state)
 
                 if scaler is not None and scaler.is_enabled():
                     scaler_state = checkpoint.get("scaler_state_dict")
-                    if isinstance(scaler_state, dict):
-                        scaler.load_state_dict(scaler_state)
+                    if not isinstance(scaler_state, dict):
+                        raise KeyError("missing scaler_state_dict for AMP resume")
+                    scaler.load_state_dict(scaler_state)
 
                 print(
                     f"Resume loaded: next_iteration={start_iteration + 1}, "
                     f"best_win_rate={best_win_rate:.2%}"
                 )
             except Exception as exc:
-                print(f"WARNING: Full resume failed ({exc})")
-                print("Falling back to transfer mode (matching tensors only).")
-                report = transfer_matching_weights(model, checkpoint)
-                transfer_match_ratio = report.get("match_ratio")
-                _print_transfer_report(report)
-                start_mode = "transfer"
-                start_iteration = 0
-                best_win_rate = 0.0
+                raise RuntimeError(
+                    "Full RL resume failed. Resume is not interchangeable with "
+                    "transfer because transfer resets optimizer, schedule and replay "
+                    "state; select TRANSFER explicitly if that is intended."
+                ) from exc
         else:
             report = transfer_matching_weights(model, checkpoint)
             transfer_match_ratio = report.get("match_ratio")

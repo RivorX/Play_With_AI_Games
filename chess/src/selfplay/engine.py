@@ -9,20 +9,21 @@ import torch
 from src.game import backend as chess
 from src.mcts.q_delta import (
     Q_DELTA_HIST_BINS as _Q_DELTA_HIST_BINS,
+    RELIABLE_POLICY_TARGET_GAP_MIN,
+    RELIABLE_POLICY_TARGET_TOP1_MIN,
+    policy_target_is_reliable,
     q_delta_histogram as _q_delta_histogram,
     q_delta_percentile_from_histogram as _q_delta_percentile_from_histogram,
 )
 from src.mcts.search import (
     MultiGameBatchMCTS,
     _EMPTY_HISTORY_TENSOR,
-    _POLICY_UPTAKE_LOW_THRESHOLD,
     _REPLAY_SOURCE_UNKNOWN,
     _SELFPLAY_SELFPLAY_OPENING_LINES,
     _board_position_key,
     _build_history_tensor_from_encoded,
     _build_sparse_policy_target_from_visits,
     _get_syzygy_oracle,
-    _policy_uptake_weight,
     _record_position_count,
     _replay_source_code,
     _resolve_replay_max_policy_targets,
@@ -157,26 +158,10 @@ class SelfPlayEngine:
         self.replay_cap_min_positions = int(rl_cfg.get('replay_cap_min_positions', 16))
         self.replay_cap_max_positions = int(rl_cfg.get('replay_cap_max_positions', 120))
         self.policy_target_max_moves = _resolve_replay_max_policy_targets(config)
-        self.deblunder_threshold = max(
-            0.0, float(rl_cfg.get('deblunder_threshold', 0.15))
-        )
-        self.deblunder_width = max(
-            1e-6, float(rl_cfg.get('deblunder_width', 0.10))
-        )
-        self.deblunder_value_min_weight = max(
-            0.0, min(1.0, float(rl_cfg.get('deblunder_value_min_weight', 0.35)))
-        )
-        self.deblunder_policy_boost_max = max(
-            1.0, float(rl_cfg.get('deblunder_policy_boost_max', 1.35))
-        )
-        self.mcts_good_target_min_top_visit_prob = 0.55
-        self.mcts_good_target_min_visit_gap = 0.12
+        self.mcts_good_target_min_top_visit_prob = RELIABLE_POLICY_TARGET_TOP1_MIN
+        self.mcts_good_target_min_visit_gap = RELIABLE_POLICY_TARGET_GAP_MIN
         self.store_frozen_best_positions = bool(
             rl_cfg.get('self_play_store_frozen_best_positions', True)
-        )
-        self.replay_importance_top_fraction = max(
-            0.0,
-            min(1.0, float(rl_cfg.get('replay_importance_top_fraction', 0.70))),
         )
         self.max_positions_per_game = max(
             0,
@@ -348,6 +333,8 @@ class SelfPlayEngine:
         central_extra_metrics = (
             'central_inference_shared_requests',
             'central_inference_shared_bytes_avoided',
+            'central_inference_compact_policy_requests',
+            'central_inference_compact_output_bytes_avoided',
             'central_inference_shared_slot_wait_time',
             'central_inference_cache_queries',
             'central_inference_cache_bypassed_positions',
@@ -535,13 +522,6 @@ class SelfPlayEngine:
         if label == "best":
             return bool(self.store_frozen_best_positions)
         return False
-
-    @staticmethod
-    def _candidate_importance(item):
-        try:
-            return float(item.get('importance_score', 0.0))
-        except Exception:
-            return 0.0
 
     @staticmethod
     def _select_evenly_spaced_candidates(candidates, effective_cap):
@@ -866,11 +846,10 @@ class SelfPlayEngine:
             selected = filtered
             cap_dropped = 0
         else:
-            selected = self._select_candidates_with_source_balance(
-                filtered,
-                effective_cap,
-                history_len,
-            )
+            # Keep the stored trajectory representative. Search confidence and
+            # tactical salience belong in the target distribution, not in a
+            # second hidden sampling policy layered on top of it.
+            selected = self._select_evenly_spaced_candidates(filtered, effective_cap)
             cap_dropped = len(filtered) - len(selected)
 
         selected.sort(key=lambda item: int(item['history_idx']))
@@ -975,89 +954,6 @@ class SelfPlayEngine:
             empty_history_tensor=_EMPTY_HISTORY_TENSOR,
         )
 
-    def _deblunder_weights_for_history(self, gs, outcome):
-        """Return per-ply policy/value weights without rewriting final results.
-
-        A later exploratory blunder makes the final result a noisy estimate of
-        earlier positions' best-play value.  Those winner-WDL rows are reduced,
-        while a reliable MCTS correction gets a bounded policy emphasis.
-        """
-        history = list(gs.get('game_history', []) or [])
-        count = len(history)
-        if count <= 0:
-            return [], []
-        regrets = np.zeros(count, dtype=np.float32)
-        correction_strengths = np.zeros(count, dtype=np.float32)
-        target_errors = np.full(count, 2.0, dtype=np.float32)
-        base_policy_weights = np.ones(count, dtype=np.float32)
-        for idx, entry in enumerate(history):
-            base_policy_weight = float(entry[5]) if len(entry) > 5 else 1.0
-            base_policy_weights[idx] = base_policy_weight
-            best_q = float(entry[13]) if len(entry) > 13 else float('nan')
-            played_q = float(entry[14]) if len(entry) > 14 else float('nan')
-            q_delta = float(entry[12]) if len(entry) > 12 else float('nan')
-            turn = entry[3]
-            signed_outcome = float(outcome if turn == chess.WHITE else -outcome)
-            target_error = (
-                abs(best_q - signed_outcome)
-                if math.isfinite(best_q)
-                else 2.0
-            )
-            target_errors[idx] = target_error
-            regret = (
-                max(0.0, best_q - played_q)
-                if math.isfinite(best_q) and math.isfinite(played_q)
-                else 0.0
-            )
-            regrets[idx] = regret
-            correction = max(
-                regret,
-                max(0.0, q_delta) if math.isfinite(q_delta) else 0.0,
-            )
-            progress = max(
-                0.0,
-                min(1.0, (correction - self.deblunder_threshold) / self.deblunder_width),
-            )
-            smooth = progress * progress * (3.0 - 2.0 * progress)
-            correction_strengths[idx] = float(smooth)
-
-        future_regret = np.maximum.accumulate(regrets[::-1])[::-1]
-        value_weights = np.ones(count, dtype=np.float32)
-        for idx, regret in enumerate(future_regret):
-            progress = max(
-                0.0,
-                min(1.0, (float(regret) - self.deblunder_threshold) / self.deblunder_width),
-            )
-            smooth = progress * progress * (3.0 - 2.0 * progress)
-            value_weights[idx] = float(
-                1.0 - (1.0 - self.deblunder_value_min_weight) * smooth
-            )
-        policy_weights = np.ones(count, dtype=np.float32)
-        for idx, base_policy_weight in enumerate(base_policy_weights):
-            if base_policy_weight <= 0.0:
-                # Keep explicit zero-weight rows excluded from policy training.
-                policy_weights[idx] = 0.0
-                continue
-            outcome_reliability = math.exp(-float(target_errors[idx]) / 0.50)
-            # If a future blunder already made the game outcome unreliable for
-            # this row, do not use that same contaminated result to reject an
-            # otherwise well-searched policy correction.
-            value_reliability = float(value_weights[idx])
-            reliability = (
-                (1.0 - value_reliability)
-                + value_reliability * outcome_reliability
-            )
-            inherited_excess = max(0.0, float(base_policy_weight) - 1.0) * reliability
-            policy_weights[idx] = min(
-                self.deblunder_policy_boost_max,
-                max(0.0, min(1.0, float(base_policy_weight)))
-                + inherited_excess
-                + (self.deblunder_policy_boost_max - 1.0)
-                * float(correction_strengths[idx])
-                * reliability,
-            )
-        return policy_weights.tolist(), value_weights.tolist()
-
     def _compute_position_importance(self, board, move, visit_counts, root, search_metadata=None):
         importance = 1.0
 
@@ -1084,7 +980,14 @@ class SelfPlayEngine:
         # policy something new. Keep them ahead of merely tactical/evenly-spaced
         # positions when a game's replay cap is tight.
         if isinstance(search_metadata, dict):
-            if float(search_metadata.get('prior_mcts_agree', 1.0) or 0.0) < 0.5:
+            reliable_target = policy_target_is_reliable(
+                search_metadata.get('top_visit_prob'),
+                search_metadata.get('visit_gap'),
+            )
+            if (
+                reliable_target
+                and float(search_metadata.get('prior_mcts_agree', 1.0) or 0.0) < 0.5
+            ):
                 importance += 0.45
                 try:
                     q_delta = float(search_metadata.get('mcts_q_delta', 0.0) or 0.0)
@@ -1131,9 +1034,6 @@ class SelfPlayEngine:
             history_len,
             is_decisive=(outcome != 0.0),
         )
-        deblunder_policy_weights, deblunder_value_weights = (
-            self._deblunder_weights_for_history(gs, outcome)
-        )
         encoded_fen_cache = {}
 
         for candidate in selected_candidates:
@@ -1144,11 +1044,6 @@ class SelfPlayEngine:
                 outcome,
                 draw_value_target=0.0,
             )
-            history_idx = int(candidate['history_idx'])
-            if history_idx < len(deblunder_policy_weights):
-                item['policy_weight'] = float(deblunder_policy_weights[history_idx])
-            if history_idx < len(deblunder_value_weights):
-                item['value_weight'] = float(deblunder_value_weights[history_idx])
             board_tensor_np = self._build_replay_history_tensor(
                 item,
                 history_positions,
@@ -1178,6 +1073,8 @@ class SelfPlayEngine:
                 float(item.get('orig_q', float('nan'))),
                 float(item.get('policy_kld', float('nan'))),
                 int(item.get('search_visits', 0)),
+                int(gs.get('_replay_game_id', -1)),
+                int(item.get('history_idx', -1)),
             ))
         if self.profile_enabled:
             self._profile_add('policy_target_postgame_time', time.perf_counter() - postgame_t0)
@@ -2007,12 +1904,17 @@ class SelfPlayEngine:
             chunk_positions, chunk_lengths, chunk_stats = (
                 self._finalize_completed_game_states(states)
             )
+            chunk_job_ids = [
+                int(gs['_stream_job_id'])
+                for gs in states
+                if gs.get('_stream_job_id') is not None
+            ]
             finalized_game_stats = _merge_finalized_stats(finalized_game_stats, chunk_stats)
             if completed_chunk_callback is None:
                 output_positions.extend(chunk_positions)
                 output_game_lengths.extend(chunk_lengths)
             else:
-                completed_chunk_callback(chunk_positions, chunk_lengths)
+                completed_chunk_callback(chunk_positions, chunk_lengths, chunk_job_ids)
 
         def _new_game_state(game_idx, game_spec=None):
             game_spec = dict(game_spec or {})
@@ -2087,6 +1989,15 @@ class SelfPlayEngine:
                 '_finalized_for_batch': False,
                 '_hard_start': bool(hard_start),
                 '_native_tree_key': id(initial_board),
+                '_stream_job_id': game_spec.get('job_id'),
+                # The global dispatcher id is stable across workers for this
+                # iteration. Replay combines it with insertion iteration, so
+                # ids may safely restart from zero in the next generation.
+                '_replay_game_id': (
+                    int(game_spec['job_id'])
+                    if game_spec.get('job_id') is not None
+                    else -1
+                ),
             }
             if not hard_start:
                 self._apply_opening_prefix(gs)
@@ -2509,20 +2420,16 @@ class SelfPlayEngine:
                         root,
                         search_metadata=search_metadata,
                     )
-                    policy_weight = _policy_uptake_weight(
-                        search_metadata,
-                        good_target_min_top_visit_prob=self.mcts_good_target_min_top_visit_prob,
-                        good_target_min_visit_gap=self.mcts_good_target_min_visit_gap,
-                    )
-                    search_changed_top, search_q_delta, correction_multiplier = (
+                    # Every completed Gumbel root is one policy example. Its
+                    # uncertainty is already encoded by the soft improved-policy
+                    # target, so confidence must not scale CE a second time.
+                    policy_weight = 1.0
+                    search_changed_top, search_q_delta = (
                         _search_correction_metadata(search_metadata)
                     )
-                    policy_weight *= correction_multiplier
                     policy_uptake_weight = policy_weight
                     target_quality['policy_uptake_samples'] += 1
                     target_quality['policy_uptake_weight_sum'] += policy_uptake_weight
-                    if policy_uptake_weight < _POLICY_UPTAKE_LOW_THRESHOLD:
-                        target_quality['policy_uptake_low_count'] += 1
                     replay_source_code = _replay_source_code(
                         learner_turn,
                         game_opponent_mcts,

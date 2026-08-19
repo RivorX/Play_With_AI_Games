@@ -22,7 +22,7 @@ import numpy as np
 from filelock import FileLock
 
 
-_API_VERSION = 6
+_API_VERSION = 7
 _INSTANCE = None
 _LOAD_ATTEMPTED = False
 _INSTANCE_LOCK = threading.Lock()

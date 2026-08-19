@@ -180,13 +180,10 @@ class _PersistentSelfPlayPool:
         self.inference_control_queues = [
             self.mp_ctx.Queue() for _ in range(self.central_inference_server_count)
         ]
-        self.inference_request_queue = self.inference_request_queues[0] if self.inference_request_queues else None
-        self.inference_control_queue = self.inference_control_queues[0] if self.inference_control_queues else None
         self.inference_response_receivers = {}
         self.inference_response_senders = {}
         self.inference_shared_buffers = {}
         self.inference_processes = []
-        self.inference_process = None
         self._central_task_id = None
         self._central_loaded_labels = set()
         self.shared_memory_enabled = bool(
@@ -345,7 +342,6 @@ class _PersistentSelfPlayPool:
                 inference_process.daemon = True
                 inference_process.start()
                 self.inference_processes.append(inference_process)
-            self.inference_process = self.inference_processes[0] if self.inference_processes else None
 
         for rank, _ in self.worker_specs:
             self._spawn_worker(rank)
@@ -599,10 +595,7 @@ class _PersistentSelfPlayPool:
         self.inference_shared_buffers.clear()
         self.inference_request_queues = []
         self.inference_control_queues = []
-        self.inference_request_queue = None
-        self.inference_control_queue = None
         self.inference_processes = []
-        self.inference_process = None
         self._central_task_id = None
         self._central_loaded_labels = set()
         self.started = False
