@@ -1,52 +1,50 @@
 # Play With AI Games
 
-Zbiór prostych projektów i eksperymentów związanych z zastosowaniem algorytmów uczenia maszynowego w grach.
-
-W repo znajdziesz m.in. implementację agenta RL dla gry Snake wraz z narzędziami do treningu, testów i wizualizacji wyników.
+Zbiór projektów i eksperymentów z uczeniem maszynowym w grach. Każdy podprojekt ma własne środowisko, skrypty treningowe oraz opis uruchomienia.
 
 ## Projekty
 
-### 🐍 Snake — PPO Agent
+### Chess — CNN + Gumbel MCTS
 
-Agent RL trenowany do gry w Snake na siatkach o zmiennych rozmiarach.
+Silnik szachowy uczony w dwóch etapach: najpierw z partii mistrzowskich (IL), następnie przez self-play z MCTS (RL). Projekt zawiera pygame GUI, adapter UCI, ewaluację Elo przeciw Stockfishowi oraz wykresy jakości i wydajności treningu.
+
+| Demo: AI vs AI |
+|:---:|
+| ![Chess AI vs AI](chess/docs/play-ai-vs-ai.gif) |
+
+- [Dokumentacja, uruchamianie i statystyki treningów](chess/README.md)
+
+### Snake — PPO Agent
+
+Agent RL trenowany do gry w Snake na siatkach o różnych rozmiarach.
 
 | Demo |
 |:---:|
 | ![Snake Run](snake/docs/snake_run_8.gif) |
 
 - [Więcej informacji](snake/README.md)
-- Trening, testowanie, analiza modelu, generowanie GIF
+- Trening, testowanie, analiza modelu i generowanie GIF-ów
 
-### 🃏 Solitaire — MaskablePPO Agent
+### Solitaire — MaskablePPO Agent
 
-Agent RL dla gry Pasjans Klondike z obsługą niewalidnych akcji (masked actions).
+Agent RL dla pasjansa Klondike z obsługą niedozwolonych akcji przez action masking.
 
 | Demo |
 |:---:|
 | ![Solitaire Run](solitaire/docs/solitaire_run.gif) |
 
 - [Więcej informacji](solitaire/README.md)
-- Trening, testowanie w Pygame, nagrywanie GIF
+- Trening, testowanie w Pygame i nagrywanie GIF-ów
 
-Każdy projekt zawiera własne instrukcje uruchomieniowe i opis konfiguracji.
+## Instalacja
 
-## Wymagania
-
-- Python 3.10+
-- pip
-- (opcjonalnie) środowisko wirtualne, np. `venv`
-
-## Szybka instalacja
-
-Przykład (Windows PowerShell):
+Przykład dla Windows PowerShell:
 
 ```powershell
-python -m venv venv
+py -3.13 -m venv venv
 .\venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-# Jeśli potrzebujesz konkretnej wersji torch (dostosuj do swojej konfiguracji GPU/CPU):
-pip uninstall torch
-pip install torch>=2.7 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-Szczegóły dotyczące uruchamiania i konfiguracji znajdziesz w README odpowiedniego podprojektu.
+Szczegóły zależności i konfiguracji znajdują się w README odpowiedniego podprojektu.

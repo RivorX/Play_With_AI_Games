@@ -1,0 +1,64 @@
+# ------------------------------------------------------------------------------
+# DATA
+# Each section below matches exactly one pipeline phase. The loader flattens
+# this presentation internally, so changing a value still has the cache impact
+# shown in its section title.
+# ------------------------------------------------------------------------------
+data:
+  # Phase 1 — PGN -> binary. Changes rebuild *_positions.bin.
+  phase_1_binary:
+    min_elo: 2300
+    max_games: "max"             # number per PGN, or "max" for full file
+    max_moves_per_game: 300
+    game_filters:
+      min_fullmove: 10
+      min_fullmove_draw: 20
+      min_fullmove_resign: 12
+      max_elo_gap: 500
+      exclude_terminations:
+        - "Time forfeit"
+        - "Timeout"
+        - "Flag"
+        - "Abandoned"
+        - "Rules infraction"
+
+  # Phase 2 — independent train/validation game split.
+  phase_2_split:
+    train_split: 0.85
+
+  # Phase 3 — positions selected from each game. Main coverage/diversity knob.
+  phase_3_positions:
+    positions_per_game:
+      max_total: 40
+      min_distance: 4
+      opening_pct: 20
+      middlegame_pct: 45
+      endgame_pct: 35
+      rare_or_eventful_pct: 0
+
+  # Phase 5 — training candidate pool. Rebuilds final index and soft cache.
+  phase_5_training_pool:
+    target_positions: 20000000
+    target_selection:
+      train_pool_multiplier: 3.0 # cache more train rows than one epoch
+      broad_fraction: 0.30       # candidate-pool coverage
+      soft_candidate_selection:
+        min_distance: 2          # coverage only; does not change target probabilities
+        max_total: 40
+
+  # Phase 6 — aggregate raw split knowledge into policy/WDL soft targets.
+  phase_6_soft_targets:
+    soft_targets:
+      # Store and use the target-mover's Elo; the gain is capped deliberately.
+      policy_rating_weight:
+        reference_elo: 2800
+        max_multiplier: 1.35
+
+  # Phase 7 — fixed per-epoch draw from the cached pool. No cache rebuild.
+  phase_7_epoch_sampling:
+    train_sampling:
+      # Every informative soft row appears once per epoch; all remaining rows
+      # are broad, non-soft coverage.
+      soft_max_fraction: 0.28
+      min_soft_moves: 2
+      min_soft_entropy: 0.12     # skip technically multi-move but near-hard targets

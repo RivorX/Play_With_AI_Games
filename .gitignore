@@ -38,3 +38,9 @@ logs/*
 *.bak
 
 logs
+
+chess/data/*
+chess/models/IL/*
+chess/models/RL/*
+chess/engines/
+chess/.cache/
