@@ -18,9 +18,7 @@ class SingleGameMCTS:
         self._root_synced = False
         self.board_history = []
 
-    def search(self, board, num_simulations, temperature=1.0, add_root_noise=False):
-        del temperature
-
+    def search(self, board, num_simulations, add_root_noise=False):
         game_state = {
             'board': board,
             'root': self.root,

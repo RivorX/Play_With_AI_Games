@@ -11,7 +11,6 @@ from src.mcts.q_delta import (
     Q_DELTA_HIST_BINS as _Q_DELTA_HIST_BINS,
     RELIABLE_POLICY_TARGET_GAP_MIN,
     RELIABLE_POLICY_TARGET_TOP1_MIN,
-    policy_target_is_reliable,
     q_delta_histogram as _q_delta_histogram,
     q_delta_percentile_from_histogram as _q_delta_percentile_from_histogram,
 )
@@ -32,6 +31,7 @@ from src.mcts.search import (
     _select_move_from_visits_safe,
 )
 from src.models.data.se_cnn_v9.helpers import move_to_index
+from src.training.rl.search_control import suffix_regret_targets
 
 
 class SelfPlayEngine:
@@ -81,7 +81,6 @@ class SelfPlayEngine:
         }
         self.opponent_mcts = next(iter(self.opponent_mcts_by_label.values()), None)
         self.opponent_plan_labels = list(opponent_plan_labels or [])
-        self._warned_missing_opponent_labels = set()
         self.history_positions = int(config.get('model', {}).get('history_positions', 0) or 0)
         self.share_trees = bool(rl_cfg.get('self_play_share_trees', True))
 
@@ -551,281 +550,6 @@ class SelfPlayEngine:
         selected_lookup = set(selected_history[:effective_cap])
         return [item for item in ordered if int(item['history_idx']) in selected_lookup]
 
-    def _select_top_scored_candidates(self, candidates, effective_cap, history_len):
-        if effective_cap <= 0 or len(candidates) <= effective_cap:
-            return list(candidates)
-        del history_len
-        ranked = sorted(
-            candidates,
-            key=lambda item: (-self._candidate_importance(item), int(item['history_idx'])),
-        )
-        top_quota = int(round(effective_cap * self.replay_importance_top_fraction))
-        top_quota = max(1, min(int(effective_cap), top_quota))
-
-        selected = []
-        selected_history = set()
-        for item in ranked:
-            history_idx = int(item['history_idx'])
-            if history_idx in selected_history:
-                continue
-            selected.append(item)
-            selected_history.add(history_idx)
-            if len(selected) >= top_quota:
-                break
-
-        remaining = int(effective_cap - len(selected))
-        if remaining > 0:
-            leftovers = [
-                item for item in candidates
-                if int(item['history_idx']) not in selected_history
-            ]
-            for item in self._select_evenly_spaced_candidates(leftovers, remaining):
-                history_idx = int(item['history_idx'])
-                if history_idx in selected_history:
-                    continue
-                selected.append(item)
-                selected_history.add(history_idx)
-                if len(selected) >= effective_cap:
-                    break
-
-        selected.sort(key=lambda item: int(item['history_idx']))
-        return selected[:effective_cap]
-
-    def _allocate_phase_stratified_caps(self, buckets, effective_cap):
-        bucket_count = len(buckets)
-        allocations = [0] * bucket_count
-        if effective_cap <= 0 or bucket_count <= 0:
-            return allocations
-
-        bucket_sizes = [len(bucket) for bucket in buckets]
-        non_empty = [idx for idx, size in enumerate(bucket_sizes) if size > 0]
-        if not non_empty:
-            return allocations
-
-        if effective_cap < len(non_empty):
-            desired = []
-            for idx in range(bucket_count):
-                if bucket_sizes[idx] <= 0:
-                    desired.append(0.0)
-                elif idx == bucket_count - 1:
-                    desired.append(1.0)
-                elif idx == bucket_count - 2:
-                    desired.append(0.75)
-                else:
-                    desired.append(0.5)
-        else:
-            # Preserve calm opening and middlegame positions instead of letting
-            # tactical/endgame importance dominate a heavily capped game.
-            desired = [0.30, 0.45, 0.25]
-
-        remaining = int(effective_cap)
-        for idx in non_empty:
-            allocations[idx] = 1
-            remaining -= 1
-
-        if remaining <= 0:
-            return allocations
-
-        desired_counts = [float(effective_cap) * desired[idx] for idx in range(bucket_count)]
-        remainders = []
-        for idx in range(bucket_count):
-            if bucket_sizes[idx] <= allocations[idx]:
-                continue
-            extra = int(math.floor(max(0.0, desired_counts[idx] - allocations[idx])))
-            if extra > 0:
-                grant = min(extra, bucket_sizes[idx] - allocations[idx], remaining)
-                allocations[idx] += grant
-                remaining -= grant
-            remainder = max(0.0, desired_counts[idx] - allocations[idx])
-            remainders.append((remainder, idx))
-
-        while remaining > 0:
-            progressed = False
-            remainders.sort(key=lambda pair: (-pair[0], pair[1]))
-            for _, idx in remainders:
-                if remaining <= 0:
-                    break
-                if allocations[idx] >= bucket_sizes[idx]:
-                    continue
-                allocations[idx] += 1
-                remaining -= 1
-                progressed = True
-            if not progressed:
-                break
-
-        if remaining > 0:
-            fill_order = sorted(
-                non_empty,
-                key=lambda idx: (
-                    -bucket_sizes[idx],
-                    -desired_counts[idx],
-                    -idx,
-                ),
-            )
-            while remaining > 0:
-                progressed = False
-                for idx in fill_order:
-                    if remaining <= 0:
-                        break
-                    if allocations[idx] >= bucket_sizes[idx]:
-                        continue
-                    allocations[idx] += 1
-                    remaining -= 1
-                    progressed = True
-                if not progressed:
-                    break
-
-        return allocations
-
-    def _select_phase_stratified_candidates(self, candidates, effective_cap, history_len):
-        if effective_cap <= 0 or len(candidates) <= effective_cap:
-            return list(candidates)
-
-        if effective_cap < 3:
-            return self._select_top_scored_candidates(candidates, effective_cap, history_len)
-
-        denom = float(max(1, history_len - 1))
-        buckets = [[], [], []]
-        for item in candidates:
-            progress = float(item['history_idx']) / denom
-            if progress < (1.0 / 3.0):
-                buckets[0].append(item)
-            elif progress < (2.0 / 3.0):
-                buckets[1].append(item)
-            else:
-                buckets[2].append(item)
-
-        allocations = self._allocate_phase_stratified_caps(buckets, effective_cap)
-        selected = []
-        selected_ids = set()
-        for bucket, bucket_cap in zip(buckets, allocations):
-            for item in self._select_top_scored_candidates(bucket, bucket_cap, history_len):
-                history_idx = int(item['history_idx'])
-                if history_idx in selected_ids:
-                    continue
-                selected.append(item)
-                selected_ids.add(history_idx)
-
-        if len(selected) < effective_cap:
-            leftovers = [
-                item for item in candidates
-                if int(item['history_idx']) not in selected_ids
-            ]
-            for item in self._select_top_scored_candidates(
-                leftovers,
-                effective_cap - len(selected),
-                history_len,
-            ):
-                history_idx = int(item['history_idx'])
-                if history_idx in selected_ids:
-                    continue
-                selected.append(item)
-                selected_ids.add(history_idx)
-
-        return selected
-
-    def _select_candidates_with_source_balance(self, candidates, effective_cap, history_len):
-        if effective_cap <= 0 or len(candidates) <= effective_cap:
-            return list(candidates)
-
-        buckets = {}
-        for item in candidates:
-            source_code = int(item.get('source_code', _REPLAY_SOURCE_UNKNOWN))
-            buckets.setdefault(source_code, []).append(item)
-        non_empty_sources = [
-            source_code for source_code, bucket in buckets.items()
-            if len(bucket) > 0
-        ]
-        if len(non_empty_sources) <= 1:
-            return self._select_phase_stratified_candidates(candidates, effective_cap, history_len)
-
-        total_candidates = max(1, len(candidates))
-        allocations = {}
-        remaining = int(effective_cap)
-        if effective_cap >= len(non_empty_sources):
-            for source_code in non_empty_sources:
-                allocations[source_code] = 1
-                remaining -= 1
-        else:
-            ranked_sources = sorted(
-                non_empty_sources,
-                key=lambda source_code: (
-                    -max(self._candidate_importance(item) for item in buckets[source_code]),
-                    source_code,
-                ),
-            )
-            for source_code in ranked_sources[:effective_cap]:
-                allocations[source_code] = 1
-            remaining = 0
-
-        desired = {
-            source_code: float(effective_cap) * len(buckets[source_code]) / float(total_candidates)
-            for source_code in non_empty_sources
-        }
-        while remaining > 0:
-            progressed = False
-            ranked_sources = sorted(
-                non_empty_sources,
-                key=lambda source_code: (
-                    -(desired[source_code] - allocations.get(source_code, 0)),
-                    -len(buckets[source_code]),
-                    source_code,
-                ),
-            )
-            for source_code in ranked_sources:
-                if remaining <= 0:
-                    break
-                current = int(allocations.get(source_code, 0))
-                if current >= len(buckets[source_code]):
-                    continue
-                allocations[source_code] = current + 1
-                remaining -= 1
-                progressed = True
-            if not progressed:
-                break
-
-        selected = []
-        selected_ids = set()
-        for source_code in sorted(non_empty_sources):
-            bucket_cap = int(allocations.get(source_code, 0))
-            if bucket_cap <= 0:
-                continue
-            bucket = buckets[source_code]
-            bucket_selected = self._select_phase_stratified_candidates(
-                bucket,
-                bucket_cap,
-                history_len,
-            )
-            for item in bucket_selected:
-                history_idx = int(item['history_idx'])
-                if history_idx in selected_ids:
-                    continue
-                selected.append(item)
-                selected_ids.add(history_idx)
-
-        if len(selected) < effective_cap:
-            leftovers = [
-                item for item in candidates
-                if int(item['history_idx']) not in selected_ids
-            ]
-            remaining_cap = int(effective_cap - len(selected))
-            refill = self._select_phase_stratified_candidates(
-                leftovers,
-                remaining_cap,
-                history_len,
-            )
-            for item in refill:
-                history_idx = int(item['history_idx'])
-                if history_idx in selected_ids:
-                    continue
-                selected.append(item)
-                selected_ids.add(history_idx)
-                if len(selected) >= effective_cap:
-                    break
-
-        selected.sort(key=lambda item: int(item['history_idx']))
-        return selected[:effective_cap]
-
     def _select_history_indices_to_keep(self, candidates, history_len, is_decisive=False):
         if not candidates:
             return [], 0, 0
@@ -954,70 +678,6 @@ class SelfPlayEngine:
             empty_history_tensor=_EMPTY_HISTORY_TENSOR,
         )
 
-    def _compute_position_importance(self, board, move, visit_counts, root, search_metadata=None):
-        importance = 1.0
-
-        if visit_counts:
-            visits = np.asarray(list(visit_counts.values()), dtype=np.float32)
-            total_visits = float(visits.sum())
-            if total_visits > 0.0:
-                probs = visits / total_visits
-                top_prob = float(probs.max())
-                entropy = 0.0
-                if probs.size > 1:
-                    entropy = float(-(probs * np.log(np.clip(probs, 1e-8, 1.0))).sum())
-                    entropy /= float(np.log(probs.size))
-                importance += 0.35 * (1.0 - top_prob)
-                importance += 0.30 * entropy
-
-        if root is not None:
-            root_visits = int(getattr(root, 'visit_count', 0) or 0)
-            if root_visits > 0:
-                root_value = float(root.value_sum / max(1, root_visits))
-                importance += 0.30 * abs(root_value)
-
-        # MCTS disagreements are precisely the positions that can teach the raw
-        # policy something new. Keep them ahead of merely tactical/evenly-spaced
-        # positions when a game's replay cap is tight.
-        if isinstance(search_metadata, dict):
-            reliable_target = policy_target_is_reliable(
-                search_metadata.get('top_visit_prob'),
-                search_metadata.get('visit_gap'),
-            )
-            if (
-                reliable_target
-                and float(search_metadata.get('prior_mcts_agree', 1.0) or 0.0) < 0.5
-            ):
-                importance += 0.45
-                try:
-                    q_delta = float(search_metadata.get('mcts_q_delta', 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    q_delta = 0.0
-                importance += 0.20 * min(1.0, max(0.0, q_delta) / 0.30)
-            try:
-                policy_kl = float(search_metadata.get('mcts_policy_kl', 0.0) or 0.0)
-            except (TypeError, ValueError):
-                policy_kl = 0.0
-            importance += 0.10 * min(1.0, max(0.0, policy_kl) / 0.20)
-
-        if chess.is_capture(board, move):
-            importance += 0.30
-            gain = self.mcts._captured_piece_value(board, move) - self.mcts._moving_piece_value(board, move)
-            if gain > 0.0:
-                importance += 0.20 * min(1.0, gain / 4.0)
-        if move.promotion is not None:
-            importance += 0.30
-        try:
-            if chess.gives_check(board, move):
-                importance += 0.15
-        except Exception:
-            pass
-        last_move = chess.last_move(board)
-        if last_move is not None and move.destination == last_move.destination:
-            importance += 0.10
-
-        return float(importance)
-
     def _append_selected_positions_from_game(
         self,
         positions,
@@ -1029,6 +689,7 @@ class SelfPlayEngine:
         postgame_t0 = time.perf_counter() if self.profile_enabled else None
         history_len = len(gs['game_history'])
         selection_candidates = self._build_history_selection_candidates(gs)
+        regret_targets = suffix_regret_targets(gs['game_history'], outcome)
         selected_candidates, curriculum_dropped, cap_dropped = self._select_history_indices_to_keep(
             selection_candidates,
             history_len,
@@ -1075,6 +736,8 @@ class SelfPlayEngine:
                 int(item.get('search_visits', 0)),
                 int(gs.get('_replay_game_id', -1)),
                 int(item.get('history_idx', -1)),
+                float(regret_targets[int(item['history_idx'])]),
+                int(gs.get('_archive_id', -1)),
             ))
         if self.profile_enabled:
             self._profile_add('policy_target_postgame_time', time.perf_counter() - postgame_t0)
@@ -1084,6 +747,12 @@ class SelfPlayEngine:
     def _should_auto_claim_draw(self, board, move_count):
         if not self.auto_claim_draw:
             return False
+        # MCTS treats a claimable fifty-move state as terminal because draw is
+        # not represented as a separate action. Keep the played environment on
+        # the same contract instead of continuing with fabricated draw-valued
+        # descendants until an unrelated absolute-ply threshold.
+        if int(board.halfmove_clock) >= 100:
+            return True
         if (
             move_count >= self.claim_repetition_after_moves
             and chess.can_claim_threefold_repetition(board)
@@ -1329,9 +998,6 @@ class SelfPlayEngine:
             'mcts_changed_q_delta_sum': 0.0,
             'mcts_changed_q_delta_values': [],
             'mcts_changed_q_delta_hist': [0] * _Q_DELTA_HIST_BINS,
-            'mcts_policy_uptake_samples': 0.0,
-            'mcts_policy_uptake_weight_sum': 0.0,
-            'mcts_policy_uptake_low_count': 0.0,
         }
         for phase in ('opening', 'middlegame', 'endgame'):
             total_mcts_quality_stats[f'mcts_phase_{phase}_samples'] = 0.0
@@ -1550,21 +1216,6 @@ class SelfPlayEngine:
                 else 0.0
             ),
             **mcts_phase_stats,
-            'mcts_policy_uptake_samples': int(total_mcts_quality_stats['mcts_policy_uptake_samples']),
-            'mcts_policy_uptake_weight_sum': float(total_mcts_quality_stats['mcts_policy_uptake_weight_sum']),
-            'mcts_policy_uptake_low_count': int(total_mcts_quality_stats['mcts_policy_uptake_low_count']),
-            'mcts_policy_uptake_weight_mean': (
-                float(total_mcts_quality_stats['mcts_policy_uptake_weight_sum'])
-                / float(total_mcts_quality_stats['mcts_policy_uptake_samples'])
-                if int(total_mcts_quality_stats['mcts_policy_uptake_samples']) > 0
-                else 1.0
-            ),
-            'mcts_policy_uptake_low_rate': (
-                float(total_mcts_quality_stats['mcts_policy_uptake_low_count'])
-                / float(total_mcts_quality_stats['mcts_policy_uptake_samples'])
-                if int(total_mcts_quality_stats['mcts_policy_uptake_samples']) > 0
-                else 0.0
-            ),
             'mcts_prior_top_visit_prob_sum': float(total_mcts_quality_stats['mcts_prior_top_visit_prob_sum']),
             'mcts_prior_top_visit_prob_mean': (
                 float(total_mcts_quality_stats['mcts_prior_top_visit_prob_sum']) / float(mcts_quality_samples)
@@ -1927,15 +1578,10 @@ class SelfPlayEngine:
             )
             opponent_mcts = self.opponent_mcts_by_label.get(game_opponent_label)
             if game_opponent_label != "current" and opponent_mcts is None:
-                if game_opponent_label not in self._warned_missing_opponent_labels:
-                    print(
-                        "Warning: opponent plan references "
-                        f"'{game_opponent_label}', but this worker has no model for it. "
-                        "Falling back to current."
-                    )
-                    self._warned_missing_opponent_labels.add(game_opponent_label)
-                game_opponent_label = "current"
-                opponent_mcts = None
+                raise RuntimeError(
+                    "Opponent plan references "
+                    f"{game_opponent_label!r}, but this worker has no matching model."
+                )
             has_frozen_opponent = opponent_mcts is not None
             hard_start = game_spec.get('hard_start')
             if hard_start is None and game_idx < len(self.hard_start_positions):
@@ -1988,6 +1634,7 @@ class SelfPlayEngine:
                 '_completion_reported': False,
                 '_finalized_for_batch': False,
                 '_hard_start': bool(hard_start),
+                '_archive_id': int((hard_start or {}).get('archive_id', -1)),
                 '_native_tree_key': id(initial_board),
                 '_stream_job_id': game_spec.get('job_id'),
                 # The global dispatcher id is stable across workers for this
@@ -2092,9 +1739,6 @@ class SelfPlayEngine:
             'changed_q_comparable': 0,
             'changed_q_delta_sum': 0.0,
             'changed_q_delta_values': [],
-            'policy_uptake_samples': 0,
-            'policy_uptake_weight_sum': 0.0,
-            'policy_uptake_low_count': 0,
         }
         for phase in ('opening', 'middlegame', 'endgame'):
             target_quality[f'{phase}_samples'] = 0
@@ -2413,13 +2057,11 @@ class SelfPlayEngine:
                             dtype=torch.int16,
                         )
                     history_count = len(gs['board_history'])
-                    importance_score = self._compute_position_importance(
-                        board,
-                        move,
-                        policy_visit_counts,
-                        root,
-                        search_metadata=search_metadata,
-                    )
+                    # The active replay cap is deliberately evenly spaced and
+                    # training is game-balanced, so importance ranking is not a
+                    # sampling input. Keep the legacy tuple slot constant until
+                    # the packed replay format is versioned independently.
+                    importance_score = 1.0
                     # Every completed Gumbel root is one policy example. Its
                     # uncertainty is already encoded by the soft improved-policy
                     # target, so confidence must not scale CE a second time.
@@ -2427,9 +2069,6 @@ class SelfPlayEngine:
                     search_changed_top, search_q_delta = (
                         _search_correction_metadata(search_metadata)
                     )
-                    policy_uptake_weight = policy_weight
-                    target_quality['policy_uptake_samples'] += 1
-                    target_quality['policy_uptake_weight_sum'] += policy_uptake_weight
                     replay_source_code = _replay_source_code(
                         learner_turn,
                         game_opponent_mcts,
@@ -2621,19 +2260,6 @@ class SelfPlayEngine:
                 else 0.0
             ),
             **target_phase_stats,
-            'mcts_policy_uptake_samples': int(target_quality['policy_uptake_samples']),
-            'mcts_policy_uptake_weight_sum': float(target_quality['policy_uptake_weight_sum']),
-            'mcts_policy_uptake_low_count': int(target_quality['policy_uptake_low_count']),
-            'mcts_policy_uptake_weight_mean': (
-                float(target_quality['policy_uptake_weight_sum']) / float(target_quality['policy_uptake_samples'])
-                if int(target_quality['policy_uptake_samples']) > 0
-                else 1.0
-            ),
-            'mcts_policy_uptake_low_rate': (
-                float(target_quality['policy_uptake_low_count']) / float(target_quality['policy_uptake_samples'])
-                if int(target_quality['policy_uptake_samples']) > 0
-                else 0.0
-            ),
             'mcts_prior_top_visit_prob_sum': float(target_quality['prior_top_visit_prob_sum']),
             'mcts_prior_top_visit_prob_mean': (
                 float(target_quality['prior_top_visit_prob_sum']) / float(target_quality_samples)

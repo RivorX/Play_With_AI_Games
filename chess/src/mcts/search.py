@@ -76,7 +76,6 @@ _DYNAMIC_BUDGET_TARGET_CHUNKS = 12
 _TREE_REUSE_MIN_FRESH_SIMULATIONS = 64
 _TREE_REUSE_CONSERVATIVE_FRESH_FRACTION = 0.50
 _TREE_REUSE_HIGH_QUALITY_FRESH_FRACTION = 1.0 / 3.0
-_TREE_REUSE_BASE_VISIT_CREDIT_DISCOUNT = 0.50
 _TREE_REUSE_MAX_VISIT_CREDIT_DISCOUNT = 0.75
 _TREE_REUSE_CANDIDATE_SUPPORT_VISITS = 2.0
 _TREE_REUSE_SCOUT_SIMULATIONS = 32
@@ -201,13 +200,12 @@ def _resolve_tree_reuse_visit_credit(
         return 0
     quality = max(0.0, min(1.0, float(quality)))
     fresh_floor = _resolve_tree_reuse_fresh_floor(budget, quality)
-    visit_discount = (
-        _TREE_REUSE_BASE_VISIT_CREDIT_DISCOUNT
-        + quality * (
-            _TREE_REUSE_MAX_VISIT_CREDIT_DISCOUNT
-            - _TREE_REUSE_BASE_VISIT_CREDIT_DISCOUNT
-        )
-    )
+    # Reuse quality must gate whether inherited work counts at all.  The old
+    # 0.50 base credited half of a subtree even at quality == 0, so narrow trees
+    # routinely replaced fresh root search despite missing the new Gumbel
+    # candidate set.  Keep the throughput win for broad trees, but make the
+    # credit proportional to measured relevance.
+    visit_discount = quality * _TREE_REUSE_MAX_VISIT_CREDIT_DISCOUNT
     discounted_visits = int(math.floor(inherited_visits * visit_discount))
     return min(discounted_visits, max(0, budget - fresh_floor))
 
@@ -1484,6 +1482,8 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     search_visits = torch.zeros((batch_size,), dtype=torch.int32)
     game_ids = torch.full((batch_size,), -1, dtype=torch.int64)
     game_ply_indices = torch.full((batch_size,), -1, dtype=torch.int16)
+    regret_targets = torch.full((batch_size,), float('nan'), dtype=torch.float32)
+    archive_ids = torch.full((batch_size,), -1, dtype=torch.int64)
     fens = []
     history_fens = []
 
@@ -1523,6 +1523,10 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
             game_ids[row_idx] = int(pos[20])
         if len(pos) > 21 and pos[21] is not None:
             game_ply_indices[row_idx] = int(pos[21])
+        if len(pos) > 22 and pos[22] is not None:
+            regret_targets[row_idx] = float(pos[22])
+        if len(pos) > 23 and pos[23] is not None:
+            archive_ids[row_idx] = int(pos[23])
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -1554,6 +1558,8 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         'search_visits': search_visits,
         'game_ids': game_ids,
         'game_ply_indices': game_ply_indices,
+        'regret_targets': regret_targets,
+        'archive_ids': archive_ids,
         'num_positions': batch_size,
     }
 
@@ -1667,8 +1673,8 @@ class MultiGameBatchMCTS:
             float(rl_cfg.get('mcts_gumbel_q_range_floor', 0.25)),
         )
         self.gumbel_target_temperature = max(
-            1.0,
-            float(rl_cfg.get('mcts_gumbel_target_temperature', 1.00)),
+            0.05,
+            float(rl_cfg.get('mcts_gumbel_target_temperature', 0.95)),
         )
         self.gumbel_use_mixed_value = bool(
             rl_cfg.get('mcts_gumbel_use_mixed_value', True)
@@ -2581,9 +2587,9 @@ class MultiGameBatchMCTS:
         return probs
 
     def _gumbel_policy_target(self, improved_policy):
-        """Soften only the stored training target, not search action selection."""
+        """Temperature-scale only the training target, not action selection."""
         probs = np.asarray(improved_policy)
-        if probs.size <= 1 or self.gumbel_target_temperature <= 1.0 + 1e-8:
+        if probs.size <= 1 or abs(self.gumbel_target_temperature - 1.0) <= 1e-8:
             return probs.astype(np.float32, copy=False)
         native = self._native_mcts
         if native is not None:
@@ -2796,10 +2802,6 @@ class MultiGameBatchMCTS:
         np.equal(fresh, most_visited, out=eligible)
         scores[~eligible] = -np.inf
         return int(np.argmax(scores))
-
-    def _select_child(self, node):
-        """Select an interior child using completed-Q policy improvement."""
-        return self._select_child_gumbel(node)
 
     def _backpropagate_and_remove_virtual_loss(self, search_path, value):
         """Commit visits and release virtual loss in one reverse traversal."""
@@ -3689,6 +3691,7 @@ class MultiGameBatchMCTS:
                 }
                 if policy_target:
                     metadata['policy_target_probs_override'] = policy_target
+                    metadata['policy_target_by_move'] = policy_target
                 metadata['gumbel_considered_actions'] = int(
                     gumbel_state.get('considered_actions', 0) or 0
                 )
@@ -3712,40 +3715,41 @@ class MultiGameBatchMCTS:
                     for move, value in zip(root.edges.moves, selection_scores)
                 }
 
-                # Full Gumbel trains against the improved completed-Q policy,
-                # so quality telemetry must compare the prior to that policy
-                # rather than to the incidental Sequential-Halving visit shape.
+                # Full Gumbel trains against the temperature-scaled completed-Q
+                # target, so telemetry must measure that stored distribution,
+                # not the pre-transform policy or incidental visit shape.
                 priors = root.edges.base_priors.astype(np.float64, copy=False)
                 prior_total = float(priors.sum())
                 prior_probs = priors / prior_total if prior_total > 0.0 else np.full_like(priors, 1.0 / len(priors))
                 prior_top_idx = int(np.argmax(prior_probs))
-                improved_top_idx = int(np.argmax(improved))
+                target_probs = policy_target_probs.astype(np.float64, copy=False)
+                improved_top_idx = int(np.argmax(target_probs))
                 selected_prior_agree = (
                     None if selected_idx is None else (1.0 if prior_top_idx == selected_idx else 0.0)
                 )
                 metadata['selected_prior_agree'] = selected_prior_agree
                 metadata['selected_q_delta'] = None
                 metadata['prior_mcts_agree'] = 1.0 if prior_top_idx == improved_top_idx else 0.0
-                metadata['prior_top_visit_prob'] = float(improved[prior_top_idx])
+                metadata['prior_top_visit_prob'] = float(target_probs[prior_top_idx])
                 metadata['mcts_top_prior_prob'] = float(prior_probs[improved_top_idx])
                 metadata['mcts_policy_kl'] = float(np.sum(
-                    improved.astype(np.float64) * (
-                        np.log(np.clip(improved.astype(np.float64), 1e-12, 1.0))
+                    target_probs * (
+                        np.log(np.clip(target_probs, 1e-12, 1.0))
                         - np.log(np.clip(prior_probs, 1e-12, 1.0))
                     )
                 ))
                 metadata['policy_kld'] = metadata['mcts_policy_kl']
-                ordered = np.sort(improved.astype(np.float64))
+                ordered = np.sort(target_probs)
                 top = float(ordered[-1])
                 second = float(ordered[-2]) if ordered.size > 1 else 0.0
                 metadata['top_visit_prob'] = top
                 metadata['visit_gap'] = max(0.0, top - second)
                 target_entropy = float(-np.sum(
-                    improved.astype(np.float64) * np.log(np.clip(improved.astype(np.float64), 1e-12, 1.0))
+                    target_probs * np.log(np.clip(target_probs, 1e-12, 1.0))
                 ))
                 metadata['visit_entropy'] = (
                     target_entropy / max(1e-12, math.log(len(improved)))
-                    if len(improved) > 1 else 0.0
+                    if len(target_probs) > 1 else 0.0
                 )
 
                 cumulative = root.edges.visit_counts.astype(np.float64, copy=False)

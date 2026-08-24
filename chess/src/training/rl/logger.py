@@ -468,7 +468,7 @@ class RLLoggerMixin:
         stage_values = {
             key: _float_or_none(stage_times.get(key))
             for key in (
-                'setup', 'selfplay', 'replay', 'train',
+                'setup', 'selfplay', 'replay', 'train', 'reanalyse',
                 'regular_eval', 'promotion_eval', 'elo_eval', 'log',
                 'checkpoint', 'gc',
             )
@@ -787,6 +787,31 @@ class RLLoggerMixin:
             bucket['draws'] += int(stats.get('draws', 0) or 0)
             bucket['losses'] += int(stats.get('losses', 0) or 0)
         opponent_games_total = sum(int(bucket['games']) for bucket in opponent_buckets.values())
+        try:
+            expected_opponent_games = int(
+                float(selfplay_stats.get('completed_games', 0) or 0)
+                + float(selfplay_stats.get('truncated_games', 0) or 0)
+            )
+        except (TypeError, ValueError):
+            expected_opponent_games = 0
+        opponent_count_error = opponent_games_total - expected_opponent_games
+        if (
+            expected_opponent_games > 0
+            and opponent_games_total > 0
+            and opponent_games_total != expected_opponent_games
+        ):
+            # Streaming telemetry used to report every source assignment twice.
+            # Preserve the observed mix while restoring the game-count invariant;
+            # keep the raw discrepancy in its own column for diagnosis.
+            current_games = int(round(
+                expected_opponent_games
+                * int(opponent_buckets['current']['games'])
+                / float(opponent_games_total)
+            ))
+            current_games = max(0, min(expected_opponent_games, current_games))
+            opponent_buckets['current']['games'] = current_games
+            opponent_buckets['best']['games'] = expected_opponent_games - current_games
+            opponent_games_total = expected_opponent_games
         for bucket in opponent_buckets.values():
             games = int(bucket['games'])
             if opponent_games_total > 0:
@@ -1034,6 +1059,14 @@ class RLLoggerMixin:
             'selfplay_truncated_rate': _value(selfplay_stats, 'truncated_rate'),
             'selfplay_avg_game_value': _value(selfplay_stats, 'avg_game_value'),
             'selfplay_value_std': _value(selfplay_stats, 'value_std'),
+            'selfplay_adjudicated_games': _value(selfplay_stats, 'adjudicated_games'),
+            'selfplay_syzygy_ended_games': _value(selfplay_stats, 'syzygy_ended_games'),
+            'selfplay_resigned_games': _value(selfplay_stats, 'resigned_games'),
+            'selfplay_syzygy_probe_hits': _value(selfplay_stats, 'syzygy_probe_hits'),
+            'selfplay_syzygy_probe_hit_rate': _ratio(
+                _float(selfplay_stats, 'syzygy_probe_hits'),
+                _float(selfplay_stats, 'syzygy_probe_positions'),
+            ),
             'selfplay_replay_storage_keep_rate': replay_storage_keep_rate,
             'selfplay_hard_start_games': hard_start_games if hard_start_games is not None else '',
             'selfplay_hard_start_fraction': _ratio(
@@ -1041,7 +1074,28 @@ class RLLoggerMixin:
                 (_float(selfplay_stats, 'completed_games') or 0.0)
                 + (_float(selfplay_stats, 'truncated_games') or 0.0),
             ),
+            'search_control_archive_size': _value(replay_stats, 'search_control_archive_size'),
+            'search_control_candidates': _value(replay_stats, 'search_control_candidates'),
+            'search_control_added': _value(replay_stats, 'search_control_added'),
+            'search_control_updated': _value(replay_stats, 'search_control_updated'),
+            'search_control_replayed': _value(replay_stats, 'search_control_replayed'),
+            'search_control_start_fraction': _value(replay_stats, 'search_control_start_fraction'),
+            'search_control_regret_mean': _value(replay_stats, 'search_control_regret_mean'),
+            'search_control_regret_p50': _value(replay_stats, 'search_control_regret_p50'),
+            'search_control_regret_p90': _value(replay_stats, 'search_control_regret_p90'),
+            'search_control_sampled_regret_mean': _value(
+                replay_stats, 'search_control_sampled_regret_mean'
+            ),
+            'search_control_sampled_regret_p90': _value(
+                replay_stats, 'search_control_sampled_regret_p90'
+            ),
+            'reanalyse_selected': _value(replay_stats, 'reanalyse_selected'),
+            'reanalyse_updated': _value(replay_stats, 'reanalyse_updated'),
+            'reanalyse_correction_fraction': _value(
+                replay_stats, 'reanalyse_correction_fraction'
+            ),
             'opponent_mix_error': opponent_mix_error,
+            'opponent_count_error': opponent_count_error,
             'opponent_promotion_transition_progress': opponent_adaptive_factors.get(
                 '_promotion_transition_progress', ''
             ),
@@ -1351,6 +1405,7 @@ class RLLoggerMixin:
             'policy_loss': kwargs.get('policy_loss', ''),
             'value_loss': kwargs.get('value_loss', ''),
             'value_primary_loss': train_metrics.get('value_primary_loss', '') if train_metrics else '',
+            'value_scalar_aux_loss': train_metrics.get('value_scalar_aux_loss', '') if train_metrics else '',
             'value_search_consistency_loss': train_metrics.get(
                 'value_search_consistency_loss', ''
             ) if train_metrics else '',

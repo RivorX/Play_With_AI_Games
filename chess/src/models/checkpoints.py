@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import random
 import time
 
+import numpy as np
 import torch
 
 
@@ -17,6 +19,56 @@ _DEPRECATED_MODEL_STATE_PREFIXES = (
 def load_checkpoint_file(checkpoint_path, device):
     """Load a tensor-only checkpoint without unsafe pickle fallback."""
     return torch.load(checkpoint_path, map_location=device, weights_only=True)
+
+
+def capture_rng_state():
+    """Capture all RNGs used by RL sampling in a weights-only-safe format."""
+    numpy_state = np.random.get_state()
+    state = {
+        "python": random.getstate(),
+        "numpy": {
+            "bit_generator": str(numpy_state[0]),
+            "keys": torch.from_numpy(numpy_state[1].copy()),
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        },
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": [],
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    """Restore a state from ``capture_rng_state``; return restored domains."""
+    if not isinstance(state, dict):
+        return ()
+    restored = []
+    python_state = state.get("python")
+    if python_state is not None:
+        random.setstate(python_state)
+        restored.append("python")
+    numpy_state = state.get("numpy")
+    if isinstance(numpy_state, dict) and torch.is_tensor(numpy_state.get("keys")):
+        np.random.set_state((
+            str(numpy_state.get("bit_generator", "MT19937")),
+            numpy_state["keys"].cpu().numpy().astype(np.uint32, copy=False),
+            int(numpy_state.get("position", 0) or 0),
+            int(numpy_state.get("has_gauss", 0) or 0),
+            float(numpy_state.get("cached_gaussian", 0.0) or 0.0),
+        ))
+        restored.append("numpy")
+    torch_cpu = state.get("torch_cpu")
+    if torch.is_tensor(torch_cpu):
+        torch.set_rng_state(torch_cpu.cpu())
+        restored.append("torch_cpu")
+    torch_cuda = state.get("torch_cuda")
+    if torch.cuda.is_available() and isinstance(torch_cuda, (list, tuple)) and torch_cuda:
+        torch.cuda.set_rng_state_all([item.cpu() for item in torch_cuda])
+        restored.append("torch_cuda")
+    return tuple(restored)
 
 
 def normalize_state_dict_keys(source_state, target_keys=None):
@@ -133,12 +185,7 @@ def save_checkpoint(
         "loss": loss,
     }
     try:
-        checkpoint["rng_state"] = {
-            "torch_cpu": torch.get_rng_state(),
-            "torch_cuda": (
-                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
-            ),
-        }
+        checkpoint["rng_state"] = capture_rng_state()
     except Exception:
         pass
     if save_optimizer and optimizer is not None:

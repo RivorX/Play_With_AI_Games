@@ -220,11 +220,18 @@ def _selfplay_best_intervals(rows):
             if replay_rebuild:
                 legacy_reasons.append("replay_rebuild")
             reason = "+".join(legacy_reasons)
-        if reason not in {
-            "replay_rebuild",
-            "safety_fallback",
+        # Refilling the pinned champion reservoir is routine bookkeeping after
+        # a promotion, not a learner safety regime.  Do not turn those one-off
+        # iterations into visual regime changes.  Old logs called this
+        # ``replay_rebuild``; new logs use the accurate ``champion_refresh``.
+        if reason in {"replay_rebuild", "champion_refresh"}:
+            continue
+        if reason in {
             "safety_fallback+replay_rebuild",
+            "safety_fallback+champion_refresh",
         }:
+            reason = "safety_fallback"
+        if reason != "safety_fallback":
             reason = "other"
         events.append((iteration, reason))
 
@@ -515,6 +522,7 @@ _RUNTIME_STAGE_SPECS = (
     ("stage_selfplay_time_s", "self-play", "#2563eb"),
     ("stage_replay_time_s", "replay", "#0891b2"),
     ("stage_train_time_s", "train", "#16a34a"),
+    ("stage_reanalyse_time_s", "reanalyse", "#d97706"),
     ("stage_regular_eval_time_s", "regular eval", "#eab308"),
     ("stage_promotion_eval_time_s", "promotion eval", "#f59e0b"),
     ("stage_elo_eval_time_s", "Elo eval", "#ec4899"),
@@ -677,6 +685,10 @@ def _mark_regime_changes(
     *,
     label=False,
 ):
+    # Matplotlib event artists participate in autoscaling.  A sparse metric
+    # (notably anchor/Elo) must keep the range implied by its measurements,
+    # even when a later promotion/recovery event exists in another panel.
+    xlim = ax.get_xlim()
     for index, promotion_iteration in enumerate(promotion_iterations):
         ax.axvline(
             promotion_iteration,
@@ -695,19 +707,16 @@ def _mark_regime_changes(
             alpha=0.58,
             label="recovery" if label and index == 0 else None,
         )
+    ax.set_xlim(xlim)
 
 
 def _mark_selfplay_best_intervals(ax, intervals, *, label=False):
     """Shade iterations whose games were generated best vs the same best."""
     styles = {
-        "replay_rebuild": ("#2563eb", "best x best - replay rebuild"),
         "safety_fallback": ("#f59e0b", "best x best - safety fallback"),
-        "safety_fallback+replay_rebuild": (
-            "#ea580c",
-            "best x best - safety + replay rebuild",
-        ),
         "other": ("#7c3aed", "best x best"),
     }
+    xlim = ax.get_xlim()
     labelled_reasons = set()
     for start, end, reason in intervals:
         color, legend_label = styles.get(reason, styles["other"])
@@ -716,13 +725,14 @@ def _mark_selfplay_best_intervals(ax, intervals, *, label=False):
             float(start) - 0.45,
             float(end) + 0.45,
             color=color,
-            alpha=0.11 if reason == "replay_rebuild" else 0.14,
+            alpha=0.14,
             linewidth=0.0,
             zorder=0.2,
             label=legend_label if show_label else None,
         )
         if show_label:
             labelled_reasons.add(reason)
+    ax.set_xlim(xlim)
 
 
 def _nested_composition_donut(ax, inner, outer, *, title, inner_name, outer_name):
@@ -1281,7 +1291,7 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
         ("MCTS lower bound", _last(main, "eval_score_lower_bound"),
          float(rl_cfg.get("promotion_score_lower_bound_min", 0.50) or 0.50), _COLORS[5]),
         ("NN severe floor", latest_nn_score,
-         float(rl_cfg.get("promotion_no_mcts_score_rate_min", 0.40) or 0.40), _COLORS[3]),
+         float(rl_cfg.get("promotion_no_mcts_score_rate_min", 0.48) or 0.48), _COLORS[3]),
         ("NN non-regression UCB", latest_nn_upper,
          float(rl_cfg.get("promotion_no_mcts_upper_bound_min", 0.50) or 0.50), _COLORS[4]),
         ("Anchor score", _last(main, "anchor_score_rate"),
@@ -1373,8 +1383,12 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     ax = axes[2, 1]
     _style(ax, "Value learning")
     shown = _line(
-        ax, main, "value_loss", "value loss", _COLORS[3], lw=2.1,
+        ax, main, "value_primary_loss", "WDL CE", _COLORS[3], lw=2.1,
         break_after=recovery_iterations,
+    )
+    shown |= _line(
+        ax, main, "value_scalar_aux_loss", "scalar W-L auxiliary",
+        _COLORS[0], ls="--", lw=1.5, break_after=recovery_iterations,
     )
     ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
     mae = _line(
@@ -1430,9 +1444,10 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
             recovery_iterations,
             label=(plot_index == 0),
         )
-    timeline_axes = [axes[0, 0], axes[0, 2], axes[1, 1], *axes[2, :]]
-    if first_promotion_iteration is not None:
-        timeline_axes.insert(1, axes[0, 1])
+    # Best-actor intervals describe self-play provenance, not sparse external
+    # evaluations.  In particular they do not belong on immutable-anchor or
+    # estimated-Elo panels.
+    timeline_axes = [axes[0, 0], axes[1, 1], *axes[2, :]]
     for plot_index, plot_ax in enumerate(timeline_axes):
         _mark_selfplay_best_intervals(
             plot_ax,

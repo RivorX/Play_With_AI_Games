@@ -403,7 +403,7 @@ class _ModelPlayer:
         if native_board is None:
             native_board = _native_board(board)
             self._current_native_board = native_board
-        search_result = self.mcts.search(native_board, self.simulations, temperature=0.0)
+        search_result = self.mcts.search(native_board, self.simulations)
         if not search_result:
             return self._best_move_raw(board)  # Fallback
         return _python_move(search_result.selected_move)

@@ -265,6 +265,7 @@ _RL_KEY_ALIASES = {
     'self_play.syzygy_paths': 'syzygy_paths',
     'losses.policy': 'policy_loss_weight',
     'losses.value': 'value_loss_weight',
+    'losses.value_scalar_aux': 'value_scalar_aux_loss_weight',
     'losses.value_search_consistency': 'value_search_consistency_loss_weight',
     'losses.moves_left': 'moves_left_loss_weight',
     'losses.search_q': 'search_q_loss_weight',
@@ -283,11 +284,29 @@ _RL_DEFAULTS = {
     'self_play_claim_draw_after_moves': 120, 'syzygy_enabled': True,
     'syzygy_auto_download_enabled': True, 'self_play_progress_interval_games': 5,
     'self_play_opening_diversity_enabled': True,
-    'self_play_device': 'cuda', 'self_play_worker_auto_multiplier': 1.50,
+    # A bounded archive-start share improves value-target independence without
+    # replacing the normal initial-position distribution.
+    'self_play_hard_start_fraction': 0.20, 'self_play_hard_start_min_age': 1,
+    # Trajectory-RGSC keeps one bounded prioritized opening archive. The paper's
+    # 50% restart rate is deliberately not copied before a chess ablation; the
+    # existing 20% total hard-start budget remains the distribution guard.
+    'search_control_enabled': True, 'search_control_archive_capacity': 128,
+    'search_control_min_archive_size': 16, 'search_control_temperature': 0.10,
+    'search_control_ema_alpha': 0.50,
+    # Reanalyse is a small freshness budget, not a second self-play phase.
+    'replay_reanalyse_enabled': True, 'replay_reanalyse_interval': 4,
+    'replay_reanalyse_fraction': 0.02, 'replay_reanalyse_max_positions': 64,
+    'replay_reanalyse_min_age': 2, 'replay_reanalyse_min_staleness': 2,
+    'replay_reanalyse_max_refreshes': 2, 'replay_reanalyse_simulations': 96,
+    'replay_reanalyse_batch_positions': 16,
+    # Importing PyTorch commits about 1 GiB per Windows process even when the
+    # central-inference worker holds no model. Nine workers still provide broad
+    # 48-game request batches while avoiding the 18-process RAM cliff on 32 GiB.
+    'self_play_device': 'cuda', 'self_play_worker_auto_multiplier': 0.75,
     'max_batch_games_per_worker': 48,
     'self_play_randomize_learner_color': True, 'self_play_store_frozen_best_positions': False,
     'mcts_gumbel_c_scale': 0.10, 'mcts_gumbel_q_range_floor': 0.25,
-    'mcts_gumbel_target_temperature': 1.00,
+    'mcts_gumbel_target_temperature': 0.95,
     'mcts_reuse_tree': True, 'mcts_tree_reuse_visit_credit_enabled': True,
     'mcts_cache_history_tensors': True,
     'mcts_temperature': 0.0, 'mcts_temperature_threshold': 0,
@@ -327,7 +346,7 @@ _RL_DEFAULTS = {
     'eval_fixed_openings_pair_games': True, 'eval_fixed_openings_max_plies': 6,
     'promotion_stat_gate_enabled': True, 'promotion_stat_gate_z': 1.28,
     'promotion_score_lower_bound_min': 0.50, 'promotion_require_anchor_non_regression': True,
-    'promotion_no_mcts_gate_enabled': True, 'promotion_no_mcts_score_rate_min': 0.40,
+    'promotion_no_mcts_gate_enabled': True, 'promotion_no_mcts_score_rate_min': 0.48,
     'promotion_no_mcts_upper_bound_min': 0.50,
     'promotion_anchor_min_score_rate': 0.50, 'promotion_anchor_min_true_win_rate': 0.0,
     'promotion_anchor_no_mcts_gate_enabled': False,
@@ -400,6 +419,12 @@ def normalize_rl_config(config):
         return config
 
     normalized = dict(_RL_DEFAULTS)
+    # Mixed configs appear during staged migrations and manual experiments.
+    # Preserve legacy flat values, then let the grouped representation win on
+    # conflicts because it is the current public format.
+    for key, value in rl_cfg.items():
+        if key not in _RL_SECTION_PREFIXES and key != 'stockfish_elo':
+            normalized[key] = value
     for section, prefix in _RL_SECTION_PREFIXES.items():
         values = rl_cfg.get(section, {})
         if not isinstance(values, dict):

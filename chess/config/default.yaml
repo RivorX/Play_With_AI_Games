@@ -51,8 +51,8 @@ imitation_learning:
 reinforcement_learning:
   # Main run size.
   run:
-    version: "rl64"
-    iterations: 60
+    version: "rl71"
+    iterations: 100
     games_per_iteration: 1000
     # New quality experiments start from the canonical IL best with
     # empty replay. The normal startup menu remains available so resume/transfer
@@ -67,10 +67,16 @@ reinforcement_learning:
     opening_diversity_min_plies: 2
     opening_diversity_max_plies: 8
 
-    # One frozen snapshot plays both colours. A confirmed guard failure changes
-    # only the next self-play actor to champion; learner weights, optimizer and
-    # replay remain continuous.
-    learner_only_bootstrap_iterations: 12
+    # RL70's value head remained strongly under-dispersed in openings and MCTS
+    # often erased a raw-policy advantage. Re-search a bounded archive sample
+    # with the current learner to produce shorter, more independent trajectories
+    # while retaining 80% normal start-position self-play.
+    hard_start_fraction: 0.20
+    hard_start_min_age: 1
+
+    # One frozen snapshot plays both colours. Only a confirmed MCTS/anchor
+    # regression changes the next self-play actor to champion; a weak raw policy
+    # remains on-policy so search can keep teaching it.
 
     syzygy_paths:
       - "data/syzygy"
@@ -100,7 +106,9 @@ reinforcement_learning:
     # The completed-Q policy is already soft. Do not flatten it a second time:
     # the last run's target top-1 fell from 65.7% to 53.7%, while useful
     # correction top-1 stayed near 10%.
-    gumbel_target_temperature: 1.00
+    # A small sharpening step makes the completed-Q teacher more separable while
+    # preserving its full distribution. It never changes MCTS action selection.
+    gumbel_target_temperature: 0.95
 
   # Optimizer and the few regularizers worth tuning between runs.
   training:
@@ -123,6 +131,8 @@ reinforcement_learning:
     # Keep clipping as a spike guard instead of making it the normal update.
     grad_clip: 1.0
 
+    # Keep the measured three-iteration warm-up, then span the cosine over the
+    # actual run so a 100-iteration learner remains plastic after iteration 60.
     warmup_pct: 0.05              # pretrained IL + conservative 2e-5 LR
     # RL56 had no promotion after iteration 2; at the 7e-6 floor its fixed
     # correction-audit gains were only a few tenths of a percentage point.
@@ -130,8 +140,8 @@ reinforcement_learning:
     min_lr_ratio: 0.50
     augment_prob: 0.50            # Applied only where horizontal symmetry is exact
 
-  # Uniform FIFO replay. Targets are consumed as generated: no difficult-state
-  # restart curriculum and no periodic search rewrite of old positions.
+  # Uniform FIFO training replay. A bounded regret archive controls 20% of game
+  # starts, while a small periodic current-model search refreshes stale targets.
   replay:
     buffer_multiplier: 3.2
 
@@ -145,6 +155,10 @@ reinforcement_learning:
     # a policy regression. This is separate from the disabled raw anchor gate.
     eval_no_mcts_every: 2
     eval_no_mcts_games: 96
+    # A candidate may improve with search while degrading its raw policy. Keep
+    # that learner training, but do not replace the user-facing best unless the
+    # paired raw score is approximately non-inferior to the current champion.
+    promotion_no_mcts_score_rate_min: 0.48
 
     # Weak learners stop early. A plausible candidate reaches 192 paired games;
     # only a narrow confidence miss receives a 96-game confirmation extension.
@@ -183,12 +197,15 @@ reinforcement_learning:
   # top-move margin acts only when search measured a higher-Q correction. The
   # final result teaches WDL. A small confidence-weighted consistency loss also
   # aligns WDL's W-L scalar with root-Q without inventing a draw distribution;
-  # the separate scalar head continues to distil the same searched state value.
+  # the separate search-Q head continues to distil the same searched state value.
   # Production MCTS consumes WDL. The trained root-Q head remains auxiliary-only:
   # the paired benchmark showed that pure Q and WDL/Q blending weakened play.
   losses:
     policy: 1.0
     value: 1.00
+    # Match the canonical IL value contract: WDL CE preserves draw calibration,
+    # while a small robust loss directly trains the W-L scalar used by MCTS.
+    value_scalar_aux: 0.20
     value_search_consistency: 0.05
     moves_left: 0.05
     search_q: 0.20

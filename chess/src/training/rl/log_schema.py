@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 
 
-RL_LOG_SCHEMA_VERSION = 52
+RL_LOG_SCHEMA_VERSION = 55
 
 
 # One row per training iteration. This is the promotion/strength dashboard source,
@@ -13,7 +13,7 @@ RL_LOG_SCHEMA_VERSION = 52
 RL_MAIN_COLUMNS = (
     "iteration", "schema_version",
     "avg_loss", "policy_loss", "value_loss",
-    "value_primary_loss", "value_search_consistency_loss", "moves_left_loss",
+    "value_primary_loss", "value_scalar_aux_loss", "value_search_consistency_loss", "moves_left_loss",
     "search_q_loss", "search_q_weight", "search_q_coverage", "search_q_mae",
     "learning_rate", "value_loss_weight",
     "temperature", "policy_top1_acc", "policy_top3_acc",
@@ -145,12 +145,21 @@ RL_DATA_QUALITY_COLUMNS = (
     "champion_sample_age_avg", "champion_sample_age_p50", "champion_sample_age_p90",
     "selfplay_completed_games", "selfplay_draw_rate", "selfplay_decisive_rate",
     "selfplay_auto_draw_rate", "selfplay_truncated_rate", "selfplay_avg_game_value",
-    "selfplay_value_std", "selfplay_replay_storage_keep_rate",
+    "selfplay_value_std", "selfplay_adjudicated_games", "selfplay_syzygy_ended_games",
+    "selfplay_resigned_games", "selfplay_syzygy_probe_hits",
+    "selfplay_syzygy_probe_hit_rate", "selfplay_replay_storage_keep_rate",
     "selfplay_hard_start_games", "selfplay_hard_start_fraction",
+    "search_control_archive_size", "search_control_candidates",
+    "search_control_added", "search_control_updated", "search_control_replayed",
+    "search_control_start_fraction", "search_control_regret_mean",
+    "search_control_regret_p50", "search_control_regret_p90",
+    "search_control_sampled_regret_mean", "search_control_sampled_regret_p90",
+    "reanalyse_selected", "reanalyse_updated", "reanalyse_correction_fraction",
     "opponent_current_planned_share", "opponent_current_actual_share",
     "opponent_current_games", "opponent_current_score_rate",
     "opponent_best_planned_share", "opponent_best_actual_share",
     "opponent_best_games", "opponent_best_score_rate", "opponent_mix_error",
+    "opponent_count_error",
     "opponent_promotion_transition_progress",
     "mcts_avg_sims", "mcts_fresh_sims", "mcts_inherited_visit_credit",
     "mcts_avg_budget",
@@ -191,7 +200,7 @@ RL_PERFORMANCE_COLUMNS = (
     "mcts_selection_node_traversals_per_sec",
     "iteration_total_time_s", "bottleneck_stage",
     "stage_setup_time_s", "stage_selfplay_time_s", "stage_replay_time_s",
-    "stage_train_time_s", "stage_regular_eval_time_s", "stage_promotion_eval_time_s",
+    "stage_train_time_s", "stage_reanalyse_time_s", "stage_regular_eval_time_s", "stage_promotion_eval_time_s",
     "stage_elo_eval_time_s", "stage_log_time_s", "stage_checkpoint_time_s",
     "stage_gc_time_s", "avg_game_length",
     "mcts_avg_batch_size", "mcts_central_avg_batch_size", "mcts_worker_nn_wait_share_pct",

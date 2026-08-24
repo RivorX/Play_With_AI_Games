@@ -600,12 +600,12 @@ def apply_rl_startup_plan(
                     scaler.load_state_dict(scaler_state)
 
                 print(
-                    f"Resume loaded: next_iteration={start_iteration + 1}, "
+                    f"Model/optimizer resume loaded: next_iteration={start_iteration + 1}, "
                     f"best_win_rate={best_win_rate:.2%}"
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    "Full RL resume failed. Resume is not interchangeable with "
+                    "RL model/optimizer resume failed. Resume is not interchangeable with "
                     "transfer because transfer resets optimizer, schedule and replay "
                     "state; select TRANSFER explicitly if that is intended."
                 ) from exc

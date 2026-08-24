@@ -14,6 +14,37 @@ from src.mcts.q_delta import (
 
 
 _DEFAULT_MAX_POLICY_TARGETS = 256
+_REPLAY_STATE_VERSION = 2
+_REPLAY_TENSOR_FIELDS = (
+    "_boards",
+    "_values",
+    "_policy_indices",
+    "_policy_values",
+    "_policy_lengths",
+    "_legal_indices",
+    "_legal_lengths",
+    "_importance",
+    "_policy_sample_weights",
+    "_value_sample_weights",
+    "_moves_left",
+    "_insertion_iterations",
+    "_source_codes",
+    "_root_q_targets",
+    "_search_changed_top",
+    "_search_q_deltas",
+    "_best_q_targets",
+    "_played_q_targets",
+    "_orig_q_targets",
+    "_policy_kld_targets",
+    "_search_visits",
+    "_game_ids",
+    "_game_ply_indices",
+    "_regret_targets",
+    "_archive_ids",
+    "_policy_target_iterations",
+    "_last_reanalysis_iterations",
+    "_reanalysis_counts",
+)
 REPLAY_SOURCE_UNKNOWN = 0
 REPLAY_SOURCE_LEARNER = 1
 REPLAY_SOURCE_FROZEN_BEST = 2
@@ -50,10 +81,14 @@ class ReplayBuffer:
         max_size,
         max_policy_targets=_DEFAULT_MAX_POLICY_TARGETS,
         use_fp16=False,
+        compact_boards=False,
+        store_hard_positions=True,
     ):
         self.max_size = int(max_size)
         self.max_policy_targets = max(1, int(max_policy_targets))
         self.use_fp16 = bool(use_fp16)
+        self.compact_boards = bool(compact_boards)
+        self.store_hard_positions = bool(store_hard_positions)
         self.decisive_value_epsilon = 0.05
         self.value_balance_epsilon = 0.05
         self.recent_window_fraction = 0.25
@@ -83,6 +118,11 @@ class ReplayBuffer:
         self._search_visits = None
         self._game_ids = None
         self._game_ply_indices = None
+        self._regret_targets = None
+        self._archive_ids = None
+        self._policy_target_iterations = None
+        self._last_reanalysis_iterations = None
+        self._reanalysis_counts = None
         self._fens = []
         self._history_fens = []
         self._scratch = {}
@@ -112,11 +152,21 @@ class ReplayBuffer:
             board = torch.as_tensor(board)
 
         board_shape = tuple(board.shape)
-        board_dtype = torch.float16 if self.use_fp16 else torch.float32
+        if self.compact_boards and (
+            len(board_shape) != 3 or int(board_shape[0]) % 16 != 0
+        ):
+            raise ValueError(
+                "Compact replay boards require [16*k, 8, 8] encoder planes, "
+                f"got {board_shape}."
+            )
+        board_dtype = torch.uint8 if self.compact_boards else (
+            torch.float16 if self.use_fp16 else torch.float32
+        )
+        value_dtype = torch.float16 if self.use_fp16 else torch.float32
         probs_dtype = torch.float16 if self.use_fp16 else torch.float32
 
         self._boards = torch.empty((self.max_size, *board_shape), dtype=board_dtype)
-        self._values = torch.empty((self.max_size, 1), dtype=board_dtype)
+        self._values = torch.empty((self.max_size, 1), dtype=value_dtype)
         self._policy_indices = torch.full(
             (self.max_size, self.max_policy_targets),
             -1,
@@ -136,7 +186,7 @@ class ReplayBuffer:
         self._importance = torch.zeros((self.max_size,), dtype=torch.float32)
         self._policy_sample_weights = torch.ones((self.max_size,), dtype=torch.float32)
         self._value_sample_weights = torch.ones((self.max_size,), dtype=torch.float32)
-        self._moves_left = torch.zeros((self.max_size, 1), dtype=torch.float32)
+        self._moves_left = torch.full((self.max_size, 1), -1.0, dtype=torch.float32)
         self._insertion_iterations = torch.zeros((self.max_size,), dtype=torch.int32)
         self._source_codes = torch.zeros((self.max_size,), dtype=torch.int8)
         self._root_q_targets = torch.full((self.max_size, 1), float("nan"), dtype=torch.float32)
@@ -149,14 +199,174 @@ class ReplayBuffer:
         self._search_visits = torch.zeros((self.max_size,), dtype=torch.int32)
         self._game_ids = torch.full((self.max_size,), -1, dtype=torch.int64)
         self._game_ply_indices = torch.full((self.max_size,), -1, dtype=torch.int16)
-        self._fens = [None] * self.max_size
-        self._history_fens = [None] * self.max_size
+        self._regret_targets = torch.full((self.max_size,), float("nan"), dtype=torch.float32)
+        self._archive_ids = torch.full((self.max_size,), -1, dtype=torch.int64)
+        self._policy_target_iterations = torch.zeros((self.max_size,), dtype=torch.int32)
+        self._last_reanalysis_iterations = torch.zeros((self.max_size,), dtype=torch.int32)
+        self._reanalysis_counts = torch.zeros((self.max_size,), dtype=torch.uint8)
+        if self.store_hard_positions:
+            self._fens = [None] * self.max_size
+            self._history_fens = [None] * self.max_size
+
+    def _copy_boards_to_storage(self, destination, source):
+        """Store exact encoder planes using half the memory of FP16.
+
+        Piece/castling/en-passant planes are binary.  In every 16-plane history
+        block the remaining two planes originate from integer clocks divided by
+        50 and 100, so storing those integers in uint8 is lossless for tensors
+        produced by the project encoder.
+        """
+        if not self.compact_boards:
+            destination.copy_(source.to(dtype=destination.dtype))
+            return
+        if source.dtype == torch.uint8:
+            destination.copy_(source)
+            return
+        destination.copy_(source)
+        channels = int(destination.shape[-3])
+        for offset in range(0, channels, 16):
+            destination[..., offset + 14, :, :].copy_(
+                torch.round(source[..., offset + 14, :, :].float() * 50.0)
+                .clamp_(0.0, 50.0)
+                .to(dtype=torch.uint8)
+            )
+            destination[..., offset + 15, :, :].copy_(
+                torch.round(source[..., offset + 15, :, :].float() * 100.0)
+                .clamp_(0.0, 100.0)
+                .to(dtype=torch.uint8)
+            )
+
+    def _decode_boards_from_storage(self, destination, source):
+        destination.copy_(source)
+        if not self.compact_boards:
+            return
+        channels = int(destination.shape[-3])
+        for offset in range(0, channels, 16):
+            destination[..., offset + 14, :, :].div_(50.0)
+            destination[..., offset + 15, :, :].div_(100.0)
 
     def set_current_iteration(self, iteration):
         try:
             self.current_iteration = max(0, int(iteration))
         except Exception:
             self.current_iteration = 0
+
+    def checkpoint_state(self):
+        """Return a tensor-only snapshot suitable for an RL replay sidecar.
+
+        Storage tensors are deliberately not cloned: checkpointing a large
+        replay must not transiently double host RAM. ``torch.save`` consumes
+        this mapping synchronously before training mutates the buffer again.
+        """
+        return {
+            "format_version": _REPLAY_STATE_VERSION,
+            "max_size": int(self.max_size),
+            "max_policy_targets": int(self.max_policy_targets),
+            "use_fp16": bool(self.use_fp16),
+            "compact_boards": bool(self.compact_boards),
+            "store_hard_positions": bool(self.store_hard_positions),
+            "size": int(self.size),
+            "position": int(self.position),
+            "current_iteration": int(self.current_iteration),
+            "total_overwritten_positions": int(self.total_overwritten_positions),
+            "total_resize_dropped_positions": int(self.total_resize_dropped_positions),
+            "storage": {
+                field: getattr(self, field)
+                for field in _REPLAY_TENSOR_FIELDS
+                if getattr(self, field) is not None
+            },
+            "fens": list(self._fens) if self.store_hard_positions else [],
+            "history_fens": (
+                [tuple(items or ()) for items in self._history_fens]
+                if self.store_hard_positions
+                else []
+            ),
+        }
+
+    def load_checkpoint_state(self, state):
+        """Restore an exact ring-buffer snapshot created by ``checkpoint_state``."""
+        if not isinstance(state, dict):
+            raise TypeError("Replay checkpoint state must be a mapping.")
+        version = int(state.get("format_version", 0) or 0)
+        if version not in (1, _REPLAY_STATE_VERSION):
+            raise ValueError(
+                f"Unsupported replay checkpoint version {version}; "
+                f"expected 1 or {_REPLAY_STATE_VERSION}."
+            )
+
+        storage = state.get("storage")
+        if not isinstance(storage, dict):
+            raise ValueError("Replay checkpoint is missing tensor storage.")
+        boards = storage.get("_boards")
+        stored_max_size = max(1, int(state.get("max_size", 1) or 1))
+        size = max(0, min(int(state.get("size", 0) or 0), stored_max_size))
+        if size > 0 and not torch.is_tensor(boards):
+            raise ValueError("Non-empty replay checkpoint is missing board storage.")
+
+        if torch.is_tensor(boards):
+            if boards.ndim < 2 or int(boards.shape[0]) != stored_max_size:
+                raise ValueError(
+                    "Replay board storage capacity does not match checkpoint metadata."
+                )
+            legacy_optional = {
+                "_regret_targets", "_archive_ids", "_policy_target_iterations",
+                "_last_reanalysis_iterations", "_reanalysis_counts",
+            }
+            for field in _REPLAY_TENSOR_FIELDS:
+                tensor = storage.get(field)
+                if version == 1 and field in legacy_optional and not torch.is_tensor(tensor):
+                    setattr(self, field, None)
+                    continue
+                if not torch.is_tensor(tensor):
+                    raise ValueError(f"Replay checkpoint is missing tensor {field!r}.")
+                if int(tensor.shape[0]) != stored_max_size:
+                    raise ValueError(
+                        f"Replay tensor {field!r} has capacity {tensor.shape[0]}, "
+                        f"expected {stored_max_size}."
+                    )
+                setattr(self, field, tensor.cpu())
+            if version == 1:
+                self._regret_targets = torch.full((stored_max_size,), float("nan"), dtype=torch.float32)
+                self._archive_ids = torch.full((stored_max_size,), -1, dtype=torch.int64)
+                self._policy_target_iterations = self._insertion_iterations.clone()
+                self._last_reanalysis_iterations = torch.zeros((stored_max_size,), dtype=torch.int32)
+                self._reanalysis_counts = torch.zeros((stored_max_size,), dtype=torch.uint8)
+        else:
+            for field in _REPLAY_TENSOR_FIELDS:
+                setattr(self, field, None)
+
+        self.max_size = stored_max_size
+        self.max_policy_targets = max(
+            1,
+            int(state.get("max_policy_targets", self.max_policy_targets) or 1),
+        )
+        self.use_fp16 = bool(state.get("use_fp16", self.use_fp16))
+        self.compact_boards = bool(state.get("compact_boards", self.compact_boards))
+        self.size = size
+        self.position = int(state.get("position", 0) or 0) % self.max_size
+        self.current_iteration = max(0, int(state.get("current_iteration", 0) or 0))
+        self.total_overwritten_positions = max(
+            0, int(state.get("total_overwritten_positions", 0) or 0)
+        )
+        self.total_resize_dropped_positions = max(
+            0, int(state.get("total_resize_dropped_positions", 0) or 0)
+        )
+
+        if self.store_hard_positions:
+            saved_fens = list(state.get("fens") or [])
+            saved_history = list(state.get("history_fens") or [])
+            self._fens = (saved_fens + [None] * self.max_size)[:self.max_size]
+            self._history_fens = [
+                tuple(items or ())
+                for items in (saved_history + [()] * self.max_size)[:self.max_size]
+            ]
+        else:
+            self._fens = []
+            self._history_fens = []
+        self._scratch = {}
+        self.last_sample_age_stats = {}
+        self.last_sample_ages = np.empty(0, dtype=np.float32)
+        return self.size
 
     def relabel_iteration_source(self, iteration, source_code):
         """Relabel active rows inserted by one self-play iteration."""
@@ -188,7 +398,7 @@ class ReplayBuffer:
             return scratch
 
         board_shape = tuple(self._boards.shape[1:])
-        board_dtype = self._boards.dtype
+        board_dtype = torch.float16 if self.use_fp16 else torch.float32
         probs_dtype = self._policy_values.dtype
 
         scratch = {
@@ -224,7 +434,7 @@ class ReplayBuffer:
         policy_weight = float(position[5]) if len(position) > 5 else 1.0
         value_weight = float(position[6]) if len(position) > 6 else 1.0
         source_code = int(position[7]) if len(position) > 7 else REPLAY_SOURCE_UNKNOWN
-        moves_left = float(position[8]) if len(position) > 8 else 0.0
+        moves_left = float(position[8]) if len(position) > 8 else -1.0
         legal_indices = position[9] if len(position) > 9 and position[9] is not None else policy_indices
         fen = str(position[10]) if len(position) > 10 and position[10] else None
         root_q = float(position[11]) if len(position) > 11 and position[11] is not None else float("nan")
@@ -238,6 +448,8 @@ class ReplayBuffer:
         search_visits = int(position[19]) if len(position) > 19 and position[19] is not None else 0
         game_id = int(position[20]) if len(position) > 20 and position[20] is not None else -1
         game_ply_index = int(position[21]) if len(position) > 21 and position[21] is not None else -1
+        regret_target = float(position[22]) if len(position) > 22 and position[22] is not None else float("nan")
+        archive_id = int(position[23]) if len(position) > 23 and position[23] is not None else -1
         if self.use_fp16:
             board = board.half().contiguous()
             policy_values = policy_values.half().contiguous()
@@ -258,6 +470,7 @@ class ReplayBuffer:
             search_changed_top, search_q_delta,
             best_q, played_q, orig_q, policy_kld, search_visits,
             game_id, game_ply_index,
+            regret_target, archive_id,
         )
 
     def _store_at_slot(self, slot, position):
@@ -284,6 +497,8 @@ class ReplayBuffer:
             search_visits,
             game_id,
             game_ply_index,
+            regret_target,
+            archive_id,
         ) = self._normalize_position(position)
 
         count = int(policy_indices.numel())
@@ -292,7 +507,10 @@ class ReplayBuffer:
             policy_indices = policy_indices[:count]
             policy_values = policy_values[:count]
 
-        self._boards[slot].copy_(board)
+        self._copy_boards_to_storage(
+            self._boards[slot:slot + 1],
+            board.unsqueeze(0),
+        )
         self._values[slot].copy_(value.to(dtype=self._values.dtype))
         self._policy_indices[slot].fill_(-1)
         self._policy_values[slot].zero_()
@@ -321,8 +539,14 @@ class ReplayBuffer:
         self._search_visits[slot] = max(0, int(search_visits))
         self._game_ids[slot] = int(game_id)
         self._game_ply_indices[slot] = int(game_ply_index)
-        self._fens[slot] = fen
-        self._history_fens[slot] = tuple(history_fens)
+        self._regret_targets[slot] = float(regret_target)
+        self._archive_ids[slot] = int(archive_id)
+        self._policy_target_iterations[slot] = int(self.current_iteration)
+        self._last_reanalysis_iterations[slot] = 0
+        self._reanalysis_counts[slot] = 0
+        if self.store_hard_positions:
+            self._fens[slot] = fen
+            self._history_fens[slot] = tuple(history_fens)
 
     def _build_batch_from_indices(self, indices):
         idx = torch.as_tensor(indices, dtype=torch.long)
@@ -346,7 +570,7 @@ class ReplayBuffer:
         orig_q_targets = scratch["orig_q_targets"]
         policy_kld_targets = scratch["policy_kld_targets"]
         search_visits = scratch["search_visits"]
-        boards.copy_(self._boards[idx])
+        self._decode_boards_from_storage(boards, self._boards[idx])
         values.copy_(self._values[idx])
         policy_sample_weights.copy_(self._policy_sample_weights[idx])
         value_sample_weights.copy_(self._value_sample_weights[idx])
@@ -420,12 +644,14 @@ class ReplayBuffer:
         search_visits=None,
         game_ids=None,
         game_ply_indices=None,
+        regret_targets=None,
+        archive_ids=None,
     ):
         if boards is None or int(boards.shape[0]) <= 0:
             return
 
         self._ensure_storage_initialized(boards[0])
-        boards = boards.to(dtype=self._boards.dtype).contiguous()
+        boards = boards.contiguous()
         values = values.reshape(-1, 1).to(dtype=self._values.dtype).contiguous()
         policy_indices = policy_indices.to(dtype=torch.int16).contiguous()
         policy_values = policy_values.to(dtype=self._policy_values.dtype).contiguous()
@@ -443,7 +669,7 @@ class ReplayBuffer:
         else:
             value_weights = value_weights.reshape(-1).to(dtype=torch.float32).contiguous()
         if moves_left is None:
-            moves_left = torch.zeros((int(boards.shape[0]), 1), dtype=torch.float32)
+            moves_left = torch.full((int(boards.shape[0]), 1), -1.0, dtype=torch.float32)
         else:
             moves_left = moves_left.reshape(-1, 1).to(dtype=torch.float32).contiguous()
         if legal_indices is None:
@@ -500,6 +726,14 @@ class ReplayBuffer:
             game_ply_indices = torch.full((batch_size,), -1, dtype=torch.int16)
         else:
             game_ply_indices = game_ply_indices.reshape(-1).to(dtype=torch.int16).contiguous()
+        if regret_targets is None:
+            regret_targets = torch.full((batch_size,), float("nan"), dtype=torch.float32)
+        else:
+            regret_targets = regret_targets.reshape(-1).to(dtype=torch.float32).contiguous()
+        if archive_ids is None:
+            archive_ids = torch.full((batch_size,), -1, dtype=torch.int64)
+        else:
+            archive_ids = archive_ids.reshape(-1).to(dtype=torch.int64).contiguous()
         fens = list(fens or [None] * batch_size)
         history_fens = list(history_fens or [()] * batch_size)
         max_len = int(policy_indices.shape[1]) if policy_indices.dim() == 2 else 0
@@ -527,7 +761,10 @@ class ReplayBuffer:
             dst_slice = slice(dst_start, dst_start + count)
             src_slice = slice(src_start, src_end)
 
-            self._boards[dst_slice].copy_(boards[src_slice])
+            self._copy_boards_to_storage(
+                self._boards[dst_slice],
+                boards[src_slice],
+            )
             self._values[dst_slice].copy_(values[src_slice])
             self._policy_indices[dst_slice].fill_(-1)
             self._policy_values[dst_slice].zero_()
@@ -555,11 +792,17 @@ class ReplayBuffer:
             self._search_visits[dst_slice].copy_(search_visits[src_slice])
             self._game_ids[dst_slice].copy_(game_ids[src_slice])
             self._game_ply_indices[dst_slice].copy_(game_ply_indices[src_slice])
+            self._regret_targets[dst_slice].copy_(regret_targets[src_slice])
+            self._archive_ids[dst_slice].copy_(archive_ids[src_slice])
+            self._policy_target_iterations[dst_slice].fill_(int(self.current_iteration))
+            self._last_reanalysis_iterations[dst_slice].zero_()
+            self._reanalysis_counts[dst_slice].zero_()
             for offset in range(count):
                 src_idx = src_start + offset
                 dst_idx = dst_start + offset
-                self._fens[dst_idx] = str(fens[src_idx]) if src_idx < len(fens) and fens[src_idx] else None
-                self._history_fens[dst_idx] = tuple(history_fens[src_idx] or ()) if src_idx < len(history_fens) else ()
+                if self.store_hard_positions:
+                    self._fens[dst_idx] = str(fens[src_idx]) if src_idx < len(fens) and fens[src_idx] else None
+                    self._history_fens[dst_idx] = tuple(history_fens[src_idx] or ()) if src_idx < len(history_fens) else ()
             self.position = (dst_start + count) % self.max_size
             self.size = min(self.size + count, self.max_size)
             remaining -= count
@@ -769,13 +1012,20 @@ class ReplayBuffer:
         for start in range(0, int(indices.size), chunk_size):
             chunk = indices[start:start + chunk_size]
             idx = torch.as_tensor(chunk, dtype=torch.long)
+            copied_boards = self._boards[idx]
+            if self.compact_boards and not target.compact_boards:
+                copied_boards = torch.empty(
+                    copied_boards.shape,
+                    dtype=torch.float16 if self.use_fp16 else torch.float32,
+                )
+                self._decode_boards_from_storage(copied_boards, self._boards[idx])
             source_codes = self._source_codes[idx]
             if source_code is not None:
                 source_codes = torch.full(
                     (int(idx.numel()),), int(source_code), dtype=torch.int8,
                 )
             target.add_packed_batch(
-                self._boards[idx],
+                copied_boards,
                 self._policy_indices[idx],
                 self._policy_values[idx],
                 self._policy_lengths[idx],
@@ -787,9 +1037,15 @@ class ReplayBuffer:
                 legal_indices=self._legal_indices[idx],
                 legal_lengths=self._legal_lengths[idx],
                 source_codes=source_codes,
-                fens=[self._fens[int(row)] for row in chunk],
+                fens=(
+                    [self._fens[int(row)] for row in chunk]
+                    if self.store_hard_positions else None
+                ),
                 root_q_targets=self._root_q_targets[idx],
-                history_fens=[self._history_fens[int(row)] for row in chunk],
+                history_fens=(
+                    [self._history_fens[int(row)] for row in chunk]
+                    if self.store_hard_positions else None
+                ),
                 search_changed_top=self._search_changed_top[idx],
                 search_q_deltas=self._search_q_deltas[idx],
                 best_q_targets=self._best_q_targets[idx],
@@ -856,7 +1112,7 @@ class ReplayBuffer:
 
     def select_hard_position_indices(self, sample_size, min_age=0):
         """Select reconstructable positions with emphasis on unresolved search corrections."""
-        if self.size <= 0 or not self._fens:
+        if self.size <= 0 or not self.store_hard_positions or not self._fens:
             return np.empty(0, dtype=np.int64)
         eligible = np.asarray(
             [
@@ -905,6 +1161,8 @@ class ReplayBuffer:
         return np.random.choice(eligible, sample_size, replace=False, p=weights).astype(np.int64)
 
     def hard_positions_for_indices(self, indices):
+        if not self.store_hard_positions:
+            return []
         result = []
         for idx in np.asarray(indices, dtype=np.int64).tolist():
             result.append({
@@ -913,6 +1171,156 @@ class ReplayBuffer:
                 "importance": float(self._importance[int(idx)].item()),
             })
         return result
+
+    def search_control_candidates(self, iteration):
+        """Return at most one highest-regret exact restart from each new game."""
+        if self.size <= 0 or not self.store_hard_positions or not self._fens:
+            return []
+        active = torch.arange(self.size, dtype=torch.long)
+        mask = (
+            (self._insertion_iterations[:self.size] == int(iteration))
+            & torch.isfinite(self._regret_targets[:self.size])
+            & (self._regret_targets[:self.size] > 0.0)
+            & (self._game_ids[:self.size] >= 0)
+        )
+        indices = active[mask].tolist()
+        best_by_game = {}
+        for idx in indices:
+            fen = self._fens[int(idx)]
+            if not fen or not _fen_resets_repetition_history(fen):
+                continue
+            game_id = int(self._game_ids[int(idx)].item())
+            regret = float(self._regret_targets[int(idx)].item())
+            previous = best_by_game.get(game_id)
+            if previous is None or regret > previous[0]:
+                best_by_game[game_id] = (regret, int(idx))
+        return [
+            {
+                "fen": self._fens[idx],
+                "history_fens": list(self._history_fens[idx] or ()),
+                "regret": regret,
+                "game_id": game_id,
+                "game_ply_index": int(self._game_ply_indices[idx].item()),
+            }
+            for game_id, (regret, idx) in best_by_game.items()
+        ]
+
+    def search_control_replay_updates(self, iteration):
+        """Return the earliest retained regret for every archive-start game."""
+        if self.size <= 0:
+            return {}
+        updates = {}
+        earliest = {}
+        for idx in range(self.size):
+            if int(self._insertion_iterations[idx].item()) != int(iteration):
+                continue
+            archive_id = int(self._archive_ids[idx].item())
+            regret = float(self._regret_targets[idx].item())
+            if archive_id < 0 or not np.isfinite(regret):
+                continue
+            ply = int(self._game_ply_indices[idx].item())
+            if archive_id not in earliest or ply < earliest[archive_id][0]:
+                earliest[archive_id] = (ply, regret)
+        for archive_id, (_, regret) in earliest.items():
+            updates[int(archive_id)] = float(regret)
+        return updates
+
+    def select_reanalysis_indices(
+        self,
+        sample_size,
+        *,
+        min_age=2,
+        min_staleness=2,
+        max_refreshes=2,
+        seed=0,
+    ):
+        """Select old, reconstructable targets once per generation."""
+        if self.size <= 0 or not self.store_hard_positions or not self._fens:
+            return np.empty(0, dtype=np.int64)
+        current = int(self.current_iteration)
+        eligible = []
+        for idx in range(self.size):
+            if not self._fens[idx] or not _fen_resets_repetition_history(self._fens[idx]):
+                continue
+            insertion_age = current - int(self._insertion_iterations[idx].item())
+            target_age = current - int(self._policy_target_iterations[idx].item())
+            if insertion_age < int(min_age) or target_age < int(min_staleness):
+                continue
+            if int(self._last_reanalysis_iterations[idx].item()) >= current:
+                continue
+            if int(self._reanalysis_counts[idx].item()) >= int(max_refreshes):
+                continue
+            eligible.append(idx)
+        eligible = np.asarray(eligible, dtype=np.int64)
+        if eligible.size <= 0:
+            return eligible
+        count = min(max(0, int(sample_size)), int(eligible.size))
+        if count <= 0:
+            return np.empty(0, dtype=np.int64)
+        idx = torch.as_tensor(eligible, dtype=torch.long)
+        regret = self._regret_targets[idx].float().cpu().numpy()
+        q_delta = self._search_q_deltas[idx].float().cpu().numpy()
+        changed = self._search_changed_top[idx].cpu().numpy()
+        priority = 0.25 + np.sqrt(np.maximum(0.0, np.nan_to_num(regret, nan=0.0)))
+        priority *= 1.0 + np.where(
+            changed & np.isfinite(q_delta) & (q_delta > USEFUL_SEARCH_Q_DELTA_MIN),
+            np.clip(q_delta, 0.0, 0.50) / 0.20,
+            0.0,
+        )
+        priority /= max(1e-12, float(priority.sum()))
+        rng = np.random.default_rng(int(seed))
+        return np.sort(rng.choice(eligible, count, replace=False, p=priority)).astype(np.int64)
+
+    def apply_reanalysis(self, indices, policy_targets, metadata_rows, *, target_iteration):
+        """Atomically replace search-derived fields while preserving game outcomes."""
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if len(set(indices.tolist())) != int(indices.size):
+            raise ValueError("Reanalysis indices must be unique.")
+        if len(policy_targets) != int(indices.size) or len(metadata_rows) != int(indices.size):
+            raise ValueError("Reanalysis payload lengths do not match selected indices.")
+        prepared = []
+        for idx, target, metadata in zip(indices.tolist(), policy_targets, metadata_rows):
+            if idx < 0 or idx >= self.size:
+                raise IndexError(f"Reanalysis index {idx} is outside active replay.")
+            policy_indices, policy_values = target
+            policy_indices = torch.as_tensor(policy_indices, dtype=torch.int16).reshape(-1)
+            policy_values = torch.as_tensor(policy_values, dtype=torch.float32).reshape(-1)
+            count = min(int(policy_indices.numel()), int(policy_values.numel()), self.max_policy_targets)
+            if count <= 0:
+                raise ValueError("Reanalysis policy target is empty.")
+            policy_indices = policy_indices[:count]
+            policy_values = policy_values[:count]
+            if not torch.isfinite(policy_values).all() or bool((policy_values < 0.0).any()):
+                raise ValueError("Reanalysis policy probabilities must be finite and non-negative.")
+            mass = float(policy_values.sum().item())
+            if mass <= 0.0:
+                raise ValueError("Reanalysis policy target has zero probability mass.")
+            legal_count = int(self._legal_lengths[idx].item())
+            legal = set(int(value) for value in self._legal_indices[idx, :legal_count].tolist())
+            if any(int(value) not in legal for value in policy_indices.tolist()):
+                raise ValueError("Reanalysis policy contains an illegal action index.")
+            prepared.append((idx, policy_indices, policy_values / mass, dict(metadata or {})))
+
+        for idx, policy_indices, policy_values, metadata in prepared:
+            count = int(policy_indices.numel())
+            self._policy_indices[idx].fill_(-1)
+            self._policy_values[idx].zero_()
+            self._policy_indices[idx, :count].copy_(policy_indices)
+            self._policy_values[idx, :count].copy_(policy_values.to(self._policy_values.dtype))
+            self._policy_lengths[idx] = count
+            self._policy_sample_weights[idx] = 1.0
+            self._root_q_targets[idx] = float(metadata.get("root_q", float("nan")))
+            self._best_q_targets[idx] = float(metadata.get("best_q", float("nan")))
+            self._played_q_targets[idx] = float("nan")
+            self._orig_q_targets[idx] = float(metadata.get("orig_q", float("nan")))
+            self._policy_kld_targets[idx] = float(metadata.get("policy_kld", float("nan")))
+            self._search_changed_top[idx] = bool(metadata.get("search_changed_top", False))
+            self._search_q_deltas[idx] = float(metadata.get("search_q_delta", float("nan")))
+            self._search_visits[idx] = max(0, int(metadata.get("search_visits", 0)))
+            self._policy_target_iterations[idx] = int(target_iteration)
+            self._last_reanalysis_iterations[idx] = int(target_iteration)
+            self._reanalysis_counts[idx] = min(255, int(self._reanalysis_counts[idx].item()) + 1)
+        return len(prepared)
 
     def _record_sample_age_stats(self, indices):
         if self._insertion_iterations is None:
@@ -977,6 +1385,11 @@ class ReplayBuffer:
         old_search_visits = self._search_visits
         old_game_ids = self._game_ids
         old_game_ply_indices = self._game_ply_indices
+        old_regret_targets = self._regret_targets
+        old_archive_ids = self._archive_ids
+        old_policy_target_iterations = self._policy_target_iterations
+        old_last_reanalysis_iterations = self._last_reanalysis_iterations
+        old_reanalysis_counts = self._reanalysis_counts
         old_fens = self._fens
         old_history_fens = self._history_fens
 
@@ -1006,7 +1419,7 @@ class ReplayBuffer:
         self._importance = torch.zeros((self.max_size,), dtype=old_importance.dtype)
         self._policy_sample_weights = torch.ones((self.max_size,), dtype=old_policy_sample_weights.dtype)
         self._value_sample_weights = torch.ones((self.max_size,), dtype=old_value_sample_weights.dtype)
-        self._moves_left = torch.zeros((self.max_size, 1), dtype=old_moves_left.dtype)
+        self._moves_left = torch.full((self.max_size, 1), -1.0, dtype=old_moves_left.dtype)
         self._insertion_iterations = torch.zeros((self.max_size,), dtype=old_insertion_iterations.dtype)
         self._source_codes = torch.zeros((self.max_size,), dtype=old_source_codes.dtype)
         self._root_q_targets = torch.full((self.max_size, 1), float("nan"), dtype=torch.float32)
@@ -1019,8 +1432,13 @@ class ReplayBuffer:
         self._search_visits = torch.zeros((self.max_size,), dtype=torch.int32)
         self._game_ids = torch.full((self.max_size,), -1, dtype=torch.int64)
         self._game_ply_indices = torch.full((self.max_size,), -1, dtype=torch.int16)
-        self._fens = [None] * self.max_size
-        self._history_fens = [None] * self.max_size
+        self._regret_targets = torch.full((self.max_size,), float("nan"), dtype=torch.float32)
+        self._archive_ids = torch.full((self.max_size,), -1, dtype=torch.int64)
+        self._policy_target_iterations = torch.zeros((self.max_size,), dtype=torch.int32)
+        self._last_reanalysis_iterations = torch.zeros((self.max_size,), dtype=torch.int32)
+        self._reanalysis_counts = torch.zeros((self.max_size,), dtype=torch.uint8)
+        self._fens = [None] * self.max_size if self.store_hard_positions else []
+        self._history_fens = [None] * self.max_size if self.store_hard_positions else []
 
         if keep_size > 0:
             idx = torch.as_tensor(keep_indices, dtype=torch.long)
@@ -1047,9 +1465,15 @@ class ReplayBuffer:
             self._search_visits[:keep_size].copy_(old_search_visits[idx])
             self._game_ids[:keep_size].copy_(old_game_ids[idx])
             self._game_ply_indices[:keep_size].copy_(old_game_ply_indices[idx])
-            for dst_idx, src_idx in enumerate(keep_indices.tolist()):
-                self._fens[dst_idx] = old_fens[int(src_idx)]
-                self._history_fens[dst_idx] = old_history_fens[int(src_idx)]
+            self._regret_targets[:keep_size].copy_(old_regret_targets[idx])
+            self._archive_ids[:keep_size].copy_(old_archive_ids[idx])
+            self._policy_target_iterations[:keep_size].copy_(old_policy_target_iterations[idx])
+            self._last_reanalysis_iterations[:keep_size].copy_(old_last_reanalysis_iterations[idx])
+            self._reanalysis_counts[:keep_size].copy_(old_reanalysis_counts[idx])
+            if self.store_hard_positions:
+                for dst_idx, src_idx in enumerate(keep_indices.tolist()):
+                    self._fens[dst_idx] = old_fens[int(src_idx)]
+                    self._history_fens[dst_idx] = old_history_fens[int(src_idx)]
 
         self.size = keep_size
         self.position = 0 if keep_size >= self.max_size else keep_size
