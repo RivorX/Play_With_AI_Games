@@ -277,37 +277,6 @@ def _mean(rows, column, window=5):
     return sum(values) / len(values) if values else None
 
 
-def _anchor_rows_with_reused_best(rows, first_promotion_iteration):
-    """Backfill the pre-promotion anchor series from the identical best match.
-
-    Before the first promotion, frozen best and the IL anchor are the same model.
-    New logs already persist the reused result on every evaluation; this fallback
-    also makes older logs render the complete pre-promotion history.
-    """
-    if first_promotion_iteration is None:
-        return list(rows)
-    column_map = {
-        "anchor_games": "eval_games",
-        "anchor_score_rate": "score_rate",
-        "anchor_true_win_rate": "true_win_rate",
-        "anchor_score_lower_bound": "eval_score_lower_bound",
-        "anchor_no_mcts_games": "no_mcts_games",
-        "anchor_no_mcts_score_rate": "no_mcts_score_rate",
-        "anchor_no_mcts_score_lower_bound": "no_mcts_score_lower_bound",
-        "anchor_mcts_no_mcts_gap": "mcts_no_mcts_gap",
-    }
-    result = []
-    for row in rows:
-        rendered = dict(row)
-        iteration = _number(row.get("iteration"))
-        if iteration is not None and iteration <= first_promotion_iteration:
-            for anchor_column, best_column in column_map.items():
-                if _number(rendered.get(anchor_column)) is None:
-                    rendered[anchor_column] = rendered.get(best_column, "")
-        result.append(rendered)
-    return result
-
-
 def _style(ax, title, percent=False):
     ax.set_title(title, fontsize=10, fontweight="bold", loc="left")
     ax.grid(True, alpha=0.22, linewidth=0.7)
@@ -349,6 +318,50 @@ def _line(
     return True
 
 
+def _value_search_alignment_panel(ax, rows, *, break_after=None):
+    """Show whether the production value scalar agrees with searched root-Q."""
+    _style(ax, "NN value vs searched root-Q")
+    shown = _line(
+        ax, rows, "value_root_q_mae", "root-Q MAE", _COLORS[0],
+        lw=2.0, break_after=break_after,
+    )
+    shown |= _line(
+        ax, rows, "value_root_q_bias", "signed bias", _COLORS[3],
+        ls="--", lw=1.8, break_after=break_after,
+    )
+    ax.axhline(0.0, color="#374151", lw=1.0, ls=":", label="zero bias")
+    ax.set_ylabel("value error", fontsize=7.5, color=_COLORS[0])
+    ax.tick_params(axis="y", labelcolor=_COLORS[0])
+
+    ax2 = ax.twinx()
+    ax2.tick_params(axis="y", labelcolor=_COLORS[2], labelsize=8)
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+    correlation = _line(
+        ax2, rows, "value_root_q_correlation", "correlation", _COLORS[2],
+        lw=1.8, break_after=break_after,
+    )
+    ax2.set_ylabel("correlation", fontsize=7.5, color=_COLORS[2])
+    latest_mae = _last(rows, "value_root_q_mae")
+    latest_bias = _last(rows, "value_root_q_bias")
+    latest_correlation = _last(rows, "value_root_q_correlation")
+    latest = []
+    if latest_mae is not None:
+        latest.append(f"MAE {latest_mae:.3f}")
+    if latest_bias is not None:
+        latest.append(f"bias {latest_bias:+.3f}")
+    if latest_correlation is not None:
+        latest.append(f"corr {latest_correlation:.1%}")
+    if latest:
+        ax.text(
+            0.02, 0.96, "latest: " + " | ".join(latest),
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.8,
+            color="#4b5563",
+        )
+    _legend_below(ax, ax2, ncol=2)
+    if not (shown or correlation):
+        _no_data(ax)
+
+
 def _fill_between_with_breaks(ax, xs, lower, upper, *, break_after=None, **kwargs):
     offset = 0
     for segment_x, segment_lower in _split_series_at_boundaries(xs, lower, break_after):
@@ -357,7 +370,17 @@ def _fill_between_with_breaks(ax, xs, lower, upper, *, break_after=None, **kwarg
         offset = stop
 
 
-def _stacked_iteration_bars(ax, rows, specs, value_resolver, *, title, ylabel, legend_columns=3):
+def _stacked_iteration_bars(
+    ax,
+    rows,
+    specs,
+    value_resolver,
+    *,
+    title,
+    ylabel,
+    legend_columns=3,
+    seamless=False,
+):
     """Draw a compact stacked decomposition with one bar per iteration."""
     iterations = []
     series = {key: [] for key, _, _ in specs}
@@ -390,13 +413,33 @@ def _stacked_iteration_bars(ax, rows, specs, value_resolver, *, title, ylabel, l
             iterations,
             values,
             bottom=bottoms,
-            width=0.76,
+            width=1.0 if seamless else 0.76,
             color=color,
             label=label,
-            edgecolor="white",
-            linewidth=0.3,
+            edgecolor="none" if seamless else "white",
+            linewidth=0.0 if seamless else 0.3,
+            antialiased=not seamless,
         )
         bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
+
+    if seamless and len(iterations) > 1:
+        boundaries = [
+            0.5 * (left + right)
+            for left, right in zip(iterations[:-1], iterations[1:])
+        ]
+        boundary_heights = [
+            max(left, right)
+            for left, right in zip(totals[:-1], totals[1:])
+        ]
+        ax.vlines(
+            boundaries,
+            0.0,
+            boundary_heights,
+            colors="#111827",
+            linewidth=0.22,
+            alpha=0.72,
+            zorder=2,
+        )
 
     if len(iterations) <= 12:
         padding = max(totals) * 0.015
@@ -781,7 +824,7 @@ def _search_correction_rate_panel(
     promotion_iterations=(),
     recovery_iterations=(),
 ):
-    """Show how often MCTS overrides the NN top move and whether that helps."""
+    """Show how often MCTS overrides the NN top move and produces a useful change."""
     _style(ax, "How often MCTS changes the NN move", percent=True)
     shown = _line(
         ax, rows, "mcts_prior_changed_rate", "changed top", _COLORS[0], lw=2.1,
@@ -791,12 +834,8 @@ def _search_correction_rate_panel(
         ax, rows, "mcts_useful_change_rate", "useful change", _COLORS[2], lw=1.9,
         break_after=break_after,
     )
-    shown |= _line(
-        ax, rows, "mcts_harmful_change_rate", "harmful change", _COLORS[1], lw=1.8,
-        break_after=break_after,
-    )
     _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
-    _legend_below(ax, ncol=3)
+    _legend_below(ax, ncol=2)
     if not shown:
         _no_data(ax)
     return shown
@@ -958,39 +997,82 @@ def _gradient_norms_panel(ax, rows, break_after=()):
 def _objective_composition_panel(ax, rows, rl_cfg):
     """Show the positive, weighted terms that actually form the train objective."""
     policy_weight = float(rl_cfg.get("policy_loss_weight", 1.0) or 0.0)
-    value_weight = float(rl_cfg.get("value_loss_weight", 1.0) or 0.0)
-    scalar_weight = float(
+    default_value_weight = float(rl_cfg.get("value_loss_weight", 1.0) or 0.0)
+    scalar_aux_weight = float(
+        rl_cfg.get("value_scalar_aux_loss_weight", 0.0) or 0.0
+    )
+    consistency_weight = float(
         rl_cfg.get("value_search_consistency_loss_weight", 0.0) or 0.0
     )
     moves_weight = float(rl_cfg.get("moves_left_loss_weight", 0.05) or 0.0)
-    search_q_weight = float(rl_cfg.get("search_q_loss_weight", 0.0) or 0.0)
+    default_search_q_weight = float(
+        rl_cfg.get("search_q_loss_weight", 0.0) or 0.0
+    )
 
     def _values(row):
-        def weighted(column, weight):
-            return max(0.0, (_number(row.get(column)) or 0.0) * weight)
-        return {
-            "policy": weighted("policy_loss", policy_weight),
-            "wdl": weighted("value_primary_loss", value_weight),
-            "scalar": weighted("value_search_consistency_loss", scalar_weight),
-            "search_q": weighted("search_q_loss", search_q_weight),
-            "moves_left": weighted("moves_left_loss", moves_weight),
+        value_weight = _number(row.get("value_loss_weight"))
+        value_weight = default_value_weight if value_weight is None else value_weight
+        search_q_weight = _number(row.get("search_q_weight"))
+        search_q_weight = (
+            default_search_q_weight if search_q_weight is None else search_q_weight
+        )
+        scalar_aux_loss = max(
+            0.0, _number(row.get("value_scalar_aux_loss")) or 0.0
+        )
+        value_primary_loss = _number(row.get("value_primary_loss"))
+        if value_primary_loss is None:
+            combined_value_loss = max(0.0, _number(row.get("value_loss")) or 0.0)
+            value_primary_loss = max(
+                0.0,
+                combined_value_loss - scalar_aux_weight * scalar_aux_loss,
+            )
+        values = {
+            "policy_ce": policy_weight * max(
+                0.0, _number(row.get("policy_loss")) or 0.0
+            ),
+            "policy_rank": 0.0,
+            "wdl": value_weight * max(0.0, value_primary_loss),
+            "scalar_aux": value_weight * scalar_aux_weight * scalar_aux_loss,
+            "root_q_consistency": consistency_weight * max(
+                0.0, _number(row.get("value_search_consistency_loss")) or 0.0
+            ),
+            "search_q": search_q_weight * max(
+                0.0, _number(row.get("search_q_loss")) or 0.0
+            ),
+            "moves_left": moves_weight * max(
+                0.0, _number(row.get("moves_left_loss")) or 0.0
+            ),
         }
+        rank_contribution = _number(row.get("policy_correction_rank_contribution"))
+        if rank_contribution is not None:
+            values["policy_rank"] = policy_weight * max(0.0, rank_contribution)
+        else:
+            # Older schemas did not log the rank term separately. The objective
+            # residual is exact for those runs because all other positive terms
+            # and the final averaged objective were already logged.
+            total = _number(row.get("avg_loss"))
+            if total is not None:
+                values["policy_rank"] = max(0.0, total - sum(values.values()))
+        return values
 
     specs = (
-        ("policy", "policy", _COLORS[0]),
-        ("wdl", "WDL value", _COLORS[3]),
-        ("scalar", "WDL-root-Q", "#c084fc"),
+        ("policy_ce", "policy CE", _COLORS[0]),
+        ("policy_rank", "policy rank", _COLORS[5]),
+        ("wdl", "WDL value", _COLORS[1]),
+        ("scalar_aux", "scalar W-L", _COLORS[4]),
+        ("root_q_consistency", "WDL-root-Q", _COLORS[3]),
         ("search_q", "search-Q", _COLORS[2]),
-        ("moves_left", "moves-left", _COLORS[1]),
+        ("moves_left", "moves-left", "#94a3b8"),
     )
     shown = _stacked_iteration_bars(
         ax,
         rows,
         specs,
         _values,
-        title="Weighted training objective",
-        ylabel="positive loss contribution",
+        title="Weighted loss decomposition",
+        ylabel="loss contribution",
         legend_columns=4,
+        seamless=True,
     )
     if not shown:
         _no_data(ax, "Loss-component telemetry is available from schema 14")
@@ -1091,19 +1173,10 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     promotion_iterations, recovery_iterations = _regime_change_iterations(main)
     selfplay_best_intervals = _selfplay_best_intervals(detail)
     matchup_breaks = tuple(promotion_iterations) + tuple(recovery_iterations)
-    first_promotion_iteration = min(promotion_iterations) if promotion_iterations else None
 
     ax = axes[0, 0]
     _style(ax, "Learner vs promoted best", percent=True)
     shown = _line(ax, main, "score_rate", "MCTS", _COLORS[0], break_after=matchup_breaks)
-    shown |= _line(
-        ax, main, "eval_score_lower_bound", "MCTS lower bound", _COLORS[0],
-        ls=":", break_after=matchup_breaks,
-    )
-    shown |= _line(
-        ax, main, "eval_score_rate_ema", "MCTS EMA", _COLORS[5],
-        ls="--", lw=1.5, break_after=matchup_breaks,
-    )
     shown |= _line(
         ax, main, "no_mcts_score_rate", "NN only", _COLORS[1],
         break_after=matchup_breaks,
@@ -1123,64 +1196,7 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
         _no_data(ax)
 
     ax = axes[0, 1]
-    _style(ax, "Learner vs immutable IL anchor", percent=True)
-    if first_promotion_iteration is None:
-        ax.grid(False)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.text(
-            0.5,
-            0.58,
-            "Best is still the IL anchor",
-            transform=ax.transAxes,
-            ha="center",
-            va="center",
-            fontsize=12,
-            fontweight="bold",
-            color="#111827",
-        )
-        ax.text(
-            0.5,
-            0.42,
-            "Results are reused from Learner vs promoted best\n(no additional games)",
-            transform=ax.transAxes,
-            ha="center",
-            va="center",
-            fontsize=9,
-            color="#6b7280",
-        )
-    else:
-        anchor_rows = _anchor_rows_with_reused_best(main, first_promotion_iteration)
-        shown = _line(
-            ax, anchor_rows, "anchor_score_rate", "MCTS score", _COLORS[0],
-            break_after=recovery_iterations,
-        )
-        shown |= _line(
-            ax, anchor_rows, "anchor_score_lower_bound", "lower bound", _COLORS[0],
-            ls=":", break_after=recovery_iterations,
-        )
-        shown |= _line(
-            ax, anchor_rows, "anchor_no_mcts_score_rate", "NN only", _COLORS[1],
-            break_after=recovery_iterations,
-        )
-        shown |= _line(
-            ax, anchor_rows, "anchor_true_win_rate", "win rate", _COLORS[2],
-            break_after=recovery_iterations,
-        )
-        ax.axhline(0.5, color="#374151", lw=1, ls="--")
-        ax.text(
-            0.98,
-            0.04,
-            "direct IL-anchor match only for promotion candidates",
-            transform=ax.transAxes,
-            ha="right",
-            va="bottom",
-            fontsize=7.5,
-            color="#6b7280",
-        )
-        _legend_below(ax, ncol=2)
-        if not shown:
-            _no_data(ax)
+    _value_search_alignment_panel(ax, main, break_after=recovery_iterations)
 
     ax = axes[0, 2]
     _style(ax, "Estimated Elo with uncertainty")
@@ -1273,58 +1289,10 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     )
 
     ax = axes[1, 2]
-    _style(ax, "Latest promotion and safety gates", percent=True)
-    latest_nn_score = _last(main, "no_mcts_score_rate")
-    latest_nn_games = _last(main, "no_mcts_games")
-    stat_z = float(rl_cfg.get("promotion_stat_gate_z", 1.28) or 1.28)
-    latest_nn_upper = None
-    if latest_nn_score is not None and latest_nn_games is not None and latest_nn_games > 0.0:
-        latest_nn_upper = min(
-            1.0,
-            latest_nn_score
-            + stat_z * math.sqrt(
-                max(0.0, latest_nn_score * (1.0 - latest_nn_score)) / latest_nn_games
-            ),
-        )
-    readiness = [
-        ("MCTS score", _last(main, "score_rate"), promotion_score_floor, _COLORS[0]),
-        ("MCTS lower bound", _last(main, "eval_score_lower_bound"),
-         float(rl_cfg.get("promotion_score_lower_bound_min", 0.50) or 0.50), _COLORS[5]),
-        ("NN severe floor", latest_nn_score,
-         float(rl_cfg.get("promotion_no_mcts_score_rate_min", 0.48) or 0.48), _COLORS[3]),
-        ("NN non-regression UCB", latest_nn_upper,
-         float(rl_cfg.get("promotion_no_mcts_upper_bound_min", 0.50) or 0.50), _COLORS[4]),
-        ("Anchor score", _last(main, "anchor_score_rate"),
-         float(rl_cfg.get("promotion_anchor_min_score_rate", 0.50) or 0.50), _COLORS[2]),
-        ("Anchor lower bound", _last(main, "anchor_score_lower_bound"),
-         float(rl_cfg.get("promotion_anchor_score_lower_bound_min", 0.47) or 0.47), _COLORS[4]),
-    ]
-    readiness = [(label, value, threshold, color) for label, value, threshold, color in readiness
-                 if value is not None]
-    shown = bool(readiness)
-    if shown:
-        y = np.arange(len(readiness))
-        values = [value for _, value, _, _ in readiness]
-        thresholds = [threshold for _, _, threshold, _ in readiness]
-        colors = [color for _, _, _, color in readiness]
-        left = min(0.25, min(values + thresholds) - 0.03)
-        right = max(0.60, max(values + thresholds) + 0.05)
-        ax.hlines(y, left, values, color=colors, linewidth=3, alpha=0.35)
-        ax.scatter(values, y, color=colors, s=45, zorder=3, label="latest result")
-        ax.scatter(thresholds, y, color="#111827", marker="|", s=150, linewidths=1.6,
-                   zorder=4, label="required floor")
-        ax.set_yticks(y, [label for label, _, _, _ in readiness]); ax.invert_yaxis()
-        ax.set_xlim(left, right)
-        for row_idx, value, threshold in zip(y, values, thresholds):
-            ax.text(value + 0.008, row_idx, f"{100.0 * value:.1f}%", va="center", fontsize=7)
-            ax.text(threshold, row_idx + 0.22, f"min {100.0 * threshold:.0f}%",
-                    ha="center", va="bottom", fontsize=5.8, color="#4b5563")
-        _legend_below(ax, ncol=2)
-    else:
-        _no_data(ax)
+    _objective_composition_panel(ax, main, rl_cfg)
 
     ax = axes[2, 0]
-    _style(ax, "Policy learning, useful MCTS corrections and LR")
+    _style(ax, "Policy learning")
     shown = _line(
         ax, main, "policy_loss", "policy loss", _COLORS[0], lw=2.1,
         break_after=recovery_iterations,
@@ -1334,7 +1302,7 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
         _COLORS[5], ls="--", lw=1.7, break_after=recovery_iterations,
     )
     shown |= _line(
-        ax, main, "policy_correction_rank_loss", "correction rank debt",
+        ax, main, "policy_correction_rank_contribution", "rank contribution",
         _COLORS[3], ls=":", lw=1.7, break_after=recovery_iterations,
     )
     ax2 = ax.twinx(); ax2.tick_params(labelsize=8); ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
@@ -1342,43 +1310,12 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
         ax2, main, "policy_top1_acc", "top-1", _COLORS[2], lw=1.8,
         break_after=recovery_iterations,
     )
-    accuracy |= _line(
-        ax2, main, "correction_audit_top1_before", "audit before training",
-        _COLORS[3], ls=":", lw=1.6, break_after=recovery_iterations,
-    )
-    accuracy |= _line(
-        ax2, main, "correction_audit_top1_after", "audit after training",
-        "#7c3aed", ls="--", lw=2.0, break_after=recovery_iterations,
-    )
-    lr_ax = ax.twinx()
-    lr_ax.spines["right"].set_position(("outward", 40))
-    lr_ax.patch.set_visible(False)
-    lr_ax.tick_params(axis="y", labelcolor=_COLORS[4], labelsize=7)
-    lr_ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
-    lr_ax.yaxis.get_offset_text().set_fontsize(6.5)
-    lr = _line(
-        lr_ax,
-        main,
-        "learning_rate",
-        "learning rate",
-        _COLORS[4],
-        ls="--",
-        lw=1.8,
-        break_after=recovery_iterations,
-    )
-    ax.text(
-        0.02, 0.96,
-        "Audit compares the same trained MCTS-correction positions before and after each iteration",
-        transform=ax.transAxes, ha="left", va="top", fontsize=6.8,
-        color="#4b5563",
-    )
     ax.set_ylabel("policy loss", fontsize=7.5, color=_COLORS[0])
     ax2.set_ylabel("top-1", fontsize=7.5, color=_COLORS[2])
-    lr_ax.set_ylabel("LR", fontsize=7.5, color=_COLORS[4], labelpad=3)
     ax.tick_params(axis="y", labelcolor=_COLORS[0])
     ax2.tick_params(axis="y", labelcolor=_COLORS[2])
-    _legend_below(ax, ax2, lr_ax, ncol=3)
-    if not (shown or accuracy or lr): _no_data(ax)
+    _legend_below(ax, ax2, ncol=2)
+    if not (shown or accuracy): _no_data(ax)
 
     ax = axes[2, 1]
     _style(ax, "Value learning")
@@ -1436,6 +1373,7 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
 
     for plot_index, plot_ax in enumerate((
         axes[0, 0], axes[0, 1], axes[0, 2],
+        axes[1, 2],
         axes[2, 0], axes[2, 1], axes[2, 2],
     )):
         _mark_regime_changes(
@@ -1445,9 +1383,9 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
             label=(plot_index == 0),
         )
     # Best-actor intervals describe self-play provenance, not sparse external
-    # evaluations.  In particular they do not belong on immutable-anchor or
-    # estimated-Elo panels.
-    timeline_axes = [axes[0, 0], axes[1, 1], *axes[2, :]]
+    # Elo evaluations. They do belong on value/objective/search timelines
+    # because actor changes can affect both targets and optimization difficulty.
+    timeline_axes = [axes[0, 0], axes[0, 1], axes[1, 1], axes[1, 2], *axes[2, :]]
     for plot_index, plot_ax in enumerate(timeline_axes):
         _mark_selfplay_best_intervals(
             plot_ax,
@@ -1461,7 +1399,7 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     _finish(
         fig,
         output_path,
-        "RL training - learner / best decision dashboard",
+        "RL training - strength and learning dashboard",
         context or None,
         hspace=0.72,
         wspace=0.38,
@@ -1505,6 +1443,7 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
         title="Replay intake and eviction",
         ylabel="positions",
         legend_columns=2,
+        seamless=True,
     )
     _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
     if not shown:
@@ -1690,15 +1629,16 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
         ls="--", lw=1.7, break_after=selfplay_breaks,
     )
     latest_rows = _last(rows, "correction_audit_rows")
-    latest_prob_gain = _last(rows, "correction_audit_target_probability_gain")
-    latest_margin_gain = _last(rows, "correction_audit_logit_margin_gain")
+    latest_top1_gain = _last(rows, "correction_audit_top1_gain")
+    latest_probability_gain = _last(rows, "correction_audit_target_probability_gain")
     latest_kl_closed = _last(rows, "correction_audit_target_kl_closed_fraction")
     if latest_rows is not None:
         ax.text(
             0.02, 0.96,
-            f"latest n={int(latest_rows):,} | target P gain "
-            f"{(latest_prob_gain or 0.0):+.1%} | KL closed {(latest_kl_closed or 0.0):+.1%} "
-            f"| margin {(latest_margin_gain or 0.0):+.3f}",
+            f"latest n={int(latest_rows):,} | top-1 "
+            f"{(latest_top1_gain or 0.0):+.1%} | target P "
+            f"{(latest_probability_gain or 0.0):+.2%} | KL closed "
+            f"{(latest_kl_closed or 0.0):+.1%}",
             transform=ax.transAxes, ha="left", va="top", fontsize=6.8, color="#4b5563",
         )
     _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
@@ -1707,64 +1647,46 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
         _no_data(ax)
 
     ax = axes[2, 0]
+    budgets = (64, 128, 192, 256, 320)
+    root_counts = [_last(rows, f"mcts_budget_{budget}_root_count") for budget in budgets]
     _style(ax, "MCTS simulation allocation")
     shown = _line(
-        ax, rows, "mcts_budget_p10", "p10", _COLORS[1], ls="--", lw=1.4,
-        break_after=selfplay_breaks,
-    )
-    shown |= _line(
-        ax, rows, "mcts_budget_p50", "p50", _COLORS[2], lw=1.5,
-        break_after=selfplay_breaks,
-    )
-    shown |= _line(
-        ax, rows, "mcts_avg_budget", "average", _COLORS[0], lw=2.4,
+        ax, rows, "mcts_avg_budget", "average budget", _COLORS[0], lw=2.2,
         break_after=selfplay_breaks,
     )
     shown |= _line(
         ax, rows, "mcts_fresh_sims", "fresh after reuse", "#0891b2", ls=":", lw=1.8,
         break_after=selfplay_breaks,
     )
-    shown |= _line(
-        ax, rows, "mcts_tree_reuse_fresh_floor_avg", "adaptive fresh floor",
-        "#f59e0b", ls="-.", lw=1.6, break_after=selfplay_breaks,
-    )
-    shown |= _line(
-        ax, rows, "mcts_tree_reuse_scout_extra_credit_avg", "post-scout extra credit",
-        "#db2777", ls=":", lw=1.6, break_after=selfplay_breaks,
-    )
-    shown |= _line(
-        ax, rows, "mcts_budget_p90", "p90", _COLORS[3], ls="--", lw=1.4,
-        break_after=selfplay_breaks,
-    )
-    p10_x, p10_y = _series(rows, "mcts_budget_p10")
-    p90_x, p90_y = _series(rows, "mcts_budget_p90")
-    if p10_x and p10_x == p90_x:
-        _fill_between_with_breaks(
-            ax, p10_x, p10_y, p90_y, break_after=selfplay_breaks,
-            color=_COLORS[0], alpha=0.08, linewidth=0,
-        )
     ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
-    allocation_quality = _line(
-        ax2, rows, "mcts_difficulty_budget_correlation", "difficulty-budget corr",
-        "#7c3aed", ls=":", lw=1.8, break_after=selfplay_breaks,
-    )
-    allocation_quality |= _line(
-        ax2, rows, "mcts_tree_reuse_hit_rate", "tree reuse hit rate",
-        "#059669", ls="--", lw=1.6, break_after=selfplay_breaks,
-    )
-    allocation_quality |= _line(
-        ax2, rows, "mcts_tree_reuse_credit_fraction", "reuse-credit eligible",
-        "#db2777", ls="-.", lw=1.5, break_after=selfplay_breaks,
-    )
-    allocation_quality |= _line(
-        ax2, rows, "mcts_tree_reuse_scout_reduction_rate", "search reduced after scout",
-        "#0f766e", ls=":", lw=1.6, break_after=selfplay_breaks,
+    _line(
+        ax2, rows, "mcts_tree_reuse_visit_credit_share", "inherited visit share",
+        "#db2777", ls="-.", lw=1.6, break_after=selfplay_breaks,
+    ) or _line(
+        ax2, rows, "mcts_tree_reuse_credit_fraction", "reuse-root rate (legacy)",
+        "#db2777", ls="-.", lw=1.6, break_after=selfplay_breaks,
     )
     ax2.set_ylim(-0.05, 1.05)
-    ax2.set_ylabel("difficulty correlation", fontsize=7.5, color="#7c3aed")
     _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
-    _legend_below(ax, ax2, ncol=3)
+    _legend_below(ax, ax2, ncol=2)
     ax.set_ylabel("simulations / position", fontsize=8)
+    if any((count or 0.0) > 0.0 for count in root_counts):
+        budget_summary = []
+        for budget, count in zip(budgets, root_counts):
+            if (count or 0.0) <= 0.0:
+                continue
+            useful = _last(rows, f"mcts_budget_{budget}_useful_change_rate") or 0.0
+            budget_summary.append(f"{budget}: {useful:.0%} (n={int(count):,})")
+        summary_lines = [
+            " · ".join(budget_summary[start:start + 3])
+            for start in range(0, len(budget_summary), 3)
+        ]
+        ax.text(
+            0.02, 0.96,
+            "latest useful corrections | " + "\n".join(summary_lines),
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.3,
+            color="#4b5563",
+        )
     if not shown:
         _no_data(ax)
 
@@ -1840,6 +1762,27 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
         ax, rows, "mcts_changed_endgame_rate", "endgame", _COLORS[1],
         break_after=selfplay_breaks,
     )
+    opening_unique = _last(rows, "selfplay_opening_unique_8ply")
+    opening_effective = _last(rows, "selfplay_opening_effective_8ply")
+    opening_top1 = _last(rows, "selfplay_opening_top1_8ply_rate")
+    if (
+        opening_unique is not None
+        or opening_effective is not None
+        or opening_top1 is not None
+    ):
+        unique_text = "n/a" if opening_unique is None else f"{opening_unique:.0f}"
+        effective_text = "n/a" if opening_effective is None else f"{opening_effective:.1f}"
+        top1_text = "n/a" if opening_top1 is None else f"{opening_top1:.1%}"
+        ax.text(
+            0.02,
+            0.96,
+            f"played 8-ply: unique {unique_text} | effective {effective_text} | top-1 {top1_text}",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=7.0,
+            color="#4b5563",
+        )
     _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
     _legend_below(ax, ncol=3)
     if not shown:

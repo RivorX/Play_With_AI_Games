@@ -188,6 +188,7 @@ _ELO_DEFAULTS = {
     'reserve_dataloader_workers': True,
     'stockfish_priority': 'below_normal',
     'paired_openings_enabled': True,
+    'paired_openings_max_plies': 8,
     'nn_eval_workers': 4,
     'nn_eval_free_threads_utilization': 0.35,
     'il_async_process_restart_limit': 2,
@@ -214,7 +215,6 @@ _ELO_DEFAULTS = {
     'adaptive_target_standard_error': 35.0,
     'adaptive_min_games_for_se_stop': 144,
     'adaptive_refine_until_target_se': True,
-    'paired_openings_max_plies': 6,
     'nn_eval_adaptive_probe_games_per_level': 12,
     'nn_eval_adaptive_min_batch_games': 36,
     'nn_eval_adaptive_focus_games_per_level': 64,
@@ -290,14 +290,15 @@ _RL_DEFAULTS = {
     # Trajectory-RGSC keeps one bounded prioritized opening archive. The paper's
     # 50% restart rate is deliberately not copied before a chess ablation; the
     # existing 20% total hard-start budget remains the distribution guard.
-    'search_control_enabled': True, 'search_control_archive_capacity': 128,
-    'search_control_min_archive_size': 16, 'search_control_temperature': 0.10,
+    'search_control_enabled': True, 'search_control_archive_capacity': 800,
+    'search_control_min_archive_size': 16, 'search_control_rank_alpha': 0.50,
     'search_control_ema_alpha': 0.50,
-    # Reanalyse is a small freshness budget, not a second self-play phase.
+    # Reanalyse is a small freshness budget, not a second self-play phase. It
+    # must not replace normal 192-sim targets with a cheaper search target.
     'replay_reanalyse_enabled': True, 'replay_reanalyse_interval': 4,
     'replay_reanalyse_fraction': 0.02, 'replay_reanalyse_max_positions': 64,
     'replay_reanalyse_min_age': 2, 'replay_reanalyse_min_staleness': 2,
-    'replay_reanalyse_max_refreshes': 2, 'replay_reanalyse_simulations': 96,
+    'replay_reanalyse_max_refreshes': 2, 'replay_reanalyse_simulations': 192,
     'replay_reanalyse_batch_positions': 16,
     # Importing PyTorch commits about 1 GiB per Windows process even when the
     # central-inference worker holds no model. Nine workers still provide broad
@@ -332,8 +333,7 @@ _RL_DEFAULTS = {
     'eval_central_inference_enabled': True,
     'eval_central_inference_min_games': 2, 'eval_auto_claim_draw': True,
     'eval_claim_repetition_after_moves': 70, 'eval_claim_draw_after_moves': 180,
-    # Raw-NN safety is consumed by the promotion gate on MCTS-eval iterations.
-    # Running it between those decisions only adds chart density.
+    # Raw NN remains a same-cadence diagnostic for MCTS-to-network absorption.
     'eval_no_mcts_enabled': True, 'eval_no_mcts_every': 2,
     'eval_no_mcts_use_fixed_openings': True, 'eval_funnel_preliminary_simulations': 'auto',
     'eval_funnel_preliminary_simulations_multiplier': 1.0,
@@ -341,21 +341,22 @@ _RL_DEFAULTS = {
     # Funnel stages use one search budget and disjoint paired openings, so every
     # completed game contributes to the cumulative decision.
     'eval_funnel_preliminary_true_win_rate': 0.0,
-    'eval_funnel_medium_simulations': 'auto', 'eval_funnel_medium_true_win_rate': 0.02,
+    'eval_funnel_medium_simulations': 'auto', 'eval_funnel_medium_true_win_rate': 0.0,
     'eval_funnel_advanced_simulations': 'auto', 'eval_fixed_openings_enabled': True,
-    'eval_fixed_openings_pair_games': True, 'eval_fixed_openings_max_plies': 6,
-    'promotion_stat_gate_enabled': True, 'promotion_stat_gate_z': 1.28,
-    'promotion_score_lower_bound_min': 0.50, 'promotion_require_anchor_non_regression': True,
+    'eval_fixed_openings_pair_games': True, 'eval_fixed_openings_max_plies': 8,
+    'score_rate_threshold': 0.53,
+    'promotion_stat_gate_enabled': True, 'promotion_stat_gate_z': 1.645,
+    'actor_guard_confidence_z': 1.28,
+    'promotion_score_lower_bound_min': 0.50, 'promotion_require_anchor_non_regression': False,
     'promotion_no_mcts_gate_enabled': True, 'promotion_no_mcts_score_rate_min': 0.48,
-    'promotion_no_mcts_upper_bound_min': 0.50,
     'promotion_anchor_min_score_rate': 0.50, 'promotion_anchor_min_true_win_rate': 0.0,
     'promotion_anchor_no_mcts_gate_enabled': False,
     'promotion_anchor_no_mcts_score_rate_min': 0.50,
     'promotion_anchor_no_mcts_score_lower_bound_min': 0.47,
     'anchor_no_mcts_max_games': 512,
-    # Promotion candidates always force a direct anchor match. There is no
-    # periodic anchor diagnostic between promotion attempts.
-    'anchor_eval_enabled': True,
+    # MCTS-only promotion compares directly with the current champion. The IL
+    # anchor path remains available for legacy/ablation configs but is not loaded.
+    'anchor_eval_enabled': False,
     'anchor_eval_mcts_simulations': 'auto', 'anchor_eval_mcts_simulations_multiplier': 1.0,
     'anchor_eval_use_fixed_openings': True,
     'value_metric_weight_min': 0.20,
@@ -406,6 +407,18 @@ def normalize_data_config(config):
     return config
 
 
+def _effective_search_control_archive_capacity(rl_cfg):
+    """Keep enough archive diversity for each iteration's regret starts."""
+    planned_regret_starts = int(round(
+        int(rl_cfg.get('games_per_iteration', 0) or 0)
+        * max(0.0, min(1.0, float(rl_cfg.get('self_play_hard_start_fraction', 0.0) or 0.0)))
+    ))
+    return max(
+        max(1, int(rl_cfg.get('search_control_archive_capacity', 800) or 800)),
+        4 * planned_regret_starts,
+    )
+
+
 def normalize_rl_config(config):
     """Flatten the grouped RL YAML and inject stable runtime defaults."""
     if not isinstance(config, dict):
@@ -416,6 +429,9 @@ def normalize_rl_config(config):
 
     has_grouped_rl = any(section in rl_cfg for section in _RL_SECTION_PREFIXES)
     if not has_grouped_rl:
+        rl_cfg['search_control_effective_archive_capacity'] = (
+            _effective_search_control_archive_capacity(rl_cfg)
+        )
         return config
 
     normalized = dict(_RL_DEFAULTS)
@@ -438,6 +454,9 @@ def normalize_rl_config(config):
         normalized['stockfish_elo'] = stockfish_cfg
 
     normalized['mcts_batch_size'] = int(normalized.get('mcts_simulations', 192))
+    normalized['search_control_effective_archive_capacity'] = (
+        _effective_search_control_archive_capacity(normalized)
+    )
     config['reinforcement_learning'] = normalized
     return config
 

@@ -18,13 +18,15 @@ class CorrectionAuditSnapshot:
     """Per-position policy diagnostics for one immutable correction cohort."""
 
     top1: torch.Tensor
-    rank: torch.Tensor
     target_probability: torch.Tensor
-    logit_margin: torch.Tensor
     target_kl: torch.Tensor
     value_wdl_ce: torch.Tensor
     value_brier: torch.Tensor
     value_mae: torch.Tensor
+    root_q_error: torch.Tensor
+    phase: torch.Tensor
+    search_q_delta: torch.Tensor | None = None
+    target_entropy: torch.Tensor | None = None
 
     @property
     def rows(self) -> int:
@@ -58,6 +60,8 @@ def evaluate_correction_cohort(
     use_amp: bool,
     use_bfloat16: bool,
     batch_size: int = CORRECTION_AUDIT_BATCH_SIZE,
+    value_phase_opening_max: int = 12,
+    value_phase_endgame_min: int = 40,
 ) -> CorrectionAuditSnapshot:
     """Evaluate exactly the stored MCTS target moves without augmentation."""
 
@@ -66,13 +70,17 @@ def evaluate_correction_cohort(
 
     boards, policy_indices, policy_values, policy_mask, value_targets = batch[:5]
     legal_indices, legal_mask = batch[8:10]
+    root_q_targets = batch[10] if len(batch) >= 11 else torch.full_like(value_targets, float("nan"))
+    search_q_deltas = batch[12] if len(batch) >= 13 else torch.full_like(value_targets, float("nan"))
+    search_visits = batch[17] if len(batch) >= 18 else torch.zeros_like(value_targets)
     row_count = int(boards.shape[0])
     if row_count <= 0:
         empty_bool = torch.empty(0, dtype=torch.bool)
         empty_float = torch.empty(0, dtype=torch.float32)
         return CorrectionAuditSnapshot(
             empty_bool, empty_float, empty_float, empty_float, empty_float,
-            empty_float, empty_float, empty_float,
+            empty_float, empty_float,
+            torch.empty(0, dtype=torch.int8),
         )
 
     device = torch.device(device)
@@ -83,13 +91,15 @@ def evaluate_correction_cohort(
     model.eval()
 
     top1_parts = []
-    rank_parts = []
     probability_parts = []
-    margin_parts = []
     target_kl_parts = []
     value_wdl_ce_parts = []
     value_brier_parts = []
     value_mae_parts = []
+    root_q_error_parts = []
+    phase_parts = []
+    search_q_delta_parts = []
+    target_entropy_parts = []
     try:
         with torch.inference_mode():
             for start in range(0, row_count, chunk_size):
@@ -105,6 +115,13 @@ def evaluate_correction_cohort(
                 legal_index_chunk = legal_indices[start:end].to(device, non_blocking=True).long()
                 legal_mask_chunk = legal_mask[start:end].to(device, non_blocking=True).bool()
                 value_target_chunk = value_targets[start:end].to(device, non_blocking=True).float().view(-1)
+                root_q_chunk = root_q_targets[start:end].to(device, non_blocking=True).float().view(-1)
+                search_q_delta_chunk = search_q_deltas[start:end].to(
+                    device, non_blocking=True
+                ).float().view(-1)
+                search_visits_chunk = search_visits[start:end].to(
+                    device, non_blocking=True
+                ).float().view(-1)
 
                 with torch.amp.autocast(
                     "cuda",
@@ -174,6 +191,7 @@ def evaluate_correction_cohort(
                 target_kl = (
                     legal_targets * (safe_target_logs - legal_log_probs)
                 ).sum(dim=1)
+                target_entropy = -(legal_targets * safe_target_logs).sum(dim=1)
                 if (
                     value_logits is not None
                     and value_logits.ndim == 2
@@ -204,12 +222,36 @@ def evaluate_correction_cohort(
                     value_brier = torch.square(value_probs - value_target_wdl).sum(dim=1)
                     value_scalar = value_probs[:, 0] - value_probs[:, 2]
                     value_mae = torch.abs(value_scalar - target_scalar)
+                    root_q_error = torch.where(
+                        torch.isfinite(root_q_chunk) & (search_visits_chunk > 0.0),
+                        value_scalar - torch.clamp(root_q_chunk, -1.0, 1.0),
+                        torch.full_like(value_scalar, float("nan")),
+                    )
                 else:
                     value_wdl_ce = torch.full(
                         (end - start,), float("nan"), device=device
                     )
                     value_brier = torch.full_like(value_wdl_ce, float("nan"))
                     value_mae = torch.full_like(value_wdl_ce, float("nan"))
+                    root_q_error = torch.full_like(value_wdl_ce, float("nan"))
+                if board_chunk.dim() >= 4 and board_chunk.size(1) > 15:
+                    fullmoves = torch.clamp(
+                        torch.round(board_chunk[:, 15, 0, 0].float() * 100.0),
+                        min=1.0,
+                    )
+                    phase = torch.where(
+                        fullmoves <= float(value_phase_opening_max),
+                        torch.zeros_like(fullmoves, dtype=torch.int8),
+                        torch.where(
+                            fullmoves >= float(value_phase_endgame_min),
+                            torch.full_like(fullmoves, 2, dtype=torch.int8),
+                            torch.ones_like(fullmoves, dtype=torch.int8),
+                        ),
+                    )
+                else:
+                    phase = torch.full(
+                        (end - start,), -1, dtype=torch.int8, device=device
+                    )
                 target_is_legal = (
                     valid_legal & (safe_legal_indices == target_moves.unsqueeze(1))
                 ).any(dim=1)
@@ -231,25 +273,16 @@ def evaluate_correction_cohort(
                 target_probabilities = torch.exp(
                     target_logits - torch.logsumexp(legal_logits, dim=1)
                 )
-                ranks = 1.0 + (
-                    valid_legal & (legal_logits > target_logits.unsqueeze(1))
-                ).sum(dim=1).float()
-                alternative_logits = legal_logits.masked_fill(
-                    valid_legal & (safe_legal_indices == target_moves.unsqueeze(1)),
-                    -torch.inf,
-                )
-                best_alternative = alternative_logits.max(dim=1).values
-                margins = target_logits - best_alternative
-                margins = torch.where(torch.isfinite(margins), margins, torch.zeros_like(margins))
-
                 top1_parts.append((predicted_moves == target_moves)[valid_rows].cpu())
-                rank_parts.append(ranks[valid_rows].cpu())
                 probability_parts.append(target_probabilities[valid_rows].cpu())
-                margin_parts.append(margins[valid_rows].cpu())
                 target_kl_parts.append(target_kl[valid_rows].cpu())
                 value_wdl_ce_parts.append(value_wdl_ce[valid_rows].cpu())
                 value_brier_parts.append(value_brier[valid_rows].cpu())
                 value_mae_parts.append(value_mae[valid_rows].cpu())
+                root_q_error_parts.append(root_q_error[valid_rows].cpu())
+                phase_parts.append(phase[valid_rows].cpu())
+                search_q_delta_parts.append(search_q_delta_chunk[valid_rows].cpu())
+                target_entropy_parts.append(target_entropy[valid_rows].cpu())
     finally:
         model.train(was_training)
 
@@ -258,17 +291,20 @@ def evaluate_correction_cohort(
         empty_float = torch.empty(0, dtype=torch.float32)
         return CorrectionAuditSnapshot(
             empty_bool, empty_float, empty_float, empty_float, empty_float,
-            empty_float, empty_float, empty_float,
+            empty_float, empty_float,
+            torch.empty(0, dtype=torch.int8),
         )
     return CorrectionAuditSnapshot(
         torch.cat(top1_parts),
-        torch.cat(rank_parts),
         torch.cat(probability_parts),
-        torch.cat(margin_parts),
         torch.cat(target_kl_parts),
         torch.cat(value_wdl_ce_parts),
         torch.cat(value_brier_parts),
         torch.cat(value_mae_parts),
+        torch.cat(root_q_error_parts),
+        torch.cat(phase_parts),
+        torch.cat(search_q_delta_parts),
+        torch.cat(target_entropy_parts),
     )
 
 
@@ -291,7 +327,12 @@ def holdout_metrics(
         "holdout_value_mae_before": float("nan"),
         "holdout_value_mae_after": float("nan"),
         "holdout_value_mae_reduction": float("nan"),
+        "holdout_root_q_mae_before": float("nan"),
+        "holdout_root_q_mae_after": float("nan"),
+        "holdout_root_q_mae_reduction": float("nan"),
     }
+    for phase_name in ("opening", "middlegame", "endgame"):
+        metrics[f"holdout_root_q_mae_{phase_name}_reduction"] = float("nan")
     if before is None or after is None or before.rows != after.rows or after.rows <= 0:
         return metrics
 
@@ -307,6 +348,8 @@ def holdout_metrics(
     value_brier_after = _mean(after.value_brier)
     value_mae_before = _mean(before.value_mae)
     value_mae_after = _mean(after.value_mae)
+    root_q_mae_before = _mean(before.root_q_error.abs())
+    root_q_mae_after = _mean(after.root_q_error.abs())
     metrics.update({
         "holdout_rows": int(after.rows),
         "holdout_policy_kl_before": policy_before,
@@ -321,7 +364,17 @@ def holdout_metrics(
         "holdout_value_mae_before": value_mae_before,
         "holdout_value_mae_after": value_mae_after,
         "holdout_value_mae_reduction": value_mae_before - value_mae_after,
+        "holdout_root_q_mae_before": root_q_mae_before,
+        "holdout_root_q_mae_after": root_q_mae_after,
+        "holdout_root_q_mae_reduction": root_q_mae_before - root_q_mae_after,
     })
+    for phase_id, phase_name in enumerate(("opening", "middlegame", "endgame")):
+        before_mask = before.phase.eq(phase_id) & torch.isfinite(before.root_q_error)
+        after_mask = after.phase.eq(phase_id) & torch.isfinite(after.root_q_error)
+        if bool(before_mask.any()) and bool(after_mask.any()):
+            before_mae = float(before.root_q_error[before_mask].abs().mean().item())
+            after_mae = float(after.root_q_error[after_mask].abs().mean().item())
+            metrics[f"holdout_root_q_mae_{phase_name}_reduction"] = before_mae - after_mae
     return metrics
 
 
@@ -336,18 +389,18 @@ def correction_audit_metrics(
 
     metrics: dict[str, float | int] = {
         "correction_audit_rows": 0,
+        "correction_audit_q_delta_mean": float("nan"),
+        "correction_audit_target_entropy_mean": float("nan"),
+        "correction_audit_candidate_rows": 0,
+        "correction_audit_eligible_rows": 0,
+        "correction_audit_correction_fraction": float("nan"),
+        "correction_audit_coverage": float("nan"),
         "correction_audit_top1_before": float("nan"),
         "correction_audit_top1_after": float("nan"),
         "correction_audit_top1_gain": float("nan"),
-        "correction_audit_rank_before": float("nan"),
-        "correction_audit_rank_after": float("nan"),
-        "correction_audit_rank_gain": float("nan"),
         "correction_audit_target_probability_before": float("nan"),
         "correction_audit_target_probability_after": float("nan"),
         "correction_audit_target_probability_gain": float("nan"),
-        "correction_audit_logit_margin_before": float("nan"),
-        "correction_audit_logit_margin_after": float("nan"),
-        "correction_audit_logit_margin_gain": float("nan"),
         "correction_audit_target_kl_before": float("nan"),
         "correction_audit_target_kl_after": float("nan"),
         "correction_audit_target_kl_reduction": float("nan"),
@@ -358,29 +411,28 @@ def correction_audit_metrics(
     if before is not None and after is not None and before.rows == after.rows and after.rows > 0:
         top1_before = float(before.top1.float().mean().item())
         top1_after = float(after.top1.float().mean().item())
-        rank_before = float(before.rank.mean().item())
-        rank_after = float(after.rank.mean().item())
         probability_before = float(before.target_probability.mean().item())
         probability_after = float(after.target_probability.mean().item())
-        margin_before = float(before.logit_margin.mean().item())
-        margin_after = float(after.logit_margin.mean().item())
         target_kl_before = float(before.target_kl.mean().item())
         target_kl_after = float(after.target_kl.mean().item())
         target_kl_reduction = target_kl_before - target_kl_after
+
+        def _finite_mean(tensor: torch.Tensor | None) -> float:
+            if tensor is None:
+                return float("nan")
+            finite = tensor[torch.isfinite(tensor)]
+            return float(finite.mean().item()) if finite.numel() else float("nan")
+
         metrics.update({
             "correction_audit_rows": after.rows,
+            "correction_audit_q_delta_mean": _finite_mean(before.search_q_delta),
+            "correction_audit_target_entropy_mean": _finite_mean(before.target_entropy),
             "correction_audit_top1_before": top1_before,
             "correction_audit_top1_after": top1_after,
             "correction_audit_top1_gain": top1_after - top1_before,
-            "correction_audit_rank_before": rank_before,
-            "correction_audit_rank_after": rank_after,
-            "correction_audit_rank_gain": rank_before - rank_after,
             "correction_audit_target_probability_before": probability_before,
             "correction_audit_target_probability_after": probability_after,
             "correction_audit_target_probability_gain": probability_after - probability_before,
-            "correction_audit_logit_margin_before": margin_before,
-            "correction_audit_logit_margin_after": margin_after,
-            "correction_audit_logit_margin_gain": margin_after - margin_before,
             "correction_audit_target_kl_before": target_kl_before,
             "correction_audit_target_kl_after": target_kl_after,
             "correction_audit_target_kl_reduction": target_kl_reduction,

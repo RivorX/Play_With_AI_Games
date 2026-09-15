@@ -84,6 +84,11 @@ _TREE_REUSE_SCOUT_MIN_CANDIDATE_COVERAGE = 0.75
 _TREE_REUSE_SCOUT_STABILITY_MIN = 0.70
 _TREE_REUSE_SCOUT_POLICY_JS_SCALE = 0.05
 _TREE_REUSE_SCOUT_MIN_FRESH_FRACTION = 1.0 / 6.0
+# At the low end of the dynamic budget, one noisy leaf evaluation per root
+# candidate is too little evidence for the first Sequential-Halving cut. Keep
+# the configured action count as a cap and narrow only when the *fresh* action
+# budget cannot fund two complete first-round passes.
+_GUMBEL_MIN_INITIAL_VISITS_PER_ACTION = 2
 
 
 def _summarize_tree_reuse_quality(root, gumbel, max_considered_actions):
@@ -476,6 +481,56 @@ def _gumbel_considered_visit_sequence(max_num_considered_actions, num_simulation
     return tuple(sequence[:simulation_count])
 
 
+@lru_cache(maxsize=256)
+def _resolve_gumbel_considered_actions(
+    max_num_considered_actions,
+    legal_action_count,
+    num_simulations,
+):
+    """Resolve root width from the fresh Sequential-Halving budget.
+
+    MCTX permits a single first-round visit, so this is a chess-specific quality
+    guard rather than a correctness fix. The configured value remains the cap.
+    When it cannot receive two complete passes, step down to the next lower
+    power of two; this avoids unstable 16 -> 15 boundary changes.
+    """
+    simulation_count = max(0, int(num_simulations))
+    limit = min(
+        max(1, int(max_num_considered_actions)),
+        max(1, int(legal_action_count)),
+        max(1, simulation_count),
+    )
+    if limit <= 1 or simulation_count <= 0:
+        return 1
+
+    rounds = int(math.ceil(math.log2(limit)))
+    initial_visits = simulation_count // max(1, rounds * limit)
+    if initial_visits >= _GUMBEL_MIN_INITIAL_VISITS_PER_ACTION:
+        return int(limit)
+
+    candidate = 1 << (int(limit).bit_length() - 1)
+    if candidate == limit:
+        candidate //= 2
+    while candidate > 1:
+        rounds = int(math.ceil(math.log2(candidate)))
+        initial_visits = simulation_count // max(1, rounds * candidate)
+        if initial_visits >= _GUMBEL_MIN_INITIAL_VISITS_PER_ACTION:
+            return int(candidate)
+        candidate //= 2
+    return 1
+
+
+def _gumbel_initial_round_visits(considered_actions, num_simulations):
+    considered = max(1, int(considered_actions))
+    simulations = max(0, int(num_simulations))
+    if simulations <= 0:
+        return 0
+    if considered <= 1:
+        return simulations
+    rounds = int(math.ceil(math.log2(considered)))
+    return max(1, simulations // max(1, rounds * considered))
+
+
 def _replay_source_code(learner_turn, game_opponent_mcts, opponent_label):
     if learner_turn or game_opponent_mcts is None:
         return _REPLAY_SOURCE_LEARNER
@@ -574,8 +629,14 @@ class _SyzygyOracle:
         # Avoid allocating a piece map on every self-play ply; native color
         # bitboards provide the same count directly.
         piece_count = chess.piece_count(board)
+        has_castling_rights = any(
+            chess.has_kingside_castling_rights(board, color)
+            or chess.has_queenside_castling_rights(board, color)
+            for color in (chess.WHITE, chess.BLACK)
+        )
         return (
             self.enabled
+            and not has_castling_rights
             and piece_count <= self.max_pieces
             and (piece_count <= 2 or piece_count in self.wdl_piece_counts)
         )
@@ -1042,6 +1103,53 @@ _SELFPLAY_SHARP_OPENING_LINES = (
     ("d2d4", "g8f6", "c2c4", "e7e5", "d4e5", "f6g4"),
 )
 _SELFPLAY_SELFPLAY_OPENING_LINES = _SELFPLAY_OPENING_LINES + _SELFPLAY_SHARP_OPENING_LINES
+
+
+def _stratify_eval_opening_lines(lines):
+    """Keep the full suite, with proportional depth coverage in every prefix."""
+    groups = {}
+    for line in lines:
+        groups.setdefault(len(line), []).append(line)
+    rng = np.random.default_rng(490050)
+    for group in groups.values():
+        rng.shuffle(group)
+    used = dict.fromkeys(groups, 0)
+    ordered = []
+    for index in range(len(lines)):
+        depth = max(
+            (depth for depth in groups if used[depth] < len(groups[depth])),
+            key=lambda depth: (index + 1) * len(groups[depth]) / len(lines) - used[depth],
+        )
+        ordered.append(groups[depth][used[depth]])
+        used[depth] += 1
+    return tuple(ordered)
+
+
+def _build_eval_opening_lines():
+    """Deduplicate the original 96 positions, then stratify their stage order."""
+    lines = _SELFPLAY_OPENING_LINES + _SELFPLAY_SHARP_OPENING_LINES
+    unique = []
+    seen_positions = set()
+    for depth in range(4, 11):
+        for line in lines:
+            if len(line) < depth:
+                continue
+            prefix = tuple(line[:depth])
+            board = chess.new_board()
+            for uci in prefix:
+                chess.apply_move(board, chess.move_from_uci(uci))
+            position_key = _board_position_key(board)
+            if position_key in seen_positions:
+                continue
+            seen_positions.add(position_key)
+            unique.append(prefix)
+            if len(unique) >= 96:
+                return _stratify_eval_opening_lines(unique)
+    return _stratify_eval_opening_lines(unique)
+
+
+_EVAL_OPENING_SUITE_ID = "curated-stratified-v2"
+_EVAL_OPENING_LINES = _build_eval_opening_lines()
 
 
 class MCTSEdgeStats:
@@ -3414,12 +3522,17 @@ class MultiGameBatchMCTS:
             )
             root_gumbel_noises[idx] = noise
             if root_reused_flags[idx]:
+                pre_credit_budget = max(
+                    0,
+                    int(simulation_budgets[idx]) - int(setup_visits[idx]),
+                )
                 tree_reuse_quality[idx] = _summarize_tree_reuse_quality(
                     root,
                     noise,
-                    min(
+                    _resolve_gumbel_considered_actions(
                         self.gumbel_max_considered_actions,
-                        max(1, int(simulation_budgets[idx])),
+                        len(root.edges.moves),
+                        pre_credit_budget,
                     ),
                 )
         inherited_visit_credits = [0] * game_count
@@ -3441,6 +3554,10 @@ class MultiGameBatchMCTS:
             )
             for idx in range(game_count)
         ]
+        # ``_run_simulation_phase`` consumes its mutable remaining-budget list
+        # in place. Preserve the assigned budget for post-search telemetry and
+        # Sequential Halving diagnostics before that mutation starts.
+        gumbel_action_budgets = tuple(action_budgets)
         pre_scout_winners = [None] * game_count
         pre_scout_policies = [None] * game_count
         tree_reuse_scout_results = [
@@ -3469,10 +3586,10 @@ class MultiGameBatchMCTS:
             initial = initial_child_visits[idx]
             if initial is None or len(initial) != len(root.edges.moves):
                 initial = np.zeros(len(root.edges.moves), dtype=np.int32)
-            considered = min(
-                len(root.edges.moves),
+            considered = _resolve_gumbel_considered_actions(
                 self.gumbel_max_considered_actions,
-                max(1, action_budgets[idx]),
+                len(root.edges.moves),
+                action_budgets[idx],
             )
             gumbel_root_states[idx] = {
                 'initial_visits': np.asarray(initial, dtype=np.int32),
@@ -3694,6 +3811,17 @@ class MultiGameBatchMCTS:
                     metadata['policy_target_by_move'] = policy_target
                 metadata['gumbel_considered_actions'] = int(
                     gumbel_state.get('considered_actions', 0) or 0
+                )
+                metadata['gumbel_action_budget'] = int(gumbel_action_budgets[idx])
+                metadata['gumbel_initial_round_visits'] = int(
+                    _gumbel_initial_round_visits(
+                        gumbel_state.get('considered_actions', 0),
+                        gumbel_action_budgets[idx],
+                    )
+                )
+                metadata['gumbel_width_adapted'] = bool(
+                    int(gumbel_state.get('considered_actions', 0) or 0)
+                    < min(len(root.edges.moves), self.gumbel_max_considered_actions)
                 )
                 metadata['gumbel_scale'] = float(
                     self.gumbel_scale if add_root_noise else self.gumbel_eval_scale

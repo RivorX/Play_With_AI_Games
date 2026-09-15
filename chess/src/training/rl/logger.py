@@ -979,12 +979,15 @@ class RLLoggerMixin:
                 replay_stats, 'policy_correction_weight_share'
             ),
             'correction_audit_rows': _value(replay_stats, 'correction_audit_rows'),
+            'correction_audit_candidate_rows': _value(replay_stats, 'correction_audit_candidate_rows'),
+            'correction_audit_eligible_rows': _value(replay_stats, 'correction_audit_eligible_rows'),
+            'correction_audit_correction_fraction': _value(replay_stats, 'correction_audit_correction_fraction'),
+            'correction_audit_coverage': _value(replay_stats, 'correction_audit_coverage'),
+            'correction_audit_q_delta_mean': _value(replay_stats, 'correction_audit_q_delta_mean'),
+            'correction_audit_target_entropy_mean': _value(replay_stats, 'correction_audit_target_entropy_mean'),
             'correction_audit_top1_before': _value(replay_stats, 'correction_audit_top1_before'),
             'correction_audit_top1_after': _value(replay_stats, 'correction_audit_top1_after'),
             'correction_audit_top1_gain': _value(replay_stats, 'correction_audit_top1_gain'),
-            'correction_audit_rank_before': _value(replay_stats, 'correction_audit_rank_before'),
-            'correction_audit_rank_after': _value(replay_stats, 'correction_audit_rank_after'),
-            'correction_audit_rank_gain': _value(replay_stats, 'correction_audit_rank_gain'),
             'correction_audit_target_probability_before': _value(
                 replay_stats, 'correction_audit_target_probability_before'
             ),
@@ -993,15 +996,6 @@ class RLLoggerMixin:
             ),
             'correction_audit_target_probability_gain': _value(
                 replay_stats, 'correction_audit_target_probability_gain'
-            ),
-            'correction_audit_logit_margin_before': _value(
-                replay_stats, 'correction_audit_logit_margin_before'
-            ),
-            'correction_audit_logit_margin_after': _value(
-                replay_stats, 'correction_audit_logit_margin_after'
-            ),
-            'correction_audit_logit_margin_gain': _value(
-                replay_stats, 'correction_audit_logit_margin_gain'
             ),
             'correction_audit_target_kl_before': _value(
                 replay_stats, 'correction_audit_target_kl_before'
@@ -1032,6 +1026,18 @@ class RLLoggerMixin:
             'holdout_value_mae_before': _value(replay_stats, 'holdout_value_mae_before'),
             'holdout_value_mae_after': _value(replay_stats, 'holdout_value_mae_after'),
             'holdout_value_mae_reduction': _value(replay_stats, 'holdout_value_mae_reduction'),
+            'holdout_root_q_mae_before': _value(replay_stats, 'holdout_root_q_mae_before'),
+            'holdout_root_q_mae_after': _value(replay_stats, 'holdout_root_q_mae_after'),
+            'holdout_root_q_mae_reduction': _value(replay_stats, 'holdout_root_q_mae_reduction'),
+            'holdout_root_q_mae_opening_reduction': _value(
+                replay_stats, 'holdout_root_q_mae_opening_reduction'
+            ),
+            'holdout_root_q_mae_middlegame_reduction': _value(
+                replay_stats, 'holdout_root_q_mae_middlegame_reduction'
+            ),
+            'holdout_root_q_mae_endgame_reduction': _value(
+                replay_stats, 'holdout_root_q_mae_endgame_reduction'
+            ),
             'learner_guard_failures': _value(replay_stats, 'learner_guard_failures'),
             'learner_actor_safe': _value(replay_stats, 'learner_actor_safe'),
             'sample_age_avg': _value(replay_stats, 'sample_age_avg'),
@@ -1053,6 +1059,8 @@ class RLLoggerMixin:
             'champion_sample_age_p50': _value(replay_stats, 'champion_sample_age_p50'),
             'champion_sample_age_p90': _value(replay_stats, 'champion_sample_age_p90'),
             'selfplay_completed_games': _value(selfplay_stats, 'completed_games'),
+            'selfplay_telemetry_complete': _value(selfplay_stats, 'telemetry_complete', 1),
+            'selfplay_recovery_attempts': _value(selfplay_stats, 'recovery_attempts', 0),
             'selfplay_draw_rate': _value(selfplay_stats, 'completed_draw_rate'),
             'selfplay_decisive_rate': _value(selfplay_stats, 'decisive_rate'),
             'selfplay_auto_draw_rate': _value(selfplay_stats, 'auto_draw_rate'),
@@ -1071,16 +1079,77 @@ class RLLoggerMixin:
             'selfplay_hard_start_games': hard_start_games if hard_start_games is not None else '',
             'selfplay_hard_start_fraction': _ratio(
                 hard_start_games,
-                (_float(selfplay_stats, 'completed_games') or 0.0)
-                + (_float(selfplay_stats, 'truncated_games') or 0.0),
+                _float(selfplay_stats, 'completed_games'),
+            ),
+            'selfplay_normal_start_games': _value(
+                selfplay_stats, 'normal_start_games'
+            ),
+            'selfplay_normal_start_no_prefix_games': _value(
+                selfplay_stats, 'normal_start_no_prefix_games'
+            ),
+            'selfplay_opening_prefix_sampled_games': _value(
+                selfplay_stats, 'opening_prefix_sampled_games'
+            ),
+            'selfplay_opening_prefix_applied_games': _value(
+                selfplay_stats, 'opening_prefix_applied_games'
+            ),
+            'selfplay_opening_prefix_coverage_completed': _value(
+                selfplay_stats, 'opening_prefix_coverage_completed'
+            ),
+            'selfplay_opening_prefix_coverage_normal_start': _value(
+                selfplay_stats, 'opening_prefix_coverage_normal_start'
+            ),
+            'selfplay_opening_prefix_games': _value(
+                selfplay_stats, 'opening_prefix_games'
+            ),
+            'selfplay_opening_prefix_fraction': _value(
+                selfplay_stats, 'opening_prefix_fraction'
+            ),
+            'selfplay_opening_prefix_plies_avg': _value(
+                selfplay_stats, 'opening_prefix_plies_avg'
+            ),
+            'selfplay_opening_sequence_games': _value(
+                selfplay_stats, 'opening_sequence_games'
+            ),
+            'selfplay_opening_unique_8ply': _value(
+                selfplay_stats, 'opening_unique_8ply'
+            ),
+            'selfplay_opening_effective_8ply': _value(
+                selfplay_stats, 'opening_effective_8ply'
+            ),
+            'selfplay_opening_top1_8ply_rate': _value(
+                selfplay_stats, 'opening_top1_8ply_rate'
             ),
             'search_control_archive_size': _value(replay_stats, 'search_control_archive_size'),
+            'search_control_archive_capacity': _value(
+                replay_stats, 'search_control_archive_capacity'
+            ),
             'search_control_candidates': _value(replay_stats, 'search_control_candidates'),
             'search_control_added': _value(replay_stats, 'search_control_added'),
             'search_control_updated': _value(replay_stats, 'search_control_updated'),
+            'search_control_replaced': _value(replay_stats, 'search_control_replaced'),
             'search_control_replayed': _value(replay_stats, 'search_control_replayed'),
+            'search_control_requested_starts': _value(
+                replay_stats, 'search_control_requested_starts'
+            ),
+            'search_control_selected_starts': _value(
+                replay_stats, 'search_control_selected_starts'
+            ),
+            'search_control_fallback_requested': _value(
+                replay_stats, 'search_control_fallback_requested'
+            ),
+            'search_control_fallback_selected': _value(
+                replay_stats, 'search_control_fallback_selected'
+            ),
+            'search_control_unfilled_starts': _value(
+                replay_stats, 'search_control_unfilled_starts'
+            ),
+            'search_control_regret_tie_fraction': _value(
+                replay_stats, 'search_control_regret_tie_fraction'
+            ),
             'search_control_start_fraction': _value(replay_stats, 'search_control_start_fraction'),
             'search_control_regret_mean': _value(replay_stats, 'search_control_regret_mean'),
+            'search_control_regret_p10': _value(replay_stats, 'search_control_regret_p10'),
             'search_control_regret_p50': _value(replay_stats, 'search_control_regret_p50'),
             'search_control_regret_p90': _value(replay_stats, 'search_control_regret_p90'),
             'search_control_sampled_regret_mean': _value(
@@ -1125,9 +1194,9 @@ class RLLoggerMixin:
             'mcts_tree_reuse_credit_samples': _value(
                 selfplay_stats, 'tree_reuse_credit_samples'
             ),
-            'mcts_tree_reuse_credit_fraction': _ratio(
-                _float(selfplay_stats, 'tree_reuse_credit_samples'),
-                mcts_search_samples,
+            'mcts_tree_reuse_visit_credit_share': _ratio(
+                _float(selfplay_stats, 'search_inherited_visit_credit_avg'),
+                mcts_avg_budget,
             ),
             'mcts_tree_reuse_quality_avg': _value(
                 selfplay_stats, 'tree_reuse_quality_avg'
@@ -1174,6 +1243,16 @@ class RLLoggerMixin:
             'mcts_visited_move_count_mean': _value(selfplay_stats, 'mcts_visited_move_count_mean'),
             'mcts_legal_move_count_mean': _value(selfplay_stats, 'mcts_legal_move_count_mean'),
             'mcts_visit_coverage_ratio_mean': _value(selfplay_stats, 'mcts_visit_coverage_ratio_mean'),
+            'gumbel_action_budget_mean': _value(selfplay_stats, 'gumbel_action_budget_mean'),
+            'gumbel_considered_actions_mean': _value(
+                selfplay_stats, 'gumbel_considered_actions_mean'
+            ),
+            'gumbel_initial_round_visits_mean': _value(
+                selfplay_stats, 'gumbel_initial_round_visits_mean'
+            ),
+            'gumbel_width_adapted_rate': _value(
+                selfplay_stats, 'gumbel_width_adapted_rate'
+            ),
         }
         for label in ('current', 'best'):
             bucket = opponent_buckets[label]
@@ -1183,6 +1262,17 @@ class RLLoggerMixin:
                 f'opponent_{label}_games': bucket['games'],
                 f'opponent_{label}_score_rate': bucket['score_rate'],
             })
+        for budget in (64, 128, 192, 256, 320):
+            prefix = f'mcts_budget_{budget}'
+            for metric in (
+                'root_count',
+                'useful_change_rate',
+                'policy_kl_mean',
+                'target_entropy_mean',
+                'fresh_sim_share',
+            ):
+                key = f'{prefix}_{metric}'
+                record[key] = _value(selfplay_stats, key)
         append_csv_record(self.data_quality_log_path, RL_DATA_QUALITY_COLUMNS, record)
 
     def plot_rl_data_quality(self):
@@ -1422,22 +1512,31 @@ class RLLoggerMixin:
             'policy_correction_loss': train_metrics.get('policy_correction_loss', '') if train_metrics else '',
             'policy_correction_rank_loss': train_metrics.get('policy_correction_rank_loss', '') if train_metrics else '',
             'policy_correction_rank_weight': train_metrics.get('policy_correction_rank_weight', '') if train_metrics else '',
+            'policy_correction_rank_objective': train_metrics.get(
+                'policy_correction_rank_objective', ''
+            ) if train_metrics else '',
+            'policy_correction_rank_contribution': train_metrics.get(
+                'policy_correction_rank_contribution', ''
+            ) if train_metrics else '',
+            'policy_correction_rank_to_ce_ratio': train_metrics.get(
+                'policy_correction_rank_to_ce_ratio', ''
+            ) if train_metrics else '',
             'policy_correction_top1_acc': train_metrics.get('policy_correction_top1_acc', '') if train_metrics else '',
             'policy_correction_fraction': train_metrics.get('policy_correction_fraction', '') if train_metrics else '',
             'policy_correction_weight_share': train_metrics.get('policy_correction_weight_share', '') if train_metrics else '',
             'correction_audit_rows': train_metrics.get('correction_audit_rows', '') if train_metrics else '',
+            'correction_audit_candidate_rows': train_metrics.get('correction_audit_candidate_rows', '') if train_metrics else '',
+            'correction_audit_eligible_rows': train_metrics.get('correction_audit_eligible_rows', '') if train_metrics else '',
+            'correction_audit_correction_fraction': train_metrics.get('correction_audit_correction_fraction', '') if train_metrics else '',
+            'correction_audit_coverage': train_metrics.get('correction_audit_coverage', '') if train_metrics else '',
+            'correction_audit_q_delta_mean': train_metrics.get('correction_audit_q_delta_mean', '') if train_metrics else '',
+            'correction_audit_target_entropy_mean': train_metrics.get('correction_audit_target_entropy_mean', '') if train_metrics else '',
             'correction_audit_top1_before': train_metrics.get('correction_audit_top1_before', '') if train_metrics else '',
             'correction_audit_top1_after': train_metrics.get('correction_audit_top1_after', '') if train_metrics else '',
             'correction_audit_top1_gain': train_metrics.get('correction_audit_top1_gain', '') if train_metrics else '',
-            'correction_audit_rank_before': train_metrics.get('correction_audit_rank_before', '') if train_metrics else '',
-            'correction_audit_rank_after': train_metrics.get('correction_audit_rank_after', '') if train_metrics else '',
-            'correction_audit_rank_gain': train_metrics.get('correction_audit_rank_gain', '') if train_metrics else '',
             'correction_audit_target_probability_before': train_metrics.get('correction_audit_target_probability_before', '') if train_metrics else '',
             'correction_audit_target_probability_after': train_metrics.get('correction_audit_target_probability_after', '') if train_metrics else '',
             'correction_audit_target_probability_gain': train_metrics.get('correction_audit_target_probability_gain', '') if train_metrics else '',
-            'correction_audit_logit_margin_before': train_metrics.get('correction_audit_logit_margin_before', '') if train_metrics else '',
-            'correction_audit_logit_margin_after': train_metrics.get('correction_audit_logit_margin_after', '') if train_metrics else '',
-            'correction_audit_logit_margin_gain': train_metrics.get('correction_audit_logit_margin_gain', '') if train_metrics else '',
             'correction_audit_target_kl_before': train_metrics.get('correction_audit_target_kl_before', '') if train_metrics else '',
             'correction_audit_target_kl_after': train_metrics.get('correction_audit_target_kl_after', '') if train_metrics else '',
             'correction_audit_target_kl_reduction': train_metrics.get('correction_audit_target_kl_reduction', '') if train_metrics else '',
@@ -1457,6 +1556,12 @@ class RLLoggerMixin:
             'holdout_value_mae_before': train_metrics.get('holdout_value_mae_before', '') if train_metrics else '',
             'holdout_value_mae_after': train_metrics.get('holdout_value_mae_after', '') if train_metrics else '',
             'holdout_value_mae_reduction': train_metrics.get('holdout_value_mae_reduction', '') if train_metrics else '',
+            'holdout_root_q_mae_before': train_metrics.get('holdout_root_q_mae_before', '') if train_metrics else '',
+            'holdout_root_q_mae_after': train_metrics.get('holdout_root_q_mae_after', '') if train_metrics else '',
+            'holdout_root_q_mae_reduction': train_metrics.get('holdout_root_q_mae_reduction', '') if train_metrics else '',
+            'holdout_root_q_mae_opening_reduction': train_metrics.get('holdout_root_q_mae_opening_reduction', '') if train_metrics else '',
+            'holdout_root_q_mae_middlegame_reduction': train_metrics.get('holdout_root_q_mae_middlegame_reduction', '') if train_metrics else '',
+            'holdout_root_q_mae_endgame_reduction': train_metrics.get('holdout_root_q_mae_endgame_reduction', '') if train_metrics else '',
             'grad_total_norm': train_metrics.get('grad_total_norm', '') if train_metrics else '',
             'grad_clip_fraction': train_metrics.get('grad_clip_fraction', '') if train_metrics else '',
             'grad_clip_scale_mean': train_metrics.get('grad_clip_scale_mean', '') if train_metrics else '',
@@ -1482,9 +1587,6 @@ class RLLoggerMixin:
             'value_draw_target_fraction_opening': train_metrics.get('value_draw_target_fraction_opening', '') if train_metrics else '',
             'value_draw_target_fraction_middlegame': train_metrics.get('value_draw_target_fraction_middlegame', '') if train_metrics else '',
             'value_draw_target_fraction_endgame': train_metrics.get('value_draw_target_fraction_endgame', '') if train_metrics else '',
-            'value_error_priority_fraction': train_metrics.get('value_error_priority_fraction', '') if train_metrics else '',
-            'value_error_priority_weight_share': train_metrics.get('value_error_priority_weight_share', '') if train_metrics else '',
-            'value_error_priority_mae': train_metrics.get('value_error_priority_mae', '') if train_metrics else '',
             'value_prediction_mean': train_metrics.get('value_prediction_mean', '') if train_metrics else '',
             'value_target_mean': train_metrics.get('value_target_mean', '') if train_metrics else '',
             'value_mean_bias': train_metrics.get('value_mean_bias', '') if train_metrics else '',
@@ -1510,12 +1612,16 @@ class RLLoggerMixin:
             'eval_score_lower_bound': kwargs.get(
                 'eval_score_lower_bound', _score_lower_bound(score_rate, eval_games)
             ),
+            'eval_score_se': kwargs.get('eval_score_se', ''),
+            'eval_unique_openings': kwargs.get('eval_unique_openings', ''),
             'eval_score_rate_ema': kwargs.get('eval_score_rate_ema', ''),
             'eval_true_win_rate_ema': kwargs.get('eval_true_win_rate_ema', ''),
             'no_mcts_games': no_mcts_games,
             'no_mcts_score_rate': no_mcts_score,
             'no_mcts_win_rate': kwargs.get('no_mcts_win_rate', kwargs.get('no_mcts_true_win_rate', '')),
-            'no_mcts_score_lower_bound': _score_lower_bound(no_mcts_score, no_mcts_games),
+            'no_mcts_score_lower_bound': kwargs.get('no_mcts_score_lower_bound', _score_lower_bound(no_mcts_score, no_mcts_games)),
+            'no_mcts_score_se': kwargs.get('no_mcts_score_se', ''),
+            'no_mcts_unique_openings': kwargs.get('no_mcts_unique_openings', ''),
             'no_mcts_score_upper_bound': kwargs.get('no_mcts_score_upper_bound', ''),
             'mcts_no_mcts_gap': mcts_no_mcts_gap,
             'promotion_status': kwargs.get('promotion_status', ''),

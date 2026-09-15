@@ -34,6 +34,23 @@ from src.models.data.se_cnn_v9.helpers import move_to_index
 from src.training.rl.search_control import suffix_regret_targets
 
 
+_OPENING_DIVERSITY_SEQUENCE_PLIES = 8
+_GUMBEL_SEARCH_STAT_KEYS = (
+    'gumbel_action_budget_sum',
+    'gumbel_considered_actions_sum',
+    'gumbel_initial_round_visits_sum',
+    'gumbel_width_adapted_count',
+)
+
+
+def _gumbel_search_stats_payload(stats):
+    stats = dict(stats or {})
+    return {
+        key: int(stats.get(key, 0) or 0)
+        for key in _GUMBEL_SEARCH_STAT_KEYS
+    }
+
+
 class SelfPlayEngine:
     """
     True batch self-play: multiple games in parallel, shared GPU eval batches.
@@ -883,10 +900,12 @@ class SelfPlayEngine:
 
     def _apply_opening_prefix(self, gs):
         prefix = self._sample_opening_prefix()
+        gs['_opening_prefix_sampled'] = bool(prefix)
         if not prefix:
             return
 
         board = gs['board']
+        applied_plies = 0
         for uci in prefix:
             try:
                 move = chess.move_from_uci(uci)
@@ -900,12 +919,16 @@ class SelfPlayEngine:
             self._trim_history_cache(gs['board_history'])
             self._trim_history_cache(gs['fen_history'])
             chess.apply_move(board, move)
+            if len(gs['_opening_sequence']) < _OPENING_DIVERSITY_SEQUENCE_PLIES:
+                gs['_opening_sequence'].append(move.uci())
+            applied_plies += 1
             gs['move_count'] += 1
             _record_position_count(gs['position_counts'], board)
 
             if chess.is_game_over(board, claim_draw=False) or gs['move_count'] >= self.max_moves:
                 gs['done'] = True
                 break
+        gs['_opening_prefix_plies'] = applied_plies
 
     def _trim_history_cache(self, history):
         """Keep only entries that can still affect the model input or replay row."""
@@ -971,6 +994,10 @@ class SelfPlayEngine:
         total_tree_reuse_scout_reduced_count = 0
         total_shared_tree_searches = 0
         total_hard_start_games = 0
+        total_opening_prefix_sampled_games = 0
+        total_opening_prefix_games = 0
+        total_opening_prefix_plies = 0
+        opening_sequence_counts = {}
         search_simulations_used_samples = []
         search_simulations_budget_samples = []
         total_mcts_quality_stats = {
@@ -999,9 +1026,22 @@ class SelfPlayEngine:
             'mcts_changed_q_delta_values': [],
             'mcts_changed_q_delta_hist': [0] * _Q_DELTA_HIST_BINS,
         }
+        for key in _GUMBEL_SEARCH_STAT_KEYS:
+            total_mcts_quality_stats[key] = 0.0
         for phase in ('opening', 'middlegame', 'endgame'):
             total_mcts_quality_stats[f'mcts_phase_{phase}_samples'] = 0.0
             total_mcts_quality_stats[f'mcts_phase_{phase}_changed_count'] = 0.0
+        for budget in (64, 128, 192, 256, 320):
+            prefix = f'mcts_budget_{budget}'
+            for suffix in (
+                'samples',
+                'useful_change_count',
+                'policy_kl_sum',
+                'target_entropy_sum',
+                'fresh_sim_sum',
+                'budget_sum',
+            ):
+                total_mcts_quality_stats[f'{prefix}_{suffix}'] = 0.0
         opponent_source_counts = {}
         opponent_source_results = {}
 
@@ -1077,6 +1117,15 @@ class SelfPlayEngine:
         )
         total_shared_tree_searches += int(batch_stats.get('shared_tree_searches', 0))
         total_hard_start_games += int(batch_stats.get('hard_start_games', 0))
+        total_opening_prefix_sampled_games += int(
+            batch_stats.get('opening_prefix_sampled_games', 0)
+        )
+        total_opening_prefix_games += int(batch_stats.get('opening_prefix_games', 0))
+        total_opening_prefix_plies += int(batch_stats.get('opening_prefix_plies_sum', 0))
+        for sequence, count in dict(batch_stats.get('opening_sequence_counts', {}) or {}).items():
+            opening_sequence_counts[str(sequence)] = (
+                int(opening_sequence_counts.get(str(sequence), 0)) + int(count)
+            )
         search_simulations_used_samples.extend(list(batch_stats.get('search_simulations_used_samples', []) or []))
         search_simulations_budget_samples.extend(list(batch_stats.get('search_simulations_budget_samples', []) or []))
         for key in total_mcts_quality_stats:
@@ -1141,6 +1190,19 @@ class SelfPlayEngine:
             mcts_phase_stats[f'mcts_phase_{phase}_samples'] = int(samples)
             mcts_phase_stats[f'mcts_phase_{phase}_changed_count'] = int(changed)
             mcts_phase_stats[f'mcts_changed_{phase}_rate'] = changed / samples if samples > 0.0 else 0.0
+        budget_quality_stats = {}
+        for budget in (64, 128, 192, 256, 320):
+            prefix = f'mcts_budget_{budget}'
+            for suffix in (
+                'samples',
+                'useful_change_count',
+                'policy_kl_sum',
+                'target_entropy_sum',
+                'fresh_sim_sum',
+                'budget_sum',
+            ):
+                key = f'{prefix}_{suffix}'
+                budget_quality_stats[key] = total_mcts_quality_stats[key]
         self.last_selfplay_stats = {
             'truncated_games': total_truncated_games,
             'completed_games': max(0, total_games - total_truncated_games),
@@ -1201,7 +1263,14 @@ class SelfPlayEngine:
             'tree_reuse_scout_extra_credit_sum': int(total_tree_reuse_scout_extra_credit_sum),
             'tree_reuse_scout_reduced_count': int(total_tree_reuse_scout_reduced_count),
             'shared_tree_searches': int(total_shared_tree_searches),
+            **_gumbel_search_stats_payload(total_mcts_quality_stats),
+            **budget_quality_stats,
             'hard_start_games': int(total_hard_start_games),
+            'opening_prefix_sampled_games': int(total_opening_prefix_sampled_games),
+            'opening_prefix_games': int(total_opening_prefix_games),
+            'opening_prefix_applied_games': int(total_opening_prefix_games),
+            'opening_prefix_plies_sum': int(total_opening_prefix_plies),
+            'opening_sequence_counts': dict(opening_sequence_counts),
             'mcts_prior_agreement_samples': int(mcts_quality_samples),
             'mcts_prior_agreement_sum': float(total_mcts_quality_stats['mcts_prior_agreement_sum']),
             'mcts_prior_agreement_rate': (
@@ -1410,6 +1479,10 @@ class SelfPlayEngine:
             'curriculum_dropped_positions': 0,
             'cap_dropped_positions': 0,
             'hard_start_games': 0,
+            'opening_prefix_sampled_games': 0,
+            'opening_prefix_games': 0,
+            'opening_prefix_plies_sum': 0,
+            'opening_sequence_counts': {},
             'opponent_source_counts': {},
             'opponent_source_results': {},
         }
@@ -1417,7 +1490,6 @@ class SelfPlayEngine:
 
         for gs in completed_game_states:
             stats['total_games'] += 1
-            stats['hard_start_games'] += int(bool(gs.get('_hard_start', False)))
             board = gs['board']
             opponent_label = str(
                 gs.get('opponent_source_label', self.opponent_source_label) or "current"
@@ -1450,6 +1522,23 @@ class SelfPlayEngine:
                 stats['dropped_positions'] += len(gs['game_history'])
                 stats['truncated_length_sum'] += game_ply_len
                 continue
+
+            is_hard_start = bool(gs.get('_hard_start', False))
+            stats['hard_start_games'] += int(is_hard_start)
+            if not is_hard_start:
+                prefix_plies = int(gs.get('_opening_prefix_plies', 0) or 0)
+                stats['opening_prefix_sampled_games'] += int(
+                    bool(gs.get('_opening_prefix_sampled', False))
+                )
+                stats['opening_prefix_games'] += int(prefix_plies > 0)
+                stats['opening_prefix_plies_sum'] += prefix_plies
+                opening_sequence = tuple(gs.get('_opening_sequence', ()) or ())
+                if opening_sequence:
+                    sequence_key = ' '.join(opening_sequence)
+                    sequence_counts = stats['opening_sequence_counts']
+                    sequence_counts[sequence_key] = int(
+                        sequence_counts.get(sequence_key, 0)
+                    ) + 1
 
             if result == '1-0':
                 outcome = 1.0
@@ -1531,7 +1620,7 @@ class SelfPlayEngine:
                     for key, value in source.items()
                 }
             for key, value in source.items():
-                if key == 'opponent_source_counts':
+                if key in {'opponent_source_counts', 'opening_sequence_counts'}:
                     for label, count in value.items():
                         target[key][label] = int(target[key].get(label, 0)) + int(count)
                 elif key == 'opponent_source_results':
@@ -1634,6 +1723,9 @@ class SelfPlayEngine:
                 '_completion_reported': False,
                 '_finalized_for_batch': False,
                 '_hard_start': bool(hard_start),
+                '_opening_sequence': [],
+                '_opening_prefix_sampled': False,
+                '_opening_prefix_plies': 0,
                 '_archive_id': int((hard_start or {}).get('archive_id', -1)),
                 '_native_tree_key': id(initial_board),
                 '_stream_job_id': game_spec.get('job_id'),
@@ -1698,6 +1790,10 @@ class SelfPlayEngine:
             'samples': 0,
             'samples_list': [],
             'budget_samples_list': [],
+            'gumbel_action_budget_sum': 0,
+            'gumbel_considered_actions_sum': 0,
+            'gumbel_initial_round_visits_sum': 0,
+            'gumbel_width_adapted_count': 0,
             'difficulty_samples': 0,
             'difficulty_sum': 0.0,
             'difficulty_sq_sum': 0.0,
@@ -1743,6 +1839,14 @@ class SelfPlayEngine:
         for phase in ('opening', 'middlegame', 'endgame'):
             target_quality[f'{phase}_samples'] = 0
             target_quality[f'{phase}_changed_count'] = 0
+        for budget in (64, 128, 192, 256, 320):
+            prefix = f'mcts_budget_{budget}'
+            target_quality[f'{prefix}_samples'] = 0
+            target_quality[f'{prefix}_useful_change_count'] = 0
+            target_quality[f'{prefix}_policy_kl_sum'] = 0.0
+            target_quality[f'{prefix}_target_entropy_sum'] = 0.0
+            target_quality[f'{prefix}_fresh_sim_sum'] = 0.0
+            target_quality[f'{prefix}_budget_sum'] = 0.0
 
         def _accumulate_target_quality(search_metadata, board):
             if not isinstance(search_metadata, dict):
@@ -1806,6 +1910,22 @@ class SelfPlayEngine:
                         target_quality['changed_to_lower_q'] += 1
                     elif q_delta_value > 0.02:
                         target_quality['changed_to_higher_q'] += 1
+            budget = int(search_metadata.get('simulation_budget', 0) or 0)
+            if budget in (64, 128, 192, 256, 320):
+                prefix = f'mcts_budget_{budget}'
+                target_quality[f'{prefix}_samples'] += 1
+                target_quality[f'{prefix}_policy_kl_sum'] += float(
+                    search_metadata.get('mcts_policy_kl', 0.0) or 0.0
+                )
+                target_quality[f'{prefix}_target_entropy_sum'] += float(
+                    search_metadata.get('visit_entropy', 0.0) or 0.0
+                )
+                target_quality[f'{prefix}_fresh_sim_sum'] += float(
+                    search_metadata.get('fresh_simulations_used', budget) or 0.0
+                )
+                target_quality[f'{prefix}_budget_sum'] += float(budget)
+                if changed_top and q_delta is not None and float(q_delta) > 0.02:
+                    target_quality[f'{prefix}_useful_change_count'] += 1
 
         while game_states:
             active_indices = []
@@ -1890,6 +2010,18 @@ class SelfPlayEngine:
                         budget = int(search_metadata.get('simulation_budget', self.num_simulations) or self.num_simulations)
                         search_stats['sim_budget'] += budget
                         search_stats['budget_samples_list'].append(budget)
+                        search_stats['gumbel_action_budget_sum'] += int(
+                            search_metadata.get('gumbel_action_budget', 0) or 0
+                        )
+                        search_stats['gumbel_considered_actions_sum'] += int(
+                            search_metadata.get('gumbel_considered_actions', 0) or 0
+                        )
+                        search_stats['gumbel_initial_round_visits_sum'] += int(
+                            search_metadata.get('gumbel_initial_round_visits', 0) or 0
+                        )
+                        search_stats['gumbel_width_adapted_count'] += int(bool(
+                            search_metadata.get('gumbel_width_adapted', False)
+                        ))
                     else:
                         search_stats['fresh_sim_used'] += used
                         search_stats['sim_budget'] += int(self.num_simulations)
@@ -2120,6 +2252,12 @@ class SelfPlayEngine:
                 self._trim_history_cache(gs['board_history'])
                 self._trim_history_cache(gs['fen_history'])
 
+                if (
+                    not gs.get('_hard_start', False)
+                    and len(gs['_opening_sequence']) < _OPENING_DIVERSITY_SEQUENCE_PLIES
+                ):
+                    gs['_opening_sequence'].append(move.uci())
+
                 # Keep both side-specific MCTS trees synchronized with the
                 # actual game line. Mixed-opponent self-play otherwise starts
                 # every move from a fresh root and produces noisier targets.
@@ -2182,6 +2320,16 @@ class SelfPlayEngine:
         cap_dropped_positions = int(finalized_game_stats.get('cap_dropped_positions', 0))
         finalized_game_count = int(finalized_game_stats.get('total_games', 0))
         hard_start_games = int(finalized_game_stats.get('hard_start_games', 0))
+        opening_prefix_sampled_games = int(
+            finalized_game_stats.get('opening_prefix_sampled_games', 0)
+        )
+        opening_prefix_games = int(finalized_game_stats.get('opening_prefix_games', 0))
+        opening_prefix_plies_sum = int(
+            finalized_game_stats.get('opening_prefix_plies_sum', 0)
+        )
+        opening_sequence_counts = dict(
+            finalized_game_stats.get('opening_sequence_counts', {}) or {}
+        )
 
         source_label = self.opponent_source_label
         if len(opponent_source_counts) > 1:
@@ -2202,6 +2350,18 @@ class SelfPlayEngine:
             target_phase_stats[f'mcts_phase_{phase}_samples'] = int(samples)
             target_phase_stats[f'mcts_phase_{phase}_changed_count'] = int(changed)
             target_phase_stats[f'mcts_changed_{phase}_rate'] = changed / samples if samples > 0.0 else 0.0
+        budget_quality_stats = {}
+        for budget in (64, 128, 192, 256, 320):
+            prefix = f'mcts_budget_{budget}'
+            for suffix in (
+                'samples',
+                'useful_change_count',
+                'policy_kl_sum',
+                'target_entropy_sum',
+                'fresh_sim_sum',
+                'budget_sum',
+            ):
+                budget_quality_stats[f'{prefix}_{suffix}'] = target_quality[f'{prefix}_{suffix}']
         return positions, game_lengths, {
             'total_games': finalized_game_count,
             'truncated_games': int(truncated_games),
@@ -2218,11 +2378,22 @@ class SelfPlayEngine:
             'search_samples': int(search_stats['samples']),
             'search_simulations_used_samples': list(search_stats['samples_list']),
             'search_simulations_budget_samples': list(search_stats['budget_samples_list']),
+            'gumbel_action_budget_sum': int(search_stats['gumbel_action_budget_sum']),
+            'gumbel_considered_actions_sum': int(
+                search_stats['gumbel_considered_actions_sum']
+            ),
+            'gumbel_initial_round_visits_sum': int(
+                search_stats['gumbel_initial_round_visits_sum']
+            ),
+            'gumbel_width_adapted_count': int(
+                search_stats['gumbel_width_adapted_count']
+            ),
             'search_difficulty_samples': int(search_stats['difficulty_samples']),
             'search_difficulty_sum': float(search_stats['difficulty_sum']),
             'search_difficulty_sq_sum': float(search_stats['difficulty_sq_sum']),
             'search_difficulty_budget_cross_sum': float(search_stats['difficulty_budget_cross_sum']),
             'search_budget_sq_sum': float(search_stats['budget_sq_sum']),
+            **budget_quality_stats,
             'tree_reuse_attempts': int(search_stats['tree_reuse_attempts']),
             'tree_reuse_hits': int(search_stats['tree_reuse_hits']),
             'tree_inherited_visits_sum': int(search_stats['tree_inherited_visits_sum']),
@@ -2246,6 +2417,11 @@ class SelfPlayEngine:
             ),
             'shared_tree_searches': int(search_stats['shared_tree_searches']),
             'hard_start_games': hard_start_games,
+            'opening_prefix_sampled_games': opening_prefix_sampled_games,
+            'opening_prefix_games': opening_prefix_games,
+            'opening_prefix_applied_games': opening_prefix_games,
+            'opening_prefix_plies_sum': opening_prefix_plies_sum,
+            'opening_sequence_counts': opening_sequence_counts,
             'mcts_prior_agreement_samples': target_quality_samples,
             'mcts_prior_agreement_sum': float(target_quality['agreement_sum']),
             'mcts_prior_changed_count': int(target_quality['changed']),

@@ -5,7 +5,11 @@ from pathlib import Path
 
 import torch
 
-from src.evaluation.elo_estimator import estimate_model_elo
+from src.evaluation.elo_estimator import (
+    _EVAL_OPENING_LINES,
+    _EVAL_OPENING_SUITE_ID,
+    estimate_model_elo,
+)
 from src.models.catalog import persist_checkpoint_elo_metadata
 
 
@@ -48,6 +52,41 @@ def mode_label(use_mcts: bool, simulations: int | None = None) -> str:
     return "Raw NN"
 
 
+def elo_protocol_settings(
+    runtime_cfg: dict,
+    *,
+    use_mcts: bool,
+    simulations: int = 0,
+) -> dict:
+    """Return the strength-defining part of an Elo evaluation protocol."""
+    runtime_cfg = dict(runtime_cfg or {})
+    paired_openings = bool(runtime_cfg.get("paired_openings_enabled", True))
+    return {
+        "use_mcts": bool(use_mcts),
+        "simulations": max(0, int(simulations or 0)) if use_mcts else 0,
+        "stockfish_time_limit": float(
+            runtime_cfg.get("stockfish_time_limit", 0.0) or 0.0
+        ),
+        "stockfish_threads": max(1, int(runtime_cfg.get("stockfish_threads", 1) or 1)),
+        "stockfish_hash_mb": max(1, int(runtime_cfg.get("stockfish_hash_mb", 64) or 64)),
+        "max_moves": max(1, int(runtime_cfg.get("max_moves", 150) or 150)),
+        "paired_openings_enabled": paired_openings,
+        "paired_openings_max_plies": (
+            max(0, int(runtime_cfg.get("paired_openings_max_plies", 8) or 0))
+            if paired_openings
+            else 0
+        ),
+        "opening_suite_id": _EVAL_OPENING_SUITE_ID if paired_openings else "disabled",
+        "opening_suite_positions": len(_EVAL_OPENING_LINES) if paired_openings else 0,
+        "claim_draw": True,
+        "rating_method": "nearest_50pct_stockfish_level",
+        # MCTS Elo is comparable only at an exact per-root simulation budget.
+        # The estimator disables both regular redistribution and eval easy cuts.
+        "mcts_simulation_budget_strict": bool(use_mcts),
+        "pair_aware_standard_error": paired_openings,
+    }
+
+
 def elo_protocol_matches_settings(
     settings: dict | None,
     runtime_cfg: dict,
@@ -58,17 +97,25 @@ def elo_protocol_matches_settings(
     """Whether a stored rating used the same strength-defining protocol."""
     if not isinstance(settings, dict):
         return False
-    try:
-        stored_time = float(settings["stockfish_time_limit"])
-        active_time = float((runtime_cfg or {}).get("stockfish_time_limit", 0.0) or 0.0)
-    except (KeyError, TypeError, ValueError):
-        return False
-    if not math.isclose(stored_time, active_time, rel_tol=0.0, abs_tol=1e-9):
-        return False
-    if bool(settings.get("use_mcts", False)) != bool(use_mcts):
-        return False
-    if use_mcts and safe_int(settings.get("simulations")) != max(0, int(simulations or 0)):
-        return False
+    expected = elo_protocol_settings(
+        runtime_cfg,
+        use_mcts=use_mcts,
+        simulations=simulations,
+    )
+    for key, active_value in expected.items():
+        if key not in settings:
+            return False
+        stored_value = settings.get(key)
+        if isinstance(active_value, float):
+            try:
+                if not math.isclose(
+                    float(stored_value), active_value, rel_tol=0.0, abs_tol=1e-9
+                ):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        elif stored_value != active_value:
+            return False
     return True
 
 

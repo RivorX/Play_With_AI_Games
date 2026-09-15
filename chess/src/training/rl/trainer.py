@@ -23,7 +23,7 @@ sys.path.insert(0, str(project_root))
 
 from src.mcts.search import (
     MultiGameBatchMCTS,
-    _SELFPLAY_OPENING_LINES,
+    _EVAL_OPENING_LINES,
     _board_position_key,
     _record_position_count,
 )
@@ -56,7 +56,7 @@ _POLICY_CORRECTION_RANK_MARGIN = 0.10
 # RL66 left useful-correction top-1 near 14% while correction rows retained their
 # natural replay share. The all-policy-row denominator below keeps this stronger
 # margin term bounded without restoring the stacked row multipliers removed in RL57.
-_POLICY_CORRECTION_RANK_WEIGHT = 0.50
+_POLICY_CORRECTION_RANK_WEIGHT = 0.75
 _POLICY_CORRECTION_Q_DELTA_FULL_STRENGTH = 0.20
 
 
@@ -350,6 +350,30 @@ def _resolve_eval_fixed_openings_max_plies(config):
         return 6
 
 
+def _resolve_eval_opening_lines(config):
+    """Return the configured held-out suite, or the canonical promotion suite.
+
+    The config form is intentionally plain nested lists so it survives Windows
+    spawn when evaluation workers reconstruct their configuration.
+    """
+    rl_cfg = config.get("reinforcement_learning", {}) or {}
+    configured = rl_cfg.get("eval_opening_lines")
+    if configured is None:
+        return _EVAL_OPENING_LINES
+    if not isinstance(configured, (list, tuple)) or not configured:
+        raise ValueError("reinforcement_learning.eval_opening_lines must be a non-empty list of UCI move lists")
+
+    lines = []
+    for line in configured:
+        if isinstance(line, (str, bytes)) or not isinstance(line, (list, tuple)) or not line:
+            raise ValueError("each eval_opening_lines entry must be a non-empty UCI move list")
+        moves = tuple(str(move).strip() for move in line)
+        if any(not move for move in moves):
+            raise ValueError("eval_opening_lines cannot contain empty moves")
+        lines.append(moves)
+    return tuple(lines)
+
+
 def _resolve_eval_mcts_simulations(config):
     rl_cfg = config.get("reinforcement_learning", {})
     try:
@@ -397,13 +421,14 @@ def _print_eval_unresolved(label, unresolved, num_games, max_moves):
 
 def _get_eval_opening_prefix(config, game_idx, enabled_override=None):
     enabled = _resolve_eval_fixed_openings_enabled(config) if enabled_override is None else bool(enabled_override)
-    if not enabled or not _SELFPLAY_OPENING_LINES:
+    opening_lines = _resolve_eval_opening_lines(config)
+    if not enabled or not opening_lines:
         return ()
 
     opening_idx = int(game_idx)
     if bool(config.get("reinforcement_learning", {}).get("eval_fixed_openings_pair_games", False)):
         opening_idx //= 2
-    line = _SELFPLAY_OPENING_LINES[opening_idx % len(_SELFPLAY_OPENING_LINES)]
+    line = opening_lines[opening_idx % len(opening_lines)]
     max_plies = _resolve_eval_fixed_openings_max_plies(config)
     if max_plies <= 0:
         return ()
@@ -2054,7 +2079,10 @@ def _weighted_mean(losses, weights):
     weights = torch.clamp(weights.to(dtype=losses.dtype), min=0.0)
     weight_total = weights.sum()
     if float(weight_total.detach().item()) <= 0.0:
-        return losses.mean()
+        # A zero weight is an explicit request to suppress supervision for the
+        # row. Falling back to an unweighted mean silently re-enabled every
+        # disabled value target and produced gradients with the wrong contract.
+        return losses.sum() * 0.0
     return (losses * weights).sum() / weight_total
 
 
@@ -2080,7 +2108,10 @@ def _useful_policy_correction_rank_loss(
 
     target_slots = valid_legal_mask & safe_legal_indices.eq(target_moves.reshape(-1, 1))
     other_slots = valid_legal_mask & ~target_slots
-    valid_rows = correction_mask & target_slots.any(dim=1) & other_slots.any(dim=1)
+    valid_rows = (
+        correction_mask & target_slots.any(dim=1) & other_slots.any(dim=1)
+        & torch.isfinite(search_q_deltas)
+    )
     if not bool(valid_rows.any().item()):
         return zero, per_row, valid_rows
 
@@ -2093,18 +2124,20 @@ def _useful_policy_correction_rank_loss(
         - target_scores[valid_rows]
     )
     q_strength = torch.clamp(
-        search_q_deltas.to(dtype=legal_log_probs.dtype)
+        search_q_deltas[valid_rows].to(dtype=legal_log_probs.dtype)
         / float(_POLICY_CORRECTION_Q_DELTA_FULL_STRENGTH),
         min=0.0,
         max=1.0,
     )
     effective_weights = torch.clamp(
-        policy_weights.to(dtype=legal_log_probs.dtype), min=0.0
+        policy_weights[valid_rows].to(dtype=legal_log_probs.dtype), min=0.0
     ) * q_strength
     # Include every policy row in the denominator. A small correction cohort can
     # no longer receive the full strength of an independently averaged loss.
     denominator = torch.clamp(policy_weights.sum(), min=1e-8)
-    loss = (per_row * effective_weights).sum() / denominator
+    # Missing Q on unrelated replay rows is normal. Never multiply their NaN
+    # by zero: that poisons both the objective and rank-loss gradients.
+    loss = (per_row[valid_rows] * effective_weights).sum() / denominator
     return loss, per_row, valid_rows
 
 
@@ -2386,6 +2419,8 @@ def train_on_batch_rl(
         )
         correction_policy_mask = (
             policy_rows_mask
+            & torch.isfinite(policy_sample_weights.reshape(-1))
+            & (policy_sample_weights.reshape(-1) > 0.0)
             & search_changed_top
             & torch.isfinite(search_q_deltas)
             & (search_q_deltas > USEFUL_SEARCH_Q_DELTA_MIN)
@@ -2469,11 +2504,6 @@ def train_on_batch_rl(
             torch.clamp(raw_value_sample_weights, min=0.0),
             torch.zeros_like(raw_value_sample_weights),
         )
-        value_error_focus_mask = torch.zeros_like(
-            effective_value_sample_weights, dtype=torch.bool
-        )
-        value_priority_abs_errors = torch.zeros_like(effective_value_sample_weights)
-
         if policy_loss_per_row.numel() == 0:
             policy_loss = torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
         else:
@@ -2573,6 +2603,11 @@ def train_on_batch_rl(
         )
         loss = policy_objective + value_objective
 
+    if not bool(torch.isfinite(loss.detach()).item()):
+        raise FloatingPointError(
+            'Non-finite RL loss before backward; check policy/value targets and weights.'
+        )
+
     task_gradient_diagnostics = (
         _task_gradient_probe(policy_objective, value_objective, model)
         if collect_gradient_diagnostics
@@ -2641,15 +2676,6 @@ def train_on_batch_rl(
         search_q_target_f32 = bounded_root_q.detach().float().reshape(-1)[search_q_mask_f32]
         target_scalar_f32 = target_scalar.detach().float().reshape(-1)
         value_row_count = int(value_scalar_f32.numel())
-        value_weight_f32 = effective_value_sample_weights.detach().float().reshape(-1)
-        value_error_focus_count = int(value_error_focus_mask.sum().item())
-        value_error_focus_weight_sum = float(
-            value_weight_f32[value_error_focus_mask].sum().item()
-        ) if value_error_focus_count > 0 else 0.0
-        value_effective_weight_sum = float(value_weight_f32.sum().item())
-        value_error_focus_abs_error_sum = float(
-            value_priority_abs_errors[value_error_focus_mask].sum().item()
-        ) if value_error_focus_count > 0 else 0.0
         wdl_pred_sums = [0.0, 0.0, 0.0]
         wdl_target_sums = [0.0, 0.0, 0.0]
         wdl_brier_sum = 0.0
@@ -2736,6 +2762,19 @@ def train_on_batch_rl(
                 target_policy_values=policy_training_values,
                 target_wdl=hard_target_wdl,
             )
+            metrics_calc.update_value_phase_loss(
+                value_pred,
+                target_value=target_scalar.unsqueeze(1),
+                target_wdl=hard_target_wdl,
+                move_indices=fullmove_indices,
+                sample_weight=effective_value_sample_weights,
+                value_phase_opening_max=int(
+                    rl_cfg.get("value_phase_opening_max_fullmove", 12)
+                ),
+                value_phase_endgame_min=int(
+                    rl_cfg.get("value_phase_endgame_min_fullmove", 40)
+                ),
+            )
 
     policy_diagnostics = {
         "correction_rows": correction_count,
@@ -2763,10 +2802,6 @@ def train_on_batch_rl(
         "search_q_abs_error_sum": float(
             (search_q_pred_f32 - search_q_target_f32).abs().sum().item()
         ),
-        "value_error_focus_rows": value_error_focus_count,
-        "value_error_focus_weight_sum": value_error_focus_weight_sum,
-        "value_effective_weight_sum": value_effective_weight_sum,
-        "value_error_focus_abs_error_sum": value_error_focus_abs_error_sum,
         "wdl_pred_sums": wdl_pred_sums,
         "wdl_target_sums": wdl_target_sums,
         "wdl_brier_sum": wdl_brier_sum,
@@ -3009,7 +3044,16 @@ def evaluate_models(
     return stats
 
 
-def evaluate_models_no_mcts(model1, model2, config, device, num_games=30, game_index_offset=0, use_fixed_openings=None):
+def evaluate_models_no_mcts(
+    model1,
+    model2,
+    config,
+    device,
+    num_games=30,
+    game_index_offset=0,
+    use_fixed_openings=None,
+    progress_callback=None,
+):
     """Policy-head-only evaluation. This is intentionally separate from promotion eval."""
     wins = 0
     draws = 0
@@ -3042,12 +3086,26 @@ def evaluate_models_no_mcts(model1, model2, config, device, num_games=30, game_i
             )
             if was_unresolved:
                 unresolved += 1
-                eval_bar.update(1)
-                continue
-            game_wins, game_draws, game_losses = _result_for_model1(model1_as_white, result)
-            wins += game_wins
-            draws += game_draws
-            losses += game_losses
+                game_wins = game_draws = game_losses = 0
+                game_unresolved = 1
+            else:
+                game_wins, game_draws, game_losses = _result_for_model1(model1_as_white, result)
+                wins += game_wins
+                draws += game_draws
+                losses += game_losses
+                game_unresolved = 0
+            if progress_callback is not None:
+                progress_callback(
+                    game_idx - game_index_offset + 1,
+                    game_idx,
+                    game_wins,
+                    game_draws,
+                    game_losses,
+                    game_unresolved,
+                    0,
+                    result,
+                    model1_as_white,
+                )
             eval_bar.update(1)
     finally:
         eval_bar.close()

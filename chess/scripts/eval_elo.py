@@ -831,7 +831,7 @@ def main():
     if bool(elo_cfg.get("paired_openings_enabled", True)):
         print(
             "Openings:       paired colors · "
-            f"{int(elo_cfg.get('paired_openings_max_plies', 6) or 0)} fixed plies"
+            f"{int(elo_cfg.get('paired_openings_max_plies', 8) or 0)} fixed plies"
         )
     else:
         print("Openings:       start position only")

@@ -105,12 +105,18 @@ class AdaptiveEloSchedule:
             initial = None
         self.initial_elo = initial if initial is not None and math.isfinite(initial) else None
         self.paired_games = bool(self.config.get("paired_openings_enabled", True))
+        self.opening_suite_positions = max(
+            0,
+            int(self.config.get("opening_suite_positions", 0) or 0),
+        )
+        self.min_independent_clusters = 2 if self.paired_games else 1
 
         self.played_by_level = {level: 0 for level in self.levels}
         self.scheduled_by_level = {level: 0 for level in self.levels}
         self.scores_by_level: dict[int, list[float]] = {level: [] for level in self.levels}
         self.all_opponent_elos: list[float] = []
         self.all_scores: list[float] = []
+        self.all_cluster_ids: list[object] = []
         self.rating_levels: list[int] = []
         self.total_scheduled = 0
 
@@ -264,6 +270,9 @@ class AdaptiveEloSchedule:
     def _build_level_tasks(self, level: int, count: int) -> list[GameTask]:
         game_index = max(0, self.scheduled_by_level.get(int(level), 0))
         count = max(0, min(int(count), self.max_total_games - self.total_scheduled))
+        if self.paired_games and self.opening_suite_positions > 0:
+            # Replaying a deterministic opening does not add independent evidence.
+            count = min(count, max(0, 2 * self.opening_suite_positions - game_index))
         if self.paired_games:
             if game_index % 2:
                 game_index += 1
@@ -288,11 +297,32 @@ class AdaptiveEloSchedule:
             tasks.extend(self._build_level_tasks(level, min(self.probe_games, remaining)))
         return self._commit_tasks(tasks)
 
-    def record_batch(self, opponent_elos: list[float], scores: list[float]):
-        for opponent, score in zip(opponent_elos, scores):
+    def record_batch(
+        self,
+        opponent_elos: list[float],
+        scores: list[float],
+        game_indices: list[int] | None = None,
+    ):
+        if len(opponent_elos) != len(scores) or (game_indices is not None and len(game_indices) != len(scores)):
+            raise ValueError("Every Elo score requires a matching opponent and, when supplied, game index.")
+        valid_indices = game_indices is not None and len(game_indices) == len(scores)
+        for index, (opponent, score) in enumerate(zip(opponent_elos, scores)):
             level = int(round(float(opponent)))
             self.all_opponent_elos.append(float(opponent))
             self.all_scores.append(float(score))
+            # A level is part of the cluster identity because each level has its
+            # own independently scheduled opening pairs.
+            if valid_indices:
+                game_index = int(game_indices[index])
+                pair_index = game_index // 2 if self.paired_games else game_index
+                if self.paired_games and self.opening_suite_positions > 0:
+                    pair_index %= self.opening_suite_positions
+                cluster_id = (level, pair_index)
+            else:
+                # Legacy callers supplied no identity. Do not accidentally
+                # merge unrelated waves by restarting the index at zero.
+                cluster_id = (level, "unknown", len(self.all_scores) - 1)
+            self.all_cluster_ids.append(cluster_id)
             self.played_by_level[level] = self.played_by_level.get(level, 0) + 1
             self.scores_by_level.setdefault(level, []).append(float(score))
 
@@ -317,32 +347,43 @@ class AdaptiveEloSchedule:
         # normally bracketed point estimate.
         return not self.next_probe_levels()
 
-    def rating_observations(self) -> tuple[list[float], list[float]]:
+    def rating_observations(self) -> tuple[list[float], list[float], list[object]]:
         if not self.rating_levels:
-            return list(self.all_opponent_elos), list(self.all_scores)
+            return list(self.all_opponent_elos), list(self.all_scores), list(self.all_cluster_ids)
         selected = set(self.rating_levels)
-        pairs = [
-            (opponent, score)
-            for opponent, score in zip(self.all_opponent_elos, self.all_scores)
+        indices = [
+            index for index, opponent in enumerate(self.all_opponent_elos)
             if int(round(opponent)) in selected
         ]
-        if not pairs:
-            return list(self.all_opponent_elos), list(self.all_scores)
-        return [pair[0] for pair in pairs], [pair[1] for pair in pairs]
+        if not indices:
+            return list(self.all_opponent_elos), list(self.all_scores), list(self.all_cluster_ids)
+        return (
+            [self.all_opponent_elos[index] for index in indices],
+            [self.all_scores[index] for index in indices],
+            [self.all_cluster_ids[index] for index in indices],
+        )
 
     def current_rating(self) -> float | None:
-        opponents, scores = self.rating_observations()
-        rating, _, _, _ = nearest_level_rating(opponents, scores)
+        opponents, scores, cluster_ids = self.rating_observations()
+        rating, _, _, _ = nearest_level_rating(opponents, scores, cluster_ids)
         return rating
 
     def current_standard_error(self) -> float | None:
-        opponents, scores = self.rating_observations()
-        _, standard_error, _, _ = nearest_level_rating(opponents, scores)
+        opponents, scores, cluster_ids = self.rating_observations()
+        _, standard_error, _, _ = nearest_level_rating(opponents, scores, cluster_ids)
         return standard_error
 
+    def independent_cluster_count(self) -> int:
+        opponents, scores, cluster_ids = self.rating_observations()
+        _, _, local_level, _ = nearest_level_rating(opponents, scores, cluster_ids)
+        return len({cluster_id for opponent, cluster_id in zip(opponents, cluster_ids)
+                    if int(round(opponent)) == local_level})
+
     def precise_enough(self) -> bool:
-        _, scores = self.rating_observations()
+        _, scores, _ = self.rating_observations()
         if self.target_se <= 0.0 or len(scores) < self.min_games_for_se_stop:
+            return False
+        if self.independent_cluster_count() < self.min_independent_clusters:
             return False
         standard_error = self.current_standard_error()
         return standard_error is not None and float(standard_error) <= self.target_se
@@ -420,13 +461,17 @@ class AdaptiveEloSchedule:
         return not any(self.games(level) < self.focus_games for level in self.rating_levels)
 
     def precision_levels(self) -> list[int]:
-        candidates = [
-            level for level in self.rating_levels if self.low_stop < self._stable_score(level) < self.high_skip
-        ] or list(self.rating_levels) or self.played_levels()
-        # Once the crossing is bracketed, every extra pair belongs at the most
-        # informative near-50% level. Repeating both neighbours only increases
-        # cost without tightening the local calibration used for the result.
-        return sorted(candidates, key=self._focus_sort_key)[:1]
+        # Refine the exact observations used by the reported estimate. The
+        # focus heuristic can prefer another opponent, leaving reported SE
+        # unchanged through every extension of the global game budget.
+        opponents, scores, cluster_ids = self.rating_observations()
+        _, _, level, _ = nearest_level_rating(opponents, scores, cluster_ids)
+        if level is None:
+            return []
+        if self.paired_games and self.opening_suite_positions > 0:
+            if self.scheduled_by_level.get(level, 0) >= 2 * self.opening_suite_positions:
+                return []
+        return [level]
 
     def precision_tasks(self) -> tuple[list[int], list[GameTask]]:
         levels = self.precision_levels()

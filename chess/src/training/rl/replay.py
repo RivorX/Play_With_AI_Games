@@ -831,7 +831,9 @@ class ReplayBuffer:
         positions per game, which is necessary with only about 1k new games per
         generation, but prevents long games from arriving as correlated runs
         and gives every represented game equal opportunity before taking a
-        second position from any game.
+        second position from any game. Shuffle the selected rounds before
+        emitting them: otherwise every epoch ends with only the longest games,
+        biasing the last optimizer updates and BatchNorm running statistics.
         """
         if self.size <= 0:
             raise ValueError("Cannot sample from an empty replay buffer.")
@@ -857,6 +859,7 @@ class ReplayBuffer:
         rng.shuffle(pools)
 
         selected = []
+        round_ends = [0]
         offsets = np.zeros(len(pools), dtype=np.int32)
         active = np.arange(len(pools), dtype=np.int64)
         while active.size > 0 and len(selected) < sample_size:
@@ -874,7 +877,13 @@ class ReplayBuffer:
                 if len(selected) >= sample_size:
                     break
             active = np.asarray(next_active, dtype=np.int64)
-        return np.asarray(selected, dtype=np.int64)
+            round_ends.append(len(selected))
+        selected = np.asarray(selected, dtype=np.int64)
+        round_order = rng.permutation(len(round_ends) - 1)
+        return np.concatenate([
+            selected[round_ends[index]:round_ends[index + 1]]
+            for index in round_order
+        ])
 
     def game_diversity_stats(self, selection=None):
         """Summarize independent-game coverage for replay diagnostics."""
@@ -1055,6 +1064,8 @@ class ReplayBuffer:
                 search_visits=self._search_visits[idx],
                 game_ids=self._game_ids[idx],
                 game_ply_indices=self._game_ply_indices[idx],
+                regret_targets=self._regret_targets[idx],
+                archive_ids=self._archive_ids[idx],
             )
             copied += int(idx.numel())
         return copied

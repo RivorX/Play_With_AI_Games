@@ -89,6 +89,17 @@ def count_syzygy_wdl_files(paths: list[Path] | tuple[Path, ...]) -> int:
     return int(total)
 
 
+def count_syzygy_dtz_files(paths: list[Path] | tuple[Path, ...]) -> int:
+    total = 0
+    for base_path in paths:
+        try:
+            if base_path.exists():
+                total += sum(1 for _ in base_path.rglob("*.rtbz"))
+        except Exception:
+            continue
+    return int(total)
+
+
 def syzygy_piece_counts(
     paths: list[Path] | tuple[Path, ...],
     *,
@@ -247,4 +258,5 @@ def describe_syzygy_status(config: dict, *, chess_dir: Path | None = None) -> di
     return {
         "paths": paths,
         "wdl_files": count_syzygy_wdl_files(paths),
+        "dtz_files": count_syzygy_dtz_files(paths),
     }
