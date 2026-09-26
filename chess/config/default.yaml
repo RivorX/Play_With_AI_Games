@@ -166,8 +166,8 @@ reinforcement_learning:
     promotion_no_mcts_score_rate_min: 0.48
 
     # Early rejection uses the paired-score upper bound (z=1.28), not point score.
-    # A plausible candidate reaches 192 games on 96 unique opening pairs.
-    # No repeated-opening confirmation: one final promotion decision per candidate.
+    # A plausible selector candidate reaches 192 games on 96 unique opening pairs.
+    # It must then pass a second, independent 96-opening confirmation arena.
     eval_funnel_preliminary_games: 48
     eval_funnel_preliminary_score_rate: 0.45
     eval_funnel_medium_games: 48
@@ -180,6 +180,12 @@ reinforcement_learning:
     score_rate_threshold: 0.53
     promotion_stat_gate_z: 1.645
     promotion_score_lower_bound_min: 0.50
+    # After the selector and raw-NN gates pass, promotion requires an
+    # independent 96-opening confirmation arena at the same MCTS budget.
+    promotion_confirmation_games: 192
+    promotion_confirmation_openings: 96
+    promotion_confirmation_score_rate_min: 0.53
+    promotion_confirmation_score_lower_bound_min: 0.50
     promotion_require_anchor_non_regression: false
     anchor_eval_enabled: false
 

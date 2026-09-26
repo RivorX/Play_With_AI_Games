@@ -106,7 +106,6 @@ from src.mcts.native import get_native_mcts
 
 from src.mcts.search import (
     MultiGameBatchMCTS,
-    _EVAL_OPENING_LINES,
     _build_sparse_policy_target_from_visits,
     _resolve_dynamic_simulation_budget,
     _resolve_replay_max_policy_targets,
@@ -146,6 +145,7 @@ from src.training.rl.trainer import (
     evaluate_models_no_mcts,
     is_transient_cuda_error,
     prepare_eval_central_runtime,
+    _resolve_eval_opening_lines,
     train_on_batch_rl,
 )
 from src.training.rl.startup import (
@@ -173,6 +173,22 @@ from src.common.runtime import (
 )
 from src.common.syzygy import ensure_syzygy_tables, describe_syzygy_status
 
+try:
+    from src.evaluation.promotion_holdout import (
+        promotion_holdout_suite_for_eval,
+        validate_promotion_holdout_bank,
+    )
+    _PROMOTION_HOLDOUT_IMPORT_ERROR = None
+except Exception as _promotion_holdout_import_exc:
+    # Keep diagnostics importable if the bank package is missing; promotion
+    # remains fail-closed when a candidate reaches independent confirmation.
+    promotion_holdout_suite_for_eval = None
+    validate_promotion_holdout_bank = None
+    _PROMOTION_HOLDOUT_IMPORT_ERROR = (
+        f"{type(_promotion_holdout_import_exc).__name__}: "
+        f"{_promotion_holdout_import_exc}"
+    )
+
 
 _LAST_RUN_LOG_CSV = None
 _LAST_RUN_LOG_PNG = None
@@ -195,6 +211,17 @@ _CHAMPION_REPLAY_DECAY_ITERATIONS = 8
 _RAW_CANDIDATE_RETEST_GAMES = 192
 _ANCHOR_NO_MCTS_RETEST_GAMES = 256
 _ANCHOR_NO_MCTS_MAX_GAMES = 512
+_PROMOTION_CONFIRMATION_GAMES = 192
+_PROMOTION_CONFIRMATION_OPENINGS = 96
+_PROMOTION_CONFIRMATION_SCORE_MIN = 0.53
+_PROMOTION_CONFIRMATION_LB_MIN = 0.50
+_PROMOTION_CONFIRMATION_Z_MIN = 1.645
+_PROMOTION_CONFIRMATION_CONFIG_DEFAULTS = {
+    'promotion_confirmation_games': _PROMOTION_CONFIRMATION_GAMES,
+    'promotion_confirmation_openings': _PROMOTION_CONFIRMATION_OPENINGS,
+    'promotion_confirmation_score_rate_min': _PROMOTION_CONFIRMATION_SCORE_MIN,
+    'promotion_confirmation_score_lower_bound_min': _PROMOTION_CONFIRMATION_LB_MIN,
+}
 _ACTOR_GUARD_FAILURES = 2
 _ACTOR_GUARD_CONTRACT_VERSION = 2
 _RL_HOLDOUT_FRACTION = 0.05
@@ -203,6 +230,42 @@ _RL_HOLDOUT_MAX_POSITIONS = 8192
 # Persist it often enough to bound resume loss without adding that write to
 # every five-minute training iteration.
 _REPLAY_SIDECAR_INTERVAL = 5
+
+
+def _apply_promotion_confirmation_config_defaults(rl_cfg):
+    """Keep pre-confirmation resume configs usable with the current gate."""
+    if not isinstance(rl_cfg, dict):
+        raise TypeError('reinforcement_learning config must be a dictionary')
+    for key, value in _PROMOTION_CONFIRMATION_CONFIG_DEFAULTS.items():
+        rl_cfg.setdefault(key, value)
+    return rl_cfg
+
+
+def _validate_promotion_confirmation_setup(rl_cfg):
+    """Fail before self-play if independent promotion confirmation cannot run."""
+    _apply_promotion_confirmation_config_defaults(rl_cfg)
+    if _PROMOTION_HOLDOUT_IMPORT_ERROR:
+        raise RuntimeError(
+            'RL startup aborted before self-play: promotion confirmation bank '
+            f'is unavailable ({_PROMOTION_HOLDOUT_IMPORT_ERROR}).'
+        )
+    if promotion_holdout_suite_for_eval is None or validate_promotion_holdout_bank is None:
+        raise RuntimeError(
+            'RL startup aborted before self-play: promotion confirmation '
+            'selector or validator is unavailable.'
+        )
+    try:
+        if validate_promotion_holdout_bank() is not True:
+            raise ValueError('holdout bank validator did not return true')
+        if int(rl_cfg['promotion_confirmation_games'] or 0) != _PROMOTION_CONFIRMATION_GAMES:
+            raise ValueError('promotion confirmation requires exactly 192 games')
+        if int(rl_cfg['promotion_confirmation_openings'] or 0) != _PROMOTION_CONFIRMATION_OPENINGS:
+            raise ValueError('promotion confirmation requires exactly 96 paired openings')
+    except Exception as exc:
+        raise RuntimeError(
+            'RL startup aborted before self-play: promotion confirmation '
+            f'configuration or bank validation failed ({type(exc).__name__}: {exc}).'
+        ) from exc
 
 
 def _source_tree_identity(base_dir):
@@ -296,15 +359,24 @@ def _resolve_resume_history_csv(
         payload.get(key)
         for key in ("rl_run_log_csv", "run_log_csv", "source_log_csv")
     )
+    declared_artifacts = [
+        raw_path
+        for raw_path in artifact_candidates
+        if raw_path is not None and str(raw_path).strip()
+    ]
     excluded = Path(exclude_path).resolve() if exclude_path is not None else None
-    for raw_path in artifact_candidates:
-        if not raw_path:
-            continue
+    for raw_path in declared_artifacts:
         candidate = Path(str(raw_path))
         if not candidate.is_absolute():
             candidate = Path(base_dir) / candidate
         if candidate.exists() and (excluded is None or candidate.resolve() != excluded):
             return candidate
+
+    # A checkpoint that names its run artifacts has already established
+    # provenance. If those paths were archived or removed, prefix-matching
+    # another run can splice unrelated history into the resumed plots.
+    if declared_artifacts:
+        return None
 
     csv_dir = Path(logs_dir) / "csv"
     if not csv_dir.exists():
@@ -1564,7 +1636,7 @@ class RLEloCoordinator:
             self.elo_events_path.parent.mkdir(parents=True, exist_ok=True)
             with self.elo_events_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(event, sort_keys=True, default=str))
-                stream.write("\n")
+                stream.write("\r\n")
         except Exception as exc:
             print(f"  Elo event log failed (result retained): {exc}")
 
@@ -1975,10 +2047,10 @@ class RLEloCoordinator:
             elo_config["adaptive_initial_elo_source"] = str(previous_source)
         elo_config.setdefault("max_error_logs_per_type", 8)
 
-        print(f"\nEstimating Elo vs Stockfish ({reason_label})...")
+        print(f"\r\nEstimating Elo vs Stockfish ({reason_label})...")
         max_attempts = 1
         elo_result = None
-        interrupt_message = "\nCtrl+C detected during Stockfish evaluation. Cancelling evaluation..."
+        interrupt_message = "\r\nCtrl+C detected during Stockfish evaluation. Cancelling evaluation..."
 
         for attempt_idx in range(max_attempts):
             elo_cancel_event = threading.Event()
@@ -2123,7 +2195,7 @@ class RLTrainingInterrupted(Exception):
 def _handle_graceful_interrupt(logger=None, stage=None):
     """Best-effort graceful shutdown on Ctrl+C."""
     stage_suffix = f" during {stage}" if stage else ""
-    print(f"\nRL training interrupted by user (Ctrl+C){stage_suffix}.")
+    print(f"\r\nRL training interrupted by user (Ctrl+C){stage_suffix}.")
     if logger is not None:
         try:
             logger.plot()
@@ -2277,7 +2349,7 @@ def _evaluate_models_with_paired_scores(*args, **kwargs):
                 True,
             )
         )
-    opening_count = len(_EVAL_OPENING_LINES) if fixed_openings else None
+    opening_count = len(_resolve_eval_opening_lines(config)) if fixed_openings else None
     kwargs['progress_callback'] = _on_progress
     return _attach_paired_score_stats(
         evaluate_models(*args, **kwargs),
@@ -2318,7 +2390,7 @@ def _evaluate_models_no_mcts_with_paired_scores(*args, **kwargs):
                 'eval_fixed_openings_enabled', True,
             )
         )
-    opening_count = len(_EVAL_OPENING_LINES) if fixed_openings else None
+    opening_count = len(_resolve_eval_opening_lines(config)) if fixed_openings else None
     kwargs['progress_callback'] = _on_progress
     return _attach_paired_score_stats(
         evaluate_models_no_mcts(*args, **kwargs),
@@ -2392,6 +2464,396 @@ def _promotion_eval_has_full_evidence(eval_stage, stats, expected_games):
         and int(stats.get('paired_score_unique_openings', 0)) == expected_games // 2
         and not stats.get('infrastructure_error')
     )
+
+
+def _promotion_confirmation_decision(
+    stats,
+    *,
+    suite_id,
+    expected_suite_id,
+    expected_games=_PROMOTION_CONFIRMATION_GAMES,
+    expected_openings=_PROMOTION_CONFIRMATION_OPENINGS,
+    score_min=_PROMOTION_CONFIRMATION_SCORE_MIN,
+    lower_bound_min=_PROMOTION_CONFIRMATION_LB_MIN,
+    z=_PROMOTION_CONFIRMATION_Z_MIN,
+):
+    """Require complete paired evidence from the independent holdout suite."""
+    stats = dict(stats or {})
+    try:
+        observed_games = int(stats.get('num_games', 0) or 0)
+        observed_openings = int(stats.get('paired_score_unique_openings', 0) or 0)
+        observed_pairs = int(stats.get('paired_score_pairs', 0) or 0)
+        observed_opening_count = int(stats.get('paired_opening_count', 0) or 0)
+        score_map = dict(stats.get('game_scores') or {})
+        score_indices = {int(index) for index in score_map}
+        score_values = [float(value) for value in score_map.values()]
+        outcome_count = sum(
+            int(stats.get(key, 0) or 0)
+            for key in ('wins', 'draws', 'losses', 'unresolved')
+        )
+    except (TypeError, ValueError):
+        observed_games = observed_openings = observed_pairs = 0
+        observed_opening_count = outcome_count = 0
+        score_map = {}
+        score_indices = set()
+        score_values = []
+    result = {
+        'passed': False,
+        'status': '',
+        'score_rate': None,
+        'score_lower_bound': None,
+        'score_se': None,
+        'games': observed_games,
+        'unique_openings': observed_openings,
+        'suite_id': str(suite_id or ''),
+        'simulations': None,
+    }
+    if stats.get('infrastructure_error'):
+        result['status'] = 'blocked: confirmation infrastructure error'
+        result['error'] = str(stats.get('infrastructure_error'))
+        return result
+    if not expected_suite_id or str(suite_id or '') != str(expected_suite_id):
+        result['status'] = 'blocked: confirmation suite ID mismatch'
+        return result
+    expected_games = int(expected_games)
+    expected_openings = int(expected_openings)
+    if (
+        expected_games != 2 * expected_openings
+        or observed_games != expected_games
+        or len(score_map) != expected_games
+        or score_indices != set(range(expected_games))
+        or observed_pairs != expected_openings
+        or observed_openings != expected_openings
+        or observed_opening_count != expected_openings
+        or outcome_count != expected_games
+        or len(score_values) != expected_games
+        or any(not math.isfinite(value) or value not in (0.0, 0.5, 1.0) for value in score_values)
+    ):
+        result['status'] = 'blocked: incomplete confirmation evidence'
+        return result
+    try:
+        score = float(stats['score_rate'])
+        score_se = float(stats['paired_score_se'])
+    except (KeyError, TypeError, ValueError):
+        result['status'] = 'blocked: confirmation score or paired SE unavailable'
+        return result
+    if (
+        not math.isfinite(score)
+        or score < 0.0
+        or score > 1.0
+        or not math.isfinite(score_se)
+        or score_se < 0.0
+    ):
+        result['status'] = 'blocked: invalid confirmation score or paired SE'
+        return result
+    if abs(sum(score_values) / float(expected_games) - score) > 1e-9:
+        result['status'] = 'blocked: confirmation score disagrees with game evidence'
+        return result
+    lower_bound = _score_rate_lower_bound(
+        score,
+        expected_games,
+        z,
+        standard_error=score_se,
+    )
+    result.update({
+        'score_rate': score,
+        'score_se': score_se,
+        'score_lower_bound': lower_bound,
+    })
+    if score < float(score_min):
+        result['status'] = (
+            f'blocked: holdout score {score:.1%} < {float(score_min):.1%}'
+        )
+    elif lower_bound < float(lower_bound_min):
+        result['status'] = (
+            f'blocked: holdout LB {lower_bound:.1%} < {float(lower_bound_min):.1%}'
+        )
+    else:
+        result['passed'] = True
+        result['status'] = 'passed: independent promotion confirmation'
+    return result
+
+
+def _resolve_promotion_confirmation_suite(eval_index):
+    """Return one validated 96-opening bank suite for a scheduled MCTS eval."""
+    if promotion_holdout_suite_for_eval is None:
+        raise RuntimeError('holdout suite selector is unavailable')
+    suite_id, opening_lines = promotion_holdout_suite_for_eval(eval_index)
+    if not suite_id:
+        raise ValueError('holdout suite ID is empty')
+    if len(opening_lines) != _PROMOTION_CONFIRMATION_OPENINGS:
+        raise ValueError(
+            'holdout suite must contain '
+            f'{_PROMOTION_CONFIRMATION_OPENINGS} paired openings'
+        )
+    return suite_id, opening_lines
+
+
+def _restore_promotion_confirmation_attempt_count(runtime_payload):
+    """Resume bank rotation, accounting for checkpoints from the static suite."""
+    runtime_payload = dict(runtime_payload or {})
+    prior_state = runtime_payload.get('promotion_confirmation_state')
+    prior_state = prior_state if isinstance(prior_state, dict) else {}
+    saved_count = runtime_payload.get('promotion_confirmation_attempt_count')
+    if saved_count is None:
+        saved_count = prior_state.get('attempt_count')
+        if saved_count is None:
+            # A legacy confirmation state represents at least one suite-0 use.
+            saved_count = 1 if prior_state else 0
+    if isinstance(saved_count, bool):
+        raise ValueError('promotion confirmation attempt count must be an integer')
+    attempt_count = int(saved_count or 0)
+    if attempt_count < 0:
+        raise ValueError('promotion confirmation attempt count is negative')
+    return attempt_count
+
+
+def _run_promotion_confirmation(
+    *,
+    model,
+    best_model,
+    config,
+    device,
+    rl_cfg,
+    central_runtime,
+    suite_id,
+    opening_lines,
+    simulation_budget,
+    configured_simulation_budget,
+    suite_error=None,
+    start_substage,
+    finish_substage,
+    discard_failed_runtime,
+):
+    """Run the two-stage independent confirmation and return its gate result."""
+    if suite_error:
+        return {
+            'passed': False,
+            'status': 'blocked: independent holdout suite unavailable',
+            'error': str(suite_error),
+            'score_rate': None,
+            'score_lower_bound': None,
+            'score_se': None,
+            'games': 0,
+            'unique_openings': 0,
+            'suite_id': str(suite_id or ''),
+            'simulations': None,
+        }
+    if (
+        int(simulation_budget or 0) <= 0
+        or int(simulation_budget) != int(configured_simulation_budget)
+    ):
+        return {
+            'passed': False,
+            'status': 'blocked: primary MCTS simulation budget unavailable',
+            'error': (
+                f'primary={int(simulation_budget or 0)}, '
+                f'configured={int(configured_simulation_budget)}'
+            ),
+            'score_rate': None,
+            'score_lower_bound': None,
+            'score_se': None,
+            'games': 0,
+            'unique_openings': 0,
+            'suite_id': str(suite_id or ''),
+            'simulations': None,
+        }
+
+    confirmation_eval_t0 = start_substage()
+    confirmation_score_min = max(
+        _PROMOTION_CONFIRMATION_SCORE_MIN,
+        float(
+            rl_cfg.get(
+                'promotion_confirmation_score_rate_min',
+                _PROMOTION_CONFIRMATION_SCORE_MIN,
+            ) or _PROMOTION_CONFIRMATION_SCORE_MIN
+        ),
+        float(rl_cfg.get('score_rate_threshold', 0.0) or 0.0),
+    )
+    confirmation_lb_min = max(
+        _PROMOTION_CONFIRMATION_LB_MIN,
+        float(
+            rl_cfg.get(
+                'promotion_confirmation_score_lower_bound_min',
+                _PROMOTION_CONFIRMATION_LB_MIN,
+            ) or _PROMOTION_CONFIRMATION_LB_MIN
+        ),
+        float(
+            rl_cfg.get(
+                'promotion_score_lower_bound_min',
+                _PROMOTION_CONFIRMATION_LB_MIN,
+            ) or _PROMOTION_CONFIRMATION_LB_MIN
+        ),
+    )
+    confirmation_z = max(
+        _PROMOTION_CONFIRMATION_Z_MIN,
+        float(rl_cfg.get('promotion_stat_gate_z', 0.0) or 0.0),
+    )
+    confirmation_config = _build_eval_config_with_exact_simulations(
+        config,
+        simulation_budget,
+    )
+    confirmation_rl_cfg = dict(
+        confirmation_config.get('reinforcement_learning', {}) or {}
+    )
+    confirmation_rl_cfg.update({
+        'eval_opening_lines': [list(line) for line in opening_lines],
+        'eval_fixed_openings_enabled': True,
+        'eval_fixed_openings_pair_games': True,
+        'eval_fixed_openings_max_plies': 8,
+        'mcts_simulations': simulation_budget,
+        'eval_mcts_simulations_multiplier': 1.0,
+        'mcts_dynamic_budget_enabled': False,
+        'eval_mcts_dynamic_budget_enabled': False,
+    })
+    confirmation_config['reinforcement_learning'] = confirmation_rl_cfg
+    confirmation_stats = {}
+    confirmation_result = None
+    try:
+        first_stage_games = _PROMOTION_CONFIRMATION_GAMES // 2
+        first_stats = _evaluate_models_with_paired_scores(
+            model,
+            best_model,
+            confirmation_config,
+            device,
+            first_stage_games,
+            game_index_offset=0,
+            use_fixed_openings=True,
+            central_runtime=central_runtime,
+            progress_desc='Independent promotion confirmation (1/2)',
+        )
+        first_game_scores = {
+            int(key): float(value)
+            for key, value in dict(
+                (first_stats or {}).get('game_scores', {}) or {}
+            ).items()
+        }
+        first_outcome_count = sum(
+            int((first_stats or {}).get(key, 0) or 0)
+            for key in ('wins', 'draws', 'losses', 'unresolved')
+        )
+        first_stage_complete = bool(
+            not (first_stats or {}).get('infrastructure_error')
+            and not (first_stats or {}).get('cancelled', False)
+            and int((first_stats or {}).get('completed', 0) or 0)
+            == first_stage_games
+            and int((first_stats or {}).get('num_games', 0) or 0)
+            == first_stage_games
+            and len(first_game_scores) == first_stage_games
+            and set(first_game_scores) == set(range(first_stage_games))
+            and first_outcome_count == first_stage_games
+        )
+        early_reject = False
+        if first_stage_complete:
+            first_score_rate = sum(first_game_scores.values()) / float(
+                first_stage_games
+            )
+            first_score_se, first_pair_count, first_opening_count = (
+                _paired_score_standard_error(
+                    first_game_scores,
+                    opening_count=_PROMOTION_CONFIRMATION_OPENINGS,
+                )
+            )
+            if (
+                first_pair_count == first_stage_games // 2
+                and first_opening_count == first_stage_games // 2
+                and first_score_se is not None
+                and math.isfinite(float(first_score_se))
+                and float(first_score_se) >= 0.0
+            ):
+                early_reject_upper_bound = _score_rate_upper_bound(
+                    first_score_rate,
+                    first_stage_games,
+                    z=1.96,
+                    standard_error=first_score_se,
+                )
+                early_reject = bool(
+                    early_reject_upper_bound < confirmation_score_min
+                )
+                if early_reject:
+                    confirmation_result = {
+                        'passed': False,
+                        'status': (
+                            'early rejected after 96 games: '
+                            f'conservative upper bound {early_reject_upper_bound:.1%} '
+                            f'< score minimum {confirmation_score_min:.1%}'
+                        ),
+                        'score_rate': float(first_score_rate),
+                        'score_lower_bound': None,
+                        'score_se': float(first_score_se),
+                        'games': first_stage_games,
+                        'unique_openings': first_opening_count,
+                        'suite_id': str(suite_id),
+                        'simulations': int(simulation_budget),
+                        'early_reject_upper_bound': float(
+                            early_reject_upper_bound
+                        ),
+                    }
+                    confirmation_stats = dict(first_stats)
+                    confirmation_stats.update({
+                        'game_scores': first_game_scores,
+                        'paired_score_pairs': first_pair_count,
+                        'paired_score_unique_openings': first_opening_count,
+                        'paired_opening_count': _PROMOTION_CONFIRMATION_OPENINGS,
+                        'paired_score_se': float(first_score_se),
+                        'score_rate': float(first_score_rate),
+                        'early_reject': True,
+                        'early_reject_upper_bound': float(
+                            early_reject_upper_bound
+                        ),
+                    })
+
+        if not early_reject:
+            if first_stage_complete:
+                second_stats = _evaluate_models_with_paired_scores(
+                    model,
+                    best_model,
+                    confirmation_config,
+                    device,
+                    _PROMOTION_CONFIRMATION_GAMES - first_stage_games,
+                    game_index_offset=first_stage_games,
+                    use_fixed_openings=True,
+                    central_runtime=central_runtime,
+                    progress_desc='Independent promotion confirmation (2/2)',
+                )
+                if (second_stats or {}).get('infrastructure_error'):
+                    confirmation_stats = dict(second_stats)
+                else:
+                    confirmation_stats = _combine_eval_stats(first_stats, second_stats)
+                    if (second_stats or {}).get('cancelled', False):
+                        confirmation_stats['cancelled'] = True
+            else:
+                # An incomplete first stage cannot reject or promote a model.
+                confirmation_stats = dict(first_stats or {})
+    except Exception as exc:
+        confirmation_stats = {
+            'infrastructure_error': f'{type(exc).__name__}: {exc}',
+            'num_games': 0,
+            'game_scores': {},
+        }
+    finally:
+        finish_substage('promotion_confirmation', confirmation_eval_t0)
+
+    confirmation_error = (confirmation_stats or {}).get('infrastructure_error')
+    if confirmation_error and (
+        is_transient_cuda_error(str(confirmation_error))
+        or 'central inference' in str(confirmation_error).lower()
+        or 'worker' in str(confirmation_error).lower()
+    ):
+        discard_failed_runtime(confirmation_error)
+    if confirmation_result is None:
+        confirmation_result = _promotion_confirmation_decision(
+            confirmation_stats,
+            suite_id=suite_id,
+            expected_suite_id=suite_id,
+            expected_games=_PROMOTION_CONFIRMATION_GAMES,
+            expected_openings=_PROMOTION_CONFIRMATION_OPENINGS,
+            score_min=confirmation_score_min,
+            lower_bound_min=confirmation_lb_min,
+            z=confirmation_z,
+        )
+        confirmation_result['simulations'] = int(simulation_budget)
+    return confirmation_result
 
 
 def _safe_score_rate(wins, draws, losses):
@@ -2726,7 +3188,7 @@ def _evaluate_models_funnel(
         raise ValueError('Promotion stages require complete colour-swapped opening pairs.')
     if len({int(preliminary_simulations), int(medium_simulations), int(advanced_simulations)}) != 1:
         raise ValueError('Cumulative promotion evidence requires the same MCTS budget in every stage.')
-    if use_fixed_openings and game_index_offset + preliminary_games + medium_games + advanced_games > 2 * len(_EVAL_OPENING_LINES):
+    if use_fixed_openings and game_index_offset + preliminary_games + medium_games + advanced_games > 2 * len(_resolve_eval_opening_lines(config)):
         raise ValueError('Promotion budget exceeds the unique fixed opening suite.')
     preliminary_config = _build_eval_config_with_exact_simulations(config, preliminary_simulations)
     medium_config = _build_eval_config_with_exact_simulations(config, medium_simulations)
@@ -2804,6 +3266,7 @@ def _evaluate_models_funnel(
     if (advanced_stats or {}).get('infrastructure_error'):
         return advanced_stats, "infrastructure_error"
     combined = _combine_eval_stats(through_medium, advanced_stats)
+    combined['promotion_mcts_simulations'] = int(advanced_simulations)
     return combined, "funnel:advanced"
 
 
@@ -3769,7 +4232,7 @@ def play_games_parallel_mcts(
                             if not message.get('ok', False):
                                 interrupted = bool(message.get('interrupt', False))
                                 if interrupted:
-                                    print("\nCtrl+C detected in self-play worker. Stopping workers...")
+                                    print("\r\nCtrl+C detected in self-play worker. Stopping workers...")
                                     raise RLTrainingInterrupted("self-play")
                                 if global_game_stream_enabled:
                                     crashed_stream_workers[int(rank)] = str(
@@ -3808,7 +4271,7 @@ def play_games_parallel_mcts(
                                 )
                                 cursor = 0
                                 print(
-                                    "\nSelf-play recovery: restarting "
+                                    "\r\nSelf-play recovery: restarting "
                                     f"{len(recovery_ranks)} worker(s) and replaying exactly "
                                     f"{len(missing_ids)} unfinished game(s) "
                                     f"(attempt {stream_recovery_attempts}/2).",
@@ -3860,7 +4323,7 @@ def play_games_parallel_mcts(
                             continue
                         interrupted = _is_interrupt_exit_code(proc.exitcode)
                         if interrupted:
-                            print("\nCtrl+C detected in self-play worker. Stopping workers...")
+                            print("\r\nCtrl+C detected in self-play worker. Stopping workers...")
                             raise RLTrainingInterrupted("self-play")
                         if not global_game_stream_enabled:
                             raise RuntimeError(
@@ -3882,7 +4345,7 @@ def play_games_parallel_mcts(
                         pending.remove(rank)
                         if _is_interrupt_exit_code(p.exitcode):
                             interrupted = True
-                            print("\nCtrl+C detected in self-play worker. Stopping workers...")
+                            print("\r\nCtrl+C detected in self-play worker. Stopping workers...")
                             raise RLTrainingInterrupted("self-play")
                 if pending:
                     time.sleep(0.05)
@@ -3898,7 +4361,7 @@ def play_games_parallel_mcts(
                     pass
     except KeyboardInterrupt:
         interrupted = True
-        print("\nCtrl+C detected during self-play. Stopping workers...")
+        print("\r\nCtrl+C detected during self-play. Stopping workers...")
         if use_persistent_pool:
             _shutdown_selfplay_pool()
         raise RLTrainingInterrupted("self-play")
@@ -4688,6 +5151,9 @@ def main(argv=None):
         debug_enabled and rl_debug_cfg.get('log_gpu_memory', debug_cfg.get('log_gpu_memory', False))
     )
 
+    rl_cfg = config.get('reinforcement_learning', {})
+    _validate_promotion_confirmation_setup(rl_cfg)
+
     try:
         syzygy_bootstrap = ensure_syzygy_tables(config, chess_dir=script_dir.parent, logger=print)
         syzygy_status = describe_syzygy_status(config, chess_dir=script_dir.parent)
@@ -5209,6 +5675,24 @@ def main(argv=None):
             training_compile_enabled = False
             print(f"RL learner: torch.compile unavailable, using eager mode ({exc}).")
     rl_cfg = config['reinforcement_learning']
+    prior_confirmation_state = resume_runtime_payload.get(
+        'promotion_confirmation_state'
+    )
+    prior_confirmation_state = (
+        dict(prior_confirmation_state)
+        if isinstance(prior_confirmation_state, dict)
+        else {}
+    )
+    try:
+        promotion_confirmation_attempt_count = (
+            _restore_promotion_confirmation_attempt_count(resume_runtime_payload)
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            'RL startup aborted before self-play: saved promotion confirmation '
+            'attempt count is invalid.'
+        ) from exc
+    last_promotion_confirmation_state = prior_confirmation_state
     # Best files are updated only when evaluation confirms model improvement.
     replay_fp16 = config['reinforcement_learning'].get('replay_fp16', False)
     store_hard_positions = float(rl_cfg.get('self_play_hard_start_fraction', 0.0) or 0.0) > 0.0
@@ -5468,7 +5952,7 @@ def main(argv=None):
     previous_correction_audit_after = None
     try:
         for iteration in range(start_iteration, total_iterations):
-            print(f"\n[Iteration {iteration + 1}/{total_iterations}] self-play -> replay -> train")
+            print(f"\r\n[Iteration {iteration + 1}/{total_iterations}] self-play -> replay -> train")
             replay_buffer.set_current_iteration(iteration + 1)
             champion_replay_buffer.set_current_iteration(iteration + 1)
             holdout_replay_buffer.clear()
@@ -6690,6 +7174,7 @@ def main(argv=None):
             eval_mcts_reference_metrics = _eval_mcts_move_metrics(None, 'model2')
             eval_infrastructure_failed = False
             eval_infrastructure_error = None
+            promotion_confirmation_result = None
             promoted_best_this_iter = False
             should_run_no_mcts_eval = no_mcts_eval_enabled and ((iteration + 1) % no_mcts_eval_every == 0)
             if should_run_no_mcts_eval:
@@ -6777,9 +7262,6 @@ def main(argv=None):
                         'completed_before_failure': 0,
                     })
                     eval_stage = "infrastructure_error"
-                # The full arena exhausts the 96 unique opening pairs. A
-                # confirmation at offset 192 repeats those games and reweights
-                # its prefix; it supplies no fresh deterministic evidence.
                 _finish_eval_substage('promotion_eval', promotion_eval_t0)
                 eval_infrastructure_error = (eval_stats or {}).get('infrastructure_error')
                 if eval_infrastructure_error:
@@ -7211,6 +7693,65 @@ def main(argv=None):
                         if anchor_gate_failed:
                             is_new_best_candidate = False
                             promotion_status = f"blocked: {anchor_reason}"
+                if is_new_best_candidate:
+                    primary_mcts_simulations = int(
+                        (eval_stats or {}).get('promotion_mcts_simulations', 0) or 0
+                    )
+                    confirmation_attempt_index = (
+                        promotion_confirmation_attempt_count
+                    )
+                    promotion_confirmation_attempt_count += 1
+                    confirmation_suite_id = ''
+                    confirmation_opening_lines = ()
+                    confirmation_suite_error = None
+                    if confirmation_suite_error is None:
+                        try:
+                            (
+                                confirmation_suite_id,
+                                confirmation_opening_lines,
+                            ) = _resolve_promotion_confirmation_suite(
+                                confirmation_attempt_index
+                            )
+                        except Exception as exc:
+                            confirmation_suite_error = (
+                                f'{type(exc).__name__}: {exc}'
+                            )
+                    promotion_confirmation_result = _run_promotion_confirmation(
+                        model=model,
+                        best_model=best_model,
+                        config=config,
+                        device=device,
+                        rl_cfg=rl_cfg,
+                        central_runtime=eval_runtime,
+                        suite_id=confirmation_suite_id,
+                        opening_lines=confirmation_opening_lines,
+                        simulation_budget=primary_mcts_simulations,
+                        configured_simulation_budget=funnel_advanced_simulations,
+                        suite_error=confirmation_suite_error,
+                        start_substage=_start_eval_substage,
+                        finish_substage=_finish_eval_substage,
+                        discard_failed_runtime=_discard_failed_eval_runtime,
+                    )
+                    last_promotion_confirmation_state = {
+                        **promotion_confirmation_result,
+                        'iteration': int(iteration + 1),
+                        'attempt_count': int(
+                            promotion_confirmation_attempt_count
+                        ),
+                        'selection_counter': int(confirmation_attempt_index),
+                    }
+                    iteration_notes.append(
+                        'independent holdout confirmation: '
+                        + str(promotion_confirmation_result.get('status', 'blocked'))
+                    )
+                    if not bool(promotion_confirmation_result.get('passed', False)):
+                        is_new_best_candidate = False
+                        promotion_status = str(
+                            promotion_confirmation_result.get(
+                                'status',
+                                'blocked: independent holdout confirmation unavailable',
+                            )
+                        )
                 if (
                     candidate_passed_best_gate
                     and not is_new_best_candidate
@@ -7228,6 +7769,9 @@ def main(argv=None):
                         'anchor_score_lower_bound': anchor_score_lower_bound,
                         'anchor_no_mcts_score_rate': anchor_no_mcts_score_rate,
                         'anchor_no_mcts_score_lower_bound': anchor_no_mcts_score_lower_bound,
+                        'promotion_confirmation': dict(
+                            last_promotion_confirmation_state
+                        ),
                         'policy_loss': avg_policy,
                         'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                         'value_mae': train_metrics.get('value_mae', 0),
@@ -7350,6 +7894,33 @@ def main(argv=None):
                     promotion_raw_nn_pass=(
                         "" if nn_safe is None else int(bool(nn_safe))
                     ),
+                    promotion_confirmation_status=(
+                        (promotion_confirmation_result or {}).get(
+                            'status',
+                            'not run: prior gates did not pass' if eval_stage else '',
+                        )
+                    ),
+                    promotion_confirmation_score_rate=(
+                        (promotion_confirmation_result or {}).get('score_rate', '')
+                    ),
+                    promotion_confirmation_score_lower_bound=(
+                        (promotion_confirmation_result or {}).get('score_lower_bound', '')
+                    ),
+                    promotion_confirmation_score_se=(
+                        (promotion_confirmation_result or {}).get('score_se', '')
+                    ),
+                    promotion_confirmation_games=(
+                        (promotion_confirmation_result or {}).get('games', '')
+                    ),
+                    promotion_confirmation_unique_openings=(
+                        (promotion_confirmation_result or {}).get('unique_openings', '')
+                    ),
+                    promotion_confirmation_suite_id=(
+                        (promotion_confirmation_result or {}).get('suite_id', '')
+                    ),
+                    promotion_confirmation_simulations=(
+                        (promotion_confirmation_result or {}).get('simulations', '')
+                    ),
                     anchor_score_rate=anchor_score_rate,
                     anchor_true_win_rate=anchor_true_win_rate,
                     anchor_games=anchor_eval_games_total,
@@ -7399,6 +7970,9 @@ def main(argv=None):
                         'anchor_true_win_rate': anchor_true_win_rate,
                         'anchor_no_mcts_score_rate': anchor_no_mcts_score_rate,
                         'anchor_no_mcts_score_lower_bound': anchor_no_mcts_score_lower_bound,
+                        'promotion_confirmation': dict(
+                            last_promotion_confirmation_state
+                        ),
                         'policy_loss': avg_policy,
                         'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                         'value_mae': train_metrics.get('value_mae', 0),
@@ -7553,7 +8127,12 @@ def main(argv=None):
             _finish_stage('eval_log')
             eval_region_total = float(iteration_stage_times.pop('eval_log', 0.0) or 0.0)
             measured_eval_total = 0.0
-            for stage_name in ('regular_eval', 'promotion_eval', 'elo_eval'):
+            for stage_name in (
+                'regular_eval',
+                'promotion_eval',
+                'promotion_confirmation',
+                'elo_eval',
+            ):
                 stage_seconds = float(iteration_eval_substage_times.get(stage_name, 0.0) or 0.0)
                 iteration_stage_times[stage_name] = stage_seconds
                 measured_eval_total += stage_seconds
@@ -7578,6 +8157,7 @@ def main(argv=None):
                 'startup_mode': start_mode,
                 'model_architecture': model_architecture,
                 'rl_run_artifacts': _rl_run_artifact_metadata(logger, base_dir),
+                'promotion_confirmation': dict(last_promotion_confirmation_state),
                 'rl_surpassed_il_anchor': bool(elo_coordinator.il_anchor_surpassed),
                 'rl_best_il_anchor_score_rate': elo_coordinator.best_il_anchor_score_rate,
                 'rl_best_il_anchor_true_win_rate': elo_coordinator.best_il_anchor_true_win_rate,
@@ -7630,6 +8210,12 @@ def main(argv=None):
                     'eval_score_rate_ema': eval_score_rate_ema,
                     'eval_true_win_rate_ema': eval_true_win_rate_ema,
                     'elo_coordinator_state': elo_coordinator.state_dict(),
+                    'promotion_confirmation_state': dict(
+                        last_promotion_confirmation_state
+                    ),
+                    'promotion_confirmation_attempt_count': int(
+                        promotion_confirmation_attempt_count
+                    ),
                     'learner_selfplay_safe': learner_selfplay_safe,
                     'learner_guard_contract_version': _ACTOR_GUARD_CONTRACT_VERSION,
                     'learner_guard_consecutive_failures': (
@@ -7916,7 +8502,7 @@ def main(argv=None):
         logger.plot_rl_performance()
         logger.plot_rl_data_quality()
 
-    print("\n=== Training complete ===")
+    print("\r\n=== Training complete ===")
 
 
 if __name__ == "__main__":
@@ -7926,5 +8512,3 @@ if __name__ == "__main__":
         _handle_graceful_interrupt(logger=None, stage="runtime")
     finally:
         _shutdown_selfplay_pool()
-
-

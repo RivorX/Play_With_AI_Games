@@ -252,9 +252,10 @@ def evaluate_correction_cohort(
                     phase = torch.full(
                         (end - start,), -1, dtype=torch.int8, device=device
                     )
-                target_is_legal = (
+                target_legal_matches = (
                     valid_legal & (safe_legal_indices == target_moves.unsqueeze(1))
-                ).any(dim=1)
+                )
+                target_is_legal = target_legal_matches.any(dim=1)
                 valid_rows = valid_policy.any(dim=1) & valid_legal.any(dim=1) & target_is_legal
                 if not bool(valid_rows.any()):
                     continue
@@ -265,13 +266,11 @@ def evaluate_correction_cohort(
                     1,
                     predicted_slots,
                 ).squeeze(1)
-                target_logits = torch.gather(
-                    policy_logits,
-                    1,
-                    target_moves.clamp(0, max(0, policy_size - 1)).unsqueeze(1),
-                ).squeeze(1)
+                target_legal_slots = target_legal_matches.to(torch.int64).argmax(
+                    dim=1, keepdim=True
+                )
                 target_probabilities = torch.exp(
-                    target_logits - torch.logsumexp(legal_logits, dim=1)
+                    torch.gather(legal_log_probs, 1, target_legal_slots).squeeze(1)
                 )
                 top1_parts.append((predicted_moves == target_moves)[valid_rows].cpu())
                 probability_parts.append(target_probabilities[valid_rows].cpu())

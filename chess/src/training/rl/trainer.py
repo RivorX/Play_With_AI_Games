@@ -2076,14 +2076,20 @@ def _legal_only_log_probs(policy_logits, legal_indices, legal_mask):
 
 
 def _weighted_mean(losses, weights):
-    weights = torch.clamp(weights.to(dtype=losses.dtype), min=0.0)
+    losses = losses.reshape(-1)
+    weights = torch.clamp(
+        weights.reshape(-1).to(device=losses.device, dtype=losses.dtype),
+        min=0.0,
+    )
     weight_total = weights.sum()
-    if float(weight_total.detach().item()) <= 0.0:
-        # A zero weight is an explicit request to suppress supervision for the
-        # row. Falling back to an unweighted mean silently re-enabled every
-        # disabled value target and produced gradients with the wrong contract.
-        return losses.sum() * 0.0
-    return (losses * weights).sum() / weight_total
+    # Keep zero-weight batches at zero without synchronizing a CUDA scalar to
+    # Python. For every positive sum this is the same weighted mean.
+    denominator = torch.where(
+        weight_total > 0.0,
+        weight_total,
+        torch.ones_like(weight_total),
+    )
+    return (losses * weights).sum() / denominator
 
 
 def _useful_policy_correction_rank_loss(
@@ -2103,7 +2109,7 @@ def _useful_policy_correction_rank_loss(
         device=legal_log_probs.device,
         dtype=legal_log_probs.dtype,
     )
-    if batch_size <= 0 or not bool(correction_mask.any().item()):
+    if batch_size <= 0:
         return zero, per_row, torch.zeros_like(correction_mask)
 
     target_slots = valid_legal_mask & safe_legal_indices.eq(target_moves.reshape(-1, 1))
@@ -2112,9 +2118,6 @@ def _useful_policy_correction_rank_loss(
         correction_mask & target_slots.any(dim=1) & other_slots.any(dim=1)
         & torch.isfinite(search_q_deltas)
     )
-    if not bool(valid_rows.any().item()):
-        return zero, per_row, valid_rows
-
     negative_inf = torch.finfo(legal_log_probs.dtype).min
     target_scores = legal_log_probs.masked_fill(~target_slots, negative_inf).max(dim=1).values
     strongest_other = legal_log_probs.masked_fill(~other_slots, negative_inf).max(dim=1).values
@@ -2137,7 +2140,7 @@ def _useful_policy_correction_rank_loss(
     denominator = torch.clamp(policy_weights.sum(), min=1e-8)
     # Missing Q on unrelated replay rows is normal. Never multiply their NaN
     # by zero: that poisons both the objective and rank-loss gradients.
-    loss = (per_row[valid_rows] * effective_weights).sum() / denominator
+    loss = (per_row[valid_rows] * effective_weights).sum() / denominator + zero
     return loss, per_row, valid_rows
 
 
@@ -2194,10 +2197,11 @@ def _search_q_auxiliary_loss(
         & torch.isfinite(sample_weights)
         & (sample_weights > 0.0)
     )
-    if not valid_mask.any():
-        return predictions.sum() * 0.0, valid_mask, torch.zeros_like(predictions)
-
-    bounded_targets = torch.clamp(targets, -1.0, 1.0)
+    bounded_targets = torch.where(
+        valid_mask.any(),
+        torch.clamp(targets, -1.0, 1.0),
+        torch.zeros_like(predictions),
+    )
     reference_visits = max(1.0, float(reference_visits))
     visit_confidence = torch.clamp(
         torch.log1p(torch.clamp(visits, min=0.0)) / math.log1p(reference_visits),
@@ -2241,10 +2245,11 @@ def _value_search_consistency_loss(
         & torch.isfinite(sample_weights)
         & (sample_weights > 0.0)
     )
-    if not valid_mask.any():
-        return predictions.sum() * 0.0, valid_mask, torch.zeros_like(predictions)
-
-    bounded_targets = torch.clamp(targets, -1.0, 1.0)
+    bounded_targets = torch.where(
+        valid_mask.any(),
+        torch.clamp(targets, -1.0, 1.0),
+        torch.zeros_like(predictions),
+    )
     reference_visits = max(1.0, float(reference_visits))
     visit_confidence = torch.clamp(
         torch.log1p(torch.clamp(visits, min=0.0)) / math.log1p(reference_visits),
@@ -2274,8 +2279,6 @@ def _moves_left_auxiliary_loss(predictions, targets, sample_weights):
         & torch.isfinite(sample_weights)
         & (sample_weights > 0.0)
     )
-    if not valid_mask.any():
-        return predictions.sum() * 0.0, valid_mask
     target_log_plies = torch.log1p(targets[valid_mask])
     loss_rows = F.smooth_l1_loss(
         predictions[valid_mask],

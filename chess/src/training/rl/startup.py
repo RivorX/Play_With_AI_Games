@@ -194,31 +194,40 @@ def _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir):
 
     IL checkpoints remain valid for NEW/SELECT initialization, but they cannot
     restore an RL optimizer/replay runtime and therefore must not be offered by
-    the RESUME picker.
+    the RESUME picker. Keep archived RL runs selectable from their subfolders.
     """
     candidates = []
     if best_model_rl_path.exists():
         candidates.append(best_model_rl_path)
 
     rl_checkpoints = sorted(
-        rl_dir.glob("*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+        (
+            path
+            for path in Path(rl_dir).rglob("*.pt")
+            if path.is_file() and not path.name.endswith(".replay.pt")
+        ),
+        key=lambda path: (-path.stat().st_mtime, str(path).lower()),
     )
     for checkpoint in rl_checkpoints:
         if checkpoint not in candidates:
             candidates.append(checkpoint)
 
-    return candidates
+    return sorted(
+        candidates,
+        key=lambda path: (-path.stat().st_mtime, str(path).lower()),
+    )
 
 
 def _collect_transfer_checkpoints(models_dir, best_model_rl_path, rl_dir):
     """Return every model checkpoint valid for NEW/SELECT or weight transfer."""
     candidates = _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir)
     all_checkpoints = sorted(
-        Path(models_dir).rglob("*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+        (
+            path
+            for path in Path(models_dir).rglob("*.pt")
+            if path.is_file() and not path.name.endswith(".replay.pt")
+        ),
+        key=lambda path: (-path.stat().st_mtime, str(path).lower()),
     )
     for checkpoint in all_checkpoints:
         if checkpoint not in candidates:
@@ -228,18 +237,11 @@ def _collect_transfer_checkpoints(models_dir, best_model_rl_path, rl_dir):
 
 def _suggest_start_mode_default(best_model_rl_path, rl_dir):
     """Prefer a fresh RL run when the latest RL checkpoint is clearly underperforming."""
-    rl_candidates = []
-    if best_model_rl_path.exists():
-        rl_candidates.append(best_model_rl_path)
-
-    for checkpoint in sorted(
-        rl_dir.glob("*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    ):
-        if checkpoint not in rl_candidates:
-            rl_candidates.append(checkpoint)
-
+    rl_candidates = _collect_rl_checkpoints(
+        Path(best_model_rl_path).parent,
+        best_model_rl_path,
+        rl_dir,
+    )
     for checkpoint_path in rl_candidates:
         entry = load_checkpoint_metadata(checkpoint_path)
         if entry.get("error"):
@@ -372,8 +374,17 @@ def _print_checkpoint_catalog(catalog, start_mode):
         return
 
     mode_label = "Resume" if start_mode == "resume" else "Transfer"
+    display_catalog = []
+    for entry in catalog:
+        display_entry = dict(entry)
+        relative_path = Path(str(entry.get("path_rel") or ""))
+        if len(relative_path.parts) > 1:
+            # Several archived RL runs can contain the same checkpoint
+            # filename. Show the full parent path so the picker is unambiguous.
+            display_entry["folder"] = str(relative_path.parent)
+        display_catalog.append(display_entry)
     print_model_table(
-        catalog,
+        display_catalog,
         title=f"Available Checkpoints ({mode_label})",
         show_folder=True,
         show_version=True,
@@ -386,7 +397,7 @@ def _print_checkpoint_catalog(catalog, start_mode):
     )
 
 
-def _choose_checkpoint_path(catalog):
+def _choose_checkpoint_path(catalog, *, prefer_newest=False):
     if not catalog:
         return None
 
@@ -395,6 +406,13 @@ def _choose_checkpoint_path(catalog):
         return None
 
     if not sys.stdin.isatty():
+        if prefer_newest:
+            valid_entries.sort(
+                key=lambda entry: (
+                    -float(entry.get("mtime_ts") or 0.0),
+                    str(entry.get("path_rel") or "").lower(),
+                )
+            )
         return valid_entries[0]["path"]
 
     while True:
@@ -515,7 +533,10 @@ def plan_rl_startup(
                 and bool(entry.get("strict_resume_ok"))
             ]
         _print_checkpoint_catalog(checkpoint_catalog, start_mode)
-        selected_checkpoint = _choose_checkpoint_path(checkpoint_catalog)
+        selected_checkpoint = _choose_checkpoint_path(
+            checkpoint_catalog,
+            prefer_newest=(start_mode == "resume"),
+        )
 
     if start_mode in {"resume", "transfer"} and selected_checkpoint is None:
         raise RuntimeError(

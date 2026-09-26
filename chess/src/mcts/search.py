@@ -1106,22 +1106,46 @@ _SELFPLAY_SELFPLAY_OPENING_LINES = _SELFPLAY_OPENING_LINES + _SELFPLAY_SHARP_OPE
 
 
 def _stratify_eval_opening_lines(lines):
-    """Keep the full suite, with proportional depth coverage in every prefix."""
+    """Interleave opening families and line depths across every suite prefix."""
     groups = {}
+    family_counts = {}
+    depth_counts = {}
     for line in lines:
-        groups.setdefault(len(line), []).append(line)
+        family = tuple(line[:2])
+        depth = len(line)
+        groups.setdefault((family, depth), []).append(line)
+        family_counts[family] = family_counts.get(family, 0) + 1
+        depth_counts[depth] = depth_counts.get(depth, 0) + 1
     rng = np.random.default_rng(490050)
     for group in groups.values():
         rng.shuffle(group)
-    used = dict.fromkeys(groups, 0)
+    used_families = dict.fromkeys(family_counts, 0)
+    used_depths = dict.fromkeys(depth_counts, 0)
     ordered = []
     for index in range(len(lines)):
-        depth = max(
-            (depth for depth in groups if used[depth] < len(groups[depth])),
-            key=lambda depth: (index + 1) * len(groups[depth]) / len(lines) - used[depth],
-        )
-        ordered.append(groups[depth][used[depth]])
-        used[depth] += 1
+        candidates = []
+        for (family, depth), group in groups.items():
+            if not group:
+                continue
+            family_deficit = (
+                (index + 1) * family_counts[family] / len(lines)
+                - used_families[family]
+            )
+            depth_deficit = (
+                (index + 1) * depth_counts[depth] / len(lines)
+                - used_depths[depth]
+            )
+            candidates.append((family_deficit + depth_deficit, family, depth))
+        best_score = max(candidate[0] for candidate in candidates)
+        best = [
+            (family, depth)
+            for score, family, depth in candidates
+            if math.isclose(score, best_score, rel_tol=0.0, abs_tol=1e-12)
+        ]
+        family, depth = best[int(rng.integers(len(best)))]
+        ordered.append(groups[(family, depth)].pop())
+        used_families[family] += 1
+        used_depths[depth] += 1
     return tuple(ordered)
 
 
@@ -1148,7 +1172,7 @@ def _build_eval_opening_lines():
     return _stratify_eval_opening_lines(unique)
 
 
-_EVAL_OPENING_SUITE_ID = "curated-stratified-v2"
+_EVAL_OPENING_SUITE_ID = "curated-family-depth-stratified-v3"
 _EVAL_OPENING_LINES = _build_eval_opening_lines()
 
 
@@ -1685,11 +1709,13 @@ def _select_move_from_visits_safe(visit_counts, temperature):
     """
     Select move from visit counts with numeric safeguards.
     """
+    if temperature == 0 or len(visit_counts) == 1:
+        # Preserve insertion-order tie breaking without allocating a key list
+        # and a NumPy array for the common deterministic-selection path.
+        return max(visit_counts, key=visit_counts.get)
+
     moves = list(visit_counts.keys())
     visits = np.fromiter(visit_counts.values(), dtype=np.float64, count=len(moves))
-
-    if temperature == 0 or len(moves) == 1:
-        return moves[int(np.argmax(visits))]
 
     visits_temp = visits ** (1.0 / temperature)
     total = float(visits_temp.sum())

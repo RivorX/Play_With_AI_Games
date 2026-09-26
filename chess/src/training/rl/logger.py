@@ -469,7 +469,8 @@ class RLLoggerMixin:
             key: _float_or_none(stage_times.get(key))
             for key in (
                 'setup', 'selfplay', 'replay', 'train', 'reanalyse',
-                'regular_eval', 'promotion_eval', 'elo_eval', 'log',
+                'regular_eval', 'promotion_eval', 'promotion_confirmation',
+                'elo_eval', 'log',
                 'checkpoint', 'gc',
             )
         }
@@ -1626,6 +1627,30 @@ class RLLoggerMixin:
             'mcts_no_mcts_gap': mcts_no_mcts_gap,
             'promotion_status': kwargs.get('promotion_status', ''),
             'promotion_raw_nn_pass': kwargs.get('promotion_raw_nn_pass', ''),
+            'promotion_confirmation_status': kwargs.get(
+                'promotion_confirmation_status', ''
+            ),
+            'promotion_confirmation_score_rate': kwargs.get(
+                'promotion_confirmation_score_rate', ''
+            ),
+            'promotion_confirmation_score_lower_bound': kwargs.get(
+                'promotion_confirmation_score_lower_bound', ''
+            ),
+            'promotion_confirmation_score_se': kwargs.get(
+                'promotion_confirmation_score_se', ''
+            ),
+            'promotion_confirmation_games': kwargs.get(
+                'promotion_confirmation_games', ''
+            ),
+            'promotion_confirmation_unique_openings': kwargs.get(
+                'promotion_confirmation_unique_openings', ''
+            ),
+            'promotion_confirmation_suite_id': kwargs.get(
+                'promotion_confirmation_suite_id', ''
+            ),
+            'promotion_confirmation_simulations': kwargs.get(
+                'promotion_confirmation_simulations', ''
+            ),
             'eval_mcts_move_samples': kwargs.get('eval_mcts_move_samples', ''),
             'eval_mcts_avg_simulations': kwargs.get('eval_mcts_avg_simulations', ''),
             'eval_mcts_reduced_budget_rate': kwargs.get(

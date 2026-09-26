@@ -5,7 +5,9 @@ from __future__ import annotations
 import csv
 
 
-RL_LOG_SCHEMA_VERSION = 62
+# Version 63 is already present in historical dirty RL81 CSVs with a
+# different column layout. Keep this confirmation schema under a new version.
+RL_LOG_SCHEMA_VERSION = 64
 
 
 # One row per training iteration. This is the promotion/strength dashboard source,
@@ -67,6 +69,10 @@ RL_MAIN_COLUMNS = (
     "no_mcts_games", "no_mcts_score_rate", "no_mcts_win_rate",
     "no_mcts_score_lower_bound", "no_mcts_score_upper_bound", "no_mcts_score_se", "no_mcts_unique_openings", "mcts_no_mcts_gap",
     "promotion_status", "promotion_raw_nn_pass",
+    "promotion_confirmation_status", "promotion_confirmation_score_rate",
+    "promotion_confirmation_score_lower_bound", "promotion_confirmation_score_se",
+    "promotion_confirmation_games", "promotion_confirmation_unique_openings",
+    "promotion_confirmation_suite_id", "promotion_confirmation_simulations",
     "eval_mcts_move_samples", "eval_mcts_avg_simulations", "eval_mcts_reduced_budget_rate",
     "eval_mcts_changed_rate",
     "eval_mcts_higher_q_when_changed_rate", "eval_mcts_lower_q_when_changed_rate",
@@ -227,6 +233,7 @@ RL_PERFORMANCE_COLUMNS = (
     "iteration_total_time_s", "bottleneck_stage",
     "stage_setup_time_s", "stage_selfplay_time_s", "stage_replay_time_s",
     "stage_train_time_s", "stage_reanalyse_time_s", "stage_regular_eval_time_s", "stage_promotion_eval_time_s",
+    "stage_promotion_confirmation_time_s",
     "stage_elo_eval_time_s", "stage_log_time_s", "stage_checkpoint_time_s",
     "stage_gc_time_s", "avg_game_length",
     "mcts_avg_batch_size", "mcts_central_avg_batch_size", "mcts_worker_nn_wait_share_pct",
