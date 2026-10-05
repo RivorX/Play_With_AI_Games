@@ -362,6 +362,176 @@ def _value_search_alignment_panel(ax, rows, *, break_after=None):
         _no_data(ax)
 
 
+def _promotion_strength_panel(ax, rows, rl_cfg):
+    """Show selector evidence and independent confirmation as separate tests.
+
+    Selector results decide which checkpoints are worth confirming, so they
+    are intentionally never averaged with the independent holdout results.
+    The lower-bound stems make the statistical gates visible alongside each
+    observed score.
+    """
+    _style(ax, "Promotion evidence: selector → independent holdout", percent=True)
+    selector_score_min = float(rl_cfg.get("score_rate_threshold", 0.55) or 0.55)
+    selector_lb_min = float(
+        rl_cfg.get("promotion_score_lower_bound_min", 0.50) or 0.50
+    )
+    confirmation_score_min = float(
+        rl_cfg.get("promotion_confirmation_score_rate_min", 0.53) or 0.53
+    )
+    confirmation_lb_min = float(
+        rl_cfg.get("promotion_confirmation_score_lower_bound_min", 0.50) or 0.50
+    )
+    advanced_games = max(
+        1, int(_number(rl_cfg.get("eval_funnel_advanced_games")) or 192)
+    )
+
+    # Score gates are separate because selector and confirmation have
+    # different thresholds. Confidence floors usually coincide; draw a
+    # single line when they do to keep the panel legible.
+    ax.axhline(
+        selector_score_min, color=_COLORS[0], lw=1.0, ls=":",
+        label=f"selector score gate {selector_score_min:.0%}",
+    )
+    ax.axhline(
+        confirmation_score_min, color="#c2410c", lw=1.0, ls="--",
+        label=f"holdout score gate {confirmation_score_min:.0%}",
+    )
+    if abs(selector_lb_min - confirmation_lb_min) < 1e-9:
+        ax.axhline(
+            selector_lb_min, color="#4b5563", lw=1.0, ls="-.",
+            label=f"lower-bound gates {selector_lb_min:.0%}",
+        )
+    else:
+        ax.axhline(
+            selector_lb_min, color=_COLORS[0], lw=1.0, ls="-.", alpha=0.8,
+            label=f"selector LB gate {selector_lb_min:.0%}",
+        )
+        ax.axhline(
+            confirmation_lb_min, color="#c2410c", lw=1.0, ls="-.", alpha=0.8,
+            label=f"holdout LB gate {confirmation_lb_min:.0%}",
+        )
+
+    xs, scores, lowers, games, full, statuses = [], [], [], [], [], []
+    hx, hscores, hlowers, hgames, hstatuses = [], [], [], [], []
+    for row in rows:
+        iteration = _number(row.get("iteration"))
+        score = _number(row.get("score_rate"))
+        if iteration is None:
+            continue
+        count = int(_number(row.get("eval_games")) or 0)
+        stage = str(row.get("eval_stage") or "").strip().lower()
+        is_full = stage == "funnel:advanced" and count >= advanced_games
+        lower = _number(row.get("eval_score_lower_bound"))
+        if score is not None:
+            xs.append(int(iteration))
+            scores.append(score)
+            lowers.append(lower if lower is not None else score)
+            games.append(count)
+            full.append(is_full)
+            statuses.append(str(row.get("promotion_status") or "").strip().lower())
+
+        holdout_score = _number(row.get("promotion_confirmation_score_rate"))
+        if holdout_score is None:
+            continue
+        hx.append(int(iteration))
+        hscores.append(holdout_score)
+        holdout_lb = _number(row.get("promotion_confirmation_score_lower_bound"))
+        hlowers.append(holdout_lb if holdout_lb is not None else holdout_score)
+        hgames.append(int(_number(row.get("promotion_confirmation_games")) or 0))
+        hstatuses.append(
+            str(row.get("promotion_confirmation_status") or "").strip().lower()
+        )
+
+    if not xs and not hx:
+        _no_data(ax, "Promotion funnel telemetry is unavailable in this CSV")
+        return False
+
+    # Selector scores form a timeline; hollow triangles are incomplete
+    # 48/96-game looks, while filled circles are complete advanced evaluations.
+    if xs:
+        ax.plot(xs, scores, color=_COLORS[0], lw=1.3, alpha=0.55, zorder=2)
+        for index, (x, score, lower, count, is_full, status) in enumerate(
+            zip(xs, scores, lowers, games, full, statuses)
+        ):
+            ax.vlines(x, lower, score, color=_COLORS[0], linewidth=1.2, alpha=0.85, zorder=3)
+            promoted = status.startswith("promoted")
+            rejected = status.startswith(("hold:", "blocked:"))
+            marker = "*" if promoted else ("o" if is_full else "^")
+            face = _COLORS[0] if is_full or promoted else "white"
+            edge = "#b91c1c" if rejected else (_COLORS[0] if not promoted else "#166534")
+            ax.scatter(
+                [x], [score], marker=marker, s=58 if promoted else 34,
+                facecolors=face,
+                edgecolors=edge,
+                linewidths=0.9, zorder=5,
+                label=("selector score (full)" if is_full else "selector score (partial)")
+                if ("selector score (full)" if is_full else "selector score (partial)")
+                not in ax.get_legend_handles_labels()[1] else None,
+            )
+            ax.scatter(
+                [x], [lower], marker="v", s=24, color=_COLORS[0], alpha=0.9,
+                zorder=4,
+                label="selector lower bound" if "selector lower bound" not in ax.get_legend_handles_labels()[1] else None,
+            )
+            if count > 0:
+                ax.annotate(
+                    f"{count}", (x, score), xytext=(0, 6), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=5.8, color="#1d4ed8",
+                )
+
+    # Holdout attempts are sparse and independent: plot them separately, with
+    # a small horizontal offset so both evidence sources remain visible.
+    if hx:
+        x_offset = 0.10
+        for x, score, lower, count, status in zip(
+            hx, hscores, hlowers, hgames, hstatuses
+        ):
+            plot_x = x + x_offset
+            passed = status.startswith(("passed", "promoted"))
+            marker = "D" if passed else "s"
+            ax.vlines(plot_x, lower, score, color="#c2410c", linewidth=1.4, alpha=0.95, zorder=4)
+            ax.scatter(
+                [plot_x], [score], marker=marker, s=36,
+                facecolors="#f97316" if passed else "white",
+                edgecolors="#9a3412", linewidths=1.0, zorder=6,
+                label="independent holdout score" if "independent holdout score" not in ax.get_legend_handles_labels()[1] else None,
+            )
+            ax.scatter(
+                [plot_x], [lower], marker="v", s=24, color="#c2410c", zorder=5,
+                label="holdout lower bound" if "holdout lower bound" not in ax.get_legend_handles_labels()[1] else None,
+            )
+            if count > 0:
+                ax.annotate(
+                    f"{count}", (plot_x, score), xytext=(0, -9), textcoords="offset points",
+                    ha="center", va="top", fontsize=5.8, color="#9a3412",
+                )
+
+    ax.axhline(0.5, color="#374151", lw=0.8, ls="--", alpha=0.7)
+    # Keep the historical framing when all results fit, but expand it for
+    # weak/partial evaluations instead of silently clipping them (for example,
+    # a 29% 48-game preliminary result). Include interval endpoints and gates
+    # so both evidence and decision thresholds remain visible.
+    evidence = [*scores, *lowers, *hscores, *hlowers, 0.5,
+                selector_score_min, confirmation_score_min,
+                selector_lb_min, confirmation_lb_min]
+    evidence = [value for value in evidence if value is not None and math.isfinite(value)]
+    data_min, data_max = min(evidence), max(evidence)
+    span = data_max - data_min
+    padding = max(0.025, span * 0.12)
+    y_min = max(0.0, min(0.35, data_min - padding))
+    y_max = min(1.0, max(0.78, data_max + padding))
+    ax.set_ylim(y_min, y_max)
+    ax.set_ylabel("match points per game", fontsize=8)
+    ax.set_xlabel("iteration (labels show games; selector / holdout)", fontsize=7)
+    _legend_below(ax, ncol=3, y=-0.25)
+    ax.text(
+        0.02, 0.03,
+        "Filled = full selector; hollow = partial; red edge = promotion blocked; holdout is separate.",
+        transform=ax.transAxes, ha="left", va="bottom", fontsize=6.4, color="#374151",
+    )
+    return True
+
+
 def _fill_between_with_breaks(ax, xs, lower, upper, *, break_after=None, **kwargs):
     offset = 0
     for segment_x, segment_lower in _split_series_at_boundaries(xs, lower, break_after):
@@ -1175,25 +1345,7 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     matchup_breaks = tuple(promotion_iterations) + tuple(recovery_iterations)
 
     ax = axes[0, 0]
-    _style(ax, "Learner vs promoted best", percent=True)
-    shown = _line(ax, main, "score_rate", "MCTS", _COLORS[0], break_after=matchup_breaks)
-    shown |= _line(
-        ax, main, "no_mcts_score_rate", "NN only", _COLORS[1],
-        break_after=matchup_breaks,
-    )
-    ax.axhline(0.5, color="#374151", lw=1, ls="--", label="break-even")
-    promotion_score_floor = float(rl_cfg.get("score_rate_threshold", 0.55) or 0.55)
-    ax.axhline(promotion_score_floor, color="#16a34a", lw=1, ls=":",
-               label=f"promotion {100.0 * promotion_score_floor:.0f}%")
-    eval_wins = _last(main, "eval_wins")
-    eval_draws = _last(main, "eval_draws")
-    eval_losses = _last(main, "eval_losses")
-    if eval_wins is not None and eval_draws is not None and eval_losses is not None:
-        ax.text(0.98, 0.04, f"latest W/D/L {eval_wins:.0f}/{eval_draws:.0f}/{eval_losses:.0f}",
-                transform=ax.transAxes, ha="right", va="bottom", fontsize=7, color="#4b5563")
-    _legend_below(ax, ncol=3)
-    if not shown:
-        _no_data(ax)
+    _promotion_strength_panel(ax, main, rl_cfg)
 
     ax = axes[0, 1]
     _value_search_alignment_panel(ax, main, break_after=recovery_iterations)
@@ -1392,7 +1544,6 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
             selfplay_best_intervals,
             label=(plot_index == 0),
         )
-    _legend_below(axes[0, 0], ncol=4)
     _mark_resume_boundaries(axes, _resume_markers(main_csv_path))
 
     context = " | ".join(str(line) for line in (run_context_lines or []) if line)

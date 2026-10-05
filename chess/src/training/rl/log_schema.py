@@ -6,8 +6,8 @@ import csv
 
 
 # Version 63 is already present in historical dirty RL81 CSVs with a
-# different column layout. Keep this confirmation schema under a new version.
-RL_LOG_SCHEMA_VERSION = 64
+# different column layout. Version 64 added independent promotion confirmation.
+RL_LOG_SCHEMA_VERSION = 65
 
 
 # One row per training iteration. This is the promotion/strength dashboard source,
@@ -119,6 +119,9 @@ RL_DATA_QUALITY_COLUMNS = (
     "policy_target_len_mean", "policy_target_len_p90", "policy_target_entropy_mean",
     "policy_target_top1_prob_mean", "policy_target_top3_prob_mean",
     "policy_target_effective_moves", "policy_entropy_ratio",
+    "policy_target_sample_count",
+    "policy_target_challenge_delta_intervention_count",
+    "policy_target_challenge_delta_intervention_rate",
     "replay_policy_correction_fraction", "replay_policy_correction_q_delta_mean",
     "replay_policy_correction_weight_share",
     "correction_audit_rows", "correction_audit_candidate_rows",

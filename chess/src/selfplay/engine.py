@@ -1001,6 +1001,8 @@ class SelfPlayEngine:
         search_simulations_used_samples = []
         search_simulations_budget_samples = []
         total_mcts_quality_stats = {
+            'policy_target_sample_count': 0.0,
+            'policy_target_challenge_delta_intervention_count': 0.0,
             'mcts_prior_agreement_samples': 0.0,
             'mcts_prior_agreement_sum': 0.0,
             'mcts_prior_changed_count': 0.0,
@@ -1177,6 +1179,10 @@ class SelfPlayEngine:
         min_search_simulations_budget = float(np.min(budget_arr)) if budget_arr is not None else 0.0
         max_search_simulations_budget = float(np.max(budget_arr)) if budget_arr is not None else 0.0
         mcts_quality_samples = int(total_mcts_quality_stats['mcts_prior_agreement_samples'])
+        policy_target_sample_count = int(total_mcts_quality_stats['policy_target_sample_count'])
+        policy_target_challenge_delta_intervention_count = int(
+            total_mcts_quality_stats['policy_target_challenge_delta_intervention_count']
+        )
         mcts_q_delta_samples = int(total_mcts_quality_stats['mcts_q_delta_samples'])
         mcts_q_delta_values = list(total_mcts_quality_stats.get('mcts_q_delta_values', []) or [])
         mcts_q_delta_hist = list(total_mcts_quality_stats.get('mcts_q_delta_hist', []) or [])
@@ -1272,6 +1278,16 @@ class SelfPlayEngine:
             'opening_prefix_plies_sum': int(total_opening_prefix_plies),
             'opening_sequence_counts': dict(opening_sequence_counts),
             'mcts_prior_agreement_samples': int(mcts_quality_samples),
+            'policy_target_sample_count': int(policy_target_sample_count),
+            'policy_target_challenge_delta_intervention_count': int(
+                policy_target_challenge_delta_intervention_count
+            ),
+            'policy_target_challenge_delta_intervention_rate': (
+                float(policy_target_challenge_delta_intervention_count)
+                / float(policy_target_sample_count)
+                if policy_target_sample_count > 0
+                else 0.0
+            ),
             'mcts_prior_agreement_sum': float(total_mcts_quality_stats['mcts_prior_agreement_sum']),
             'mcts_prior_agreement_rate': (
                 float(total_mcts_quality_stats['mcts_prior_agreement_sum']) / float(mcts_quality_samples)
@@ -1814,6 +1830,8 @@ class SelfPlayEngine:
         }
         target_quality = {
             'samples': 0,
+            'policy_target_sample_count': 0,
+            'policy_target_challenge_delta_intervention_count': 0,
             'changed': 0,
             'agreement_sum': 0.0,
             'prior_top_visit_prob_sum': 0.0,
@@ -1855,6 +1873,9 @@ class SelfPlayEngine:
             if agree is None:
                 return
             target_quality['samples'] += 1
+            target_quality['policy_target_sample_count'] += 1
+            if bool(search_metadata.get('policy_target_intervention_applied', False)):
+                target_quality['policy_target_challenge_delta_intervention_count'] += 1
             agree_value = float(agree)
             changed_top = agree_value < 0.5
             phase = self._mcts_phase_for_board(board)
@@ -2423,6 +2444,10 @@ class SelfPlayEngine:
             'opening_prefix_plies_sum': opening_prefix_plies_sum,
             'opening_sequence_counts': opening_sequence_counts,
             'mcts_prior_agreement_samples': target_quality_samples,
+            'policy_target_sample_count': int(target_quality['policy_target_sample_count']),
+            'policy_target_challenge_delta_intervention_count': int(
+                target_quality['policy_target_challenge_delta_intervention_count']
+            ),
             'mcts_prior_agreement_sum': float(target_quality['agreement_sum']),
             'mcts_prior_changed_count': int(target_quality['changed']),
             'mcts_prior_agreement_rate': (

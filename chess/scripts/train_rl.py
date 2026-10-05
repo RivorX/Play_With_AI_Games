@@ -756,6 +756,19 @@ def _next_raw_candidate_retest_target(
     return None
 
 
+def _raw_nn_evaluation_is_scheduled(*, iteration_number, cadence, enabled):
+    """Whether this iteration gets the routine raw-NN diagnostic match."""
+    return bool(
+        enabled
+        and int(iteration_number) % max(1, int(cadence)) == 0
+    )
+
+
+def _raw_nn_candidate_match_required(*, is_candidate, promotion_gate_enabled, stats):
+    """Keep the raw-NN promotion gate fresh even off diagnostic cadence."""
+    return bool(is_candidate and promotion_gate_enabled and stats is None)
+
+
 def _build_rl_optimizer_param_groups(model, rl_config, base_lr):
     """Build resume-compatible AdamW groups with one global learning rate.
 
@@ -2220,6 +2233,61 @@ def _empty_eval_stats():
     }
 
 
+def _raw_eval_metric_values(stats):
+    """Return the scalar/raw-NN match fields consumed by the RL loop."""
+    stats = stats or {}
+    return (
+        float(stats.get('score_rate', 0.0)),
+        float(stats.get('win_rate', 0.0)),
+        float(stats.get('draw_rate', 0.0)),
+        float(stats.get('loss_rate', 0.0)),
+        int(stats.get('wins', 0)),
+        int(stats.get('draws', 0)),
+        int(stats.get('losses', 0)),
+        int(stats.get('unresolved', 0)),
+        int(stats.get('num_games', 0) or 0),
+    )
+
+
+_EVAL_TIMING_STAGE_LABELS = (
+    ('regular_eval', 'raw NN'),
+    ('promotion_eval', 'MCTS selection'),
+    ('promotion_confirmation', 'independent holdout'),
+    ('elo_eval', 'Stockfish Elo'),
+)
+
+
+def _format_iteration_stage_summary(stage_times):
+    """Compact eval timing presentation without changing recorded stage data."""
+    stage_times = dict(stage_times or {})
+    eval_seconds = {
+        key: max(0.0, float(stage_times.get(key, 0.0) or 0.0))
+        for key, _label in _EVAL_TIMING_STAGE_LABELS
+    }
+    eval_total = sum(eval_seconds.values())
+    eval_labels = dict(_EVAL_TIMING_STAGE_LABELS)
+    parts = []
+    evaluation_added = False
+
+    for name, seconds in stage_times.items():
+        if name in eval_labels:
+            if not evaluation_added and eval_total >= 0.5:
+                detail = ', '.join(
+                    f"{eval_labels[key]} {format_duration(value)}"
+                    for key, value in eval_seconds.items()
+                    if value >= 0.5
+                )
+                parts.append(
+                    f"evaluation {format_duration(eval_total)} ({detail})"
+                )
+                evaluation_added = True
+            continue
+        if float(seconds or 0.0) >= 0.5:
+            parts.append(f"{name} {format_duration(seconds)}")
+
+    return ' | '.join(parts)
+
+
 def _score_rate_standard_error(score_rate, num_games, standard_error=None):
     games = max(1.0, float(num_games or 1))
     score = max(0.0, min(1.0, float(score_rate or 0.0)))
@@ -2397,6 +2465,37 @@ def _evaluate_models_no_mcts_with_paired_scores(*args, **kwargs):
         game_scores,
         opening_count=opening_count,
     )
+
+
+def _make_cumulative_eval_progress_callback(progress_bar, expected_game_indices):
+    """Count each scheduled game once across multiple evaluation calls."""
+    expected_game_indices = set(int(index) for index in expected_game_indices)
+    seen_game_indices = set()
+
+    def _on_progress(completed, game_idx=None, *_details):
+        if game_idx is not None:
+            try:
+                game_idx = int(game_idx)
+            except (TypeError, ValueError):
+                game_idx = None
+        if game_idx is not None:
+            if game_idx not in expected_game_indices or game_idx in seen_game_indices:
+                return
+            seen_game_indices.add(game_idx)
+            increment = 1
+        else:
+            # The evaluation callbacks currently report one completed game at
+            # a time. Keep the fallback bounded if a caller omits game indices.
+            try:
+                increment = max(0, int(completed or 0))
+            except (TypeError, ValueError):
+                increment = 0
+            total = int(progress_bar.total or 0)
+            increment = min(increment, max(0, total - int(progress_bar.n)))
+        if increment:
+            progress_bar.update(increment)
+
+    return _on_progress
 
 
 def _promotion_anchor_safety_decision(
@@ -2709,6 +2808,15 @@ def _run_promotion_confirmation(
     confirmation_config['reinforcement_learning'] = confirmation_rl_cfg
     confirmation_stats = {}
     confirmation_result = None
+    confirmation_progress = tqdm(
+        total=_PROMOTION_CONFIRMATION_GAMES,
+        desc='Independent promotion confirmation',
+        unit='game',
+    )
+    confirmation_progress_callback = _make_cumulative_eval_progress_callback(
+        confirmation_progress,
+        range(_PROMOTION_CONFIRMATION_GAMES),
+    )
     try:
         first_stage_games = _PROMOTION_CONFIRMATION_GAMES // 2
         first_stats = _evaluate_models_with_paired_scores(
@@ -2720,7 +2828,9 @@ def _run_promotion_confirmation(
             game_index_offset=0,
             use_fixed_openings=True,
             central_runtime=central_runtime,
-            progress_desc='Independent promotion confirmation (1/2)',
+            progress_desc='Independent promotion confirmation',
+            progress_callback=confirmation_progress_callback,
+            show_progress=False,
         )
         first_game_scores = {
             int(key): float(value)
@@ -2814,7 +2924,9 @@ def _run_promotion_confirmation(
                     game_index_offset=first_stage_games,
                     use_fixed_openings=True,
                     central_runtime=central_runtime,
-                    progress_desc='Independent promotion confirmation (2/2)',
+                    progress_desc='Independent promotion confirmation',
+                    progress_callback=confirmation_progress_callback,
+                    show_progress=False,
                 )
                 if (second_stats or {}).get('infrastructure_error'):
                     confirmation_stats = dict(second_stats)
@@ -2832,6 +2944,7 @@ def _run_promotion_confirmation(
             'game_scores': {},
         }
     finally:
+        confirmation_progress.close()
         finish_substage('promotion_confirmation', confirmation_eval_t0)
 
     confirmation_error = (confirmation_stats or {}).get('infrastructure_error')
@@ -3193,81 +3306,95 @@ def _evaluate_models_funnel(
     preliminary_config = _build_eval_config_with_exact_simulations(config, preliminary_simulations)
     medium_config = _build_eval_config_with_exact_simulations(config, medium_simulations)
     advanced_config = _build_eval_config_with_exact_simulations(config, advanced_simulations)
-    preliminary_stats = _evaluate_models_with_paired_scores(
-        model,
-        best_model,
-        preliminary_config,
-        device,
-        preliminary_games,
-        game_index_offset=game_index_offset,
-        use_fixed_openings=use_fixed_openings,
-        central_runtime=central_runtime,
+    total_games = preliminary_games + medium_games + advanced_games
+    expected_game_indices = range(
+        int(game_index_offset), int(game_index_offset) + total_games
     )
-    if (preliminary_stats or {}).get('infrastructure_error'):
-        return preliminary_stats, "infrastructure_error"
-    score_rate = float((preliminary_stats or {}).get('score_rate', 0.0) or 0.0)
-    true_win_rate = float((preliminary_stats or {}).get('win_rate', 0.0) or 0.0)
-    # Early stages stop for futility only: an uncertain near-even candidate
-    # deserves the remaining openings. Final promotion bounds stay unchanged.
-    if (
-        not bool(force_medium)
-        and (
-            _score_rate_upper_bound(
-                score_rate, preliminary_stats.get('num_games', preliminary_games),
-                standard_error=preliminary_stats.get('paired_score_se'),
-            ) < float(preliminary_score_rate)
-            or true_win_rate < float(preliminary_true_win_rate)
+    with tqdm(
+        total=total_games,
+        desc='Eval vs best (MCTS selection)',
+        unit='game',
+    ) as eval_bar:
+        progress_callback = _make_cumulative_eval_progress_callback(
+            eval_bar,
+            expected_game_indices,
         )
-    ):
-        return preliminary_stats, "funnel:preliminary_reject"
-    if medium_games <= 0:
-        return preliminary_stats, "funnel:preliminary_only"
 
-    medium_stats = _evaluate_models_with_paired_scores(
-        model,
-        best_model,
-        medium_config,
-        device,
-        medium_games,
-        game_index_offset=game_index_offset + preliminary_games,
-        use_fixed_openings=use_fixed_openings,
-        central_runtime=central_runtime,
-    )
-    if (medium_stats or {}).get('infrastructure_error'):
-        return medium_stats, "infrastructure_error"
-    # Every stage now uses the same search budget and disjoint paired openings,
-    # so all completed games are commensurate.  Keep the preliminary evidence
-    # instead of discarding it and making the reported score jump between small
-    # opening subsets.
-    through_medium = _combine_eval_stats(preliminary_stats, medium_stats)
-    medium_score = float((through_medium or {}).get('score_rate', 0.0) or 0.0)
-    medium_true_win = float((through_medium or {}).get('win_rate', 0.0) or 0.0)
-    if (
-        _score_rate_upper_bound(
-            medium_score, through_medium.get('num_games', preliminary_games + medium_games),
-            standard_error=through_medium.get('paired_score_se'),
-        ) < float(medium_score_rate)
-        or medium_true_win < float(medium_true_win_rate)
-    ):
-        return through_medium, "funnel:medium_reject"
-    if advanced_games <= 0:
-        return through_medium, "funnel:medium_only"
+        def _run_stage(stage_config, num_games, stage_game_offset):
+            return _evaluate_models_with_paired_scores(
+                model,
+                best_model,
+                stage_config,
+                device,
+                num_games,
+                game_index_offset=stage_game_offset,
+                use_fixed_openings=use_fixed_openings,
+                central_runtime=central_runtime,
+                progress_desc='Eval vs best',
+                progress_callback=progress_callback,
+                show_progress=False,
+            )
 
-    advanced_stats = _evaluate_models_with_paired_scores(
-        model,
-        best_model,
-        advanced_config,
-        device,
-        advanced_games,
-        game_index_offset=game_index_offset + preliminary_games + medium_games,
-        use_fixed_openings=use_fixed_openings,
-        central_runtime=central_runtime,
-    )
-    if (advanced_stats or {}).get('infrastructure_error'):
-        return advanced_stats, "infrastructure_error"
-    combined = _combine_eval_stats(through_medium, advanced_stats)
-    combined['promotion_mcts_simulations'] = int(advanced_simulations)
-    return combined, "funnel:advanced"
+        preliminary_stats = _run_stage(
+            preliminary_config,
+            preliminary_games,
+            game_index_offset,
+        )
+        if (preliminary_stats or {}).get('infrastructure_error'):
+            return preliminary_stats, "infrastructure_error"
+        score_rate = float((preliminary_stats or {}).get('score_rate', 0.0) or 0.0)
+        true_win_rate = float((preliminary_stats or {}).get('win_rate', 0.0) or 0.0)
+        # Early stages stop for futility only: an uncertain near-even candidate
+        # deserves the remaining openings. Final promotion bounds stay unchanged.
+        if (
+            not bool(force_medium)
+            and (
+                _score_rate_upper_bound(
+                    score_rate, preliminary_stats.get('num_games', preliminary_games),
+                    standard_error=preliminary_stats.get('paired_score_se'),
+                ) < float(preliminary_score_rate)
+                or true_win_rate < float(preliminary_true_win_rate)
+            )
+        ):
+            return preliminary_stats, "funnel:preliminary_reject"
+        if medium_games <= 0:
+            return preliminary_stats, "funnel:preliminary_only"
+
+        medium_stats = _run_stage(
+            medium_config,
+            medium_games,
+            game_index_offset + preliminary_games,
+        )
+        if (medium_stats or {}).get('infrastructure_error'):
+            return medium_stats, "infrastructure_error"
+        # Every stage now uses the same search budget and disjoint paired openings,
+        # so all completed games are commensurate. Keep the preliminary evidence
+        # instead of discarding it and making the reported score jump between small
+        # opening subsets.
+        through_medium = _combine_eval_stats(preliminary_stats, medium_stats)
+        medium_score = float((through_medium or {}).get('score_rate', 0.0) or 0.0)
+        medium_true_win = float((through_medium or {}).get('win_rate', 0.0) or 0.0)
+        if (
+            _score_rate_upper_bound(
+                medium_score, through_medium.get('num_games', preliminary_games + medium_games),
+                standard_error=through_medium.get('paired_score_se'),
+            ) < float(medium_score_rate)
+            or medium_true_win < float(medium_true_win_rate)
+        ):
+            return through_medium, "funnel:medium_reject"
+        if advanced_games <= 0:
+            return through_medium, "funnel:medium_only"
+
+        advanced_stats = _run_stage(
+            advanced_config,
+            advanced_games,
+            game_index_offset + preliminary_games + medium_games,
+        )
+        if (advanced_stats or {}).get('infrastructure_error'):
+            return advanced_stats, "infrastructure_error"
+        combined = _combine_eval_stats(through_medium, advanced_stats)
+        combined['promotion_mcts_simulations'] = int(advanced_simulations)
+        return combined, "funnel:advanced"
 
 
 def _models_have_identical_state(model_a, model_b):
@@ -3330,6 +3457,8 @@ def _run_selective_reanalyse(replay_buffer, model, config, device, iteration):
     model.eval()
     started = time.perf_counter()
     updated = skipped = corrections = 0
+    policy_target_sample_count = 0
+    policy_target_challenge_delta_intervention_count = 0
     try:
         for start in range(0, len(positions), batch_size):
             chunk_indices = indices[start:start + batch_size]
@@ -3365,11 +3494,16 @@ def _run_selective_reanalyse(replay_buffer, model, config, device, iteration):
             )
             policy_targets = []
             metadata_rows = []
+            batch_target_count = 0
+            batch_intervention_count = 0
             for board, visits, metadata in zip(boards, visits_list, metadata_list):
                 metadata = dict(metadata or {})
                 probability_target = metadata.get('policy_target_probs_override')
                 target = probability_target if isinstance(probability_target, dict) and probability_target else visits
                 policy_targets.append(_build_sparse_policy_target_from_visits(target, board))
+                batch_target_count += 1
+                if bool(metadata.get('policy_target_intervention_applied', False)):
+                    batch_intervention_count += 1
                 changed_top, q_delta = _search_correction_metadata(metadata)
                 corrections += int(
                     changed_top and math.isfinite(q_delta) and q_delta > USEFUL_SEARCH_Q_DELTA_MIN
@@ -3383,16 +3517,24 @@ def _run_selective_reanalyse(replay_buffer, model, config, device, iteration):
                     'search_q_delta': q_delta,
                     'search_visits': int(metadata.get('search_visits', 0) or 0),
                 })
-            updated += replay_buffer.apply_reanalysis(
+            batch_updated = replay_buffer.apply_reanalysis(
                 valid_indices,
                 policy_targets,
                 metadata_rows,
                 target_iteration=int(iteration),
             )
+            updated += batch_updated
+            if batch_updated == len(policy_targets):
+                policy_target_sample_count += batch_target_count
+                policy_target_challenge_delta_intervention_count += batch_intervention_count
     except Exception as exc:
         return {
             'selected': int(indices.size), 'updated': int(updated), 'skipped': int(skipped),
             'corrections': int(corrections), 'simulations': simulations,
+            'policy_target_sample_count': int(policy_target_sample_count),
+            'policy_target_challenge_delta_intervention_count': int(
+                policy_target_challenge_delta_intervention_count
+            ),
             'seconds': float(time.perf_counter() - started),
             'reason': f'{type(exc).__name__}: {str(exc)[:160]}',
         }
@@ -3402,6 +3544,10 @@ def _run_selective_reanalyse(replay_buffer, model, config, device, iteration):
     return {
         'selected': int(indices.size), 'updated': int(updated), 'skipped': int(skipped),
         'corrections': int(corrections), 'simulations': simulations,
+        'policy_target_sample_count': int(policy_target_sample_count),
+        'policy_target_challenge_delta_intervention_count': int(
+            policy_target_challenge_delta_intervention_count
+        ),
         'seconds': float(time.perf_counter() - started), 'reason': 'ok',
     }
 
@@ -3749,6 +3895,8 @@ def play_games_parallel_mcts(
             source.get('mcts_changed_q_delta_values'),
         )
         for key in [
+            'policy_target_sample_count',
+            'policy_target_challenge_delta_intervention_count',
             'mcts_prior_agreement_samples',
             'mcts_prior_agreement_sum',
             'mcts_prior_changed_count',
@@ -4686,6 +4834,16 @@ def play_games_parallel_mcts(
     value_var = (total_value_sq_sum / total_value_count) - (avg_game_value ** 2) if total_value_count > 0 else 0.0
     value_std = math.sqrt(max(0.0, value_var))
     mcts_quality_samples = int(float(total_mcts_quality_stats.get('mcts_prior_agreement_samples', 0.0) or 0.0))
+    policy_target_sample_count = int(
+        float(total_mcts_quality_stats.get('policy_target_sample_count', 0.0) or 0.0)
+    )
+    policy_target_challenge_delta_intervention_count = int(
+        float(
+            total_mcts_quality_stats.get(
+                'policy_target_challenge_delta_intervention_count', 0.0
+            ) or 0.0
+        )
+    )
     mcts_q_delta_samples = int(float(total_mcts_quality_stats.get('mcts_q_delta_samples', 0.0) or 0.0))
     mcts_q_delta_values = list(total_mcts_quality_stats.get('mcts_q_delta_values', []) or [])
     mcts_q_delta_hist = list(total_mcts_quality_stats.get('mcts_q_delta_hist', []) or [])
@@ -4928,6 +5086,16 @@ def play_games_parallel_mcts(
         'opening_effective_8ply': float(opening_diversity['effective']),
         'opening_top1_8ply_rate': float(opening_diversity['top1_rate']),
         'mcts_prior_agreement_samples': int(mcts_quality_samples),
+        'policy_target_sample_count': int(policy_target_sample_count),
+        'policy_target_challenge_delta_intervention_count': int(
+            policy_target_challenge_delta_intervention_count
+        ),
+        'policy_target_challenge_delta_intervention_rate': (
+            float(policy_target_challenge_delta_intervention_count)
+            / float(policy_target_sample_count)
+            if policy_target_sample_count > 0
+            else 0.0
+        ),
         'mcts_prior_agreement_rate': (
             float(total_mcts_quality_stats.get('mcts_prior_agreement_sum', 0.0) or 0.0) / float(mcts_quality_samples)
             if mcts_quality_samples > 0
@@ -5109,6 +5277,47 @@ def play_games_parallel_mcts(
 # MAIN TRAINING LOOP
 # ==============================================================================
 
+def _validate_pause_after_iteration(pause_after_iteration, total_iterations):
+    """Validate an optional absolute completed-iteration pause target."""
+    if pause_after_iteration is None:
+        return None
+    pause_after_iteration = int(pause_after_iteration)
+    total_iterations = int(total_iterations)
+    if not 1 <= pause_after_iteration <= total_iterations:
+        raise ValueError(
+            "--pause-after-iteration must be between 1 and the configured "
+            f"total iterations ({total_iterations}); got {pause_after_iteration}."
+        )
+    return pause_after_iteration
+
+
+def _should_pause_after_iteration(completed_iteration, total_iterations, pause_after_iteration):
+    """Pause only at a requested boundary that has another iteration after it."""
+    return bool(
+        pause_after_iteration is not None
+        and int(completed_iteration) == int(pause_after_iteration)
+        and int(completed_iteration) < int(total_iterations)
+    )
+
+
+def _should_save_replay_sidecar_for_iteration(
+    completed_iteration,
+    total_iterations,
+    pause_after_iteration=None,
+):
+    """Keep periodic sidecars and force one at an explicitly requested pause."""
+    completed_iteration = int(completed_iteration)
+    return bool(
+        completed_iteration == 1
+        or completed_iteration % _REPLAY_SIDECAR_INTERVAL == 0
+        or completed_iteration == int(total_iterations)
+        or (
+            pause_after_iteration is not None
+            and completed_iteration == int(pause_after_iteration)
+        )
+    )
+
+
 def _parse_cli_args(argv=None):
     parser = argparse.ArgumentParser(description="Train the chess RL learner.")
     parser.add_argument(
@@ -5125,6 +5334,16 @@ def _parse_cli_args(argv=None):
             "optimizer, schedule and empty replay. Requires fresh_il_start=true."
         ),
     )
+    parser.add_argument(
+        "--pause-after-iteration",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Save a synchronized model/replay checkpoint and stop cleanly "
+            "after completed iteration N."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -5138,6 +5357,11 @@ def main(argv=None):
     
     print(f"Chess RL trainer | config: {compact_path(config_path, 3)}")
     config = load_project_config(config_path=config_path)
+    initial_rl_cfg = config.get('reinforcement_learning', {}) or {}
+    pause_after_iteration = _validate_pause_after_iteration(
+        args.pause_after_iteration,
+        initial_rl_cfg.get('iterations', 0),
+    )
 
     debug_cfg = config.get('debug', {}) or {}
     rl_debug_cfg = debug_cfg.get('rl', {}) or {}
@@ -5447,6 +5671,11 @@ def main(argv=None):
     start_mode = startup_state.get("start_mode", "new")
     selected_checkpoint_label = startup_state.get("selected_checkpoint_label")
     start_iteration = int(startup_state.get("start_iteration", 0) or 0)
+    if pause_after_iteration is not None and pause_after_iteration <= start_iteration:
+        raise ValueError(
+            "--pause-after-iteration must be after the checkpoint's completed "
+            f"iteration ({start_iteration}); omit it to resume normally."
+        )
     resumed_best_win_rate = float(startup_state.get("best_win_rate", 0.0) or 0.0)
     selected_compatibility_ratio = startup_state.get("selected_compatibility_ratio")
     transfer_match_ratio = startup_state.get("transfer_match_ratio")
@@ -5874,7 +6103,7 @@ def main(argv=None):
     )
     eval_every = max(1, int(rl_cfg.get('eval_every', 1) or 1))
     no_mcts_eval_enabled = bool(rl_cfg.get('eval_no_mcts_enabled', True))
-    no_mcts_eval_every = max(1, int(rl_cfg.get('eval_no_mcts_every', 2)))
+    no_mcts_eval_every = max(1, int(rl_cfg.get('eval_no_mcts_every', 4)))
     no_mcts_eval_games = max(1, int(rl_cfg.get('eval_no_mcts_games', 30)))
     diagnostic_ema_alpha = max(
         0.0,
@@ -5913,6 +6142,7 @@ def main(argv=None):
         )
     training_interrupted = False
     interrupted_stage = None
+    paused_iteration = None
     last_logged_iteration = start_iteration if start_iteration > 0 else None
 
     funnel_stages = (
@@ -7134,6 +7364,21 @@ def main(argv=None):
                 float(reanalyse_stats.get('corrections', 0) or 0)
                 / float(max(1, int(reanalyse_stats.get('updated', 0) or 0)))
             )
+            selfplay_stats = dict(selfplay_stats or {})
+            selfplay_stats['policy_target_sample_count'] = int(
+                selfplay_stats.get('policy_target_sample_count', 0) or 0
+            ) + int(reanalyse_stats.get('policy_target_sample_count', 0) or 0)
+            selfplay_stats['policy_target_challenge_delta_intervention_count'] = int(
+                selfplay_stats.get('policy_target_challenge_delta_intervention_count', 0) or 0
+            ) + int(
+                reanalyse_stats.get(
+                    'policy_target_challenge_delta_intervention_count', 0
+                ) or 0
+            )
+            selfplay_stats['policy_target_challenge_delta_intervention_rate'] = (
+                float(selfplay_stats['policy_target_challenge_delta_intervention_count'])
+                / float(max(1, selfplay_stats['policy_target_sample_count']))
+            )
             if int(reanalyse_stats.get('updated', 0) or 0) > 0:
                 iteration_notes.append(
                     "reanalyse: "
@@ -7176,7 +7421,15 @@ def main(argv=None):
             eval_infrastructure_error = None
             promotion_confirmation_result = None
             promoted_best_this_iter = False
-            should_run_no_mcts_eval = no_mcts_eval_enabled and ((iteration + 1) % no_mcts_eval_every == 0)
+            iteration_number = iteration + 1
+            # Raw-NN matches are a periodic diagnostic. Promotion candidates
+            # that fall between diagnostic iterations still get a fresh raw
+            # match below, in the same iteration as their MCTS evaluation.
+            should_run_no_mcts_eval = _raw_nn_evaluation_is_scheduled(
+                iteration_number=iteration_number,
+                cadence=no_mcts_eval_every,
+                enabled=no_mcts_eval_enabled,
+            )
             if should_run_no_mcts_eval:
                 regular_eval_t0 = _start_eval_substage()
                 model.eval()
@@ -7191,17 +7444,18 @@ def main(argv=None):
                     no_mcts_eval_games,
                     use_fixed_openings=bool(rl_cfg.get('eval_no_mcts_use_fixed_openings', True)),
                 )
-                no_mcts_score_rate = float((no_mcts_stats or {}).get('score_rate', 0.0))
-                no_mcts_true_win_rate = float((no_mcts_stats or {}).get('win_rate', 0.0))
-                no_mcts_draw_rate = float((no_mcts_stats or {}).get('draw_rate', 0.0))
-                no_mcts_loss_rate = float((no_mcts_stats or {}).get('loss_rate', 0.0))
-                no_mcts_wins = int((no_mcts_stats or {}).get('wins', 0))
-                no_mcts_draws = int((no_mcts_stats or {}).get('draws', 0))
-                no_mcts_losses = int((no_mcts_stats or {}).get('losses', 0))
-                no_mcts_unresolved = int((no_mcts_stats or {}).get('unresolved', 0))
-                no_mcts_games_total = int((no_mcts_stats or {}).get('num_games', 0) or 0)
+                (
+                    no_mcts_score_rate,
+                    no_mcts_true_win_rate,
+                    no_mcts_draw_rate,
+                    no_mcts_loss_rate,
+                    no_mcts_wins,
+                    no_mcts_draws,
+                    no_mcts_losses,
+                    no_mcts_unresolved,
+                    no_mcts_games_total,
+                ) = _raw_eval_metric_values(no_mcts_stats)
                 _finish_eval_substage('regular_eval', regular_eval_t0)
-            iteration_number = iteration + 1
             should_run_mcts_eval = (iteration_number % eval_every) == 0
             if should_run_mcts_eval:
                 promotion_eval_t0 = _start_eval_substage()
@@ -7368,14 +7622,14 @@ def main(argv=None):
                     raw_promotion_gate_enabled = bool(
                         rl_cfg.get('promotion_no_mcts_gate_enabled', True)
                     )
-                    if (
-                        raw_promotion_gate_enabled
-                        and no_mcts_eval_enabled
-                        and no_mcts_stats is None
+                    if _raw_nn_candidate_match_required(
+                        is_candidate=is_new_best_candidate,
+                        promotion_gate_enabled=raw_promotion_gate_enabled,
+                        stats=no_mcts_stats,
                     ):
-                        # Defensive fallback for configurations whose raw-NN
-                        # cadence differs from the MCTS arena cadence: every
-                        # promotion candidate must still have raw-vs-best data.
+                        # The raw-NN gate is mandatory for an MCTS candidate,
+                        # even when periodic raw diagnostics are disabled or
+                        # this iteration is outside their cadence.
                         regular_eval_t0 = _start_eval_substage()
                         no_mcts_stats = _evaluate_models_no_mcts_with_paired_scores(
                             model,
@@ -7387,15 +7641,17 @@ def main(argv=None):
                                 rl_cfg.get('eval_no_mcts_use_fixed_openings', True)
                             ),
                         )
-                        no_mcts_score_rate = float((no_mcts_stats or {}).get('score_rate', 0.0))
-                        no_mcts_true_win_rate = float((no_mcts_stats or {}).get('win_rate', 0.0))
-                        no_mcts_draw_rate = float((no_mcts_stats or {}).get('draw_rate', 0.0))
-                        no_mcts_loss_rate = float((no_mcts_stats or {}).get('loss_rate', 0.0))
-                        no_mcts_wins = int((no_mcts_stats or {}).get('wins', 0))
-                        no_mcts_draws = int((no_mcts_stats or {}).get('draws', 0))
-                        no_mcts_losses = int((no_mcts_stats or {}).get('losses', 0))
-                        no_mcts_unresolved = int((no_mcts_stats or {}).get('unresolved', 0))
-                        no_mcts_games_total = int((no_mcts_stats or {}).get('num_games', 0) or 0)
+                        (
+                            no_mcts_score_rate,
+                            no_mcts_true_win_rate,
+                            no_mcts_draw_rate,
+                            no_mcts_loss_rate,
+                            no_mcts_wins,
+                            no_mcts_draws,
+                            no_mcts_losses,
+                            no_mcts_unresolved,
+                            no_mcts_games_total,
+                        ) = _raw_eval_metric_values(no_mcts_stats)
                         _finish_eval_substage('regular_eval', regular_eval_t0)
                     nn_block_reason = ""
                     nn_score_floor = float(
@@ -7442,15 +7698,17 @@ def main(argv=None):
                             ),
                         )
                         no_mcts_stats = _combine_eval_stats(no_mcts_stats, raw_extra_stats)
-                        no_mcts_score_rate = float((no_mcts_stats or {}).get('score_rate', 0.0))
-                        no_mcts_true_win_rate = float((no_mcts_stats or {}).get('win_rate', 0.0))
-                        no_mcts_draw_rate = float((no_mcts_stats or {}).get('draw_rate', 0.0))
-                        no_mcts_loss_rate = float((no_mcts_stats or {}).get('loss_rate', 0.0))
-                        no_mcts_wins = int((no_mcts_stats or {}).get('wins', 0))
-                        no_mcts_draws = int((no_mcts_stats or {}).get('draws', 0))
-                        no_mcts_losses = int((no_mcts_stats or {}).get('losses', 0))
-                        no_mcts_unresolved = int((no_mcts_stats or {}).get('unresolved', 0))
-                        no_mcts_games_total = int((no_mcts_stats or {}).get('num_games', 0) or 0)
+                        (
+                            no_mcts_score_rate,
+                            no_mcts_true_win_rate,
+                            no_mcts_draw_rate,
+                            no_mcts_loss_rate,
+                            no_mcts_wins,
+                            no_mcts_draws,
+                            no_mcts_losses,
+                            no_mcts_unresolved,
+                            no_mcts_games_total,
+                        ) = _raw_eval_metric_values(no_mcts_stats)
                         _finish_eval_substage('regular_eval', regular_eval_t0)
                         nn_safe, nn_block_reason, nn_score_floor, nn_score_upper = (
                             _promotion_nn_safety_decision(
@@ -7472,6 +7730,25 @@ def main(argv=None):
                     if raw_promotion_gate_enabled and not nn_safe:
                         is_new_best_candidate = False
                         promotion_status = nn_block_reason
+                if (
+                    no_mcts_eval_enabled
+                    and not should_run_no_mcts_eval
+                    and no_mcts_stats is None
+                ):
+                    skip_reason = (
+                        "MCTS evaluation incomplete"
+                        if not full_eval_evidence
+                        else (
+                            "raw-NN promotion gate disabled"
+                            if is_new_best_candidate
+                            else "MCTS promotion gates did not nominate a candidate"
+                        )
+                    )
+                    iteration_notes.append(
+                        f"raw NN diagnostic skipped (periodic cadence every "
+                        f"{no_mcts_eval_every} iterations; {skip_reason}; "
+                        "MCTS candidates receive an on-demand same-iteration check)"
+                    )
                 anchor_gate_enabled = bool(rl_cfg.get('promotion_require_anchor_non_regression', True))
                 min_anchor_score_for_progress = float(rl_cfg.get('promotion_anchor_min_score_rate', 0.50))
                 min_anchor_true_win_for_progress = float(
@@ -8172,10 +8449,10 @@ def main(argv=None):
                 best_model,
                 dtype=runtime_snapshot_dtype,
             )
-            should_save_replay_sidecar = bool(
-                iteration == 0
-                or (iteration + 1) % _REPLAY_SIDECAR_INTERVAL == 0
-                or (iteration + 1) == total_iterations
+            should_save_replay_sidecar = _should_save_replay_sidecar_for_iteration(
+                iteration + 1,
+                total_iterations,
+                pause_after_iteration=pause_after_iteration,
             )
             if should_save_replay_sidecar:
                 _save_rl_replay_sidecar(
@@ -8414,7 +8691,9 @@ def main(argv=None):
             elif score_rate is not None:
                 eval_parts = [
                     f"MCTS {score_rate:.1%} (LB {float(score_lower_bound or 0.0):.1%}, "
-                    f"W/D/L {eval_wins}/{eval_draws}/{eval_losses}, {eval_stage})"
+                    f"W/D/L {eval_wins}/{eval_draws}/{eval_losses}, "
+                    f"{int(eval_games_total or 0)}/"
+                    f"{funnel_preliminary_games + funnel_medium_games + funnel_advanced_games} games)"
                 ]
                 if no_mcts_score_rate is not None:
                     eval_parts.append(
@@ -8437,11 +8716,7 @@ def main(argv=None):
                 eval_summary = f"not scheduled; MCTS eval in {until_mcts_eval} iter"
 
             bottleneck, bottleneck_share = dominant_stage(iteration_stage_times)
-            stage_summary = " | ".join(
-                f"{name} {format_duration(seconds)}"
-                for name, seconds in iteration_stage_times.items()
-                if float(seconds or 0.0) >= 0.5
-            )
+            stage_summary = _format_iteration_stage_summary(iteration_stage_times)
             print_panel(
                 f"ITERATION {iteration + 1}/{total_iterations} | {format_duration(iteration_total_time_s)}",
                 [
@@ -8466,6 +8741,17 @@ def main(argv=None):
                 notes=iteration_notes[:4],
             )
             _emit_iteration_profile()
+            if _should_pause_after_iteration(
+                iteration + 1,
+                total_iterations,
+                pause_after_iteration,
+            ):
+                paused_iteration = iteration + 1
+                print(
+                    f"\r\n=== Training paused after iteration "
+                    f"{paused_iteration}/{total_iterations} ==="
+                )
+                break
     except RLTrainingInterrupted as exc:
         training_interrupted = True
         interrupted_stage = str(exc) or "self-play"
@@ -8481,6 +8767,13 @@ def main(argv=None):
     logger.plot_rl_data_quality()
     if training_interrupted:
         _handle_graceful_interrupt(logger=logger, stage=interrupted_stage)
+        return
+    if paused_iteration is not None:
+        print(
+            f"\r\nCheckpoint and replay state are synchronized at iteration "
+            f"{paused_iteration}. Resume this run without --fresh-canonical-il "
+            "to continue the configured schedule."
+        )
         return
 
     # `0` is a real best iteration: it means the immutable IL initialization

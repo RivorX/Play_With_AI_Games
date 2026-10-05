@@ -31,6 +31,7 @@ from src.models.data.se_cnn_v9.helpers import (
 )
 from src.mcts.native import get_native_mcts
 from src.mcts.result import SearchResult
+from src.mcts.q_delta import USEFUL_SEARCH_Q_DELTA_MIN
 
 
 _EMPTY_HISTORY_TENSOR = np.zeros((16, 8, 8), dtype=np.float32)
@@ -89,6 +90,117 @@ _TREE_REUSE_SCOUT_MIN_FRESH_FRACTION = 1.0 / 6.0
 # the configured action count as a cap and narrow only when the *fresh* action
 # budget cannot fund two complete first-round passes.
 _GUMBEL_MIN_INITIAL_VISITS_PER_ACTION = 2
+
+
+_POLICY_TARGET_MODES = frozenset({'baseline', 'challenge_delta'})
+_POLICY_TARGET_DEFAULT_PRIOR_FRACTION = 0.5
+
+
+def _resolve_policy_target_config(rl_cfg):
+    """Validate the optional one-axis stored policy-target experiment."""
+    rl_cfg = rl_cfg if isinstance(rl_cfg, dict) else {}
+    mode = str(rl_cfg.get('mcts_policy_target_mode', 'baseline')).strip().lower()
+    if mode not in _POLICY_TARGET_MODES:
+        choices = ', '.join(sorted(_POLICY_TARGET_MODES))
+        raise ValueError(
+            f"reinforcement_learning.search.policy_target_mode must be one of {choices}; got {mode!r}"
+        )
+    try:
+        prior_fraction = float(rl_cfg.get(
+            'mcts_challenge_delta_prior_fraction',
+            _POLICY_TARGET_DEFAULT_PRIOR_FRACTION,
+        ))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            'reinforcement_learning.search.challenge_delta_prior_fraction must be a finite number in (0, 1)'
+        ) from exc
+    if not math.isfinite(prior_fraction) or not 0.0 < prior_fraction < 1.0:
+        raise ValueError(
+            'reinforcement_learning.search.challenge_delta_prior_fraction must be a finite number in (0, 1)'
+        )
+    return mode, prior_fraction
+
+
+def _build_challenge_delta_policy_target(
+    policy_target,
+    prior_distribution,
+    *,
+    changed_top,
+    q_delta,
+    prior_fraction=_POLICY_TARGET_DEFAULT_PRIOR_FRACTION,
+):
+    """Subtract prior-aligned mass from a useful completed-Q correction.
+
+    For normalized completed-Q target ``pi`` and prior ``p``, the treatment is
+    ``q_i = max(pi_i - alpha * p_i, 0) / Z``. Invalid inputs, unchanged top
+    moves, or weak Q evidence return the original target unchanged.
+    """
+    fallback = {'applied': False, 'removed_prior_mass': 0.0}
+    if not changed_top:
+        return policy_target, fallback
+    try:
+        delta = float(q_delta)
+        alpha = float(prior_fraction)
+    except (TypeError, ValueError):
+        return policy_target, fallback
+    if (
+        not math.isfinite(delta)
+        or delta <= USEFUL_SEARCH_Q_DELTA_MIN
+        or not math.isfinite(alpha)
+        or not 0.0 < alpha < 1.0
+        or not isinstance(policy_target, dict)
+        or not policy_target
+        or not isinstance(prior_distribution, dict)
+        or not prior_distribution
+    ):
+        return policy_target, fallback
+    try:
+        if not set(policy_target).issubset(prior_distribution):
+            return policy_target, fallback
+        target_values = {move: float(value) for move, value in policy_target.items()}
+        prior_values = {move: float(value) for move, value in prior_distribution.items()}
+    except (TypeError, ValueError):
+        return policy_target, fallback
+    if (
+        any(not math.isfinite(value) or value < 0.0 for value in target_values.values())
+        or any(not math.isfinite(value) or value < 0.0 for value in prior_values.values())
+    ):
+        return policy_target, fallback
+    try:
+        target_total = math.fsum(target_values.values())
+        prior_total = math.fsum(prior_values.values())
+    except OverflowError:
+        return policy_target, fallback
+    if (
+        not math.isfinite(target_total)
+        or not math.isfinite(prior_total)
+        or target_total <= 1e-12
+        or prior_total <= 1e-12
+    ):
+        return policy_target, fallback
+
+    transformed = {}
+    removed_prior_mass = 0.0
+    for move, prior_value in prior_values.items():
+        prior_probability = prior_value / prior_total
+        search_probability = target_values.get(move, 0.0) / target_total
+        retained = max(0.0, search_probability - alpha * prior_probability)
+        removed_prior_mass += search_probability - retained
+        if retained > 0.0:
+            transformed[move] = retained
+    transformed_total = math.fsum(transformed.values())
+    if not transformed or not math.isfinite(transformed_total) or transformed_total <= 1e-12:
+        return policy_target, fallback
+    normalized = {
+        move: probability / transformed_total
+        for move, probability in transformed.items()
+    }
+    if any(not math.isfinite(value) or value < 0.0 for value in normalized.values()):
+        return policy_target, fallback
+    return normalized, {
+        'applied': True,
+        'removed_prior_mass': float(max(0.0, min(1.0, removed_prior_mass))),
+    }
 
 
 def _summarize_tree_reuse_quality(root, gumbel, max_considered_actions):
@@ -410,6 +522,75 @@ def _allocate_eval_easy_cut_simulation_budgets(
         quantized = int(round(raw_budget / chunk)) * chunk
         budgets.append(max(minimum, min(target, quantized)))
     return budgets
+
+
+def _gumbel_policy_target_telemetry(target_probs, prior_probs, visit_counts, value_sums):
+    """Describe one stored target; attach measured Q labels only to its top move."""
+    target = np.asarray(target_probs, dtype=np.float64)
+    prior = np.asarray(prior_probs, dtype=np.float64)
+    visits = np.asarray(visit_counts, dtype=np.float64)
+    values = np.asarray(value_sums, dtype=np.float64)
+    if (
+        target.ndim != 1
+        or target.size == 0
+        or prior.shape != target.shape
+        or visits.shape != target.shape
+        or values.shape != target.shape
+        or not np.all(np.isfinite(target))
+        or not np.all(np.isfinite(prior))
+        or not np.all(np.isfinite(visits))
+        or not np.all(np.isfinite(values))
+        or np.any(target < 0.0)
+        or np.any(prior < 0.0)
+        or np.any(visits < 0.0)
+    ):
+        return None
+    target_total = float(target.sum())
+    prior_total = float(prior.sum())
+    if target_total <= 1e-12 or prior_total <= 1e-12:
+        return None
+    target = target / target_total
+    prior = prior / prior_total
+    prior_top_idx = int(np.argmax(prior))
+    target_top_idx = int(np.argmax(target))
+    ordered = np.sort(target)
+    top = float(ordered[-1])
+    second = float(ordered[-2]) if ordered.size > 1 else 0.0
+    entropy = float(-np.sum(target * np.log(np.clip(target, 1e-12, 1.0))))
+    result = {
+        'prior_mcts_agree': 1.0 if prior_top_idx == target_top_idx else 0.0,
+        'prior_top_visit_prob': float(target[prior_top_idx]),
+        'mcts_top_prior_prob': float(prior[target_top_idx]),
+        'mcts_policy_kl': float(np.sum(
+            target * (
+                np.log(np.clip(target, 1e-12, 1.0))
+                - np.log(np.clip(prior, 1e-12, 1.0))
+            )
+        )),
+        'policy_kld': None,
+        'top_visit_prob': top,
+        'visit_gap': max(0.0, top - second),
+        'visit_entropy': (
+            entropy / max(1e-12, math.log(len(target))) if len(target) > 1 else 0.0
+        ),
+        'best_q': None,
+        'mcts_q_delta': None,
+        'mcts_changed_to_lower_q': None,
+    }
+    result['policy_kld'] = result['mcts_policy_kl']
+    if visits[target_top_idx] > 0.0:
+        target_q = -float(values[target_top_idx]) / float(visits[target_top_idx])
+        if math.isfinite(target_q):
+            result['best_q'] = float(max(-1.0, min(1.0, target_q)))
+            if visits[prior_top_idx] > 0.0:
+                prior_q = -float(values[prior_top_idx]) / float(visits[prior_top_idx])
+                if math.isfinite(prior_q):
+                    q_delta = float(max(-2.0, min(2.0, target_q - prior_q)))
+                    result['mcts_q_delta'] = q_delta
+                    result['mcts_changed_to_lower_q'] = (
+                        1.0 if prior_top_idx != target_top_idx and q_delta < -0.02 else 0.0
+                    )
+    return result
 
 
 def _gumbel_prior_difficulty(root):
@@ -1793,6 +1974,10 @@ class MultiGameBatchMCTS:
         self.config = config
         self.device = device
         rl_cfg = config['reinforcement_learning']
+        (
+            self.policy_target_mode,
+            self.challenge_delta_prior_fraction,
+        ) = _resolve_policy_target_config(rl_cfg)
 
         self.gumbel_max_considered_actions = max(
             1,
@@ -3014,6 +3199,8 @@ class MultiGameBatchMCTS:
             'played_q': None,
             'orig_q': None,
             'policy_kld': None,
+            'policy_target_intervention_applied': False,
+            'policy_target_removed_prior_mass': 0.0,
             'search_visits': int(fresh_used),
             'stopped_early': effective_used < budget,
             'policy_weight': float(max(0.0, min(1.0, effective_used / float(budget)))),
@@ -3870,60 +4057,45 @@ class MultiGameBatchMCTS:
                 }
 
                 # Full Gumbel trains against the temperature-scaled completed-Q
-                # target, so telemetry must measure that stored distribution,
-                # not the pre-transform policy or incidental visit shape.
+                # target; target telemetry and Q labels must use that exact map.
                 priors = root.edges.base_priors.astype(np.float64, copy=False)
                 prior_total = float(priors.sum())
-                prior_probs = priors / prior_total if prior_total > 0.0 else np.full_like(priors, 1.0 / len(priors))
+                prior_probs = (
+                    priors / prior_total
+                    if prior_total > 0.0
+                    else np.full_like(priors, 1.0 / len(priors))
+                )
                 prior_top_idx = int(np.argmax(prior_probs))
                 target_probs = policy_target_probs.astype(np.float64, copy=False)
-                improved_top_idx = int(np.argmax(target_probs))
-                selected_prior_agree = (
-                    None if selected_idx is None else (1.0 if prior_top_idx == selected_idx else 0.0)
+                original_changed_top = prior_top_idx != int(np.argmax(target_probs))
+                metadata['selected_prior_agree'] = (
+                    None
+                    if selected_idx is None
+                    else (1.0 if prior_top_idx == selected_idx else 0.0)
                 )
-                metadata['selected_prior_agree'] = selected_prior_agree
                 metadata['selected_q_delta'] = None
-                metadata['prior_mcts_agree'] = 1.0 if prior_top_idx == improved_top_idx else 0.0
-                metadata['prior_top_visit_prob'] = float(target_probs[prior_top_idx])
-                metadata['mcts_top_prior_prob'] = float(prior_probs[improved_top_idx])
-                metadata['mcts_policy_kl'] = float(np.sum(
-                    target_probs * (
-                        np.log(np.clip(target_probs, 1e-12, 1.0))
-                        - np.log(np.clip(prior_probs, 1e-12, 1.0))
-                    )
-                ))
-                metadata['policy_kld'] = metadata['mcts_policy_kl']
-                ordered = np.sort(target_probs)
-                top = float(ordered[-1])
-                second = float(ordered[-2]) if ordered.size > 1 else 0.0
-                metadata['top_visit_prob'] = top
-                metadata['visit_gap'] = max(0.0, top - second)
-                target_entropy = float(-np.sum(
-                    target_probs * np.log(np.clip(target_probs, 1e-12, 1.0))
-                ))
-                metadata['visit_entropy'] = (
-                    target_entropy / max(1e-12, math.log(len(improved)))
-                    if len(target_probs) > 1 else 0.0
-                )
-
                 cumulative = root.edges.visit_counts.astype(np.float64, copy=False)
-                if cumulative[improved_top_idx] > 0.0:
-                    metadata['best_q'] = float(max(
-                        -1.0,
-                        min(
-                            1.0,
-                            -float(root.edges.value_sums[improved_top_idx])
-                            / float(cumulative[improved_top_idx]),
-                        ),
-                    ))
-                if cumulative[prior_top_idx] > 0.0 and cumulative[improved_top_idx] > 0.0:
-                    prior_q = -float(root.edges.value_sums[prior_top_idx]) / cumulative[prior_top_idx]
-                    improved_q = -float(root.edges.value_sums[improved_top_idx]) / cumulative[improved_top_idx]
-                    q_delta = float(max(-2.0, min(2.0, improved_q - prior_q)))
-                    metadata['mcts_q_delta'] = q_delta
-                    metadata['mcts_changed_to_lower_q'] = (
-                        1.0 if prior_top_idx != improved_top_idx and q_delta < -0.02 else 0.0
-                    )
+                target_telemetry = _gumbel_policy_target_telemetry(
+                    target_probs,
+                    prior_probs,
+                    cumulative,
+                    root.edges.value_sums,
+                )
+                if target_telemetry is not None:
+                    metadata.update(target_telemetry)
+                else:
+                    # Invalid target data cannot certify a changed top or measured Q.
+                    metadata['prior_mcts_agree'] = 1.0
+                    metadata['prior_top_visit_prob'] = None
+                    metadata['mcts_top_prior_prob'] = None
+                    metadata['mcts_policy_kl'] = None
+                    metadata['policy_kld'] = None
+                    metadata['top_visit_prob'] = None
+                    metadata['visit_gap'] = None
+                    metadata['visit_entropy'] = None
+                    metadata['best_q'] = None
+                    metadata['mcts_q_delta'] = None
+                    metadata['mcts_changed_to_lower_q'] = None
                 if (
                     selected_idx is not None
                     and cumulative[prior_top_idx] > 0.0
@@ -3934,6 +4106,53 @@ class MultiGameBatchMCTS:
                     metadata['selected_q_delta'] = float(
                         max(-2.0, min(2.0, selected_q - prior_q))
                     )
+
+                # Transform eligibility uses the original improved target and its
+                # measured Q evidence. Only after an applied transformation do we
+                # recalculate target telemetry for the distribution stored in replay.
+                if self.policy_target_mode == 'challenge_delta' and policy_target:
+                    prior_by_move = {
+                        move: float(probability)
+                        for move, probability in zip(root.edges.moves, prior_probs)
+                    }
+                    transformed_target, intervention = _build_challenge_delta_policy_target(
+                        policy_target,
+                        prior_by_move,
+                        changed_top=original_changed_top,
+                        q_delta=metadata.get('mcts_q_delta'),
+                        prior_fraction=self.challenge_delta_prior_fraction,
+                    )
+                    if intervention['applied']:
+                        metadata['policy_target_probs_override'] = transformed_target
+                        metadata['policy_target_by_move'] = transformed_target
+                        metadata['policy_target_intervention_applied'] = True
+                        metadata['policy_target_removed_prior_mass'] = float(
+                            intervention['removed_prior_mass']
+                        )
+                        transformed_probs = np.asarray([
+                            float(transformed_target.get(move, 0.0))
+                            for move in root.edges.moves
+                        ], dtype=np.float64)
+                        transformed_telemetry = _gumbel_policy_target_telemetry(
+                            transformed_probs,
+                            prior_probs,
+                            cumulative,
+                            root.edges.value_sums,
+                        )
+                        if transformed_telemetry is not None:
+                            metadata.update(transformed_telemetry)
+                        else:
+                            metadata['prior_mcts_agree'] = 1.0
+                            metadata['prior_top_visit_prob'] = None
+                            metadata['mcts_top_prior_prob'] = None
+                            metadata['mcts_policy_kl'] = None
+                            metadata['policy_kld'] = None
+                            metadata['top_visit_prob'] = None
+                            metadata['visit_gap'] = None
+                            metadata['visit_entropy'] = None
+                            metadata['best_q'] = None
+                            metadata['mcts_q_delta'] = None
+                            metadata['mcts_changed_to_lower_q'] = None
 
                 root_result = {
                     move: float(count)

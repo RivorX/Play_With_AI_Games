@@ -970,6 +970,15 @@ class RLLoggerMixin:
             'policy_target_top3_prob_mean': _value(replay_stats, 'policy_target_top3_prob_mean'),
             'policy_target_effective_moves': _value(replay_stats, 'policy_target_effective_moves'),
             'policy_entropy_ratio': policy_entropy_ratio,
+            'policy_target_sample_count': _value(
+                selfplay_stats, 'policy_target_sample_count'
+            ),
+            'policy_target_challenge_delta_intervention_count': _value(
+                selfplay_stats, 'policy_target_challenge_delta_intervention_count'
+            ),
+            'policy_target_challenge_delta_intervention_rate': _value(
+                selfplay_stats, 'policy_target_challenge_delta_intervention_rate'
+            ),
             'replay_policy_correction_fraction': _value(
                 replay_stats, 'policy_correction_fraction'
             ),

@@ -42,5 +42,7 @@ logs
 chess/data/*
 chess/models/IL/*
 chess/models/RL/*
+# Root-level, run-specific RL champion exports; keep canonical best_model_rl.pt.
+chess/models/best_model_rl_*.pt
 chess/engines/
 chess/.cache/

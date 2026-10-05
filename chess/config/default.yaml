@@ -155,10 +155,11 @@ reinforcement_learning:
     # Promotion evaluation is exact: both models receive 192 fresh root
     # simulations on 96 unique colour-paired opening positions, without
     # self-play redistribution or easy-root cuts.
-    # Raw-policy matches protect promotion from checkpoints whose search is
-    # strong but whose policy has not absorbed it yet. This gate does not choose
-    # the self-play actor: a safe learner-MCTS actor may still generate data.
-    eval_no_mcts_every: 2
+    # Raw-policy matches are periodic diagnostics; every MCTS promotion
+    # candidate still gets a fresh same-iteration raw match on demand.
+    # This gate does not choose the self-play actor: a safe learner-MCTS actor
+    # may still generate data.
+    eval_no_mcts_every: 4
     eval_no_mcts_games: 96
     promotion_no_mcts_gate_enabled: true
     # The one-sided raw-NN lower bound must reach 48% against best.
