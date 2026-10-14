@@ -189,6 +189,13 @@ def _load_with_allowed_missing_prefixes(model, checkpoint, allowed_missing_prefi
     return missing
 
 
+def _is_diagnostic_candidate_checkpoint(path):
+    path = Path(path)
+    return path.name.endswith("_candidate.pt") or any(
+        "_candidate_archive" in part for part in path.parts
+    )
+
+
 def _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir):
     """Return only checkpoints that belong to the RL checkpoint namespace.
 
@@ -204,7 +211,9 @@ def _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir):
         (
             path
             for path in Path(rl_dir).rglob("*.pt")
-            if path.is_file() and not path.name.endswith(".replay.pt")
+            if path.is_file()
+            and not path.name.endswith(".replay.pt")
+            and not _is_diagnostic_candidate_checkpoint(path)
         ),
         key=lambda path: (-path.stat().st_mtime, str(path).lower()),
     )
@@ -225,7 +234,9 @@ def _collect_transfer_checkpoints(models_dir, best_model_rl_path, rl_dir):
         (
             path
             for path in Path(models_dir).rglob("*.pt")
-            if path.is_file() and not path.name.endswith(".replay.pt")
+            if path.is_file()
+            and not path.name.endswith(".replay.pt")
+            and not _is_diagnostic_candidate_checkpoint(path)
         ),
         key=lambda path: (-path.stat().st_mtime, str(path).lower()),
     )
@@ -472,6 +483,7 @@ def plan_rl_startup(
     available_checkpoints = initial_plan.get("available_checkpoints")
     if available_checkpoints is None:
         available_checkpoints = _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir)
+    forced_checkpoint = initial_plan.get("forced_checkpoint")
     selected_checkpoint = None
     checkpoint_catalog = []
     start_mode = initial_plan.get("start_mode")
@@ -511,6 +523,7 @@ def plan_rl_startup(
             "start_mode": start_mode,
             "new_init_mode": new_init_mode,
             "available_checkpoints": available_checkpoints,
+            "forced_checkpoint": forced_checkpoint,
         }
 
     if start_mode == "new":
@@ -533,10 +546,26 @@ def plan_rl_startup(
                 and bool(entry.get("strict_resume_ok"))
             ]
         _print_checkpoint_catalog(checkpoint_catalog, start_mode)
-        selected_checkpoint = _choose_checkpoint_path(
-            checkpoint_catalog,
-            prefer_newest=(start_mode == "resume"),
-        )
+        if forced_checkpoint is not None:
+            forced_path = Path(forced_checkpoint).resolve()
+            forced_entries = [
+                entry
+                for entry in checkpoint_catalog
+                if not entry.get("error")
+                and Path(str(entry.get("path", ""))).resolve() == forced_path
+            ]
+            if len(forced_entries) != 1:
+                raise RuntimeError(
+                    "The explicitly requested resume checkpoint is not a unique, "
+                    "strictly compatible RL checkpoint with optimizer state: "
+                    f"{forced_path}"
+                )
+            selected_checkpoint = forced_entries[0]["path"]
+        else:
+            selected_checkpoint = _choose_checkpoint_path(
+                checkpoint_catalog,
+                prefer_newest=(start_mode == "resume"),
+            )
 
     if start_mode in {"resume", "transfer"} and selected_checkpoint is None:
         raise RuntimeError(

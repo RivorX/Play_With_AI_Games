@@ -4,10 +4,12 @@ Sequential Halving selects root actions and completed-Q policy improvement is
 used below the root and for replay targets.
 """
 
+import errno
 import logging
 import math
 import os
 import shutil
+import struct
 import tempfile
 import time
 import weakref
@@ -593,6 +595,29 @@ def _gumbel_policy_target_telemetry(target_probs, prior_probs, visit_counts, val
     return result
 
 
+def _clear_gumbel_policy_target_telemetry(metadata):
+    """Mark target-derived measurements unavailable when the target is invalid.
+
+    In particular, an invalid distribution cannot be counted as agreement with
+    the prior: self-play aggregation treats ``prior_mcts_agree is None`` as an
+    unavailable sample and excludes it from agreement/correction rates.
+    """
+    for key in (
+        'prior_mcts_agree',
+        'prior_top_visit_prob',
+        'mcts_top_prior_prob',
+        'mcts_policy_kl',
+        'policy_kld',
+        'top_visit_prob',
+        'visit_gap',
+        'visit_entropy',
+        'best_q',
+        'mcts_q_delta',
+        'mcts_changed_to_lower_q',
+    ):
+        metadata[key] = None
+
+
 def _gumbel_prior_difficulty(root):
     """Prior-only uncertainty used to assign a budget before Gumbel search.
 
@@ -725,8 +750,9 @@ def _search_correction_metadata(search_metadata):
     """Return the persisted top-change flag and measured Q delta."""
     metadata = search_metadata if isinstance(search_metadata, dict) else {}
     try:
-        changed_top = float(metadata.get('prior_mcts_agree', 1.0) or 0.0) < 0.5
-    except (TypeError, ValueError):
+        prior_mcts_agree = float(metadata.get('prior_mcts_agree'))
+        changed_top = math.isfinite(prior_mcts_agree) and prior_mcts_agree < 0.5
+    except (TypeError, ValueError, OverflowError):
         changed_top = False
     try:
         q_delta = float(metadata.get('mcts_q_delta', float('nan')))
@@ -908,6 +934,134 @@ def _get_syzygy_oracle(config):
     return oracle if oracle.enabled else None
 
 
+
+def _lock_file_identity(stat_result):
+    return (
+        getattr(stat_result, "st_dev", None),
+        getattr(stat_result, "st_ino", None),
+        getattr(stat_result, "st_size", None),
+        getattr(stat_result, "st_mtime_ns", None),
+        getattr(stat_result, "st_ctime_ns", None),
+    )
+
+
+def _windows_process_creation_generation(process_handle):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_times = kernel32.GetProcessTimes
+    get_times.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    )
+    get_times.restype = wintypes.BOOL
+    created = wintypes.FILETIME()
+    exited = wintypes.FILETIME()
+    kernel = wintypes.FILETIME()
+    user = wintypes.FILETIME()
+    if not get_times(
+        process_handle,
+        ctypes.byref(created),
+        ctypes.byref(exited),
+        ctypes.byref(kernel),
+        ctypes.byref(user),
+    ):
+        return None
+    return (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+
+
+def _current_process_creation_generation():
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_current_process = kernel32.GetCurrentProcess
+        get_current_process.restype = wintypes.HANDLE
+        return _windows_process_creation_generation(get_current_process())
+    except (AttributeError, OSError):
+        return None
+
+
+def _process_liveness(pid, expected_generation=None):
+    """Return True for live, False for verified dead, or None if unknown."""
+    if int(pid) <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_process.restype = wintypes.HANDLE
+        wait_for_single = kernel32.WaitForSingleObject
+        wait_for_single.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        wait_for_single.restype = wintypes.DWORD
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(0x00101000, False, int(pid))  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            # ERROR_INVALID_PARAMETER means the PID does not identify a process.
+            # Access denied and all other errors are unknown: fail closed.
+            return False if ctypes.get_last_error() == 87 else None
+        try:
+            wait_result = wait_for_single(handle, 0)
+            if wait_result == 0:  # WAIT_OBJECT_0: process exited.
+                return False
+            if wait_result != 0x102:  # Anything except WAIT_TIMEOUT is unknown.
+                return None
+            generation = _windows_process_creation_generation(handle)
+            if generation is None:
+                return None
+            if expected_generation is not None:
+                return generation == expected_generation
+            return True
+        finally:
+            close_handle(handle)
+
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
+            return None
+        return None
+    return True
+
+
+
+def _unlink_lock_if_unchanged(lock_path, expected_identity, expected_payload=None):
+    """Remove a lock only when its path still names the inspected file."""
+    try:
+        before = lock_path.stat()
+        if _lock_file_identity(before) != expected_identity:
+            return False
+        payload = lock_path.read_bytes()
+        after = lock_path.stat()
+        if _lock_file_identity(after) != expected_identity:
+            return False
+        if expected_payload is not None and payload != expected_payload:
+            return False
+        lock_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
 class _SelfPlayCompileLock:
     def __init__(self, lock_path, timeout_s=900.0, poll_s=0.2, stale_after_s=1800.0):
         self.lock_path = Path(lock_path)
@@ -915,6 +1069,8 @@ class _SelfPlayCompileLock:
         self.poll_s = max(0.05, float(poll_s))
         self.stale_after_s = max(self.timeout_s, float(stale_after_s))
         self._fd = None
+        self._owned_identity = None
+        self._owned_payload = None
 
     def __enter__(self):
         start_t = time.perf_counter()
@@ -922,18 +1078,67 @@ class _SelfPlayCompileLock:
         while True:
             try:
                 self._fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                payload = f"{os.getpid()} {time.time():.6f}\n".encode("ascii", errors="ignore")
-                os.write(self._fd, payload)
+                lock_created_at = time.time()
+                generation = _current_process_creation_generation()
+                generation_field = f" {generation}" if generation is not None else ""
+                payload = (
+                    f"{os.getpid()} {lock_created_at:.6f}{generation_field}\n"
+                    .encode("ascii", errors="ignore")
+                )
+                written = 0
+                while written < len(payload):
+                    written += os.write(self._fd, payload[written:])
+                fd_identity = _lock_file_identity(os.fstat(self._fd))
+                self._owned_payload = self.lock_path.read_bytes()
+                self._owned_identity = _lock_file_identity(self.lock_path.stat())
+                if fd_identity[:2] != self._owned_identity[:2]:
+                    os.close(self._fd)
+                    self._fd = None
+                    self._owned_identity = None
+                    self._owned_payload = None
+                    continue
                 return self
             except FileExistsError:
                 try:
                     stat = self.lock_path.stat()
+                    identity = _lock_file_identity(stat)
                     age_s = max(0.0, time.time() - float(stat.st_mtime))
-                    if age_s > self.stale_after_s:
-                        self.lock_path.unlink(missing_ok=True)
+                    payload = self.lock_path.read_bytes()
+                    if _lock_file_identity(self.lock_path.stat()) != identity:
                         continue
-                except Exception:
-                    pass
+                except OSError:
+                    identity = None
+                    age_s = 0.0
+                    payload = b""
+
+                owner_pid = None
+                owner_generation = None
+                if identity is not None:
+                    try:
+                        fields = payload.decode("ascii", errors="strict").strip().split()
+                        if len(fields) >= 2:
+                            parsed_pid = int(fields[0])
+                            float(fields[1])  # Keep malformed records on age fallback.
+                            if parsed_pid > 0:
+                                owner_pid = parsed_pid
+                                if len(fields) >= 3:
+                                    try:
+                                        owner_generation = int(fields[2])
+                                    except ValueError:
+                                        owner_generation = None
+                    except (UnicodeError, ValueError, IndexError):
+                        pass
+
+                reclaim = False
+                if owner_pid is not None:
+                    reclaim = _process_liveness(owner_pid, owner_generation) is False
+                elif identity is not None and age_s > self.stale_after_s:
+                    # Only legacy malformed/empty files use age fallback. Never
+                    # unlink a fresh file that may be between create and write.
+                    reclaim = True
+                if reclaim and identity is not None:
+                    if _unlink_lock_if_unchanged(self.lock_path, identity, payload):
+                        continue
                 if (time.perf_counter() - start_t) >= self.timeout_s:
                     raise TimeoutError(f"Timed out waiting for compile lock: {self.lock_path}")
                 time.sleep(self.poll_s)
@@ -945,10 +1150,15 @@ class _SelfPlayCompileLock:
         finally:
             self._fd = None
             try:
-                self.lock_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
+                if self._owned_identity is not None:
+                    _unlink_lock_if_unchanged(
+                        self.lock_path,
+                        self._owned_identity,
+                        self._owned_payload,
+                    )
+            finally:
+                self._owned_identity = None
+                self._owned_payload = None
 
 def _resolve_selfplay_compile_enabled(config, device):
     if device.type != 'cuda' or not torch.cuda.is_available():
@@ -1144,8 +1354,44 @@ def _copy_board_fast(board):
 
 def _board_position_key(board):
     """
-    Fast board identity for tree reuse.
+    Repetition identity for FIDE position matching.
+
+    The halfmove and fullmove counters do not define a position for repetition
+    purposes. An en-passant target does define one only when the side to move
+    has a legal en-passant capture; an uncapturable or pinned capture must not
+    distinguish otherwise identical positions.
     """
+    piece_masks = tuple(
+        int(board[color, piece_type])
+        for color, piece_type in _INPUT_PIECE_SPECS
+    )
+    castling_rights = (
+        int(chess.has_kingside_castling_rights(board, chess.WHITE))
+        | (int(chess.has_queenside_castling_rights(board, chess.WHITE)) << 1)
+        | (int(chess.has_kingside_castling_rights(board, chess.BLACK)) << 2)
+        | (int(chess.has_queenside_castling_rights(board, chess.BLACK)) << 3)
+    )
+    ep_square = board.en_passant_square
+    if ep_square is not None and any(
+        chess.is_en_passant(board, move) for move in chess.legal_moves(board)
+    ):
+        ep_square = chess.square_index(ep_square) + 1
+    else:
+        ep_square = 0
+    # Twelve 64-bit piece masks plus side, rights and EP sentinel/index. This
+    # exact fixed-width encoding avoids retaining a nested tuple and 12 PyLongs
+    # on every node whose repetition key is cached.
+    return struct.pack(
+        "<12QBBB",
+        *piece_masks,
+        int(board.turn == chess.BLACK),
+        castling_rights,
+        ep_square,
+    )
+
+
+def _board_tree_reuse_key(board):
+    """Keep root reuse tied to the backend's full board hash, including clocks."""
     return chess.position_key(board)
 
 
@@ -1515,6 +1761,7 @@ class MCTSNode:
         "expanded",
         "_root_virtual_loss",
         "_position_key_cache",
+        "_tree_reuse_key_cache",
         "_board_tensor",
         "_legal_moves",
         "_legal_indices",
@@ -1539,6 +1786,7 @@ class MCTSNode:
         self._root_virtual_loss = 0
 
         self._position_key_cache = None
+        self._tree_reuse_key_cache = None
         self._board_tensor = None
         self._legal_moves = None
         self._legal_indices = None
@@ -1677,6 +1925,7 @@ class MCTSNode:
         self._legal_moves = None
         self._legal_indices = None
         self._position_key_cache = None
+        self._tree_reuse_key_cache = None
 
     def iter_child_nodes(self):
         return self.edges.iter_nodes()
@@ -1691,6 +1940,11 @@ class MCTSNode:
         if self._position_key_cache is None:
             self._position_key_cache = _board_position_key(self.board)
         return self._position_key_cache
+
+    def get_tree_reuse_key(self):
+        if self._tree_reuse_key_cache is None:
+            self._tree_reuse_key_cache = _board_tree_reuse_key(self.board)
+        return self._tree_reuse_key_cache
 
     def get_legal_moves(self):
         if self._legal_moves is None:
@@ -1757,6 +2011,16 @@ def _build_sparse_policy_target_from_visits(visit_counts, board):
     )
 
 
+def _optional_int32_search_count(value):
+    if value is None:
+        return -1
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return -1
+    return count if 0 <= count <= (1 << 31) - 1 else -1
+
+
 def _pack_positions_for_transfer(positions, max_policy_targets=None):
     """
     Pack self-play positions into batched tensors for queue transport.
@@ -1797,6 +2061,10 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     game_ply_indices = torch.full((batch_size,), -1, dtype=torch.int16)
     regret_targets = torch.full((batch_size,), float('nan'), dtype=torch.float32)
     archive_ids = torch.full((batch_size,), -1, dtype=torch.int64)
+    search_budget_assigned = torch.full((batch_size,), -1, dtype=torch.int32)
+    search_simulations_effective = torch.full((batch_size,), -1, dtype=torch.int32)
+    search_simulations_fresh = torch.full((batch_size,), -1, dtype=torch.int32)
+    search_visits_inherited_credit = torch.full((batch_size,), -1, dtype=torch.int32)
     fens = []
     history_fens = []
 
@@ -1840,6 +2108,14 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
             regret_targets[row_idx] = float(pos[22])
         if len(pos) > 23 and pos[23] is not None:
             archive_ids[row_idx] = int(pos[23])
+        if len(pos) > 24:
+            search_budget_assigned[row_idx] = _optional_int32_search_count(pos[24])
+        if len(pos) > 25:
+            search_simulations_effective[row_idx] = _optional_int32_search_count(pos[25])
+        if len(pos) > 26:
+            search_simulations_fresh[row_idx] = _optional_int32_search_count(pos[26])
+        if len(pos) > 27:
+            search_visits_inherited_credit[row_idx] = _optional_int32_search_count(pos[27])
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -1873,6 +2149,10 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         'game_ply_indices': game_ply_indices,
         'regret_targets': regret_targets,
         'archive_ids': archive_ids,
+        'search_budget_assigned': search_budget_assigned,
+        'search_simulations_effective': search_simulations_effective,
+        'search_simulations_fresh': search_simulations_fresh,
+        'search_visits_inherited_credit': search_visits_inherited_credit,
         'num_positions': batch_size,
     }
 
@@ -2312,6 +2592,164 @@ class MultiGameBatchMCTS:
             self._history_tensor_cache.popitem(last=False)
         return cached
 
+    def _encode_native_history_pairs(self, pending):
+        """Encode the cache misses from one leaf batch in a single native call."""
+        if not pending:
+            return {}
+
+        profile_t0 = time.perf_counter() if self.profile_enabled else None
+        pending_items = list(pending.items())
+        pair_count = len(pending_items)
+        row_count = pair_count * 2
+        (
+            piece_masks,
+            black_to_move,
+            castling_masks,
+            en_passant_masks,
+            halfmove_values,
+            fullmove_values,
+        ) = self._get_native_board_plane_scratch(row_count)
+        encoded_pairs = np.empty(
+            (row_count, 16, 8, 8),
+            dtype=self.history_storage_dtype,
+        )
+        for pair_idx, (_cache_key, node) in enumerate(pending_items):
+            board = node.board
+            white_row = pair_idx * 2
+            black_row = white_row + 1
+            for plane_idx, (color, piece_type) in enumerate(_INPUT_PIECE_SPECS):
+                mask = int(board[color, piece_type])
+                piece_masks[white_row, plane_idx] = mask
+                piece_masks[black_row, plane_idx] = mask
+
+            castling_rights = board.castling_rights
+            ep_square = board.en_passant_square
+            ep_mask = 0 if ep_square is None else 1 << chess.square_index(ep_square)
+            halfmove_value = min(float(board.halfmove_clock) / 50.0, 1.0)
+            fullmove_value = min(float(board.fullmove_number) / 100.0, 1.0)
+            for row_idx, is_black in ((white_row, False), (black_row, True)):
+                black_to_move[row_idx] = int(is_black)
+                pov_color = chess.BLACK if is_black else chess.WHITE
+                kingside_flag = (
+                    chess.BLACK_KINGSIDE if is_black else chess.WHITE_KINGSIDE
+                )
+                queenside_flag = (
+                    chess.BLACK_QUEENSIDE if is_black else chess.WHITE_QUEENSIDE
+                )
+                kingside = kingside_flag in castling_rights
+                queenside = queenside_flag in castling_rights
+                castling_mask = 0
+                if kingside or queenside:
+                    king_square = chess.king_square(board, pov_color)
+                    if king_square is not None:
+                        king_index = chess.square_index(king_square)
+                        castling_mask |= 1 << king_index
+                        back_rank_base = (king_index >> 3) << 3
+                        if kingside:
+                            castling_mask |= 1 << (back_rank_base + 7)
+                        if queenside:
+                            castling_mask |= 1 << back_rank_base
+                castling_masks[row_idx] = castling_mask
+                en_passant_masks[row_idx] = ep_mask
+                halfmove_values[row_idx] = halfmove_value
+                fullmove_values[row_idx] = fullmove_value
+
+        self._native_mcts.encode_board_planes(
+            piece_masks,
+            black_to_move,
+            castling_masks,
+            en_passant_masks,
+            halfmove_values,
+            fullmove_values,
+            encoded_pairs,
+        )
+        resolved = {}
+        cache = self._history_tensor_cache
+        for pair_idx, (cache_key, node) in enumerate(pending_items):
+            pair = encoded_pairs[pair_idx * 2:pair_idx * 2 + 2].copy()
+            cached = (pair[0], pair[1])
+            cache[cache_key] = (weakref.ref(node), cached)
+            cache.move_to_end(cache_key)
+            resolved[cache_key] = (node, cached)
+            while len(cache) > self._history_tensor_cache_capacity:
+                cache.popitem(last=False)
+
+        if profile_t0 is not None:
+            self._profile_add('board_to_tensor_time', time.perf_counter() - profile_t0)
+            self._profile_inc('board_to_tensor_calls', pair_count * 2)
+        return resolved
+
+    def _fill_history_prefixes_for_nodes(
+        self,
+        nodes,
+        game_indices,
+        board_histories,
+        destinations,
+    ):
+        """Fill a leaf batch's histories while batching newly used MCTS ancestors."""
+        if self.history_positions <= 0:
+            return
+
+        profile_t0 = time.perf_counter() if self.profile_detail_enabled else None
+        native_batch = (
+            self._native_input_planes_enabled
+            and self.cache_history_tensors
+        )
+        cache = self._history_tensor_cache
+        pending = {}
+        resolved = {}
+        rows = []
+        history_positions = int(self.history_positions)
+        for row_idx, node in enumerate(nodes):
+            entries = self._collect_node_history_entries(
+                node,
+                board_histories[game_indices[row_idx]],
+            )
+            use_black_pov = node.board.turn == chess.BLACK
+            first_slot = max(0, history_positions - len(entries))
+            if native_batch:
+                for entry in entries:
+                    if not isinstance(entry, MCTSNode):
+                        continue
+                    cache_key = id(entry)
+                    already_resolved = resolved.get(cache_key)
+                    if already_resolved is not None and already_resolved[0] is entry:
+                        continue
+                    cached_entry = cache.get(cache_key)
+                    if cached_entry is not None:
+                        node_ref, cached = cached_entry
+                        if node_ref() is entry:
+                            cache.move_to_end(cache_key)
+                            resolved[cache_key] = (entry, cached)
+                            continue
+                        del cache[cache_key]
+                    pending.setdefault(cache_key, entry)
+            rows.append(
+                (node, entries, first_slot, use_black_pov, destinations[row_idx])
+            )
+
+        if pending:
+            resolved.update(self._encode_native_history_pairs(pending))
+
+        for _node, entries, first_slot, use_black_pov, destination in rows:
+            destination.fill(0.0)
+            for slot, entry in enumerate(entries, start=first_slot):
+                begin = slot * self._board_planes
+                end = begin + self._board_planes
+                if native_batch and isinstance(entry, MCTSNode):
+                    cached = resolved.get(id(entry))
+                    if cached is not None and cached[0] is entry:
+                        pair = cached[1]
+                        tensor = pair[1] if use_black_pov else pair[0]
+                    else:
+                        tensor = self._history_tensor_for_entry(entry, use_black_pov)
+                else:
+                    tensor = self._history_tensor_for_entry(entry, use_black_pov)
+                destination[begin:end] = tensor
+
+        if profile_t0 is not None:
+            self._profile_add('batch_expand_history_time', time.perf_counter() - profile_t0)
+
     @staticmethod
     def _is_encoded_history_entry(entry):
         return (
@@ -2473,11 +2911,7 @@ class MultiGameBatchMCTS:
         for row_idx, node in enumerate(nodes):
             board = node.board
             for plane_idx, (color, piece_type) in enumerate(_INPUT_PIECE_SPECS):
-                piece_masks[row_idx, plane_idx] = chess.piece_mask(
-                    board,
-                    piece_type,
-                    color,
-                )
+                piece_masks[row_idx, plane_idx] = int(board[color, piece_type])
             is_black = board.turn == chess.BLACK
             black_to_move[row_idx] = int(is_black)
             pov_color = chess.BLACK if is_black else chess.WHITE
@@ -3386,13 +3820,13 @@ class MultiGameBatchMCTS:
                     root_synced = False
                     root_reused_flags[idx] = True
                 else:
-                    target_key = _board_position_key(board)
-                    if root.get_position_key() == target_key:
+                    target_key = _board_tree_reuse_key(board)
+                    if root.get_tree_reuse_key() == target_key:
                         root_reused_flags[idx] = True
                     else:
                         for move in root.edges.moves:
                             child = root.get_child_for_move(move)
-                            if child is not None and child.get_position_key() == target_key:
+                            if child is not None and child.get_tree_reuse_key() == target_key:
                                 _ = child.board  # Ensure board is instantiated
                                 root = child.detach_as_root()
                                 root_reused_flags[idx] = True
@@ -4084,18 +4518,7 @@ class MultiGameBatchMCTS:
                 if target_telemetry is not None:
                     metadata.update(target_telemetry)
                 else:
-                    # Invalid target data cannot certify a changed top or measured Q.
-                    metadata['prior_mcts_agree'] = 1.0
-                    metadata['prior_top_visit_prob'] = None
-                    metadata['mcts_top_prior_prob'] = None
-                    metadata['mcts_policy_kl'] = None
-                    metadata['policy_kld'] = None
-                    metadata['top_visit_prob'] = None
-                    metadata['visit_gap'] = None
-                    metadata['visit_entropy'] = None
-                    metadata['best_q'] = None
-                    metadata['mcts_q_delta'] = None
-                    metadata['mcts_changed_to_lower_q'] = None
+                    _clear_gumbel_policy_target_telemetry(metadata)
                 if (
                     selected_idx is not None
                     and cumulative[prior_top_idx] > 0.0
@@ -4142,17 +4565,7 @@ class MultiGameBatchMCTS:
                         if transformed_telemetry is not None:
                             metadata.update(transformed_telemetry)
                         else:
-                            metadata['prior_mcts_agree'] = 1.0
-                            metadata['prior_top_visit_prob'] = None
-                            metadata['mcts_top_prior_prob'] = None
-                            metadata['mcts_policy_kl'] = None
-                            metadata['policy_kld'] = None
-                            metadata['top_visit_prob'] = None
-                            metadata['visit_gap'] = None
-                            metadata['visit_entropy'] = None
-                            metadata['best_q'] = None
-                            metadata['mcts_q_delta'] = None
-                            metadata['mcts_changed_to_lower_q'] = None
+                            _clear_gumbel_policy_target_telemetry(metadata)
 
                 root_result = {
                     move: float(count)
@@ -4311,21 +4724,19 @@ class MultiGameBatchMCTS:
                     non_terminal_nodes,
                     boards_np[:, self._history_planes:, :, :],
                 )
+            if self.history_positions > 0:
+                self._fill_history_prefixes_for_nodes(
+                    non_terminal_nodes,
+                    non_terminal_game_indices,
+                    board_histories,
+                    boards_np[:, :self._history_planes, :, :],
+                )
             for row_idx, (node, gi) in enumerate(zip(non_terminal_nodes, non_terminal_game_indices)):
                 if not self._native_input_planes_enabled:
                     self._current_tensor_for_node(
                         node,
                         out=boards_np[row_idx, self._history_planes:, :, :],
                     )
-                history_t0 = perf_counter() if profile_detail else None
-                if self.history_positions > 0:
-                    self._fill_history_prefix_for_node(
-                        node,
-                        board_histories[gi],
-                        boards_np[row_idx, :self._history_planes],
-                    )
-                if profile_detail:
-                    self._profile_add('batch_expand_history_time', perf_counter() - history_t0)
             if profile_timing:
                 self._profile_add('batch_expand_tensor_pack_time', perf_counter() - tensor_pack_t0)
 

@@ -125,6 +125,9 @@ reinforcement_learning:
     # lowering supervised loss but raw NN fell back to 50%, so three is the
     # measured quality/overfit boundary rather than simply using the maximum.
     train_epochs_per_iteration: 3
+    # Optional BN-only regularization: use running stats without freezing affine
+    # parameters; dropout and other train-mode behavior remain enabled.
+    freeze_batchnorm_stats: false
 
     # RL72 reached near-zero late holdout uptake while gradient clipping was
     # effectively inactive. Raise plasticity in one controlled axis; retain the

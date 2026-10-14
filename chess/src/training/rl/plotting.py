@@ -363,20 +363,17 @@ def _value_search_alignment_panel(ax, rows, *, break_after=None):
 
 
 def _promotion_strength_panel(ax, rows, rl_cfg):
-    """Show selector evidence and independent confirmation as separate tests.
-
-    Selector results decide which checkpoints are worth confirming, so they
-    are intentionally never averaged with the independent holdout results.
-    The lower-bound stems make the statistical gates visible alongside each
-    observed score.
-    """
-    _style(ax, "Promotion evidence: selector → independent holdout", percent=True)
+    """Show promotion evidence without combining distinct evaluation protocols."""
+    _style(ax, "Promotion evidence", percent=True)
     selector_score_min = float(rl_cfg.get("score_rate_threshold", 0.55) or 0.55)
     selector_lb_min = float(
         rl_cfg.get("promotion_score_lower_bound_min", 0.50) or 0.50
     )
     confirmation_score_min = float(
         rl_cfg.get("promotion_confirmation_score_rate_min", 0.53) or 0.53
+    )
+    raw_score_min = float(
+        rl_cfg.get("promotion_no_mcts_score_rate_min", 0.48) or 0.48
     )
     confirmation_lb_min = float(
         rl_cfg.get("promotion_confirmation_score_lower_bound_min", 0.50) or 0.50
@@ -385,135 +382,142 @@ def _promotion_strength_panel(ax, rows, rl_cfg):
         1, int(_number(rl_cfg.get("eval_funnel_advanced_games")) or 192)
     )
 
-    # Score gates are separate because selector and confirmation have
-    # different thresholds. Confidence floors usually coincide; draw a
-    # single line when they do to keep the panel legible.
-    ax.axhline(
-        selector_score_min, color=_COLORS[0], lw=1.0, ls=":",
-        label=f"selector score gate {selector_score_min:.0%}",
-    )
-    ax.axhline(
-        confirmation_score_min, color="#c2410c", lw=1.0, ls="--",
-        label=f"holdout score gate {confirmation_score_min:.0%}",
-    )
-    if abs(selector_lb_min - confirmation_lb_min) < 1e-9:
-        ax.axhline(
-            selector_lb_min, color="#4b5563", lw=1.0, ls="-.",
-            label=f"lower-bound gates {selector_lb_min:.0%}",
-        )
-    else:
-        ax.axhline(
-            selector_lb_min, color=_COLORS[0], lw=1.0, ls="-.", alpha=0.8,
-            label=f"selector LB gate {selector_lb_min:.0%}",
-        )
-        ax.axhline(
-            confirmation_lb_min, color="#c2410c", lw=1.0, ls="-.", alpha=0.8,
-            label=f"holdout LB gate {confirmation_lb_min:.0%}",
-        )
+    # Keep thresholds visible as subtle guides; their concise values are
+    # summarized below the legend instead of becoming extra legend entries.
+    gate_color = "#6b7280"
+    for value, linestyle in (
+        (selector_score_min, ":"),
+        (confirmation_score_min, "--"),
+        (raw_score_min, ":"),
+    ):
+        ax.axhline(value, color=gate_color, lw=0.8, ls=linestyle, alpha=0.48,
+                   zorder=0)
+    for value in sorted({selector_lb_min, confirmation_lb_min}):
+        ax.axhline(value, color="#374151", lw=0.9, ls="-.", alpha=0.62,
+                   zorder=0)
 
-    xs, scores, lowers, games, full, statuses = [], [], [], [], [], []
-    hx, hscores, hlowers, hgames, hstatuses = [], [], [], [], []
+    selector, raw_nn, holdout = [], [], []
     for row in rows:
         iteration = _number(row.get("iteration"))
-        score = _number(row.get("score_rate"))
         if iteration is None:
             continue
+
+        score = _number(row.get("score_rate"))
         count = int(_number(row.get("eval_games")) or 0)
         stage = str(row.get("eval_stage") or "").strip().lower()
         is_full = stage == "funnel:advanced" and count >= advanced_games
-        lower = _number(row.get("eval_score_lower_bound"))
         if score is not None:
-            xs.append(int(iteration))
-            scores.append(score)
-            lowers.append(lower if lower is not None else score)
-            games.append(count)
-            full.append(is_full)
-            statuses.append(str(row.get("promotion_status") or "").strip().lower())
+            candidate_status = str(
+                row.get("mcts_candidate_status") or row.get("promotion_status") or ""
+            ).strip().lower()
+            selector.append({
+                "x": int(iteration), "score": score,
+                "lower": _number(row.get("eval_score_lower_bound")),
+                "upper": _number(row.get("eval_score_upper_bound")),
+                "games": count, "full": is_full, "status": candidate_status,
+                "decision_status": str(row.get("promotion_status") or "").strip().lower(),
+            })
+
+        # Missing means unmeasured; never coerce raw NN evidence to zero.
+        raw_score = _number(row.get("no_mcts_score_rate"))
+        if raw_score is not None:
+            raw_nn.append({
+                "x": int(iteration), "score": raw_score,
+                "lower": _number(row.get("no_mcts_score_lower_bound")),
+                "upper": _number(row.get("no_mcts_score_upper_bound")),
+                "games": int(_number(row.get("no_mcts_games")) or 0),
+                "status": str(row.get("promotion_raw_nn_status") or "").strip().lower(),
+            })
 
         holdout_score = _number(row.get("promotion_confirmation_score_rate"))
-        if holdout_score is None:
-            continue
-        hx.append(int(iteration))
-        hscores.append(holdout_score)
-        holdout_lb = _number(row.get("promotion_confirmation_score_lower_bound"))
-        hlowers.append(holdout_lb if holdout_lb is not None else holdout_score)
-        hgames.append(int(_number(row.get("promotion_confirmation_games")) or 0))
-        hstatuses.append(
-            str(row.get("promotion_confirmation_status") or "").strip().lower()
-        )
+        if holdout_score is not None:
+            holdout.append({
+                "x": int(iteration), "score": holdout_score,
+                "lower": _number(row.get("promotion_confirmation_score_lower_bound")),
+                "upper": _number(row.get("promotion_confirmation_score_upper_bound")),
+                "games": int(_number(row.get("promotion_confirmation_games")) or 0),
+                "status": str(row.get("promotion_confirmation_status") or "").strip().lower(),
+            })
 
-    if not xs and not hx:
+    if not selector and not raw_nn and not holdout:
         _no_data(ax, "Promotion funnel telemetry is unavailable in this CSV")
         return False
 
-    # Selector scores form a timeline; hollow triangles are incomplete
-    # 48/96-game looks, while filled circles are complete advanced evaluations.
-    if xs:
-        ax.plot(xs, scores, color=_COLORS[0], lw=1.3, alpha=0.55, zorder=2)
-        for index, (x, score, lower, count, is_full, status) in enumerate(
-            zip(xs, scores, lowers, games, full, statuses)
-        ):
-            ax.vlines(x, lower, score, color=_COLORS[0], linewidth=1.2, alpha=0.85, zorder=3)
-            promoted = status.startswith("promoted")
-            rejected = status.startswith(("hold:", "blocked:"))
-            marker = "*" if promoted else ("o" if is_full else "^")
-            face = _COLORS[0] if is_full or promoted else "white"
-            edge = "#b91c1c" if rejected else (_COLORS[0] if not promoted else "#166534")
-            ax.scatter(
-                [x], [score], marker=marker, s=58 if promoted else 34,
-                facecolors=face,
-                edgecolors=edge,
-                linewidths=0.9, zorder=5,
-                label=("selector score (full)" if is_full else "selector score (partial)")
-                if ("selector score (full)" if is_full else "selector score (partial)")
-                not in ax.get_legend_handles_labels()[1] else None,
+    def draw_evidence(items, *, offset, color, label, marker):
+        """Draw one protocol, preserving sparse stages and logged intervals."""
+        # Do not draw a continuous trend across iterations where that protocol
+        # was not run. In particular, holdout evidence is intentionally sparse.
+        segment = []
+        for item in sorted(items, key=lambda value: value["x"]):
+            if segment and item["x"] != segment[-1]["x"] + 1:
+                if len(segment) > 1:
+                    ax.plot(
+                        [point["x"] + offset for point in segment],
+                        [point["score"] for point in segment],
+                        color=color, lw=1.0, alpha=0.35, zorder=1,
+                    )
+                segment = []
+            segment.append(item)
+        if len(segment) > 1:
+            ax.plot(
+                [point["x"] + offset for point in segment],
+                [point["score"] for point in segment],
+                color=color, lw=1.0, alpha=0.35, zorder=1,
             )
-            ax.scatter(
-                [x], [lower], marker="v", s=24, color=_COLORS[0], alpha=0.9,
-                zorder=4,
-                label="selector lower bound" if "selector lower bound" not in ax.get_legend_handles_labels()[1] else None,
-            )
-            if count > 0:
-                ax.annotate(
-                    f"{count}", (x, score), xytext=(0, 6), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=5.8, color="#1d4ed8",
+        for item in items:
+            x = item["x"] + offset
+            score = item["score"]
+            lower, upper = item["lower"], item["upper"]
+            if lower is not None or upper is not None:
+                lower_error = max(0.0, score - lower) if lower is not None else 0.0
+                upper_error = max(0.0, upper - score) if upper is not None else 0.0
+                ax.errorbar(
+                    x, score, yerr=np.array([[lower_error], [upper_error]]),
+                    fmt="none", ecolor=color, elinewidth=1.0, capsize=2.2,
+                    alpha=0.78, zorder=3,
                 )
 
-    # Holdout attempts are sparse and independent: plot them separately, with
-    # a small horizontal offset so both evidence sources remain visible.
-    if hx:
-        x_offset = 0.10
-        for x, score, lower, count, status in zip(
-            hx, hscores, hlowers, hgames, hstatuses
-        ):
-            plot_x = x + x_offset
-            passed = status.startswith(("passed", "promoted"))
-            marker = "D" if passed else "s"
-            ax.vlines(plot_x, lower, score, color="#c2410c", linewidth=1.4, alpha=0.95, zorder=4)
+            candidate_state = item.get("candidate_status", "")
+            # Only the persisted candidate state means promotion. A passing
+            # holdout is evidence, not itself a promotion decision.
+            promoted = candidate_state == "promoted" or candidate_state.startswith("promoted:")
+            archived = candidate_state == "archived"
+            point_marker = "*" if promoted else ("h" if archived else item.get("marker", marker))
+            face = color if item.get("full", True) or promoted or archived else "white"
+            edge = "#15803d" if promoted else ("#a16207" if archived else color)
             ax.scatter(
-                [plot_x], [score], marker=marker, s=36,
-                facecolors="#f97316" if passed else "white",
-                edgecolors="#9a3412", linewidths=1.0, zorder=6,
-                label="independent holdout score" if "independent holdout score" not in ax.get_legend_handles_labels()[1] else None,
+                [x], [score], marker=point_marker,
+                s=68 if promoted else (48 if archived else 33),
+                facecolors=face, edgecolors=edge, linewidths=1.0, zorder=6,
+                label=label,
             )
-            ax.scatter(
-                [plot_x], [lower], marker="v", s=24, color="#c2410c", zorder=5,
-                label="holdout lower bound" if "holdout lower bound" not in ax.get_legend_handles_labels()[1] else None,
-            )
-            if count > 0:
-                ax.annotate(
-                    f"{count}", (plot_x, score), xytext=(0, -9), textcoords="offset points",
-                    ha="center", va="top", fontsize=5.8, color="#9a3412",
-                )
+
+    for item in selector:
+        item["candidate_status"] = item["status"]
+        item["marker"] = "o" if item["full"] else "^"
+    draw_evidence(selector, offset=-0.14, color=_COLORS[0],
+                  label="selector MCTS", marker="o")
+    draw_evidence(raw_nn, offset=0.0, color=_COLORS[3],
+                  label="raw NN safety", marker="s")
+    draw_evidence(holdout, offset=0.14, color="#c2410c",
+                  label="independent confirmation", marker="D")
 
     ax.axhline(0.5, color="#374151", lw=0.8, ls="--", alpha=0.7)
     # Keep the historical framing when all results fit, but expand it for
     # weak/partial evaluations instead of silently clipping them (for example,
     # a 29% 48-game preliminary result). Include interval endpoints and gates
     # so both evidence and decision thresholds remain visible.
-    evidence = [*scores, *lowers, *hscores, *hlowers, 0.5,
-                selector_score_min, confirmation_score_min,
-                selector_lb_min, confirmation_lb_min]
+    evidence = [item["score"] for item in selector + raw_nn + holdout]
+    evidence.extend(
+        endpoint
+        for item in selector + raw_nn + holdout
+        for endpoint in (item["lower"], item["upper"])
+        if endpoint is not None
+    )
+    evidence.extend([
+        0.5, selector_score_min, confirmation_score_min, raw_score_min,
+        selector_lb_min, confirmation_lb_min,
+    ])
     evidence = [value for value in evidence if value is not None and math.isfinite(value)]
     data_min, data_max = min(evidence), max(evidence)
     span = data_max - data_min
@@ -522,12 +526,35 @@ def _promotion_strength_panel(ax, rows, rl_cfg):
     y_max = min(1.0, max(0.78, data_max + padding))
     ax.set_ylim(y_min, y_max)
     ax.set_ylabel("match points per game", fontsize=8)
-    ax.set_xlabel("iteration (labels show games; selector / holdout)", fontsize=7)
-    _legend_below(ax, ncol=3, y=-0.25)
+    ax.set_xlabel("iteration", fontsize=7)
+    handles, labels = ax.get_legend_handles_labels()
+    unique = {}
+    for handle, label in zip(handles, labels):
+        unique.setdefault(label, handle)
+    marker_handles = []
+    if any(item["candidate_status"] == "archived" for item in selector):
+        marker_handles.append(("h", "#a16207", "archived"))
+    if any(item["candidate_status"] == "promoted" or
+           str(item["candidate_status"]).startswith("promoted:") for item in selector):
+        marker_handles.append(("*", "#15803d", "promoted"))
+    from matplotlib.lines import Line2D
+    for symbol, color, label in marker_handles:
+        unique[label] = Line2D([], [], linestyle="none", marker=symbol,
+                               markerfacecolor=color, markeredgecolor=color,
+                               markersize=7)
+    ax.legend(
+        list(unique.values()), list(unique.keys()), fontsize=6.3, frameon=False,
+        ncol=max(1, min(3, len(unique))), loc="upper center",
+        bbox_to_anchor=(0.5, -0.22), borderaxespad=0.0,
+        columnspacing=0.9, handlelength=1.4,
+    )
     ax.text(
-        0.02, 0.03,
-        "Filled = full selector; hollow = partial; red edge = promotion blocked; holdout is separate.",
-        transform=ax.transAxes, ha="left", va="bottom", fontsize=6.4, color="#374151",
+        0.5, -0.39,
+        f"Gates: selector {selector_score_min:.0%} / LB {selector_lb_min:.0%}"
+        f"  ·  raw NN {raw_score_min:.0%}"
+        f"  ·  holdout {confirmation_score_min:.0%} / LB {confirmation_lb_min:.0%}",
+        transform=ax.transAxes, ha="center", va="top", fontsize=5.8,
+        color="#4b5563", clip_on=False,
     )
     return True
 
@@ -732,24 +759,18 @@ def _composition_donut(
 
 
 _RUNTIME_STAGE_SPECS = (
-    ("stage_selfplay_time_s", "self-play", "#2563eb"),
-    ("stage_replay_time_s", "replay", "#0891b2"),
-    ("stage_train_time_s", "train", "#16a34a"),
-    ("stage_reanalyse_time_s", "reanalyse", "#d97706"),
-    ("stage_regular_eval_time_s", "regular eval", "#eab308"),
-    ("stage_promotion_eval_time_s", "promotion eval", "#f59e0b"),
-    ("stage_elo_eval_time_s", "Elo eval", "#ec4899"),
-    ("stage_log_time_s", "decision/log", "#a855f7"),
-    # Schemas <= 7 did not split evaluation. Preserve it as a separate bucket.
-    ("stage_eval_log_time_s", "legacy eval/log", "#fbbf24"),
-    ("stage_checkpoint_time_s", "checkpoint", "#9333ea"),
-    ("stage_setup_time_s", "setup", "#64748b"),
-    ("stage_gc_time_s", "gc", "#db2777"),
+    ("selfplay", "self-play", "#2563eb"),
+    ("replay_setup", "replay/setup", "#0891b2"),
+    ("train", "training", "#16a34a"),
+    ("evaluation", "evaluation", "#f59e0b"),
+    ("maintenance", "checkpoint/log/cleanup", "#7c3aed"),
+    ("additional", "additional stages", "#64748b"),
+    ("other", "unaccounted", "#cbd5e1"),
 )
 
 
 def _runtime_composition_data(rows):
-    """Resolve per-iteration runtime stages once for both RL dashboards."""
+    """Group exclusive iteration stages and retain only a measured residual."""
     iterations, totals = [], []
     stage_values = {column: [] for column, _, _ in _RUNTIME_STAGE_SPECS}
     other_values = []
@@ -757,18 +778,66 @@ def _runtime_composition_data(rows):
         iteration = _number(row.get("iteration"))
         if iteration is None:
             continue
-        values = {
-            column: max(0.0, _number(row.get(column)) or 0.0)
-            for column, _, _ in _RUNTIME_STAGE_SPECS
-        }
-        measured_total = sum(values.values())
         logged_total = _number(row.get("iteration_total_time_s"))
-        total = max(measured_total, logged_total or 0.0)
+        raw_stages = {
+            str(column): _number(value)
+            for column, value in row.items()
+            if str(column).startswith("stage_") and str(column).endswith("_time_s")
+        }
+        # Blank stage cells mean unknown, not zero. The residual is available
+        # only when the row has a logged total and every stage cell is numeric.
+        stage_complete = bool(raw_stages) and all(value is not None for value in raw_stages.values())
+        numeric = {key: max(0.0, value) for key, value in raw_stages.items() if value is not None}
+        def group(columns):
+            present = [column for column in columns if column in raw_stages]
+            if not present or any(raw_stages[column] is None for column in present):
+                return None
+            return sum(numeric.get(column, 0.0) for column in present)
+
+        values = {
+            "selfplay": group(("stage_selfplay_time_s",)),
+            "replay_setup": group((
+                "stage_setup_time_s", "stage_replay_time_s", "stage_reanalyse_time_s",
+            )),
+            "train": group(("stage_train_time_s",)),
+            "evaluation": group((
+                "stage_regular_eval_time_s", "stage_promotion_eval_time_s",
+                "stage_promotion_confirmation_time_s", "stage_elo_eval_time_s",
+                "stage_eval_log_time_s",
+            )),
+            "maintenance": group((
+                "stage_log_time_s", "stage_checkpoint_time_s", "stage_gc_time_s",
+            )),
+        }
+        grouped_columns = {
+            "stage_selfplay_time_s", "stage_setup_time_s", "stage_replay_time_s",
+            "stage_reanalyse_time_s", "stage_train_time_s", "stage_regular_eval_time_s",
+            "stage_promotion_eval_time_s", "stage_promotion_confirmation_time_s",
+            "stage_elo_eval_time_s", "stage_eval_log_time_s", "stage_log_time_s",
+            "stage_checkpoint_time_s", "stage_gc_time_s",
+        }
+        additional_columns = [
+            key for key in raw_stages if key not in grouped_columns
+        ]
+        values["additional"] = (
+            sum(numeric.get(key, 0.0) for key in additional_columns)
+            if all(raw_stages[key] is not None for key in additional_columns)
+            else None
+        )
+        measured_total = sum(value for value in values.values() if value is not None)
+        residual = None
+        if logged_total is not None and stage_complete:
+            delta = logged_total - measured_total
+            # Stage timers are intended to be exclusive; tiny clock/rounding
+            # error is treated as zero. A negative residual is an accounting
+            # mismatch, never an invented negative/zero-duration stage.
+            residual = max(0.0, delta) if delta >= -0.01 else None
+        values["other"] = residual
         iterations.append(int(iteration))
-        totals.append(total)
+        totals.append(max(0.0, logged_total) if logged_total is not None else None)
         for column in stage_values:
-            stage_values[column].append(values[column])
-        other_values.append(max(0.0, total - measured_total))
+            stage_values[column].append(values.get(column))
+        other_values.append(residual)
     return iterations, totals, stage_values, other_values
 
 
@@ -776,23 +845,15 @@ def _average_runtime_composition_panel(ax, rows):
     """Draw the identical average-runtime donut on both RL PNGs."""
     iterations, _, stage_values, other_values = _runtime_composition_data(rows)
     sample_count = len(iterations)
-    averaged = [
-        (
-            column,
-            label,
-            sum(stage_values[column]) / max(1, sample_count),
-            color,
-        )
-        for column, label, color in _RUNTIME_STAGE_SPECS
-    ]
-    averaged.append(
-        (
-            "other",
-            "other / unaccounted",
-            sum(other_values) / max(1, sample_count),
-            "#d1d5db",
-        )
-    )
+    # Average each known stage over rows where its timing was actually logged.
+    averaged = []
+    for column, label, color in _RUNTIME_STAGE_SPECS:
+        values = [value for value in stage_values[column] if value is not None]
+        if not values:
+            continue
+        if column == "other" and len(values) != sample_count:
+            continue
+        averaged.append((column, label, sum(values) / max(1, len(values)), color))
     return _composition_donut(
         ax,
         averaged,
@@ -948,44 +1009,6 @@ def _mark_selfplay_best_intervals(ax, intervals, *, label=False):
     ax.set_xlim(xlim)
 
 
-def _nested_composition_donut(ax, inner, outer, *, title, inner_name, outer_name):
-    """Compare two part-to-whole distributions without duplicating line charts."""
-    ax.set_title(title, fontsize=10, fontweight="bold", loc="left")
-    inner_values = [max(0.0, float(value or 0.0)) for _, value, _ in inner]
-    outer_values = [max(0.0, float(value or 0.0)) for _, value, _ in outer]
-    if sum(inner_values) <= 0.0 or sum(outer_values) <= 0.0:
-        _no_data(ax)
-        return False
-    colors = [color for _, _, color in outer]
-    outer_wedges, _ = ax.pie(
-        outer_values,
-        radius=1.0,
-        colors=colors,
-        startangle=90,
-        counterclock=False,
-        wedgeprops={"width": 0.28, "edgecolor": "white", "linewidth": 1.0},
-    )
-    ax.pie(
-        inner_values,
-        radius=0.68,
-        colors=[color for _, _, color in inner],
-        startangle=90,
-        counterclock=False,
-        wedgeprops={"width": 0.28, "edgecolor": "white", "linewidth": 1.0},
-    )
-    ax.text(0, 0.10, outer_name, ha="center", va="center", fontsize=7.5, fontweight="bold")
-    ax.text(0, -0.08, f"inner: {inner_name}", ha="center", va="center", fontsize=6.8, color="#4b5563")
-    labels = [
-        f"{label}: {100.0 * value / max(1e-12, sum(outer_values)):.1f}% {outer_name} / "
-        f"{100.0 * inner_values[index] / max(1e-12, sum(inner_values)):.1f}% {inner_name}"
-        for index, (label, value, _) in enumerate(outer)
-    ]
-    ax.legend(outer_wedges, labels, fontsize=6.5, frameon=False, loc="upper center",
-              bbox_to_anchor=(0.5, -0.02))
-    ax.set_aspect("equal")
-    return True
-
-
 def _search_correction_rate_panel(
     ax,
     rows,
@@ -1065,103 +1088,6 @@ def _latest_search_decision_donut(ax, rows):
     ax.grid(False)
     ax.set_aspect("equal")
     return True
-
-
-def _task_gradient_interaction_panel(ax, rows, break_after=()):
-    """Show whether policy and value agree on changes to the shared tower."""
-    _style(ax, "Policy vs value gradient interaction")
-    shown = _line(
-        ax, rows, "grad_policy_probe_norm", "policy @ shared tower",
-        _COLORS[0], lw=1.9, break_after=break_after,
-    )
-    shown |= _line(
-        ax, rows, "grad_value_probe_norm", "value @ shared tower",
-        _COLORS[3], lw=1.9, break_after=break_after,
-    )
-    if shown:
-        ax.set_yscale("log")
-        ax.set_ylabel("gradient norm (log)", fontsize=8)
-    ax2 = ax.twinx()
-    ax2.tick_params(labelsize=8)
-    cosine = _line(
-        ax2, rows, "grad_policy_value_cosine", "policy/value cosine",
-        _COLORS[4], ls="--", lw=1.8, break_after=break_after,
-    )
-    if cosine:
-        ax2.set_ylim(-1.05, 1.05)
-        ax2.axhline(0.0, color="#9ca3af", lw=1, ls=":")
-        ax2.axhspan(-1.0, -0.20, color="#dc2626", alpha=0.035, zorder=0)
-        ax2.axhspan(0.20, 1.0, color="#16a34a", alpha=0.035, zorder=0)
-        ax2.set_ylabel("task cosine", fontsize=8, color=_COLORS[4])
-        cosine_values = [
-            value for value in (_number(row.get("grad_policy_value_cosine")) for row in rows)
-            if value is not None
-        ]
-        latest_cosine = cosine_values[-1] if cosine_values else None
-        mean_cosine = float(np.mean(cosine_values)) if cosine_values else None
-        latest_policy = _last(rows, "grad_policy_probe_norm")
-        latest_value = _last(rows, "grad_value_probe_norm")
-        if latest_cosine is not None:
-            state = (
-                "aligned" if latest_cosine > 0.20
-                else "conflicting" if latest_cosine < -0.20
-                else "mostly independent"
-            )
-            summary = f"latest {latest_cosine:+.2f} ({state}) | mean {mean_cosine:+.2f}"
-            if latest_policy is not None and latest_value is not None and latest_policy > 0.0:
-                summary += f" | value/policy norm {latest_value / latest_policy:.1f}x"
-            ax.text(
-                0.02, 0.96, summary, transform=ax.transAxes,
-                ha="left", va="top", fontsize=7.2, color="#374151",
-            )
-    _legend_below(ax, ax2, ncol=2)
-    if not (shown or cosine):
-        _no_data(ax, "Gradient telemetry is available from schema 14")
-    return bool(shown or cosine)
-
-
-def _gradient_norms_panel(ax, rows, break_after=()):
-    """Separate the update magnitude in the shared tower and both heads."""
-    _style(ax, "Gradient norms and clipping")
-    shown = _line(
-        ax, rows, "grad_total_norm", "total before clip", "#111827", lw=2.0,
-        break_after=break_after,
-    )
-    shown |= _line(
-        ax, rows, "grad_backbone_norm", "shared tower", _COLORS[0], lw=1.8,
-        break_after=break_after,
-    )
-    shown |= _line(
-        ax, rows, "grad_policy_head_norm", "policy head", _COLORS[2], lw=1.8,
-        break_after=break_after,
-    )
-    shown |= _line(
-        ax, rows, "grad_value_head_norm", "value heads", _COLORS[3], lw=1.8,
-        break_after=break_after,
-    )
-    if shown:
-        ax.set_yscale("log")
-        ax.set_ylabel("gradient norm (log)", fontsize=8)
-    ax2 = ax.twinx()
-    ax2.tick_params(labelsize=8)
-    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
-    clipped = _line(
-        ax2, rows, "grad_clip_fraction", "batches clipped",
-        _COLORS[1], ls="--", lw=1.7, break_after=break_after,
-    )
-    if clipped:
-        ax2.set_ylim(0.0, 1.05)
-        ax2.set_ylabel("clipped batches", fontsize=8, color=_COLORS[1])
-    latest_scale = _last(rows, "grad_clip_scale_mean")
-    if latest_scale is not None:
-        ax.text(
-            0.02, 0.96, f"latest mean applied scale {latest_scale:.2f}",
-            transform=ax.transAxes, ha="left", va="top", fontsize=7.2, color="#374151",
-        )
-    _legend_below(ax, ax2, ncol=3)
-    if not (shown or clipped):
-        _no_data(ax, "Gradient telemetry is available from schema 14")
-    return bool(shown or clipped)
 
 
 def _objective_composition_panel(ax, rows, rl_cfg):
@@ -1821,7 +1747,41 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
     _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
     _legend_below(ax, ax2, ncol=2)
     ax.set_ylabel("simulations / position", fontsize=8)
-    if any((count or 0.0) > 0.0 for count in root_counts):
+    latest_budget_json = _last(rows, "mcts_budget_quality_levels_json")
+    all_level_summary = []
+    if latest_budget_json:
+        try:
+            levels = json.loads(latest_budget_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            levels = {}
+        if isinstance(levels, dict):
+            for level in sorted(
+                (key for key in levels if str(key).isdigit()),
+                key=lambda key: int(key),
+            ):
+                item = levels.get(level) or {}
+                count = int(item.get("samples") or 0)
+                rate = item.get("useful_change_rate")
+                shown_rate = "—" if count <= 0 or rate is None else f"{float(rate):.0%}"
+                all_level_summary.append(f"{level}:{shown_rate}[{count}]")
+    if all_level_summary:
+        summary_lines = [
+            " · ".join(all_level_summary[start:start + 6])
+            for start in range(0, len(all_level_summary), 6)
+        ]
+        coverage = _last(rows, "mcts_budget_quality_coverage")
+        coverage_text = (
+            f" | known {float(coverage):.0%}"
+            if coverage is not None else ""
+        )
+        ax.text(
+            0.02, 0.96,
+            "useful correction by 16-step budget" + coverage_text + "\n"
+            + "\n".join(summary_lines),
+            transform=ax.transAxes, ha="left", va="top", fontsize=5.7,
+            color="#4b5563",
+        )
+    elif any((count or 0.0) > 0.0 for count in root_counts):
         budget_summary = []
         for budget, count in zip(budgets, root_counts):
             if (count or 0.0) <= 0.0:
@@ -2067,54 +2027,112 @@ def render_rl_performance(
 
     ax = axes[0, 1]
     _style(ax, "Runtime composition per iteration")
-    if iterations and any(totals):
+    has_stage_values = any(
+        value is not None
+        for values in stage_values.values()
+        for value in values
+    )
+    if iterations and (any(value is not None and value > 0.0 for value in totals) or has_stage_values):
         bottoms = [0.0] * len(iterations)
-        runtime_total = sum(totals)
+        runtime_total = sum(value for value in totals if value is not None)
         visible_stage_count = 0
+        plotted_stack = [0.0] * len(iterations)
         for column, label, color in stage_specs:
-            values = stage_values[column]
-            component_total = sum(values)
+            if column == "other":
+                continue
+            raw_values = stage_values[column]
+            values = [np.nan if value is None else value for value in raw_values]
+            component_total = sum(value for value in raw_values if value is not None)
             if component_total < 1.0 or (
                 runtime_total > 0.0 and component_total / runtime_total < 0.002
             ):
                 continue
             ax.bar(iterations, values, bottom=bottoms, width=0.76, color=color,
                    label=label, edgecolor="white", linewidth=0.35)
-            bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
+            bottoms = [
+                bottom + (value if np.isfinite(value) else 0.0)
+                for bottom, value in zip(bottoms, values)
+            ]
+            plotted_stack = [
+                current + (value if np.isfinite(value) else 0.0)
+                for current, value in zip(plotted_stack, values)
+            ]
             visible_stage_count += 1
-        other_total = sum(other_values)
+        known_residuals = [value for value in other_values if value is not None]
+        other_total = sum(known_residuals)
         if other_total >= 1.0 and (runtime_total <= 0.0 or other_total / runtime_total >= 0.002):
-            ax.bar(iterations, other_values, bottom=bottoms, width=0.76, color="#d1d5db",
-                   label="other/unaccounted", edgecolor="white", linewidth=0.35)
+            residual_plot = [np.nan if value is None else value for value in other_values]
+            ax.bar(iterations, residual_plot, bottom=bottoms, width=0.76, color="#cbd5e1",
+                   label="unaccounted", edgecolor="white", linewidth=0.35, hatch="//")
+            plotted_stack = [
+                current + (value if np.isfinite(value) else 0.0)
+                for current, value in zip(plotted_stack, residual_plot)
+            ]
             visible_stage_count += 1
-        if len(iterations) <= 12:
-            padding = max(totals) * 0.015
-            for iteration, total in zip(iterations, totals):
+        # Iteration total is the reference line. It exposes a mismatch when
+        # timer rows are incomplete or exclusive stage accounting drifts.
+        logged_totals = [
+            (iteration, total) for iteration, total in zip(iterations, totals)
+            if total is not None
+        ]
+        if logged_totals:
+            ax.plot([item[0] for item in logged_totals], [item[1] for item in logged_totals],
+                    color="#111827", lw=1.0, ls="--", marker="o", ms=2.3,
+                    label="iteration total", zorder=5)
+        if len(logged_totals) <= 12 and logged_totals:
+            padding = max(value for _, value in logged_totals) * 0.015
+            for iteration, total in logged_totals:
                 ax.text(iteration, total + padding, f"{total:.0f}s", ha="center", va="bottom",
                         fontsize=6.5, color="#374151")
-        ax.set_ylim(0.0, max(totals) * 1.10)
+        max_logged_total = max((value for value in totals if value is not None), default=0.0)
+        ax.set_ylim(0.0, max(max_logged_total, max(plotted_stack)) * 1.10)
         ax.set_ylabel("seconds", fontsize=8)
         ax.set_axisbelow(True)
+        if any(value is None for value in other_values):
+            ax.text(0.02, 0.97, "unaccounted: unknown where total or a stage timer is missing",
+                    transform=ax.transAxes, ha="left", va="top", fontsize=6.4,
+                    color="#6b7280")
+        elif other_total < 1.0 or (runtime_total > 0.0 and other_total / runtime_total < 0.002):
+            ax.text(0.02, 0.97, "unaccounted ≈ 0: logged stages cover iteration time",
+                    transform=ax.transAxes, ha="left", va="top", fontsize=6.4,
+                    color="#6b7280")
         _legend_below(ax, ncol=min(4, max(1, visible_stage_count)))
     else:
         _no_data(ax)
 
     ax = axes[0, 2]
-    _style(ax, "Self-play scheduling and tail")
-    scheduling = _line(ax, rows, "selfplay_games_per_worker_min", "min games/worker", "#94a3b8")
-    scheduling |= _line(ax, rows, "selfplay_games_per_worker_mean", "mean games/worker", _COLORS[0])
-    scheduling |= _line(ax, rows, "selfplay_games_per_worker_max", "max games/worker", _COLORS[2])
-    ax.set_ylabel("games / worker", fontsize=8)
-    ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
-    tail = _line(ax2, rows, "selfplay_tail_10pct_time_s", "last 10% drain", _COLORS[3])
-    tail |= _line(ax2, rows, "selfplay_worker_finish_spread_s", "worker finish spread", "#7c3aed")
-    if tail:
-        ax2.set_ylabel("seconds", fontsize=8)
+    _style(ax, "Worker time per 1k NN evaluations")
+    active_x, active_y, wait_x, wait_y = [], [], [], []
+    inconsistent = 0
+    for row in rows:
+        iteration = _number(row.get("iteration"))
+        positions = _number(row.get("mcts_nn_inference_batch_items"))
+        search = _number(row.get("mcts_search_many_time_s"))
+        wait = _number(row.get("mcts_nn_inference_time_s"))
+        if iteration is None or positions is None or positions <= 0 or search is None or wait is None:
+            continue
+        if wait < 0.0 or search < 0.0 or wait > search + 0.01:
+            inconsistent += 1
+            continue
+        factor = 1e6 / positions
+        wait_x.append(int(iteration)); wait_y.append(wait * factor)
+        active_x.append(int(iteration)); active_y.append(max(0.0, search - wait) * factor)
+    if wait_x:
+        ax.plot(wait_x, wait_y, marker="o", ms=3, lw=1.6, color="#db2777",
+                label="waiting for NN")
+        ax.plot(active_x, active_y, marker="o", ms=3, lw=1.6, color="#2563eb",
+                label="search outside NN wait")
+        _legend_below(ax, ncol=2)
+        ax.set_ylabel("worker ms / 1k NN evaluations", fontsize=8)
+        ax.text(0.02, 0.97, "Both lines partition measured search time; summed across workers.",
+                transform=ax.transAxes, ha="left", va="top", fontsize=6.4,
+                color="#6b7280")
+        if inconsistent:
+            ax.text(0.02, 0.89, f"omitted {inconsistent} rows with inconsistent timers",
+                    transform=ax.transAxes, ha="left", va="top", fontsize=6.4,
+                    color="#9a3412")
     else:
-        ax2.set_visible(False)
-    _legend_below(ax, ax2, ncol=2)
-    if not (scheduling or tail):
-        _no_data(ax)
+        _no_data(ax, "Search and NN wait timers unavailable")
 
     ax = axes[1, 0]
     _average_runtime_composition_panel(ax, rows)
@@ -2190,19 +2208,32 @@ def render_rl_performance(
         return parts
 
     ax = axes[1, 1]
-    position_latency_specs = (*central_specs, ("local_other", "local/other", "#111827"))
+    position_latency_specs = (
+        ("waiting", "queue / batch wait", "#f59e0b"),
+        ("transfer", "data movement", "#0891b2"),
+        ("forward", "GPU forward", "#16a34a"),
+        ("remainder", "IPC / other", "#64748b"),
+    )
 
     def _position_latency_parts(row):
         worker_batch = max(0.0, _number(row.get("mcts_avg_batch_size")) or 0.0)
         worker_wait = max(0.0, _number(row.get("mcts_worker_nn_wait_ms_per_position")) or 0.0)
         if worker_batch <= 0.0:
-            return {"local_other": worker_wait}
-        parts = {
-            key: value / worker_batch
-            for key, value in _central_latency_parts(row).items()
+            return {"remainder": worker_wait}
+        central = _central_latency_parts(row)
+        waiting = sum(central[key] for key in (
+            "request_submit", "descriptor_queue", "batch_coalesce", "pipeline_wait",
+        ))
+        transfer = sum(central[key] for key in (
+            "concat", "cache", "staging", "h2d", "d2h",
+        ))
+        remainder = central["server_other"] + central["ipc_other"]
+        return {
+            "waiting": waiting / worker_batch,
+            "transfer": transfer / worker_batch,
+            "forward": central["forward"] / worker_batch,
+            "remainder": remainder / worker_batch,
         }
-        parts["local_other"] = max(0.0, worker_wait - sum(parts.values()))
-        return parts
 
     _stacked_iteration_bars(
         ax,
@@ -2233,72 +2264,34 @@ def render_rl_performance(
     )
 
     ax = axes[2, 0]
-    search_specs = (
-        ("inference_wait", "waiting for NN inference", "#db2777"),
-        ("board_copy", "board materialization/push", "#dc2626"),
-        ("terminal", "terminal/draw", "#f59e0b"),
-        ("legal_mixed", "legal + move encoding", "#ea580c"),
-        ("legal", "legal move generation", "#fb923c"),
-        ("move_index", "move encoding", "#facc15"),
-        ("legacy_leaf", "legacy leaf prep (mixed)", "#9ca3af"),
-        ("selection", "tree selection", "#2563eb"),
-        ("encoding", "board encoding", "#0891b2"),
-        ("packing", "input packing", "#06b6d4"),
-        ("policy", "CPU policy", "#16a34a"),
-        ("native_transfer", "native tree import/sync", "#9333ea"),
-        ("backprop", "backprop/other", "#7c3aed"),
+    _style(ax, "MCTS hotspots per 1k NN evaluations")
+    hotspot_specs = (
+        ("mcts_search_selection_time_s", "tree selection", "#2563eb"),
+        ("mcts_board_to_tensor_time_s", "board encoding", "#0891b2"),
+        ("mcts_batch_expand_cpu_policy_time_s", "CPU policy", "#16a34a"),
+        ("mcts_native_tree_import_time_s", "native import", "#9333ea"),
+        ("mcts_native_tree_sync_time_s", "native sync", "#f59e0b"),
     )
-
-    def _mcts_search_parts(row):
-        schema_version = _number(row.get("schema_version")) or 0.0
-        tensor_pack = max(0.0, _number(row.get("mcts_batch_expand_tensor_pack_time_s")) or 0.0)
-        legal_index_pack = max(0.0, _number(row.get("mcts_batch_expand_legal_index_pack_time_s")) or 0.0)
-        board_encoding = max(0.0, _number(row.get("mcts_board_to_tensor_time_s")) or 0.0)
-        encoding_in_pack = min(tensor_pack, board_encoding)
-        tree_other = sum(
-            max(0.0, _number(row.get(column)) or 0.0)
-            for column in (
-                "mcts_search_backprop_time_s",
-                "mcts_search_root_setup_time_s",
-                "mcts_search_metadata_time_s",
-                "mcts_batch_expand_dedup_time_s",
-                "mcts_batch_expand_value_fanout_time_s",
-            )
-        )
-        old_leaf_prep = max(0.0, _number(row.get("mcts_batch_expand_legal_moves_time_s")) or 0.0)
-        return {
-            # In central-inference mode this is worker wall-time blocked on the
-            # response queue. It is intentionally separate from measured CPU
-            # work so a slow search is not misdiagnosed as Python tree cost.
-            "inference_wait": _number(row.get("mcts_nn_inference_time_s")) or 0.0,
-            "board_copy": _number(row.get("mcts_board_materialize_time_s")) or 0.0,
-            "terminal": _number(row.get("mcts_terminal_checks_time_s")) or 0.0,
-            # Schema 5 measured legal generation and policy-index encoding together.
-            # Schema 6 separates them; older schemas measured mixed leaf preparation.
-            "legal_mixed": old_leaf_prep if 5.0 <= schema_version < 6.0 else 0.0,
-            "legal": old_leaf_prep if schema_version >= 6.0 else 0.0,
-            "move_index": _number(row.get("mcts_batch_expand_move_index_time_s")) or 0.0,
-            "legacy_leaf": old_leaf_prep if schema_version < 5.0 else 0.0,
-            "selection": _number(row.get("mcts_search_selection_time_s")) or 0.0,
-            "encoding": encoding_in_pack,
-            "packing": max(0.0, tensor_pack - encoding_in_pack) + legal_index_pack,
-            "policy": _number(row.get("mcts_batch_expand_cpu_policy_time_s")) or 0.0,
-            "native_transfer": (
-                (_number(row.get("mcts_native_tree_import_time_s")) or 0.0)
-                + (_number(row.get("mcts_native_tree_sync_time_s")) or 0.0)
-            ),
-            "backprop": tree_other,
-        }
-
-    _stacked_iteration_bars(
-        ax,
-        rows,
-        search_specs,
-        _mcts_search_parts,
-        title="Measured MCTS search composition",
-        ylabel="worker-summed seconds",
-        legend_columns=4,
-    )
+    hotspot_shown = False
+    for column, label, color in hotspot_specs:
+        xs, ys = [], []
+        for row in rows:
+            iteration = _number(row.get("iteration"))
+            positions = _number(row.get("mcts_nn_inference_batch_items"))
+            seconds = _number(row.get(column))
+            if iteration is None or positions is None or positions <= 0 or seconds is None:
+                continue
+            xs.append(int(iteration)); ys.append(1e6 * max(0.0, seconds) / positions)
+        if xs:
+            ax.plot(xs, ys, marker="o", ms=2.7, lw=1.3, label=label, color=color)
+            hotspot_shown = True
+    ax.set_ylabel("worker ms / 1k NN evaluations", fontsize=8)
+    ax.text(0.02, 0.97, "Counters overlap; compare trends, do not add these lines.",
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.4,
+            color="#6b7280")
+    _legend_below(ax, ncol=3)
+    if not hotspot_shown:
+        _no_data(ax, "MCTS hotspot timers unavailable")
 
     for row in rows:
         item_count = max(1.0, _number(row.get("mcts_nn_inference_batch_items")) or 0.0)

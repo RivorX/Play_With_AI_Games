@@ -44,6 +44,7 @@ from src.mcts.q_delta import (
     USEFUL_SEARCH_Q_DELTA_MIN,
 )
 from src.inference.shared_memory import create_shared_inference_buffer
+from .batch import ReplayBatch
 
 
 _HFLIP_INV_INDEX_MAP = None
@@ -74,6 +75,31 @@ _TRANSIENT_CUDA_ERROR_MARKERS = (
     "device is busy or unavailable",
     "the launch timed out",
 )
+
+
+@contextlib.contextmanager
+def _freeze_batchnorm_running_stats(model, enabled):
+    """Use stored BatchNorm statistics for one forward without freezing affine weights.
+
+    Dropout and other modules keep their original mode. BatchNorm affine
+    parameters remain differentiable; only running-stat updates are disabled.
+    """
+    if not enabled:
+        yield
+        return
+
+    batchnorm_modes = tuple(
+        (module, bool(module.training))
+        for module in model.modules()
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
+    )
+    try:
+        for module, _ in batchnorm_modes:
+            module.training = False
+        yield
+    finally:
+        for module, was_training in batchnorm_modes:
+            module.training = was_training
 
 
 def is_transient_cuda_error(error):
@@ -208,7 +234,7 @@ def _resolve_configured_self_play_workers(rl_cfg, cpu_budget):
             multiplier = max(0.10, float(rl_cfg.get("self_play_worker_auto_multiplier", 1.0)))
         except Exception:
             multiplier = 1.0
-        return max(1, int(np.ceil(float(cpu_budget) * multiplier)))
+        return max(1, math.ceil(float(cpu_budget) * multiplier))
     try:
         workers = int(raw_workers)
     except Exception:
@@ -218,7 +244,7 @@ def _resolve_configured_self_play_workers(rl_cfg, cpu_budget):
             multiplier = max(0.10, float(rl_cfg.get("self_play_worker_auto_multiplier", 1.0)))
         except Exception:
             multiplier = 1.0
-        return max(1, int(np.ceil(float(cpu_budget) * multiplier)))
+        return max(1, math.ceil(float(cpu_budget) * multiplier))
     return max(1, workers)
 
 
@@ -2301,37 +2327,46 @@ def train_on_batch_rl(
     policy_weight_override=None,
     collect_gradient_diagnostics=False,
 ):
-    root_q_targets = None
-    search_changed_top = None
-    search_q_deltas = None
-    best_q_targets = None
-    played_q_targets = None
-    orig_q_targets = None
-    policy_kld_targets = None
-    search_visits = None
-    if len(batch) >= 18:
-        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask, root_q_targets, search_changed_top, search_q_deltas, best_q_targets, played_q_targets, orig_q_targets, policy_kld_targets, search_visits = batch[:18]
-    elif len(batch) >= 13:
-        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask, root_q_targets, search_changed_top, search_q_deltas = batch[:13]
-    elif len(batch) >= 11:
-        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask, root_q_targets = batch[:11]
-    elif len(batch) >= 10:
-        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets, legal_indices, legal_mask = batch[:10]
-    elif len(batch) >= 8:
-        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights, moves_left_targets = batch[:8]
-        legal_indices = policy_indices
-        legal_mask = policy_mask
-    elif len(batch) >= 7:
-        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights, value_sample_weights = batch[:7]
-        moves_left_targets = torch.full_like(value_targets, -1.0, dtype=torch.float32)
-        legal_indices = policy_indices
-        legal_mask = policy_mask
-    else:
-        boards, policy_indices, policy_values, policy_mask, value_targets, policy_sample_weights = batch
-        value_sample_weights = torch.ones_like(policy_sample_weights, dtype=torch.float32)
-        moves_left_targets = torch.full_like(value_targets, -1.0, dtype=torch.float32)
-        legal_indices = policy_indices
-        legal_mask = policy_mask
+    replay_batch = ReplayBatch.from_tuple(batch)
+    (
+        boards,
+        policy_indices,
+        policy_values,
+        policy_mask,
+        value_targets,
+        policy_sample_weights,
+        value_sample_weights,
+        moves_left_targets,
+        legal_indices,
+        legal_mask,
+        root_q_targets,
+        search_changed_top,
+        search_q_deltas,
+        best_q_targets,
+        played_q_targets,
+        orig_q_targets,
+        policy_kld_targets,
+        search_visits,
+    ) = (
+        replay_batch.boards,
+        replay_batch.policy_indices,
+        replay_batch.policy_values,
+        replay_batch.policy_mask,
+        replay_batch.value_targets,
+        replay_batch.policy_sample_weights,
+        replay_batch.value_sample_weights,
+        replay_batch.moves_left_targets,
+        replay_batch.legal_indices,
+        replay_batch.legal_mask,
+        replay_batch.root_q_targets,
+        replay_batch.search_changed_top,
+        replay_batch.search_q_deltas,
+        replay_batch.best_q_targets,
+        replay_batch.played_q_targets,
+        replay_batch.orig_q_targets,
+        replay_batch.policy_kld_targets,
+        replay_batch.search_visits,
+    )
     if config["reinforcement_learning"].get("replay_fp16", False):
         boards = boards.float()
         policy_values = policy_values.float()
@@ -2399,13 +2434,15 @@ def train_on_batch_rl(
         0.0,
         float(rl_cfg.get("value_search_consistency_loss_weight", 0.0)),
     )
+    freeze_batchnorm_stats = bool(rl_cfg.get("freeze_batchnorm_stats", False))
     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-        policy_logits, value_pred, moves_left_pred, search_q_pred = model(
-            boards,
-            apply_log_softmax=False,
-            return_moves_left=True,
-            return_search_aux=True,
-        )
+        with _freeze_batchnorm_running_stats(model, freeze_batchnorm_stats):
+            policy_logits, value_pred, moves_left_pred, search_q_pred = model(
+                boards,
+                apply_log_softmax=False,
+                return_moves_left=True,
+                return_search_aux=True,
+            )
         policy_pred = F.log_softmax(policy_logits.float(), dim=1)
         legal_policy_log_probs, valid_legal_mask, safe_legal_indices = _legal_only_log_probs(
             policy_logits,
@@ -2481,7 +2518,6 @@ def train_on_batch_rl(
             search_q_deltas,
             policy_effective_weights,
         )
-
         target_scalar = _final_outcome_targets(value_targets)
         target_value_std = target_scalar.std(unbiased=False)
         if value_pred.dim() == 2 and value_pred.size(1) == 3:
@@ -2596,7 +2632,8 @@ def train_on_batch_rl(
         )
         policy_objective = policy_weight * (
             policy_loss
-            + float(_POLICY_CORRECTION_RANK_WEIGHT) * policy_correction_rank_loss
+            + float(_POLICY_CORRECTION_RANK_WEIGHT)
+            * policy_correction_rank_loss
         )
         value_objective = (
             value_weight * value_loss
@@ -2611,15 +2648,18 @@ def train_on_batch_rl(
             'Non-finite RL loss before backward; check policy/value targets and weights.'
         )
 
-    task_gradient_diagnostics = (
-        _task_gradient_probe(policy_objective, value_objective, model)
-        if collect_gradient_diagnostics
-        else {
+    if collect_gradient_diagnostics:
+        task_gradient_diagnostics = _task_gradient_probe(
+            policy_objective,
+            value_objective,
+            model,
+        )
+    else:
+        task_gradient_diagnostics = {
             'policy_probe_norm': 0.0,
             'value_probe_norm': 0.0,
             'policy_value_cosine': 0.0,
         }
-    )
     scaler.scale(loss).backward()
 
     grad_clip = config["reinforcement_learning"].get("grad_clip", 1.0)

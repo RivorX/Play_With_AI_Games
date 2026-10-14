@@ -1,6 +1,7 @@
 """RL-specific canonical CSV logging and plots."""
 
 import csv
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -907,6 +908,42 @@ class RLLoggerMixin:
             'replay_size': _value(replay_stats, 'size'),
             'replay_capacity': _value(replay_stats, 'capacity'),
             'replay_fill_rate': _value(replay_stats, 'fill_rate'),
+            'replay_search_budget_provenance_rows': _value(
+                replay_stats, 'replay_search_budget_provenance_rows'
+            ),
+            'replay_search_budget_provenance_coverage': _value(
+                replay_stats, 'replay_search_budget_provenance_coverage'
+            ),
+            'replay_search_budget_provenance_partial_rows': _value(
+                replay_stats, 'replay_search_budget_provenance_partial_rows'
+            ),
+            'replay_search_budget_accounting_mismatch_rows': _value(
+                replay_stats, 'replay_search_budget_accounting_mismatch_rows'
+            ),
+            'replay_search_budget_assigned_sum': _value(
+                replay_stats, 'replay_search_budget_assigned_sum'
+            ),
+            'replay_search_simulations_effective_sum': _value(
+                replay_stats, 'replay_search_simulations_effective_sum'
+            ),
+            'replay_search_simulations_fresh_sum': _value(
+                replay_stats, 'replay_search_simulations_fresh_sum'
+            ),
+            'replay_search_visits_inherited_credit_sum': _value(
+                replay_stats, 'replay_search_visits_inherited_credit_sum'
+            ),
+            'replay_search_budget_assigned_mean': _value(
+                replay_stats, 'replay_search_budget_assigned_mean'
+            ),
+            'replay_search_simulations_effective_mean': _value(
+                replay_stats, 'replay_search_simulations_effective_mean'
+            ),
+            'replay_search_simulations_fresh_mean': _value(
+                replay_stats, 'replay_search_simulations_fresh_mean'
+            ),
+            'replay_search_visits_inherited_credit_mean': _value(
+                replay_stats, 'replay_search_visits_inherited_credit_mean'
+            ),
             'train_batch_size': _value(replay_stats, 'train_batch_size'),
             'train_steps': _value(replay_stats, 'train_steps'),
             'train_selected_samples': _value(replay_stats, 'train_selected_samples'),
@@ -1186,6 +1223,21 @@ class RLLoggerMixin:
                 selfplay_stats, 'search_inherited_visit_credit_avg'
             ),
             'mcts_avg_budget': mcts_avg_budget,
+            'mcts_budget_quality_samples': _value(
+                selfplay_stats, 'mcts_budget_quality_samples'
+            ),
+            'mcts_budget_quality_coverage': _value(
+                selfplay_stats, 'mcts_budget_quality_coverage'
+            ),
+            'mcts_budget_quality_levels_json': (
+                json.dumps(
+                    selfplay_stats.get('mcts_budget_quality_levels'),
+                    sort_keys=True,
+                    separators=(',', ':'),
+                )
+                if isinstance(selfplay_stats.get('mcts_budget_quality_levels'), dict)
+                else ''
+            ),
             'mcts_budget_utilization': _ratio(mcts_avg_sims, mcts_avg_budget),
             'mcts_budget_target': _value(selfplay_stats, 'search_simulations_budget_target'),
             'mcts_budget_min': _value(selfplay_stats, 'search_simulations_budget_min'),
@@ -1622,6 +1674,7 @@ class RLLoggerMixin:
             'eval_score_lower_bound': kwargs.get(
                 'eval_score_lower_bound', _score_lower_bound(score_rate, eval_games)
             ),
+            'eval_score_upper_bound': kwargs.get('eval_score_upper_bound', ''),
             'eval_score_se': kwargs.get('eval_score_se', ''),
             'eval_unique_openings': kwargs.get('eval_unique_openings', ''),
             'eval_score_rate_ema': kwargs.get('eval_score_rate_ema', ''),
@@ -1636,6 +1689,8 @@ class RLLoggerMixin:
             'mcts_no_mcts_gap': mcts_no_mcts_gap,
             'promotion_status': kwargs.get('promotion_status', ''),
             'promotion_raw_nn_pass': kwargs.get('promotion_raw_nn_pass', ''),
+            'promotion_raw_nn_status': kwargs.get('promotion_raw_nn_status', ''),
+            'mcts_candidate_status': kwargs.get('mcts_candidate_status', ''),
             'promotion_confirmation_status': kwargs.get(
                 'promotion_confirmation_status', ''
             ),
@@ -1644,6 +1699,9 @@ class RLLoggerMixin:
             ),
             'promotion_confirmation_score_lower_bound': kwargs.get(
                 'promotion_confirmation_score_lower_bound', ''
+            ),
+            'promotion_confirmation_score_upper_bound': kwargs.get(
+                'promotion_confirmation_score_upper_bound', ''
             ),
             'promotion_confirmation_score_se': kwargs.get(
                 'promotion_confirmation_score_se', ''
@@ -1654,8 +1712,17 @@ class RLLoggerMixin:
             'promotion_confirmation_unique_openings': kwargs.get(
                 'promotion_confirmation_unique_openings', ''
             ),
+            'promotion_confirmation_mode': kwargs.get(
+                'promotion_confirmation_mode', 'legacy_192'
+            ),
             'promotion_confirmation_suite_id': kwargs.get(
                 'promotion_confirmation_suite_id', ''
+            ),
+            'promotion_confirmation_suite_ids': kwargs.get(
+                'promotion_confirmation_suite_ids', ''
+            ),
+            'promotion_confirmation_suite_index': kwargs.get(
+                'promotion_confirmation_suite_index', ''
             ),
             'promotion_confirmation_simulations': kwargs.get(
                 'promotion_confirmation_simulations', ''

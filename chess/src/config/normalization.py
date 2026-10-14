@@ -255,6 +255,7 @@ _RL_SECTION_PREFIXES = {
     'self_play': 'self_play_',
     'search': 'mcts_',
     'training': '',
+    'optimization': '',
     'replay': 'replay_',
     'evaluation': '',
     'losses': '',
@@ -284,6 +285,7 @@ _RL_DEFAULTS = {
     'self_play_claim_draw_after_moves': 120, 'syzygy_enabled': True,
     'syzygy_auto_download_enabled': True, 'self_play_progress_interval_games': 5,
     'self_play_opening_diversity_enabled': True,
+    'self_play_opening_pool_path': None, 'self_play_opening_pool_sha256': None,
     # A bounded archive-start share improves value-target independence without
     # replacing the normal initial-position distribution.
     'self_play_hard_start_fraction': 0.20, 'self_play_hard_start_min_age': 1,
@@ -312,6 +314,9 @@ _RL_DEFAULTS = {
     'mcts_cache_history_tensors': True,
     'mcts_temperature': 0.0, 'mcts_temperature_threshold': 0,
     # Optimizer/replay mechanics.
+    # When opted in, training forwards use stored BatchNorm running statistics
+    # while keeping affine gradients and all other train-mode modules active.
+    'freeze_batchnorm_stats': False,
     'train_dynamic_batch_size_enabled': True, 'train_batch_size_round_to': 256,
     'train_batch_size_min': 1024, 'train_batch_size_max': 6144,
     'train_epochs_per_iteration': 1, 'train_max_steps_per_iteration': 0,
@@ -432,6 +437,7 @@ def normalize_rl_config(config):
         rl_cfg['search_control_effective_archive_capacity'] = (
             _effective_search_control_archive_capacity(rl_cfg)
         )
+        _preflight_configured_opening_pool(config, rl_cfg)
         return config
 
     normalized = dict(_RL_DEFAULTS)
@@ -458,7 +464,30 @@ def normalize_rl_config(config):
         _effective_search_control_archive_capacity(normalized)
     )
     config['reinforcement_learning'] = normalized
+    _preflight_configured_opening_pool(config, normalized)
     return config
+
+
+def _preflight_configured_opening_pool(config, rl_cfg):
+    """Fail before model/device setup if an opt-in opening pool is invalid."""
+    path = rl_cfg.get('self_play_opening_pool_path')
+    if path is None or not str(path).strip():
+        return
+    from src.selfplay.opening_pool import preflight_opening_pool
+
+    history_positions = int(config.get('model', {}).get('history_positions', 0) or 0)
+    digest = preflight_opening_pool(
+        path,
+        history_positions=history_positions,
+        config=config,
+    )
+    configured_digest = rl_cfg.get('self_play_opening_pool_sha256')
+    if configured_digest and str(configured_digest) != digest:
+        raise ValueError(
+            "Configured self-play opening pool SHA changed after preflight: "
+            f"{configured_digest} != {digest}"
+        )
+    rl_cfg['self_play_opening_pool_sha256'] = digest
 
 
 def normalize_config(config):

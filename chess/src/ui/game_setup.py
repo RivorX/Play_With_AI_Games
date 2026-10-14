@@ -11,7 +11,6 @@ import sys
 import chess
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
-import torch
 import yaml
 
 # Add utils to path for model_catalog import
@@ -20,7 +19,7 @@ sys.path.insert(0, str(script_dir.parent.parent))
 
 from src.models.catalog import format_elo_stat_parts, format_elo_summary, load_checkpoint_metadata
 from src.common.logger_helpers import _parse_mcts_elo_by_simulations
-from src.ui.gui_helpers import create_piece_surfaces, start_piece_asset_prefetch
+from src.ui.gui_helpers import create_piece_surfaces
 from src.ui.theme import (
     ACCENT as _ACCENT,
     ACCENT_HOVER as _ACCENT_BORDER,
@@ -148,30 +147,6 @@ def _scaled_setup_piece_icon(symbol, target_size, fill_ratio=0.82):
     return canvas
 
 
-_MODEL_ARCH_KEYS = [
-    "version",
-    "filters",
-    "num_residual_blocks",
-    "dropout",
-    "history_positions",
-    "use_se_blocks",
-    "use_se_bottleneck",
-    "se_reduction",
-    "drop_path_rate",
-    "use_coord_conv",
-    "use_layer_scale",
-    "layer_scale_init",
-    "policy_head_channels",
-    "policy_head_conv_filters",
-    "policy_head_conv_groups",
-    "policy_head_global_dim",
-    "policy_head_hidden_dim",
-    "value_head_filters",
-    "value_hidden_dim",
-    "moves_left_hidden_dim",
-]
-
-
 def _safe_int(value, default=None):
     try:
         return int(value)
@@ -258,29 +233,6 @@ def _infer_architecture_from_state_dict(state_dict):
     inferred["use_layer_scale"] = any(".layer_scale.gamma" in key for key in state_dict.keys())
 
     return inferred
-
-
-def _build_checkpoint_model_config(config, checkpoint):
-    model_cfg = dict((config or {}).get("model", {}) or {})
-    checkpoint_arch = checkpoint.get("model_architecture")
-    if isinstance(checkpoint_arch, dict):
-        for key in _MODEL_ARCH_KEYS:
-            if key in checkpoint_arch:
-                model_cfg[key] = checkpoint_arch[key]
-        if "use_se_blocks" not in model_cfg and "use_se2d_blocks" in checkpoint_arch:
-            model_cfg["use_se_blocks"] = checkpoint_arch["use_se2d_blocks"]
-
-    for key in _MODEL_ARCH_KEYS:
-        if key in checkpoint:
-            model_cfg[key] = checkpoint[key]
-    if "use_se_blocks" not in model_cfg and "use_se2d_blocks" in checkpoint:
-        model_cfg["use_se_blocks"] = checkpoint["use_se2d_blocks"]
-
-    inferred = _infer_architecture_from_state_dict(checkpoint.get("model_state_dict"))
-    for key, value in inferred.items():
-        model_cfg[key] = value
-
-    return model_cfg
 
 
 class ModelCompatibilityError(RuntimeError):

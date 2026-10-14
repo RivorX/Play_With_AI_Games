@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-import numpy as np
 import torch
+
+from .batch import ReplayBatch
 
 
 CORRECTION_AUDIT_MAX_ROWS = 2048
@@ -68,11 +69,17 @@ def evaluate_correction_cohort(
     if len(batch) < 10:
         raise ValueError("Correction audit requires policy and legal-move replay fields.")
 
-    boards, policy_indices, policy_values, policy_mask, value_targets = batch[:5]
-    legal_indices, legal_mask = batch[8:10]
-    root_q_targets = batch[10] if len(batch) >= 11 else torch.full_like(value_targets, float("nan"))
-    search_q_deltas = batch[12] if len(batch) >= 13 else torch.full_like(value_targets, float("nan"))
-    search_visits = batch[17] if len(batch) >= 18 else torch.zeros_like(value_targets)
+    replay_batch = ReplayBatch.from_tuple(batch)
+    boards = replay_batch.boards
+    policy_indices = replay_batch.policy_indices
+    policy_values = replay_batch.policy_values
+    policy_mask = replay_batch.policy_mask
+    value_targets = replay_batch.value_targets
+    legal_indices = replay_batch.legal_indices
+    legal_mask = replay_batch.legal_mask
+    root_q_targets = replay_batch.root_q_targets
+    search_q_deltas = replay_batch.search_q_deltas
+    search_visits = replay_batch.search_visits
     row_count = int(boards.shape[0])
     if row_count <= 0:
         empty_bool = torch.empty(0, dtype=torch.bool)
@@ -87,7 +94,10 @@ def evaluate_correction_cohort(
     chunk_size = max(1, int(batch_size))
     amp_enabled = bool(use_amp and device.type == "cuda")
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
-    was_training = bool(model.training)
+    # The learner may deliberately keep some submodules (for example a frozen
+    # BatchNorm layer) in eval mode while the rest of the model trains. A single
+    # root-level flag cannot restore that mixed state.
+    module_modes = tuple((module, bool(module.training)) for module in model.modules())
     model.eval()
 
     top1_parts = []
@@ -283,7 +293,10 @@ def evaluate_correction_cohort(
                 search_q_delta_parts.append(search_q_delta_chunk[valid_rows].cpu())
                 target_entropy_parts.append(target_entropy[valid_rows].cpu())
     finally:
-        model.train(was_training)
+        # Assign each flag directly: calling train() on the root recursively
+        # overwrites any per-module mode restored earlier in the traversal.
+        for module, was_training in module_modes:
+            module.training = was_training
 
     if not top1_parts:
         empty_bool = torch.empty(0, dtype=torch.bool)

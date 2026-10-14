@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
+from src.inference.fused_output import packed_output_views, packed_output_width_bytes
 from src.inference.shared_memory import shared_inference_array
 from src.mcts.native import get_native_mcts
 from src.mcts.search import (
@@ -142,6 +143,8 @@ class RemoteInferenceClient:
         self.last_server_pipeline_wait_s = 0.0
         self.last_server_output_finalize_wait_s = 0.0
         self.last_server_output_pipeline_used = False
+        self.last_server_output_ready_checked = False
+        self.last_server_output_early_published = False
         self.last_server_total_s = 0.0
         self.last_server_concat_s = 0.0
         self.last_server_h2d_s = 0.0
@@ -365,6 +368,12 @@ class RemoteInferenceClient:
             )
             self.last_server_output_pipeline_used = bool(
                 response.get("server_output_pipeline_used", False)
+            )
+            self.last_server_output_ready_checked = bool(
+                response.get("server_output_ready_checked", False)
+            )
+            self.last_server_output_early_published = bool(
+                response.get("server_output_early_published", False)
             )
             self.last_server_total_s = float(response.get("server_total_time_s", 0.0) or 0.0)
             self.last_server_concat_s = float(response.get("server_concat_time_s", 0.0) or 0.0)
@@ -763,6 +772,28 @@ def central_inference_server(
         _prioritize_central_inference_process()
         device = _configure_selfplay_worker_runtime(config, device_id)
         output_copy_stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
+        fused_legal_output = None
+        if device.type == 'cuda':
+            try:
+                from src.inference.fused_output import FusedLegalOutput
+
+                fused_legal_output = FusedLegalOutput()
+                expected_output_dtype = (
+                    central_amp_dtype
+                    if bool(config.get('hardware', {}).get('use_amp', False))
+                    else torch.float32
+                )
+                if not fused_legal_output.warmup_types(
+                    device,
+                    expected_output_dtype,
+                    expected_output_dtype,
+                    torch.int16,
+                ):
+                    fused_legal_output = None
+            except Exception:
+                # The regular torch gather/copy path remains the supported
+                # fallback when Triton is missing or cannot initialize.
+                fused_legal_output = None
         async_output_buffers = [None, None]
 
         def _async_output_buffer(slot, rows, policy_width):
@@ -773,19 +804,22 @@ def central_inference_server(
                 or int(current['rows']) < int(rows)
                 or int(current['policy_width']) < int(policy_width)
             )
+            if current is not None and current.get('pending') and needs_new:
+                # A failed deferred launch can leave an in-flight copy without
+                # a context retaining this slot. Drain it before replacing the
+                # last buffer reference, which also protects pinned host memory.
+                current['copy_done'].synchronize()
+                current['pending'] = False
             if needs_new:
+                packed_width_bytes = packed_output_width_bytes(policy_width)
                 current = {
                     'rows': int(rows),
                     'policy_width': int(policy_width),
-                    'gpu_policy': torch.empty(
-                        (rows, policy_width), device=device, dtype=torch.float16
+                    'gpu_packed': torch.empty(
+                        (rows, packed_width_bytes), device=device, dtype=torch.uint8
                     ),
-                    'gpu_value': torch.empty((rows, 3), device=device, dtype=torch.float32),
-                    'cpu_policy': torch.empty(
-                        (rows, policy_width), dtype=torch.float16, pin_memory=True
-                    ),
-                    'cpu_value': torch.empty(
-                        (rows, 3), dtype=torch.float32, pin_memory=True
+                    'cpu_packed': torch.empty(
+                        (rows, packed_width_bytes), dtype=torch.uint8, pin_memory=True
                     ),
                     'copy_done': torch.cuda.Event(),
                     'pending': False,
@@ -795,6 +829,7 @@ def central_inference_server(
                 current['copy_done'].synchronize()
                 current['pending'] = False
             return current
+
         try:
             compile_rank = int(server_rank)
         except Exception:
@@ -838,6 +873,7 @@ def central_inference_server(
                 )
             warmup_t0 = time.perf_counter()
             with torch.inference_mode():
+                fused_warmup_done = False
                 for batch_size in warmup_batches:
                     dummy_input = torch.zeros(
                         batch_size,
@@ -848,7 +884,22 @@ def central_inference_server(
                         dtype=dummy_dtype,
                     ).to(memory_format=torch.channels_last)
                     with torch.autocast(device_type='cuda', enabled=use_amp, dtype=central_amp_dtype):
-                        model(dummy_input, apply_log_softmax=False)
+                        policy_logits, value_logits = model(
+                            dummy_input, apply_log_softmax=False
+                        )
+                    if fused_legal_output is not None and not fused_warmup_done:
+                        # Warm any actual model output dtype before serving.
+                        # Width/strides stay runtime scalars in the Triton
+                        # kernel, so this does not create per-legal-width JITs.
+                        warm_legal_indices = torch.zeros(
+                            (1, 64), device=device, dtype=torch.int16
+                        )
+                        fused_legal_output.warmup(
+                            policy_logits[:1],
+                            warm_legal_indices,
+                            value_logits[:1],
+                        )
+                        fused_warmup_done = True
                     torch.cuda.synchronize(device)
             warmup_s = time.perf_counter() - warmup_t0
             if debug_enabled:
@@ -1145,8 +1196,11 @@ def central_inference_server(
                 async_output['pending'] = False
                 rows = int(ctx['eval_count'])
                 width = int(ctx['max_legal_cols'])
-                evaluated_policy = async_output['cpu_policy'][:rows, :width].numpy()
-                evaluated_values = async_output['cpu_value'][:rows, :3].numpy()
+                policy_view, value_view = packed_output_views(
+                    async_output['cpu_packed'], rows, width
+                )
+                evaluated_policy = policy_view.numpy()
+                evaluated_values = value_view.numpy()
                 finalize_wait = time.perf_counter() - finalize_t0
                 ctx['d2h_time'] += finalize_wait
             else:
@@ -1250,6 +1304,12 @@ def central_inference_server(
                     'server_pipeline_wait_s': float(ctx['pipeline_wait_time']),
                     'server_output_finalize_wait_s': float(finalize_wait),
                     'server_output_pipeline_used': bool(async_output is not None),
+                    'server_output_ready_checked': bool(
+                        ctx.get('output_ready_checked', False)
+                    ),
+                    'server_output_early_published': bool(
+                        ctx.get('output_early_published', False)
+                    ),
                     'server_total_time_s': float(server_total_before_publish),
                     'server_concat_time_s': float(ctx['concat_time']),
                     'server_h2d_time_s': float(ctx['h2d_time']),
@@ -1533,7 +1593,7 @@ def central_inference_server(
                 if compact_policy:
                     legal_index_tensor = torch.from_numpy(
                         eval_legal_indices[batch_start:batch_end]
-                    ).to(device, non_blocking=True).long()
+                    ).to(device, non_blocking=True)
                 if sync_timing and device.type == 'cuda':
                     torch.cuda.synchronize(device)
                 h2d_time += time.perf_counter() - h2d_t0
@@ -1586,9 +1646,6 @@ def central_inference_server(
                     forward_time += time.perf_counter() - forward_t0
                     forward_chunk_count += 1
                     d2h_t0 = time.perf_counter()
-                    if compact_policy and legal_index_tensor is not None:
-                        policy_logits = torch.gather(policy_logits, 1, legal_index_tensor)
-                    policy_fp16 = policy_logits.to(dtype=torch.float16)
                     use_async_output = bool(
                         defer_output
                         and output_copy_stream is not None
@@ -1597,48 +1654,115 @@ def central_inference_server(
                         and eval_count <= max_batch
                         and batch_start == 0
                     )
-                    if use_async_output:
-                        policy_width = int(policy_fp16.shape[1])
-                        async_output = _async_output_buffer(
+                    fused_output_used = False
+                    if (
+                        fused_legal_output is not None
+                        and device.type == 'cuda'
+                        and compact_policy
+                        and legal_index_tensor is not None
+                        and not group_cache_active
+                        and eval_count <= max_batch
+                        and batch_start == 0
+                        and max_legal_cols > 0
+                        and int(policy_logits.shape[0]) == actual_batch_size
+                        and fused_legal_output.is_warmed_types(
+                            policy_logits,
+                            legal_index_tensor,
+                            value_logits,
+                        )
+                    ):
+                        policy_width = int(legal_index_tensor.shape[1])
+                        packed_output = _async_output_buffer(
                             output_slot,
                             actual_batch_size,
                             policy_width,
                         )
-                        async_output['gpu_policy'][:actual_batch_size, :policy_width].copy_(
-                            policy_fp16
-                        )
-                        async_output['gpu_value'][:actual_batch_size, :3].copy_(
-                            value_logits
-                        )
-                        compute_done = torch.cuda.Event()
-                        compute_done.record()
-                        with torch.cuda.stream(output_copy_stream):
-                            output_copy_stream.wait_event(compute_done)
-                            async_output['cpu_policy'][:actual_batch_size, :policy_width].copy_(
-                                async_output['gpu_policy'][:actual_batch_size, :policy_width],
-                                non_blocking=True,
+                        gpu_packed = packed_output['gpu_packed'][:actual_batch_size]
+                        if fused_legal_output.launch(
+                            policy_logits,
+                            legal_index_tensor,
+                            value_logits,
+                            gpu_packed,
+                            policy_width,
+                        ):
+                            fused_output_used = True
+                            if use_async_output:
+                                async_output = packed_output
+                                compute_done = torch.cuda.Event()
+                                compute_done.record(torch.cuda.current_stream(device))
+                                with torch.cuda.stream(output_copy_stream):
+                                    output_copy_stream.wait_event(compute_done)
+                                    async_output['cpu_packed'][:actual_batch_size].copy_(
+                                        gpu_packed,
+                                        non_blocking=True,
+                                    )
+                                    async_output['copy_done'].record(output_copy_stream)
+                                async_output['pending'] = True
+                            else:
+                                # The synchronous path returns NumPy arrays to
+                                # queue-backed callers. Copy them out before the
+                                # reusable pinned slot can be selected again.
+                                packed_output['cpu_packed'][:actual_batch_size].copy_(
+                                    gpu_packed,
+                                    non_blocking=True,
+                                )
+                                packed_output['copy_done'].record(
+                                    torch.cuda.current_stream(device)
+                                )
+                                packed_output['pending'] = True
+                                packed_output['copy_done'].synchronize()
+                                packed_output['pending'] = False
+                                policy_view, value_view = packed_output_views(
+                                    packed_output['cpu_packed'],
+                                    actual_batch_size,
+                                    policy_width,
+                                )
+                                policy_np_chunks.append(policy_view.numpy().copy())
+                                value_np_chunks.append(value_view.numpy().copy())
+                    if not fused_output_used:
+                        if compact_policy and legal_index_tensor is not None:
+                            policy_logits = torch.gather(
+                                policy_logits, 1, legal_index_tensor.long()
                             )
-                            async_output['cpu_value'][:actual_batch_size, :3].copy_(
-                                async_output['gpu_value'][:actual_batch_size, :3],
-                                non_blocking=True,
+                        policy_fp16 = policy_logits.to(dtype=torch.float16)
+                        if use_async_output:
+                            policy_width = int(policy_fp16.shape[1])
+                            async_output = _async_output_buffer(
+                                output_slot,
+                                actual_batch_size,
+                                policy_width,
                             )
-                            async_output['copy_done'].record(output_copy_stream)
-                        async_output['pending'] = True
-                    elif (
-                        device.type == 'cuda'
-                        and policy_fp16.dtype == torch.float16
-                        and value_logits.dtype == torch.float16
-                    ):
-                        policy_width = int(policy_fp16.shape[1])
-                        packed_output = torch.cat((policy_fp16, value_logits), dim=1)
-                        packed_np = packed_output.cpu().numpy()
-                        policy_np_chunks.append(packed_np[:, :policy_width])
-                        value_np_chunks.append(
-                            packed_np[:, policy_width:].astype(np.float32)
-                        )
-                    else:
-                        policy_np_chunks.append(policy_fp16.cpu().numpy())
-                        value_np_chunks.append(value_logits.float().cpu().numpy())
+                            gpu_packed = async_output['gpu_packed'][:actual_batch_size]
+                            policy_view, value_view = packed_output_views(
+                                gpu_packed, actual_batch_size, policy_width
+                            )
+                            policy_view.copy_(policy_fp16)
+                            value_view.copy_(value_logits)
+                            compute_done = torch.cuda.Event()
+                            compute_done.record(torch.cuda.current_stream(device))
+                            with torch.cuda.stream(output_copy_stream):
+                                output_copy_stream.wait_event(compute_done)
+                                async_output['cpu_packed'][:actual_batch_size].copy_(
+                                    gpu_packed,
+                                    non_blocking=True,
+                                )
+                                async_output['copy_done'].record(output_copy_stream)
+                            async_output['pending'] = True
+                        elif (
+                            device.type == 'cuda'
+                            and policy_fp16.dtype == torch.float16
+                            and value_logits.dtype == torch.float16
+                        ):
+                            policy_width = int(policy_fp16.shape[1])
+                            packed_output = torch.cat((policy_fp16, value_logits), dim=1)
+                            packed_np = packed_output.cpu().numpy()
+                            policy_np_chunks.append(packed_np[:, :policy_width])
+                            value_np_chunks.append(
+                                packed_np[:, policy_width:].astype(np.float32)
+                            )
+                        else:
+                            policy_np_chunks.append(policy_fp16.cpu().numpy())
+                            value_np_chunks.append(value_logits.float().cpu().numpy())
                     if sync_timing and device.type == 'cuda':
                         torch.cuda.synchronize(device)
                     d2h_time += time.perf_counter() - d2h_t0
@@ -1677,9 +1801,28 @@ def central_inference_server(
                 'staging_copy_time': staging_copy_time,
                 'batch_target': int(batch_target or max_batch),
                 'launch_total_time': time.perf_counter() - group_t0,
+                'output_ready_checked': False,
+                'output_early_published': False,
             }
             if async_output is not None:
-                return {'deferred_finalize': lambda ctx=ctx: _finalize_infer_group(ctx)}
+                shared_pipe_output = all(
+                    _shared_request_arrays(req) is not None
+                    and hasattr(_response_queue_for(req), 'send')
+                    for req in requests
+                )
+                return {
+                    'deferred_finalize': lambda ctx=ctx: _finalize_infer_group(ctx),
+                    'deferred_ready': lambda ctx=ctx: bool(
+                        ctx['async_output']['copy_done'].query()
+                    ),
+                    'mark_deferred_ready': lambda ready, ctx=ctx: ctx.update(
+                        {
+                            'output_ready_checked': True,
+                            'output_early_published': bool(ready),
+                        }
+                    ),
+                    'early_publish_safe': bool(shared_pipe_output),
+                }
             return _finalize_infer_group(ctx)
 
         pending = []
@@ -1969,6 +2112,30 @@ def central_inference_server(
                             inference_tasks[task_idx + 1][1],
                             bool(cache_gate.active),
                         )
+                    # If the previous D2H copy already finished while this
+                    # batch was being prepared, publish it before submitting
+                    # another GPU forward.  Otherwise retain the existing
+                    # launch-then-finalize overlap.  Restrict the optimization
+                    # to shared outputs with synchronous Pipe metadata sends;
+                    # Queue-backed NumPy response ownership remains unchanged.
+                    if (
+                        deferred_stage is not None
+                        and deferred_stage.get('early_publish_safe', False)
+                    ):
+                        try:
+                            output_ready = bool(deferred_stage['ready']())
+                        except Exception:
+                            # Preserve the existing synchronize-and-publish
+                            # path if a nonblocking event query is unavailable.
+                            output_ready = False
+                        deferred_stage['mark_ready'](output_ready)
+                        if output_ready:
+                            previous_stats = deferred_stage['finalize']()
+                            _record_stage_stats(
+                                previous_stats,
+                                time.perf_counter() - deferred_stage['started_at'],
+                            )
+                            deferred_stage = None
                     try:
                         infer_t0 = time.perf_counter()
                         launched = _infer_group(
@@ -1992,6 +2159,11 @@ def central_inference_server(
                         if finalize is not None:
                             deferred_stage = {
                                 'finalize': finalize,
+                                'ready': launched['deferred_ready'],
+                                'mark_ready': launched['mark_deferred_ready'],
+                                'early_publish_safe': bool(
+                                    launched.get('early_publish_safe', False)
+                                ),
                                 'started_at': infer_t0,
                             }
                         else:

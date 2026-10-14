@@ -334,7 +334,9 @@ struct NativeNode {
 
 struct RootSelectionState {
     std::vector<double> initial_visits;
-    std::vector<double> gumbel;
+    // Per-search normalized log-prior + sampled Gumbel, rebuilt from current
+    // priors/noise in configure_root and reused across root selections.
+    std::vector<double> root_base_scores;
     std::vector<std::int32_t> sequence;
     double initial_total = 0.0;
     bool configured = false;
@@ -619,16 +621,6 @@ inline std::int32_t select_root(
     }
     const double eligible_visit = has_considered ? considered_visit : min_fresh;
     const double scale = (forest.c_visit + max_fresh) * forest.c_scale;
-    double max_log_prior = -std::numeric_limits<double>::infinity();
-    for (std::int32_t index = 0; index < count; ++index) {
-        max_log_prior = std::max(
-            max_log_prior,
-            std::log(std::max(
-                static_cast<double>(edges[index].prior),
-                std::numeric_limits<double>::min()
-            ))
-        );
-    }
     std::int32_t selected = 0;
     double best_score = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < count; ++index) {
@@ -645,15 +637,10 @@ inline std::int32_t select_root(
         const float q_score = static_cast<float>(
             forest.completed_q[static_cast<std::size_t>(index)] * scale
         );
-        const double gumbel = index < static_cast<std::int32_t>(state.gumbel.size())
-            ? state.gumbel[static_cast<std::size_t>(index)]
+        const double base_score = index < static_cast<std::int32_t>(state.root_base_scores.size())
+            ? state.root_base_scores[static_cast<std::size_t>(index)]
             : 0.0;
-        const double score = (
-            std::log(std::max(
-                static_cast<double>(edges[index].prior),
-                std::numeric_limits<double>::min()
-            )) - max_log_prior
-        ) + gumbel + static_cast<double>(q_score);
+        const double score = base_score + static_cast<double>(q_score);
         if (score > best_score) {
             best_score = score;
             selected = index;
@@ -938,10 +925,10 @@ MCTS_API std::int32_t mcts_forest_configure_root(
     try {
         auto& state = forest->root_states[static_cast<std::size_t>(node_id)];
         state.initial_visits.resize(static_cast<std::size_t>(count));
-        state.gumbel.clear();
+        state.root_base_scores.clear();
         state.sequence.clear();
         if (count > 0) {
-            state.gumbel.assign(gumbel, gumbel + count);
+            state.root_base_scores.assign(gumbel, gumbel + count);
         }
         if (sequence_count > 0) {
             state.sequence.assign(sequence, sequence + sequence_count);
@@ -951,6 +938,26 @@ MCTS_API std::int32_t mcts_forest_configure_root(
             state.initial_visits[static_cast<std::size_t>(index)] =
                 static_cast<double>(initial_visits[index]);
             state.initial_total += static_cast<double>(initial_visits[index]);
+        }
+        if (count > 0) {
+            const auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
+            const auto* edges = node_edges(*forest, node);
+            const double tiny = std::numeric_limits<double>::min();
+            double max_log_prior = -std::numeric_limits<double>::infinity();
+            for (std::int32_t index = 0; index < count; ++index) {
+                max_log_prior = std::max(
+                    max_log_prior,
+                    std::log(std::max(static_cast<double>(edges[index].prior), tiny))
+                );
+            }
+            for (std::int32_t index = 0; index < count; ++index) {
+                const double normalized_log_prior = std::log(std::max(
+                    static_cast<double>(edges[index].prior),
+                    tiny
+                )) - max_log_prior;
+                state.root_base_scores[static_cast<std::size_t>(index)] =
+                    normalized_log_prior + state.root_base_scores[static_cast<std::size_t>(index)];
+            }
         }
         state.configured = true;
         return 0;

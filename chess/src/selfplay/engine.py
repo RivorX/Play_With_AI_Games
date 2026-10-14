@@ -1,6 +1,7 @@
 """Self-play game engine built on the canonical batched MCTS search."""
 
 import math
+import struct
 import time
 
 import numpy as np
@@ -32,6 +33,7 @@ from src.mcts.search import (
 )
 from src.models.data.se_cnn_v9.helpers import move_to_index
 from src.training.rl.search_control import suffix_regret_targets
+from src.selfplay.opening_pool import load_opening_pool
 
 
 _OPENING_DIVERSITY_SEQUENCE_PLIES = 8
@@ -41,6 +43,246 @@ _GUMBEL_SEARCH_STAT_KEYS = (
     'gumbel_initial_round_visits_sum',
     'gumbel_width_adapted_count',
 )
+
+
+def _hard_start_position_counts(hard_start, initial_board):
+    """Return FIDE repetition counts when a hard start's legal prefix is known.
+
+    ``position_history_uci`` is the complete move sequence from the standard
+    initial position (or ``position_history_start_fen``) through ``initial_board``.
+    FEN-only legacy starts retain their previous root-only count because their
+    earlier repetition history cannot be inferred safely.
+    """
+    hard_start = dict(hard_start or {})
+    if 'position_history_uci' not in hard_start:
+        return {_board_position_key(initial_board): 1}
+
+    start_fen = hard_start.get('position_history_start_fen')
+    replay = chess.new_board(start_fen) if start_fen else chess.new_board()
+    counts = {_board_position_key(replay): 1}
+    for ply, raw_uci in enumerate(hard_start.get('position_history_uci') or ()):
+        try:
+            move = chess.move_from_uci(str(raw_uci))
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid hard-start history UCI at ply {ply}: {raw_uci!r}"
+            ) from exc
+        if move is None or move not in chess.legal_moves(replay):
+            raise ValueError(
+                f"Illegal hard-start history UCI at ply {ply}: {raw_uci!r}"
+            )
+        chess.apply_move(replay, move)
+        key = _board_position_key(replay)
+        counts[key] = int(counts.get(key, 0)) + 1
+
+    if chess.board_fen(replay) != chess.board_fen(initial_board):
+        raise ValueError(
+            "Hard-start position_history_uci does not end at the supplied FEN: "
+            f"{chess.board_fen(replay)!r} != {chess.board_fen(initial_board)!r}"
+        )
+    return counts
+
+
+def _optional_nonnegative_search_count(value):
+    """Keep unavailable historical search accounting explicitly unknown."""
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _new_mcts_budget_quality_bucket():
+    return {
+        'samples': 0,
+        'useful_change_count': 0,
+        'policy_kl_sum': 0.0,
+        'target_entropy_sum': 0.0,
+        'fresh_sim_sum': 0.0,
+        'fresh_sim_samples': 0,
+        'fresh_budget_sum': 0.0,
+    }
+
+
+def _mcts_budget_quality_levels_summary(buckets):
+    summary = {}
+    for level, raw in buckets.items():
+        samples = int(raw['samples'])
+        fresh_samples = int(raw['fresh_sim_samples'])
+        fresh_budget = float(raw['fresh_budget_sum'])
+        summary[str(level)] = {
+            'samples': samples,
+            'useful_change_count': int(raw['useful_change_count']),
+            'useful_change_rate': (
+                float(raw['useful_change_count']) / float(samples)
+                if samples > 0 else None
+            ),
+            'policy_kl_mean': (
+                float(raw['policy_kl_sum']) / float(samples)
+                if samples > 0 else None
+            ),
+            'target_entropy_mean': (
+                float(raw['target_entropy_sum']) / float(samples)
+                if samples > 0 else None
+            ),
+            'fresh_simulations_mean': (
+                float(raw['fresh_sim_sum']) / float(fresh_samples)
+                if fresh_samples > 0 else None
+            ),
+            'fresh_simulations_known_fraction': (
+                float(fresh_samples) / float(samples)
+                if samples > 0 else 0.0
+            ),
+            'fresh_sim_share': (
+                float(raw['fresh_sim_sum']) / fresh_budget
+                if fresh_budget > 0.0 else None
+            ),
+        }
+    return summary
+
+
+class _CompactSelfPlayHistoryEntry:
+    """Compact internal candidate storage with the legacy indexed view.
+
+    Games retain every candidate until the final trajectory length is known,
+    then select evenly spaced replay rows. Keep the sequence indices consumed
+    by suffix_regret_targets and the postgame selector, while storing sparse
+    tensors as exact bytes and scalar search metadata as float64 bytes.
+    """
+
+    __slots__ = (
+        'history_count',
+        'ply_index',
+        'policy_indices',
+        'policy_values',
+        'turn',
+        'source_code',
+        'legal_indices',
+        'fen',
+        'packed_metrics',
+        'history_fens',
+        'search_changed_top',
+        'search_visits',
+        'search_budget_assigned',
+        'search_simulations_effective',
+        'search_simulations_fresh',
+        'search_visits_inherited_credit',
+    )
+
+    _LENGTH = 18
+    _METRIC_OFFSETS = {
+        9: 0,
+        12: 1,
+        13: 2,
+        14: 3,
+        15: 4,
+        16: 5,
+    }
+
+    def __init__(
+        self,
+        *,
+        history_count,
+        ply_index=None,
+        policy_indices,
+        policy_values,
+        turn,
+        source_code,
+        legal_indices,
+        fen,
+        root_q,
+        history_fens,
+        search_changed_top,
+        search_q_delta,
+        best_q,
+        played_q,
+        orig_q,
+        policy_kld,
+        search_visits,
+        search_budget_assigned=None,
+        search_simulations_effective=None,
+        search_simulations_fresh=None,
+        search_visits_inherited_credit=None,
+    ):
+        self.history_count = int(history_count)
+        self.ply_index = None if ply_index is None else int(ply_index)
+        self.policy_indices = policy_indices.numpy().tobytes()
+        self.policy_values = policy_values.numpy().tobytes()
+        self.turn = turn
+        self.source_code = int(source_code)
+        self.legal_indices = legal_indices.numpy().tobytes()
+        self.fen = fen
+        self.packed_metrics = struct.pack(
+            '<6d',
+            float(root_q),
+            float(search_q_delta),
+            float(best_q),
+            float(played_q),
+            float(orig_q),
+            float(policy_kld),
+        )
+        self.history_fens = history_fens
+        self.search_changed_top = bool(search_changed_top)
+        self.search_visits = int(search_visits)
+        self.search_budget_assigned = _optional_nonnegative_search_count(
+            search_budget_assigned
+        )
+        self.search_simulations_effective = _optional_nonnegative_search_count(
+            search_simulations_effective
+        )
+        self.search_simulations_fresh = _optional_nonnegative_search_count(
+            search_simulations_fresh
+        )
+        self.search_visits_inherited_credit = _optional_nonnegative_search_count(
+            search_visits_inherited_credit
+        )
+
+    def __len__(self):
+        return self._LENGTH
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[idx] for idx in range(*index.indices(self._LENGTH)))
+        index = int(index)
+        if index < 0:
+            index += self._LENGTH
+        if index == 0:
+            return self.history_count
+        if index == 1:
+            return self.policy_indices
+        if index == 2:
+            return self.policy_values
+        if index == 3:
+            return self.turn
+        if index in (4, 5):
+            return 1.0
+        if index == 6:
+            return self.source_code
+        if index == 7:
+            return self.legal_indices
+        if index == 8:
+            return self.fen
+        if index == 10:
+            return self.history_fens
+        if index == 11:
+            return self.search_changed_top
+        if index == 17:
+            return self.search_visits
+        metric_index = self._METRIC_OFFSETS.get(index)
+        if metric_index is not None:
+            return struct.unpack_from('<d', self.packed_metrics, metric_index * 8)[0]
+        raise IndexError(index)
+
+
+def _restore_compact_history_tensor(payload, dtype):
+    """Recreate one ordinary CPU tensor from a compact candidate payload."""
+    if not isinstance(payload, bytes):
+        return payload
+    if not payload:
+        return torch.empty(0, dtype=dtype)
+    return torch.frombuffer(bytearray(payload), dtype=dtype)
 
 
 def _gumbel_search_stats_payload(stats):
@@ -67,13 +309,23 @@ class SelfPlayEngine:
         opponent_models_by_label=None,
         opponent_plan_labels=None,
     ):
+        rl_cfg = config.get('reinforcement_learning', {})
+        self.opening_pool_path = rl_cfg.get('self_play_opening_pool_path')
+        if self.opening_pool_path:
+            self.opening_lines = load_opening_pool(
+                self.opening_pool_path,
+                history_positions=int(config.get('model', {}).get('history_positions', 0) or 0),
+                expected_sha256=rl_cfg.get('self_play_opening_pool_sha256'),
+            )
+        else:
+            self.opening_lines = _SELFPLAY_SELFPLAY_OPENING_LINES
+
         self.model = model
         self.config = config
         self.device = device
         self.model.eval()
         self.opponent_model = opponent_model
         self.opponent_source_label = str(opponent_source_label or "current")
-        rl_cfg = config.get('reinforcement_learning', {})
         self.mcts_phase_opening_max_fullmove = max(
             1,
             int(rl_cfg.get('value_phase_opening_max_fullmove', 12)),
@@ -617,10 +869,13 @@ class SelfPlayEngine:
     ):
         history_entry = gs['game_history'][int(history_idx)]
         history_count, policy_indices, policy_values, turn = history_entry[:4]
+        policy_indices = _restore_compact_history_tensor(policy_indices, torch.int16)
+        policy_values = _restore_compact_history_tensor(policy_values, torch.float32)
         importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
         policy_weight = float(history_entry[5]) if len(history_entry) > 5 else 1.0
         source_code = int(history_entry[6]) if len(history_entry) > 6 else _REPLAY_SOURCE_UNKNOWN
         legal_indices = history_entry[7] if len(history_entry) > 7 and history_entry[7] is not None else policy_indices
+        legal_indices = _restore_compact_history_tensor(legal_indices, torch.int16)
         fen = history_entry[8] if len(history_entry) > 8 else None
         root_q = float(history_entry[9]) if len(history_entry) > 9 else float('nan')
         history_fens = tuple(history_entry[10] or ()) if len(history_entry) > 10 else ()
@@ -631,6 +886,25 @@ class SelfPlayEngine:
         orig_q = float(history_entry[15]) if len(history_entry) > 15 else float('nan')
         policy_kld = float(history_entry[16]) if len(history_entry) > 16 else float('nan')
         search_visits = int(history_entry[17]) if len(history_entry) > 17 else 0
+        search_budget_assigned = getattr(history_entry, 'search_budget_assigned', None)
+        search_simulations_effective = getattr(
+            history_entry, 'search_simulations_effective', None
+        )
+        search_simulations_fresh = getattr(
+            history_entry, 'search_simulations_fresh', None
+        )
+        search_visits_inherited_credit = getattr(
+            history_entry, 'search_visits_inherited_credit', None
+        )
+        game_ply_index = getattr(history_entry, 'ply_index', None)
+        has_game_ply_index = game_ply_index is not None
+        if game_ply_index is None:
+            # Legacy tuple entries carry no physical ply. Preserve their old
+            # stored-row distance rather than mixing that ordinal with the
+            # game's actual move counter.
+            game_ply_index = int(history_idx)
+        else:
+            game_ply_index = int(game_ply_index)
 
         if outcome == 0.0:
             value = draw_value_target
@@ -638,10 +912,14 @@ class SelfPlayEngine:
             signed_outcome = outcome if turn == chess.WHITE else -outcome
             value = float(signed_outcome)
         value_weight = 1.0
-        # The live board-history cache is intentionally bounded.  The replay
-        # target still knows the exact distance to the end from its stable game
-        # index, so it must not depend on the cache length.
-        moves_left = max(0, int(history_len) - int(history_idx))
+        # The live board-history cache is intentionally bounded.  Count real
+        # plies from this root to the terminal position; history_idx counts
+        # stored policy rows and can skip frozen-opponent turns.
+        if has_game_ply_index:
+            game_ply_count = int(gs.get('move_count', history_len))
+            moves_left = max(0, game_ply_count - game_ply_index)
+        else:
+            moves_left = max(0, int(history_len) - int(history_idx))
 
         return {
             'history_idx': int(history_idx),
@@ -654,6 +932,7 @@ class SelfPlayEngine:
             'policy_weight': policy_weight,
             'value_weight': value_weight,
             'moves_left': moves_left,
+            'game_ply_index': game_ply_index,
             'legal_indices': legal_indices,
             'source_code': source_code,
             'fen': fen,
@@ -666,6 +945,10 @@ class SelfPlayEngine:
             'orig_q': orig_q,
             'policy_kld': policy_kld,
             'search_visits': search_visits,
+            'search_budget_assigned': search_budget_assigned,
+            'search_simulations_effective': search_simulations_effective,
+            'search_simulations_fresh': search_simulations_fresh,
+            'search_visits_inherited_credit': search_visits_inherited_credit,
         }
 
     def _build_replay_history_tensor(self, item, history_positions, encoded_fen_cache):
@@ -752,9 +1035,13 @@ class SelfPlayEngine:
                 float(item.get('policy_kld', float('nan'))),
                 int(item.get('search_visits', 0)),
                 int(gs.get('_replay_game_id', -1)),
-                int(item.get('history_idx', -1)),
+                int(item.get('game_ply_index', item.get('history_idx', -1))),
                 float(regret_targets[int(item['history_idx'])]),
                 int(gs.get('_archive_id', -1)),
+                item.get('search_budget_assigned'),
+                item.get('search_simulations_effective'),
+                item.get('search_simulations_fresh'),
+                item.get('search_visits_inherited_credit'),
             ))
         if self.profile_enabled:
             self._profile_add('policy_target_postgame_time', time.perf_counter() - postgame_t0)
@@ -788,8 +1075,8 @@ class SelfPlayEngine:
         if np.random.random() > self.opening_diversity_fraction:
             return ()
 
-        line = _SELFPLAY_SELFPLAY_OPENING_LINES[
-            int(np.random.randint(0, len(_SELFPLAY_SELFPLAY_OPENING_LINES)))
+        line = self.opening_lines[
+            int(np.random.randint(0, len(self.opening_lines)))
         ]
         max_plies = min(len(line), self.opening_diversity_max_plies)
         min_plies = min(max_plies, self.opening_diversity_min_plies)
@@ -1044,6 +1331,11 @@ class SelfPlayEngine:
                 'budget_sum',
             ):
                 total_mcts_quality_stats[f'{prefix}_{suffix}'] = 0.0
+        total_mcts_budget_quality_levels = {
+            str(budget): _new_mcts_budget_quality_bucket()
+            for budget in range(64, 321, 16)
+        }
+        total_mcts_budget_quality_levels['other'] = _new_mcts_budget_quality_bucket()
         opponent_source_counts = {}
         opponent_source_results = {}
 
@@ -1140,6 +1432,14 @@ class SelfPlayEngine:
                         total_mcts_quality_stats[key][idx] += int(count or 0)
             else:
                 total_mcts_quality_stats[key] += float(batch_stats.get(key, 0.0) or 0.0)
+        for level_key, level_stats in dict(
+            batch_stats.get('mcts_budget_quality_levels_raw', {}) or {}
+        ).items():
+            target_bucket = total_mcts_budget_quality_levels.get(str(level_key))
+            if target_bucket is None:
+                target_bucket = total_mcts_budget_quality_levels['other']
+            for key in target_bucket:
+                target_bucket[key] += level_stats.get(key, 0)
         for label, count in dict(batch_stats.get('opponent_source_counts', {}) or {}).items():
             opponent_source_counts[str(label)] = int(opponent_source_counts.get(str(label), 0)) + int(count)
         for label, stats in dict(batch_stats.get('opponent_source_results', {}) or {}).items():
@@ -1209,6 +1509,13 @@ class SelfPlayEngine:
             ):
                 key = f'{prefix}_{suffix}'
                 budget_quality_stats[key] = total_mcts_quality_stats[key]
+        mcts_budget_quality_levels_summary = _mcts_budget_quality_levels_summary(
+            total_mcts_budget_quality_levels
+        )
+        mcts_budget_quality_samples = sum(
+            int(bucket['samples'])
+            for bucket in total_mcts_budget_quality_levels.values()
+        )
         self.last_selfplay_stats = {
             'truncated_games': total_truncated_games,
             'completed_games': max(0, total_games - total_truncated_games),
@@ -1278,6 +1585,12 @@ class SelfPlayEngine:
             'opening_prefix_plies_sum': int(total_opening_prefix_plies),
             'opening_sequence_counts': dict(opening_sequence_counts),
             'mcts_prior_agreement_samples': int(mcts_quality_samples),
+            'mcts_budget_quality_levels': mcts_budget_quality_levels_summary,
+            'mcts_budget_quality_samples': int(mcts_budget_quality_samples),
+            'mcts_budget_quality_coverage': (
+                float(mcts_budget_quality_samples) / float(mcts_quality_samples)
+                if mcts_quality_samples > 0 else 0.0
+            ),
             'policy_target_sample_count': int(policy_target_sample_count),
             'policy_target_challenge_delta_intervention_count': int(
                 policy_target_challenge_delta_intervention_count
@@ -1695,6 +2008,10 @@ class SelfPlayEngine:
                     hard_start = candidate
             initial_board = chess.new_board(hard_start.get('fen')) if hard_start else chess.new_board()
             hard_history_fens = list((hard_start or {}).get('history_fens', []) or [])[-self.history_positions:]
+            if hard_start:
+                position_counts = _hard_start_position_counts(hard_start, initial_board)
+            else:
+                position_counts = {_board_position_key(initial_board): 1}
             encoded_hard_history = []
             for history_fen in hard_history_fens:
                 try:
@@ -1711,7 +2028,7 @@ class SelfPlayEngine:
                 'board': initial_board,
                 'board_history': encoded_hard_history,
                 'fen_history': hard_history_fens,
-                'position_counts': {_board_position_key(initial_board): 1},
+                'position_counts': position_counts,
                 'root': None,
                 '_root_synced': False,
                 'opponent_root': None,
@@ -1865,6 +2182,11 @@ class SelfPlayEngine:
             target_quality[f'{prefix}_target_entropy_sum'] = 0.0
             target_quality[f'{prefix}_fresh_sim_sum'] = 0.0
             target_quality[f'{prefix}_budget_sum'] = 0.0
+        mcts_budget_quality_levels = {
+            str(budget): _new_mcts_budget_quality_bucket()
+            for budget in range(64, 321, 16)
+        }
+        mcts_budget_quality_levels['other'] = _new_mcts_budget_quality_bucket()
 
         def _accumulate_target_quality(search_metadata, board):
             if not isinstance(search_metadata, dict):
@@ -1931,7 +2253,28 @@ class SelfPlayEngine:
                         target_quality['changed_to_lower_q'] += 1
                     elif q_delta_value > 0.02:
                         target_quality['changed_to_higher_q'] += 1
-            budget = int(search_metadata.get('simulation_budget', 0) or 0)
+            budget = _optional_nonnegative_search_count(
+                search_metadata.get('simulation_budget')
+            )
+            if budget is not None:
+                budget_key = str(budget) if str(budget) in mcts_budget_quality_levels else 'other'
+                level = mcts_budget_quality_levels[budget_key]
+                level['samples'] += 1
+                if changed_top and q_delta is not None and float(q_delta) > 0.02:
+                    level['useful_change_count'] += 1
+                level['policy_kl_sum'] += float(
+                    search_metadata.get('mcts_policy_kl', 0.0) or 0.0
+                )
+                level['target_entropy_sum'] += float(
+                    search_metadata.get('visit_entropy', 0.0) or 0.0
+                )
+                fresh = _optional_nonnegative_search_count(
+                    search_metadata.get('fresh_simulations_used')
+                )
+                if fresh is not None:
+                    level['fresh_sim_sum'] += float(fresh)
+                    level['fresh_sim_samples'] += 1
+                    level['fresh_budget_sum'] += float(budget)
             if budget in (64, 128, 192, 256, 320):
                 prefix = f'mcts_budget_{budget}'
                 target_quality[f'{prefix}_samples'] += 1
@@ -2212,13 +2555,11 @@ class SelfPlayEngine:
                     history_count = len(gs['board_history'])
                     # The active replay cap is deliberately evenly spaced and
                     # training is game-balanced, so importance ranking is not a
-                    # sampling input. Keep the legacy tuple slot constant until
-                    # the packed replay format is versioned independently.
-                    importance_score = 1.0
+                    # sampling input. The compact history sequence exposes the
+                    # legacy constant slot to postgame replay construction.
                     # Every completed Gumbel root is one policy example. Its
                     # uncertainty is already encoded by the soft improved-policy
                     # target, so confidence must not scale CE a second time.
-                    policy_weight = 1.0
                     search_changed_top, search_q_delta = (
                         _search_correction_metadata(search_metadata)
                     )
@@ -2234,33 +2575,60 @@ class SelfPlayEngine:
                     replay_search_metadata = (
                         search_metadata if isinstance(search_metadata, dict) else {}
                     )
-                    gs['game_history'].append((
-                        history_count,
-                        policy_indices,
-                        policy_values,
-                        board.turn,
-                        importance_score,
-                        policy_weight,
-                        replay_source_code,
-                        legal_indices_full,
-                        chess.board_fen(board),
-                        (
+                    gs['game_history'].append(_CompactSelfPlayHistoryEntry(
+                        history_count=history_count,
+                        ply_index=int(gs.get('move_count', len(gs['game_history']))),
+                        policy_indices=policy_indices,
+                        policy_values=policy_values,
+                        turn=board.turn,
+                        source_code=replay_source_code,
+                        legal_indices=legal_indices_full,
+                        fen=chess.board_fen(board),
+                        root_q=(
                             float(replay_search_metadata.get('root_value'))
                             if replay_search_metadata.get('root_value') is not None
                             else float('nan')
                         ),
-                        tuple(gs.get('fen_history', [])[-self.history_positions:]),
-                        search_changed_top,
-                        search_q_delta,
-                        float(replay_search_metadata.get('best_q'))
-                        if replay_search_metadata.get('best_q') is not None else float('nan'),
-                        float(replay_search_metadata.get('played_q'))
-                        if replay_search_metadata.get('played_q') is not None else float('nan'),
-                        float(replay_search_metadata.get('orig_q'))
-                        if replay_search_metadata.get('orig_q') is not None else float('nan'),
-                        float(replay_search_metadata.get('policy_kld'))
-                        if replay_search_metadata.get('policy_kld') is not None else float('nan'),
-                        int(replay_search_metadata.get('search_visits', 0) or 0),
+                        history_fens=tuple(
+                            gs.get('fen_history', [])[-self.history_positions:]
+                        ),
+                        search_changed_top=search_changed_top,
+                        search_q_delta=search_q_delta,
+                        best_q=(
+                            float(replay_search_metadata.get('best_q'))
+                            if replay_search_metadata.get('best_q') is not None
+                            else float('nan')
+                        ),
+                        played_q=(
+                            float(replay_search_metadata.get('played_q'))
+                            if replay_search_metadata.get('played_q') is not None
+                            else float('nan')
+                        ),
+                        orig_q=(
+                            float(replay_search_metadata.get('orig_q'))
+                            if replay_search_metadata.get('orig_q') is not None
+                            else float('nan')
+                        ),
+                        policy_kld=(
+                            float(replay_search_metadata.get('policy_kld'))
+                            if replay_search_metadata.get('policy_kld') is not None
+                            else float('nan')
+                        ),
+                        search_visits=int(
+                            replay_search_metadata.get('search_visits', 0) or 0
+                        ),
+                        search_budget_assigned=replay_search_metadata.get(
+                            'simulation_budget'
+                        ),
+                        search_simulations_effective=replay_search_metadata.get(
+                            'simulations_used'
+                        ),
+                        search_simulations_fresh=replay_search_metadata.get(
+                            'fresh_simulations_used'
+                        ),
+                        search_visits_inherited_credit=replay_search_metadata.get(
+                            'inherited_visit_credit'
+                        ),
                     ))
                     if self.profile_enabled:
                         self._profile_add('policy_target_build_time', time.perf_counter() - policy_t0)
@@ -2383,6 +2751,9 @@ class SelfPlayEngine:
                 'budget_sum',
             ):
                 budget_quality_stats[f'{prefix}_{suffix}'] = target_quality[f'{prefix}_{suffix}']
+        budget_quality_stats['mcts_budget_quality_levels_raw'] = {
+            key: dict(value) for key, value in mcts_budget_quality_levels.items()
+        }
         return positions, game_lengths, {
             'total_games': finalized_game_count,
             'truncated_games': int(truncated_games),

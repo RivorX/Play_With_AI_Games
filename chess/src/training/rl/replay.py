@@ -14,7 +14,9 @@ from src.mcts.q_delta import (
 
 
 _DEFAULT_MAX_POLICY_TARGETS = 256
-_REPLAY_STATE_VERSION = 2
+_REPLAY_STATE_VERSION = 3
+_UNKNOWN_SEARCH_COUNT = -1
+_MAX_SEARCH_COUNT = (1 << 31) - 1
 _REPLAY_TENSOR_FIELDS = (
     "_boards",
     "_values",
@@ -37,6 +39,10 @@ _REPLAY_TENSOR_FIELDS = (
     "_orig_q_targets",
     "_policy_kld_targets",
     "_search_visits",
+    "_search_budget_assigned",
+    "_search_simulations_effective",
+    "_search_simulations_fresh",
+    "_search_visits_inherited_credit",
     "_game_ids",
     "_game_ply_indices",
     "_regret_targets",
@@ -55,6 +61,19 @@ REPLAY_SOURCE_LABELS = {
     REPLAY_SOURCE_LEARNER: "learner",
     REPLAY_SOURCE_FROZEN_BEST: "frozen_best",
 }
+
+
+def _search_count_or_unknown(value):
+    """Normalize optional search accounting without inventing legacy values."""
+    if value is None:
+        return _UNKNOWN_SEARCH_COUNT
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return _UNKNOWN_SEARCH_COUNT
+    if count < 0 or count > _MAX_SEARCH_COUNT:
+        return _UNKNOWN_SEARCH_COUNT
+    return count
 
 
 def _fen_resets_repetition_history(fen):
@@ -116,6 +135,10 @@ class ReplayBuffer:
         self._orig_q_targets = None
         self._policy_kld_targets = None
         self._search_visits = None
+        self._search_budget_assigned = None
+        self._search_simulations_effective = None
+        self._search_simulations_fresh = None
+        self._search_visits_inherited_credit = None
         self._game_ids = None
         self._game_ply_indices = None
         self._regret_targets = None
@@ -197,6 +220,18 @@ class ReplayBuffer:
         self._orig_q_targets = torch.full((self.max_size, 1), float("nan"), dtype=torch.float32)
         self._policy_kld_targets = torch.full((self.max_size,), float("nan"), dtype=torch.float32)
         self._search_visits = torch.zeros((self.max_size,), dtype=torch.int32)
+        self._search_budget_assigned = torch.full(
+            (self.max_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+        )
+        self._search_simulations_effective = torch.full(
+            (self.max_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+        )
+        self._search_simulations_fresh = torch.full(
+            (self.max_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+        )
+        self._search_visits_inherited_credit = torch.full(
+            (self.max_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+        )
         self._game_ids = torch.full((self.max_size,), -1, dtype=torch.int64)
         self._game_ply_indices = torch.full((self.max_size,), -1, dtype=torch.int16)
         self._regret_targets = torch.full((self.max_size,), float("nan"), dtype=torch.float32)
@@ -236,8 +271,14 @@ class ReplayBuffer:
                 .to(dtype=torch.uint8)
             )
 
-    def _decode_boards_from_storage(self, destination, source):
-        destination.copy_(source)
+    def _decode_boards_from_storage(self, destination, source, indices=None):
+        if indices is not None and source.dtype == destination.dtype:
+            # Gather directly into the cached output. Advanced indexing followed
+            # by copy_ would hold a second full sampled board batch temporarily.
+            torch.index_select(source, 0, indices, out=destination)
+        else:
+            selected = source if indices is None else source[indices]
+            destination.copy_(selected)
         if not self.compact_boards:
             return
         channels = int(destination.shape[-3])
@@ -288,10 +329,10 @@ class ReplayBuffer:
         if not isinstance(state, dict):
             raise TypeError("Replay checkpoint state must be a mapping.")
         version = int(state.get("format_version", 0) or 0)
-        if version not in (1, _REPLAY_STATE_VERSION):
+        if version not in (1, 2, _REPLAY_STATE_VERSION):
             raise ValueError(
                 f"Unsupported replay checkpoint version {version}; "
-                f"expected 1 or {_REPLAY_STATE_VERSION}."
+                f"expected 1, 2, or {_REPLAY_STATE_VERSION}."
             )
 
         storage = state.get("storage")
@@ -312,8 +353,25 @@ class ReplayBuffer:
                 "_regret_targets", "_archive_ids", "_policy_target_iterations",
                 "_last_reanalysis_iterations", "_reanalysis_counts",
             }
+            provenance_fields = {
+                "_search_budget_assigned",
+                "_search_simulations_effective",
+                "_search_simulations_fresh",
+                "_search_visits_inherited_credit",
+            }
             for field in _REPLAY_TENSOR_FIELDS:
                 tensor = storage.get(field)
+                if version < _REPLAY_STATE_VERSION and field in provenance_fields and not torch.is_tensor(tensor):
+                    setattr(
+                        self,
+                        field,
+                        torch.full(
+                            (stored_max_size,),
+                            _UNKNOWN_SEARCH_COUNT,
+                            dtype=torch.int32,
+                        ),
+                    )
+                    continue
                 if version == 1 and field in legacy_optional and not torch.is_tensor(tensor):
                     setattr(self, field, None)
                     continue
@@ -420,6 +478,18 @@ class ReplayBuffer:
             "orig_q_targets": torch.full((batch_size, 1), float("nan"), dtype=torch.float32),
             "policy_kld_targets": torch.full((batch_size,), float("nan"), dtype=torch.float32),
             "search_visits": torch.zeros((batch_size,), dtype=torch.int32),
+            "search_budget_assigned": torch.full(
+                (batch_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+            ),
+            "search_simulations_effective": torch.full(
+                (batch_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+            ),
+            "search_simulations_fresh": torch.full(
+                (batch_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+            ),
+            "search_visits_inherited_credit": torch.full(
+                (batch_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+            ),
             "arange": torch.arange(max_len, dtype=torch.int16),
             "legal_arange": torch.arange(max_legal_len, dtype=torch.int16),
         }
@@ -450,6 +520,10 @@ class ReplayBuffer:
         game_ply_index = int(position[21]) if len(position) > 21 and position[21] is not None else -1
         regret_target = float(position[22]) if len(position) > 22 and position[22] is not None else float("nan")
         archive_id = int(position[23]) if len(position) > 23 and position[23] is not None else -1
+        search_budget_assigned = _search_count_or_unknown(position[24]) if len(position) > 24 else _UNKNOWN_SEARCH_COUNT
+        search_simulations_effective = _search_count_or_unknown(position[25]) if len(position) > 25 else _UNKNOWN_SEARCH_COUNT
+        search_simulations_fresh = _search_count_or_unknown(position[26]) if len(position) > 26 else _UNKNOWN_SEARCH_COUNT
+        search_visits_inherited_credit = _search_count_or_unknown(position[27]) if len(position) > 27 else _UNKNOWN_SEARCH_COUNT
         if self.use_fp16:
             board = board.half().contiguous()
             policy_values = policy_values.half().contiguous()
@@ -471,6 +545,8 @@ class ReplayBuffer:
             best_q, played_q, orig_q, policy_kld, search_visits,
             game_id, game_ply_index,
             regret_target, archive_id,
+            search_budget_assigned, search_simulations_effective,
+            search_simulations_fresh, search_visits_inherited_credit,
         )
 
     def _store_at_slot(self, slot, position):
@@ -499,6 +575,10 @@ class ReplayBuffer:
             game_ply_index,
             regret_target,
             archive_id,
+            search_budget_assigned,
+            search_simulations_effective,
+            search_simulations_fresh,
+            search_visits_inherited_credit,
         ) = self._normalize_position(position)
 
         count = int(policy_indices.numel())
@@ -541,6 +621,10 @@ class ReplayBuffer:
         self._game_ply_indices[slot] = int(game_ply_index)
         self._regret_targets[slot] = float(regret_target)
         self._archive_ids[slot] = int(archive_id)
+        self._search_budget_assigned[slot] = int(search_budget_assigned)
+        self._search_simulations_effective[slot] = int(search_simulations_effective)
+        self._search_simulations_fresh[slot] = int(search_simulations_fresh)
+        self._search_visits_inherited_credit[slot] = int(search_visits_inherited_credit)
         self._policy_target_iterations[slot] = int(self.current_iteration)
         self._last_reanalysis_iterations[slot] = 0
         self._reanalysis_counts[slot] = 0
@@ -570,19 +654,33 @@ class ReplayBuffer:
         orig_q_targets = scratch["orig_q_targets"]
         policy_kld_targets = scratch["policy_kld_targets"]
         search_visits = scratch["search_visits"]
-        self._decode_boards_from_storage(boards, self._boards[idx])
-        values.copy_(self._values[idx])
-        policy_sample_weights.copy_(self._policy_sample_weights[idx])
-        value_sample_weights.copy_(self._value_sample_weights[idx])
-        moves_left.copy_(self._moves_left[idx])
-        root_q_targets.copy_(self._root_q_targets[idx])
-        search_changed_top.copy_(self._search_changed_top[idx])
-        search_q_deltas.copy_(self._search_q_deltas[idx])
-        best_q_targets.copy_(self._best_q_targets[idx])
-        played_q_targets.copy_(self._played_q_targets[idx])
-        orig_q_targets.copy_(self._orig_q_targets[idx])
-        policy_kld_targets.copy_(self._policy_kld_targets[idx])
-        search_visits.copy_(self._search_visits[idx])
+        search_budget_assigned = scratch["search_budget_assigned"]
+        search_simulations_effective = scratch["search_simulations_effective"]
+        search_simulations_fresh = scratch["search_simulations_fresh"]
+        search_visits_inherited_credit = scratch["search_visits_inherited_credit"]
+        self._decode_boards_from_storage(boards, self._boards, indices=idx)
+
+        def gather_into(destination, source):
+            # Write each selected field into its reusable batch buffer instead
+            # of allocating an indexed tensor and copying it immediately.
+            torch.index_select(source, 0, idx, out=destination)
+
+        gather_into(values, self._values)
+        gather_into(policy_sample_weights, self._policy_sample_weights)
+        gather_into(value_sample_weights, self._value_sample_weights)
+        gather_into(moves_left, self._moves_left)
+        gather_into(root_q_targets, self._root_q_targets)
+        gather_into(search_changed_top, self._search_changed_top)
+        gather_into(search_q_deltas, self._search_q_deltas)
+        gather_into(best_q_targets, self._best_q_targets)
+        gather_into(played_q_targets, self._played_q_targets)
+        gather_into(orig_q_targets, self._orig_q_targets)
+        gather_into(policy_kld_targets, self._policy_kld_targets)
+        gather_into(search_visits, self._search_visits)
+        gather_into(search_budget_assigned, self._search_budget_assigned)
+        gather_into(search_simulations_effective, self._search_simulations_effective)
+        gather_into(search_simulations_fresh, self._search_simulations_fresh)
+        gather_into(search_visits_inherited_credit, self._search_visits_inherited_credit)
 
         if max_len <= 0:
             policy_indices = scratch["policy_indices"][:, :0]
@@ -591,9 +689,17 @@ class ReplayBuffer:
             legal_indices = scratch["legal_indices"][:, :max_legal_len]
             legal_mask = scratch["legal_mask"][:, :max_legal_len]
             if max_legal_len > 0:
-                legal_indices.copy_(self._legal_indices[idx, :max_legal_len])
+                gather_into(legal_indices, self._legal_indices[:self.size, :max_legal_len])
                 legal_mask.copy_(scratch["legal_arange"].unsqueeze(0) < legal_lengths.unsqueeze(1))
-            return boards, policy_indices, policy_values, policy_mask, values, policy_sample_weights, value_sample_weights, moves_left, legal_indices, legal_mask, root_q_targets, search_changed_top, search_q_deltas, best_q_targets, played_q_targets, orig_q_targets, policy_kld_targets, search_visits
+            return (
+                boards, policy_indices, policy_values, policy_mask, values,
+                policy_sample_weights, value_sample_weights, moves_left,
+                legal_indices, legal_mask, root_q_targets, search_changed_top,
+                search_q_deltas, best_q_targets, played_q_targets,
+                orig_q_targets, policy_kld_targets, search_visits,
+                search_budget_assigned, search_simulations_effective,
+                search_simulations_fresh, search_visits_inherited_credit,
+            )
 
         policy_indices = scratch["policy_indices"]
         policy_values = scratch["policy_values"]
@@ -601,13 +707,21 @@ class ReplayBuffer:
         legal_indices = scratch["legal_indices"]
         legal_mask = scratch["legal_mask"]
 
-        policy_indices.copy_(self._policy_indices[idx, :max_len])
-        policy_values.copy_(self._policy_values[idx, :max_len])
+        gather_into(policy_indices, self._policy_indices[:self.size, :max_len])
+        gather_into(policy_values, self._policy_values[:self.size, :max_len])
         policy_mask.copy_(scratch["arange"].unsqueeze(0) < lengths.unsqueeze(1))
         if max_legal_len > 0:
-            legal_indices.copy_(self._legal_indices[idx, :max_legal_len])
+            gather_into(legal_indices, self._legal_indices[:self.size, :max_legal_len])
             legal_mask.copy_(scratch["legal_arange"].unsqueeze(0) < legal_lengths.unsqueeze(1))
-        return boards, policy_indices, policy_values, policy_mask, values, policy_sample_weights, value_sample_weights, moves_left, legal_indices, legal_mask, root_q_targets, search_changed_top, search_q_deltas, best_q_targets, played_q_targets, orig_q_targets, policy_kld_targets, search_visits
+        return (
+            boards, policy_indices, policy_values, policy_mask, values,
+            policy_sample_weights, value_sample_weights, moves_left,
+            legal_indices, legal_mask, root_q_targets, search_changed_top,
+            search_q_deltas, best_q_targets, played_q_targets, orig_q_targets,
+            policy_kld_targets, search_visits, search_budget_assigned,
+            search_simulations_effective, search_simulations_fresh,
+            search_visits_inherited_credit,
+        )
 
     def add(self, position):
         board = position[0]
@@ -646,6 +760,10 @@ class ReplayBuffer:
         game_ply_indices=None,
         regret_targets=None,
         archive_ids=None,
+        search_budget_assigned=None,
+        search_simulations_effective=None,
+        search_simulations_fresh=None,
+        search_visits_inherited_credit=None,
     ):
         if boards is None or int(boards.shape[0]) <= 0:
             return
@@ -734,6 +852,18 @@ class ReplayBuffer:
             archive_ids = torch.full((batch_size,), -1, dtype=torch.int64)
         else:
             archive_ids = archive_ids.reshape(-1).to(dtype=torch.int64).contiguous()
+        search_budget_assigned = self._normalize_search_count_batch(
+            search_budget_assigned, batch_size
+        )
+        search_simulations_effective = self._normalize_search_count_batch(
+            search_simulations_effective, batch_size
+        )
+        search_simulations_fresh = self._normalize_search_count_batch(
+            search_simulations_fresh, batch_size
+        )
+        search_visits_inherited_credit = self._normalize_search_count_batch(
+            search_visits_inherited_credit, batch_size
+        )
         fens = list(fens or [None] * batch_size)
         history_fens = list(history_fens or [()] * batch_size)
         max_len = int(policy_indices.shape[1]) if policy_indices.dim() == 2 else 0
@@ -794,6 +924,10 @@ class ReplayBuffer:
             self._game_ply_indices[dst_slice].copy_(game_ply_indices[src_slice])
             self._regret_targets[dst_slice].copy_(regret_targets[src_slice])
             self._archive_ids[dst_slice].copy_(archive_ids[src_slice])
+            self._search_budget_assigned[dst_slice].copy_(search_budget_assigned[src_slice])
+            self._search_simulations_effective[dst_slice].copy_(search_simulations_effective[src_slice])
+            self._search_simulations_fresh[dst_slice].copy_(search_simulations_fresh[src_slice])
+            self._search_visits_inherited_credit[dst_slice].copy_(search_visits_inherited_credit[src_slice])
             self._policy_target_iterations[dst_slice].fill_(int(self.current_iteration))
             self._last_reanalysis_iterations[dst_slice].zero_()
             self._reanalysis_counts[dst_slice].zero_()
@@ -807,6 +941,32 @@ class ReplayBuffer:
             self.size = min(self.size + count, self.max_size)
             remaining -= count
             src_start = src_end
+
+    @staticmethod
+    def _normalize_search_count_batch(values, batch_size):
+        if values is None:
+            return torch.full(
+                (int(batch_size),), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+            )
+        try:
+            tensor = torch.as_tensor(values).reshape(-1).to(
+                device="cpu", dtype=torch.int64
+            )
+        except (TypeError, ValueError, RuntimeError):
+            tensor = torch.tensor(
+                [_search_count_or_unknown(value) for value in values],
+                dtype=torch.int64,
+            )
+        if int(tensor.numel()) != int(batch_size):
+            raise ValueError(
+                "Search provenance batch length does not match replay rows."
+            )
+        # Normalize before int32 conversion so large counters cannot wrap into
+        # plausible-looking nonnegative values.
+        valid = (tensor >= 0) & (tensor <= _MAX_SEARCH_COUNT)
+        return torch.where(
+            valid, tensor, torch.full_like(tensor, _UNKNOWN_SEARCH_COUNT)
+        ).to(dtype=torch.int32)
 
     def _sample_indices_uniform(self, batch_size):
         return np.random.choice(self.size, batch_size, replace=False)
@@ -1066,6 +1226,10 @@ class ReplayBuffer:
                 game_ply_indices=self._game_ply_indices[idx],
                 regret_targets=self._regret_targets[idx],
                 archive_ids=self._archive_ids[idx],
+                search_budget_assigned=self._search_budget_assigned[idx],
+                search_simulations_effective=self._search_simulations_effective[idx],
+                search_simulations_fresh=self._search_simulations_fresh[idx],
+                search_visits_inherited_credit=self._search_visits_inherited_credit[idx],
             )
             copied += int(idx.numel())
         return copied
@@ -1328,6 +1492,21 @@ class ReplayBuffer:
             self._search_changed_top[idx] = bool(metadata.get("search_changed_top", False))
             self._search_q_deltas[idx] = float(metadata.get("search_q_delta", float("nan")))
             self._search_visits[idx] = max(0, int(metadata.get("search_visits", 0)))
+            # A reanalyzed policy supersedes the old search target. When the
+            # producer lacks explicit accounting, clear provenance to unknown
+            # rather than attributing the previous search to the new target.
+            self._search_budget_assigned[idx] = _search_count_or_unknown(
+                metadata.get("simulation_budget")
+            )
+            self._search_simulations_effective[idx] = _search_count_or_unknown(
+                metadata.get("simulations_used")
+            )
+            self._search_simulations_fresh[idx] = _search_count_or_unknown(
+                metadata.get("fresh_simulations_used")
+            )
+            self._search_visits_inherited_credit[idx] = _search_count_or_unknown(
+                metadata.get("inherited_visit_credit")
+            )
             self._policy_target_iterations[idx] = int(target_iteration)
             self._last_reanalysis_iterations[idx] = int(target_iteration)
             self._reanalysis_counts[idx] = min(255, int(self._reanalysis_counts[idx].item()) + 1)
@@ -1394,6 +1573,10 @@ class ReplayBuffer:
         old_orig_q_targets = self._orig_q_targets
         old_policy_kld_targets = self._policy_kld_targets
         old_search_visits = self._search_visits
+        old_search_budget_assigned = self._search_budget_assigned
+        old_search_simulations_effective = self._search_simulations_effective
+        old_search_simulations_fresh = self._search_simulations_fresh
+        old_search_visits_inherited_credit = self._search_visits_inherited_credit
         old_game_ids = self._game_ids
         old_game_ply_indices = self._game_ply_indices
         old_regret_targets = self._regret_targets
@@ -1441,6 +1624,18 @@ class ReplayBuffer:
         self._orig_q_targets = torch.full((self.max_size, 1), float("nan"), dtype=torch.float32)
         self._policy_kld_targets = torch.full((self.max_size,), float("nan"), dtype=torch.float32)
         self._search_visits = torch.zeros((self.max_size,), dtype=torch.int32)
+        self._search_budget_assigned = torch.full(
+            (self.max_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+        )
+        self._search_simulations_effective = torch.full(
+            (self.max_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+        )
+        self._search_simulations_fresh = torch.full(
+            (self.max_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+        )
+        self._search_visits_inherited_credit = torch.full(
+            (self.max_size,), _UNKNOWN_SEARCH_COUNT, dtype=torch.int32
+        )
         self._game_ids = torch.full((self.max_size,), -1, dtype=torch.int64)
         self._game_ply_indices = torch.full((self.max_size,), -1, dtype=torch.int16)
         self._regret_targets = torch.full((self.max_size,), float("nan"), dtype=torch.float32)
@@ -1474,6 +1669,10 @@ class ReplayBuffer:
             self._orig_q_targets[:keep_size].copy_(old_orig_q_targets[idx])
             self._policy_kld_targets[:keep_size].copy_(old_policy_kld_targets[idx])
             self._search_visits[:keep_size].copy_(old_search_visits[idx])
+            self._search_budget_assigned[:keep_size].copy_(old_search_budget_assigned[idx])
+            self._search_simulations_effective[:keep_size].copy_(old_search_simulations_effective[idx])
+            self._search_simulations_fresh[:keep_size].copy_(old_search_simulations_fresh[idx])
+            self._search_visits_inherited_credit[:keep_size].copy_(old_search_visits_inherited_credit[idx])
             self._game_ids[:keep_size].copy_(old_game_ids[idx])
             self._game_ply_indices[:keep_size].copy_(old_game_ply_indices[idx])
             self._regret_targets[:keep_size].copy_(old_regret_targets[idx])
@@ -1507,10 +1706,64 @@ class ReplayBuffer:
             "size": int(self.size),
             "capacity": int(self.max_size),
             "fill_rate": float(self.size) / float(max(1, self.max_size)),
+            "replay_search_budget_provenance_rows": 0,
+            "replay_search_budget_provenance_coverage": 0.0,
+            "replay_search_budget_provenance_partial_rows": 0,
+            "replay_search_budget_accounting_mismatch_rows": 0,
+            "replay_search_budget_assigned_sum": 0,
+            "replay_search_simulations_effective_sum": 0,
+            "replay_search_simulations_fresh_sum": 0,
+            "replay_search_visits_inherited_credit_sum": 0,
+            "replay_search_budget_assigned_mean": 0.0,
+            "replay_search_simulations_effective_mean": 0.0,
+            "replay_search_simulations_fresh_mean": 0.0,
+            "replay_search_visits_inherited_credit_mean": 0.0,
             **self.storage_rotation_stats(),
         }
         if self.size <= 0 or self._boards is None:
             return stats
+
+        provenance = (
+            self._search_budget_assigned[:self.size],
+            self._search_simulations_effective[:self.size],
+            self._search_simulations_fresh[:self.size],
+            self._search_visits_inherited_credit[:self.size],
+        )
+        known_fields = tuple(field >= 0 for field in provenance)
+        provenance_known = known_fields[0]
+        provenance_any_known = known_fields[0]
+        for field_known in known_fields[1:]:
+            provenance_known = provenance_known & field_known
+            provenance_any_known = provenance_any_known | field_known
+        provenance_rows = int(provenance_known.sum().item())
+        partial_rows = int((provenance_any_known & ~provenance_known).sum().item())
+        mismatch_mask = provenance_known & (
+            provenance[1].to(dtype=torch.int64)
+            != provenance[2].to(dtype=torch.int64)
+            + provenance[3].to(dtype=torch.int64)
+        )
+        stats.update({
+            "replay_search_budget_provenance_rows": provenance_rows,
+            "replay_search_budget_provenance_coverage": (
+                float(provenance_rows) / float(self.size)
+            ),
+            "replay_search_budget_provenance_partial_rows": partial_rows,
+            "replay_search_budget_accounting_mismatch_rows": int(
+                mismatch_mask.sum().item()
+            ),
+        })
+        provenance_names = (
+            "replay_search_budget_assigned",
+            "replay_search_simulations_effective",
+            "replay_search_simulations_fresh",
+            "replay_search_visits_inherited_credit",
+        )
+        if provenance_rows > 0:
+            for name, field in zip(provenance_names, provenance):
+                known_values = field[provenance_known].to(dtype=torch.int64)
+                total = int(known_values.sum().item())
+                stats[f"{name}_sum"] = total
+                stats[f"{name}_mean"] = float(total) / float(provenance_rows)
 
         values = self._values[:self.size].reshape(-1).float()
         policy_lengths = self._policy_lengths[:self.size].to(dtype=torch.float32)
