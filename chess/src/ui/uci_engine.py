@@ -6,7 +6,7 @@ Implements a minimal-but-practical UCI command set:
 - position startpos [moves ...]
 - position fen <fen> [moves ...]
 - go [movetime|wtime btime winc binc movestogo]
-- setoption name UseMCTS|Simulations|MoveOverhead|Temperature
+- setoption name UseMCTS|Simulations|MoveOverhead
 """
 
 import argparse
@@ -48,7 +48,6 @@ class UCIChessEngine:
             else self.config.get("reinforcement_learning", {}).get("mcts_simulations", 200)
         )
         self.move_overhead_ms = 50
-        self.temperature = 0.0
 
         self.use_amp = bool(
             self.config.get("hardware", {}).get("use_amp", True) and self.device.type == "cuda"
@@ -193,7 +192,7 @@ class UCIChessEngine:
         self._ensure_mcts()
         sims = self._compute_simulations(go_args)
         self._send(f"info string mcts simulations {sims}")
-        search_result = self.mcts.search(self.board, sims, temperature=self.temperature)
+        search_result = self.mcts.search(self.board, sims)
         if not search_result:
             return None
         return search_result.selected_move
@@ -275,12 +274,6 @@ class UCIChessEngine:
                 self._send(f"info string MoveOverhead set to {self.move_overhead_ms}")
             except ValueError:
                 self._send("info string invalid MoveOverhead value")
-        elif key == "temperature":
-            try:
-                self.temperature = max(0.0, float(value))
-                self._send(f"info string Temperature set to {self.temperature}")
-            except ValueError:
-                self._send("info string invalid Temperature value")
 
     def _go(self, args):
         if chess.is_game_over(self.board, claim_draw=True):
@@ -307,7 +300,6 @@ class UCIChessEngine:
         self._send(
             f"option name MoveOverhead type spin default {self.move_overhead_ms} min 0 max 2000"
         )
-        self._send("option name Temperature type spin default 0 min 0 max 2")
         self._send("uciok")
 
     def loop(self):

@@ -107,10 +107,6 @@ def _json_safe_config(value):
     return str(value)
 
 
-def _is_config_metadata_row(row):
-    return bool(row) and str(row[0]).strip() == _CSV_CONFIG_METADATA_KEY
-
-
 def _is_run_summary_metadata_row(row):
     return bool(row) and str(row[0]).strip() == _CSV_RUN_SUMMARY_METADATA_KEY
 

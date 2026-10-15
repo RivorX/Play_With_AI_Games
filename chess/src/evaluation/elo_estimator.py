@@ -43,7 +43,8 @@ from src.models.data.se_cnn_v9.helpers import (
 )
 from src.mcts.search import (
     MultiGameBatchMCTS,
-    _SELFPLAY_OPENING_LINES,
+    _EVAL_OPENING_LINES,
+    _EVAL_OPENING_SUITE_ID,
 )
 from src.mcts.single_game import SingleGameMCTS
 from src.game import backend as native_chess
@@ -51,6 +52,7 @@ from src.evaluation.central_inference import CentralInferenceSession, snapshot_m
 from src.evaluation.elo_rating import (
     elo_fit_diagnostics as _elo_fit_diagnostics,
     local_performance_rating as _local_performance_rating,
+    nearest_level_rating as _nearest_level_rating,
     performance_rating as _performance_rating,
 )
 from src.evaluation.elo_schedule import AdaptiveEloSchedule, build_stockfish_elo_levels
@@ -74,6 +76,7 @@ def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict
     elo_mcts_config = dict(config or {})
     rl_config = dict(elo_mcts_config.get('reinforcement_learning', {}) or {})
     rl_config['mcts_dynamic_budget_enabled'] = False
+    rl_config['eval_mcts_dynamic_budget_enabled'] = False
     elo_mcts_config['reinforcement_learning'] = rl_config
     return elo_mcts_config
 
@@ -402,7 +405,7 @@ class _ModelPlayer:
         if native_board is None:
             native_board = _native_board(board)
             self._current_native_board = native_board
-        search_result = self.mcts.search(native_board, self.simulations, temperature=0.0)
+        search_result = self.mcts.search(native_board, self.simulations)
         if not search_result:
             return self._best_move_raw(board)  # Fallback
         return _python_move(search_result.selected_move)
@@ -916,7 +919,7 @@ class EloEstimator:
         max_moves: int,
         stockfish_path: str,
         progress_bar,
-    ) -> tuple[list[float], list[float]]:
+    ) -> tuple[list[float], list[float], list[int]]:
         group_count, group_workers = self._resolve_central_client_groups(workers, len(tasks))
         games_per_worker_chunk = max(
             1,
@@ -942,6 +945,7 @@ class EloEstimator:
 
         all_opponent_elos: list[float] = []
         all_scores: list[float] = []
+        all_game_indices: list[int] = []
         stats_items: list[dict] = []
 
         def _next_chunk(group_worker_count: int):
@@ -971,7 +975,7 @@ class EloEstimator:
             def _next_group_tasks(group_worker_count: int):
                 return _next_chunk(group_worker_count)
 
-            elos, scores = self._estimate_batched_games(
+            elos, scores, game_indices = self._estimate_batched_games(
                 tasks=[],
                 workers=group_workers[group_idx],
                 use_mcts=True,
@@ -985,7 +989,7 @@ class EloEstimator:
                 stats_out=group_stats,
                 next_tasks_fn=_next_group_tasks,
             )
-            return elos, scores, self._merge_batched_stats([group_stats])
+            return elos, scores, game_indices, self._merge_batched_stats([group_stats])
 
         executor = ThreadPoolExecutor(max_workers=group_count)
         futures = []
@@ -994,9 +998,10 @@ class EloEstimator:
             for future in as_completed(futures):
                 if self._is_cancelled():
                     break
-                elos, scores, group_stats = future.result()
+                elos, scores, game_indices, group_stats = future.result()
                 all_opponent_elos.extend(elos)
                 all_scores.extend(scores)
+                all_game_indices.extend(game_indices)
                 stats_items.append(group_stats)
         except KeyboardInterrupt:
             self._request_cancel()
@@ -1020,7 +1025,7 @@ class EloEstimator:
         self._last_elo_batch_stats = dict(merged_stats)
         if sum(worker_counts) > 0 and bool(self.elo_config.get("elo_verbose_worker_stats", False)):
             print(f"  Info: Elo games/worker: {_format_worker_game_counts(worker_counts)}")
-        return all_opponent_elos, all_scores
+        return all_opponent_elos, all_scores, all_game_indices
 
     def _register_worker_engine(self, engine: chess.engine.SimpleEngine):
         with self._worker_engines_lock:
@@ -1170,16 +1175,16 @@ class EloEstimator:
     def _opening_prefix(self, game_idx: int) -> tuple[str, ...]:
         if not bool(self.elo_config.get("paired_openings_enabled", True)):
             return ()
-        if not _SELFPLAY_OPENING_LINES:
+        if not _EVAL_OPENING_LINES:
             return ()
         try:
-            max_plies = max(0, int(self.elo_config.get("paired_openings_max_plies", 6) or 0))
+            max_plies = max(0, int(self.elo_config.get("paired_openings_max_plies", 8) or 0))
         except (TypeError, ValueError):
-            max_plies = 6
+            max_plies = 8
         if max_plies <= 0:
             return ()
         pair_idx = max(0, int(game_idx)) // 2
-        line = _SELFPLAY_OPENING_LINES[pair_idx % len(_SELFPLAY_OPENING_LINES)]
+        line = _EVAL_OPENING_LINES[pair_idx % len(_EVAL_OPENING_LINES)]
         return tuple(line[: min(max_plies, len(line))])
 
     def _initial_board(self, game_idx: int, record_state=None, on_move_played=None) -> chess.Board:
@@ -1228,18 +1233,19 @@ class EloEstimator:
         central_inference_enabled: bool,
         progress_bar,
         parallel_executor=None,
-    ) -> tuple[list[float], list[float], bool]:
+    ) -> tuple[list[float], list[float], list[int], bool]:
         """Run an already chosen list of Elo games through the shared executor."""
         all_opponent_elos: list[float] = []
         all_scores: list[float] = []
+        all_game_indices: list[int] = []
         interrupted_by_user = False
 
         if not tasks:
-            return all_opponent_elos, all_scores, interrupted_by_user
+            return all_opponent_elos, all_scores, all_game_indices, interrupted_by_user
 
         if central_inference_enabled:
             try:
-                all_opponent_elos, all_scores = self._estimate_central_batched_groups(
+                all_opponent_elos, all_scores, all_game_indices = self._estimate_central_batched_groups(
                     tasks=tasks,
                     workers=workers,
                     simulations=simulations,
@@ -1254,7 +1260,7 @@ class EloEstimator:
                 print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
         elif batch_model_moves and workers > 1:
             try:
-                all_opponent_elos, all_scores = self._estimate_batched_games(
+                all_opponent_elos, all_scores, all_game_indices = self._estimate_batched_games(
                     tasks=tasks,
                     workers=workers,
                     use_mcts=use_mcts,
@@ -1336,6 +1342,7 @@ class EloEstimator:
                                 continue
                             all_opponent_elos.append(float(level))
                             all_scores.append(float(result))
+                            all_game_indices.append(int(futures[future][1]))
                         except Exception as exc:
                             self._log_limited("parallel_game_fail", f"  Warning: game at level {level} failed: {exc}")
                         finally:
@@ -1385,6 +1392,7 @@ class EloEstimator:
                         if result is not None:
                             all_opponent_elos.append(float(level))
                             all_scores.append(float(result))
+                            all_game_indices.append(int(game_idx))
                         if progress_bar is not None:
                             progress_bar.update(1)
                 except KeyboardInterrupt:
@@ -1394,7 +1402,7 @@ class EloEstimator:
             finally:
                 self._force_close_engine(engine)
 
-        return all_opponent_elos, all_scores, interrupted_by_user
+        return all_opponent_elos, all_scores, all_game_indices, interrupted_by_user
 
     def _print_elo_completion_summary(self, result: dict):
         if not bool(self.elo_config.get("elo_print_completion_summary", True)):
@@ -1410,10 +1418,10 @@ class EloEstimator:
         worker_counts = list(stats.get("worker_game_counts", []) or [])
         if worker_counts and bool(self.elo_config.get("elo_print_worker_summary", False)):
             print(f"  Elo workers: {_format_worker_game_counts(worker_counts)}")
-        if result.get("fit_warning"):
+        if result.get("calibration_warning"):
             print(
-                "  Warning: ladder results are more inconsistent than the Elo curve expects; "
-                f"uncertainty inflated x{math.sqrt(float(result.get('elo_overdispersion', 1.0))):.2f}."
+                "  Note: Stockfish levels have a flatter/steeper score curve than textbook Elo "
+                "at this time control; the reported rating uses the local 50% level."
             )
 
     # -----------------------------------------------------------------------
@@ -1562,9 +1570,11 @@ class EloEstimator:
         budget_extension_games = max(2, budget_extension_games)
 
         workers = self._resolve_workers(workers, total_games=max_total_games)
+        schedule_config = dict(self.elo_config)
+        schedule_config["opening_suite_positions"] = len(_EVAL_OPENING_LINES)
         schedule = AdaptiveEloSchedule(
             levels,
-            self.elo_config,
+            schedule_config,
             max_total_games=max_total_games,
             workers=workers,
             probe_games=probe_games_cfg,
@@ -1598,14 +1608,17 @@ class EloEstimator:
         )
         print(
             "  Info: Adaptive Elo ladder enabled: "
-            f"levels={levels}, initial_budget={max_total_games}, hard_cap={hard_max_total_games}, "
+            f"{len(levels)} candidates in SF {min(levels)}-{max(levels)}, "
+            f"initial_budget={max_total_games}, hard_cap={hard_max_total_games}, "
             f"probe={probe_games_cfg}, "
             f"focus>={focus_games_cfg}/selected level, then precision rounds"
         )
+        if bool(self.elo_config.get("elo_verbose_adaptive", False)):
+            print(f"  Info: Elo candidate levels: {levels}")
         if bool(self.elo_config.get("paired_openings_enabled", True)):
             print(
                 "  Info: Elo openings: paired colors, "
-                f"{int(self.elo_config.get('paired_openings_max_plies', 6) or 0)} fixed plies."
+                f"{int(self.elo_config.get('paired_openings_max_plies', 8) or 0)} fixed plies."
             )
         if batch_model_moves and workers > 1:
             model_path = "batched_mcts" if use_mcts else "batched_raw"
@@ -1668,7 +1681,7 @@ class EloEstimator:
                 cap=schedule.max_total_games,
                 phase=phase,
             )
-            batch_elos, batch_scores, batch_interrupted = self._run_task_batch(
+            batch_elos, batch_scores, batch_game_indices, batch_interrupted = self._run_task_batch(
                 tasks=tasks,
                 workers=min(workers, max(1, len(tasks))),
                 use_mcts=use_mcts,
@@ -1684,7 +1697,7 @@ class EloEstimator:
             if self._last_elo_batch_stats:
                 phase_profile_stats.append(dict(self._last_elo_batch_stats))
             interrupted_by_user = interrupted_by_user or batch_interrupted
-            schedule.record_batch(batch_elos, batch_scores)
+            schedule.record_batch(batch_elos, batch_scores, batch_game_indices)
             return batch_interrupted or self._is_cancelled()
 
         try:
@@ -1726,6 +1739,14 @@ class EloEstimator:
                             )
                 if schedule.should_stop_probing(wave_levels):
                     break
+                next_levels = schedule.next_probe_levels()
+                if next_levels:
+                    direction = schedule.probe_direction()
+                    direction_text = "upward" if direction > 0 else "downward" if direction < 0 else "around estimate"
+                    print(
+                        "  Adaptive Elo: 50% rating bracket not found; "
+                        f"expanding {direction_text} to levels {next_levels}."
+                    )
 
             focus_levels = schedule.select_rating_levels()
             if focus_levels and bool(self.elo_config.get("elo_verbose_adaptive", False)):
@@ -1751,6 +1772,12 @@ class EloEstimator:
                 and not self._is_cancelled()
                 and not schedule.precise_enough()
             ):
+                if not schedule.precision_levels():
+                    print(
+                        "  Adaptive Elo: local opening evidence exhausted; "
+                        "stopping without replaying openings or extending the budget."
+                    )
+                    break
                 if schedule.total_scheduled >= schedule.max_total_games:
                     if schedule.max_total_games >= hard_max_total_games:
                         break
@@ -1857,10 +1884,16 @@ class EloEstimator:
             }
 
         elapsed = time.perf_counter() - t0
-        rating_opponent_elos, rating_scores = schedule.rating_observations()
-        estimated_elo = _performance_rating(rating_opponent_elos, rating_scores)
-        fit_diagnostics = _elo_fit_diagnostics(rating_opponent_elos, rating_scores, estimated_elo)
-        elo_se = fit_diagnostics.get("standard_error")
+        rating_opponent_elos, rating_scores, rating_cluster_ids = schedule.rating_observations()
+        curve_elo = _performance_rating(rating_opponent_elos, rating_scores)
+        fit_diagnostics = _elo_fit_diagnostics(rating_opponent_elos, rating_scores, curve_elo)
+        estimated_elo, elo_se, local_level, local_games = _nearest_level_rating(
+            rating_opponent_elos,
+            rating_scores,
+            rating_cluster_ids,
+        )
+        bracket_status = schedule.bracket_status()
+        bracket_lower, bracket_upper = schedule.rating_bracket()
         elo_ci95 = None
         if estimated_elo is not None and elo_se is not None:
             elo_ci95 = [round(estimated_elo - 1.96 * elo_se), round(estimated_elo + 1.96 * elo_se)]
@@ -1886,7 +1919,38 @@ class EloEstimator:
             "hard_max_total_games": int(hard_max_total_games),
             "elo_overdispersion": round(float(fit_diagnostics.get("overdispersion", 1.0)), 3),
             "fit_warning": bool(fit_diagnostics.get("fit_warning", False)),
+            "calibration_warning": bool(fit_diagnostics.get("calibration_warning", False)),
+            "rating_method": "nearest_50pct_stockfish_level",
+            "pair_aware_standard_error": bool(self.elo_config.get("paired_openings_enabled", True)),
+            "mcts_simulation_budget_strict": bool(use_mcts),
+            "local_rating_level": local_level,
+            "local_rating_games": local_games,
+            "local_rating_clusters": schedule.independent_cluster_count(),
+            "precision_stop_reason": (
+                "target_reached" if schedule.precise_enough()
+                else "opening_suite_exhausted" if not schedule.precision_levels()
+                else "game_budget_or_interruption"
+            ),
+            "standard_error_method": "opening_cluster_sandwich_with_variance_guard_v1",
+            "elo_curve_estimate": round(curve_elo) if curve_elo is not None else None,
+            "rating_bracketed": bracket_status == "bracketed",
+            "rating_bracket": (
+                [int(bracket_lower), int(bracket_upper)]
+                if bracket_lower is not None and bracket_upper is not None
+                else None
+            ),
+            "rating_range_status": bracket_status,
+            "rating_censored": bracket_status in {
+                "above_stockfish_range",
+                "below_stockfish_range",
+            },
+            "opening_suite_id": _EVAL_OPENING_SUITE_ID,
+            "opening_suite_positions": len(_EVAL_OPENING_LINES),
         }
+        if bracket_status == "above_stockfish_range":
+            result["elo_lower_bound"] = int(max(levels))
+        elif bracket_status == "below_stockfish_range":
+            result["elo_upper_bound"] = int(min(levels))
         model_se = fit_diagnostics.get("model_standard_error")
         if model_se is not None:
             result["elo_model_std_error"] = round(float(model_se), 1)
@@ -1966,9 +2030,10 @@ class EloEstimator:
         device_override=None,
         stats_out: dict | None = None,
         next_tasks_fn=None,
-    ) -> tuple[list[float], list[float]]:
+    ) -> tuple[list[float], list[float], list[int]]:
         all_opponent_elos: list[float] = []
         all_scores: list[float] = []
+        all_game_indices: list[int] = []
         max_half_moves = max(1, int(max_moves)) * 2
 
         batched_player = _BatchedModelPlayer(
@@ -2013,6 +2078,7 @@ class EloEstimator:
             if valid_result and score is not None:
                 all_opponent_elos.append(float(game["level"]))
                 all_scores.append(float(score))
+                all_game_indices.append(int(game["game_idx"]))
             worker_slot = int(game.get("worker_slot", -1))
             if 0 <= worker_slot < len(worker_game_counts):
                 worker_game_counts[worker_slot] += 1
@@ -2056,6 +2122,7 @@ class EloEstimator:
                 active_games.append(
                     {
                         "level": level,
+                        "game_idx": int(game_idx),
                         "model_is_white": bool(model_is_white),
                         "board": board,
                         "state": state,
@@ -2269,7 +2336,7 @@ class EloEstimator:
         ):
             print(f"  Info: Elo games/worker: {_format_worker_game_counts(worker_game_counts)}")
 
-        return all_opponent_elos, all_scores
+        return all_opponent_elos, all_scores, all_game_indices
 
     def _play_game(
         self,
