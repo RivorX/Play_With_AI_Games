@@ -36,6 +36,9 @@ sys.path.insert(0, str(script_dir.parent))
 from src.mcts.single_game import SingleGameMCTS
 from src.game import backend as native_chess
 from src.config import default_config_path, load_project_config
+from src.models.registry import MODEL_REGISTRY
+from src.models.data.registry import get_input_encoder
+from src.mcts.search import _board_position_key
 
 #  v4.2: Import board_to_tensor from data_helpers
 #  v4.4: Added move_to_index for POV-aware move encoding
@@ -278,19 +281,36 @@ class ChessGUI:
         
         # History depth can differ per loaded checkpoint architecture.
         default_history = int(config['model'].get('history_positions', 0))
-        self.model1_history_positions = int(getattr(model1, 'history_positions', default_history)) if model1 else default_history
-        self.model2_history_positions = int(getattr(model2, 'history_positions', self.model1_history_positions)) if model2 else self.model1_history_positions
+        def _model_history_positions(model, fallback):
+            model_spec = getattr(model, 'model_spec', {}) or {}
+            input_spec = model_spec.get('input_spec', {}) or {}
+            return int(
+                input_spec.get(
+                    'history_positions',
+                    getattr(model, 'history_positions', fallback),
+                )
+                or 0
+            )
+
+        self.model1_history_positions = (
+            _model_history_positions(model1, default_history)
+            if model1
+            else default_history
+        )
+        self.model2_history_positions = (
+            _model_history_positions(model2, self.model1_history_positions)
+            if model2
+            else self.model1_history_positions
+        )
         
         # Only create MCTS if enabled
         if model1 and self.mcts_enabled:
             self.mcts1 = SingleGameMCTS(model1, config, device)
-            self.mcts1.history_positions = self.model1_history_positions
         else:
             self.mcts1 = None
             
         if model2 and self.mcts_enabled:
             self.mcts2 = SingleGameMCTS(model2, config, device)
-            self.mcts2.history_positions = self.model2_history_positions
         else:
             self.mcts2 = None
 
@@ -1324,7 +1344,7 @@ class ChessGUI:
         try:
             history_positions = self._history_positions_for_model(model)
             board_tensor = torch.FloatTensor(
-                self._build_history_tensor(self.board, history_positions=history_positions)
+                self._build_history_tensor(self.board, history_positions=history_positions, model=model)
             ).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 with self.inference_lock:
@@ -2454,18 +2474,41 @@ class ChessGUI:
     def _record_pre_move_state(self):
         """Store pre-move state for history-aware inference."""
         self.board_history.append(self.board.copy())
+        current_native = _native_board(self.board)
+        repetition_count = None
+        if any(
+            mcts is not None and mcts._multi._path_dependent_repetition
+            for mcts in (self.mcts1, self.mcts2)
+        ):
+            current_key = _board_position_key(current_native)
+            repetition_count = sum(
+                _board_position_key(_native_board(history_board)) == current_key
+                for history_board in self.board_history[:-1]
+            )
         if self.mcts1:
-            self.mcts1.update_history(_native_board(self.board))
+            self.mcts1.update_history(current_native, repetition_count=repetition_count)
         if self.mcts2:
-            self.mcts2.update_history(_native_board(self.board))
+            self.mcts2.update_history(current_native, repetition_count=repetition_count)
 
     def _sync_mcts_histories(self):
         """Rebuild MCTS histories after undoing moves."""
         for mcts in (self.mcts1, self.mcts2):
             if mcts:
                 mcts.reset_tree()
+                previous_counts = {}
                 for hist_board in self.board_history:
-                    mcts.update_history(_native_board(hist_board))
+                    native_board = _native_board(hist_board)
+                    key = _board_position_key(native_board)
+                    repetition_count = max(0, int(previous_counts.get(key, 0)))
+                    mcts.update_history(
+                        native_board,
+                        repetition_count=(
+                            repetition_count
+                            if mcts._multi._path_dependent_repetition
+                            else None
+                        ),
+                    )
+                    previous_counts[key] = repetition_count + 1
 
     def _rewind_to_ply(self, target_ply):
         try:
@@ -2654,7 +2697,7 @@ class ChessGUI:
             return self.model2_history_positions
         return self.model1_history_positions
 
-    def _build_history_tensor(self, current_board, history_positions):
+    def _build_history_tensor(self, current_board, history_positions, model=None):
         """
          v4.2: Build tensor with history using POV-aware board_to_tensor
         
@@ -2669,6 +2712,42 @@ class ChessGUI:
             numpy array: (input_planes, 8, 8) tensor
         """
         history_positions = max(0, int(history_positions))
+
+        encoder_id = getattr(model, "input_encoder_id", None)
+        if encoder_id is None and model is not None:
+            model_spec = getattr(model, "model_spec", {}) or {}
+            encoder_id = (model_spec.get("input_spec") or {}).get("encoder_id")
+        encoder_id = str(
+            encoder_id
+            or self.config.get("model", {}).get("input_encoder_id", "planes_history_v1")
+        )
+        if encoder_id == "planes_history_v2":
+            encoder = get_input_encoder(encoder_id)
+            native_current = _native_board(current_board)
+            native_all_history = [_native_board(board) for board in self.board_history]
+            all_boards = native_all_history + [native_current]
+            seen = {}
+            all_repetition_counts = []
+            for history_board in all_boards:
+                key = _board_position_key(history_board)
+                all_repetition_counts.append(int(seen.get(key, 0)))
+                seen[key] = int(seen.get(key, 0)) + 1
+            native_history = (
+                native_all_history[-history_positions:] if history_positions else []
+            )
+            repetition_counts = (
+                all_repetition_counts[-(len(native_history) + 1):-1]
+                + [all_repetition_counts[-1]]
+                if native_history
+                else [all_repetition_counts[-1]]
+            )
+            return encoder.encode_history(
+                native_current,
+                history_boards=native_history,
+                history_positions=history_positions,
+                repetition_counts=repetition_counts,
+                dtype=np.float32,
+            )
 
         if history_positions == 0:
             # No history - just current board
@@ -2712,7 +2791,7 @@ class ChessGUI:
         # Build tensor with history and POV
         history_positions = self._history_positions_for_model(model)
         board_tensor = torch.FloatTensor(
-            self._build_history_tensor(self.board, history_positions=history_positions)
+            self._build_history_tensor(self.board, history_positions=history_positions, model=model)
         ).unsqueeze(0).to(self.device)
         
         # Get policy from model
@@ -2956,10 +3035,20 @@ def main():
         action="store_true",
         help="Enable verbose console logs (model details and setup summary).",
     )
+    parser.add_argument(
+        "--architecture",
+        choices=tuple(sorted(MODEL_REGISTRY)),
+        default=None,
+        help="Select the model profile used when no checkpoint supplies its own model_spec.",
+    )
     args = parser.parse_args()
 
     config_path = default_config_path()
-    config = load_project_config()
+    config = load_project_config(architecture_id=args.architecture)
+    if args.architecture and config.get("model", {}).get("architecture_id") != args.architecture:
+        raise ValueError(
+            f"Active config model profile conflicts with --architecture {args.architecture!r}."
+        )
 
     verbose_console = bool(args.verbose)
     config.setdefault("model", {})
@@ -2982,7 +3071,10 @@ def main():
     if verbose_console:
         history_positions = config["model"].get("history_positions", 0)
         print(f"History positions: {history_positions}")
-        print(f"Input planes: {16 * (1 + history_positions)}")
+        input_encoder = get_input_encoder(
+            config["model"].get("input_encoder_id", "planes_history_v1")
+        )
+        print(f"Input planes: {input_encoder.input_planes(history_positions)}")
 
     base_dir = script_dir.parent
     models_root = (base_dir / config.get("paths", {}).get("models_dir", "models")).resolve()
@@ -3056,7 +3148,7 @@ def main():
                     )
             except Exception as exc:
                 if isinstance(exc, ModelCompatibilityError):
-                    print(f"Model incompatible with the current architecture: {loading_model_path.name}")
+                    print(f"Model checkpoint is incompatible: {loading_model_path.name}")
                 else:
                     print(f"Could not load model {loading_model_path.name}: {exc}")
                 if verbose_console:

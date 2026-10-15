@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+from src.models.data.nested_cnn_v10 import encoder as v10_encoder, pipeline as v10_pipeline
 from src.models.data.se_cnn_v9 import encoder, pipeline, policy
 
 
 INPUT_ENCODERS = {
     encoder.ENCODER_ID: encoder,
+    v10_encoder.ENCODER_ID: v10_encoder,
 }
 POLICY_CODECS = {
     policy.CODEC_ID: policy,
 }
 IL_DATA_PIPELINES = {
     (encoder.ENCODER_ID, policy.CODEC_ID): pipeline,
+    (v10_encoder.ENCODER_ID, policy.CODEC_ID): v10_pipeline,
 }
 
 

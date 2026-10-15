@@ -1,6 +1,7 @@
 """IL checkpoint/SWA helper functions."""
 
 import math
+from pathlib import Path
 
 import torch
 from tqdm import tqdm
@@ -371,6 +372,7 @@ def finalize_swa_model(
     elo_stop_event=None,
     model_architecture=None,
     training_batch_size=None,
+    swa_checkpoint_path=None,
 ):
     """Finalize SWA model with BN refresh, optional Elo, and save best_model_il_swa.pt."""
     result = {
@@ -465,7 +467,11 @@ def finalize_swa_model(
             f"({eval_error})"
         )
 
-    swa_model_path = best_model_path.parent / "best_model_il_swa.pt"
+    swa_model_path = (
+        Path(swa_checkpoint_path)
+        if swa_checkpoint_path is not None
+        else best_model_path.parent / "best_model_il_swa.pt"
+    )
     epoch_to_store = max(int(final_epoch_idx), 0)
     result["model_path"] = str(swa_model_path)
 

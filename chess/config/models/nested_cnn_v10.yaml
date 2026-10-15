@@ -1,0 +1,25 @@
+# Independent v10 architecture and data contract. The se_cnn_v9 profile remains intact.
+model:
+  architecture_id: "nested_cnn_v10"
+  version: "v10.0"
+
+  history_positions: 4
+  input_planes: 72
+  input_encoder_id: "planes_history_v2"
+  policy_codec_id: "lc0_1858_v1"
+  value_head_id: "wdl_search_aux_v1"
+
+  trunk_channels: 192
+  bottleneck_channels: 96
+  outer_blocks: 6
+  inner_residual_units: 2
+  global_pool_blocks: [2, 4, 6]
+  drop_path_rate: 0.05
+
+  policy_head_channels: 96
+  value_head_filters: 32
+  value_hidden_dim: 192
+  moves_left_hidden_dim: 128
+  dropout: 0.08
+
+  print_summary: true

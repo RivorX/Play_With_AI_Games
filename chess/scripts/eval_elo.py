@@ -19,6 +19,10 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.config import default_config_path, load_project_config
+from src.common.runtime import (
+    legacy_architecture_scoped_file,
+    model_alias_file,
+)
 from src.model import (
     create_model,
     load_checkpoint_file,
@@ -292,12 +296,25 @@ def collect_model_candidates(chess_dir, config, max_candidates=200):
     candidates = []
 
     best_rel = config.get("paths", {}).get("best_model_il", "models/best_model_il.pt")
-    best_path = (chess_dir / best_rel).resolve()
-    best_swa_path = (best_path.parent / "best_model_il_swa.pt").resolve()
+    architecture_id = str(config.get("model", {}).get("architecture_id", "se_cnn_v9"))
+    configured_best_path = (chess_dir / best_rel).resolve()
+    best_path = model_alias_file(configured_best_path, architecture_id, "il")
+    best_swa_path = model_alias_file(
+        configured_best_path.parent / "best_model_il_swa.pt",
+        architecture_id,
+        "il_swa",
+    ).resolve()
+    legacy_best_path = legacy_architecture_scoped_file(
+        configured_best_path, architecture_id
+    ).resolve()
+    legacy_best_swa_path = legacy_architecture_scoped_file(
+        configured_best_path.parent / "best_model_il_swa.pt",
+        architecture_id,
+    ).resolve()
     models_rel = config.get("paths", {}).get("models_dir", "models")
     models_dir = (chess_dir / models_rel).resolve()
 
-    for path in (best_path, best_swa_path):
+    for path in (best_path, best_swa_path, legacy_best_path, legacy_best_swa_path):
         if path.exists() and path not in candidates:
             candidates.append(path)
 

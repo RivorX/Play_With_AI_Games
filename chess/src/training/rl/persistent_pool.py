@@ -1,6 +1,7 @@
 ﻿"""Persistent self-play worker pool utilities."""
 
 import contextlib
+import copy
 import os
 import queue
 import signal
@@ -21,6 +22,49 @@ from src.inference.shared_memory import (
 
 WORKER_INTERRUPT_EXIT_CODE = 130
 _SELFPLAY_POOL = None
+
+
+def _resolve_payload_model_spec(config, state, explicit_spec=None):
+    from src.models.contracts import model_spec_from_config, validate_model_spec
+    from src.models.data import validate_data_contract
+    from src.models.registry import resolve_model_spec
+
+    if explicit_spec is not None:
+        spec = copy.deepcopy(explicit_spec)
+        validate_model_spec(spec)
+        validate_data_contract(spec)
+        return spec
+    is_raw_state_dict = bool(
+        isinstance(state, dict)
+        and state
+        and "model_spec" not in state
+        and "model_architecture" not in state
+        and "model_state_dict" not in state
+        and "state_dict" not in state
+        and all(torch.is_tensor(value) for value in state.values())
+    )
+    if is_raw_state_dict or state is None:
+        return model_spec_from_config(config)
+    return resolve_model_spec(config, state)
+
+
+def _max_registered_model_input_planes(config):
+    from src.models.contracts import model_spec_from_config
+    from src.models.registry import MODEL_REGISTRY
+
+    max_planes = 0
+    for architecture_id in MODEL_REGISTRY:
+        candidate = copy.deepcopy(config)
+        model_cfg = dict(candidate.get("model", {}) or {})
+        model_cfg["architecture_id"] = str(architecture_id)
+        model_cfg.pop("input_encoder_id", None)
+        model_cfg.pop("input_planes", None)
+        candidate["model"] = model_cfg
+        max_planes = max(
+            max_planes,
+            int(model_spec_from_config(candidate)["input_spec"]["input_planes"]),
+        )
+    return max_planes
 
 
 def _close_mp_queue(queue_obj):
@@ -81,7 +125,8 @@ def borrow_selfplay_central_runtime():
         "worker_shared_buffers": pool.inference_shared_buffers,
         "worker_server_idx": worker_server_idx,
         # These labels already have compiled wrappers in the self-play server.
-        "model_labels": ("learner", "best"),
+        "model_labels": tuple(pool.model_specs_by_label),
+        "model_specs_by_label": copy.deepcopy(pool.model_specs_by_label),
         "model_summary": "self-play server borrowed",
         "pid_summary": ",".join(str(process.pid) for process in pool.inference_processes),
         "load_s": 0.0,
@@ -186,6 +231,9 @@ class _PersistentSelfPlayPool:
         self.inference_processes = []
         self._central_task_id = None
         self._central_loaded_labels = set()
+        self.model_specs_by_label = {
+            "learner": _resolve_payload_model_spec(self.config, None)
+        }
         self.shared_memory_enabled = bool(
             self.central_inference_enabled
             and central_cfg.get('shared_memory_enabled', True)
@@ -199,7 +247,10 @@ class _PersistentSelfPlayPool:
                 raw_capacity = rl_cfg.get('mcts_batch_size', rl_cfg.get('mcts_simulations', 192))
             slot_capacity = max(1, int(raw_capacity or 192))
             slot_count = max(1, int(central_cfg.get('shared_memory_slots_per_worker', 2) or 2))
-            input_planes = 16 * (1 + int(config.get('model', {}).get('history_positions', 0) or 0))
+            # Reserve enough physical channels for every architecture registered
+            # in this runtime. Each request still declares and transfers only
+            # the exact logical tensor shape required by its label.
+            input_planes = _max_registered_model_input_planes(config)
             for rank, _games in self.worker_specs:
                 self.inference_shared_buffers[int(rank)] = create_shared_inference_buffer(
                     self.mp_ctx,
@@ -356,14 +407,21 @@ class _PersistentSelfPlayPool:
         if clear:
             self._central_task_id = task_id
             self._central_loaded_labels = set()
+            self.model_specs_by_label = {}
 
         models_to_load = []
         if "learner" not in self._central_loaded_labels:
+            learner_spec = _resolve_payload_model_spec(
+                self.config,
+                model_state,
+            )
             models_to_load.append({
                 "label": "learner",
                 "state": model_state,
                 "state_path": str(model_state_path) if model_state is None and model_state_path is not None else None,
+                "model_spec": learner_spec,
             })
+            self.model_specs_by_label["learner"] = learner_spec
             self._central_loaded_labels.add("learner")
 
         for entry in list((opponent_payload or {}).get("pool_entries", []) or []):
@@ -373,7 +431,16 @@ class _PersistentSelfPlayPool:
             state = (entry or {}).get("state")
             if state is None:
                 continue
-            models_to_load.append({"label": label, "state": state, "state_path": None})
+            model_spec = (entry or {}).get("model_spec")
+            if model_spec is None:
+                model_spec = _resolve_payload_model_spec(self.config, state)
+            models_to_load.append({
+                "label": label,
+                "state": state,
+                "state_path": None,
+                "model_spec": model_spec,
+            })
+            self.model_specs_by_label[label] = model_spec
             self._central_loaded_labels.add(label)
 
         if models_to_load or clear:
@@ -406,6 +473,18 @@ class _PersistentSelfPlayPool:
                         message = self.inference_control_queues[server_idx].get(timeout=min(remaining, 0.25))
                     except Exception:
                         continue
+                    if (
+                        message.get("type") == "models_load_failed"
+                        and str(message.get("task_id")) == task_id
+                    ):
+                        self._central_task_id = None
+                        self._central_loaded_labels.clear()
+                        raise RuntimeError(
+                            "Central inference rejected the self-play model contract "
+                            "before game tasks were dispatched: "
+                            f"server={message.get('server_rank', server_idx)}, "
+                            f"{message.get('error', 'unspecified model contract error')}"
+                        )
                     if message.get("type") == "models_loaded" and str(message.get("task_id")) == task_id:
                         load_messages.append(dict(message))
                         pending_servers.discard(server_idx)
@@ -458,7 +537,13 @@ class _PersistentSelfPlayPool:
             "label": payload.get("label", "current"),
             "plan_labels": list(payload.get("plan_labels", []) or []),
             "pool_entries": [
-                {"label": str((entry or {}).get("label") or "current")}
+                {
+                    "label": str((entry or {}).get("label") or "current"),
+                    "model_spec": self.model_specs_by_label.get(
+                        str((entry or {}).get("label") or "current"),
+                        (entry or {}).get("model_spec"),
+                    ),
+                }
                 for entry in list(payload.get("pool_entries", []) or [])
                 if str((entry or {}).get("label") or "current") != "current"
             ],
@@ -489,6 +574,7 @@ class _PersistentSelfPlayPool:
             'model_state': worker_model_state,
             'model_state_path': str(model_state_path),
             'opponent_payload': worker_opponent_payload,
+            'model_specs_by_label': copy.deepcopy(self.model_specs_by_label),
             'num_games': int(num_games),
             'result_file_path': str(result_file),
             'mcts_temperature': temperature,

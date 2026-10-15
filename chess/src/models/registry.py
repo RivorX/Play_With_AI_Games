@@ -9,12 +9,14 @@ from src.models.contracts import (
     model_spec_from_config,
     validate_model_spec,
 )
+from src.models.architecture.nested_cnn_v10 import NestedCNNV10
 from src.models.architecture.se_cnn_v9 import SECNNV9
 from src.models.data import validate_data_contract
 
 
 MODEL_REGISTRY = {
     "se_cnn_v9": SECNNV9,
+    "nested_cnn_v10": NestedCNNV10,
 }
 
 
@@ -32,9 +34,13 @@ def resolve_model_spec(
     checkpoint: dict | None = None,
 ) -> dict:
     raw_spec = (checkpoint or {}).get("model_spec")
-    spec = deepcopy(raw_spec) if isinstance(raw_spec, dict) else legacy_model_spec(
-        checkpoint, config
-    )
+    if isinstance(raw_spec, dict):
+        spec = deepcopy(raw_spec)
+    elif checkpoint is None:
+        # A fresh/untrained model follows the explicitly selected profile.
+        spec = model_spec_from_config(config)
+    else:
+        spec = legacy_model_spec(checkpoint, config)
     validate_model_spec(spec)
     validate_data_contract(spec)
     return spec
@@ -52,6 +58,7 @@ def config_for_model_spec(config: dict, spec: dict) -> dict:
             "history_positions", model_cfg.get("history_positions", 0)
         )
     )
+    model_cfg["input_planes"] = int(spec["input_spec"]["input_planes"])
     model_cfg["policy_codec_id"] = spec["policy_spec"]["codec_id"]
     model_cfg["value_head_id"] = spec.get("value_spec", {}).get(
         "head_id", "wdl_search_aux_v1"

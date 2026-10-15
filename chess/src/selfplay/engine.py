@@ -83,6 +83,58 @@ def _hard_start_position_counts(hard_start, initial_board):
     return counts
 
 
+def _hard_start_history_repetition_counts(hard_start, initial_board, history_fens):
+    """Recover frame repetition counts only when the supplied move prefix proves them."""
+    hard_start = dict(hard_start or {})
+    history_fens = list(history_fens or ())
+    if not history_fens:
+        return []
+    if 'position_history_uci' not in hard_start:
+        return [None] * len(history_fens)
+
+    start_fen = hard_start.get('position_history_start_fen')
+    replay = chess.new_board(start_fen) if start_fen else chess.new_board()
+    counts = {}
+    records = []
+
+    def record_position(board):
+        key = _board_position_key(board)
+        prior = int(counts.get(key, 0))
+        records.append((key, min(2, prior)))
+        counts[key] = prior + 1
+
+    record_position(replay)
+    for raw_uci in hard_start.get('position_history_uci') or ():
+        move = chess.move_from_uci(str(raw_uci))
+        if move is None or move not in chess.legal_moves(replay):
+            return [None] * len(history_fens)
+        chess.apply_move(replay, move)
+        record_position(replay)
+    if chess.board_fen(replay) != chess.board_fen(initial_board):
+        return [None] * len(history_fens)
+
+    wanted = []
+    for fen in history_fens:
+        try:
+            wanted.append(_board_position_key(chess.new_board(fen)))
+        except Exception:
+            return [None] * len(history_fens)
+    prior_records = records[:-1]
+    if len(wanted) > len(prior_records):
+        return [None] * len(history_fens)
+    suffix = prior_records[-len(wanted):] if wanted else []
+    if [key for key, _count in suffix] != wanted:
+        return [None] * len(history_fens)
+    return [count for _key, count in suffix]
+
+
+def _game_repetition_count_before_current(gs, board):
+    if not bool(gs.get('position_history_complete', True)):
+        return None
+    key = _board_position_key(board)
+    return max(0, int(gs.get('position_counts', {}).get(key, 0)) - 1)
+
+
 def _optional_nonnegative_search_count(value):
     """Keep unavailable historical search accounting explicitly unknown."""
     if value is None:
@@ -169,9 +221,11 @@ class _CompactSelfPlayHistoryEntry:
         'search_simulations_effective',
         'search_simulations_fresh',
         'search_visits_inherited_credit',
+        'repetition_count',
+        'history_repetition_counts',
     )
 
-    _LENGTH = 18
+    _LENGTH = 20
     _METRIC_OFFSETS = {
         9: 0,
         12: 1,
@@ -205,6 +259,8 @@ class _CompactSelfPlayHistoryEntry:
         search_simulations_effective=None,
         search_simulations_fresh=None,
         search_visits_inherited_credit=None,
+        repetition_count=None,
+        history_repetition_counts=(),
     ):
         self.history_count = int(history_count)
         self.ply_index = None if ply_index is None else int(ply_index)
@@ -238,6 +294,8 @@ class _CompactSelfPlayHistoryEntry:
         self.search_visits_inherited_credit = _optional_nonnegative_search_count(
             search_visits_inherited_credit
         )
+        self.repetition_count = repetition_count
+        self.history_repetition_counts = tuple(history_repetition_counts or ())
 
     def __len__(self):
         return self._LENGTH
@@ -270,6 +328,10 @@ class _CompactSelfPlayHistoryEntry:
             return self.search_changed_top
         if index == 17:
             return self.search_visits
+        if index == 18:
+            return self.repetition_count
+        if index == 19:
+            return self.history_repetition_counts
         metric_index = self._METRIC_OFFSETS.get(index)
         if metric_index is not None:
             return struct.unpack_from('<d', self.packed_metrics, metric_index * 8)[0]
@@ -350,7 +412,7 @@ class SelfPlayEngine:
         }
         self.opponent_mcts = next(iter(self.opponent_mcts_by_label.values()), None)
         self.opponent_plan_labels = list(opponent_plan_labels or [])
-        self.history_positions = int(config.get('model', {}).get('history_positions', 0) or 0)
+        self.history_positions = int(self.mcts.history_positions)
         self.share_trees = bool(rl_cfg.get('self_play_share_trees', True))
 
         if device.type == 'cuda':
@@ -886,6 +948,16 @@ class SelfPlayEngine:
         orig_q = float(history_entry[15]) if len(history_entry) > 15 else float('nan')
         policy_kld = float(history_entry[16]) if len(history_entry) > 16 else float('nan')
         search_visits = int(history_entry[17]) if len(history_entry) > 17 else 0
+        repetition_count = (
+            history_entry[18]
+            if len(history_entry) > 18
+            else None
+        )
+        history_repetition_counts = (
+            tuple(history_entry[19] or ())
+            if len(history_entry) > 19
+            else ()
+        )
         search_budget_assigned = getattr(history_entry, 'search_budget_assigned', None)
         search_simulations_effective = getattr(
             history_entry, 'search_simulations_effective', None
@@ -945,6 +1017,8 @@ class SelfPlayEngine:
             'orig_q': orig_q,
             'policy_kld': policy_kld,
             'search_visits': search_visits,
+            'repetition_count': repetition_count,
+            'history_repetition_counts': history_repetition_counts,
             'search_budget_assigned': search_budget_assigned,
             'search_simulations_effective': search_simulations_effective,
             'search_simulations_fresh': search_simulations_fresh,
@@ -961,6 +1035,45 @@ class SelfPlayEngine:
             history_fens = history_fens[-int(history_positions):]
         else:
             history_fens = []
+
+        if self.mcts._path_dependent_repetition:
+            history_repetition_counts = list(
+                item.get('history_repetition_counts', ()) or ()
+            )
+            if history_positions > 0:
+                history_repetition_counts = history_repetition_counts[-int(history_positions):]
+            else:
+                history_repetition_counts = []
+            if len(history_repetition_counts) != len(history_fens):
+                history_repetition_counts = [None] * len(history_fens)
+
+            encoded_history = []
+            for fen, repetition_count in zip(
+                history_fens,
+                history_repetition_counts,
+            ):
+                cache_key = (fen, repetition_count)
+                encoded = encoded_fen_cache.get(cache_key)
+                if encoded is None:
+                    encoded = self.mcts._encode_history_entry(
+                        fen,
+                        repetition_count=repetition_count,
+                    )
+                    encoded_fen_cache[cache_key] = encoded
+                encoded_history.append(encoded)
+
+            current_repetition_count = item.get('repetition_count')
+            current_board = chess.new_board(current_fen)
+            current_tensor = self.mcts._board_to_tensor_profiled(
+                current_board,
+                repetition_count=current_repetition_count,
+            )
+            return self.mcts._build_history_tensor(
+                current_board,
+                encoded_history,
+                current_tensor=current_tensor,
+                repetition_count=current_repetition_count,
+            )
 
         encoded_history = []
         for fen in history_fens + [current_fen]:
@@ -1201,10 +1314,36 @@ class SelfPlayEngine:
             if move is None or move not in chess.legal_moves(board):
                 break
 
-            gs['board_history'].append(self.mcts._encode_history_entry(board))
+            repetition_count = _game_repetition_count_before_current(gs, board)
+            gs['board_history'].append(
+                self.mcts._encode_history_entry(
+                    board,
+                    repetition_count=repetition_count,
+                )
+            )
+            opponent_mcts = gs.get('opponent_mcts')
+            opponent_history = gs.get('opponent_board_history')
+            if (
+                opponent_mcts is not None
+                and opponent_history is not gs['board_history']
+            ):
+                gs['opponent_board_history'].append(
+                    opponent_mcts._encode_history_entry(
+                        board,
+                        repetition_count=repetition_count,
+                    )
+                )
             gs.setdefault('fen_history', []).append(chess.board_fen(board))
+            gs.setdefault('repetition_history', []).append(repetition_count)
             self._trim_history_cache(gs['board_history'])
+            self._trim_history_cache(
+                gs.get('opponent_board_history', []),
+                history_positions=(
+                    opponent_mcts.history_positions if opponent_mcts is not None else 0
+                ),
+            )
             self._trim_history_cache(gs['fen_history'])
+            self._trim_history_cache(gs['repetition_history'])
             chess.apply_move(board, move)
             if len(gs['_opening_sequence']) < _OPENING_DIVERSITY_SEQUENCE_PLIES:
                 gs['_opening_sequence'].append(move.uci())
@@ -1217,9 +1356,16 @@ class SelfPlayEngine:
                 break
         gs['_opening_prefix_plies'] = applied_plies
 
-    def _trim_history_cache(self, history):
+    def _trim_history_cache(self, history, history_positions=None):
         """Keep only entries that can still affect the model input or replay row."""
-        limit = max(0, int(self.history_positions))
+        limit = max(
+            0,
+            int(
+                self.history_positions
+                if history_positions is None
+                else history_positions
+            ),
+        )
         if limit == 0:
             history.clear()
         elif len(history) > limit:
@@ -2007,17 +2153,64 @@ class SelfPlayEngine:
                 if isinstance(candidate, dict) and candidate.get('fen'):
                     hard_start = candidate
             initial_board = chess.new_board(hard_start.get('fen')) if hard_start else chess.new_board()
-            hard_history_fens = list((hard_start or {}).get('history_fens', []) or [])[-self.history_positions:]
+            opponent_history_positions = int(
+                opponent_mcts.history_positions if opponent_mcts is not None else 0
+            )
+            max_history_positions = max(
+                self.history_positions,
+                opponent_history_positions,
+            )
+            all_hard_history_fens = list(
+                (hard_start or {}).get('history_fens', []) or []
+            )
+            if max_history_positions > 0:
+                all_hard_history_fens = all_hard_history_fens[-max_history_positions:]
+            else:
+                all_hard_history_fens = []
             if hard_start:
                 position_counts = _hard_start_position_counts(hard_start, initial_board)
             else:
                 position_counts = {_board_position_key(initial_board): 1}
-            encoded_hard_history = []
-            for history_fen in hard_history_fens:
-                try:
-                    encoded_hard_history.append(self.mcts._encode_history_entry(chess.new_board(history_fen)))
-                except Exception:
-                    continue
+            position_history_complete = bool(
+                not hard_start
+                or 'position_history_uci' in hard_start
+                or int(initial_board.halfmove_clock) == 0
+            )
+            hard_history_repetition_counts = _hard_start_history_repetition_counts(
+                hard_start,
+                initial_board,
+                all_hard_history_fens,
+            )
+            def _encode_hard_history(search_mcts):
+                depth = int(search_mcts.history_positions)
+                if depth <= 0:
+                    return []
+                history_fens = all_hard_history_fens[-depth:]
+                repetition_counts = hard_history_repetition_counts[-len(history_fens):]
+                return [
+                    search_mcts._encode_history_entry(
+                        chess.new_board(history_fen),
+                        repetition_count=repetition_count,
+                    )
+                    for history_fen, repetition_count in zip(
+                        history_fens,
+                        repetition_counts,
+                    )
+                ]
+
+            encoded_hard_history = _encode_hard_history(self.mcts)
+            share_history_cache = bool(
+                opponent_mcts is not None
+                and self.mcts.input_encoder_id == opponent_mcts.input_encoder_id
+                and self.history_positions == opponent_history_positions
+            )
+            encoded_opponent_history = (
+                encoded_hard_history
+                if share_history_cache
+                else _encode_hard_history(opponent_mcts)
+                if opponent_mcts is not None
+                else []
+            )
             fen_parts = chess.board_fen(initial_board).split()
             try:
                 fullmove = max(1, int(fen_parts[5]))
@@ -2027,8 +2220,11 @@ class SelfPlayEngine:
             gs = {
                 'board': initial_board,
                 'board_history': encoded_hard_history,
-                'fen_history': hard_history_fens,
+                'opponent_board_history': encoded_opponent_history,
+                'fen_history': all_hard_history_fens[-self.history_positions:] if self.history_positions > 0 else [],
+                'repetition_history': hard_history_repetition_counts[-self.history_positions:] if self.history_positions > 0 else [],
                 'position_counts': position_counts,
+                'position_history_complete': position_history_complete,
                 'root': None,
                 '_root_synced': False,
                 'opponent_root': None,
@@ -2330,7 +2526,7 @@ class SelfPlayEngine:
 
             visit_counts_by_index = {}
 
-            def _run_search_for_indices(indices, mcts_ref, root_key, synced_key):
+            def _run_search_for_indices(indices, mcts_ref, root_key, synced_key, history_key):
                 if not indices:
                     return
                 group_states = []
@@ -2340,11 +2536,12 @@ class SelfPlayEngine:
                         gs['board'],
                         gs.get(root_key),
                         bool(gs.get(synced_key, False)),
-                        gs['board_history'],
+                        gs[history_key],
                         int(gs.get('move_count', 0) or 0),
                         gs.get('position_counts'),
                         None,
                         gs['_native_tree_key'],
+                        bool(gs.get('position_history_complete', True)),
                     ])
                 visit_counts_list_group, search_metadata_group = mcts_ref.search_many(
                     group_states,
@@ -2434,14 +2631,32 @@ class SelfPlayEngine:
                             search_stats['difficulty_budget_cross_sum'] += difficulty * float(budget)
                             search_stats['budget_sq_sum'] += float(budget) * float(budget)
             if not self.opponent_mcts_by_label:
-                _run_search_for_indices(active_indices, self.mcts, 'root', '_root_synced')
+                _run_search_for_indices(
+                    active_indices,
+                    self.mcts,
+                    'root',
+                    '_root_synced',
+                    'board_history',
+                )
             else:
-                _run_search_for_indices(learner_indices, self.mcts, 'root', '_root_synced')
+                _run_search_for_indices(
+                    learner_indices,
+                    self.mcts,
+                    'root',
+                    '_root_synced',
+                    'board_history',
+                )
                 for label, indices in grouped_opponent_indices.items():
                     opponent_mcts = self.opponent_mcts_by_label.get(label)
                     if opponent_mcts is None:
                         continue
-                    _run_search_for_indices(indices, opponent_mcts, 'opponent_root', '_opponent_root_synced')
+                    _run_search_for_indices(
+                        indices,
+                        opponent_mcts,
+                        'opponent_root',
+                        '_opponent_root_synced',
+                        'opponent_board_history',
+                    )
             for idx in active_indices:
                 gs = game_states[idx]
                 board = gs['board']
@@ -2592,6 +2807,10 @@ class SelfPlayEngine:
                         history_fens=tuple(
                             gs.get('fen_history', [])[-self.history_positions:]
                         ),
+                        repetition_count=_game_repetition_count_before_current(gs, board),
+                        history_repetition_counts=tuple(
+                            gs.get('repetition_history', [])[-self.history_positions:]
+                        ),
                         search_changed_top=search_changed_top,
                         search_q_delta=search_q_delta,
                         best_q=(
@@ -2636,10 +2855,37 @@ class SelfPlayEngine:
 
                 # Update history BEFORE making the move
                 # Store cached tensors for both POVs to avoid repeated FEN parse + tensor rebuild.
-                gs['board_history'].append(self.mcts._encode_history_entry(board))
+                repetition_count = _game_repetition_count_before_current(gs, board)
+                gs['board_history'].append(
+                    self.mcts._encode_history_entry(
+                        board,
+                        repetition_count=repetition_count,
+                    )
+                )
+                game_opponent_mcts = gs.get('opponent_mcts')
+                if (
+                    game_opponent_mcts is not None
+                    and gs.get('opponent_board_history') is not gs['board_history']
+                ):
+                    gs['opponent_board_history'].append(
+                        game_opponent_mcts._encode_history_entry(
+                            board,
+                            repetition_count=repetition_count,
+                        )
+                    )
                 gs.setdefault('fen_history', []).append(chess.board_fen(board))
+                gs.setdefault('repetition_history', []).append(repetition_count)
                 self._trim_history_cache(gs['board_history'])
+                self._trim_history_cache(
+                    gs.get('opponent_board_history', []),
+                    history_positions=(
+                        game_opponent_mcts.history_positions
+                        if game_opponent_mcts is not None
+                        else 0
+                    ),
+                )
                 self._trim_history_cache(gs['fen_history'])
+                self._trim_history_cache(gs['repetition_history'])
 
                 if (
                     not gs.get('_hard_start', False)

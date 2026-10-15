@@ -6,6 +6,7 @@ import sys
 from src.model import (
     load_checkpoint_file,
     normalize_state_dict_keys,
+    resolve_model_spec,
     transfer_matching_weights,
 )
 from src.models.catalog import (
@@ -34,6 +35,20 @@ def _safe_int(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _architecture_mismatch(model, checkpoint):
+    """Prevent partial tensor transfer between unrelated registered models."""
+    target_spec = getattr(model, "model_spec", None)
+    if not isinstance(target_spec, dict):
+        return None
+    model_config = getattr(model, "model_config", {}) or {}
+    source_spec = resolve_model_spec({"model": dict(model_config)}, checkpoint)
+    target_architecture = target_spec.get("architecture_id")
+    source_architecture = source_spec.get("architecture_id")
+    if target_architecture != source_architecture:
+        return f"current={target_architecture!r}, checkpoint={source_architecture!r}"
+    return None
 
 
 def select_best_il_checkpoint(best_checkpoint, swa_checkpoint=None):
@@ -196,7 +211,9 @@ def _is_diagnostic_candidate_checkpoint(path):
     )
 
 
-def _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir):
+def _collect_rl_checkpoints(
+    models_dir, best_model_rl_path, rl_dir, fallback_best_paths=()
+):
     """Return only checkpoints that belong to the RL checkpoint namespace.
 
     IL checkpoints remain valid for NEW/SELECT initialization, but they cannot
@@ -204,8 +221,10 @@ def _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir):
     the RESUME picker. Keep archived RL runs selectable from their subfolders.
     """
     candidates = []
-    if best_model_rl_path.exists():
-        candidates.append(best_model_rl_path)
+    for path in (best_model_rl_path, *tuple(fallback_best_paths or ())):
+        path = Path(path)
+        if path.exists() and path not in candidates:
+            candidates.append(path)
 
     rl_checkpoints = sorted(
         (
@@ -227,9 +246,13 @@ def _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir):
     )
 
 
-def _collect_transfer_checkpoints(models_dir, best_model_rl_path, rl_dir):
+def _collect_transfer_checkpoints(
+    models_dir, best_model_rl_path, rl_dir, fallback_best_paths=()
+):
     """Return every model checkpoint valid for NEW/SELECT or weight transfer."""
-    candidates = _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir)
+    candidates = _collect_rl_checkpoints(
+        models_dir, best_model_rl_path, rl_dir, fallback_best_paths
+    )
     all_checkpoints = sorted(
         (
             path
@@ -246,12 +269,13 @@ def _collect_transfer_checkpoints(models_dir, best_model_rl_path, rl_dir):
     return candidates
 
 
-def _suggest_start_mode_default(best_model_rl_path, rl_dir):
+def _suggest_start_mode_default(best_model_rl_path, rl_dir, fallback_best_paths=()):
     """Prefer a fresh RL run when the latest RL checkpoint is clearly underperforming."""
     rl_candidates = _collect_rl_checkpoints(
         Path(best_model_rl_path).parent,
         best_model_rl_path,
         rl_dir,
+        fallback_best_paths,
     )
     for checkpoint_path in rl_candidates:
         entry = load_checkpoint_metadata(checkpoint_path)
@@ -477,12 +501,15 @@ def plan_rl_startup(
     default_new_checkpoint=None,
     initial_plan=None,
     prefer_fresh_il=False,
+    fallback_best_paths=(),
 ):
     """Choose the startup mode first, then finalize it once the model exists."""
     initial_plan = dict(initial_plan or {})
     available_checkpoints = initial_plan.get("available_checkpoints")
     if available_checkpoints is None:
-        available_checkpoints = _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir)
+        available_checkpoints = _collect_rl_checkpoints(
+            models_dir, best_model_rl_path, rl_dir, fallback_best_paths
+        )
     forced_checkpoint = initial_plan.get("forced_checkpoint")
     selected_checkpoint = None
     checkpoint_catalog = []
@@ -494,7 +521,9 @@ def plan_rl_startup(
             default_choice = "1"
             default_hint = "RL quality experiment: NEW from canonical IL with empty replay"
         else:
-            default_choice, default_hint = _suggest_start_mode_default(best_model_rl_path, rl_dir)
+            default_choice, default_hint = _suggest_start_mode_default(
+                best_model_rl_path, rl_dir, fallback_best_paths
+            )
         start_mode = _choose_start_mode(
             has_checkpoints=(len(available_checkpoints) > 0),
             default_choice=default_choice,
@@ -505,6 +534,7 @@ def plan_rl_startup(
                 models_dir,
                 best_model_rl_path,
                 rl_dir,
+                fallback_best_paths,
             )
             has_default_init = bool(default_new_checkpoint is not None and Path(default_new_checkpoint).exists())
             new_init_mode = _choose_new_init_mode(
@@ -516,6 +546,7 @@ def plan_rl_startup(
                 models_dir,
                 best_model_rl_path,
                 rl_dir,
+                fallback_best_paths,
             )
 
     if model is None:
@@ -618,6 +649,14 @@ def apply_rl_startup_plan(
         print(f"\nLoading startup checkpoint: {selected_checkpoint_label}")
         checkpoint = load_checkpoint_file(str(selected_checkpoint), device)
 
+        architecture_mismatch = _architecture_mismatch(model, checkpoint)
+        if architecture_mismatch:
+            raise ValueError(
+                "RL resume/transfer cannot cross model architectures "
+                f"({architecture_mismatch}). Select a checkpoint with the same "
+                "architecture or start a fresh run from that architecture's IL model."
+            )
+
         if start_mode == "resume":
             try:
                 model_state = checkpoint.get("model_state_dict")
@@ -675,6 +714,13 @@ def apply_rl_startup_plan(
         if init_path is not None and init_path.exists():
             print(f"\nInitializing RL from: {init_path}")
             checkpoint = load_checkpoint_file(str(init_path), device)
+            architecture_mismatch = _architecture_mismatch(model, checkpoint)
+            if architecture_mismatch:
+                raise ValueError(
+                    "RL initialization cannot cross model architectures "
+                    f"({architecture_mismatch}). Select an IL checkpoint matching "
+                    "the active architecture."
+                )
             model_state = checkpoint.get("model_state_dict")
             try:
                 if not isinstance(model_state, dict):

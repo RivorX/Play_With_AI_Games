@@ -4289,7 +4289,8 @@ class BinaryChessDataset(Dataset):
                  history_positions=0, game_length_by_id=None,
                  index_cache_path=None, use_index_mmap=True,
                  soft_targets=None, soft_target_paths=None, board_dtype='float32',
-                 return_numpy=False, filter_stats=None):
+                 return_numpy=False, filter_stats=None,
+                 input_encoder_id='planes_history_v1'):
         """
         Args:
             binary_file: Path to binary file
@@ -4307,11 +4308,19 @@ class BinaryChessDataset(Dataset):
         self.binary_file = binary_file
         self.position_size = position_size
         self.history_positions = history_positions
+        self.input_encoder_id = str(input_encoder_id or 'planes_history_v1')
+        if self.input_encoder_id not in {'planes_history_v1', 'planes_history_v2'}:
+            raise ValueError(f"Unsupported dataset input encoder: {self.input_encoder_id!r}")
         self.game_length_by_id = game_length_by_id
         board_dtype = str(board_dtype or 'float32').strip().lower()
         self.board_np_dtype = np.float16 if board_dtype in {'float16', 'fp16', 'half'} else np.float32
         self.return_numpy = bool(return_numpy)
-        self._empty_history_tensor = np.zeros((16, 8, 8), dtype=self.board_np_dtype)
+        if self.input_encoder_id == 'planes_history_v2':
+            from src.models.data.nested_cnn_v10.helpers import empty_history_frame
+
+            self._empty_history_tensor = empty_history_frame(self.board_np_dtype)
+        else:
+            self._empty_history_tensor = np.zeros((16, 8, 8), dtype=self.board_np_dtype)
         self.index_cache_path = str(index_cache_path) if index_cache_path else None
         self.use_index_mmap = bool(use_index_mmap and self.index_cache_path)
         self.soft_targets = soft_targets or None
@@ -4439,12 +4448,24 @@ class BinaryChessDataset(Dataset):
         turn = get_turn_from_move_idx(move_idx)
         is_black_turn = turn == chess.BLACK
 
-        # Convert current board to tensor with POV
-        board_tensor = compact_to_tensor(compact_board, flip_perspective=is_black_turn)
-        
-        # 🔧 v4.5: Validate tensor shape (should be 16 planes now)
-        if board_tensor.shape[0] != 16:
-            raise ValueError(f"Invalid board tensor shape: {board_tensor.shape} (expected (16, 8, 8))")
+        if self.input_encoder_id == 'planes_history_v2':
+            from src.models.data.nested_cnn_v10.helpers import compact_to_tensor as v10_compact_to_tensor
+
+            board_tensor = v10_compact_to_tensor(
+                compact_board,
+                turn=turn,
+                flip_perspective=is_black_turn,
+                dtype=self.board_np_dtype,
+            )
+            if board_tensor.shape != (20, 8, 8):
+                raise ValueError(
+                    f"Invalid v10 current tensor shape: {board_tensor.shape} (expected (20, 8, 8))"
+                )
+        else:
+            # Keep the established v9 encoding path and output byte-for-byte stable.
+            board_tensor = compact_to_tensor(compact_board, flip_perspective=is_black_turn)
+            if board_tensor.shape[0] != 16:
+                raise ValueError(f"Invalid board tensor shape: {board_tensor.shape} (expected (16, 8, 8))")
         
         # DYNAMIC SLIDING WINDOW: Build history by walking backwards through raw file.
         # We walk position_idx-1, position_idx-2, … and stop as soon as the GameID
@@ -4469,10 +4490,21 @@ class BinaryChessDataset(Dataset):
                 
                 hist_compact_board = hist_data[:38]  # 🔧 FIXED: 38 bytes
                 
-                # All history boards use the CURRENT player's POV for consistency
-                hist_tensor = compact_to_tensor(hist_compact_board, flip_perspective=is_black_turn)
-                
-                history_tensors.append(hist_tensor)  # newest first, reversed below
+                # All history boards use the CURRENT player's POV for consistency.
+                if self.input_encoder_id == 'planes_history_v2':
+                    hist_move_idx = struct.unpack('H', hist_data[42:44])[0]
+                    hist_turn = get_turn_from_move_idx(hist_move_idx)
+                    hist_tensor = v10_compact_to_tensor(
+                        hist_compact_board,
+                        turn=hist_turn,
+                        flip_perspective=is_black_turn,
+                        dtype=self.board_np_dtype,
+                    )
+                    history_tensors.append(hist_tensor[:13])
+                else:
+                    hist_tensor = compact_to_tensor(hist_compact_board, flip_perspective=is_black_turn)
+                    history_tensors.append(hist_tensor)
+                # Newest first, reversed below.
                 collected_history += 1
                 current_offset -= 1
             
@@ -4483,8 +4515,22 @@ class BinaryChessDataset(Dataset):
             while len(history_tensors) < self.history_positions:
                 history_tensors.insert(0, self._empty_history_tensor)
         
-        # Stack: [oldest_history, …, newest_history, current]  →  (16*(H+1), 8, 8)
-        if history_tensors:
+        if self.input_encoder_id == 'planes_history_v2':
+            # Prior positions carry only pieces + repetition. Compact PGN records
+            # do not preserve repetition provenance, so all such planes remain
+            # explicitly unknown (-1); the current frame retains its own metadata.
+            if history_tensors:
+                all_tensors = history_tensors + [board_tensor[:13], board_tensor[13:20]]
+            else:
+                all_tensors = [board_tensor]
+            stacked_board = np.concatenate(all_tensors, axis=0)
+            expected_planes = 13 * (1 + self.history_positions) + 7
+            if stacked_board.shape != (expected_planes, 8, 8):
+                raise ValueError(
+                    f"Invalid v10 stacked tensor shape: {stacked_board.shape}; "
+                    f"expected ({expected_planes}, 8, 8)"
+                )
+        elif history_tensors:
             all_tensors = history_tensors + [board_tensor]
             stacked_board = np.concatenate(all_tensors, axis=0)
         else:
@@ -5341,6 +5387,11 @@ def create_dataloaders(metadata, config):
     need_game_length = True
     index_cache_paths = _build_index_cache_paths(metadata, config)
     history_positions = config['model'].get('history_positions', 0)
+    input_encoder_id = str(config.get('model', {}).get('input_encoder_id', 'planes_history_v1'))
+    from src.models.data.registry import get_input_encoder
+
+    encoder = get_input_encoder(input_encoder_id)
+    input_planes = int(encoder.input_planes(history_positions))
     hw_cfg = config.get('hardware', {})
     
     if split_by_game:
@@ -5577,9 +5628,6 @@ def create_dataloaders(metadata, config):
     # Get configuration
     position_size = metadata.get('position_size')
     
-    # 🔧 v4.5 FIXED: Calculate actual input planes (16 per position with metadata)
-    input_planes = 16 * (1 + history_positions)  # 16 planes (12 pieces + 4 metadata)
-    
     selected_total = int(len(train_indices) + len(val_indices))
     epoch_train_print = int(epoch_train_count) if epoch_train_count is not None else int(len(train_indices))
     epoch_val_print = int(epoch_val_count) if epoch_val_count is not None else int(len(val_indices))
@@ -5692,6 +5740,7 @@ def create_dataloaders(metadata, config):
         board_dtype=dataloader_board_dtype,
         return_numpy=dataloader_return_numpy,
         filter_stats=train_filter_stats,
+        input_encoder_id=input_encoder_id,
     )
     if epoch_train_count is not None:
         train_dataset.epoch_sample_count = max(1, min(len(train_dataset), int(epoch_train_count)))
@@ -5709,6 +5758,7 @@ def create_dataloaders(metadata, config):
         board_dtype=dataloader_board_dtype,
         return_numpy=dataloader_return_numpy,
         filter_stats=val_filter_stats,
+        input_encoder_id=input_encoder_id,
     )
 
     # Debug: show progress histogram after per-game selection

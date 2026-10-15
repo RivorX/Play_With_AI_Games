@@ -4,7 +4,7 @@
 
 project:
   # Used for new IL/RL models. Existing checkpoints use their own model_spec.
-  # se_cnn_v9, ...
+  # se_cnn_v9 or nested_cnn_v10. CLI selection is also available via --architecture.
   active_architecture: "se_cnn_v9"
   # Reproducible sampling, opening selection and learner updates. Change this
   # only when intentionally starting an independent comparison run.

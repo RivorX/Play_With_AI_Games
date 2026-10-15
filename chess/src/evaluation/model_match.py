@@ -64,8 +64,8 @@ def run_model_match(
     """Run a fair alternating-colour match through the canonical eval engine.
 
     The same batched MCTS, process workers and central GPU inference path used by
-    RL evaluation are reused here. Different architectures safely fall back to
-    the in-process executor because the central server owns one architecture.
+    RL evaluation are reused here. Each side keeps its checkpoint's input and
+    search contract, including when the two architectures differ.
     """
     model1_spec = getattr(model1, "model_spec", None)
     model2_spec = getattr(model2, "model_spec", None)
@@ -118,15 +118,15 @@ def run_model_match(
         and _state_shapes(model1) == _state_shapes(model2)
     )
     if not same_architecture:
+        # Mixed local matches use one board worker, but central inference remains
+        # eligible: the server routes each model label using its own model_spec.
         rl_cfg["eval_workers"] = 1
-        rl_cfg["eval_central_inference_enabled"] = False
 
     model1_config = _side_search_config(match_config, model1, simulations_model1)
     model2_config = _side_search_config(match_config, model2, simulations_model2)
     workers = _resolve_eval_workers(match_config, device, int(num_games))
     central = bool(
-        same_architecture
-        and _eval_uses_central_inference(match_config, device)
+        _eval_uses_central_inference(match_config, device)
         and int(num_games) >= max(1, int(rl_cfg.get("eval_central_inference_min_games", 2) or 2))
     )
     batch_games = int(_resolve_eval_batch_games(match_config, int(num_games)))

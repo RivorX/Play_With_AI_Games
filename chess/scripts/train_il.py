@@ -15,6 +15,7 @@ Imitation Learning Training Script - v4.5
 - 👑 Promotions: Promotion-aware action space (see ACTION_SIZE)
 """
 
+import argparse
 import torch
 import torch.optim as optim
 import torch._dynamo
@@ -36,11 +37,12 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
 from src.model import (
+    MODEL_REGISTRY,
     create_model,
     load_model,
     save_checkpoint,
 )
-from src.models.data import create_dataloaders, process_pgn_files
+from src.models.data import create_dataloaders, process_pgn_files, get_input_encoder
 from src.models.data.se_cnn_v9.helpers import ACTION_SIZE, get_position_size
 from src.config import default_config_path, load_project_config
 
@@ -49,6 +51,7 @@ from src.common.logger import TrainingLogger
 from src.common.torch_cache import configure_torch_compile_cache
 from src.training.il.trainer import train_epoch_il, evaluate_il
 from src.training.il.startup import (
+    ask_il_architecture,
     plan_il_startup,
     apply_il_startup_plan,
     ask_resume_additional_epochs,
@@ -66,6 +69,9 @@ from src.training.il.checkpointing import (
 from src.common.runtime import (
     build_model_file_tag,
     build_model_architecture_metadata,
+    architecture_scoped_directory,
+    legacy_architecture_scoped_file,
+    model_alias_file,
     cleanup_interrupted_log_csv,
 )
 from src.evaluation.elo_runner import (
@@ -195,7 +201,10 @@ def _checkpoint_resume_tag(checkpoint_path):
         stem = Path(checkpoint_path).stem
     except TypeError:
         return None
-    if stem in {"best_model_il", "best_model", "model"}:
+    if (
+        stem in {"best_model_il", "best_model", "model"}
+        or stem.startswith("best_model_il_")
+    ):
         return None
     for suffix in ("_latest_swa", "_best_swa", "_latest", "_best", "_swa"):
         if stem.endswith(suffix):
@@ -615,7 +624,21 @@ def _load_il_model_for_final_elo(checkpoint_path, config, device, fallback_model
         return None, None
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Train a chess model with imitation learning.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="YAML override merged over the standard project configuration.",
+    )
+    parser.add_argument(
+        "--architecture",
+        choices=tuple(sorted(MODEL_REGISTRY)),
+        default=None,
+        help="Select a versioned model profile for a new IL run.",
+    )
+    args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding='utf-8', errors='replace')
@@ -623,10 +646,65 @@ def main():
             pass
 
     # Load config
-    config_path = default_config_path()
-    
+    config_path = Path(args.config).resolve() if args.config is not None else default_config_path()
+
+    if args.architecture is None:
+        # Resolve the configured profile first so the menu can mark it as the
+        # default. This only reads YAML; model and dataset setup happen later.
+        configured_config = load_project_config(config_path=config_path)
+        configured_architecture = str(
+            configured_config.get("model", {}).get("architecture_id", "se_cnn_v9")
+        )
+        available_profiles = {}
+        for architecture_id in sorted(MODEL_REGISTRY):
+            profile_path = config_path.parent / "models" / f"{architecture_id}.yaml"
+            # Standard profiles live beside default.yaml. An explicit --config
+            # can live elsewhere, so also check the repository profile directory.
+            if not profile_path.is_file():
+                profile_path = (
+                    Path(__file__).resolve().parents[1]
+                    / "config"
+                    / "models"
+                    / f"{architecture_id}.yaml"
+                )
+            if not profile_path.is_file():
+                continue
+            profile_config = load_project_config(
+                architecture_id=architecture_id,
+                config_path=config_path,
+            )
+            if profile_config.get("model", {}).get("architecture_id") != architecture_id:
+                continue
+            version = profile_config.get("model", {}).get("version")
+            label = f"{version} ({architecture_id})" if version else architecture_id
+            available_profiles[architecture_id] = label
+
+        selected_architecture = ask_il_architecture(
+            available_profiles,
+            default_architecture=configured_architecture,
+        )
+        config = (
+            configured_config
+            if selected_architecture == configured_architecture
+            else load_project_config(
+                architecture_id=selected_architecture,
+                config_path=config_path,
+            )
+        )
+    else:
+        selected_architecture = args.architecture
+        config = load_project_config(
+            architecture_id=selected_architecture,
+            config_path=config_path,
+        )
+
     print(f"Loading config from: {config_path}")
-    config = load_project_config()
+    if args.architecture and config.get('model', {}).get('architecture_id') != args.architecture:
+        raise ValueError(
+            f"Config selects architecture {config.get('model', {}).get('architecture_id')!r}, "
+            f"but --architecture requested {args.architecture!r}. Remove the conflicting "
+            "model.architecture_id override or select its matching profile."
+        )
 
     model_version = config.get('model', {}).get('version', 'v?.?')
     model_file_tag = build_model_file_tag(config)
@@ -683,12 +761,21 @@ def main():
     base_dir = script_dir.parent
     models_dir = base_dir / config['paths']['models_dir']
     logs_dir = base_dir / config['paths']['logs_dir']
-    il_dir = base_dir / config['paths']['il_checkpoints_dir']
+    architecture_id = str(config['model'].get('architecture_id', 'se_cnn_v9'))
+    il_dir = architecture_scoped_directory(
+        base_dir / config['paths']['il_checkpoints_dir'], architecture_id
+    )
     
     models_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
     il_dir.mkdir(parents=True, exist_ok=True)
-    best_model_path = base_dir / config['paths']['best_model_il']
+    configured_best_model_path = base_dir / config['paths']['best_model_il']
+    best_model_path = model_alias_file(
+        configured_best_model_path, architecture_id, "il"
+    )
+    legacy_best_model_path = legacy_architecture_scoped_file(
+        configured_best_model_path, architecture_id
+    )
     version_best_model_path = il_dir / f"{model_file_tag}_best.pt"
     latest_checkpoint_path = il_dir / f"{model_file_tag}_latest.pt"
     
@@ -699,11 +786,21 @@ def main():
     soft_targets_cfg = config.get('data', {}).get('soft_targets', {}) or {}
     
     # 🆕 v4.5 FIXED: Calculate expected input planes with chess metadata
-    expected_input_planes = 16 * (1 + history_positions)  # 🔧 FIXED: 16 planes (12 pieces + 4 metadata)
+    input_encoder = get_input_encoder(config['model'].get('input_encoder_id', 'planes_history_v1'))
+    expected_input_planes = int(input_encoder.input_planes(history_positions))
+    expected_configured_planes = config['model'].get('input_planes')
+    if expected_configured_planes is not None and int(expected_configured_planes) != expected_input_planes:
+        raise ValueError(
+            f"model.input_planes={expected_configured_planes} conflicts with encoder "
+            f"contract ({expected_input_planes})"
+        )
+    model_blocks = config['model'].get('outer_blocks', config['model'].get('num_residual_blocks', '?'))
+    model_channels = config['model'].get('trunk_channels', config['model'].get('filters', '?'))
     
     print(
-        f"IL setup: version={model_version}, blocks={config['model']['num_residual_blocks']}, "
-        f"filters={config['model']['filters']}, history={history_positions}, "
+        f"IL setup: architecture={config['model'].get('architecture_id', 'se_cnn_v9')}, "
+        f"version={model_version}, blocks={model_blocks}, "
+        f"channels={model_channels}, history={history_positions}, "
         f"input_planes={expected_input_planes}"
     )
     print(
@@ -723,7 +820,11 @@ def main():
 
     hparam_mode = ask_il_hyperparam_source(default_mode="auto")
     selected_start_mode = ask_il_start_mode(
-        has_checkpoints=has_il_checkpoints(best_model_path, il_dir)
+        has_checkpoints=has_il_checkpoints(
+            best_model_path,
+            il_dir,
+            fallback_best_paths=(legacy_best_model_path,),
+        )
     )
     target_positions = ask_il_target_positions(
         default_millions=_target_positions_default_millions(config.get('data', {}), default=15)
@@ -741,6 +842,7 @@ def main():
         il_dir=il_dir,
         start_mode=selected_start_mode,
         base_learning_rate=config['imitation_learning']['learning_rate'],
+        fallback_best_paths=(legacy_best_model_path,),
     )
 
     if startup_plan.get("start_mode") == "resume":
@@ -840,8 +942,8 @@ def main():
             f.write("=" * 70 + "\n")
             f.write(f"Timestamp: {timestamp}\n")
             f.write(
-                f"Model: {config['model']['filters']} filters, "
-                f"{config['model']['num_residual_blocks']} blocks\n"
+                f"Model: {config['model'].get('trunk_channels', config['model'].get('filters', '?'))} channels, "
+                f"{config['model'].get('outer_blocks', config['model'].get('num_residual_blocks', '?'))} blocks\n"
             )
             f.write(f"Model hash: {hparam_resolution.get('model_hash', 'n/a')}\n")
             f.write(f"Hyperparameter source: {hparam_resolution.get('source', 'config')}\n")
@@ -853,8 +955,7 @@ def main():
             f.write(f"Learning rate: {config['imitation_learning']['learning_rate']}\n")
             f.write(f"History positions: {history_positions} (dynamic)\n")
             f.write(f"Positions per game: {positions_per_game_cfg}\n")
-            f.write(f"Input planes: {expected_input_planes} (16 per position)\n")
-            f.write("Chess metadata: Castling, En Passant, Halfmove, Fullmove\n")
+            f.write(f"Input contract: {config['model'].get('input_encoder_id', 'planes_history_v1')} ({expected_input_planes} planes)\n")
             f.write("WDL Value: True (forced)\n")
             f.write("POV enabled: True\n")
             if hparam_resolution.get("mode") == "auto":
@@ -1119,8 +1220,8 @@ def main():
 
     # Prepend model architecture info: version | xM params | N blocks Xf
     _total_params = sum(p.numel() for p in model.parameters())
-    _blocks  = config['model'].get('num_residual_blocks', '?')
-    _filters = config['model'].get('filters', '?')
+    _blocks  = config['model'].get('outer_blocks', config['model'].get('num_residual_blocks', '?'))
+    _filters = config['model'].get('trunk_channels', config['model'].get('filters', '?'))
     _params_str = f"{_total_params / 1e6:.2f}M"
     model_context = f"Model: {model_version} | {_params_str} params | {_blocks} blocks {_filters}f"
     run_context = f"Run: {plot_run_context}"
@@ -2594,6 +2695,11 @@ def main():
             elo_stop_event=swa_elo_stop_event,
             model_architecture=model_architecture,
             training_batch_size=trained_batch_size,
+            swa_checkpoint_path=model_alias_file(
+                configured_best_model_path.parent / "best_model_il_swa.pt",
+                architecture_id,
+                "il_swa",
+            ),
         )
     except KeyboardInterrupt:
         swa_elo_stop_event.set()
@@ -2648,7 +2754,14 @@ def main():
         logger.plot()
 
         if final_il_elo_enabled and not skip_interrupt_final_elo and not swa_final_result.get("elo_cancelled"):
-            swa_model_path = Path(swa_final_result.get("model_path") or (best_model_path.parent / "best_model_il_swa.pt"))
+            swa_model_path = Path(
+                swa_final_result.get("model_path")
+                or model_alias_file(
+                    configured_best_model_path.parent / "best_model_il_swa.pt",
+                    architecture_id,
+                    "il_swa",
+                )
+            )
             swa_elo_model, swa_elo_label = _load_il_model_for_final_elo(
                 swa_model_path,
                 config,

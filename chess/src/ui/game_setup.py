@@ -313,10 +313,13 @@ def load_model_from_checkpoint(checkpoint_path, config, device, verbose=False):
 
         if verbose:
             print(f"Loaded model: {checkpoint_path.name}")
+            model_cfg = getattr(model, "model_config", None) or runtime_config.get("model", {})
+            architecture_id = str(getattr(model, "architecture_id", "se_cnn_v9"))
+            blocks = model_cfg.get("outer_blocks", model_cfg.get("num_residual_blocks"))
+            channels = model_cfg.get("trunk_channels", model_cfg.get("filters"))
             print(
-                f"  Arch: blocks={runtime_config['model'].get('num_residual_blocks')}, "
-                f"filters={runtime_config['model'].get('filters')}, "
-                f"history={runtime_config['model'].get('history_positions')}, "
+                f"  Arch: {architecture_id}, blocks={blocks}, channels={channels}, "
+                f"history={getattr(model, 'history_positions', model_cfg.get('history_positions'))}, "
                 f"input_planes={int(getattr(model, 'input_planes', 0))}"
             )
 
@@ -363,8 +366,8 @@ def load_model_from_checkpoint(checkpoint_path, config, device, verbose=False):
 def _discover_models(base_dir, config):
     models_dir = base_dir / config["paths"]["models_dir"]
     all_models = list(models_dir.glob("*.pt"))
-    all_models.extend(models_dir.glob("IL/*.pt"))
-    all_models.extend(models_dir.glob("RL/*.pt"))
+    all_models.extend((models_dir / "IL").rglob("*.pt"))
+    all_models.extend((models_dir / "RL").rglob("*.pt"))
     all_models.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     return models_dir, all_models
 
@@ -392,7 +395,16 @@ def _group_models(all_models):
     return grouped
 
 
-def _default_model(grouped):
+def _default_model(grouped, architecture_id=None, metadata_cache=None):
+    if architecture_id:
+        metadata_cache = metadata_cache or {}
+        for key in ("best", "il", "rl", "other"):
+            for model_path in grouped[key]:
+                metadata = metadata_cache.get(model_path) or {}
+                if metadata.get("architecture_id") == architecture_id:
+                    return model_path
+        # Do not default a newly selected architecture to a different model.
+        return None
     for key in ("best", "il", "rl", "other"):
         if grouped[key]:
             return grouped[key][0]
@@ -1938,7 +1950,11 @@ def select_models(
         ("Ultra", 400),
     ]
 
-    default_model = _default_model(grouped)
+    default_model = _default_model(
+        grouped,
+        architecture_id=str((config or {}).get("model", {}).get("architecture_id", "se_cnn_v9")),
+        metadata_cache=metadata_cache,
+    )
     selected_models = {
         "white": _resolve_saved_model_path(saved_preferences.get("model_white"), models_dir, all_models) or default_model,
         "black": _resolve_saved_model_path(saved_preferences.get("model_black"), models_dir, all_models) or default_model,

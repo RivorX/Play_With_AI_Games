@@ -24,13 +24,29 @@ from src.inference.shared_memory import (
     shared_inference_bytes,
 )
 from src.models.data.se_cnn_v9.helpers import MAX_LEGAL_MOVES
+from src.models.contracts import model_spec_from_config
+from src.models.registry import config_for_model_spec, resolve_model_spec
 
 
-def snapshot_model_state_cpu(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    return {
+def snapshot_model_state_cpu(model: torch.nn.Module) -> dict[str, Any]:
+    state_dict = {
         key: value.detach().cpu()
         for key, value in model.state_dict().items()
     }
+    model_spec = getattr(model, "model_spec", None)
+    if not isinstance(model_spec, dict):
+        model_spec = getattr(getattr(model, "module", None), "model_spec", None)
+    if isinstance(model_spec, dict):
+        # Preserve the producer's contract when the session's runtime profile
+        # belongs to another architecture (for example V9 evaluated while V10
+        # is the active project profile).
+        return {
+            "model_state_dict": state_dict,
+            "model_spec": copy.deepcopy(model_spec),
+        }
+    # Compatibility for legacy modules without attached checkpoint metadata:
+    # CentralInferenceSession will resolve these using its configured profile.
+    return state_dict
 
 
 class CentralInferenceSession:
@@ -48,6 +64,7 @@ class CentralInferenceSession:
         option_prefix: str = "eval_elo",
         model_label: str = "learner",
         rank_base: int = 730000,
+        model_specs: dict[str, dict[str, Any]] | None = None,
     ):
         self.config = config
         self.device = device
@@ -67,12 +84,52 @@ class CentralInferenceSession:
             self.model_states = {}
         if not self.model_states:
             raise ValueError("CentralInferenceSession requires model_state or model_states.")
+        supplied_specs = {
+            str(label): copy.deepcopy(spec)
+            for label, spec in dict(model_specs or {}).items()
+        }
+        self.model_specs: dict[str, dict[str, Any]] = {}
+        for label, state in self.model_states.items():
+            explicit_spec = supplied_specs.get(label)
+            if explicit_spec is not None:
+                spec = copy.deepcopy(explicit_spec)
+                # Run the common registry checks before allocating IPC buffers
+                # or starting a server process.
+                config_for_model_spec(self.config, spec)
+            elif self._is_bare_state_dict(state):
+                # In-memory snapshots produced by existing one-model callers
+                # omit checkpoint metadata. Their runtime profile is the
+                # authoritative source; callers mixing bare states can pass
+                # `model_specs` explicitly.
+                spec = model_spec_from_config(self.config)
+            else:
+                spec = resolve_model_spec(self.config, state)
+            self.model_specs[label] = spec
         self.rank_base = int(rank_base)
 
         self._session = None
         self._rank_lock = threading.Lock()
         self._thread_ranks: dict[int, int] = {}
         self._next_rank = 0
+
+    @staticmethod
+    def _is_bare_state_dict(state) -> bool:
+        return bool(
+            isinstance(state, dict)
+            and state
+            and "model_spec" not in state
+            and "model_architecture" not in state
+            and "model_state_dict" not in state
+            and "state_dict" not in state
+            and all(torch.is_tensor(value) for value in state.values())
+        )
+
+    def config_for_label(self, label: str) -> dict:
+        """Return runtime config with the selected model's input/output contract."""
+        label = str(label)
+        if label not in self.model_specs:
+            raise KeyError(f"Central inference model label is not loaded: {label}")
+        return config_for_model_spec(self.config, self.model_specs[label])
 
     def _key(self, suffix: str) -> str:
         return f"{self.option_prefix}_{suffix}" if self.option_prefix else suffix
@@ -165,12 +222,12 @@ class CentralInferenceSession:
 
         server_count = self.resolve_server_count()
         mp_ctx = mp.get_context("spawn")
-        device_id = 0
+        device_id = "cpu"
         if self.device.type == "cuda":
             try:
                 device_id = int(self.device.index if self.device.index is not None else torch.cuda.current_device())
             except Exception:
-                device_id = 0
+                device_id = int(self.device.index or 0)
 
         server_config = self._server_config()
         request_queues = []
@@ -188,8 +245,9 @@ class CentralInferenceSession:
             1,
             int(self._option("central_inference_shared_memory_slots_per_worker", 1) or 1),
         )
-        input_planes = 16 * (
-            1 + int(self.config.get("model", {}).get("history_positions", 0) or 0)
+        input_planes = max(
+            int(spec["input_spec"]["input_planes"])
+            for spec in self.model_specs.values()
         )
         shared_buffers_by_rank = {
             int(rank): create_shared_inference_buffer(
@@ -239,7 +297,11 @@ class CentralInferenceSession:
 
         task_id = f"central_load_{os.getpid()}_{int(time.time() * 1000)}"
         model_payload = [
-            {"label": label, "state": state}
+            {
+                "label": label,
+                "state": state,
+                "model_spec": self.model_specs[label],
+            }
             for label, state in self.model_states.items()
         ]
         for request_queue in request_queues:
@@ -255,18 +317,47 @@ class CentralInferenceSession:
         timeout_s = float(self._option("central_inference_load_timeout_s", 180.0) or 180.0)
         deadline = time.time() + max(5.0, timeout_s)
         load_messages = []
-        for control_queue in control_queues:
-            while True:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    raise TimeoutError("Central inference model load timed out.")
-                try:
-                    message = control_queue.get(timeout=min(1.0, remaining))
-                except queue.Empty:
-                    continue
-                if message and message.get("type") == "models_loaded" and message.get("task_id") == task_id:
-                    load_messages.append(dict(message))
-                    break
+        try:
+            for control_queue in control_queues:
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise TimeoutError("Central inference model load timed out.")
+                    try:
+                        message = control_queue.get(timeout=min(1.0, remaining))
+                    except queue.Empty:
+                        continue
+                    if (
+                        message
+                        and message.get("type") == "models_load_failed"
+                        and message.get("task_id") == task_id
+                    ):
+                        raise RuntimeError(
+                            "Central inference rejected a per-label model contract: "
+                            f"server={message.get('server_rank')}, "
+                            f"{message.get('error', 'unspecified model contract error')}"
+                        )
+                    if message and message.get("type") == "models_loaded" and message.get("task_id") == task_id:
+                        load_messages.append(dict(message))
+                        break
+        except Exception:
+            for request_queue in request_queues:
+                with contextlib.suppress(Exception):
+                    request_queue.put({"cmd": "stop"})
+            for process in processes:
+                with contextlib.suppress(Exception):
+                    process.join(timeout=0.5)
+                if getattr(process, "is_alive", lambda: False)():
+                    with contextlib.suppress(Exception):
+                        process.terminate()
+                    with contextlib.suppress(Exception):
+                        process.join(timeout=1.0)
+            for queue_obj in request_queues + control_queues + list(response_queues_by_rank.values()):
+                with contextlib.suppress(Exception):
+                    queue_obj.cancel_join_thread()
+                with contextlib.suppress(Exception):
+                    queue_obj.close()
+            raise
 
         self._thread_ranks = {}
         self._next_rank = 0
@@ -280,6 +371,12 @@ class CentralInferenceSession:
             "server_config": server_config,
             "load_messages": load_messages,
             "shared_buffers_by_rank": shared_buffers_by_rank,
+            # Label-specific proxies for one rank share the same response
+            # queue and (when enabled) shared-memory slot. Keep all their
+            # request/response transactions paired under one lock.
+            "shared_call_locks_by_rank": {
+                rank: threading.Lock() for rank in range(self.workers)
+            },
         }
         return self
 
@@ -349,7 +446,7 @@ class CentralInferenceSession:
         if rank < 0:
             return None
         label = str(model_label or self.model_label)
-        if label not in self.model_states:
+        if label not in self.model_specs:
             raise KeyError(f"Central inference model label is not loaded: {label}")
         server_idx = int((self._session.get("rank_to_server", {}) or {}).get(rank, 0))
         return RemoteInferenceClient(
@@ -362,6 +459,8 @@ class CentralInferenceSession:
             debug_enabled=bool(self._option("central_inference_debug", False)),
             transport_dtype=str(self._option("central_inference_transport_dtype", "float16") or "float16"),
             shared_buffer=(self._session.get("shared_buffers_by_rank", {}) or {}).get(rank),
+            shared_call_lock=(self._session.get("shared_call_locks_by_rank", {}) or {}).get(rank),
+            model_spec=self.model_specs[label],
         )
 
     def describe(self) -> str:

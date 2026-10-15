@@ -157,15 +157,25 @@ def _build_model_rows(
     device=None,
     selected_entry=None,
 ):
-    model_cfg = config.get("model", {})
+    model_cfg = getattr(model, "model_config", None) or config.get("model", {})
+    architecture_id = str(
+        getattr(model, "architecture_id", model_cfg.get("architecture_id", "se_cnn_v9"))
+    )
     history = _safe_int(getattr(model, "history_positions", model_cfg.get("history_positions", 0)))
     input_planes = _safe_int(getattr(model, "input_planes", None))
     if input_planes is None and history is not None:
-        input_planes = 16 * (1 + history)
+        try:
+            from src.models.data.registry import get_input_encoder
+
+            encoder_id = model_cfg.get("input_encoder_id", "planes_history_v1")
+            input_planes = int(get_input_encoder(encoder_id).input_planes(history))
+        except (ImportError, ValueError, TypeError):
+            input_planes = None
 
     version = model_cfg.get("version", getattr(model, "model_version", "n/a"))
-    filters = _safe_int(model_cfg.get("filters"))
-    blocks = _safe_int(model_cfg.get("num_residual_blocks"))
+    filters = _safe_int(model_cfg.get("trunk_channels", model_cfg.get("filters")))
+    blocks = _safe_int(model_cfg.get("outer_blocks", model_cfg.get("num_residual_blocks")))
+    bottleneck = _safe_int(model_cfg.get("bottleneck_channels"))
     dropout = _safe_float(model_cfg.get("dropout"))
     drop_path_rate = _safe_float(model_cfg.get("drop_path_rate"))
     policy_channels = _safe_int(model_cfg.get("policy_head_channels", model_cfg.get("policy_head_conv_filters")))
@@ -181,7 +191,7 @@ def _build_model_rows(
     layer_scale_init = model_cfg.get("layer_scale_init")
 
 
-    rows = [("Version", version)]
+    rows = [("Version", version), ("Model", architecture_id)]
     if source_label:
         rows.append(("Source", source_label))
     if startup_mode:
@@ -194,7 +204,12 @@ def _build_model_rows(
         rows.append(("Device", str(device)))
 
     arch_parts = []
-    if blocks is not None and filters is not None:
+    if blocks is not None and filters is not None and bottleneck is not None:
+        arch_parts.append(f"{blocks} nested blocks x {filters}/{bottleneck}")
+        inner_units = _safe_int(model_cfg.get("inner_residual_units"))
+        if inner_units is not None:
+            arch_parts.append(f"{inner_units} inner units/block")
+    elif blocks is not None and filters is not None:
         arch_parts.append(f"{blocks} blocks x {filters} filters")
     elif blocks is not None:
         arch_parts.append(f"{blocks} blocks")
@@ -229,6 +244,9 @@ def _build_model_rows(
             feature_parts.append("SE")
     if use_layer_scale:
         feature_parts.append("LayerScale")
+    global_pool_blocks = model_cfg.get("global_pool_blocks")
+    if global_pool_blocks:
+        feature_parts.append(f"global pool={','.join(str(i) for i in global_pool_blocks)}")
     if dropout is not None and dropout > 0:
         feature_parts.append(f"dropout={dropout:.3f}")
     if drop_path_rate is not None and drop_path_rate > 0:
@@ -277,6 +295,48 @@ def _build_model_rows(
 
 
 def _build_parameter_rows(model, num_blocks):
+    architecture_id = str(getattr(model, "architecture_id", "se_cnn_v9"))
+    total_params = _count_params(model)
+    trainable_params = _count_params(model, trainable_only=True)
+    frozen_params = max(0, total_params - trainable_params)
+
+    if architecture_id == "nested_cnn_v10":
+        named_parameters = list(model.named_parameters())
+        groups = (
+            ("Stem", ("stem_conv.", "stem_norm.")),
+            ("Nested trunk + final norm", ("residual_tower.", "final_norm.")),
+            ("Policy head + global context", ("policy_conv.", "policy_norm.", "policy_global_bias.", "policy_logits_conv.")),
+            ("Value head", ("value_conv.", "value_norm.", "value_norm_flat.", "value_fc1.", "value_dropout.", "value_fc2.")),
+            ("Search-Q head", ("search_q_fc.",)),
+            ("Moves-left head", ("moves_left_fc1.", "moves_left_norm.", "moves_left_fc2.")),
+        )
+        core_parts = [
+            (
+                label,
+                sum(
+                    parameter.numel()
+                    for name, parameter in named_parameters
+                    if name.startswith(prefixes)
+                ),
+            )
+            for label, prefixes in groups
+        ]
+        counted = sum(params for _, params in core_parts)
+        if counted < total_params:
+            core_parts.append(("Other", total_params - counted))
+        rows = []
+        for part, params in core_parts:
+            if params <= 0:
+                continue
+            share = (params / total_params * 100.0) if total_params > 0 else 0.0
+            rows.append((part, f"{params:,}", f"{share:6.2f}%"))
+        rows.append(("Trainable", _fmt_int(trainable_params), "100.00%" if trainable_params == total_params else ""))
+        if frozen_params > 0:
+            share = (frozen_params / total_params * 100.0) if total_params > 0 else 0.0
+            rows.append(("Frozen", _fmt_int(frozen_params), f"{share:6.2f}%"))
+        rows.append(("Total", _fmt_int(total_params), "100.00%"))
+        return rows
+
     stem_params = _count_params(getattr(model, "conv_block", None))
     tower_params = _count_params(getattr(model, "residual_tower", None))
     final_bn_params = _count_params(getattr(model, "final_bn", None))
@@ -302,9 +362,6 @@ def _build_parameter_rows(model, num_blocks):
         for name in ("moves_left_fc1", "moves_left_ln", "moves_left_fc2")
     )
 
-    total_params = _count_params(model)
-    trainable_params = _count_params(model, trainable_only=True)
-    frozen_params = max(0, total_params - trainable_params)
     per_block = tower_params // max(1, int(num_blocks or 1))
 
     core_parts = [
@@ -357,7 +414,10 @@ def print_active_model_summary(
     _print_kv_table(title, model_rows)
 
     if include_parameters:
-        num_blocks = _safe_int(config.get("model", {}).get("num_residual_blocks"))
+        model_cfg = getattr(model, "model_config", None) or config.get("model", {})
+        num_blocks = _safe_int(
+            model_cfg.get("outer_blocks", model_cfg.get("num_residual_blocks"))
+        )
         param_rows = _build_parameter_rows(model, num_blocks)
         _print_param_table(f"{title} - Parameters", param_rows)
 

@@ -413,6 +413,8 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
         "swa": False,
         "optimizer": False,
         "version": None,
+        "rl_run_version": None,
+        "alias_kind": None,
         "architecture_id": None,
         "input_encoder_id": None,
         "policy_codec_id": None,
@@ -495,6 +497,7 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
         input_spec = model_spec.get("input_spec") or {}
         policy_spec = model_spec.get("policy_spec") or {}
         entry["input_encoder_id"] = input_spec.get("encoder_id")
+        entry["input_planes"] = input_spec.get("input_planes")
         entry["policy_codec_id"] = policy_spec.get("codec_id")
         model_kwargs = model_spec.get("model_kwargs") or {}
     else:
@@ -503,6 +506,22 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
             "architecture_id", "se_cnn_v9"
         )
     entry["version"] = checkpoint.get("version", model_kwargs.get("version"))
+    entry["rl_run_version"] = checkpoint.get("rl_run_version")
+    checkpoint_name = checkpoint_path.stem.lower()
+    if checkpoint_name == "best_model_v10_il":
+        entry["alias_kind"] = "v10 IL best"
+    elif checkpoint_name == "best_model_v10_il_swa":
+        entry["alias_kind"] = "v10 IL SWA"
+    elif checkpoint_name.startswith("best_model_v10_rl"):
+        entry["alias_kind"] = "v10 RL best"
+        if entry["rl_run_version"] is None:
+            entry["rl_run_version"] = checkpoint_name.removeprefix("best_model_v10_")
+    elif checkpoint_name == "best_model_il_nested_cnn_v10":
+        entry["alias_kind"] = "legacy v10 IL best"
+    elif checkpoint_name == "best_model_il_swa_nested_cnn_v10":
+        entry["alias_kind"] = "legacy v10 IL SWA"
+    elif checkpoint_name == "best_model_rl_nested_cnn_v10":
+        entry["alias_kind"] = "legacy v10 RL best"
     entry["startup_mode"] = checkpoint.get("startup_mode")
     
     return entry

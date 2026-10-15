@@ -4,6 +4,7 @@ import pickle
 import random
 import threading
 import time
+import copy
 
 import numpy as np
 import torch
@@ -23,6 +24,17 @@ from src.mcts.search import (
     _resolve_replay_max_policy_targets,
 )
 from src.selfplay.engine import SelfPlayEngine
+
+
+def _worker_payload_model_spec(config, state=None, explicit_spec=None):
+    """Resolve the architecture contract for one self-play model label."""
+    from src.models.registry import model_spec_from_config, resolve_model_spec
+
+    if isinstance(explicit_spec, dict):
+        return copy.deepcopy(explicit_spec)
+    if isinstance(state, dict):
+        return resolve_model_spec(config, state)
+    return model_spec_from_config(config)
 
 
 def _seed_selfplay_worker(rank, task_seed):
@@ -362,6 +374,7 @@ def persistent_selfplay_worker(
             _central_inference_option(config, 'transport_dtype', 'float16') or 'float16'
         )
         shared_inference_call_lock = threading.Lock()
+        learner_model_spec = _worker_payload_model_spec(config)
         model = None if central_inference_enabled else _build_selfplay_worker_model(config, device)
         inference_model = (
             RemoteInferenceClient(
@@ -375,6 +388,7 @@ def persistent_selfplay_worker(
                 transport_dtype=central_transport_dtype,
                 shared_buffer=inference_shared_buffer,
                 shared_call_lock=shared_inference_call_lock,
+                model_spec=learner_model_spec,
             )
             if central_inference_enabled
             else _maybe_compile_selfplay_model(
@@ -446,6 +460,11 @@ def persistent_selfplay_worker(
                     entry_state = (entry or {}).get('state')
                     if entry_label == 'current':
                         continue
+                    entry_model_spec = _worker_payload_model_spec(
+                        config,
+                        entry_state,
+                        (entry or {}).get('model_spec'),
+                    )
                     if central_inference_enabled:
                         pooled_model = RemoteInferenceClient(
                             entry_label,
@@ -458,11 +477,16 @@ def persistent_selfplay_worker(
                             transport_dtype=central_transport_dtype,
                             shared_buffer=inference_shared_buffer,
                             shared_call_lock=shared_inference_call_lock,
+                            model_spec=entry_model_spec,
                         )
                     else:
                         if entry_state is None:
                             continue
-                        pooled_model = _build_selfplay_worker_model(config, device)
+                        pooled_model = _build_selfplay_worker_model(
+                            config,
+                            device,
+                            model_spec=entry_model_spec,
+                        )
                         _load_worker_model_state(pooled_model, entry_state, rank)
                         pooled_model.eval()
                         pooled_model = _maybe_compile_selfplay_model(
@@ -594,7 +618,16 @@ def run_selfplay_worker(
                 entry_state = (entry or {}).get('state')
                 if entry_state is None or entry_label == 'current':
                     continue
-                pooled_model = _build_selfplay_worker_model(config, device)
+                entry_model_spec = _worker_payload_model_spec(
+                    config,
+                    entry_state,
+                    (entry or {}).get('model_spec'),
+                )
+                pooled_model = _build_selfplay_worker_model(
+                    config,
+                    device,
+                    model_spec=entry_model_spec,
+                )
                 _load_worker_model_state(pooled_model, entry_state, rank)
                 pooled_model.eval()
                 pooled_model = _maybe_compile_selfplay_model(

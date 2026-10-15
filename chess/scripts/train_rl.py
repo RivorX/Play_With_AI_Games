@@ -95,6 +95,7 @@ from src.mcts.q_delta import (
 )
 
 from src.model import (
+    MODEL_REGISTRY,
     create_model,
     load_checkpoint_file,
     normalize_state_dict_keys,
@@ -169,6 +170,9 @@ from src.common.runtime import (
     build_rl_experiment_name,
     build_model_file_tag,
     build_model_architecture_metadata,
+    architecture_scoped_directory,
+    legacy_architecture_scoped_file,
+    model_alias_file,
     cleanup_interrupted_log_csv,
 )
 from src.common.syzygy import ensure_syzygy_tables, describe_syzygy_status
@@ -705,6 +709,31 @@ def _rl_run_artifact_metadata(logger, base_dir):
     if manifest_path is not None:
         result['run_manifest'] = _portable(manifest_path)
     return result
+
+
+def _saved_rl_run_version(checkpoint_path, base_dir):
+    """Read the RL run label from checkpoint metadata or its saved manifest."""
+    checkpoint = load_checkpoint_file(str(checkpoint_path), torch.device("cpu"))
+    if not isinstance(checkpoint, dict):
+        return None
+    saved_version = checkpoint.get("rl_run_version")
+    if saved_version:
+        return str(saved_version)
+
+    artifacts = checkpoint.get("rl_run_artifacts") or {}
+    manifest_ref = artifacts.get("run_manifest") if isinstance(artifacts, dict) else None
+    if not manifest_ref:
+        return None
+    manifest_path = Path(str(manifest_ref))
+    if not manifest_path.is_absolute():
+        manifest_path = Path(base_dir) / manifest_path
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    saved_config = manifest.get("effective_config") or {}
+    saved_version = (saved_config.get("reinforcement_learning") or {}).get("version")
+    return str(saved_version) if saved_version else None
 
 
 def _write_rl_run_manifest(logger, config, checkpoint_path, base_dir):
@@ -1396,7 +1425,7 @@ def _temporary_sigint_cancel_handler(cancel_event, message=None, hard_exit=False
             signal.signal(sigint, previous_handler)
 
 
-def _snapshot_model_state_cpu(model, share_memory=False, dtype=None):
+def _snapshot_model_state_cpu(model, share_memory=False, dtype=None, config=None):
     normalized_state = normalize_state_dict_keys(model.state_dict())
     snapshot = {}
     for key, tensor in normalized_state.items():
@@ -1407,12 +1436,41 @@ def _snapshot_model_state_cpu(model, share_memory=False, dtype=None):
             cpu_tensor = cpu_tensor.contiguous()
             cpu_tensor.share_memory_()
         snapshot[key] = cpu_tensor
-    return snapshot
+
+    unwrapped = getattr(model, "_orig_mod", getattr(model, "module", model))
+    model_spec = getattr(unwrapped, "model_spec", None)
+    if not isinstance(model_spec, dict):
+        # Models constructed before model_spec was introduced are V9-only.
+        # Never infer a new architecture from tensor names or the active profile.
+        if str((config or {}).get("model", {}).get("architecture_id", "se_cnn_v9")) != "se_cnn_v9":
+            raise RuntimeError(
+                "Cannot snapshot a model without model_spec under a non-V9 profile; "
+                "V10 snapshots must preserve their explicit architecture and input contract."
+            )
+        from src.models.contracts import model_spec_from_config
+
+        model_spec = model_spec_from_config(config or {"model": {"architecture_id": "se_cnn_v9"}})
+    return {
+        "model_state_dict": snapshot,
+        "model_spec": copy.deepcopy(model_spec),
+    }
 
 
 def _load_model_snapshot(model, state):
     if not isinstance(state, dict):
         return False
+    if isinstance(state.get("model_state_dict"), dict):
+        snapshot_spec = state.get("model_spec")
+        model_spec = getattr(model, "model_spec", None)
+        if isinstance(snapshot_spec, dict) and isinstance(model_spec, dict) and snapshot_spec != model_spec:
+            raise ValueError(
+                "Runtime model snapshot architecture/input contract does not match "
+                "the destination model."
+            )
+        state = state["model_state_dict"]
+    elif isinstance(state.get("state_dict"), dict):
+        # Compatibility with older runtime snapshot wrappers.
+        state = state["state_dict"]
     normalized = normalize_state_dict_keys(state, target_keys=set(model.state_dict().keys()))
     model.load_state_dict(normalized, strict=True)
     return True
@@ -3905,7 +3963,9 @@ def play_games_parallel_mcts(
 
             task_id = f"{os.getpid()}_{time.time_ns()}"
             model_state_path = temp_dir / f"selfplay_model_{task_id}.pt"
-            model_state_cpu = _snapshot_model_state_cpu(model, share_memory=True)
+            model_state_cpu = _snapshot_model_state_cpu(
+                model, share_memory=True, config=config
+            )
 
             if not use_queue_transport:
                 torch.save(model_state_cpu, model_state_path)
@@ -5304,12 +5364,18 @@ def _parse_cli_args(argv=None):
         default=None,
         help="YAML override merged over the standard project configuration.",
     )
+    parser.add_argument(
+        "--architecture",
+        choices=tuple(sorted(MODEL_REGISTRY)),
+        default=None,
+        help="Select a versioned model profile for a new RL run.",
+    )
     initialization = parser.add_mutually_exclusive_group()
     initialization.add_argument(
         "--fresh-canonical-il",
         action="store_true",
         help=(
-            "Run non-interactively from canonical best_model_il.pt with a new "
+            "Run non-interactively from this architecture's best IL alias with a new "
             "optimizer, schedule and empty replay. Requires fresh_il_start=true."
         ),
     )
@@ -5371,7 +5437,16 @@ def main(argv=None):
     )
 
     print(f"Chess RL trainer | config: {compact_path(config_path, 3)}")
-    config = load_project_config(config_path=config_path)
+    config = load_project_config(
+        architecture_id=args.architecture,
+        config_path=config_path,
+    )
+    if args.architecture and config.get('model', {}).get('architecture_id') != args.architecture:
+        raise ValueError(
+            f"Config selects architecture {config.get('model', {}).get('architecture_id')!r}, "
+            f"but --architecture requested {args.architecture!r}. Remove the conflicting "
+            "model.architecture_id override or select its matching profile."
+        )
     initial_rl_cfg = config.get('reinforcement_learning', {}) or {}
     pause_after_iteration = _validate_pause_after_iteration(
         args.pause_after_iteration,
@@ -5511,10 +5586,47 @@ def main(argv=None):
         )
 
     base_dir = script_dir.parent
+    architecture_id = str(config.get('model', {}).get('architecture_id', 'se_cnn_v9'))
     models_dir = base_dir / config['paths']['models_dir']
     logs_dir = base_dir / config['paths']['logs_dir']
-    rl_dir = base_dir / config['paths']['rl_checkpoints_dir']
-    best_model_rl_path = base_dir / config['paths']['best_model_rl']
+    rl_dir = architecture_scoped_directory(
+        base_dir / config['paths']['rl_checkpoints_dir'], architecture_id
+    )
+    configured_best_model_rl_path = base_dir / config['paths']['best_model_rl']
+    configured_best_model_il_path = base_dir / config['paths']['best_model_il']
+    rl_version = config.get('reinforcement_learning', {}).get('version', 'rl')
+    best_model_rl_path = model_alias_file(
+        configured_best_model_rl_path,
+        architecture_id,
+        "rl",
+        rl_version=rl_version,
+    )
+    legacy_best_model_rl_path = legacy_architecture_scoped_file(
+        configured_best_model_rl_path, architecture_id
+    )
+    best_model_il_path = model_alias_file(
+        configured_best_model_il_path, architecture_id, "il"
+    )
+    legacy_best_model_il_path = legacy_architecture_scoped_file(
+        configured_best_model_il_path, architecture_id
+    )
+    best_model_il_swa_path = model_alias_file(
+        configured_best_model_il_path.parent / "best_model_il_swa.pt",
+        architecture_id,
+        "il_swa",
+    )
+    legacy_best_model_il_swa_path = legacy_architecture_scoped_file(
+        configured_best_model_il_path.parent / "best_model_il_swa.pt",
+        architecture_id,
+    )
+    if architecture_id == "nested_cnn_v10" and args.resume_checkpoint is None:
+        if not best_model_il_path.is_file() and not legacy_best_model_il_path.is_file():
+            raise FileNotFoundError(
+                "A fresh nested_cnn_v10 RL run requires its own IL checkpoint at "
+                f"{best_model_il_path} (or legacy alias {legacy_best_model_il_path}). "
+                "Train V10 IL first; V9 or random weights "
+                "are not used as an implicit substitute."
+            )
 
     if args.fresh_canonical_il:
         collisions = [
@@ -5556,18 +5668,30 @@ def main(argv=None):
             print("Warning: bfloat16 not supported")
             use_bfloat16 = False
 
-    best_model_il_path = base_dir / config['paths']['best_model_il']
     fresh_il_start_recommended = bool(
         config['reinforcement_learning'].get('fresh_il_start', False)
     )
+    best_model_il_source_path = next(
+        (
+            path for path in (best_model_il_path, legacy_best_model_il_path)
+            if path.is_file()
+        ),
+        best_model_il_path,
+    )
+    best_model_il_swa_source_path = next(
+        (
+            path for path in (best_model_il_swa_path, legacy_best_model_il_swa_path)
+            if path.is_file()
+        ),
+        best_model_il_swa_path,
+    )
     if fresh_il_start_recommended:
-        rl_init_checkpoint_path = best_model_il_path
-        rl_init_checkpoint_reason = "RL53 recommended fresh start from canonical best_model_il.pt"
+        rl_init_checkpoint_path = best_model_il_source_path
+        rl_init_checkpoint_reason = f"fresh start from {architecture_id} best IL checkpoint"
     else:
-        best_model_il_swa_path = best_model_il_path.parent / "best_model_il_swa.pt"
         rl_init_checkpoint_path, rl_init_checkpoint_reason = select_best_il_checkpoint(
-            best_model_il_path,
-            best_model_il_swa_path,
+            best_model_il_source_path,
+            best_model_il_swa_source_path,
         )
     print(f"RL IL initialization: {rl_init_checkpoint_path.name} ({rl_init_checkpoint_reason}).")
     version_best_model_path = rl_dir / f"{model_file_tag}_best.pt"
@@ -5597,6 +5721,7 @@ def main(argv=None):
         default_new_checkpoint=rl_init_checkpoint_path,
         prefer_fresh_il=fresh_il_start_recommended,
         initial_plan=forced_startup_plan,
+        fallback_best_paths=(legacy_best_model_rl_path,),
     )
 
     # Build/load once in the parent before Windows spawn starts the persistent
@@ -5646,7 +5771,34 @@ def main(argv=None):
         rl_dir=rl_dir,
         default_new_checkpoint=rl_init_checkpoint_path,
         initial_plan=startup_choice,
+        fallback_best_paths=(legacy_best_model_rl_path,),
     )
+
+    if startup_plan.get("start_mode") == "resume":
+        selected_resume_path = startup_plan.get("selected_checkpoint")
+        saved_rl_version = (
+            _saved_rl_run_version(selected_resume_path, base_dir)
+            if selected_resume_path is not None
+            else None
+        )
+        if architecture_id == "nested_cnn_v10" and not saved_rl_version:
+            raise ValueError(
+                "Cannot identify the RL run version saved with this V10 resume "
+                "checkpoint. Its best alias cannot be safely named; start a new "
+                "run or restore the checkpoint's run manifest."
+            )
+        if saved_rl_version:
+            config.setdefault("reinforcement_learning", {})["version"] = saved_rl_version
+            best_model_rl_path = model_alias_file(
+                configured_best_model_rl_path,
+                architecture_id,
+                "rl",
+                rl_version=saved_rl_version,
+            )
+            print(
+                f"RL resume alias uses saved run version {saved_rl_version}: "
+                f"{best_model_rl_path.name}"
+            )
 
     # Initialize logger after startup selection.
     logger = TrainingLogger(
@@ -8618,6 +8770,7 @@ def main(argv=None):
                         'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                         'value_mae': train_metrics.get('value_mae', 0),
                         'version': model_version,
+                        'rl_run_version': config.get('reinforcement_learning', {}).get('version'),
                         'startup_mode': start_mode,
                         'model_architecture': model_architecture,
                         'rl_run_artifacts': _rl_run_artifact_metadata(logger, base_dir),
@@ -8792,6 +8945,7 @@ def main(argv=None):
                 'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                 'value_mae': train_metrics.get('value_mae', 0),
                 'version': model_version,
+                'rl_run_version': config.get('reinforcement_learning', {}).get('version'),
                 'startup_mode': start_mode,
                 'model_architecture': model_architecture,
                 'rl_run_artifacts': _rl_run_artifact_metadata(logger, base_dir),
@@ -8809,6 +8963,7 @@ def main(argv=None):
             best_runtime_state = _snapshot_model_state_cpu(
                 best_model,
                 dtype=runtime_snapshot_dtype,
+                config=config,
             )
             should_save_replay_sidecar = _should_save_replay_sidecar_for_iteration(
                 iteration + 1,

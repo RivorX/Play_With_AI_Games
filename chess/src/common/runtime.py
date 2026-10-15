@@ -33,6 +33,58 @@ def build_model_file_tag(config):
     return sanitize_filename_tag(raw, default="model")
 
 
+def architecture_scoped_file(path, architecture_id):
+    """Keep legacy V9 aliases unchanged and isolate newer architectures."""
+    path = Path(path)
+    architecture_id = str(architecture_id or "se_cnn_v9").strip()
+    if not architecture_id or architecture_id == "se_cnn_v9":
+        return path
+    suffix = path.suffix
+    scoped_name = f"{path.stem}_{sanitize_filename_tag(architecture_id)}{suffix}"
+    return path.with_name(scoped_name)
+
+
+def model_alias_file(path, architecture_id, alias_kind, rl_version=None):
+    """Return the stable root-level alias for a model family.
+
+    V9 keeps its historical configured filename. V10 aliases use a short
+    family name independent of the profile's minor version (for example,
+    ``v10.0`` still maps to ``best_model_v10_il.pt``).
+    """
+    path = Path(path)
+    architecture_id = str(architecture_id or "se_cnn_v9").strip()
+    if architecture_id != "nested_cnn_v10":
+        return architecture_scoped_file(path, architecture_id)
+
+    kind = str(alias_kind or "").strip().lower()
+    if kind == "il":
+        name = "best_model_v10_il.pt"
+    elif kind in {"il_swa", "swa"}:
+        name = "best_model_v10_il_swa.pt"
+    elif kind == "rl":
+        run_tag = sanitize_filename_tag(rl_version or "rl", default="rl").lower()
+        if not run_tag.startswith("rl"):
+            run_tag = f"rl{run_tag.lstrip('_-')}"
+        name = f"best_model_v10_{run_tag}.pt"
+    else:
+        raise ValueError(f"Unsupported V10 model alias kind: {alias_kind!r}")
+    return path.with_name(name)
+
+
+def legacy_architecture_scoped_file(path, architecture_id):
+    """Return the pre-stable alias used by earlier non-V9 checkpoints."""
+    return architecture_scoped_file(path, architecture_id)
+
+
+def architecture_scoped_directory(path, architecture_id):
+    """Give non-V9 runs a private checkpoint directory without moving V9 data."""
+    path = Path(path)
+    architecture_id = str(architecture_id or "se_cnn_v9").strip()
+    if not architecture_id or architecture_id == "se_cnn_v9":
+        return path
+    return path / sanitize_filename_tag(architecture_id)
+
+
 def build_rl_experiment_name(config):
     """Build the compact user-facing RL run name."""
     model_version = sanitize_filename_tag(
@@ -75,6 +127,12 @@ def build_model_architecture_metadata(config):
         'value_head_filters',
         'value_hidden_dim',
         'moves_left_hidden_dim',
+        'input_planes',
+        'trunk_channels',
+        'bottleneck_channels',
+        'outer_blocks',
+        'inner_residual_units',
+        'global_pool_blocks',
         'input_encoder_id',
         'policy_codec_id',
         'value_head_id',

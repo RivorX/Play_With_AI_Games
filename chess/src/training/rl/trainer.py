@@ -6,6 +6,7 @@ import os
 import sys
 import contextlib
 import concurrent.futures
+import copy
 import math
 import threading
 import time
@@ -25,11 +26,12 @@ from src.mcts.search import (
     MultiGameBatchMCTS,
     _EVAL_OPENING_LINES,
     _board_position_key,
+    _position_counts_from_board,
     _record_position_count,
 )
 from src.inference.central import RemoteInferenceClient, central_inference_server
 from src.game import backend as chess
-from src.model import create_model
+from src.model import config_for_model_spec, create_model, model_spec_from_config
 from src.models.data.se_cnn_v9.helpers import (
     ACTION_SIZE,
     MAX_LEGAL_MOVES,
@@ -38,6 +40,7 @@ from src.models.data.se_cnn_v9.helpers import (
     build_hflip_inverse_index_map,
     move_to_index,
 )
+from src.models.data.registry import get_input_encoder
 from src.mcts.q_delta import (
     RELIABLE_POLICY_TARGET_GAP_MIN,
     RELIABLE_POLICY_TARGET_TOP1_MIN,
@@ -461,19 +464,37 @@ def _get_eval_opening_prefix(config, game_idx, enabled_override=None):
     return tuple(line[: min(len(line), max_plies)])
 
 
-def _append_eval_history(board_history, board, config):
-    board_history.append(_encode_eval_history_entry(board))
-    max_history = int(config.get("model", {}).get("history_positions", 0) or 0) + 10
+def _append_eval_history(
+    board_history,
+    board,
+    config,
+    repetition_count=None,
+    max_history_positions=None,
+):
+    board_history.append(
+        _encode_eval_history_entry(
+            board,
+            config,
+            repetition_count=repetition_count,
+        )
+    )
+    history_positions = (
+        config.get("model", {}).get("history_positions", 0)
+        if max_history_positions is None
+        else max_history_positions
+    )
+    max_history = int(history_positions or 0) + 10
     if len(board_history) > max_history:
         del board_history[:-max_history]
 
 
 def _apply_opening_prefix_for_batched_eval(
     board,
-    board_history,
+    board_histories,
     opening_prefix,
-    config,
+    history_configs,
     position_counts=None,
+    max_history_positions=None,
 ):
     if not opening_prefix:
         return 0
@@ -489,7 +510,25 @@ def _apply_opening_prefix_for_batched_eval(
         if move is None or move not in chess.legal_moves(board):
             break
 
-        _append_eval_history(board_history, board, config)
+        repetition_count = (
+            max(0, int(position_counts.get(_board_position_key(board), 0)) - 1)
+            if position_counts is not None
+            else None
+        )
+        seen_histories = set()
+        for board_history, history_config in zip(board_histories, history_configs):
+            # Both sides can share the same encoder contract. In that case the
+            # cached tensors are identical, so encode each visited position once.
+            if id(board_history) in seen_histories:
+                continue
+            seen_histories.add(id(board_history))
+            _append_eval_history(
+                board_history,
+                board,
+                history_config,
+                repetition_count=repetition_count,
+                max_history_positions=max_history_positions,
+            )
         chess.apply_move(board, move)
         if position_counts is not None:
             _record_position_count(position_counts, board)
@@ -497,22 +536,56 @@ def _apply_opening_prefix_for_batched_eval(
     return applied
 
 
-def _encode_eval_history_entry(board):
+def _encode_eval_history_entry(board, config=None, repetition_count=None):
+    model_cfg = (config or {}).get('model', {}) or {}
+    encoder = get_input_encoder(
+        str(model_cfg.get('input_encoder_id', 'planes_history_v1'))
+    )
+    if encoder.ENCODER_ID == 'planes_history_v2':
+        return encoder.encode_pair(
+            board,
+            repetition_count=repetition_count,
+        )
     return board_to_tensor_pair(board)
 
 
-def _build_no_mcts_eval_input(board, board_history, config):
-    history_positions = int(config.get("model", {}).get("history_positions", 0) or 0)
-    current_tensor = board_to_tensor(board)
+def _build_no_mcts_eval_input(
+    board,
+    board_history,
+    config,
+    repetition_count=None,
+):
+    model_cfg = config.get('model', {}) or {}
+    history_positions = int(model_cfg.get("history_positions", 0) or 0)
+    encoder = get_input_encoder(
+        str(model_cfg.get('input_encoder_id', 'planes_history_v1'))
+    )
+    if encoder.ENCODER_ID == 'planes_history_v2':
+        current_tensor = encoder.encode(
+            board,
+            repetition_count=repetition_count,
+        )
+    else:
+        current_tensor = board_to_tensor(board)
     if history_positions <= 0:
         return current_tensor
 
     use_black_pov = (board.turn == chess.BLACK)
     history_slice = list(board_history[-history_positions:]) if board_history else []
-    history_tensors = [
-        encoded[1] if use_black_pov else encoded[0]
-        for encoded in history_slice
-    ]
+    history_tensors = []
+    for encoded in history_slice:
+        # Evaluation stores one history cache per model, so these are already
+        # encoded with this model's encoder contract.
+        history_tensors.append(encoded[1] if use_black_pov else encoded[0])
+    if encoder.ENCODER_ID == 'planes_history_v2':
+        from src.models.data.nested_cnn_v10.helpers import stack_encoded_history
+
+        return stack_encoded_history(
+            current_tensor,
+            history_tensors,
+            history_positions,
+            dtype=np.float32,
+        )
     pad_count = max(0, history_positions - len(history_tensors))
     if pad_count:
         empty = np.zeros((16, 8, 8), dtype=np.float32)
@@ -521,10 +594,23 @@ def _build_no_mcts_eval_input(board, board_history, config):
     return np.concatenate(history_tensors, axis=0)
 
 
-def _select_no_mcts_policy_move(model, board, board_history, config, device):
+def _select_no_mcts_policy_move(
+    model,
+    board,
+    board_history,
+    config,
+    device,
+    position_counts=None,
+    position_history_complete=None,
+):
     moves = _select_no_mcts_policy_moves_batched(
         model,
-        [{"board": board, "board_history": board_history}],
+        [{
+            "board": board,
+            "board_history": board_history,
+            "position_counts": position_counts,
+            "position_history_complete": position_history_complete,
+        }],
         config,
         device,
     )
@@ -543,7 +629,31 @@ def _select_no_mcts_policy_moves_batched(model, game_states, config, device):
     max_legal = 0
     for state in states:
         board = state["board"]
-        inputs.append(_build_no_mcts_eval_input(board, state.get("board_history", []), config))
+        position_counts = state.get('position_counts')
+        provenance_known = state.get(
+            'position_history_complete',
+            position_counts is not None
+            or int(board.halfmove_clock) == 0
+            or bool(chess.move_history(board)),
+        )
+        if provenance_known:
+            known_counts = (
+                position_counts
+                if isinstance(position_counts, dict)
+                else _position_counts_from_board(board)
+            )
+            repetition_count = max(
+                0,
+                int(known_counts.get(_board_position_key(board), 0)) - 1,
+            )
+        else:
+            repetition_count = None
+        inputs.append(_build_no_mcts_eval_input(
+            board,
+            state.get("board_history", []),
+            config,
+            repetition_count=repetition_count,
+        ))
         legal_moves = tuple(chess.legal_moves(board))
         legal_indices = [move_to_index(move, board) for move in legal_moves]
         legal_moves_by_row.append(legal_moves)
@@ -605,7 +715,13 @@ def _select_no_mcts_policy_moves_batched(model, game_states, config, device):
     return selected
 
 
-def _apply_opening_prefix_for_no_mcts_eval(board, board_history, opening_prefix):
+def _apply_opening_prefix_for_no_mcts_eval(
+    board,
+    board_history,
+    opening_prefix,
+    config=None,
+    position_counts=None,
+):
     if not opening_prefix:
         return 0
 
@@ -619,8 +735,19 @@ def _apply_opening_prefix_for_no_mcts_eval(board, board_history, opening_prefix)
             break
         if move is None or move not in chess.legal_moves(board):
             break
-        board_history.append(_encode_eval_history_entry(board))
+        repetition_count = (
+            max(0, int(position_counts.get(_board_position_key(board), 0)) - 1)
+            if position_counts is not None
+            else None
+        )
+        board_history.append(_encode_eval_history_entry(
+            board,
+            config,
+            repetition_count=repetition_count,
+        ))
         chess.apply_move(board, move)
+        if position_counts is not None:
+            _record_position_count(position_counts, board)
         applied += 1
     return applied
 
@@ -638,7 +765,14 @@ def _evaluate_single_game_no_mcts(
 ):
     board = chess.new_board()
     board_history = []
-    move_count = _apply_opening_prefix_for_no_mcts_eval(board, board_history, opening_prefix)
+    position_counts = {_board_position_key(board): 1}
+    move_count = _apply_opening_prefix_for_no_mcts_eval(
+        board,
+        board_history,
+        opening_prefix,
+        config,
+        position_counts,
+    )
     ended_by_auto_claim_draw = False
 
     while move_count < max_moves:
@@ -646,12 +780,29 @@ def _evaluate_single_game_no_mcts(
             break
 
         model = model_white if board.turn == chess.WHITE else model_black
-        move = _select_no_mcts_policy_move(model, board, board_history, config, device)
+        move = _select_no_mcts_policy_move(
+            model,
+            board,
+            board_history,
+            config,
+            device,
+            position_counts=position_counts,
+            position_history_complete=True,
+        )
         if move is None:
             break
 
-        board_history.append(_encode_eval_history_entry(board))
+        repetition_count = max(
+            0,
+            int(position_counts.get(_board_position_key(board), 0)) - 1,
+        )
+        board_history.append(_encode_eval_history_entry(
+            board,
+            config,
+            repetition_count=repetition_count,
+        ))
         chess.apply_move(board, move)
+        _record_position_count(position_counts, board)
         move_count += 1
 
         if auto_claim_draw:
@@ -770,23 +921,39 @@ def _evaluate_games_batched(
             key = f"eval_mcts_{prefix}_lower_q_count"
             eval_search_profile[key] = int(eval_search_profile.get(key, 0)) + 1
 
+    max_history_positions = max(
+        int(model1_search_config.get("model", {}).get("history_positions", 0) or 0),
+        int(model2_search_config.get("model", {}).get("history_positions", 0) or 0),
+    )
+
+    shared_history_cache = (
+        model1_search_config.get('model', {}).get('input_encoder_id', 'planes_history_v1')
+        == model2_search_config.get('model', {}).get('input_encoder_id', 'planes_history_v1')
+        and int(model1_search_config.get('model', {}).get('history_positions', 0) or 0)
+        == int(model2_search_config.get('model', {}).get('history_positions', 0) or 0)
+    )
+
     def _new_game_state(game_idx):
         board = chess.new_board()
-        board_history = []
+        model1_history = []
+        model2_history = model1_history if shared_history_cache else []
         position_counts = {_board_position_key(board): 1}
         opening_prefix = _get_eval_opening_prefix(config, game_idx, enabled_override=use_fixed_openings)
         move_count = _apply_opening_prefix_for_batched_eval(
             board,
-            board_history,
+            [model1_history, model2_history],
             opening_prefix,
-            config,
+            [model1_search_config, model2_search_config],
             position_counts,
+            max_history_positions=max_history_positions,
         )
         return {
             "game_idx": int(game_idx),
             "board": board,
-            "board_history": board_history,
+            "model1_board_history": model1_history,
+            "model2_board_history": model2_history,
             "position_counts": position_counts,
+            "position_history_complete": True,
             "move_count": int(move_count),
             "model1_as_white": bool(int(game_idx) % 2 == 0),
             "model1_root": None,
@@ -880,7 +1047,7 @@ def _evaluate_games_batched(
 
         moves_by_index = {}
 
-        def _run_group(indices, model, search_config, mcts, sims, root_key, synced_key, profile_prefix):
+        def _run_group(indices, model, search_config, mcts, sims, root_key, synced_key, history_key, profile_prefix):
             if not indices:
                 return
             group_states = []
@@ -895,8 +1062,11 @@ def _evaluate_games_batched(
                     "board": gs["board"],
                     "root": gs.get(root_key),
                     "_root_synced": bool(gs.get(synced_key, False)),
-                    "board_history": gs["board_history"],
+                    "board_history": gs[history_key],
                     "position_counts": gs.get("position_counts"),
+                    "position_history_complete": gs.get(
+                        "position_history_complete", True
+                    ),
                     "simulation_budget_override": None,
                     "_native_tree_key": gs.setdefault(
                         "_native_tree_key",
@@ -920,6 +1090,10 @@ def _evaluate_games_batched(
                         {
                             "board": local_state["board"],
                             "board_history": local_state["board_history"],
+                            "position_counts": local_state.get("position_counts"),
+                            "position_history_complete": local_state.get(
+                                "position_history_complete", True
+                            ),
                         }
                         for local_state in group_states
                     ],
@@ -935,11 +1109,11 @@ def _evaluate_games_batched(
 
         _run_group(
             model1_indices, model1, model1_search_config, mcts1, sims1,
-            "model1_root", "model1_synced", "model1",
+            "model1_root", "model1_synced", "model1_board_history", "model1",
         )
         _run_group(
             model2_indices, model2, model2_search_config, mcts2, sims2,
-            "model2_root", "model2_synced", "model2",
+            "model2_root", "model2_synced", "model2_board_history", "model2",
         )
 
         for idx, gs in enumerate(active_games):
@@ -951,7 +1125,25 @@ def _evaluate_games_batched(
                 gs["done"] = True
                 continue
 
-            _append_eval_history(gs["board_history"], board, config)
+            repetition_count = max(
+                0,
+                int(gs['position_counts'].get(_board_position_key(board), 0)) - 1,
+            )
+            _append_eval_history(
+                gs["model1_board_history"],
+                board,
+                model1_search_config,
+                repetition_count=repetition_count,
+                max_history_positions=max_history_positions,
+            )
+            if not shared_history_cache:
+                _append_eval_history(
+                    gs["model2_board_history"],
+                    board,
+                    model2_search_config,
+                    repetition_count=repetition_count,
+                    max_history_positions=max_history_positions,
+                )
             gs["model1_root"], gs["model1_synced"] = _advance_eval_root(gs.get("model1_root"), move)
             gs["model2_root"], gs["model2_synced"] = _advance_eval_root(gs.get("model2_root"), move)
             chess.apply_move(board, move)
@@ -1096,6 +1288,8 @@ def _eval_central_worker(
     model1_label="eval_model1",
     model2_label="eval_model2",
     shared_buffer=None,
+    model1_spec=None,
+    model2_spec=None,
 ):
     try:
         # These processes own only boards and MCTS trees.  The one central
@@ -1114,6 +1308,16 @@ def _eval_central_worker(
         transport_dtype = str(_central_inference_option(config, "transport_dtype", "float16") or "float16")
         debug_enabled = bool(rl_cfg.get("eval_central_inference_debug", False))
         shared_call_lock = threading.Lock()
+        model1_search_config = model1_mcts_config or worker_config
+        model2_search_config = model2_mcts_config or worker_config
+        if isinstance(model1_spec, dict):
+            model1_search_config = config_for_model_spec(
+                model1_search_config, model1_spec
+            )
+        if isinstance(model2_spec, dict):
+            model2_search_config = config_for_model_spec(
+                model2_search_config, model2_spec
+            )
 
         model1 = RemoteInferenceClient(
             str(model1_label),
@@ -1126,6 +1330,7 @@ def _eval_central_worker(
             transport_dtype=transport_dtype,
             shared_buffer=shared_buffer,
             shared_call_lock=shared_call_lock,
+            model_spec=model1_spec,
         )
         model2 = RemoteInferenceClient(
             str(model2_label),
@@ -1138,6 +1343,7 @@ def _eval_central_worker(
             transport_dtype=transport_dtype,
             shared_buffer=shared_buffer,
             shared_call_lock=shared_call_lock,
+            model_spec=model2_spec,
         )
 
         stats = _evaluate_games_batched(
@@ -1160,8 +1366,8 @@ def _eval_central_worker(
                 "result": str(result),
                 "model1_as_white": bool(model1_as_white),
             }),
-            model1_mcts_config=model1_mcts_config,
-            model2_mcts_config=model2_mcts_config,
+            model1_mcts_config=model1_search_config,
+            model2_mcts_config=model2_search_config,
             use_mcts_model1=use_mcts_model1,
             use_mcts_model2=use_mcts_model2,
         )
@@ -1208,6 +1414,17 @@ def _close_eval_central_runtime(runtime):
     runtime.get("worker_shared_buffers", {}).clear()
 
 
+def _eval_central_model_specs(model1, model2, config):
+    """Return checkpoint-specific contracts used by the two eval labels."""
+    specs = {}
+    for label, model in (("eval_model1", model1), ("eval_model2", model2)):
+        spec = getattr(model, "model_spec", None)
+        if not isinstance(spec, dict):
+            spec = model_spec_from_config(config)
+        specs[label] = copy.deepcopy(spec)
+    return specs
+
+
 def _start_eval_central_runtime(
     model1,
     model2,
@@ -1237,6 +1454,7 @@ def _start_eval_central_runtime(
 
     central_cfg = config.get("central_inference", {}) or {}
     rl_cfg = config.get("reinforcement_learning", {}) or {}
+    model_specs = _eval_central_model_specs(model1, model2, config)
     shared_memory_enabled = bool(
         central_cfg.get("shared_memory_enabled", True)
         and str(central_cfg.get("transport_dtype", "float16")).lower() in {"float16", "fp16"}
@@ -1251,7 +1469,10 @@ def _start_eval_central_runtime(
             raw_capacity = rl_cfg.get("mcts_batch_size", rl_cfg.get("mcts_simulations", 192))
         capacity = max(1, int(raw_capacity or 192))
         slots = max(1, int(central_cfg.get("shared_memory_slots_per_worker", 2) or 2))
-        input_planes = 16 * (1 + int(config.get("model", {}).get("history_positions", 0) or 0))
+        input_planes = max(
+            int(spec["input_spec"]["input_planes"])
+            for spec in model_specs.values()
+        )
         worker_shared_buffers = {
             int(rank): create_shared_inference_buffer(
                 ctx,
@@ -1274,6 +1495,7 @@ def _start_eval_central_runtime(
         "worker_server_idx": worker_server_idx,
         "worker_shared_buffers": worker_shared_buffers,
         "model_labels": ("eval_model1", "eval_model2"),
+        "model_specs": model_specs,
         "server_processes": [],
         "closed": False,
         "stage_count": 0,
@@ -1289,11 +1511,14 @@ def _start_eval_central_runtime(
                 )
             else:
                 compile_rank = int(configured_cache_rank) + int(server_idx)
+            server_device = (
+                int(device.index or 0) if device.type == "cuda" else "cpu"
+            )
             proc = ctx.Process(
                 target=central_inference_server,
                 args=(
                     config,
-                    int(device.index or 0) if device.type == "cuda" else 0,
+                    server_device,
                     request_queues[server_idx],
                     server_response_senders[server_idx],
                     control_queues[server_idx],
@@ -1322,8 +1547,18 @@ def _start_eval_central_runtime(
                 "task_id": task_id,
                 "clear": True,
                 "models": [
-                    {"label": "eval_model1", "state": model1_state, "state_path": None},
-                    {"label": "eval_model2", "state": model2_state, "state_path": None},
+                    {
+                        "label": "eval_model1",
+                        "state": model1_state,
+                        "state_path": None,
+                        "model_spec": model_specs["eval_model1"],
+                    },
+                    {
+                        "label": "eval_model2",
+                        "state": model2_state,
+                        "state_path": None,
+                        "model_spec": model_specs["eval_model2"],
+                    },
                 ],
             })
 
@@ -1405,6 +1640,7 @@ def _refresh_eval_central_runtime(
     model1_label, model2_label = runtime.get(
         "model_labels", ("eval_model1", "eval_model2")
     )
+    model_specs = _eval_central_model_specs(model1, model2, config)
     snapshot_s = time.perf_counter() - snapshot_t0
     for request_queue in runtime["request_queues"]:
         request_queue.put({
@@ -1412,8 +1648,18 @@ def _refresh_eval_central_runtime(
             "task_id": task_id,
             "clear": True,
             "models": [
-                {"label": model1_label, "state": model1_state, "state_path": None},
-                {"label": model2_label, "state": model2_state, "state_path": None},
+                {
+                    "label": model1_label,
+                    "state": model1_state,
+                    "state_path": None,
+                    "model_spec": model_specs[model1_label],
+                },
+                {
+                    "label": model2_label,
+                    "state": model2_state,
+                    "state_path": None,
+                    "model_spec": model_specs[model2_label],
+                },
             ],
         })
 
@@ -1451,6 +1697,7 @@ def _refresh_eval_central_runtime(
         if message.get("pid") is not None
     )
     runtime["load_s"] = max(load_times) if load_times else 0.0
+    runtime["model_specs"] = model_specs
     runtime["snapshot_s"] = snapshot_s
     runtime["startup_s"] = time.perf_counter() - refresh_t0
     if ready_callback is not None:
@@ -1483,6 +1730,7 @@ def prepare_eval_central_runtime(runtime, model1, model2, config, device, num_ga
 
     workers = _resolve_eval_workers(config, device, num_games)
     server_count = _resolve_eval_central_server_count(config, workers)
+    desired_model_specs = _eval_central_model_specs(model1, model2, config)
     runtime_workers = int(runtime.get("workers", 0)) if runtime is not None else 0
     worker_topology_matches = bool(
         runtime_workers == int(workers)
@@ -1495,6 +1743,7 @@ def prepare_eval_central_runtime(runtime, model1, model2, config, device, num_ga
     reusable = bool(
         runtime is not None
         and not runtime.get("closed", False)
+        and runtime.get("model_specs") == desired_model_specs
         and worker_topology_matches
         and int(runtime.get("server_count", 0)) == int(server_count)
         and all(process.is_alive() for process in runtime.get("server_processes", []))
@@ -1587,6 +1836,8 @@ def _evaluate_models_with_central_inference(
                 model1_label,
                 model2_label,
                 dict(active_runtime.get("worker_shared_buffers", {}) or {}).get(int(rank)),
+                dict(active_runtime.get("model_specs", {}) or {}).get(model1_label),
+                dict(active_runtime.get("model_specs", {}) or {}).get(model2_label),
             ),
         )
 
@@ -1937,16 +2188,33 @@ def _get_hflip_forward_index_map():
     return _HFLIP_FWD_INDEX_MAP
 
 
-def _horizontal_flip_eligible_mask(boards):
+def _horizontal_flip_eligible_mask(boards, *, input_encoder_id=None, history_positions=None):
     """Return rows where file mirroring is an exact chess symmetry.
 
     Castling is asymmetric around the a<->h reflection (the king starts on the
-    e-file, not on the centre line).  Plane 12 in every 16-plane history frame
-    marks castling rights, so exclude any row where that state is visible.
+    e-file, not on the centre line).  V9 stores castling in plane 12 of every
+    16-plane frame; v10 stores current castling rights in metadata planes
+    13:17 after H chronological 13-plane history frames and the current
+    13-plane state.  Select offsets from the encoder contract, never by
+    assuming one layout for both profiles.
     """
-    if boards.dim() != 4 or int(boards.size(1)) < 16:
+    if boards.dim() != 4:
         return torch.ones(int(boards.size(0)), dtype=torch.bool, device=boards.device)
-    castling_planes = boards[:, 12::16]
+    if input_encoder_id == "planes_history_v2":
+        if history_positions is None:
+            raise ValueError("v10 augmentation requires history_positions from the model input spec")
+        castling_start = int(history_positions) * 13 + 13
+        castling_end = castling_start + 4
+        if int(boards.size(1)) < castling_end:
+            raise ValueError(
+                f"v10 augmentation expected castling planes {castling_start}:{castling_end}, "
+                f"got {int(boards.size(1))} input planes"
+            )
+        castling_planes = boards[:, castling_start:castling_end]
+    else:
+        if int(boards.size(1)) < 16:
+            return torch.ones(int(boards.size(0)), dtype=torch.bool, device=boards.device)
+        castling_planes = boards[:, 12::16]
     has_castling_rights = castling_planes.abs().flatten(1).amax(dim=1) > 0
     return ~has_castling_rights
 
@@ -1959,6 +2227,9 @@ def _maybe_augment_batch(
     legal_indices,
     legal_mask,
     config,
+    *,
+    input_encoder_id=None,
+    history_positions=None,
 ):
     rl_cfg = config.get("reinforcement_learning", {})
     if not rl_cfg.get("use_augmentation", False):
@@ -1976,7 +2247,11 @@ def _maybe_augment_batch(
 
     flip_mask = (
         torch.rand(batch_size, device=boards.device) < prob
-    ) & _horizontal_flip_eligible_mask(boards)
+    ) & _horizontal_flip_eligible_mask(
+        boards,
+        input_encoder_id=input_encoder_id,
+        history_positions=history_positions,
+    )
     if not flip_mask.any():
         return boards, policy_indices, policy_values, policy_mask, legal_indices, legal_mask
 
@@ -2381,6 +2656,16 @@ def train_on_batch_rl(
         legal_indices,
         legal_mask,
         config,
+        input_encoder_id=(
+            getattr(model, "input_encoder_id", None)
+            or (getattr(model, "model_spec", {}) or {}).get("input_spec", {}).get("encoder_id")
+            or config.get("model", {}).get("input_encoder_id")
+        ),
+        history_positions=(
+            (getattr(model, "model_spec", {}) or {}).get("input_spec", {}).get("history_positions")
+            if (getattr(model, "model_spec", {}) or {}).get("input_spec")
+            else config.get("model", {}).get("history_positions", 0)
+        ),
     )
     boards = boards.to(device, memory_format=torch.channels_last, non_blocking=True)
     policy_indices = policy_indices.to(device, non_blocking=True)

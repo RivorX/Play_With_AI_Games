@@ -12,8 +12,11 @@ class SingleGameMCTS:
     def __init__(self, model, config, device):
         from src.mcts.search import MultiGameBatchMCTS
 
-        self.config = config
         self._multi = MultiGameBatchMCTS(model, config, device)
+        # MultiGameBatchMCTS resolves architecture and encoder settings from
+        # this model's checkpoint spec. Keep history trimming on that same
+        # per-model config when two architectures share a game.
+        self.config = self._multi.config
         self.root = None
         self._root_synced = False
         self.board_history = []
@@ -52,8 +55,13 @@ class SingleGameMCTS:
         self.root = child.detach_as_root()
         self._root_synced = True
 
-    def update_history(self, board):
-        self.board_history.append(self._multi._encode_history_entry(board))
+    def update_history(self, board, repetition_count=None):
+        self.board_history.append(
+            self._multi._encode_history_entry(
+                board,
+                repetition_count=repetition_count,
+            )
+        )
         max_history = int(self.config.get('model', {}).get('history_positions', 0)) + 10
         if len(self.board_history) > max_history:
             self.board_history = self.board_history[-max_history:]

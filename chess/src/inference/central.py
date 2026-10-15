@@ -14,6 +14,7 @@ import torch
 from src.inference.fused_output import packed_output_views, packed_output_width_bytes
 from src.inference.shared_memory import shared_inference_array
 from src.mcts.native import get_native_mcts
+from src.models.data.registry import get_input_encoder
 from src.mcts.search import (
     _configure_inductor_for_selfplay,
     _debug_nested,
@@ -53,12 +54,12 @@ def _configure_selfplay_worker_runtime(config, device_id):
     return device
 
 
-def _build_selfplay_worker_model(config, device):
+def _build_selfplay_worker_model(config, device, model_spec=None):
     from src.model import create_model
 
     worker_config = dict(config)
     worker_config['model'] = {**config.get('model', {}), 'print_summary': False}
-    model = create_model(worker_config).to(device)
+    model = create_model(worker_config, model_spec=model_spec).to(device)
     if device.type == 'cuda':
         model = model.to(memory_format=torch.channels_last)
     model.eval()
@@ -88,7 +89,11 @@ def _load_worker_model_state(model, model_state, rank):
     missing, unexpected = model.load_state_dict(model_state, strict=False)
     missing = [
         key for key in missing
-        if not (key.endswith('coord_x') or key.endswith('coord_y'))
+        if not (
+            key.endswith('coord_x')
+            or key.endswith('coord_y')
+            or key in {'search_q_fc.weight', 'search_q_fc.bias'}
+        )
     ]
     unexpected = [
         key for key in unexpected
@@ -99,6 +104,66 @@ def _load_worker_model_state(model, model_state, rank):
             f"Worker {rank}: incompatible state_dict. "
             f"Missing={missing}, Unexpected={unexpected}"
         )
+
+
+def _validate_central_model_input_contract(
+    config,
+    label,
+    checkpoint,
+    expected_model_spec=None,
+):
+    """Resolve and validate one label's checkpoint contract.
+
+    Central inference can host different architectures at once. Each request is
+    routed by label and carries inputs encoded for that label, so comparing a
+    checkpoint against the server's single active profile incorrectly rejects
+    valid mixed-version play.
+    """
+    from src.models.contracts import validate_model_spec
+    from src.models.data import validate_data_contract
+    from src.models.registry import resolve_model_spec
+
+    is_raw_state_dict = bool(
+        isinstance(checkpoint, dict)
+        and checkpoint
+        and "model_spec" not in checkpoint
+        and "model_architecture" not in checkpoint
+        and "model_state_dict" not in checkpoint
+        and "state_dict" not in checkpoint
+        and all(torch.is_tensor(value) for value in checkpoint.values())
+    )
+    if expected_model_spec is not None and is_raw_state_dict:
+        # In-memory state_dict snapshots need the caller's actual per-label
+        # metadata; inferring a new architecture from tensor shapes here would
+        # make mixed-version routing ambiguous.
+        checkpoint_spec = dict(expected_model_spec)
+        validate_model_spec(checkpoint_spec)
+        validate_data_contract(checkpoint_spec)
+    else:
+        checkpoint_spec = resolve_model_spec(config, checkpoint)
+    policy_spec = checkpoint_spec.get("policy_spec", {}) or {}
+    value_spec = checkpoint_spec.get("value_spec", {}) or {}
+    if (
+        int(policy_spec.get("action_size", 0) or 0) != 1858
+        or int(policy_spec.get("policy_planes", 0) or 0) != 73
+    ):
+        raise ValueError(
+            f"Central inference model {str(label or 'learner')!r} has unsupported "
+            f"policy output contract: {policy_spec!r}. Expected the 1858-action, "
+            "73-plane chess policy."
+        )
+    if int(value_spec.get("wdl_size", 0) or 0) != 3:
+        raise ValueError(
+            f"Central inference model {str(label or 'learner')!r} has unsupported "
+            f"value output contract: {value_spec!r}. Expected WDL size 3."
+        )
+    if expected_model_spec is not None and expected_model_spec != checkpoint_spec:
+        raise ValueError(
+            f"Central inference model {str(label or 'learner')!r} has a checkpoint "
+            "contract that differs from the per-label model_spec sent by its client. "
+            f"Client={expected_model_spec!r}; checkpoint={checkpoint_spec!r}."
+        )
+    return checkpoint_spec
 
 
 class RemoteInferenceClient:
@@ -116,8 +181,24 @@ class RemoteInferenceClient:
         transport_dtype="float16",
         shared_buffer=None,
         shared_call_lock=None,
+        model_spec=None,
     ):
         self.model_label = str(model_label or "learner")
+        self.model_spec = dict(model_spec) if isinstance(model_spec, dict) else None
+        input_spec = (self.model_spec or {}).get("input_spec", {}) or {}
+        policy_spec = (self.model_spec or {}).get("policy_spec", {}) or {}
+        # Older callers construct a single-model v9 proxy without model_spec.
+        # Keep that API working, while mixed-version callers pass explicit
+        # per-label metadata and never infer v10 from an untagged payload.
+        self.input_encoder_id = str(
+            input_spec.get("encoder_id", "planes_history_v1")
+        )
+        self.input_planes = (
+            int(input_spec["input_planes"])
+            if input_spec.get("input_planes") is not None
+            else None
+        )
+        self.action_size = int(policy_spec.get("action_size", 1858))
         self.request_queue = request_queue
         self.response_queue = response_queue
         self.worker_rank = int(worker_rank)
@@ -170,6 +251,11 @@ class RemoteInferenceClient:
         self.shared_buffer = shared_buffer
         self._shared_arrays = None
         self._shared_call_lock = shared_call_lock or threading.Lock()
+        # A CentralInferenceSession may expose several label-specific proxies
+        # over the same response queue. Serialize those proxies even when the
+        # transport uses ordinary queues (without a shared-memory slot), so a
+        # concurrent caller cannot consume another model's response.
+        self._serialize_calls = shared_call_lock is not None or shared_buffer is not None
         if shared_buffer is not None:
             self._shared_arrays = {
                 name: shared_inference_array(shared_buffer, name)
@@ -206,7 +292,7 @@ class RemoteInferenceClient:
         return time.strftime("%H:%M:%S")
 
     def __call__(self, board_tensors, apply_log_softmax=False, legal_index_matrix=None, **kwargs):
-        if self._shared_arrays is None:
+        if not self._serialize_calls:
             return self._call_impl(
                 board_tensors,
                 apply_log_softmax=apply_log_softmax,
@@ -232,6 +318,17 @@ class RemoteInferenceClient:
             boards_source = board_tensors.detach().to('cpu').contiguous().numpy()
         else:
             boards_source = np.asarray(board_tensors)
+        if boards_source.ndim != 4 or tuple(boards_source.shape[-2:]) != (8, 8):
+            raise ValueError(
+                "Central inference expects board tensors shaped [batch, planes, 8, 8]; "
+                f"received {tuple(boards_source.shape)} for model '{self.model_label}'."
+            )
+        if self.input_planes is not None and int(boards_source.shape[1]) != self.input_planes:
+            raise ValueError(
+                f"Central inference model '{self.model_label}' expects "
+                f"{self.input_planes} input planes from {self.input_encoder_id}, "
+                f"received {int(boards_source.shape[1])}."
+            )
         batch_size = int(boards_source.shape[0])
         legal_source = None
         legal_cols = 0
@@ -250,7 +347,7 @@ class RemoteInferenceClient:
             and legal_source is not None
             and batch_size <= int(self.shared_buffer.get("capacity", 0))
             and legal_cols <= int(self.shared_buffer.get("max_legal_moves", 0))
-            and int(boards_source.shape[1]) == int(self.shared_buffer.get("input_planes", -1))
+            and int(boards_source.shape[1]) <= int(self.shared_buffer.get("input_planes", -1))
         )
         request = {
             "cmd": "infer",
@@ -265,7 +362,9 @@ class RemoteInferenceClient:
         if shared_eligible:
             shared_slot = int((self._request_counter - 1) % int(self.shared_buffer.get("slots", 1)))
             np.copyto(
-                self._shared_arrays["boards"][shared_slot, :batch_size],
+                self._shared_arrays["boards"][
+                    shared_slot, :batch_size, :int(boards_source.shape[1])
+                ],
                 boards_source,
                 casting="unsafe",
             )
@@ -280,6 +379,7 @@ class RemoteInferenceClient:
                 "shared_memory": True,
                 "shared_slot": shared_slot,
                 "batch_size": batch_size,
+                "input_planes": int(boards_source.shape[1]),
                 "legal_cols": legal_cols,
                 "input_bytes": int(batch_size * np.prod(boards_source.shape[1:]) * np.dtype(np.float16).itemsize),
                 "shared_token": int(shared_token),
@@ -288,6 +388,7 @@ class RemoteInferenceClient:
         else:
             boards_np = np.ascontiguousarray(boards_source, dtype=self._transport_np_dtype)
             request["boards"] = boards_np
+            request["input_planes"] = int(boards_np.shape[1])
             if legal_source is not None:
                 request["legal_index_matrix"] = np.ascontiguousarray(legal_source, dtype=np.int16)
                 request["legal_counts"] = np.ascontiguousarray(legal_counts_source, dtype=np.int16)
@@ -839,6 +940,7 @@ def central_inference_server(
                 _central_inference_option(config, 'cudnn_benchmark', False)
             )
         models = {}
+        model_specs = {}
         compiled_base_models = {}
         compiled_wrappers = {}
 
@@ -861,8 +963,31 @@ def central_inference_server(
             warmup_batches = list(compile_batch_buckets)
             if not warmup_batches:
                 return None
-            history_positions = int(config.get('model', {}).get('history_positions', 0) or 0)
-            input_planes = 16 * (1 + history_positions)
+            model_spec = getattr(model, 'model_spec', {}) or {}
+            input_spec = model_spec.get('input_spec', {}) or {}
+            history_positions = int(
+                input_spec.get(
+                    'history_positions',
+                    (config.get('model', {}) or {}).get('history_positions', 0),
+                )
+                or 0
+            )
+            encoder_id = str(
+                input_spec.get(
+                    'encoder_id',
+                    (config.get('model', {}) or {}).get(
+                        'input_encoder_id',
+                        'planes_history_v1',
+                    ),
+                )
+            )
+            encoder = get_input_encoder(encoder_id)
+            input_planes = int(
+                input_spec.get(
+                    'input_planes',
+                    encoder.input_planes(history_positions),
+                )
+            )
             use_amp = bool(config.get('hardware', {}).get('use_amp', False))
             dummy_dtype = torch.float16 if use_amp and transport_np_dtype == np.float16 else torch.float32
             if debug_enabled:
@@ -910,9 +1035,18 @@ def central_inference_server(
                 )
             return warmup_s
 
-        def _load_model(label, state):
+        def _load_model(label, state, model_spec):
             nonlocal central_use_compile
+            from src.models.registry import config_for_model_spec
+
             label = str(label or "learner")
+            model_spec = _validate_central_model_input_contract(
+                config,
+                label,
+                state,
+                expected_model_spec=model_spec,
+            )
+            model_config = config_for_model_spec(config, model_spec)
             load_info = {
                 "label": label,
                 "compiled": bool(central_use_compile),
@@ -924,6 +1058,11 @@ def central_inference_server(
             if central_use_compile:
                 if label in compiled_wrappers and label in compiled_base_models:
                     base_model = compiled_base_models[label]
+                    if getattr(base_model, 'model_spec', None) != model_spec:
+                        raise RuntimeError(
+                            f"Central inference label '{label}' changed model_spec while its "
+                            "compiled runtime was resident"
+                        )
                     _load_worker_model_state(base_model, state, rank=-1)
                     base_model.eval()
                     model = compiled_wrappers[label]
@@ -931,12 +1070,16 @@ def central_inference_server(
                     if debug_enabled:
                         print(f"[{_ts()}] Central inference: reused compiled model '{label}'.", flush=True)
                 else:
-                    base_model = _build_selfplay_worker_model(config, device)
+                    base_model = _build_selfplay_worker_model(
+                        model_config,
+                        device,
+                        model_spec=model_spec,
+                    )
                     _load_worker_model_state(base_model, state, rank=-1)
                     base_model.eval()
                     model = _maybe_compile_selfplay_model(
                         base_model,
-                        config,
+                        model_config,
                         device,
                         rank=compile_rank,
                         model_label=f"central:{label}",
@@ -974,10 +1117,15 @@ def central_inference_server(
                     else:
                         load_info["compiled"] = False
             else:
-                model = _build_selfplay_worker_model(config, device)
+                model = _build_selfplay_worker_model(
+                    model_config,
+                    device,
+                    model_spec=model_spec,
+                )
                 _load_worker_model_state(model, state, rank=-1)
                 model.eval()
             models[label] = model
+            model_specs[label] = model_spec
             if debug_enabled:
                 print(f"[{_ts()}] Central inference: model '{label}' ready.", flush=True)
             return load_info
@@ -1002,7 +1150,59 @@ def central_inference_server(
                 return np.asarray(req['boards'], dtype=transport_np_dtype)
             slot = int(req.get('shared_slot', 0))
             batch_size = int(req.get('batch_size', 0))
-            return arrays['boards'][slot, :batch_size]
+            input_planes = int(req.get('input_planes', 0) or 0)
+            return arrays['boards'][slot, :batch_size, :input_planes]
+
+        def _validate_infer_request(req):
+            label = str(req.get("model_label", "learner"))
+            model_spec = model_specs.get(label)
+            if model_spec is None:
+                raise ValueError(f"Central inference has no model loaded for label '{label}'.")
+            expected_planes = int(model_spec["input_spec"]["input_planes"])
+            if bool(req.get("shared_memory", False)):
+                arrays = _shared_request_arrays(req)
+                if arrays is None:
+                    raise ValueError(
+                        "Central inference shared-memory request has no buffer for "
+                        f"worker {int(req.get('rank', -1))}."
+                    )
+                slot = int(req.get("shared_slot", -1))
+                batch_size = int(req.get("batch_size", 0) or 0)
+                logical_planes = int(req.get("input_planes", 0) or 0)
+                physical = arrays["boards"]
+                if not 0 <= slot < int(physical.shape[0]):
+                    raise ValueError(f"Invalid shared-memory slot {slot}.")
+                if not 0 < batch_size <= int(physical.shape[1]):
+                    raise ValueError(f"Invalid shared-memory batch size {batch_size}.")
+                if logical_planes != expected_planes:
+                    raise ValueError(
+                        f"Central inference model '{label}' expects {expected_planes} "
+                        f"input planes, shared request declares {logical_planes}."
+                    )
+                if logical_planes > int(physical.shape[2]):
+                    raise ValueError(
+                        f"Central inference shared buffer holds {physical.shape[2]} planes, "
+                        f"but model '{label}' requires {logical_planes}."
+                    )
+                legal_cols = int(req.get("legal_cols", 0) or 0)
+                if legal_cols < 0 or legal_cols > int(arrays["legal_indices"].shape[2]):
+                    raise ValueError(f"Invalid shared-memory legal-move width {legal_cols}.")
+                return
+
+            boards = np.asarray(req.get("boards"))
+            if boards.ndim != 4 or tuple(boards.shape[-2:]) != (8, 8):
+                raise ValueError(
+                    "Central inference expects board tensors shaped [batch, planes, 8, 8]; "
+                    f"received {tuple(boards.shape)} for model '{label}'."
+                )
+            actual_planes = int(boards.shape[1])
+            declared_planes = int(req.get("input_planes", actual_planes) or 0)
+            if actual_planes != expected_planes or declared_planes != expected_planes:
+                raise ValueError(
+                    f"Central inference model '{label}' expects {expected_planes} input "
+                    f"planes, queue request has shape {actual_planes} and declares "
+                    f"{declared_planes}."
+                )
 
         def _request_legal_indices(req):
             arrays = _shared_request_arrays(req)
@@ -1158,10 +1358,20 @@ def central_inference_server(
                 legal_counts = None
 
             native_hashes = None
+            requested_label = str(
+                requests[0].get('model_label', 'learner')
+                if requests
+                else 'learner'
+            )
+            requested_model = models.get(requested_label)
+            path_dependent_input = str(
+                getattr(requested_model, 'input_encoder_id', '')
+            ) == 'planes_history_v2'
             if (
                 compute_hashes
                 and compact_policy
                 and native_server_kernels is not None
+                and not path_dependent_input
             ):
                 native_hashes = np.empty((total_n, 2), dtype=np.uint64)
                 native_server_kernels.hash_positions(
@@ -1465,7 +1675,14 @@ def central_inference_server(
             if group_cache_active:
                 pending_representatives = {}
                 native_hashes = prepared.get('native_hashes')
-                if native_hashes is None and native_server_kernels is not None:
+                path_dependent_input = str(
+                    getattr(model, 'input_encoder_id', '')
+                ) == 'planes_history_v2'
+                if (
+                    native_hashes is None
+                    and native_server_kernels is not None
+                    and not path_dependent_input
+                ):
                     native_hashes = native_hash_scratch[:total_n]
                     native_server_kernels.hash_positions(
                         boards,
@@ -1475,7 +1692,7 @@ def central_inference_server(
                     )
                 for idx in range(total_n):
                     legal_count = int(legal_counts[idx])
-                    if native_hashes is not None:
+                    if native_hashes is not None and not path_dependent_input:
                         key = (
                             model_label,
                             int(native_hashes[idx, 0]),
@@ -1868,19 +2085,57 @@ def central_inference_server(
                 return "stop"
             if cmd == "load_models":
                 task_id = item.get("task_id")
+                load_t0 = time.perf_counter()
+                prepared_models = []
+                try:
+                    # Preflight every selected checkpoint before clearing or
+                    # loading any model. The pool waits for this acknowledgement
+                    # before it releases game tasks to workers.
+                    for entry in list(item.get("models", []) or []):
+                        state = entry.get("state")
+                        state_path = entry.get("state_path")
+                        if state is None and state_path:
+                            state = torch.load(state_path, map_location='cpu')
+                        if state is not None:
+                            label = entry.get("label", "learner")
+                            expected_model_spec = entry.get("model_spec")
+                            model_spec = _validate_central_model_input_contract(
+                                config,
+                                label,
+                                state,
+                                expected_model_spec=expected_model_spec,
+                            )
+                            prepared_models.append((label, state, model_spec))
+                except Exception as exc:
+                    if control_queue is not None:
+                        control_queue.put({
+                            "type": "models_load_failed",
+                            "task_id": task_id,
+                            "server_rank": int(compile_rank),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        })
+                        return "control"
+                    raise
+
                 if bool(item.get("clear", False)):
                     models.clear()
+                    model_specs.clear()
                     cache.clear()
                     cache_gate.reset()
                 loaded_models = []
-                load_t0 = time.perf_counter()
-                for entry in list(item.get("models", []) or []):
-                    state = entry.get("state")
-                    state_path = entry.get("state_path")
-                    if state is None and state_path:
-                        state = torch.load(state_path, map_location='cpu')
-                    if state is not None:
-                        loaded_models.append(_load_model(entry.get("label", "learner"), state))
+                try:
+                    for label, state, model_spec in prepared_models:
+                        loaded_models.append(_load_model(label, state, model_spec))
+                except Exception as exc:
+                    if control_queue is not None:
+                        control_queue.put({
+                            "type": "models_load_failed",
+                            "task_id": task_id,
+                            "server_rank": int(compile_rank),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        })
+                        return "control"
+                    raise
                 if loaded_models:
                     # A label may have received new weights. Never reuse outputs
                     # computed by a previous model generation.
@@ -1931,6 +2186,14 @@ def central_inference_server(
                 return "control"
             if cmd == "infer":
                 item["server_dequeued_at_perf"] = time.perf_counter()
+                try:
+                    _validate_infer_request(item)
+                except Exception as exc:
+                    _put_response(item, {
+                        "ok": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    return "ignored"
                 arrays = _shared_request_arrays(item)
                 if arrays is not None:
                     slot = int(item.get('shared_slot', 0))

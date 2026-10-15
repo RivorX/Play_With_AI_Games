@@ -25,7 +25,11 @@ from src.mcts.single_game import SingleGameMCTS
 from src.game import backend as chess
 from src.config import default_config_path, load_project_config
 from src.model import load_model
+from src.models.registry import MODEL_REGISTRY
+from src.models.data.registry import get_input_encoder
+from src.mcts.search import _board_position_key
 from src.models.data.se_cnn_v9.helpers import board_to_tensor, move_to_index
+from src.common.runtime import legacy_architecture_scoped_file, model_alias_file
 
 
 class UCIChessEngine:
@@ -39,6 +43,7 @@ class UCIChessEngine:
 
         self.board = chess.new_board()
         self.board_history = []
+        self._repetition_history_known = True
         self.stop_requested = False
 
         self.use_mcts = bool(use_mcts)
@@ -87,20 +92,47 @@ class UCIChessEngine:
 
     def _record_pre_move_state(self):
         self.board_history.append(chess.copy_board(self.board))
-        max_history = self.history_positions + 20
-        if len(self.board_history) > max_history:
-            self.board_history = self.board_history[-max_history:]
+        if getattr(self.model, "input_encoder_id", "planes_history_v1") != "planes_history_v2":
+            max_history = self.history_positions + 20
+            if len(self.board_history) > max_history:
+                self.board_history = self.board_history[-max_history:]
         if self.mcts:
             self.mcts.update_history(self.board)
 
     def _new_game(self):
         self.board = chess.new_board()
         self.board_history = []
+        self._repetition_history_known = True
         self.stop_requested = False
         if self.mcts:
             self.mcts.reset_tree()
 
     def _build_history_tensor(self):
+        encoder_id = str(getattr(self.model, "input_encoder_id", "planes_history_v1"))
+        if encoder_id == "planes_history_v2":
+            encoder = get_input_encoder(encoder_id)
+            history = self.board_history[-self.history_positions:] if self.history_positions else []
+            repetition_counts = None
+            if self._repetition_history_known:
+                seen = {}
+                all_boards = list(self.board_history) + [self.board]
+                all_counts = []
+                for history_board in all_boards:
+                    key = _board_position_key(history_board)
+                    all_counts.append(int(seen.get(key, 0)))
+                    seen[key] = int(seen.get(key, 0)) + 1
+                repetition_counts = (
+                    all_counts[-(len(history) + 1):-1] + [all_counts[-1]]
+                    if history
+                    else [all_counts[-1]]
+                )
+            return encoder.encode_history(
+                self.board,
+                history_boards=history,
+                history_positions=self.history_positions,
+                repetition_counts=repetition_counts,
+            )
+
         if self.history_positions <= 0:
             return board_to_tensor(self.board)
 
@@ -202,12 +234,14 @@ class UCIChessEngine:
             return
 
         self.board_history = []
+        self._repetition_history_known = False
         if self.mcts:
             self.mcts.reset_tree()
 
         idx = 0
         if args[0] == "startpos":
             self.board = chess.new_board()
+            self._repetition_history_known = True
             idx = 1
         elif args[0] == "fen":
             if len(args) < 7:
@@ -216,6 +250,7 @@ class UCIChessEngine:
             fen = " ".join(args[1:7])
             try:
                 self.board = chess.board_from_fen(fen)
+                self._repetition_history_known = False
             except ValueError:
                 self._send("info string invalid fen")
                 self.board = chess.new_board()
@@ -348,7 +383,12 @@ def resolve_model_path(base_dir, config, override):
             p = base_dir / p
         return p
     best_rel = config.get("paths", {}).get("best_model_il", "models/best_model_il.pt")
-    return base_dir / best_rel
+    architecture_id = str(config.get("model", {}).get("architecture_id", "se_cnn_v9"))
+    configured = base_dir / best_rel
+    best_path = model_alias_file(configured, architecture_id, "il")
+    if best_path.is_file():
+        return best_path
+    return legacy_architecture_scoped_file(configured, architecture_id)
 
 
 def main():
@@ -357,6 +397,12 @@ def main():
         "--config",
         default=str(default_config_path()),
         help="Path to config YAML.",
+    )
+    parser.add_argument(
+        "--architecture",
+        choices=tuple(sorted(MODEL_REGISTRY)),
+        default=None,
+        help="Select a model profile when using a new or untrained model.",
     )
     parser.add_argument("--model", default="", help="Checkpoint path (.pt).")
     parser.add_argument("--device", default="", help="Device override (e.g. cuda or cpu).")
@@ -370,7 +416,17 @@ def main():
     args = parser.parse_args()
 
     config_path = Path(args.config)
-    config = load_config(config_path)
+    config = load_project_config(
+        architecture_id=args.architecture,
+        config_path=config_path,
+    )
+    config = copy.deepcopy(config)
+    config.setdefault("model", {})
+    config["model"]["print_summary"] = False
+    if args.architecture and config.get("model", {}).get("architecture_id") != args.architecture:
+        raise ValueError(
+            f"Active config model profile conflicts with --architecture {args.architecture!r}."
+        )
     base_dir = chess_dir
     model_path = resolve_model_path(base_dir, config, args.model)
 

@@ -31,6 +31,7 @@ from src.models.data.se_cnn_v9.helpers import (
     board_to_tensor_pair,
     move_to_index,
 )
+from src.models.data.registry import get_input_encoder
 from src.mcts.native import get_native_mcts
 from src.mcts.result import SearchResult
 from src.mcts.q_delta import USEFUL_SEARCH_Q_DELTA_MIN
@@ -1284,8 +1285,32 @@ def _maybe_compile_selfplay_model(
     timeout_s = float(rl_cfg.get('self_play_compile_lock_timeout_s', 900.0) or 900.0)
     use_compile_lock = _resolve_selfplay_compile_use_lock(config)
 
-    history_positions = int(config.get('model', {}).get('history_positions', 0) or 0)
-    expected_input_planes = 16 * (1 + history_positions)
+    model_cfg = config.get('model', {}) or {}
+    input_spec = (
+        (getattr(model, 'model_spec', {}) or {}).get('input_spec', {}) or {}
+    )
+    history_positions = int(
+        input_spec.get('history_positions', model_cfg.get('history_positions', 0))
+        or 0
+    )
+    encoder = get_input_encoder(
+        str(
+            input_spec.get(
+                'encoder_id',
+                getattr(
+                    model,
+                    'input_encoder_id',
+                    model_cfg.get('input_encoder_id', 'planes_history_v1'),
+                ),
+            )
+        )
+    )
+    expected_input_planes = int(
+        input_spec.get(
+            'input_planes',
+            encoder.input_planes(history_positions),
+        )
+    )
     use_amp = bool(config.get('hardware', {}).get('use_amp', False) and device.type == 'cuda')
     use_bfloat16 = bool(config.get('hardware', {}).get('use_bfloat16', False))
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
@@ -1407,6 +1432,28 @@ def _position_counts_from_board(board):
         key = _board_position_key(replay)
         counts[key] = int(counts.get(key, 0)) + 1
     return counts
+
+
+def _repetition_count_before_node(node, root_position_counts, provenance_known=True):
+    """Return exact prior occurrences for a node, or None when history is partial."""
+    if not provenance_known:
+        return None
+    key = node.get_position_key()
+    root = node
+    while root.parent is not None:
+        root = root.parent
+    occurrences = int((root_position_counts or {}).get(key, 0))
+    if node is root:
+        return max(0, min(2, occurrences - 1))
+
+    # root_position_counts already includes the real-game root. Count only
+    # simulated descendants strictly between root and the requested node.
+    cursor = node.parent
+    while cursor is not None and cursor is not root:
+        if cursor.get_position_key() == key:
+            occurrences += 1
+        cursor = cursor.parent
+    return max(0, min(2, occurrences))
 
 
 def _record_position_count(position_counts, board):
@@ -2251,8 +2298,29 @@ class MultiGameBatchMCTS:
 
     def __init__(self, model, config, device):
         self.model = model
+        model_spec = getattr(model, 'model_spec', None)
+        if isinstance(model_spec, dict):
+            # Search inputs are part of the checkpoint contract. In matches
+            # between architectures, do not inherit the other player's
+            # encoder/history settings from the process-wide config.
+            from src.models.registry import config_for_model_spec
+
+            config = config_for_model_spec(config, model_spec)
         self.config = config
         self.device = device
+        model_cfg = config.get('model', {}) or {}
+        input_spec = (
+            (model_spec or {}).get('input_spec', {})
+            if isinstance(model_spec, dict)
+            else {}
+        ) or {}
+        self.input_encoder_id = str(
+            input_spec.get('encoder_id')
+            or getattr(model, 'input_encoder_id', None)
+            or model_cfg.get('input_encoder_id', 'planes_history_v1')
+        )
+        self.input_encoder = get_input_encoder(self.input_encoder_id)
+        self._path_dependent_repetition = self.input_encoder_id == 'planes_history_v2'
         rl_cfg = config['reinforcement_learning']
         (
             self.policy_target_mode,
@@ -2318,7 +2386,13 @@ class MultiGameBatchMCTS:
         )
         self.eval_batch_size = config['reinforcement_learning'].get('mcts_batch_size', 32)
         # History configuration (POV)
-        self.history_positions = config['model'].get('history_positions', 0)
+        self.history_positions = int(
+            input_spec.get(
+                'history_positions',
+                model_cfg.get('history_positions', 0),
+            )
+            or 0
+        )
         self.history_storage_dtype = (
             np.float16
             if bool(config['reinforcement_learning'].get('self_play_history_fp16', True))
@@ -2344,6 +2418,11 @@ class MultiGameBatchMCTS:
         self.cache_history_tensors = bool(
             config['reinforcement_learning'].get('mcts_cache_history_tensors', True)
         )
+        # V10's repetition feature depends on the complete path. Reusing a
+        # cached tensor by node/transposition identity alone would leak the
+        # first path's repetition count into another path.
+        if self._path_dependent_repetition:
+            self.cache_history_tensors = False
         # History pairs are 4 KiB each in FP16. Keeping one on every expanded
         # node made tree RAM grow with all visits, although only recent
         # ancestors are revisited while assembling leaf inputs. A bounded LRU
@@ -2387,10 +2466,25 @@ class MultiGameBatchMCTS:
         # Inference optimization (AMP on GPU)
         self.use_amp = config.get('hardware', {}).get('use_amp', False) and self.device.type == 'cuda'
         self.amp_dtype = torch.bfloat16 if config.get('hardware', {}).get('use_bfloat16', False) else torch.float16
-        self._empty_history_tensor = _EMPTY_HISTORY_TENSOR.astype(self.history_storage_dtype, copy=False)
-        self._board_planes = int(self._empty_history_tensor.shape[0])
-        self._history_planes = int(self.history_positions) * self._board_planes
-        self._input_planes = self._board_planes + self._history_planes
+        if self._path_dependent_repetition:
+            self._history_frame_planes = int(self.input_encoder.PLANES_PER_POSITION)
+            self._current_planes = int(self.input_encoder.input_planes(0))
+            self._empty_history_tensor = np.zeros(
+                (self._history_frame_planes, 8, 8),
+                dtype=self.history_storage_dtype,
+            )
+            self._empty_history_tensor[12].fill(-1.0)
+        else:
+            self._history_frame_planes = int(_EMPTY_HISTORY_TENSOR.shape[0])
+            self._current_planes = self._history_frame_planes
+            self._empty_history_tensor = _EMPTY_HISTORY_TENSOR.astype(
+                self.history_storage_dtype, copy=False
+            )
+        # Keep the legacy attribute as the temporal frame width; v10 has 13
+        # planes per historical frame and a separate 20-plane current state.
+        self._board_planes = self._history_frame_planes
+        self._history_planes = int(self.history_positions) * self._history_frame_planes
+        self._input_planes = int(self.input_encoder.input_planes(self.history_positions))
         self._legal_index_scratch = {}
         self._legal_index_tensor_scratch = {}
         self._board_input_scratch = {}
@@ -2425,7 +2519,10 @@ class MultiGameBatchMCTS:
         )
         self._profile_stats = {}
         self._native_mcts = get_native_mcts()
-        self._native_input_planes_enabled = self._native_mcts is not None
+        self._native_input_planes_enabled = (
+            self._native_mcts is not None
+            and not self._path_dependent_repetition
+        )
         self._native_move_indices_enabled = self._native_mcts is not None
         # The native forest persists across plies. Python only materializes
         # evaluated leaves and root telemetry; traversal, virtual visits,
@@ -2552,27 +2649,57 @@ class MultiGameBatchMCTS:
         flip_perspective=None,
         storage_dtype=None,
         out=None,
+        repetition_count=None,
     ):
         sample_t0, sample_scale = self._profile_sample_begin('board_to_tensor')
-        tensor = board_to_tensor(
-            board,
-            flip_perspective=flip_perspective,
-            dtype=np.float32 if storage_dtype is None else storage_dtype,
-            out=out,
-        )
+        dtype = np.float32 if storage_dtype is None else storage_dtype
+        if self._path_dependent_repetition:
+            tensor = self.input_encoder.encode(
+                board,
+                flip_perspective=flip_perspective,
+                dtype=dtype,
+                repetition_count=repetition_count,
+            )
+            if out is not None:
+                np.copyto(out, tensor)
+                tensor = out
+        else:
+            # Preserve the established v9 native/helper path exactly.
+            tensor = board_to_tensor(
+                board,
+                flip_perspective=flip_perspective,
+                dtype=dtype,
+                out=out,
+            )
         self._profile_sample_finish('board_to_tensor', sample_t0, sample_scale)
         return tensor
 
-    def _history_tensor_pair_for_board(self, board):
+    def _history_tensor_pair_for_board(self, board, repetition_count=None):
         storage_dtype = self.history_storage_dtype
         sample_t0, sample_scale = self._profile_sample_begin('board_to_tensor_pair')
-        white_tensor, black_tensor = board_to_tensor_pair(board, dtype=storage_dtype)
+        if self._path_dependent_repetition:
+            white_tensor, black_tensor = self.input_encoder.encode_pair(
+                board,
+                dtype=storage_dtype,
+                repetition_count=repetition_count,
+            )
+        else:
+            white_tensor, black_tensor = board_to_tensor_pair(
+                board, dtype=storage_dtype
+            )
         if sample_t0 is not None and sample_scale > 0:
             self._profile_add('board_to_tensor_time', (time.perf_counter() - sample_t0) * float(sample_scale))
             self._profile_inc('board_to_tensor_calls', int(sample_scale) * 2)
         return (white_tensor, black_tensor)
 
-    def _history_tensor_pair_for_node(self, node):
+    def _history_tensor_pair_for_node(self, node, repetition_count=None):
+        if self._path_dependent_repetition:
+            # Repetition planes are path dependent, including unknown versus 0.
+            # Do not reuse a pair cached only by node/transposition identity.
+            return self._history_tensor_pair_for_board(
+                node.board,
+                repetition_count=repetition_count,
+            )
         if not self.cache_history_tensors:
             return self._history_tensor_pair_for_board(node.board)
 
@@ -2684,6 +2811,8 @@ class MultiGameBatchMCTS:
         nodes,
         game_indices,
         board_histories,
+        root_position_counts,
+        root_repetition_known,
         destinations,
     ):
         """Fill a leaf batch's histories while batching newly used MCTS ancestors."""
@@ -2724,18 +2853,41 @@ class MultiGameBatchMCTS:
                             continue
                         del cache[cache_key]
                     pending.setdefault(cache_key, entry)
-            rows.append(
-                (node, entries, first_slot, use_black_pov, destinations[row_idx])
-            )
+            gi = int(game_indices[row_idx])
+            rows.append((
+                node,
+                entries,
+                first_slot,
+                use_black_pov,
+                gi,
+                destinations[row_idx],
+            ))
 
         if pending:
             resolved.update(self._encode_native_history_pairs(pending))
 
-        for _node, entries, first_slot, use_black_pov, destination in rows:
+        for _node, entries, first_slot, use_black_pov, gi, destination in rows:
             destination.fill(0.0)
+            if self._path_dependent_repetition:
+                destination.reshape(
+                    history_positions,
+                    self._history_frame_planes,
+                    8,
+                    8,
+                )[:, 12].fill(-1.0)
             for slot, entry in enumerate(entries, start=first_slot):
                 begin = slot * self._board_planes
                 end = begin + self._board_planes
+                repetition_count = (
+                    _repetition_count_before_node(
+                        entry,
+                        root_position_counts[gi],
+                        root_repetition_known[gi],
+                    )
+                    if self._path_dependent_repetition
+                    and isinstance(entry, MCTSNode)
+                    else None
+                )
                 if native_batch and isinstance(entry, MCTSNode):
                     cached = resolved.get(id(entry))
                     if cached is not None and cached[0] is entry:
@@ -2744,7 +2896,11 @@ class MultiGameBatchMCTS:
                     else:
                         tensor = self._history_tensor_for_entry(entry, use_black_pov)
                 else:
-                    tensor = self._history_tensor_for_entry(entry, use_black_pov)
+                    tensor = self._history_tensor_for_entry(
+                        entry,
+                        use_black_pov,
+                        repetition_count=repetition_count,
+                    )
                 destination[begin:end] = tensor
 
         if profile_t0 is not None:
@@ -2759,7 +2915,7 @@ class MultiGameBatchMCTS:
             and isinstance(entry[1], np.ndarray)
         )
 
-    def _encode_history_entry(self, board_or_fen):
+    def _encode_history_entry(self, board_or_fen, repetition_count=None):
         """
         Convert history item to cached tensors for both POVs:
         (white_pov_tensor, black_pov_tensor).
@@ -2773,9 +2929,18 @@ class MultiGameBatchMCTS:
         if not isinstance(board_obj, chess.Board):
             raise TypeError(f"Unsupported history entry type: {type(board_or_fen)}")
 
-        return self._history_tensor_pair_for_board(board_obj)
+        return self._history_tensor_pair_for_board(
+            board_obj,
+            repetition_count=repetition_count,
+        )
 
-    def _build_history_tensor(self, current_board, board_history, current_tensor=None):
+    def _build_history_tensor(
+        self,
+        current_board,
+        board_history,
+        current_tensor=None,
+        repetition_count=None,
+    ):
         """
         Build tensor with history using POV-aware board_to_tensor.
 
@@ -2786,7 +2951,10 @@ class MultiGameBatchMCTS:
         if self.history_positions == 0:
             if current_tensor is not None:
                 return current_tensor
-            return self._board_to_tensor_profiled(current_board)
+            return self._board_to_tensor_profiled(
+                current_board,
+                repetition_count=repetition_count,
+            )
 
         history_tensors = []
         use_black_pov = current_board.turn == chess.BLACK
@@ -2802,28 +2970,68 @@ class MultiGameBatchMCTS:
             history_tensors = [self._empty_history_tensor] * pad_count + history_tensors
 
         if current_tensor is None:
-            current_tensor = self._board_to_tensor_profiled(current_board)
+            current_tensor = self._board_to_tensor_profiled(
+                current_board,
+                repetition_count=repetition_count,
+            )
         history_tensors.append(current_tensor)
+
+        if self._path_dependent_repetition:
+            frames = [
+                np.asarray(item[:self._history_frame_planes])
+                for item in history_tensors[:-1]
+            ]
+            frames = [self._empty_history_tensor] * (
+                self.history_positions - len(frames)
+            ) + frames
+            return np.concatenate(
+                frames + [current_tensor[:13], current_tensor[13:20]],
+                axis=0,
+            )
 
         return np.concatenate(history_tensors, axis=0)
 
-    def _history_tensor_for_entry(self, entry, use_black_pov):
+    def _history_tensor_for_entry(
+        self,
+        entry,
+        use_black_pov,
+        repetition_count=None,
+    ):
         if self._is_encoded_history_entry(entry):
-            return entry[1] if use_black_pov else entry[0]
+            if any(
+                tensor.shape != (self._current_planes, 8, 8)
+                for tensor in entry
+            ):
+                raise ValueError(
+                    "Cached self-play history tensor does not match the active "
+                    f"encoder {self.input_encoder_id!r} ({self._current_planes} planes)"
+                )
+            tensor = entry[1] if use_black_pov else entry[0]
+            return tensor[:13] if self._path_dependent_repetition else tensor
 
         if isinstance(entry, MCTSNode):
-            encoded = self._history_tensor_pair_for_node(entry)
-            return encoded[1] if use_black_pov else encoded[0]
+            encoded = self._history_tensor_pair_for_node(
+                entry,
+                repetition_count=repetition_count,
+            )
+            tensor = encoded[1] if use_black_pov else encoded[0]
+            return tensor[:13] if self._path_dependent_repetition else tensor
 
         if isinstance(entry, chess.Board):
-            return self._board_to_tensor_profiled(
+            tensor = self._board_to_tensor_profiled(
                 entry,
                 flip_perspective=use_black_pov,
                 storage_dtype=self.history_storage_dtype,
+                repetition_count=repetition_count,
             )
+            return tensor[:13] if self._path_dependent_repetition else tensor
 
-        encoded = self._encode_history_entry(entry)
-        return encoded[1] if use_black_pov else encoded[0]
+        encoded = self._encode_history_entry(
+            entry,
+            repetition_count=repetition_count,
+        )
+        tensor = encoded[1] if use_black_pov else encoded[0]
+        return tensor[:13] if self._path_dependent_repetition else tensor
 
     def _collect_node_history_entries(self, node, board_history):
         """
@@ -2853,6 +3061,13 @@ class MultiGameBatchMCTS:
         if self.history_positions <= 0:
             return
         destination.fill(0.0)
+        if self._path_dependent_repetition:
+            destination.reshape(
+                int(self.history_positions),
+                self._history_frame_planes,
+                8,
+                8,
+            )[:, 12].fill(-1.0)
         use_black_pov = (node.board.turn == chess.BLACK)
         history_entries = self._collect_node_history_entries(node, board_history)
         first_slot = max(0, int(self.history_positions) - len(history_entries))
@@ -2864,12 +3079,13 @@ class MultiGameBatchMCTS:
                 use_black_pov,
             )
 
-    def _current_tensor_for_node(self, node, out=None):
+    def _current_tensor_for_node(self, node, out=None, repetition_count=None):
         if not self.cache_node_tensors:
             return self._board_to_tensor_profiled(
                 node.board,
                 storage_dtype=self.input_storage_dtype,
                 out=out,
+                repetition_count=repetition_count,
             )
 
         cached = getattr(node, "_board_tensor", None)
@@ -2877,6 +3093,7 @@ class MultiGameBatchMCTS:
             cached = self._board_to_tensor_profiled(
                 node.board,
                 storage_dtype=self.input_storage_dtype,
+                repetition_count=repetition_count,
             )
             node._board_tensor = cached
         if out is not None:
@@ -3768,6 +3985,7 @@ class MultiGameBatchMCTS:
         root_synced_flags = [False] * game_count
         board_histories = [None] * game_count
         root_position_counts = [None] * game_count
+        root_repetition_known = [False] * game_count
         budget_overrides = [None] * game_count
         native_tree_keys = [None] * game_count
         is_mapping_state = [False] * game_count
@@ -3786,12 +4004,13 @@ class MultiGameBatchMCTS:
                 root_synced = bool(gs.get('_root_synced', False))
                 board_history = gs.get('board_history', [])
                 position_counts = gs.get('position_counts')
+                position_history_complete = gs.get('position_history_complete')
                 budget_override = gs.get('simulation_budget_override')
                 native_tree_key = gs.get('_native_tree_key', id(board))
             else:
-                if len(gs) > 8:
+                if len(gs) > 9:
                     raise ValueError(
-                        "packed MCTS state supports at most 8 fields; "
+                        "packed MCTS state supports at most 9 fields; "
                         "use a mapping for named/extended state"
                     )
                 board = gs[0]
@@ -3801,6 +4020,7 @@ class MultiGameBatchMCTS:
                 position_counts = gs[5] if len(gs) > 5 else None
                 budget_override = gs[6] if len(gs) > 6 else None
                 native_tree_key = gs[7] if len(gs) > 7 else id(board)
+                position_history_complete = gs[8] if len(gs) > 8 else None
 
             boards[idx] = board
             incoming_root_present[idx] = root is not None
@@ -3810,6 +4030,21 @@ class MultiGameBatchMCTS:
                 if isinstance(position_counts, dict)
                 else _position_counts_from_board(board)
             )
+            if position_history_complete is not None:
+                root_repetition_known[idx] = bool(position_history_complete)
+            elif isinstance(position_counts, dict):
+                # Existing callers that provide explicit occurrence counts are
+                # treated as supplying complete provenance unless they mark it
+                # partial (legacy FEN-only hard starts do so explicitly).
+                root_repetition_known[idx] = True
+            else:
+                # A zero halfmove clock follows an irreversible move, so no
+                # earlier occurrence of the current position can exist. A
+                # nonzero-clock FEN without a retained move stack is unknown.
+                root_repetition_known[idx] = bool(
+                    int(board.halfmove_clock) == 0
+                    or bool(chess.move_history(board))
+                )
             budget_overrides[idx] = (
                 max(1, int(budget_override)) if budget_override is not None else None
             )
@@ -4043,6 +4278,7 @@ class MultiGameBatchMCTS:
                     leaf_game_indices,
                     board_histories,
                     root_position_counts,
+                    root_repetition_known,
                 )
 
                 backprop_t0 = perf_counter() if profile_timing else None
@@ -4608,6 +4844,7 @@ class MultiGameBatchMCTS:
         game_indices,
         board_histories,
         root_position_counts,
+        root_repetition_known,
     ):
         """
         Batch expansion + evaluation for leaf nodes across games.
@@ -4729,13 +4966,25 @@ class MultiGameBatchMCTS:
                     non_terminal_nodes,
                     non_terminal_game_indices,
                     board_histories,
+                    root_position_counts,
+                    root_repetition_known,
                     boards_np[:, :self._history_planes, :, :],
                 )
             for row_idx, (node, gi) in enumerate(zip(non_terminal_nodes, non_terminal_game_indices)):
                 if not self._native_input_planes_enabled:
+                    repetition_count = (
+                        _repetition_count_before_node(
+                            node,
+                            root_position_counts[gi],
+                            root_repetition_known[gi],
+                        )
+                        if self._path_dependent_repetition
+                        else None
+                    )
                     self._current_tensor_for_node(
                         node,
                         out=boards_np[row_idx, self._history_planes:, :, :],
+                        repetition_count=repetition_count,
                     )
             if profile_timing:
                 self._profile_add('batch_expand_tensor_pack_time', perf_counter() - tensor_pack_t0)

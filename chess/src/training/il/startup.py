@@ -1,8 +1,9 @@
 ﻿"""IL startup flow (menu, checkpoint catalog, resume/transfer loading)."""
 
 import sys
+from pathlib import Path
 
-from src.model import load_checkpoint_file, transfer_matching_weights
+from src.model import load_checkpoint_file, resolve_model_spec, transfer_matching_weights
 from src.models.catalog import (
     load_checkpoint_metadata,
     print_model_table,
@@ -35,6 +36,45 @@ def ask_resume_additional_epochs(completed_epochs, default_additional):
         except ValueError:
             pass
         print("Invalid value. Enter an integer >= 0.")
+
+
+def ask_il_architecture(available_profiles, default_architecture=None, input_fn=None, interactive=None):
+    """Choose a loadable IL architecture, defaulting safely outside a TTY."""
+    profiles = dict(available_profiles or {})
+    if not profiles:
+        raise ValueError("No registered architecture has a loadable model profile.")
+    if default_architecture not in profiles:
+        default_architecture = next(iter(profiles))
+    if interactive is None:
+        interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+    if not interactive:
+        return default_architecture
+
+    input_fn = input_fn or input
+    architecture_ids = list(profiles)
+    default_number = architecture_ids.index(default_architecture) + 1
+    print("\nAvailable model architectures for IL:")
+    for number, architecture_id in enumerate(architecture_ids, start=1):
+        marker = " (configured default)" if architecture_id == default_architecture else ""
+        print(f"{number}) {profiles[architecture_id]}{marker}")
+
+    while True:
+        try:
+            raw = input_fn(
+                f"Choose model [1-{len(architecture_ids)}] "
+                f"(Enter = {default_number}): "
+            ).strip()
+        except EOFError:
+            return default_architecture
+        if not raw:
+            return default_architecture
+        try:
+            choice = int(raw)
+            if 1 <= choice <= len(architecture_ids):
+                return architecture_ids[choice - 1]
+        except ValueError:
+            pass
+        print(f"Invalid choice. Enter a number from 1 to {len(architecture_ids)}.")
 
 
 def ask_il_target_positions(default_millions=15):
@@ -227,7 +267,7 @@ def _path_relative_to_base(path, base_dir):
         return str(path)
 
 
-def _collect_il_checkpoints(best_model_path, il_dir):
+def _collect_il_checkpoints(best_model_path, il_dir, fallback_best_paths=()):
     candidates = []
     il_checkpoints = sorted(
         il_dir.glob("*.pt"),
@@ -235,8 +275,11 @@ def _collect_il_checkpoints(best_model_path, il_dir):
         reverse=True,
     )
     has_version_best = any(checkpoint.name.endswith("_best.pt") for checkpoint in il_checkpoints)
-    if best_model_path.exists() and not has_version_best:
-        candidates.append(best_model_path)
+    if not has_version_best:
+        for path in (best_model_path, *tuple(fallback_best_paths or ())):
+            path = Path(path)
+            if path.exists() and path not in candidates:
+                candidates.append(path)
 
     for checkpoint in il_checkpoints:
         if checkpoint not in candidates:
@@ -279,8 +322,10 @@ def ask_il_start_mode(has_checkpoints):
         print("Invalid choice. Enter 1, 2, 3, or press Enter for default.")
 
 
-def has_il_checkpoints(best_model_path, il_dir):
-    return len(_collect_il_checkpoints(best_model_path, il_dir)) > 0
+def has_il_checkpoints(best_model_path, il_dir, fallback_best_paths=()):
+    return len(
+        _collect_il_checkpoints(best_model_path, il_dir, fallback_best_paths)
+    ) > 0
 
 
 def _normalize_source_state(source_state, target_keys):
@@ -368,8 +413,38 @@ def _safe_int(value):
         return None
 
 
+def _resume_contract_mismatch(model, checkpoint):
+    """Reject a full resume when a checkpoint belongs to a different model/data contract."""
+    target_spec = getattr(model, "model_spec", None)
+    if not isinstance(target_spec, dict):
+        return None
+    model_config = getattr(model, "model_config", {}) or {}
+    source_spec = resolve_model_spec({"model": dict(model_config)}, checkpoint)
+    target_input = target_spec.get("input_spec") or {}
+    source_input = source_spec.get("input_spec") or {}
+    target_policy = target_spec.get("policy_spec") or {}
+    source_policy = source_spec.get("policy_spec") or {}
+    checks = (
+        ("architecture", target_spec.get("architecture_id"), source_spec.get("architecture_id")),
+        ("input encoder", target_input.get("encoder_id"), source_input.get("encoder_id")),
+        ("history depth", target_input.get("history_positions"), source_input.get("history_positions")),
+        ("input planes", target_input.get("input_planes"), source_input.get("input_planes")),
+        ("policy codec", target_policy.get("codec_id"), source_policy.get("codec_id")),
+    )
+    mismatches = [
+        f"{name}: current={current!r}, checkpoint={saved!r}"
+        for name, current, saved in checks
+        if current != saved
+    ]
+    return "; ".join(mismatches) if mismatches else None
+
+
 def _build_checkpoint_catalog(candidates, model, device, base_dir):
     target_state = model.state_dict()
+    target_architecture = str(
+        getattr(model, "architecture_id", "")
+        or (getattr(model, "model_spec", {}) or {}).get("architecture_id", "")
+    )
     catalog = []
 
     for checkpoint_path in candidates:
@@ -397,7 +472,14 @@ def _build_checkpoint_catalog(candidates, model, device, base_dir):
             continue
 
         compat = _compute_compatibility(target_state, model_state)
+        source_architecture = str(entry.get("architecture_id") or "se_cnn_v9")
+        architecture_compatible = (
+            not target_architecture or source_architecture == target_architecture
+        )
+        if not architecture_compatible:
+            compat["strict_resume_ok"] = False
         entry.update(compat)
+        entry["architecture_compatible"] = architecture_compatible
         catalog.append(entry)
 
     return sort_entries_by_folder_and_elo(catalog)
@@ -546,9 +628,20 @@ def _infer_changed_parameter_names(model, transfer_report):
     return sorted(changed_params)
 
 
-def plan_il_startup(model, device, base_dir, best_model_path, il_dir, start_mode=None, base_learning_rate=None):
+def plan_il_startup(
+    model,
+    device,
+    base_dir,
+    best_model_path,
+    il_dir,
+    start_mode=None,
+    base_learning_rate=None,
+    fallback_best_paths=(),
+):
     """Interactive startup menu + checkpoint selection (no state loading yet)."""
-    available_checkpoints = _collect_il_checkpoints(best_model_path, il_dir)
+    available_checkpoints = _collect_il_checkpoints(
+        best_model_path, il_dir, fallback_best_paths
+    )
     catalog_base_dir = best_model_path.parent
     selected_checkpoint = None
     checkpoint_catalog = []
@@ -711,6 +804,20 @@ def apply_il_startup_plan(startup_plan, model, optimizer, scheduler, scaler, dev
         checkpoint = load_checkpoint_file(str(selected_checkpoint), device)
         if "model_state_dict" not in checkpoint:
             raise KeyError(f"Checkpoint missing 'model_state_dict': {selected_checkpoint}")
+        if start_mode in {"resume", "transfer"}:
+            contract_mismatch = _resume_contract_mismatch(model, checkpoint)
+            if contract_mismatch:
+                if start_mode == "transfer":
+                    raise ValueError(
+                        "IL transfer is unsupported across different model/data "
+                        f"contracts ({contract_mismatch}). Start a fresh run or "
+                        "select a checkpoint with the same architecture, encoder, "
+                        "history depth, input planes, and policy codec."
+                    )
+                raise ValueError(
+                    "Full IL resume is incompatible with the selected model profile "
+                    f"({contract_mismatch}). Choose New or Transfer explicitly."
+                )
         target_keys = set(model.state_dict().keys())
         normalized_model_state = _normalize_source_state(checkpoint["model_state_dict"], target_keys)
 
