@@ -1,7 +1,5 @@
 """Single-game API over the canonical batched MCTS engine."""
 
-from src.mcts.result import SearchResult
-
 
 class SingleGameMCTS:
     """
@@ -20,9 +18,7 @@ class SingleGameMCTS:
         self._root_synced = False
         self.board_history = []
 
-    def search(self, board, num_simulations, temperature=1.0, add_root_noise=False):
-        del temperature
-
+    def search(self, board, num_simulations, add_root_noise=False):
         game_state = {
             'board': board,
             'root': self.root,
@@ -37,7 +33,12 @@ class SingleGameMCTS:
         )
         self.root = game_state.get('root')
         self._root_synced = bool(game_state.get('_root_synced', False))
-        return search_results[0] if search_results else SearchResult.from_legacy_result({})
+        if len(search_results) != 1:
+            raise RuntimeError(
+                "SingleGameMCTS expected exactly one result from the canonical "
+                f"batched search, received {len(search_results)}"
+            )
+        return search_results[0]
 
     def advance_root(self, move):
         if self.root is None:

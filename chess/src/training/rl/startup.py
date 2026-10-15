@@ -189,36 +189,56 @@ def _load_with_allowed_missing_prefixes(model, checkpoint, allowed_missing_prefi
     return missing
 
 
+def _is_diagnostic_candidate_checkpoint(path):
+    path = Path(path)
+    return path.name.endswith("_candidate.pt") or any(
+        "_candidate_archive" in part for part in path.parts
+    )
+
+
 def _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir):
     """Return only checkpoints that belong to the RL checkpoint namespace.
 
     IL checkpoints remain valid for NEW/SELECT initialization, but they cannot
     restore an RL optimizer/replay runtime and therefore must not be offered by
-    the RESUME picker.
+    the RESUME picker. Keep archived RL runs selectable from their subfolders.
     """
     candidates = []
     if best_model_rl_path.exists():
         candidates.append(best_model_rl_path)
 
     rl_checkpoints = sorted(
-        rl_dir.glob("*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+        (
+            path
+            for path in Path(rl_dir).rglob("*.pt")
+            if path.is_file()
+            and not path.name.endswith(".replay.pt")
+            and not _is_diagnostic_candidate_checkpoint(path)
+        ),
+        key=lambda path: (-path.stat().st_mtime, str(path).lower()),
     )
     for checkpoint in rl_checkpoints:
         if checkpoint not in candidates:
             candidates.append(checkpoint)
 
-    return candidates
+    return sorted(
+        candidates,
+        key=lambda path: (-path.stat().st_mtime, str(path).lower()),
+    )
 
 
 def _collect_transfer_checkpoints(models_dir, best_model_rl_path, rl_dir):
     """Return every model checkpoint valid for NEW/SELECT or weight transfer."""
     candidates = _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir)
     all_checkpoints = sorted(
-        Path(models_dir).rglob("*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+        (
+            path
+            for path in Path(models_dir).rglob("*.pt")
+            if path.is_file()
+            and not path.name.endswith(".replay.pt")
+            and not _is_diagnostic_candidate_checkpoint(path)
+        ),
+        key=lambda path: (-path.stat().st_mtime, str(path).lower()),
     )
     for checkpoint in all_checkpoints:
         if checkpoint not in candidates:
@@ -228,18 +248,11 @@ def _collect_transfer_checkpoints(models_dir, best_model_rl_path, rl_dir):
 
 def _suggest_start_mode_default(best_model_rl_path, rl_dir):
     """Prefer a fresh RL run when the latest RL checkpoint is clearly underperforming."""
-    rl_candidates = []
-    if best_model_rl_path.exists():
-        rl_candidates.append(best_model_rl_path)
-
-    for checkpoint in sorted(
-        rl_dir.glob("*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    ):
-        if checkpoint not in rl_candidates:
-            rl_candidates.append(checkpoint)
-
+    rl_candidates = _collect_rl_checkpoints(
+        Path(best_model_rl_path).parent,
+        best_model_rl_path,
+        rl_dir,
+    )
     for checkpoint_path in rl_candidates:
         entry = load_checkpoint_metadata(checkpoint_path)
         if entry.get("error"):
@@ -372,8 +385,17 @@ def _print_checkpoint_catalog(catalog, start_mode):
         return
 
     mode_label = "Resume" if start_mode == "resume" else "Transfer"
+    display_catalog = []
+    for entry in catalog:
+        display_entry = dict(entry)
+        relative_path = Path(str(entry.get("path_rel") or ""))
+        if len(relative_path.parts) > 1:
+            # Several archived RL runs can contain the same checkpoint
+            # filename. Show the full parent path so the picker is unambiguous.
+            display_entry["folder"] = str(relative_path.parent)
+        display_catalog.append(display_entry)
     print_model_table(
-        catalog,
+        display_catalog,
         title=f"Available Checkpoints ({mode_label})",
         show_folder=True,
         show_version=True,
@@ -386,7 +408,7 @@ def _print_checkpoint_catalog(catalog, start_mode):
     )
 
 
-def _choose_checkpoint_path(catalog):
+def _choose_checkpoint_path(catalog, *, prefer_newest=False):
     if not catalog:
         return None
 
@@ -395,6 +417,13 @@ def _choose_checkpoint_path(catalog):
         return None
 
     if not sys.stdin.isatty():
+        if prefer_newest:
+            valid_entries.sort(
+                key=lambda entry: (
+                    -float(entry.get("mtime_ts") or 0.0),
+                    str(entry.get("path_rel") or "").lower(),
+                )
+            )
         return valid_entries[0]["path"]
 
     while True:
@@ -454,6 +483,7 @@ def plan_rl_startup(
     available_checkpoints = initial_plan.get("available_checkpoints")
     if available_checkpoints is None:
         available_checkpoints = _collect_rl_checkpoints(models_dir, best_model_rl_path, rl_dir)
+    forced_checkpoint = initial_plan.get("forced_checkpoint")
     selected_checkpoint = None
     checkpoint_catalog = []
     start_mode = initial_plan.get("start_mode")
@@ -462,7 +492,7 @@ def plan_rl_startup(
     if start_mode is None:
         if prefer_fresh_il:
             default_choice = "1"
-            default_hint = "RL49 quality experiment: NEW from canonical IL with empty replay"
+            default_hint = "RL quality experiment: NEW from canonical IL with empty replay"
         else:
             default_choice, default_hint = _suggest_start_mode_default(best_model_rl_path, rl_dir)
         start_mode = _choose_start_mode(
@@ -493,6 +523,7 @@ def plan_rl_startup(
             "start_mode": start_mode,
             "new_init_mode": new_init_mode,
             "available_checkpoints": available_checkpoints,
+            "forced_checkpoint": forced_checkpoint,
         }
 
     if start_mode == "new":
@@ -515,11 +546,32 @@ def plan_rl_startup(
                 and bool(entry.get("strict_resume_ok"))
             ]
         _print_checkpoint_catalog(checkpoint_catalog, start_mode)
-        selected_checkpoint = _choose_checkpoint_path(checkpoint_catalog)
+        if forced_checkpoint is not None:
+            forced_path = Path(forced_checkpoint).resolve()
+            forced_entries = [
+                entry
+                for entry in checkpoint_catalog
+                if not entry.get("error")
+                and Path(str(entry.get("path", ""))).resolve() == forced_path
+            ]
+            if len(forced_entries) != 1:
+                raise RuntimeError(
+                    "The explicitly requested resume checkpoint is not a unique, "
+                    "strictly compatible RL checkpoint with optimizer state: "
+                    f"{forced_path}"
+                )
+            selected_checkpoint = forced_entries[0]["path"]
+        else:
+            selected_checkpoint = _choose_checkpoint_path(
+                checkpoint_catalog,
+                prefer_newest=(start_mode == "resume"),
+            )
 
     if start_mode in {"resume", "transfer"} and selected_checkpoint is None:
-        print("WARNING: No valid checkpoint available. Falling back to new RL training.")
-        start_mode = "new"
+        raise RuntimeError(
+            f"No valid checkpoint was selected for RL startup mode {start_mode!r}. "
+            "Choose NEW explicitly if a fresh run is intended."
+        )
 
     selected_entry = _find_checkpoint_entry(checkpoint_catalog, selected_checkpoint)
     selected_checkpoint_label = None
@@ -558,8 +610,9 @@ def apply_rl_startup_plan(
     best_win_rate = 0.0
 
     if start_mode in {"resume", "transfer"} and selected_checkpoint is None:
-        print("WARNING: Startup plan has no checkpoint. Falling back to new RL training.")
-        start_mode = "new"
+        raise RuntimeError(
+            f"RL startup mode {start_mode!r} requires an explicit compatible checkpoint."
+        )
 
     if start_mode in {"resume", "transfer"} and selected_checkpoint is not None:
         print(f"\nLoading startup checkpoint: {selected_checkpoint_label}")
@@ -574,21 +627,7 @@ def apply_rl_startup_plan(
                     model_state,
                     target_keys=set(model.state_dict()),
                 )
-                try:
-                    model.load_state_dict(model_state)
-                except RuntimeError:
-                    report = transfer_matching_weights(model, checkpoint)
-                    allowed_missing = (
-                        'search_q_fc.',
-                    )
-                    if report.get('shape_mismatch') or any(
-                        not str(key).startswith(allowed_missing)
-                        for key in report.get('missing_keys', [])
-                    ):
-                        raise
-                    print(
-                        "Resume upgrade: initialized the optional search-Q head."
-                    )
+                model.load_state_dict(model_state)
 
                 checkpoint_epoch = _safe_int(checkpoint.get("epoch"))
                 if checkpoint_epoch is not None:
@@ -600,35 +639,26 @@ def apply_rl_startup_plan(
 
                 if optimizer is not None:
                     optimizer_state = checkpoint.get("optimizer_state_dict")
-                    if isinstance(optimizer_state, dict):
-                        try:
-                            optimizer.load_state_dict(optimizer_state)
-                        except ValueError as exc:
-                            print(
-                                "Resume warning: optimizer_state_dict is incompatible with the "
-                                f"current RL optimizer groups; optimizer reset. ({exc})"
-                            )
-                    else:
-                        print("Resume warning: optimizer_state_dict not found; optimizer reset.")
+                    if not isinstance(optimizer_state, dict):
+                        raise KeyError("missing optimizer_state_dict for full resume")
+                    optimizer.load_state_dict(optimizer_state)
 
                 if scaler is not None and scaler.is_enabled():
                     scaler_state = checkpoint.get("scaler_state_dict")
-                    if isinstance(scaler_state, dict):
-                        scaler.load_state_dict(scaler_state)
+                    if not isinstance(scaler_state, dict):
+                        raise KeyError("missing scaler_state_dict for AMP resume")
+                    scaler.load_state_dict(scaler_state)
 
                 print(
-                    f"Resume loaded: next_iteration={start_iteration + 1}, "
+                    f"Model/optimizer resume loaded: next_iteration={start_iteration + 1}, "
                     f"best_win_rate={best_win_rate:.2%}"
                 )
             except Exception as exc:
-                print(f"WARNING: Full resume failed ({exc})")
-                print("Falling back to transfer mode (matching tensors only).")
-                report = transfer_matching_weights(model, checkpoint)
-                transfer_match_ratio = report.get("match_ratio")
-                _print_transfer_report(report)
-                start_mode = "transfer"
-                start_iteration = 0
-                best_win_rate = 0.0
+                raise RuntimeError(
+                    "RL model/optimizer resume failed. Resume is not interchangeable with "
+                    "transfer because transfer resets optimizer, schedule and replay "
+                    "state; select TRANSFER explicitly if that is intended."
+                ) from exc
         else:
             report = transfer_matching_weights(model, checkpoint)
             transfer_match_ratio = report.get("match_ratio")

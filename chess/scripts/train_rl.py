@@ -9,11 +9,16 @@ NEW Features:
 
 import os
 import sys
+import argparse
 import signal
 import shutil
 import contextlib
 import csv
+import hashlib
+import json
 import multiprocessing as _stdlib_mp
+import random
+import subprocess
 from collections import defaultdict
 
 try:
@@ -69,6 +74,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 import gc
+import copy
 import time
 import pickle
 import tempfile
@@ -93,26 +99,19 @@ from src.model import (
     load_checkpoint_file,
     normalize_state_dict_keys,
     save_checkpoint,
-    transfer_matching_weights,
 )
+from src.models.checkpoints import restore_rng_state
 from src.game import backend as chess
 from src.mcts.native import get_native_mcts
 
-# Import MCTS self-play
-try:
-    from src.mcts.search import (
-        MultiGameBatchMCTS,
-        _build_sparse_policy_target_from_visits,
-        _policy_uptake_weight,
-        _resolve_dynamic_simulation_budget,
-        _resolve_replay_max_policy_targets,
-        _search_correction_metadata,
-    )
-    from src.selfplay.workers import run_selfplay_worker
-    MCTS_SELFPLAY_AVAILABLE = True
-except ImportError:
-    MCTS_SELFPLAY_AVAILABLE = False
-    print("Warning: MCTS self-play not available")
+from src.mcts.search import (
+    MultiGameBatchMCTS,
+    _build_sparse_policy_target_from_visits,
+    _resolve_dynamic_simulation_budget,
+    _resolve_replay_max_policy_targets,
+    _search_correction_metadata,
+)
+from src.selfplay.workers import run_selfplay_worker
 
 # Import training modules
 from src.common.logger import TrainingLogger
@@ -122,6 +121,7 @@ from src.evaluation.elo_runner import (
     build_final_mcts_elo_configs,
     checkpoint_elo_seed,
     elo_protocol_matches_settings,
+    elo_protocol_settings,
     run_elo_check,
     safe_float as _safe_float,
 )
@@ -131,11 +131,13 @@ from src.training.rl.replay import (
     REPLAY_SOURCE_LEARNER,
     ReplayBuffer,
 )
+from src.training.rl.search_control import RegretOpeningArchive
 from src.training.rl.correction_audit import (
     CORRECTION_AUDIT_MAX_ROWS,
     correction_audit_metrics,
     evaluate_correction_cohort,
     freeze_replay_batch,
+    holdout_metrics,
 )
 from src.training.rl.trainer import (
     close_eval_central_runtime,
@@ -143,7 +145,7 @@ from src.training.rl.trainer import (
     evaluate_models_no_mcts,
     is_transient_cuda_error,
     prepare_eval_central_runtime,
-    resolve_policy_correction_rank_loss_weight,
+    _resolve_eval_opening_lines,
     train_on_batch_rl,
 )
 from src.training.rl.startup import (
@@ -170,6 +172,53 @@ from src.common.runtime import (
     cleanup_interrupted_log_csv,
 )
 from src.common.syzygy import ensure_syzygy_tables, describe_syzygy_status
+from src.evaluation.rl_promotion import (
+    anchor_candidate_needs_more_games as _anchor_candidate_needs_more_games,
+    attach_paired_score_stats as _attach_paired_score_stats,
+    combine_eval_stats as _combine_eval_stats,
+    empty_eval_stats as _empty_eval_stats,
+    eval_mcts_move_metrics as _eval_mcts_move_metrics,
+    paired_score_standard_error as _paired_score_standard_error,
+    promotion_anchor_safety_decision as _promotion_anchor_safety_decision,
+    promotion_confirmation_decision as _promotion_confirmation_decision,
+    promotion_eval_has_full_evidence as _promotion_eval_has_full_evidence,
+    promotion_raw_nn_decision as _promotion_nn_safety_decision,
+    next_raw_candidate_retest_target as _next_raw_candidate_retest_target,
+    safe_score_rate as _safe_score_rate,
+    score_rate_lower_bound as _score_rate_lower_bound,
+    score_rate_standard_error as _score_rate_standard_error,
+    score_rate_upper_bound as _score_rate_upper_bound,
+    evaluate_mcts_selector_funnel as _run_cumulative_promotion_funnel,
+)
+from src.evaluation.rl_candidate_archive import (
+    MctsCandidateArchive,
+    model_state_sha256 as _model_state_sha256,
+    json_sha256 as _json_sha256,
+    restore_candidate_archive_identity as _restore_candidate_archive_identity,
+    sha256_file as _sha256_file,
+)
+
+try:
+    from src.evaluation.promotion_holdout import (
+        promotion_holdout_suite_capacity,
+        promotion_holdout_ledger_status,
+        reserve_promotion_holdout_suites,
+        finish_promotion_holdout_reservation,
+        validate_promotion_holdout_bank,
+    )
+    _PROMOTION_HOLDOUT_IMPORT_ERROR = None
+except Exception as _promotion_holdout_import_exc:
+    # Keep diagnostics importable if the bank package is missing; promotion
+    # remains fail-closed when a candidate reaches independent confirmation.
+    promotion_holdout_suite_capacity = None
+    promotion_holdout_ledger_status = None
+    reserve_promotion_holdout_suites = None
+    finish_promotion_holdout_reservation = None
+    validate_promotion_holdout_bank = None
+    _PROMOTION_HOLDOUT_IMPORT_ERROR = (
+        f"{type(_promotion_holdout_import_exc).__name__}: "
+        f"{_promotion_holdout_import_exc}"
+    )
 
 
 _LAST_RUN_LOG_CSV = None
@@ -181,18 +230,348 @@ _LAST_RUN_LOG_PNG = None
 # sample coverage and add little compute, but make each iteration a materially
 # larger optimization step.
 _TARGET_OPTIMIZER_STEPS_PER_REPLAY_PASS = 48
+# Keep the measured short warm-up even for a longer run. The cosine itself must
+# span the requested run so useful updates do not collapse to the floor at i61.
+_RL_LR_WARMUP_REFERENCE_ITERATIONS = 60
 # Anchor decides whether a promoted checkpoint may replace a long-lived safety
-# baseline.  A close result is therefore allowed to continue to 256 games; the
+# baseline.  A close result is therefore allowed to continue to 192 games; the
 # sequential gate still stops obvious wins/losses after the initial batch.
-_ANCHOR_CANDIDATE_MAX_GAMES = 256
-_CHAMPION_REPLAY_MIN_FRACTION = 0.10
+_ANCHOR_CANDIDATE_MAX_GAMES = 192
+_CHAMPION_REPLAY_MIN_FRACTION = 0.05
 _CHAMPION_REPLAY_DECAY_ITERATIONS = 8
-_RAW_CANDIDATE_RETEST_GAMES = 192
-_RAW_CANDIDATE_MAX_GAMES = 256
-_PROMOTION_CONFIRMATION_GAMES = 128
-_PROMOTION_CONFIRMATION_LB_FLOOR = 0.49
+_RAW_CANDIDATE_MAX_GAMES = 192
 _ANCHOR_NO_MCTS_RETEST_GAMES = 256
 _ANCHOR_NO_MCTS_MAX_GAMES = 512
+_PROMOTION_CONFIRMATION_GAMES = 192
+_PROMOTION_CONFIRMATION_OPENINGS = 96
+_PROMOTION_CONFIRMATION_INDEPENDENT_384_GAMES = 384
+_PROMOTION_CONFIRMATION_INDEPENDENT_384_OPENINGS = 192
+_PROMOTION_CONFIRMATION_SCORE_MIN = 0.53
+_PROMOTION_CONFIRMATION_LB_MIN = 0.50
+_PROMOTION_CONFIRMATION_Z_MIN = 1.645
+_PROMOTION_CONFIRMATION_CONFIG_DEFAULTS = {
+    'promotion_confirmation_games': _PROMOTION_CONFIRMATION_GAMES,
+    'promotion_confirmation_openings': _PROMOTION_CONFIRMATION_OPENINGS,
+    'promotion_confirmation_score_rate_min': _PROMOTION_CONFIRMATION_SCORE_MIN,
+    'promotion_confirmation_score_lower_bound_min': _PROMOTION_CONFIRMATION_LB_MIN,
+    'promotion_confirmation_suite_offset': 0,
+    'promotion_confirmation_mode': 'legacy_192',
+    'promotion_confirmation_reserved_suite_indices': [],
+    'promotion_no_mcts_max_games': _RAW_CANDIDATE_MAX_GAMES,
+}
+_MCTS_BUDGET_QUALITY_RAW_FIELDS = (
+    'samples',
+    'useful_change_count',
+    'policy_kl_sum',
+    'target_entropy_sum',
+    'fresh_sim_sum',
+    'fresh_sim_samples',
+    'fresh_budget_sum',
+)
+_MCTS_BUDGET_QUALITY_COUNT_FIELDS = {
+    'samples', 'useful_change_count', 'fresh_sim_samples',
+}
+_ACTOR_GUARD_FAILURES = 2
+_ACTOR_GUARD_CONTRACT_VERSION = 2
+_RL_HOLDOUT_FRACTION = 0.05
+_RL_HOLDOUT_MAX_POSITIONS = 8192
+# A full compact replay is roughly 1.5 GiB at the current adaptive capacity.
+# Persist it often enough to bound resume loss without adding that write to
+# every five-minute training iteration.
+_REPLAY_SIDECAR_INTERVAL = 5
+
+
+def _apply_promotion_confirmation_config_defaults(rl_cfg):
+    """Keep pre-confirmation resume configs usable with the current gate."""
+    if not isinstance(rl_cfg, dict):
+        raise TypeError('reinforcement_learning config must be a dictionary')
+    for key, value in _PROMOTION_CONFIRMATION_CONFIG_DEFAULTS.items():
+        rl_cfg.setdefault(key, value)
+    return rl_cfg
+
+
+def _merge_mcts_budget_quality_levels(target, source):
+    """Add raw per-budget sums/counts from one self-play result into another."""
+    source_levels = dict((source or {}).get('mcts_budget_quality_levels_raw') or {})
+    if not source_levels:
+        return
+    target_levels = target.setdefault('mcts_budget_quality_levels_raw', {})
+    for level, raw in source_levels.items():
+        if not isinstance(raw, dict):
+            continue
+        bucket = target_levels.setdefault(
+            str(level),
+            {
+                field: (0 if field in _MCTS_BUDGET_QUALITY_COUNT_FIELDS else 0.0)
+                for field in _MCTS_BUDGET_QUALITY_RAW_FIELDS
+            },
+        )
+        for field in _MCTS_BUDGET_QUALITY_RAW_FIELDS:
+            value = raw.get(field, 0)
+            try:
+                bucket[field] += (
+                    int(value or 0)
+                    if field in _MCTS_BUDGET_QUALITY_COUNT_FIELDS
+                    else float(value or 0.0)
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+
+def _summarize_mcts_budget_quality_levels(raw_levels):
+    """Build per-budget metrics from merged raw totals using their own denominators."""
+    ordered_levels = sorted(
+        (str(key) for key in dict(raw_levels or {}) if str(key) != 'other'),
+        key=lambda key: (0, int(key)) if key.isdigit() else (1, key),
+    )
+    if 'other' in dict(raw_levels or {}):
+        ordered_levels.append('other')
+    summary = {}
+    for level in ordered_levels:
+        raw = dict((raw_levels or {}).get(level) or {})
+        samples = max(0, int(raw.get('samples', 0) or 0))
+        useful = max(0, int(raw.get('useful_change_count', 0) or 0))
+        fresh_samples = max(0, int(raw.get('fresh_sim_samples', 0) or 0))
+        fresh_budget_sum = max(0.0, float(raw.get('fresh_budget_sum', 0.0) or 0.0))
+        fresh_sim_sum = max(0.0, float(raw.get('fresh_sim_sum', 0.0) or 0.0))
+        summary[level] = {
+            'samples': samples,
+            'useful_change_count': useful,
+            'useful_change_rate': useful / samples if samples > 0 else None,
+            'policy_kl_mean': (
+                float(raw.get('policy_kl_sum', 0.0) or 0.0) / samples
+                if samples > 0 else None
+            ),
+            'target_entropy_mean': (
+                float(raw.get('target_entropy_sum', 0.0) or 0.0) / samples
+                if samples > 0 else None
+            ),
+            'fresh_simulations_mean': (
+                fresh_sim_sum / fresh_samples if fresh_samples > 0 else None
+            ),
+            'fresh_simulations_known_fraction': (
+                fresh_samples / samples if samples > 0 else 0.0
+            ),
+            'fresh_sim_share': (
+                fresh_sim_sum / fresh_budget_sum if fresh_budget_sum > 0.0 else None
+            ),
+        }
+    return summary
+
+
+def _reanalysis_search_accounting(metadata):
+    """Keep reanalysis provenance aligned with the replacement policy target."""
+    metadata = dict(metadata or {})
+    return {
+        'simulation_budget': metadata.get('simulation_budget'),
+        'simulations_used': metadata.get('simulations_used'),
+        'fresh_simulations_used': metadata.get('fresh_simulations_used'),
+        'inherited_visit_credit': metadata.get('inherited_visit_credit'),
+    }
+
+
+def _accumulate_mcts_quality_stats(target, source):
+    """Merge one self-play result into the run-level quality accumulator."""
+    source = dict(source or {})
+    if source.get('mcts_q_delta_values') is not None:
+        values = target.setdefault('mcts_q_delta_values', [])
+        values.extend(list(source.get('mcts_q_delta_values') or []))
+    if source.get('mcts_changed_q_delta_values') is not None:
+        values = target.setdefault('mcts_changed_q_delta_values', [])
+        values.extend(list(source.get('mcts_changed_q_delta_values') or []))
+    _merge_q_delta_histogram(
+        target,
+        'mcts_q_delta_hist',
+        source.get('mcts_q_delta_hist'),
+        source.get('mcts_q_delta_values'),
+    )
+    _merge_q_delta_histogram(
+        target,
+        'mcts_changed_q_delta_hist',
+        source.get('mcts_changed_q_delta_hist'),
+        source.get('mcts_changed_q_delta_values'),
+    )
+    for key in [
+        'policy_target_sample_count',
+        'policy_target_challenge_delta_intervention_count',
+        'mcts_prior_agreement_samples',
+        'mcts_prior_agreement_sum',
+        'mcts_prior_changed_count',
+        'mcts_prior_top_visit_prob_sum',
+        'mcts_top_prior_prob_sum',
+        'mcts_policy_kl_sum',
+        'mcts_top_visit_prob_sum',
+        'mcts_visit_gap_sum',
+        'mcts_visit_entropy_sum',
+        'mcts_good_target_count',
+        'mcts_explored_prior_mass_sum',
+        'mcts_visited_move_count_sum',
+        'mcts_legal_move_count_sum',
+        'mcts_visit_coverage_ratio_sum',
+        'gumbel_action_budget_sum',
+        'gumbel_considered_actions_sum',
+        'gumbel_initial_round_visits_sum',
+        'gumbel_width_adapted_count',
+        'mcts_q_delta_samples',
+        'mcts_q_delta_sum',
+        'mcts_changed_to_lower_q_count',
+        'mcts_changed_to_higher_q_count',
+        'mcts_changed_q_delta_samples',
+        'mcts_changed_q_delta_sum',
+    ]:
+        target[key] = float(target.get(key, 0.0)) + float(source.get(key, 0.0) or 0.0)
+    for phase in ('opening', 'middlegame', 'endgame'):
+        for suffix in ('samples', 'changed_count'):
+            key = f'mcts_phase_{phase}_{suffix}'
+            target[key] = float(target.get(key, 0.0)) + float(source.get(key, 0.0) or 0.0)
+    for budget in (64, 128, 192, 256, 320):
+        prefix = f'mcts_budget_{budget}'
+        for suffix in (
+            'samples',
+            'useful_change_count',
+            'policy_kl_sum',
+            'target_entropy_sum',
+            'fresh_sim_sum',
+            'budget_sum',
+        ):
+            key = f'{prefix}_{suffix}'
+            target[key] = float(target.get(key, 0.0)) + float(source.get(key, 0.0) or 0.0)
+    _merge_mcts_budget_quality_levels(target, source)
+
+
+def _validate_promotion_confirmation_setup(rl_cfg, full_config=None):
+    """Fail before self-play if independent promotion confirmation cannot run."""
+    _apply_promotion_confirmation_config_defaults(rl_cfg)
+    if _PROMOTION_HOLDOUT_IMPORT_ERROR:
+        raise RuntimeError(
+            'RL startup aborted before self-play: promotion confirmation bank '
+            f'is unavailable ({_PROMOTION_HOLDOUT_IMPORT_ERROR}).'
+        )
+    if any(
+        item is None
+        for item in (
+            promotion_holdout_suite_capacity,
+            promotion_holdout_ledger_status,
+            validate_promotion_holdout_bank,
+        )
+    ):
+        raise RuntimeError(
+            'RL startup aborted before self-play: promotion confirmation '
+            'selector or validator is unavailable.'
+        )
+    try:
+        if validate_promotion_holdout_bank() is not True:
+            raise ValueError('holdout bank validator did not return true')
+        suite_capacity = int(promotion_holdout_suite_capacity())
+        suite_offset = int(rl_cfg.get('promotion_confirmation_suite_offset', 0) or 0)
+        mode = str(rl_cfg.get('promotion_confirmation_mode', 'legacy_192'))
+        if mode not in ('legacy_192', 'independent_384'):
+            raise ValueError(f'unsupported promotion confirmation mode {mode!r}')
+        suites_per_attempt = 2 if mode == 'independent_384' else 1
+        if suite_offset < 0 or suite_offset >= suite_capacity:
+            raise ValueError(
+                f'promotion confirmation suite offset {suite_offset} is outside '
+                f'the bank capacity {suite_capacity}'
+            )
+        reserved_indices = tuple(
+            int(index)
+            for index in (rl_cfg.get('promotion_confirmation_reserved_suite_indices') or ())
+        )
+        if len(set(reserved_indices)) != len(reserved_indices):
+            raise ValueError('reserved promotion confirmation suites contain duplicates')
+        if any(index < 0 or index >= suite_capacity for index in reserved_indices):
+            raise ValueError('reserved promotion confirmation suite is outside bank capacity')
+        ledger_status = promotion_holdout_ledger_status(
+            reserved_indices=reserved_indices,
+            preferred_start_index=suite_offset,
+        )
+        if int(ledger_status.get('remaining', 0)) < suites_per_attempt:
+            raise ValueError(
+                'promotion confirmation holdout exhausted before self-play: '
+                f'mode={mode}, need={suites_per_attempt}, '
+                f'remaining={ledger_status.get("remaining", 0)}, '
+                f'capacity={ledger_status.get("capacity", suite_capacity)}, '
+                f'historically_consumed={ledger_status.get("historical_suite_count", "unknown")}, '
+                f'ledger={ledger_status.get("ledger_path", "unknown")}'
+            )
+        if full_config is not None:
+            fixed_raw = bool(rl_cfg.get('eval_no_mcts_use_fixed_openings', True))
+            raw_max = int(
+                rl_cfg.get('promotion_no_mcts_max_games', _RAW_CANDIDATE_MAX_GAMES)
+                or _RAW_CANDIDATE_MAX_GAMES
+            )
+            raw_initial = int(rl_cfg.get('eval_no_mcts_games', 96) or 96)
+            raw_opening_count = len(_resolve_eval_opening_lines(full_config))
+            if raw_max < raw_initial or raw_max <= 0 or raw_max % 2:
+                raise ValueError(
+                    'promotion_no_mcts_max_games must be even and at least '
+                    'eval_no_mcts_games'
+                )
+            if raw_max > _RAW_CANDIDATE_MAX_GAMES:
+                raise ValueError(
+                    'promotion_no_mcts_max_games cannot exceed 192 until a '
+                    'predeclared multi-look confidence correction is configured'
+                )
+            if fixed_raw and raw_max > 2 * raw_opening_count:
+                raise ValueError(
+                    'raw-NN promotion budget exceeds the unique fixed-opening '
+                    f'capacity ({raw_opening_count} pairs / {2 * raw_opening_count} games)'
+                )
+        expected_games, expected_openings = (
+            (_PROMOTION_CONFIRMATION_INDEPENDENT_384_GAMES,
+             _PROMOTION_CONFIRMATION_INDEPENDENT_384_OPENINGS)
+            if mode == 'independent_384'
+            else (_PROMOTION_CONFIRMATION_GAMES, _PROMOTION_CONFIRMATION_OPENINGS)
+        )
+        if int(rl_cfg['promotion_confirmation_games'] or 0) != expected_games:
+            raise ValueError(f'{mode} confirmation requires exactly {expected_games} games')
+        if int(rl_cfg['promotion_confirmation_openings'] or 0) != expected_openings:
+            raise ValueError(
+                f'{mode} confirmation requires exactly {expected_openings} paired openings'
+            )
+        if mode == 'independent_384' and float(rl_cfg.get('promotion_stat_gate_z', 0.0) or 0.0) < _PROMOTION_CONFIRMATION_Z_MIN:
+            raise ValueError('independent_384 requires promotion_stat_gate_z >= 1.645')
+    except Exception as exc:
+        raise RuntimeError(
+            'RL startup aborted before self-play: promotion confirmation '
+            f'configuration or bank validation failed ({type(exc).__name__}: {exc}).'
+        ) from exc
+
+
+def _source_tree_identity(base_dir):
+    """Hash the exact RL-relevant source tree, including untracked files."""
+    base_dir = Path(base_dir).resolve()
+    # ``main`` passes the chess project directory, while tests and external
+    # callers may pass the repository root. Resolve both without silently
+    # hashing an empty ``chess/chess`` tree.
+    chess_root = base_dir if (base_dir / 'src').is_dir() else base_dir / 'chess'
+    roots = (
+        chess_root / 'src',
+        chess_root / 'scripts',
+        chess_root / 'config',
+    )
+    suffixes = {'.py', '.yaml', '.yml', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.cu', '.cuh'}
+    files = []
+    for root in roots:
+        if root.is_dir():
+            files.extend(
+                path for path in root.rglob('*')
+                if path.is_file() and path.suffix.lower() in suffixes
+            )
+    if chess_root.is_dir():
+        files.extend(path for path in chess_root.glob('test*.py') if path.is_file())
+
+    digest = hashlib.sha256()
+    unique_files = sorted(set(files), key=lambda path: path.as_posix().lower())
+    for path in unique_files:
+        relative = path.relative_to(chess_root).as_posix()
+        digest.update(relative.encode('utf-8'))
+        digest.update(b'\0')
+        with path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        digest.update(b'\0')
+    return digest.hexdigest(), len(unique_files)
 
 
 def _csv_last_iteration(path):
@@ -250,15 +629,24 @@ def _resolve_resume_history_csv(
         payload.get(key)
         for key in ("rl_run_log_csv", "run_log_csv", "source_log_csv")
     )
+    declared_artifacts = [
+        raw_path
+        for raw_path in artifact_candidates
+        if raw_path is not None and str(raw_path).strip()
+    ]
     excluded = Path(exclude_path).resolve() if exclude_path is not None else None
-    for raw_path in artifact_candidates:
-        if not raw_path:
-            continue
+    for raw_path in declared_artifacts:
         candidate = Path(str(raw_path))
         if not candidate.is_absolute():
             candidate = Path(base_dir) / candidate
         if candidate.exists() and (excluded is None or candidate.resolve() != excluded):
             return candidate
+
+    # A checkpoint that names its run artifacts has already established
+    # provenance. If those paths were archived or removed, prefix-matching
+    # another run can splice unrelated history into the resumed plots.
+    if declared_artifacts:
+        return None
 
     csv_dir = Path(logs_dir) / "csv"
     if not csv_dir.exists():
@@ -308,11 +696,89 @@ def _rl_run_artifact_metadata(logger, base_dir):
         except (OSError, ValueError):
             return str(path)
 
-    return {
+    result = {
         "main_csv": _portable(logger.csv_path),
         "performance_csv": _portable(logger.performance_log_path),
         "data_quality_csv": _portable(logger.data_quality_log_path),
     }
+    manifest_path = getattr(logger, 'run_manifest_path', None)
+    if manifest_path is not None:
+        result['run_manifest'] = _portable(manifest_path)
+    return result
+
+
+def _write_rl_run_manifest(logger, config, checkpoint_path, base_dir):
+    """Persist the exact code/config/checkpoint/seed identity of a quality run."""
+    base_dir = Path(base_dir).resolve()
+
+    def _git(*args):
+        try:
+            completed = subprocess.run(
+                ['git', *args],
+                cwd=base_dir,
+                capture_output=True,
+                text=True,
+                check=True,
+                creationflags=(0x08000000 if os.name == 'nt' else 0),
+            )
+            return completed.stdout.strip()
+        except Exception:
+            return ''
+
+    checkpoint_path = Path(checkpoint_path).resolve() if checkpoint_path else None
+    checkpoint_sha256 = None
+    if checkpoint_path is not None and checkpoint_path.is_file():
+        digest = hashlib.sha256()
+        with checkpoint_path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        checkpoint_sha256 = digest.hexdigest()
+
+    manifest_path = Path(logger.csv_path).with_name(
+        f"{Path(logger.csv_path).stem}_manifest.json"
+    )
+    source_tree_sha256, source_tree_file_count = _source_tree_identity(base_dir)
+    payload = {
+        'created_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+        'git_commit': _git('rev-parse', 'HEAD') or None,
+        'git_dirty': bool(_git('status', '--porcelain')),
+        'source_tree_sha256': source_tree_sha256,
+        'source_tree_file_count': source_tree_file_count,
+        'checkpoint_path': str(checkpoint_path) if checkpoint_path else None,
+        'checkpoint_sha256': checkpoint_sha256,
+        'seed': int(config.get('seed', 490050)),
+        'worker_seed_stride': 100_003,
+        'iteration_seed_stride': 1_000_003,
+        'effective_config': config,
+    }
+    manifest_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str),
+        encoding='utf-8',
+    )
+    logger.run_manifest_path = manifest_path
+    return manifest_path
+
+
+def _update_rl_run_manifest_runtime(logger, **runtime_values):
+    """Record resolved mutable capacities without rewriting the input config."""
+    manifest_path = getattr(logger, 'run_manifest_path', None)
+    if manifest_path is None:
+        return False
+    manifest_path = Path(manifest_path)
+    try:
+        payload = json.loads(manifest_path.read_text(encoding='utf-8'))
+        runtime = dict(payload.get('effective_runtime', {}) or {})
+        runtime.update(runtime_values)
+        payload['effective_runtime'] = runtime
+        temporary_path = manifest_path.with_suffix(f"{manifest_path.suffix}.tmp")
+        temporary_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str),
+            encoding='utf-8',
+        )
+        os.replace(temporary_path, manifest_path)
+        return True
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _build_eval_config_with_exact_simulations(config, simulations):
@@ -326,44 +792,239 @@ def _build_eval_config_with_exact_simulations(config, simulations):
     return eval_config
 
 
-def _use_best_for_selfplay_iteration(
-    iteration_number,
-    *,
-    learner_only_bootstrap_iterations,
-    champion_refresh_due,
-    learner_selfplay_safe,
-):
-    if int(iteration_number) <= max(0, int(learner_only_bootstrap_iterations)):
-        return False
-    return bool(champion_refresh_due or not learner_selfplay_safe)
+def _update_actor_guard_state(consecutive_failures, guard_safe_now):
+    """Gate only the self-play actor; never mutate the continuous learner."""
+    if bool(guard_safe_now):
+        return True, 0
+    failures = min(
+        _ACTOR_GUARD_FAILURES,
+        max(0, int(consecutive_failures)) + 1,
+    )
+    return failures < _ACTOR_GUARD_FAILURES, failures
 
 
-def _resolve_champion_replay_sample_fraction(base_fraction, iterations_since_promotion):
-    """Decay pinned rehearsal without letting the champion signal disappear."""
+def _actor_guard_evidence_is_safe(mcts_selfplay_safe):
+    """Protect self-play from search regression without suppressing policy recovery.
+
+    Raw-NN strength is a promotion contract, not an actor-selection contract.
+    Search can remain a strong policy-improvement operator while the raw policy
+    is temporarily weak. Replacing that learner with best-vs-best games removes
+    precisely the on-policy search targets needed to close the raw-policy gap.
+    """
+    return bool(mcts_selfplay_safe)
+
+
+def _actor_guard_failure_is_actionable(eval_stage):
+    """Never switch the actor from a 48-game preliminary result alone."""
+    return str(eval_stage or '') not in {
+        'funnel:preliminary_reject',
+        'funnel:preliminary_only',
+    }
+
+
+def _restore_actor_guard_state(runtime_payload, *, is_resume):
+    """Restore only states written under the current actor-safety contract."""
+    if not bool(is_resume):
+        return True, 0, False, False
+    payload = dict(runtime_payload or {})
+    version = int(payload.get('learner_guard_contract_version', 0) or 0)
+    if version < _ACTOR_GUARD_CONTRACT_VERSION:
+        return True, 0, False, True
+    safe = bool(payload.get('learner_selfplay_safe', True))
+    failures = max(
+        0,
+        min(
+            _ACTOR_GUARD_FAILURES,
+            int(payload.get('learner_guard_consecutive_failures', 0) or 0),
+        ),
+    )
+    confirmation_due = bool(payload.get('learner_guard_confirmation_due', False))
+    return safe, failures, confirmation_due, False
+
+
+def _split_replay_holdout_positions(positions, *, seed):
+    """Reserve complete games so adjacent positions cannot leak into training."""
+    positions = list(positions or [])
+    if not positions:
+        return positions, []
+    rng = np.random.default_rng(int(seed))
+    game_assignment = {}
+    selected = np.zeros(len(positions), dtype=np.bool_)
+    for index, position in enumerate(positions):
+        game_id = int(position[20]) if len(position) > 20 and position[20] is not None else -1
+        if game_id < 0:
+            raise ValueError(
+                "RL holdout requires a non-negative game_id for every replay row."
+            )
+        if game_id not in game_assignment:
+            game_assignment[game_id] = bool(rng.random() < _RL_HOLDOUT_FRACTION)
+        selected[index] = game_assignment[game_id]
+    training = [position for idx, position in enumerate(positions) if not selected[idx]]
+    holdout = [position for idx, position in enumerate(positions) if selected[idx]]
+    return training, holdout
+
+
+class _ReplayHoldoutRouter:
+    """Route streamed replay rows to disjoint train/holdout buffers in batches."""
+
+    def __init__(self, training_buffer, holdout_buffer, *, seed):
+        self.training_buffer = training_buffer
+        self.holdout_buffer = holdout_buffer
+        self.rng = np.random.default_rng(int(seed))
+        self.training_count = 0
+        self.holdout_count = 0
+        self._game_assignment = {}
+        self.training_game_ids = set()
+        self.holdout_game_ids = set()
+
+    def _holdout_mask(self, count, game_ids=None):
+        count = max(0, int(count))
+        if count <= 0:
+            return np.zeros(count, dtype=np.bool_)
+        if game_ids is None:
+            raise ValueError("RL holdout routing requires game_ids for packed replay.")
+        if torch.is_tensor(game_ids):
+            game_ids = game_ids.reshape(-1).cpu().numpy()
+        mask = np.zeros(count, dtype=np.bool_)
+        for row, raw_game_id in enumerate(game_ids):
+            game_id = int(raw_game_id)
+            if game_id < 0:
+                raise ValueError(
+                    "RL holdout requires a non-negative game_id for every replay row."
+                )
+            if game_id not in self._game_assignment:
+                self._game_assignment[game_id] = bool(
+                    self.rng.random() < _RL_HOLDOUT_FRACTION
+                )
+            mask[row] = self._game_assignment[game_id]
+            (self.holdout_game_ids if mask[row] else self.training_game_ids).add(game_id)
+        return mask
+
+    def add(self, position):
+        game_id = int(position[20]) if len(position) > 20 and position[20] is not None else -1
+        if bool(self._holdout_mask(1, [game_id])[0]):
+            self.holdout_buffer.add(position)
+            self.holdout_count += 1
+        else:
+            self.training_buffer.add(position)
+            self.training_count += 1
+
+    @staticmethod
+    def _take_rows(value, indices):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            return value[torch.as_tensor(indices, dtype=torch.long)]
+        return [value[int(index)] for index in indices]
+
+    def _add_packed_selection(self, buffer, indices, args, kwargs):
+        if indices.size <= 0:
+            return
+        selected_args = tuple(self._take_rows(value, indices) for value in args)
+        selected_kwargs = {
+            key: self._take_rows(value, indices)
+            for key, value in kwargs.items()
+        }
+        buffer.add_packed_batch(*selected_args, **selected_kwargs)
+
+    def add_packed_batch(self, *args, **kwargs):
+        if not args or args[0] is None:
+            return
+        count = int(args[0].shape[0])
+        game_ids = kwargs.get('game_ids')
+        holdout_mask = self._holdout_mask(count, game_ids)
+        holdout_indices = np.flatnonzero(holdout_mask).astype(np.int64, copy=False)
+        training_indices = np.flatnonzero(~holdout_mask).astype(np.int64, copy=False)
+        self._add_packed_selection(self.training_buffer, training_indices, args, kwargs)
+        self._add_packed_selection(self.holdout_buffer, holdout_indices, args, kwargs)
+        self.training_count += int(training_indices.size)
+        self.holdout_count += int(holdout_indices.size)
+
+
+def _resolve_champion_replay_sample_fraction(base_fraction, replay_age):
+    """Decay champion rehearsal to a small anti-forgetting floor."""
     base = max(0.0, min(0.40, float(base_fraction or 0.0)))
     if base <= 0.0:
         return 0.0
     floor = min(base, _CHAMPION_REPLAY_MIN_FRACTION)
-    age = max(0, int(iterations_since_promotion or 0))
+    age = max(0, int(replay_age or 0))
     progress = min(1.0, float(age) / float(_CHAMPION_REPLAY_DECAY_ITERATIONS))
     return float(base + (floor - base) * progress)
 
 
-def _next_raw_candidate_retest_target(
-    *, nn_safe, games_played, score_upper_bound, score_floor
+def _summarize_opening_sequence_counts(sequence_counts):
+    """Summarize actual played opening lines without confusing them with search corrections."""
+    counts = [
+        int(count)
+        for count in dict(sequence_counts or {}).values()
+        if int(count) > 0
+    ]
+    total = int(sum(counts))
+    if total <= 0:
+        return {
+            'games': 0,
+            'unique': 0,
+            'effective': 0.0,
+            'top1_rate': 0.0,
+        }
+    probabilities = [float(count) / float(total) for count in counts]
+    entropy = -sum(probability * math.log(probability) for probability in probabilities)
+    return {
+        'games': total,
+        'unique': len(counts),
+        'effective': float(math.exp(entropy)),
+        'top1_rate': float(max(counts)) / float(total),
+    }
+
+
+def _champion_replay_age(iteration_number, refresh_iteration):
+    """Age only populated rehearsal rows; an empty reservoir has zero share."""
+    if refresh_iteration is None:
+        return _CHAMPION_REPLAY_DECAY_ITERATIONS
+    return max(0, int(iteration_number) - int(refresh_iteration))
+
+
+def _champion_replay_bootstrap_due(
+    *,
+    iteration_number,
+    first_iteration_number,
+    champion_fraction,
+    champion_size,
+    selfplay_uses_best,
+    initial_learner_matches_best,
 ):
-    """Spend extra cheap raw games only while a passed MCTS candidate is undecided."""
-    if bool(nn_safe):
-        return None
-    games_played = max(0, int(games_played or 0))
-    if games_played < _RAW_CANDIDATE_RETEST_GAMES:
-        return _RAW_CANDIDATE_RETEST_GAMES
-    if (
-        games_played < _RAW_CANDIDATE_MAX_GAMES
-        and float(score_upper_bound or 0.0) >= float(score_floor or 0.0)
-    ):
-        return _RAW_CANDIDATE_MAX_GAMES
-    return None
+    """Pin the initial champion targets once, without a duplicate best-only run."""
+    return bool(
+        float(champion_fraction or 0.0) > 0.0
+        and int(champion_size or 0) <= 0
+        and int(iteration_number) == int(first_iteration_number)
+        and not bool(selfplay_uses_best)
+        and bool(initial_learner_matches_best)
+    )
+
+
+def _champion_replay_capture_due(
+    *, iteration_number, scheduled_iteration, selfplay_actor_matches_best
+):
+    """Capture only targets generated by the exact accepted champion snapshot."""
+    return bool(
+        scheduled_iteration is not None
+        and int(iteration_number) == int(scheduled_iteration)
+        and bool(selfplay_actor_matches_best)
+    )
+
+
+def _raw_nn_evaluation_is_scheduled(*, iteration_number, cadence, enabled):
+    """Whether this iteration gets the routine raw-NN diagnostic match."""
+    return bool(
+        enabled
+        and int(iteration_number) % max(1, int(cadence)) == 0
+    )
+
+
+def _raw_nn_candidate_match_required(*, is_candidate, promotion_gate_enabled, stats):
+    """Keep the raw-NN promotion gate fresh even off diagnostic cadence."""
+    return bool(is_candidate and promotion_gate_enabled and stats is None)
 
 
 def _build_rl_optimizer_param_groups(model, rl_config, base_lr):
@@ -502,22 +1163,29 @@ def _print_rl_startup_plan(
     precision = "bf16" if use_bfloat16 else ("AMP fp16" if use_amp else "fp32")
     train_schedule = "fixed"
     if bool(rl_cfg.get('use_lr_schedule', False)):
-        train_schedule = f"warmup {warmup_iters} -> cosine x{min_lr_ratio:.2f}"
+        train_schedule = f"warmup {warmup_iters} -> one cosine x{min_lr_ratio:.2f}"
     champion_replay_share = float(rl_cfg.get('replay_champion_fraction', 0.15) or 0.0)
-    learner_only_bootstrap = max(
-        0,
-        int(rl_cfg.get('self_play_learner_only_bootstrap_iterations', 0) or 0),
-    )
-    correction_rank_target = max(
+    hard_start_share = max(
         0.0,
-        float(rl_cfg.get('policy_correction_rank_weight', 0.0) or 0.0),
-    )
-    correction_rank_warmup = max(
-        0,
-        int(rl_cfg.get('policy_correction_rank_warmup_iterations', 0) or 0),
+        min(1.0, float(rl_cfg.get('self_play_hard_start_fraction', 0.0) or 0.0)),
     )
     promotion_lb = float(rl_cfg.get('promotion_score_lower_bound_min', 0.50) or 0.50)
-    anchor_lb = float(rl_cfg.get('promotion_anchor_score_lower_bound_min', 0.47) or 0.47)
+    promotion_contract = (
+        f"MCTS score >= {float(rl_cfg.get('score_rate_threshold', 0.53)):.0%}, "
+        f"LB >= {promotion_lb:.0%}"
+    )
+    if bool(rl_cfg.get('promotion_no_mcts_gate_enabled', True)):
+        raw_promotion_floor = float(
+            rl_cfg.get('promotion_no_mcts_score_rate_min', 0.48) or 0.48
+        )
+        promotion_contract += f" | raw LB >= {raw_promotion_floor:.0%}"
+    else:
+        promotion_contract += " | NN-only diagnostic"
+    if bool(rl_cfg.get('promotion_require_anchor_non_regression', False)):
+        anchor_lb = float(
+            rl_cfg.get('promotion_anchor_score_lower_bound_min', 0.47) or 0.47
+        )
+        promotion_contract += f" | anchor LB >= {anchor_lb:.0%}"
     source_text = source_label
     if start_mode == 'resume':
         source_text = f"{source_label}; continue at iteration {start_iteration + 1}"
@@ -538,11 +1206,11 @@ def _print_rl_startup_plan(
     else:
         search_budget_text = f"{int(rl_cfg.get('mcts_simulations', 0))} sims"
     search_detail = (
-        f"Gumbel · top {int(rl_cfg.get('mcts_gumbel_max_considered_actions', 16))} "
+        f"Gumbel · adaptive top <= {int(rl_cfg.get('mcts_gumbel_max_considered_actions', 16))} "
         f"· c=({float(rl_cfg.get('mcts_gumbel_c_visit', 100.0)):.0f},"
         f"{float(rl_cfg.get('mcts_gumbel_c_scale', 0.10)):.2f}) "
         f"· Q-floor={float(rl_cfg.get('mcts_gumbel_q_range_floor', 0.25)):.2f} "
-        f"· target-T={float(rl_cfg.get('mcts_gumbel_target_temperature', 1.0)):.2f}"
+        f"· target-T={float(rl_cfg.get('mcts_gumbel_target_temperature', 0.95)):.2f}"
     )
 
     rows = [
@@ -559,9 +1227,12 @@ def _print_rl_startup_plan(
         (
             "self-play",
             f"{int(rl_cfg.get('games_per_iteration', 0))} games/iter | "
-            f"learner-only first {learner_only_bootstrap} iter, then guarded | "
+            "learner MCTS actor; best only after confirmed search failure | "
+            f"regret-guided starts {hard_start_share:.0%} | "
             f"champion replay {champion_replay_share:.0%} -> "
             f"{min(champion_replay_share, _CHAMPION_REPLAY_MIN_FRACTION):.0%} | "
+            f"fresh holdout {_RL_HOLDOUT_FRACTION:.0%} | "
+            f"reanalyse every {int(rl_cfg.get('replay_reanalyse_interval', 4))} iter | "
             f"replay {int(rl_cfg.get('replay_buffer_size', 0)):,} "
             f"| target <= {int(replay_max_policy_targets)} moves",
         ),
@@ -573,15 +1244,14 @@ def _print_rl_startup_plan(
         (
             "learning",
             f"batch {int(rl_cfg.get('batch_size', 0)):,} | lr {float(rl_cfg.get('learning_rate', 0.0)):.2e} "
-            f"| {train_schedule} | correction-rank 0->{correction_rank_target:.2f} "
-            f"in {correction_rank_warmup} iter | AdamW uniform LR",
+            f"| {train_schedule} | direct policy CE + final WDL CE "
+            f"| AdamW uniform LR",
         ),
         (
             "evaluation",
             f"every {int(rl_cfg.get('eval_every', 1))} iter | exact "
             f"{int(rl_cfg.get('mcts_simulations', 192))} sims/side | funnel {funnel_stages} | "
-            f"promote score >= {float(rl_cfg.get('score_rate_threshold', 0.55)):.0%}, LB >= {promotion_lb:.0%} "
-            f"| anchor LB >= {anchor_lb:.0%}",
+            f"promotion: {promotion_contract}",
         ),
         (
             "run",
@@ -590,6 +1260,54 @@ def _print_rl_startup_plan(
         ),
     ]
     print_panel("RL RUN PLAN", rows)
+
+
+def _compute_rl_learning_rate(
+    iter_idx,
+    *,
+    use_schedule,
+    lr_base,
+    warmup_iters,
+    min_lr_ratio,
+    total_iterations,
+):
+    """Resolve one continuous LR schedule independent of noisy arena results."""
+    iter_idx = max(0, int(iter_idx))
+    lr_base = max(0.0, float(lr_base))
+    if not bool(use_schedule):
+        return lr_base
+
+    warmup_iters = max(0, int(warmup_iters))
+    total_iterations = max(1, int(total_iterations))
+    min_lr_ratio = max(0.0, min(1.0, float(min_lr_ratio)))
+    if warmup_iters > 0 and iter_idx < warmup_iters:
+        return lr_base * ((iter_idx + 1) / warmup_iters)
+
+    progress = (iter_idx - warmup_iters) / max(
+        1,
+        total_iterations - 1 - warmup_iters,
+    )
+    progress = max(0.0, min(1.0, float(progress)))
+    multiplier = min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (
+        1.0 + math.cos(math.pi * progress)
+    )
+    return lr_base * multiplier
+
+
+def _resolve_rl_warmup_iterations(total_iterations, warmup_pct):
+    """Keep startup conservative without shortening the later learning window."""
+    total_iterations = max(1, int(total_iterations))
+    warmup_pct = max(0.0, min(1.0, float(warmup_pct)))
+    if warmup_pct <= 0.0:
+        return 0
+    reference_iterations = min(
+        total_iterations,
+        int(_RL_LR_WARMUP_REFERENCE_ITERATIONS),
+    )
+    warmup_iters = int(math.ceil(reference_iterations * warmup_pct))
+    if total_iterations > 1:
+        warmup_iters = max(2, warmup_iters)
+    return min(warmup_iters, total_iterations)
 
 
 def _cuda_memory_stats(device):
@@ -700,6 +1418,141 @@ def _load_model_snapshot(model, state):
     return True
 
 
+def _atomic_torch_save(payload, path):
+    """Atomically replace a large tensor sidecar on Windows and POSIX."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        torch.save(payload, temporary)
+        last_error = None
+        for attempt in range(6):
+            try:
+                os.replace(temporary, path)
+                return
+            except OSError as exc:
+                last_error = exc
+                if attempt < 5:
+                    time.sleep(0.05 * (attempt + 1))
+        raise last_error
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+
+
+def _new_rl_replay_sidecar_path(latest_checkpoint_path, completed_iteration):
+    """Choose a never-overwritten sibling for one synchronized replay snapshot."""
+    latest_checkpoint_path = Path(latest_checkpoint_path)
+    legacy_path = latest_checkpoint_path.with_suffix(".replay.pt")
+    generation = f"{int(completed_iteration)}-{time.time_ns()}"
+    return legacy_path.with_name(
+        f"{legacy_path.stem}.iter-{generation}{legacy_path.suffix}"
+    )
+
+
+def _remove_obsolete_rl_replay_sidecar(
+    latest_checkpoint_path,
+    filename,
+    *,
+    current_filename,
+    previous_filename,
+):
+    """Remove only an obsolete generated sidecar after its checkpoint publishes."""
+    if not filename or filename in {current_filename, previous_filename}:
+        return False
+    latest_checkpoint_path = Path(latest_checkpoint_path)
+    legacy_path = latest_checkpoint_path.with_suffix(".replay.pt")
+    name = Path(str(filename)).name
+    generated_prefix = f"{legacy_path.stem}.iter-"
+    if name != str(filename) or not name.startswith(generated_prefix) or not name.endswith(".pt"):
+        return False
+    obsolete_path = legacy_path.with_name(name)
+    try:
+        obsolete_path.unlink(missing_ok=True)
+        return True
+    except OSError as exc:
+        print(
+            f"Replay sidecar cleanup deferred for {obsolete_path.name}: {exc}",
+            flush=True,
+        )
+        return False
+
+
+def _save_rl_replay_sidecar(
+    path,
+    *,
+    completed_iteration,
+    replay_buffer,
+    champion_replay_buffer,
+    search_control_archive=None,
+):
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(
+            f"Refusing to overwrite an existing RL replay sidecar: {path}"
+        )
+    _atomic_torch_save(
+        {
+            "format_version": 1,
+            "completed_iteration": int(completed_iteration),
+            "replay": replay_buffer.checkpoint_state(),
+            "champion_replay": champion_replay_buffer.checkpoint_state(),
+            "search_control_archive": (
+                search_control_archive.state_dict() if search_control_archive is not None else None
+            ),
+        },
+        path,
+    )
+
+
+def _restore_rl_replay_sidecar(
+    checkpoint_payload,
+    checkpoint_path,
+    *,
+    expected_completed_iteration,
+    replay_buffer,
+    champion_replay_buffer,
+    search_control_archive=None,
+    max_iteration_lag=_REPLAY_SIDECAR_INTERVAL,
+):
+    """Restore replay only when its sidecar belongs to this exact checkpoint."""
+    filename = checkpoint_payload.get("replay_state_file")
+    if not filename:
+        return False, "checkpoint predates replay sidecars"
+    filename = str(filename)
+    if Path(filename).name != filename:
+        return False, "replay sidecar path is not a sibling filename"
+    sidecar_path = Path(checkpoint_path).parent / filename
+    if not sidecar_path.exists():
+        return False, f"missing {sidecar_path.name}"
+    payload = torch.load(sidecar_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict) or int(payload.get("format_version", 0) or 0) != 1:
+        return False, "unsupported replay sidecar format"
+    completed_iteration = int(payload.get("completed_iteration", -1) or -1)
+    recorded_iteration = int(
+        checkpoint_payload.get("replay_state_iteration", completed_iteration) or -1
+    )
+    if recorded_iteration != completed_iteration:
+        return False, (
+            f"sidecar iteration {completed_iteration} does not match checkpoint "
+            f"metadata {recorded_iteration}"
+        )
+    lag = int(expected_completed_iteration) - completed_iteration
+    if lag < 0 or lag > max(0, int(max_iteration_lag)):
+        return False, (
+            f"sidecar iteration {completed_iteration} is outside the allowed "
+            f"resume lag for checkpoint iteration {int(expected_completed_iteration)}"
+        )
+    replay_buffer.load_checkpoint_state(payload.get("replay"))
+    champion_replay_buffer.load_checkpoint_state(payload.get("champion_replay"))
+    if search_control_archive is not None and payload.get("search_control_archive"):
+        search_control_archive.load_state_dict(payload.get("search_control_archive"))
+    detail = str(sidecar_path)
+    if lag > 0:
+        detail = f"{detail} (bounded lag: {lag} iteration(s))"
+    return True, detail
+
+
 def _pad_replay_matrix(tensor, width, fill_value):
     if int(tensor.shape[1]) >= int(width):
         return tensor
@@ -736,6 +1589,30 @@ def _round_replay_capacity(value, quantum):
     return int(math.ceil(value / quantum) * quantum)
 
 
+def _refresh_champion_replay_snapshot(
+    replay_buffer,
+    champion_replay_buffer,
+    iteration_number,
+):
+    """Pin accepted on-policy search targets without a best-vs-best iteration."""
+    capacity = max(0, int(getattr(champion_replay_buffer, 'max_size', 0) or 0))
+    if capacity <= 0:
+        return 0
+    indices = replay_buffer.select_iteration_indices(
+        int(iteration_number),
+        max_count=capacity,
+        prefer_useful_search_corrections=True,
+    )
+    if indices is None or len(indices) <= 0:
+        return 0
+    champion_replay_buffer.clear()
+    return int(replay_buffer.copy_indices_to(
+        champion_replay_buffer,
+        indices,
+        source_code=REPLAY_SOURCE_CHAMPION,
+    ))
+
+
 def _resolve_train_batch_size(replay_size, rl_cfg):
     configured_batch_size = max(1, int(rl_cfg.get('batch_size', 1024)))
     if not bool(rl_cfg.get('train_dynamic_batch_size_enabled', False)):
@@ -763,11 +1640,13 @@ def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", e
     mode_prefix = "estimated_elo_mcts" if use_mcts else "estimated_elo_nn"
     timestamp = datetime.now().isoformat(timespec="seconds")
     settings = {
+        **elo_protocol_settings(
+            elo_config,
+            use_mcts=use_mcts,
+            simulations=simulations,
+        ),
         "levels": [int(x) for x in list((elo_config or {}).get("levels", []) or [])],
         "games_per_level": int((elo_config or {}).get("games_per_level", 0) or 0),
-        "use_mcts": use_mcts,
-        "simulations": simulations,
-        "stockfish_time_limit": float((elo_config or {}).get("stockfish_time_limit", 0.0) or 0.0),
     }
     if isinstance(elo_result, dict):
         settings["adaptive"] = bool(elo_result.get("adaptive", False))
@@ -783,6 +1662,15 @@ def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", e
             settings["elo_std_error"] = float(elo_result.get("elo_std_error"))
         if elo_result.get("elo_ci95") is not None:
             settings["elo_ci95"] = list(elo_result.get("elo_ci95") or [])
+        for key in (
+            "rating_bracketed", "rating_bracket", "rating_range_status",
+            "rating_censored", "elo_lower_bound", "elo_upper_bound",
+            "rating_levels", "rating_games", "probe_only_games",
+            "local_rating_level", "local_rating_games", "local_rating_clusters",
+            "standard_error_method",
+        ):
+            if elo_result.get(key) is not None:
+                settings[key] = elo_result.get(key)
     elo_std_error = _safe_float(settings.get("elo_std_error"))
     elo_ci95 = settings.get("elo_ci95")
     ci_low = _safe_float(elo_ci95[0]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
@@ -866,8 +1754,18 @@ def _best_mcts_elo_from_metadata(entry):
     return None, None
 
 
-def _seed_rl_plot_elo_from_checkpoint(logger, checkpoint_path, base_dir=None):
-    """Add iteration-0 Elo to RL plots from the active startup checkpoint metadata."""
+def _seed_rl_plot_elo_from_checkpoint(
+    logger,
+    checkpoint_path,
+    base_dir=None,
+    elo_config=None,
+):
+    """Show checkpoint Elo at iteration zero as a visual reference.
+
+    Protocol compatibility is deliberately not enforced here. Reusing a stored
+    measurement for scheduling or final evaluation remains guarded separately
+    by ``elo_protocol_matches_settings``.
+    """
     if logger is None or checkpoint_path is None:
         return
     checkpoint_path = Path(checkpoint_path)
@@ -877,7 +1775,16 @@ def _seed_rl_plot_elo_from_checkpoint(logger, checkpoint_path, base_dir=None):
     if entry.get("error"):
         return
     elo_nn = entry.get("elo_nn")
-    elo_mcts, mcts_sims = _best_mcts_elo_from_metadata(entry)
+    mcts_profile = {}
+    for raw_simulations, info in dict(entry.get("elo_mcts_by_simulations") or {}).items():
+        if not isinstance(info, dict) or info.get("elo") is None:
+            continue
+        mcts_profile[int(raw_simulations)] = dict(info)
+    if mcts_profile:
+        mcts_sims, mcts_info = max(mcts_profile.items())
+        elo_mcts = mcts_info.get("elo")
+    else:
+        elo_mcts, mcts_sims = _best_mcts_elo_from_metadata(entry)
     if elo_nn is None and elo_mcts is None:
         return
     logger.record_rl_model_info_elo(
@@ -885,12 +1792,11 @@ def _seed_rl_plot_elo_from_checkpoint(logger, checkpoint_path, base_dir=None):
         elo_nn=elo_nn,
         elo_mcts=elo_mcts,
         mcts_simulations=mcts_sims,
-        mcts_by_simulations=entry.get("elo_mcts_by_simulations"),
+        mcts_by_simulations=mcts_profile,
     )
     parts = []
     if elo_nn is not None:
         parts.append(f"raw NN {int(round(float(elo_nn)))}")
-    mcts_profile = entry.get("elo_mcts_by_simulations") or {}
     if mcts_profile:
         parts.extend(
             f"MCTS {int(round(float(info['elo'])))}@{int(simulations)}"
@@ -916,7 +1822,7 @@ class RLEloCoordinator:
         self._elo_priors = {}
         self._elo_prior_settings = {}
         self._load_checkpoint_elo_priors()
-        self.enabled = True
+        self.enabled = bool(self.rl_elo_config.get("enabled", True))
         # RL evaluation is synchronous by design (training is paused while Elo runs).
         # Prefer CUDA for RL Elo/MCTS evaluation when available.
         rl_eval_device_raw = str(self.rl_elo_config.get("device", "cuda")).strip().lower()
@@ -942,6 +1848,111 @@ class RLEloCoordinator:
         self.last_promoted_mcts_elo = None
         self.last_promoted_mcts_simulations = None
         self.last_mcts_eval_iteration = None
+        self.pending_mcts_best_iteration = None
+        self.elo_events_path = Path(self.logger.csv_path).with_name(
+            f"{Path(self.logger.csv_path).stem}_elo_events.jsonl"
+        )
+
+    def state_dict(self):
+        return {
+            "last_elo_iteration": self.last_elo_iteration,
+            "last_elo_metadata": dict(self.last_elo_metadata),
+            "il_anchor_surpassed": bool(self.il_anchor_surpassed),
+            "best_il_anchor_score_rate": self.best_il_anchor_score_rate,
+            "best_il_anchor_true_win_rate": self.best_il_anchor_true_win_rate,
+            "best_il_anchor_iteration": self.best_il_anchor_iteration,
+            "promoted_evaluations": int(self.promoted_evaluations),
+            "last_promoted_iteration": self.last_promoted_iteration,
+            "last_promoted_raw_elo": self.last_promoted_raw_elo,
+            "last_promoted_mcts_elo": self.last_promoted_mcts_elo,
+            "last_promoted_mcts_simulations": self.last_promoted_mcts_simulations,
+            "last_mcts_eval_iteration": self.last_mcts_eval_iteration,
+            "pending_mcts_best_iteration": self.pending_mcts_best_iteration,
+        }
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict):
+            return False
+        optional_ints = (
+            "last_elo_iteration",
+            "best_il_anchor_iteration",
+            "last_promoted_iteration",
+            "last_promoted_mcts_simulations",
+            "last_mcts_eval_iteration",
+            "pending_mcts_best_iteration",
+        )
+        optional_floats = (
+            "best_il_anchor_score_rate",
+            "best_il_anchor_true_win_rate",
+            "last_promoted_raw_elo",
+            "last_promoted_mcts_elo",
+        )
+        for key in optional_ints:
+            value = state.get(key)
+            setattr(self, key, None if value is None else int(value))
+        for key in optional_floats:
+            value = state.get(key)
+            setattr(self, key, None if value is None else float(value))
+        self.last_elo_metadata = dict(state.get("last_elo_metadata") or {})
+        self.il_anchor_surpassed = bool(state.get("il_anchor_surpassed", False))
+        self.promoted_evaluations = max(
+            0, int(state.get("promoted_evaluations", 0) or 0)
+        )
+        return True
+
+    def _append_elo_event(
+        self,
+        *,
+        iteration_num,
+        model_iteration_num=None,
+        reason_label,
+        source,
+        use_mcts,
+        simulations,
+        elo_config,
+        elo_result,
+    ):
+        """Persist the ladder result with execution and model iterations separated."""
+        prior_key = self._elo_prior_key(bool(use_mcts), int(simulations or 0))
+        prior_settings = self._elo_prior_settings.get(prior_key)
+        model_iteration_num = (
+            int(iteration_num)
+            if model_iteration_num is None
+            else int(model_iteration_num)
+        )
+        event = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "iteration": int(iteration_num),
+            "model_iteration": model_iteration_num,
+            "evaluated_at_iteration": int(iteration_num),
+            "reason": str(reason_label),
+            "source": str(source),
+            "mode": "mcts" if use_mcts else "nn",
+            "simulations": int(simulations or 0) if use_mcts else 0,
+            "protocol": elo_protocol_settings(
+                elo_config,
+                use_mcts=bool(use_mcts),
+                simulations=int(simulations or 0),
+            ),
+            "seed_elo": elo_config.get("adaptive_initial_elo"),
+            "seed_source": elo_config.get("adaptive_initial_elo_source"),
+            "seed_protocol_matches": bool(
+                elo_protocol_matches_settings(
+                    prior_settings,
+                    elo_config,
+                    use_mcts=bool(use_mcts),
+                    simulations=int(simulations or 0),
+                )
+            ),
+            "result": dict(elo_result or {}),
+        }
+        try:
+            self.elo_events_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.elo_events_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, sort_keys=True, default=str))
+                stream.write("\r\n")
+        except Exception as exc:
+            print(f"  Elo event log failed (result retained): {exc}")
 
     @staticmethod
     def _elo_prior_key(use_mcts, simulations=0):
@@ -964,7 +1975,17 @@ class RLEloCoordinator:
                 if elo is not None:
                     self._elo_priors[key] = (float(elo), str(source or "previous checkpoint Elo"))
                     entry = load_checkpoint_metadata(checkpoint_path)
-                    settings = entry.get("elo_nn_settings") if not use_mcts else None
+                    if use_mcts:
+                        profile = dict(entry.get("elo_mcts_by_simulations") or {}).get(
+                            int(simulations)
+                        )
+                        settings = (
+                            profile.get("settings")
+                            if isinstance(profile, dict)
+                            else None
+                        )
+                    else:
+                        settings = entry.get("elo_nn_settings")
                     if isinstance(settings, dict):
                         self._elo_prior_settings[key] = dict(settings)
                     break
@@ -1067,6 +2088,13 @@ class RLEloCoordinator:
             return True
         return int(iteration_num) - int(self.last_mcts_eval_iteration) >= min_gap
 
+    def pending_promoted_mcts_due(self, iteration_num):
+        return bool(
+            self.enabled
+            and self.pending_mcts_best_iteration is not None
+            and self._should_run_promoted_mcts(iteration_num)
+        )
+
     def _apply_promoted_elo_budget(self, elo_config, *, use_mcts):
         """Apply tracking-only Elo limits without weakening final Elo."""
         prefix = "promoted_mcts" if use_mcts else "promoted_nn"
@@ -1121,6 +2149,7 @@ class RLEloCoordinator:
         self.last_promoted_mcts_elo = None
         self.last_promoted_mcts_simulations = None
         run_mcts = self._should_run_promoted_mcts(iteration_num)
+        self.pending_mcts_best_iteration = None if run_mcts else int(iteration_num)
         mode_label = "raw NN and scheduled MCTS" if run_mcts else "raw NN"
         print(f"Promoted best model: running shared IL-grade Stockfish Elo for {mode_label}.")
         results = []
@@ -1151,7 +2180,41 @@ class RLEloCoordinator:
                 self.last_promoted_mcts_elo = float(mcts_result)
                 self.last_promoted_mcts_simulations = int(mcts_simulations)
                 self.last_mcts_eval_iteration = int(iteration_num)
+                self.pending_mcts_best_iteration = None
         return next((r for r in reversed(results) if r is not None), None)
+
+    def evaluate_pending_promoted_mcts(self, iteration_num, model_override):
+        """Measure the latest promoted best once its MCTS rate limit expires."""
+        if (
+            not self.pending_promoted_mcts_due(iteration_num)
+        ):
+            return None
+        promoted_iteration = int(self.pending_mcts_best_iteration)
+        old_model = self.model
+        self.model = model_override
+        try:
+            result = self._run_estimate(
+                iteration_num,
+                # Rate limiting delays the benchmark, but the measured weights
+                # still belong to the promotion row on the strength timeline.
+                model_iteration_num=promoted_iteration,
+                reason_label=(
+                    f"deferred promoted best MCTS {promoted_iteration} "
+                    f"tracked at {int(iteration_num)}"
+                ),
+                use_mcts=True,
+                persist_checkpoints=True,
+                source="rl_deferred_promoted_elo",
+            )
+        finally:
+            self.model = old_model
+        if result is not None:
+            simulations = self._resolve_eval_mcts_simulations()
+            self.last_promoted_mcts_elo = float(result)
+            self.last_promoted_mcts_simulations = int(simulations)
+            self.last_mcts_eval_iteration = int(iteration_num)
+            self.pending_mcts_best_iteration = None
+        return result
 
     def evaluate_final_best(self, iteration_num, model_override=None):
         if not self.enabled or not bool(self.rl_elo_config.get("final_enabled", True)):
@@ -1269,11 +2332,18 @@ class RLEloCoordinator:
         iteration_num,
         reason_label,
         *,
+        model_iteration_num=None,
         use_mcts,
         persist_checkpoints,
         source,
         mcts_simulations=None,
     ):
+        iteration_num = int(iteration_num)
+        model_iteration_num = (
+            iteration_num
+            if model_iteration_num is None
+            else int(model_iteration_num)
+        )
         elo_config = build_final_elo_config(self.elo_config, use_mcts=bool(use_mcts))
         if use_mcts:
             elo_config["mcts_simulations"] = int(
@@ -1281,7 +2351,7 @@ class RLEloCoordinator:
                 if mcts_simulations is not None
                 else self._resolve_eval_mcts_simulations()
             )
-        if str(source) == "rl_promoted_elo":
+        if str(source) in {"rl_promoted_elo", "rl_deferred_promoted_elo"}:
             self._apply_promoted_elo_budget(elo_config, use_mcts=bool(use_mcts))
         active_simulations = int(elo_config.get("mcts_simulations", 0) or 0) if use_mcts else 0
         previous = self._resolve_elo_prior(bool(use_mcts), active_simulations)
@@ -1291,10 +2361,10 @@ class RLEloCoordinator:
             elo_config["adaptive_initial_elo_source"] = str(previous_source)
         elo_config.setdefault("max_error_logs_per_type", 8)
 
-        print(f"\nEstimating Elo vs Stockfish ({reason_label})...")
+        print(f"\r\nEstimating Elo vs Stockfish ({reason_label})...")
         max_attempts = 1
         elo_result = None
-        interrupt_message = "\nCtrl+C detected during Stockfish evaluation. Cancelling evaluation..."
+        interrupt_message = "\r\nCtrl+C detected during Stockfish evaluation. Cancelling evaluation..."
 
         for attempt_idx in range(max_attempts):
             elo_cancel_event = threading.Event()
@@ -1328,6 +2398,16 @@ class RLEloCoordinator:
             break
 
         elo_result = elo_result or {}
+        self._append_elo_event(
+            iteration_num=iteration_num,
+            model_iteration_num=model_iteration_num,
+            reason_label=reason_label,
+            source=source,
+            use_mcts=bool(use_mcts),
+            simulations=active_simulations,
+            elo_config=elo_config,
+            elo_result=elo_result,
+        )
         if elo_result.get("cancelled"):
             print("Elo estimation cancelled.")
             return None
@@ -1358,7 +2438,7 @@ class RLEloCoordinator:
                 print(f"  Elo metadata build failed (result retained): {exc}")
             try:
                 self.logger.record_estimated_elo_mode(
-                    iteration_num,
+                    model_iteration_num,
                     estimated_elo,
                     mode="mcts" if bool(elo_config.get("use_mcts", False)) else "nn",
                     simulations=int(elo_config.get("mcts_simulations", 0) or 0),
@@ -1369,6 +2449,21 @@ class RLEloCoordinator:
             except Exception as exc:
                 print(f"  Elo logger update failed (result retained): {exc}")
             print(f"Estimated Elo: {estimated_elo}")
+            if elo_result.get("local_rating_level") is not None:
+                print(
+                    f"  local calibration: SF {elo_result['local_rating_level']} "
+                    f"({int(elo_result.get('local_rating_games', 0) or 0)} games nearest 50%)"
+                )
+            rating_bracket = elo_result.get("rating_bracket")
+            if elo_result.get("rating_bracketed") and isinstance(rating_bracket, list):
+                print(f"  rating bracket: SF {rating_bracket[0]}-{rating_bracket[1]} (crosses 50% score)")
+            elif elo_result.get("rating_censored"):
+                bound = elo_result.get("elo_lower_bound", elo_result.get("elo_upper_bound"))
+                relation = ">" if elo_result.get("elo_lower_bound") is not None else "<"
+                print(
+                    f"  warning: rating is range-censored ({relation}{bound}); "
+                    "the Stockfish UCI_Elo range did not bracket 50%."
+                )
             if elo_result.get("elo_std_error") is not None:
                 ci = elo_result.get("elo_ci95")
                 ci_str = f", 95% CI {ci[0]}-{ci[1]}" if isinstance(ci, list) and len(ci) == 2 else ""
@@ -1414,7 +2509,7 @@ class RLTrainingInterrupted(Exception):
 def _handle_graceful_interrupt(logger=None, stage=None):
     """Best-effort graceful shutdown on Ctrl+C."""
     stage_suffix = f" during {stage}" if stage else ""
-    print(f"\nRL training interrupted by user (Ctrl+C){stage_suffix}.")
+    print(f"\r\nRL training interrupted by user (Ctrl+C){stage_suffix}.")
     if logger is not None:
         try:
             logger.plot()
@@ -1424,74 +2519,71 @@ def _handle_graceful_interrupt(logger=None, stage=None):
     print("RL training stopped gracefully.")
 
 
-def _empty_eval_stats():
-    return {
-        'wins': 0,
-        'draws': 0,
-        'losses': 0,
-        'unresolved': 0,
-        'score_rate': 0.0,
-        'win_rate': 0.0,
-        'draw_rate': 0.0,
-        'loss_rate': 0.0,
-        'num_games': 0,
-        'resolved_games': 0,
-    }
 
 
-def _score_rate_standard_error(score_rate, num_games, standard_error=None):
-    games = max(1.0, float(num_games or 1))
-    score = max(0.0, min(1.0, float(score_rate or 0.0)))
+def _raw_eval_metric_values(stats):
+    """Return the scalar/raw-NN match fields consumed by the RL loop."""
+    stats = stats or {}
     return (
-        math.sqrt(score * (1.0 - score) / games)
-        if standard_error is None
-        else max(0.0, float(standard_error))
+        float(stats.get('score_rate', 0.0)),
+        float(stats.get('win_rate', 0.0)),
+        float(stats.get('draw_rate', 0.0)),
+        float(stats.get('loss_rate', 0.0)),
+        int(stats.get('wins', 0)),
+        int(stats.get('draws', 0)),
+        int(stats.get('losses', 0)),
+        int(stats.get('unresolved', 0)),
+        int(stats.get('num_games', 0) or 0),
     )
 
 
-def _score_rate_lower_bound(score_rate, num_games, z=1.28, standard_error=None):
-    """Conservative one-sided normal lower bound for a [0, 1] game score."""
-    score = max(0.0, min(1.0, float(score_rate or 0.0)))
-    z_value = max(0.0, float(z or 0.0))
-    score_se = _score_rate_standard_error(score, num_games, standard_error)
-    return max(0.0, score - z_value * score_se)
+_EVAL_TIMING_STAGE_LABELS = (
+    ('regular_eval', 'raw NN'),
+    ('promotion_eval', 'MCTS selection'),
+    ('promotion_confirmation', 'independent holdout'),
+    ('elo_eval', 'Stockfish Elo'),
+)
 
 
-def _score_rate_upper_bound(score_rate, num_games, z=1.28, standard_error=None):
-    """One-sided normal upper bound paired with `_score_rate_lower_bound`."""
-    score = max(0.0, min(1.0, float(score_rate or 0.0)))
-    z_value = max(0.0, float(z or 0.0))
-    score_se = _score_rate_standard_error(score, num_games, standard_error)
-    return min(1.0, score + z_value * score_se)
+def _format_iteration_stage_summary(stage_times):
+    """Compact eval timing presentation without changing recorded stage data."""
+    stage_times = dict(stage_times or {})
+    eval_seconds = {
+        key: max(0.0, float(stage_times.get(key, 0.0) or 0.0))
+        for key, _label in _EVAL_TIMING_STAGE_LABELS
+    }
+    eval_total = sum(eval_seconds.values())
+    eval_labels = dict(_EVAL_TIMING_STAGE_LABELS)
+    parts = []
+    evaluation_added = False
+
+    for name, seconds in stage_times.items():
+        if name in eval_labels:
+            if not evaluation_added and eval_total >= 0.5:
+                detail = ', '.join(
+                    f"{eval_labels[key]} {format_duration(value)}"
+                    for key, value in eval_seconds.items()
+                    if value >= 0.5
+                )
+                parts.append(
+                    f"evaluation {format_duration(eval_total)} ({detail})"
+                )
+                evaluation_added = True
+            continue
+        if float(seconds or 0.0) >= 0.5:
+            parts.append(f"{name} {format_duration(seconds)}")
+
+    return ' | '.join(parts)
 
 
-def _paired_score_standard_error(game_scores):
-    """Estimate match uncertainty from complete opening/color pairs.
-
-    Games ``2k`` and ``2k+1`` use the same fixed opening with swapped colours.
-    Treating their mean as one observation removes a large part of opening and
-    colour variance while retaining correlation inside the pair.
-    """
-    pairs = defaultdict(list)
-    for game_idx, score in dict(game_scores or {}).items():
-        pairs[int(game_idx) // 2].append(float(score))
-    pair_scores = [sum(values) / 2.0 for values in pairs.values() if len(values) == 2]
-    pair_count = len(pair_scores)
-    if pair_count < 2:
-        return None, pair_count
-    mean = sum(pair_scores) / pair_count
-    sample_variance = sum((value - mean) ** 2 for value in pair_scores) / (pair_count - 1)
-    return math.sqrt(sample_variance / pair_count), pair_count
 
 
-def _attach_paired_score_stats(stats, game_scores):
-    stats = dict(stats or {})
-    scores = {int(key): float(value) for key, value in dict(game_scores or {}).items()}
-    score_se, pair_count = _paired_score_standard_error(scores)
-    stats['game_scores'] = scores
-    stats['paired_score_pairs'] = int(pair_count)
-    stats['paired_score_se'] = score_se
-    return stats
+
+
+
+
+
+
 
 
 def _evaluate_models_with_paired_scores(*args, **kwargs):
@@ -1525,220 +2617,577 @@ def _evaluate_models_with_paired_scores(*args, **kwargs):
                 model1_as_white,
             )
 
+    config = args[2] if len(args) > 2 else kwargs.get('config', {})
+    fixed_openings = kwargs.get('use_fixed_openings')
+    if fixed_openings is None:
+        fixed_openings = bool(
+            (config or {}).get('reinforcement_learning', {}).get(
+                'eval_fixed_openings_enabled',
+                True,
+            )
+        )
+    opening_count = len(_resolve_eval_opening_lines(config)) if fixed_openings else None
     kwargs['progress_callback'] = _on_progress
-    return _attach_paired_score_stats(evaluate_models(*args, **kwargs), game_scores)
-
-
-def _promotion_anchor_safety_decision(
-    anchor_score_rate,
-    anchor_score_lower_bound,
-    anchor_no_mcts_score_rate,
-    anchor_no_mcts_score_lower_bound,
-    rl_cfg,
-):
-    """Keep every promoted best above the IL floor with and without search."""
-    if not bool(rl_cfg.get('promotion_require_anchor_non_regression', True)):
-        return True, "anchor guard disabled"
-    if anchor_score_rate is None or anchor_score_lower_bound is None:
-        return False, "anchor evidence unavailable"
-    score_floor = float(rl_cfg.get('promotion_anchor_min_score_rate', 0.50))
-    lower_bound_floor = float(
-        rl_cfg.get('promotion_anchor_score_lower_bound_min', 0.47)
-    )
-    score = float(anchor_score_rate)
-    lower_bound = float(anchor_score_lower_bound)
-    mcts_safe = bool(score >= score_floor and lower_bound >= lower_bound_floor)
-    raw_enabled = bool(rl_cfg.get('promotion_anchor_no_mcts_gate_enabled', True))
-    raw_score_floor = float(
-        rl_cfg.get('promotion_anchor_no_mcts_score_rate_min', 0.50) or 0.50
-    )
-    raw_lower_bound_floor = float(
-        rl_cfg.get('promotion_anchor_no_mcts_score_lower_bound_min', 0.47) or 0.47
-    )
-    if raw_enabled and (
-        anchor_no_mcts_score_rate is None
-        or anchor_no_mcts_score_lower_bound is None
-    ):
-        return False, "raw anchor evidence unavailable"
-    raw_score = (
-        None if anchor_no_mcts_score_rate is None else float(anchor_no_mcts_score_rate)
-    )
-    raw_lower = (
-        None
-        if anchor_no_mcts_score_lower_bound is None
-        else float(anchor_no_mcts_score_lower_bound)
-    )
-    raw_safe = bool(
-        not raw_enabled
-        or (raw_score >= raw_score_floor and raw_lower >= raw_lower_bound_floor)
-    )
-    raw_text = "off" if not raw_enabled else (
-        f"{raw_score:.1%}, LB {raw_lower:.1%}; "
-        f"required {raw_score_floor:.1%}/{raw_lower_bound_floor:.1%}"
-    )
-    return bool(mcts_safe and raw_safe), (
-        f"anchor MCTS {score:.1%}, LB {lower_bound:.1%}; "
-        f"required {score_floor:.1%}/{lower_bound_floor:.1%}; raw {raw_text}"
+    return _attach_paired_score_stats(
+        evaluate_models(*args, **kwargs),
+        game_scores,
+        opening_count=opening_count,
     )
 
 
-def _promotion_eval_has_full_evidence(eval_stage):
-    """Only the complete paired funnel may promote a new best checkpoint."""
-    return str(eval_stage or '') in {'funnel:advanced', 'funnel:confirmation'}
-
-
-def _safe_score_rate(wins, draws, losses):
-    total = int(wins or 0) + int(draws or 0) + int(losses or 0)
-    return (
-        (float(wins or 0) + 0.5 * float(draws or 0)) / float(total)
-        if total > 0 else 0.0
-    )
-
-
-def _promotion_nn_safety_decision(no_mcts_score_rate, num_games, z, rl_cfg):
-    """Require raw-NN non-inferiority before promoting a search winner."""
-    enabled = bool(rl_cfg.get('promotion_no_mcts_gate_enabled', True))
-    score_floor = float(
-        rl_cfg.get(
-            'promotion_no_mcts_score_rate_min',
-            0.40,
-        ) or 0.40
-    )
-    upper_floor = float(rl_cfg.get('promotion_no_mcts_upper_bound_min', 0.50) or 0.50)
-    if not enabled:
-        return True, "", score_floor, None
-    if no_mcts_score_rate is None:
-        return False, "blocked: NN-only safety evaluation unavailable", score_floor, None
-    score = float(no_mcts_score_rate)
-    upper = _score_rate_upper_bound(score, num_games, z)
-    if score < score_floor:
-        return (
-            False,
-            f"blocked: NN-only {score:.1%} < severe floor {score_floor:.1%}",
-            score_floor,
-            upper,
-        )
-    if upper < upper_floor:
-        return (
-            False,
-            f"blocked: NN-only UCB {upper:.1%} < break-even {upper_floor:.1%}",
-            score_floor,
-            upper,
-        )
-    return True, "", score_floor, upper
-
-
-def _anchor_candidate_needs_more_games(
-    score_rate,
-    num_games,
-    *,
-    min_score_rate,
-    min_score_lower_bound,
-    z,
-    max_games,
-    score_standard_error=None,
-):
-    """Whether an anchor result is still statistically inconclusive."""
-    games = max(1, int(num_games or 0))
-    if games >= max(1, int(max_games)):
-        return False
-    lower = _score_rate_lower_bound(
-        score_rate,
-        games,
-        z,
-        standard_error=score_standard_error,
-    )
-    if float(score_rate or 0.0) >= float(min_score_rate) and lower >= float(min_score_lower_bound):
-        return False
-    upper = _score_rate_upper_bound(
-        score_rate,
-        games,
-        z,
-        standard_error=score_standard_error,
-    )
-    return upper >= float(min_score_rate)
-
-
-def _combine_eval_stats(*stats_items):
-    combined = _empty_eval_stats()
-    total_games = 0.0
-    weighted_unresolved = 0.0
-    weighted_wins = 0.0
-    weighted_draws = 0.0
-    weighted_losses = 0.0
+def _evaluate_models_no_mcts_with_paired_scores(*args, **kwargs):
+    """Retain raw-NN paired-opening scores for the same confidence contract."""
     game_scores = {}
-    combined_profile = {}
-    for item in stats_items:
-        if not item:
-            continue
-        weight = 1.0
-        stats = item
-        if isinstance(item, (tuple, list)) and len(item) == 2:
-            stats, weight = item
-        weight = max(0.0, float(weight or 0.0))
-        if weight <= 0.0 or not stats:
-            continue
-        weighted_wins += weight * float(stats.get('wins', 0) or 0)
-        weighted_draws += weight * float(stats.get('draws', 0) or 0)
-        weighted_losses += weight * float(stats.get('losses', 0) or 0)
-        weighted_unresolved += weight * float(stats.get('unresolved', 0) or 0)
-        total_games += weight * float(stats.get('num_games', 0) or 0)
-        for key, value in dict(stats.get('profile', {}) or {}).items():
-            if isinstance(value, (int, float)):
-                combined_profile[key] = combined_profile.get(key, 0) + weight * value
-        if weight == 1.0:
-            game_scores.update({
-                int(key): float(value)
-                for key, value in dict(stats.get('game_scores', {}) or {}).items()
-            })
+    external_callback = kwargs.pop('progress_callback', None)
 
-    combined['wins'] = int(round(weighted_wins))
-    combined['draws'] = int(round(weighted_draws))
-    combined['losses'] = int(round(weighted_losses))
-    combined['unresolved'] = int(round(weighted_unresolved))
-    combined['num_games'] = int(round(total_games))
-    combined['resolved_games'] = max(0, combined['num_games'] - combined['unresolved'])
-    if total_games > 0:
-        combined['score_rate'] = float(
-            (weighted_wins + 0.5 * (weighted_draws + weighted_unresolved)) / total_games
+    def _on_progress(
+        completed,
+        game_idx=None,
+        wins=0,
+        draws=0,
+        losses=0,
+        unresolved=0,
+        plies=0,
+        result='*',
+        model1_as_white=True,
+    ):
+        if game_idx is not None:
+            game_scores[int(game_idx)] = float(wins) + 0.5 * float(draws + unresolved)
+        if external_callback is not None:
+            external_callback(
+                completed, game_idx, wins, draws, losses, unresolved,
+                plies, result, model1_as_white,
+            )
+
+    config = args[2] if len(args) > 2 else kwargs.get('config', {})
+    fixed_openings = kwargs.get('use_fixed_openings')
+    if fixed_openings is None:
+        fixed_openings = bool(
+            (config or {}).get('reinforcement_learning', {}).get(
+                'eval_fixed_openings_enabled', True,
+            )
         )
-        combined['win_rate'] = float(weighted_wins / total_games)
-        combined['draw_rate'] = float((weighted_draws + weighted_unresolved) / total_games)
-        combined['loss_rate'] = float(weighted_losses / total_games)
-    combined['profile'] = combined_profile
-    return _attach_paired_score_stats(combined, game_scores)
+    opening_count = len(_resolve_eval_opening_lines(config)) if fixed_openings else None
+    kwargs['progress_callback'] = _on_progress
+    return _attach_paired_score_stats(
+        evaluate_models_no_mcts(*args, **kwargs),
+        game_scores,
+        opening_count=opening_count,
+    )
 
 
-def _eval_mcts_move_metrics(eval_stats, prefix):
-    """Derive actual Gumbel move-change rates from additive eval counters."""
-    profile = dict((eval_stats or {}).get('profile', {}) or {})
-    base = f'eval_mcts_{prefix}'
-    samples = int(profile.get(f'{base}_move_samples', 0) or 0)
-    changed = int(profile.get(f'{base}_changed_count', 0) or 0)
-    q_samples = int(profile.get(f'{base}_changed_q_samples', 0) or 0)
-    higher = int(profile.get(f'{base}_higher_q_count', 0) or 0)
-    lower = int(profile.get(f'{base}_lower_q_count', 0) or 0)
-    q_sum = float(profile.get(f'{base}_changed_q_delta_sum', 0.0) or 0.0)
-    budget_samples = int(profile.get(f'{base}_budget_samples', 0) or 0)
-    budget_sum = float(profile.get(f'{base}_budget_sum', 0.0) or 0.0)
-    reduced_budgets = int(profile.get(f'{base}_reduced_budget_count', 0) or 0)
-    return {
-        'samples': samples,
-        'avg_simulations': (
-            budget_sum / float(budget_samples)
-        ) if budget_samples > 0 else None,
-        'reduced_budget_rate': (
-            float(reduced_budgets) / float(budget_samples)
-        ) if budget_samples > 0 else None,
-        'changed_rate': (float(changed) / float(samples)) if samples > 0 else None,
-        'higher_q_when_changed_rate': (
-            float(higher) / float(q_samples)
-        ) if q_samples > 0 else None,
-        'lower_q_when_changed_rate': (
-            float(lower) / float(q_samples)
-        ) if q_samples > 0 else None,
-        'changed_q_delta_mean': (q_sum / float(q_samples)) if q_samples > 0 else None,
-    }
+def _make_cumulative_eval_progress_callback(progress_bar, expected_game_indices):
+    """Count each scheduled game once across multiple evaluation calls."""
+    expected_game_indices = set(int(index) for index in expected_game_indices)
+    seen_game_indices = set()
+
+    def _on_progress(completed, game_idx=None, *_details):
+        if game_idx is not None:
+            try:
+                game_idx = int(game_idx)
+            except (TypeError, ValueError):
+                game_idx = None
+        if game_idx is not None:
+            if game_idx not in expected_game_indices or game_idx in seen_game_indices:
+                return
+            seen_game_indices.add(game_idx)
+            increment = 1
+        else:
+            # The evaluation callbacks currently report one completed game at
+            # a time. Keep the fallback bounded if a caller omits game indices.
+            try:
+                increment = max(0, int(completed or 0))
+            except (TypeError, ValueError):
+                increment = 0
+            total = int(progress_bar.total or 0)
+            increment = min(increment, max(0, total - int(progress_bar.n)))
+        if increment:
+            progress_bar.update(increment)
+
+    return _on_progress
+
+
+
+
+
+
+
+
+def _restore_promotion_confirmation_attempt_count(runtime_payload):
+    """Resume bank rotation, accounting for checkpoints from the static suite."""
+    runtime_payload = dict(runtime_payload or {})
+    prior_state = runtime_payload.get('promotion_confirmation_state')
+    prior_state = prior_state if isinstance(prior_state, dict) else {}
+    saved_count = runtime_payload.get('promotion_confirmation_attempt_count')
+    if saved_count is None:
+        saved_count = prior_state.get('attempt_count')
+        if saved_count is None:
+            # A legacy confirmation state represents at least one suite-0 use.
+            saved_count = 1 if prior_state else 0
+    if isinstance(saved_count, bool):
+        raise ValueError('promotion confirmation attempt count must be an integer')
+    attempt_count = int(saved_count or 0)
+    if attempt_count < 0:
+        raise ValueError('promotion confirmation attempt count is negative')
+    return attempt_count
+
+
+def _validate_promotion_confirmation_resume_record(
+    attempt_count, prior_state, *, mode, suite_offset, is_resume
+):
+    """Validate checkpoint telemetry without treating it as global allocation."""
+    attempt_count = int(attempt_count)
+    prior_state = dict(prior_state or {})
+    saved_count = prior_state.get('attempt_count')
+    if saved_count is not None and int(saved_count) != attempt_count:
+        raise RuntimeError(
+            'confirmation counter disagrees with the last persisted confirmation record'
+        )
+    saved_mode = prior_state.get('mode')
+    if (
+        is_resume and attempt_count > 0 and saved_mode
+        and str(saved_mode) != str(mode)
+    ):
+        raise RuntimeError(
+            f'saved confirmation mode {saved_mode!r} does not match configured mode {mode!r}'
+        )
+    saved_indices = [int(value) for value in (prior_state.get('suite_indices') or [])]
+    saved_ids = [str(value) for value in (prior_state.get('suite_ids') or [])]
+    if saved_indices and saved_ids and len(saved_indices) != len(saved_ids):
+        raise RuntimeError(
+            'saved confirmation suite indices and IDs have different lengths'
+        )
+    if mode == 'independent_384' and prior_state and saved_ids and len(saved_ids) not in (0, 2):
+        raise RuntimeError('saved independent_384 confirmation record must contain two suites')
+    if prior_state.get('reservation_token') is not None and not str(
+        prior_state.get('reservation_token')
+    ).strip():
+        raise RuntimeError('saved confirmation reservation token is empty')
+    return True
+
+
+def _run_promotion_confirmation(
+    *,
+    model,
+    best_model,
+    config,
+    device,
+    rl_cfg,
+    central_runtime,
+    suite_id,
+    opening_lines,
+    suite_ids=None,
+    suite_opening_lines=None,
+    expected_candidate_model_state_sha256=None,
+    expected_opponent_model_state_sha256=None,
+    simulation_budget,
+    configured_simulation_budget,
+    suite_error=None,
+    start_substage,
+    finish_substage,
+    discard_failed_runtime,
+):
+    """Run the configured independent confirmation protocol."""
+    mode = str(rl_cfg.get('promotion_confirmation_mode', 'legacy_192'))
+    independent_384 = mode == 'independent_384'
+    expected_games = (
+        _PROMOTION_CONFIRMATION_INDEPENDENT_384_GAMES
+        if independent_384 else _PROMOTION_CONFIRMATION_GAMES
+    )
+    expected_openings = (
+        _PROMOTION_CONFIRMATION_INDEPENDENT_384_OPENINGS
+        if independent_384 else _PROMOTION_CONFIRMATION_OPENINGS
+    )
+    if suite_error:
+        return {
+            'passed': False,
+            'status': 'blocked: independent holdout suite unavailable',
+            'error': str(suite_error),
+            'score_rate': None,
+            'score_lower_bound': None,
+            'score_se': None,
+            'games': 0,
+            'unique_openings': 0,
+            'suite_id': str(suite_id or ''),
+            'simulations': None,
+        }
+    if (
+        int(simulation_budget or 0) <= 0
+        or int(simulation_budget) != int(configured_simulation_budget)
+    ):
+        return {
+            'passed': False,
+            'status': 'blocked: primary MCTS simulation budget unavailable',
+            'error': (
+                f'primary={int(simulation_budget or 0)}, '
+                f'configured={int(configured_simulation_budget)}'
+            ),
+            'score_rate': None,
+            'score_lower_bound': None,
+            'score_se': None,
+            'games': 0,
+            'unique_openings': 0,
+            'suite_id': str(suite_id or ''),
+            'simulations': None,
+        }
+
+    confirmation_eval_t0 = start_substage()
+    confirmation_score_min = max(
+        _PROMOTION_CONFIRMATION_SCORE_MIN,
+        float(
+            rl_cfg.get(
+                'promotion_confirmation_score_rate_min',
+                _PROMOTION_CONFIRMATION_SCORE_MIN,
+            ) or _PROMOTION_CONFIRMATION_SCORE_MIN
+        ),
+        float(rl_cfg.get('score_rate_threshold', 0.0) or 0.0),
+    )
+    confirmation_lb_min = max(
+        _PROMOTION_CONFIRMATION_LB_MIN,
+        float(
+            rl_cfg.get(
+                'promotion_confirmation_score_lower_bound_min',
+                _PROMOTION_CONFIRMATION_LB_MIN,
+            ) or _PROMOTION_CONFIRMATION_LB_MIN
+        ),
+        float(
+            rl_cfg.get(
+                'promotion_score_lower_bound_min',
+                _PROMOTION_CONFIRMATION_LB_MIN,
+            ) or _PROMOTION_CONFIRMATION_LB_MIN
+        ),
+    )
+    confirmation_z = max(
+        _PROMOTION_CONFIRMATION_Z_MIN,
+        float(rl_cfg.get('promotion_stat_gate_z', 0.0) or 0.0),
+    )
+    confirmation_config = _build_eval_config_with_exact_simulations(
+        config,
+        simulation_budget,
+    )
+    confirmation_rl_cfg = dict(
+        confirmation_config.get('reinforcement_learning', {}) or {}
+    )
+    confirmation_rl_cfg.update({
+        'eval_opening_lines': [list(line) for line in opening_lines],
+        'eval_fixed_openings_enabled': True,
+        'eval_fixed_openings_pair_games': True,
+        'eval_fixed_openings_max_plies': 8,
+        'mcts_simulations': simulation_budget,
+        'eval_mcts_simulations_multiplier': 1.0,
+        'mcts_dynamic_budget_enabled': False,
+        'eval_mcts_dynamic_budget_enabled': False,
+    })
+    confirmation_config['reinforcement_learning'] = confirmation_rl_cfg
+    confirmation_stats = {}
+    confirmation_result = None
+    confirmation_progress = tqdm(
+        total=expected_games,
+        desc='Independent promotion confirmation',
+        unit='game',
+    )
+    confirmation_progress_callback = _make_cumulative_eval_progress_callback(
+        confirmation_progress,
+        range(expected_games),
+    )
+    try:
+        if independent_384:
+            if (
+                not isinstance(suite_ids, (list, tuple))
+                or len(suite_ids) != 2
+                or not isinstance(suite_opening_lines, (list, tuple))
+                or len(suite_opening_lines) != 2
+            ):
+                confirmation_stats = {
+                    'infrastructure_error': 'independent_384 requires exactly two suite identities and opening sets',
+                    'num_games': 0,
+                    'game_scores': {},
+                }
+            else:
+                candidate_sha_before = _model_state_sha256(model)
+                opponent_sha_before = _model_state_sha256(best_model)
+                if (
+                    expected_candidate_model_state_sha256
+                    and candidate_sha_before != str(expected_candidate_model_state_sha256)
+                ) or (
+                    expected_opponent_model_state_sha256
+                    and opponent_sha_before != str(expected_opponent_model_state_sha256)
+                ):
+                    confirmation_stats = {
+                        'infrastructure_error': 'candidate or opponent model state SHA does not match selector archive identity',
+                        'num_games': 0,
+                        'game_scores': {},
+                        'suite_ids': [str(value) for value in suite_ids],
+                        'candidate_model_state_sha256_before': candidate_sha_before,
+                        'candidate_model_state_sha256_after': candidate_sha_before,
+                        'opponent_model_state_sha256_before': opponent_sha_before,
+                        'opponent_model_state_sha256_after': opponent_sha_before,
+                    }
+                    stage_stats = []
+                else:
+                    stage_stats = []
+                for stage_index, stage_openings in enumerate(
+                    suite_opening_lines if not confirmation_stats else ()
+                ):
+                    stage_config = copy.deepcopy(confirmation_config)
+                    stage_rl_cfg = dict(
+                        stage_config.get('reinforcement_learning', {}) or {}
+                    )
+                    stage_rl_cfg['eval_opening_lines'] = [
+                        list(line) for line in stage_openings
+                    ]
+                    stage_config['reinforcement_learning'] = stage_rl_cfg
+                    stage_offset = stage_index * _PROMOTION_CONFIRMATION_GAMES
+                    stage_result = _evaluate_models_with_paired_scores(
+                        model,
+                        best_model,
+                        stage_config,
+                        device,
+                        _PROMOTION_CONFIRMATION_GAMES,
+                        game_index_offset=stage_offset,
+                        use_fixed_openings=True,
+                        central_runtime=central_runtime,
+                        progress_desc='Independent promotion confirmation (fixed suite)',
+                        progress_callback=confirmation_progress_callback,
+                        show_progress=False,
+                    ) or {}
+                    stage_stats.append(dict(stage_result))
+                    if stage_result.get('infrastructure_error') or stage_result.get('cancelled'):
+                        break
+                if len(stage_stats) == 2:
+                    confirmation_stats = _combine_eval_stats(*stage_stats)
+                elif stage_stats and not confirmation_stats:
+                    confirmation_stats = dict(stage_stats[0])
+                elif not confirmation_stats:
+                    confirmation_stats = {
+                        'infrastructure_error': 'independent_384 evaluation produced no stage results',
+                        'num_games': 0,
+                        'game_scores': {},
+                    }
+                scores = dict(confirmation_stats.get('game_scores') or {})
+                confirmation_stats = _attach_paired_score_stats(
+                    confirmation_stats,
+                    scores,
+                    opening_count=_PROMOTION_CONFIRMATION_INDEPENDENT_384_OPENINGS,
+                )
+                candidate_sha_after = _model_state_sha256(model)
+                opponent_sha_after = _model_state_sha256(best_model)
+                confirmation_stats.update({
+                    'suite_ids': [str(value) for value in suite_ids],
+                    'candidate_model_state_sha256_before': candidate_sha_before,
+                    'candidate_model_state_sha256_after': candidate_sha_after,
+                    'opponent_model_state_sha256_before': opponent_sha_before,
+                    'opponent_model_state_sha256_after': opponent_sha_after,
+                    'fixed_suite_stage_games': [
+                        int(item.get('num_games', 0) or 0) for item in stage_stats
+                    ],
+                })
+                for expected_offset, item in enumerate(stage_stats):
+                    expected_offset *= _PROMOTION_CONFIRMATION_GAMES
+                    expected_indices = set(range(
+                        expected_offset,
+                        expected_offset + _PROMOTION_CONFIRMATION_GAMES,
+                    ))
+                    observed_indices = {
+                        int(index) for index in dict(item.get('game_scores') or {})
+                    }
+                    if (
+                        int(item.get('num_games', 0) or 0) != _PROMOTION_CONFIRMATION_GAMES
+                        or observed_indices != expected_indices
+                    ):
+                        confirmation_stats['incomplete_fixed_suite_stage'] = True
+                        break
+                if candidate_sha_before != candidate_sha_after or opponent_sha_before != opponent_sha_after:
+                    confirmation_stats['infrastructure_error'] = (
+                        'model state SHA changed during independent confirmation'
+                    )
+                if (
+                    expected_candidate_model_state_sha256
+                    and candidate_sha_before != str(expected_candidate_model_state_sha256)
+                ) or (
+                    expected_opponent_model_state_sha256
+                    and opponent_sha_before != str(expected_opponent_model_state_sha256)
+                ):
+                    confirmation_stats['infrastructure_error'] = (
+                        'candidate or opponent model state SHA does not match selector archive identity'
+                    )
+        else:
+            first_stage_games = _PROMOTION_CONFIRMATION_GAMES // 2
+            first_stats = _evaluate_models_with_paired_scores(
+                model,
+                best_model,
+                confirmation_config,
+                device,
+                first_stage_games,
+                game_index_offset=0,
+                use_fixed_openings=True,
+                central_runtime=central_runtime,
+                progress_desc='Independent promotion confirmation',
+                progress_callback=confirmation_progress_callback,
+                show_progress=False,
+            )
+            first_game_scores = {
+                int(key): float(value)
+                for key, value in dict(
+                    (first_stats or {}).get('game_scores', {}) or {}
+                ).items()
+            }
+            first_outcome_count = sum(
+                int((first_stats or {}).get(key, 0) or 0)
+                for key in ('wins', 'draws', 'losses', 'unresolved')
+            )
+            first_stage_complete = bool(
+                not (first_stats or {}).get('infrastructure_error')
+                and not (first_stats or {}).get('cancelled', False)
+                and int((first_stats or {}).get('completed', 0) or 0)
+                == first_stage_games
+                and int((first_stats or {}).get('num_games', 0) or 0)
+                == first_stage_games
+                and len(first_game_scores) == first_stage_games
+                and set(first_game_scores) == set(range(first_stage_games))
+                and first_outcome_count == first_stage_games
+            )
+            early_reject = False
+            if first_stage_complete:
+                first_score_rate = sum(first_game_scores.values()) / float(
+                    first_stage_games
+                )
+                first_score_se, first_pair_count, first_opening_count = (
+                    _paired_score_standard_error(
+                        first_game_scores,
+                        opening_count=_PROMOTION_CONFIRMATION_OPENINGS,
+                    )
+                )
+                if (
+                    first_pair_count == first_stage_games // 2
+                    and first_opening_count == first_stage_games // 2
+                    and first_score_se is not None
+                    and math.isfinite(float(first_score_se))
+                    and float(first_score_se) >= 0.0
+                ):
+                    early_reject_upper_bound = _score_rate_upper_bound(
+                        first_score_rate,
+                        first_stage_games,
+                        z=1.96,
+                        standard_error=first_score_se,
+                    )
+                    early_reject = bool(
+                        early_reject_upper_bound < confirmation_score_min
+                    )
+                    if early_reject:
+                        confirmation_result = {
+                            'passed': False,
+                            'status': (
+                                'early rejected after 96 games: '
+                                f'conservative upper bound {early_reject_upper_bound:.1%} '
+                                f'< score minimum {confirmation_score_min:.1%}'
+                            ),
+                            'score_rate': float(first_score_rate),
+                            'score_lower_bound': None,
+                            'score_se': float(first_score_se),
+                            'games': first_stage_games,
+                            'unique_openings': first_opening_count,
+                            'suite_id': str(suite_id),
+                            'simulations': int(simulation_budget),
+                            'early_reject_upper_bound': float(
+                                early_reject_upper_bound
+                            ),
+                        }
+                        confirmation_stats = dict(first_stats)
+                        confirmation_stats.update({
+                            'game_scores': first_game_scores,
+                            'paired_score_pairs': first_pair_count,
+                            'paired_score_unique_openings': first_opening_count,
+                            'paired_opening_count': _PROMOTION_CONFIRMATION_OPENINGS,
+                            'paired_score_se': float(first_score_se),
+                            'score_rate': float(first_score_rate),
+                            'early_reject': True,
+                            'early_reject_upper_bound': float(
+                                early_reject_upper_bound
+                            ),
+                        })
+
+            if not early_reject:
+                if first_stage_complete:
+                    second_stats = _evaluate_models_with_paired_scores(
+                        model,
+                        best_model,
+                        confirmation_config,
+                        device,
+                        _PROMOTION_CONFIRMATION_GAMES - first_stage_games,
+                        game_index_offset=first_stage_games,
+                        use_fixed_openings=True,
+                        central_runtime=central_runtime,
+                        progress_desc='Independent promotion confirmation',
+                        progress_callback=confirmation_progress_callback,
+                        show_progress=False,
+                    )
+                    if (second_stats or {}).get('infrastructure_error'):
+                        confirmation_stats = dict(second_stats)
+                    else:
+                        confirmation_stats = _combine_eval_stats(first_stats, second_stats)
+                        if (second_stats or {}).get('cancelled', False):
+                            confirmation_stats['cancelled'] = True
+                else:
+                    # An incomplete first stage cannot reject or promote a model.
+                    confirmation_stats = dict(first_stats or {})
+    except Exception as exc:
+        confirmation_stats = {
+            'infrastructure_error': f'{type(exc).__name__}: {exc}',
+            'num_games': 0,
+            'game_scores': {},
+        }
+    finally:
+        confirmation_progress.close()
+        finish_substage('promotion_confirmation', confirmation_eval_t0)
+
+    confirmation_error = (confirmation_stats or {}).get('infrastructure_error')
+    if confirmation_error and (
+        is_transient_cuda_error(str(confirmation_error))
+        or 'central inference' in str(confirmation_error).lower()
+        or 'worker' in str(confirmation_error).lower()
+    ):
+        discard_failed_runtime(confirmation_error)
+    if confirmation_result is None:
+        confirmation_result = _promotion_confirmation_decision(
+            confirmation_stats,
+            suite_id=suite_id,
+            expected_suite_id=suite_id,
+            expected_games=expected_games,
+            expected_openings=expected_openings,
+            score_min=confirmation_score_min,
+            lower_bound_min=confirmation_lb_min,
+            z=confirmation_z,
+            expected_suite_ids=suite_ids if independent_384 else None,
+        )
+        confirmation_result['suite_indices'] = list(
+            rl_cfg.get('_promotion_confirmation_suite_indices', []) or []
+        )
+        for identity_key in (
+            'candidate_model_state_sha256_before',
+            'candidate_model_state_sha256_after',
+            'opponent_model_state_sha256_before',
+            'opponent_model_state_sha256_after',
+        ):
+            if identity_key in confirmation_stats:
+                confirmation_result[identity_key] = confirmation_stats[identity_key]
+        if confirmation_stats.get('incomplete_fixed_suite_stage'):
+            confirmation_result.update({
+                'passed': False,
+                'status': 'blocked: incomplete fixed confirmation suite stage',
+            })
+        confirmation_result['simulations'] = int(simulation_budget)
+    return confirmation_result
+
+
+
+
+
+
+
+
+
+
 
 
 def _evaluate_anchor_candidate_sequential(
@@ -1851,7 +3300,7 @@ def _evaluate_anchor_no_mcts_sequential(
         if completed_games >= target_games:
             continue
         games_this_batch = int(target_games - completed_games)
-        stats = evaluate_models_no_mcts(
+        stats = _evaluate_models_no_mcts_with_paired_scores(
             model,
             anchor_model,
             config,
@@ -1893,79 +3342,81 @@ def _evaluate_models_funnel(
     preliminary_true_win_rate=0.0,
     medium_score_rate=0.53,
     medium_true_win_rate=0.0,
+    force_medium=False,
     game_index_offset=0,
     use_fixed_openings=True,
     central_runtime=None,
 ):
-    preliminary_games = max(1, int(preliminary_games))
-    medium_games = max(0, int(medium_games))
-    advanced_games = max(0, int(advanced_games))
-    preliminary_config = _build_eval_config_with_exact_simulations(config, preliminary_simulations)
-    medium_config = _build_eval_config_with_exact_simulations(config, medium_simulations)
-    advanced_config = _build_eval_config_with_exact_simulations(config, advanced_simulations)
-    preliminary_stats = _evaluate_models_with_paired_scores(
-        model,
-        best_model,
-        preliminary_config,
-        device,
-        preliminary_games,
+    """Thin runtime adapter for the shared cumulative MCTS selector."""
+    def _evaluate_stage(
+        stage_model,
+        reference_model,
+        stage_config,
+        stage_device,
+        games,
+        offset,
+        fixed_openings,
+        runtime,
+        *,
+        progress,
+        progress_desc,
+    ):
+        callback = (
+            _make_cumulative_eval_progress_callback(
+                progress, range(int(offset), int(offset) + int(games))
+            )
+            if progress is not None else None
+        )
+        return _evaluate_models_with_paired_scores(
+            stage_model,
+            reference_model,
+            stage_config,
+            stage_device,
+            games,
+            game_index_offset=offset,
+            use_fixed_openings=fixed_openings,
+            central_runtime=runtime,
+            progress_desc=progress_desc,
+            progress_callback=callback,
+            show_progress=False,
+        )
+
+    def _make_progress(total_games):
+        return tqdm(
+            total=int(total_games),
+            desc="Eval vs best (MCTS selection)",
+            unit="game",
+        )
+
+    return _run_cumulative_promotion_funnel(
+        model=model,
+        best_model=best_model,
+        config=config,
+        device=device,
+        preliminary_games=preliminary_games,
+        preliminary_simulations=preliminary_simulations,
+        medium_games=medium_games,
+        medium_simulations=medium_simulations,
+        advanced_games=advanced_games,
+        advanced_simulations=advanced_simulations,
+        preliminary_score_rate=preliminary_score_rate,
+        preliminary_true_win_rate=preliminary_true_win_rate,
+        medium_score_rate=medium_score_rate,
+        medium_true_win_rate=medium_true_win_rate,
+        force_medium=force_medium,
         game_index_offset=game_index_offset,
         use_fixed_openings=use_fixed_openings,
         central_runtime=central_runtime,
+        evaluate_stage=_evaluate_stage,
+        build_config=_build_eval_config_with_exact_simulations,
+        opening_count=(
+            len(_resolve_eval_opening_lines(config))
+            if use_fixed_openings else None
+        ),
+        combine_stats=_combine_eval_stats,
+        score_upper_bound=_score_rate_upper_bound,
+        progress_factory=_make_progress,
     )
-    if (preliminary_stats or {}).get('infrastructure_error'):
-        return preliminary_stats, "infrastructure_error"
-    score_rate = float((preliminary_stats or {}).get('score_rate', 0.0) or 0.0)
-    true_win_rate = float((preliminary_stats or {}).get('win_rate', 0.0) or 0.0)
-    if (
-        score_rate < float(preliminary_score_rate)
-        or true_win_rate < float(preliminary_true_win_rate)
-    ):
-        return preliminary_stats, "funnel:preliminary_reject"
-    if medium_games <= 0:
-        return preliminary_stats, "funnel:preliminary_only"
-
-    medium_stats = _evaluate_models_with_paired_scores(
-        model,
-        best_model,
-        medium_config,
-        device,
-        medium_games,
-        game_index_offset=game_index_offset + preliminary_games,
-        use_fixed_openings=use_fixed_openings,
-        central_runtime=central_runtime,
-    )
-    if (medium_stats or {}).get('infrastructure_error'):
-        return medium_stats, "infrastructure_error"
-    # Every stage now uses the same search budget and disjoint paired openings,
-    # so all completed games are commensurate.  Keep the preliminary evidence
-    # instead of discarding it and making the reported score jump between small
-    # opening subsets.
-    through_medium = _combine_eval_stats(preliminary_stats, medium_stats)
-    medium_score = float((through_medium or {}).get('score_rate', 0.0) or 0.0)
-    medium_true_win = float((through_medium or {}).get('win_rate', 0.0) or 0.0)
-    if (
-        medium_score < float(medium_score_rate)
-        or medium_true_win < float(medium_true_win_rate)
-    ):
-        return through_medium, "funnel:medium_reject"
-    if advanced_games <= 0:
-        return through_medium, "funnel:medium_only"
-
-    advanced_stats = _evaluate_models_with_paired_scores(
-        model,
-        best_model,
-        advanced_config,
-        device,
-        advanced_games,
-        game_index_offset=game_index_offset + preliminary_games + medium_games,
-        use_fixed_openings=use_fixed_openings,
-        central_runtime=central_runtime,
-    )
-    if (advanced_stats or {}).get('infrastructure_error'):
-        return advanced_stats, "infrastructure_error"
-    combined = _combine_eval_stats(through_medium, advanced_stats)
-    return combined, "funnel:advanced"
 
 
 def _models_have_identical_state(model_a, model_b):
@@ -1983,6 +3434,147 @@ def _models_have_identical_state(model_a, model_b):
         if not torch.equal(tensor_a, tensor_b):
             return False
     return True
+
+
+def _run_selective_reanalyse(replay_buffer, model, config, device, iteration):
+    """Refresh a small stale replay cohort with deterministic current-model MCTS."""
+    rl_cfg = config.get('reinforcement_learning', {})
+    if not bool(rl_cfg.get('replay_reanalyse_enabled', True)):
+        return {'selected': 0, 'updated': 0, 'reason': 'disabled', 'seconds': 0.0}
+    interval = max(1, int(rl_cfg.get('replay_reanalyse_interval', 4)))
+    if int(iteration) % interval != 0:
+        return {'selected': 0, 'updated': 0, 'reason': 'cadence', 'seconds': 0.0}
+    if replay_buffer is None or len(replay_buffer) <= 0:
+        return {'selected': 0, 'updated': 0, 'reason': 'empty', 'seconds': 0.0}
+
+    fraction = max(0.0, min(1.0, float(rl_cfg.get('replay_reanalyse_fraction', 0.02))))
+    max_positions = max(1, int(rl_cfg.get('replay_reanalyse_max_positions', 64)))
+    count = min(max_positions, int(round(len(replay_buffer) * fraction)))
+    if count <= 0:
+        return {'selected': 0, 'updated': 0, 'reason': 'below_fraction', 'seconds': 0.0}
+    indices = replay_buffer.select_reanalysis_indices(
+        count,
+        min_age=int(rl_cfg.get('replay_reanalyse_min_age', 2)),
+        min_staleness=int(rl_cfg.get('replay_reanalyse_min_staleness', 2)),
+        max_refreshes=int(rl_cfg.get('replay_reanalyse_max_refreshes', 2)),
+        seed=int(config.get('seed', 490050)) + int(iteration) * 1_000_033,
+    )
+    if indices.size <= 0:
+        return {'selected': 0, 'updated': 0, 'reason': 'no_stale_exact_fen', 'seconds': 0.0}
+
+    simulations = max(1, int(rl_cfg.get('replay_reanalyse_simulations', 192)))
+    batch_size = max(1, int(rl_cfg.get('replay_reanalyse_batch_positions', 16)))
+    mcts_rl_cfg = dict(rl_cfg)
+    mcts_rl_cfg.update({
+        'mcts_simulations': simulations,
+        'mcts_dynamic_budget_enabled': False,
+        'mcts_gumbel_scale': 0.0,
+        'mcts_gumbel_eval_scale': 0.0,
+    })
+    mcts_config = dict(config)
+    mcts_config['reinforcement_learning'] = mcts_rl_cfg
+    mcts = MultiGameBatchMCTS(model, mcts_config, device)
+    positions = replay_buffer.hard_positions_for_indices(indices)
+    was_training = bool(model.training)
+    model.eval()
+    started = time.perf_counter()
+    updated = skipped = corrections = 0
+    policy_target_sample_count = 0
+    policy_target_challenge_delta_intervention_count = 0
+    try:
+        for start in range(0, len(positions), batch_size):
+            chunk_indices = indices[start:start + batch_size]
+            states = []
+            boards = []
+            valid_indices = []
+            for replay_idx, payload in zip(chunk_indices.tolist(), positions[start:start + batch_size]):
+                try:
+                    board = chess.new_board(payload['fen'])
+                    encoded_history = [
+                        mcts._encode_history_entry(chess.new_board(fen))
+                        for fen in list(payload.get('history_fens', ()) or ())
+                    ]
+                except Exception:
+                    skipped += 1
+                    continue
+                boards.append(board)
+                valid_indices.append(int(replay_idx))
+                states.append({
+                    'board': board,
+                    'root': None,
+                    'board_history': encoded_history,
+                    'position_counts': None,
+                    '_native_tree_key': ('reanalyse', int(iteration), int(replay_idx)),
+                })
+            if not states:
+                continue
+            visits_list, metadata_list = mcts.search_many(
+                states,
+                num_simulations=simulations,
+                add_root_noise=False,
+                return_search_metadata=True,
+            )
+            policy_targets = []
+            metadata_rows = []
+            batch_target_count = 0
+            batch_intervention_count = 0
+            for board, visits, metadata in zip(boards, visits_list, metadata_list):
+                metadata = dict(metadata or {})
+                probability_target = metadata.get('policy_target_probs_override')
+                target = probability_target if isinstance(probability_target, dict) and probability_target else visits
+                policy_targets.append(_build_sparse_policy_target_from_visits(target, board))
+                batch_target_count += 1
+                if bool(metadata.get('policy_target_intervention_applied', False)):
+                    batch_intervention_count += 1
+                changed_top, q_delta = _search_correction_metadata(metadata)
+                corrections += int(
+                    changed_top and math.isfinite(q_delta) and q_delta > USEFUL_SEARCH_Q_DELTA_MIN
+                )
+                metadata_rows.append({
+                    'root_q': metadata.get('root_value', float('nan')),
+                    'best_q': metadata.get('best_q', float('nan')),
+                    'orig_q': metadata.get('orig_q', float('nan')),
+                    'policy_kld': metadata.get('policy_kld', float('nan')),
+                    'search_changed_top': changed_top,
+                    'search_q_delta': q_delta,
+                    'search_visits': int(metadata.get('search_visits', 0) or 0),
+                    # Reanalysis replaces the search target, so carry the exact
+                    # accounting for this search instead of retaining old values.
+                    **_reanalysis_search_accounting(metadata),
+                })
+            batch_updated = replay_buffer.apply_reanalysis(
+                valid_indices,
+                policy_targets,
+                metadata_rows,
+                target_iteration=int(iteration),
+            )
+            updated += batch_updated
+            if batch_updated == len(policy_targets):
+                policy_target_sample_count += batch_target_count
+                policy_target_challenge_delta_intervention_count += batch_intervention_count
+    except Exception as exc:
+        return {
+            'selected': int(indices.size), 'updated': int(updated), 'skipped': int(skipped),
+            'corrections': int(corrections), 'simulations': simulations,
+            'policy_target_sample_count': int(policy_target_sample_count),
+            'policy_target_challenge_delta_intervention_count': int(
+                policy_target_challenge_delta_intervention_count
+            ),
+            'seconds': float(time.perf_counter() - started),
+            'reason': f'{type(exc).__name__}: {str(exc)[:160]}',
+        }
+    finally:
+        if was_training:
+            model.train()
+    return {
+        'selected': int(indices.size), 'updated': int(updated), 'skipped': int(skipped),
+        'corrections': int(corrections), 'simulations': simulations,
+        'policy_target_sample_count': int(policy_target_sample_count),
+        'policy_target_challenge_delta_intervention_count': int(
+            policy_target_challenge_delta_intervention_count
+        ),
+        'seconds': float(time.perf_counter() - started), 'reason': 'ok',
+    }
 
 
 # ==============================================================================
@@ -2052,135 +3644,6 @@ def _resolve_selfplay_worker_plan(config, num_games):
     }
 
 
-def _run_selective_reanalyse(replay_buffer, model, config, device):
-    """Refresh the hardest reconstructable replay rows with the active search."""
-    rl_cfg = config.get('reinforcement_learning', {})
-    if not bool(rl_cfg.get('replay_reanalyse_enabled', True)):
-        return {'selected': 0, 'updated': 0, 'reason': 'disabled'}
-    if replay_buffer is None or len(replay_buffer) <= 0:
-        return {'selected': 0, 'updated': 0, 'reason': 'empty'}
-
-    max_positions = max(1, int(rl_cfg.get('replay_reanalyse_max_positions', 128)))
-    fraction = max(0.0, min(1.0, float(rl_cfg.get('replay_reanalyse_fraction', 0.01))))
-    count = min(max_positions, max(1, int(round(len(replay_buffer) * fraction))))
-    indices = replay_buffer.select_hard_position_indices(
-        count,
-        min_age=int(rl_cfg.get('replay_reanalyse_min_age', 1)),
-    )
-    if indices.size <= 0:
-        return {'selected': 0, 'updated': 0, 'reason': 'no_fen'}
-
-    simulations = max(1, int(rl_cfg.get('replay_reanalyse_simulations', 256)))
-    batch_size = max(1, int(rl_cfg.get('replay_reanalyse_batch_positions', 16)))
-    policy_mix = max(0.0, min(1.0, float(rl_cfg.get('replay_reanalyse_policy_mix', 0.65))))
-    mcts_rl_cfg = dict(rl_cfg)
-    mcts_rl_cfg.update({
-        'mcts_simulations': simulations,
-        'mcts_dynamic_budget_enabled': False,
-        'mcts_gumbel_scale': 0.0,
-        'mcts_gumbel_eval_scale': 0.0,
-    })
-    mcts_config = dict(config)
-    mcts_config['reinforcement_learning'] = mcts_rl_cfg
-    mcts = MultiGameBatchMCTS(model, mcts_config, device)
-    hard_positions = replay_buffer.hard_positions_for_indices(indices)
-    was_training = bool(model.training)
-    model.eval()
-    updated = 0
-    skipped = 0
-    correction_count = 0
-    started = time.perf_counter()
-    try:
-        for start in range(0, len(hard_positions), batch_size):
-            chunk_positions = hard_positions[start:start + batch_size]
-            chunk_indices = indices[start:start + batch_size]
-            states = []
-            boards = []
-            valid_indices = []
-            for replay_idx, payload in zip(chunk_indices.tolist(), chunk_positions):
-                try:
-                    board = chess.new_board(payload['fen'])
-                    encoded_history = [
-                        mcts._encode_history_entry(chess.new_board(history_fen))
-                        for history_fen in list(payload.get('history_fens', []) or [])
-                    ]
-                except Exception:
-                    skipped += 1
-                    continue
-                boards.append(board)
-                valid_indices.append(int(replay_idx))
-                states.append([board, None, False, encoded_history, 0, None, simulations])
-            if not states:
-                continue
-            visits_list, metadata_list = mcts.search_many(
-                states,
-                num_simulations=simulations,
-                add_root_noise=False,
-                return_search_metadata=True,
-            )
-            policy_targets = []
-            root_q_values = []
-            best_q_values = []
-            orig_q_values = []
-            policy_kld_values = []
-            search_visit_values = []
-            policy_weight_values = []
-            search_changed_top_values = []
-            search_q_delta_values = []
-            for board, visits, metadata in zip(boards, visits_list, metadata_list):
-                metadata = metadata or {}
-                def _metadata_float(key, default=float('nan')):
-                    try:
-                        value = metadata.get(key, default)
-                        return float(default if value is None else value)
-                    except (TypeError, ValueError):
-                        return float(default)
-                probability_target = (metadata or {}).get('policy_target_probs_override')
-                target = probability_target if isinstance(probability_target, dict) and probability_target else visits
-                policy_targets.append(_build_sparse_policy_target_from_visits(target, board))
-                root_q_values.append(_metadata_float('root_value', 0.0))
-                best_q_values.append(_metadata_float('best_q'))
-                orig_q_values.append(_metadata_float('orig_q'))
-                policy_kld_values.append(_metadata_float('policy_kld'))
-                search_visit_values.append(int(metadata.get('search_visits', 0) or 0))
-                changed_top, q_delta, correction_multiplier = _search_correction_metadata(metadata)
-                policy_weight_values.append(
-                    _policy_uptake_weight(metadata) * correction_multiplier
-                )
-                search_changed_top_values.append(changed_top)
-                search_q_delta_values.append(q_delta)
-                correction_count += int(
-                    changed_top
-                    and math.isfinite(q_delta)
-                    and q_delta > USEFUL_SEARCH_Q_DELTA_MIN
-                )
-            updated += replay_buffer.update_reanalyzed_targets(
-                valid_indices,
-                policy_targets,
-                root_q_values,
-                policy_mix=policy_mix,
-                policy_weight_values=policy_weight_values,
-                search_changed_top_values=search_changed_top_values,
-                search_q_delta_values=search_q_delta_values,
-                best_q_values=best_q_values,
-                orig_q_values=orig_q_values,
-                policy_kld_values=policy_kld_values,
-                search_visit_values=search_visit_values,
-            )
-    finally:
-        if was_training:
-            model.train()
-    return {
-        'selected': int(indices.size),
-        'updated': int(updated),
-        'skipped': int(skipped),
-        'corrections': int(correction_count),
-        'simulations': simulations,
-        'seconds': float(time.perf_counter() - started),
-        'reason': 'ok',
-    }
-
-
 def play_games_parallel_mcts(
     model,
     config,
@@ -2191,20 +3654,16 @@ def play_games_parallel_mcts(
 ):
     """
     Parallel self-play using MCTS
-    
+
     This is the PROPER AlphaZero approach:
     - Each worker plays games using MCTS
     - Training targets = MCTS visit distributions
     - High quality training data
     """
     start_time = time.time()
-    
-    if not MCTS_SELFPLAY_AVAILABLE:
-        print("MCTS self-play not available!")
-        return [], 0, 0, 0, 0, 0
-    
+
     model_state = model.state_dict()
-    
+
     rl_cfg = config.get('reinforcement_learning', {})
     hard_start_positions = list(hard_start_positions or [None] * int(num_games))
     if len(hard_start_positions) < int(num_games):
@@ -2224,7 +3683,7 @@ def play_games_parallel_mcts(
     # game slots from a shared FIFO. The old fixed-size outer chunk scheduler
     # created repeated drain waves and is intentionally gone.
     global_game_stream_enabled = bool(dynamic_dispatch_enabled)
-    
+
     worker_plan = _resolve_selfplay_worker_plan(config, num_games)
     device_type = worker_plan['device_type']
     worker_specs = worker_plan['worker_specs']
@@ -2234,14 +3693,14 @@ def play_games_parallel_mcts(
         max_batch_games = max(1, int(max_batch_games_raw))
     except Exception:
         max_batch_games = 1
-    
+
     opponent_assignments = {int(rank): {} for rank, _games in worker_specs}
     opponent_debug = {"mode": "same-model"}
 
     # Shared temp dir used by worker result files.
     temp_dir = Path(tempfile.gettempdir()) / "chess_selfplay_mcts"
     temp_dir.mkdir(exist_ok=True)
-    
+
     processes = []
     result_files = []
     progress_files = []
@@ -2291,6 +3750,10 @@ def play_games_parallel_mcts(
     queue_tree_reuse_scout_reduced_count = 0
     queue_shared_tree_searches = 0
     queue_hard_start_games = 0
+    queue_opening_prefix_sampled_games = 0
+    queue_opening_prefix_games = 0
+    queue_opening_prefix_plies_sum = 0
+    queue_opening_sequence_counts = defaultdict(int)
     queue_search_simulations_used_samples = []
     queue_search_simulations_budget_samples = []
     queue_wait_total_s = 0.0
@@ -2436,60 +3899,6 @@ def play_games_parallel_mcts(
             if native_tree_leaves + python_tree_leaves > 0 else 0.0
         )
 
-    def _accumulate_mcts_quality_stats(target, source):
-        source = dict(source or {})
-        if source.get('mcts_q_delta_values') is not None:
-            values = target.setdefault('mcts_q_delta_values', [])
-            values.extend(list(source.get('mcts_q_delta_values') or []))
-        if source.get('mcts_changed_q_delta_values') is not None:
-            values = target.setdefault('mcts_changed_q_delta_values', [])
-            values.extend(list(source.get('mcts_changed_q_delta_values') or []))
-        _merge_q_delta_histogram(
-            target,
-            'mcts_q_delta_hist',
-            source.get('mcts_q_delta_hist'),
-            source.get('mcts_q_delta_values'),
-        )
-        _merge_q_delta_histogram(
-            target,
-            'mcts_changed_q_delta_hist',
-            source.get('mcts_changed_q_delta_hist'),
-            source.get('mcts_changed_q_delta_values'),
-        )
-        for key in [
-            'mcts_prior_agreement_samples',
-            'mcts_prior_agreement_sum',
-            'mcts_prior_changed_count',
-            'mcts_prior_top_visit_prob_sum',
-            'mcts_top_prior_prob_sum',
-            'mcts_policy_kl_sum',
-            'mcts_top_visit_prob_sum',
-            'mcts_visit_gap_sum',
-            'mcts_visit_entropy_sum',
-            'mcts_good_target_count',
-            'mcts_explored_prior_mass_sum',
-            'mcts_visited_move_count_sum',
-            'mcts_legal_move_count_sum',
-            'mcts_visit_coverage_ratio_sum',
-            'mcts_q_delta_samples',
-            'mcts_q_delta_sum',
-            'mcts_changed_to_lower_q_count',
-            'mcts_changed_to_higher_q_count',
-            'mcts_changed_q_delta_samples',
-            'mcts_changed_q_delta_sum',
-            'mcts_policy_uptake_samples',
-            'mcts_policy_uptake_weight_sum',
-            'mcts_policy_uptake_low_count',
-        ]:
-            target[key] = float(target.get(key, 0.0)) + float(source.get(key, 0.0) or 0.0)
-        for phase in ('opening', 'middlegame', 'endgame'):
-            for suffix in (
-                'samples',
-                'changed_count',
-            ):
-                key = f'mcts_phase_{phase}_{suffix}'
-                target[key] = float(target.get(key, 0.0)) + float(source.get(key, 0.0) or 0.0)
-
     try:
         if use_persistent_pool:
             selfplay_pool = get_or_create_selfplay_pool(config, worker_specs, device_type, temp_dir)
@@ -2505,8 +3914,14 @@ def play_games_parallel_mcts(
                 return {
                     'mcts_temperature': rl_cfg.get('mcts_temperature'),
                     'mcts_temperature_threshold': rl_cfg.get('mcts_temperature_threshold'),
+                    'self_play_task_seed': (
+                        int(config.get('seed', 490050))
+                        + int(rl_cfg.get('current_iteration', 1) or 1) * 1_000_003
+                    ),
                 }
 
+            stream_job_by_id = {}
+            completed_stream_job_ids = set()
             if global_game_stream_enabled:
                 result_files = []
                 progress_files = []
@@ -2514,9 +3929,15 @@ def play_games_parallel_mcts(
                 completed_games_by_rank = {int(rank): 0 for rank, _ in worker_specs}
                 current_progress_files = {}
                 stream_jobs = [
-                    {'hard_start': hard_start_positions[game_idx]}
+                    {
+                        'job_id': int(game_idx),
+                        'hard_start': hard_start_positions[game_idx],
+                    }
                     for game_idx in range(int(num_games))
                 ]
+                stream_job_by_id = {
+                    int(job['job_id']): dict(job) for job in stream_jobs
+                }
                 worker_ranks = [int(rank) for rank, _ in worker_specs]
                 initial_total = min(
                     len(stream_jobs),
@@ -2662,14 +4083,11 @@ def play_games_parallel_mcts(
             rank_to_index = {rank: idx for idx, (rank, _) in enumerate(worker_specs)}
             games_reported = {rank: 0 for rank, _ in worker_specs}
             games_bar_last = 0
+            crashed_stream_workers = {}
+            stream_recovery_attempts = 0
+            recovery_quiet_since = None
 
-            def _redispatch_after_worker_crash(rank, exitcode):
-                raise RuntimeError(
-                    f"Persistent self-play worker {int(rank)} exited unexpectedly with code {exitcode}; "
-                    "the iteration is aborted because a claimed game cannot be reconstructed safely."
-                )
-
-            while pending:
+            while pending or (global_game_stream_enabled and crashed_stream_workers):
                 # Update games progress from .progress files
                 total_done = 0
                 for rank, _ in worker_specs:
@@ -2692,12 +4110,33 @@ def play_games_parallel_mcts(
                     queue_wait_t0 = time.perf_counter()
                     try:
                         message = selfplay_pool.result_queue.get(timeout=0.2)
+                        recovery_quiet_since = None
                         queue_wait_total_s += float(time.perf_counter() - queue_wait_t0)
                         queue_wait_events += 1
                         if message.get('task_id') == task_id:
                             if message.get('type') == 'payload':
                                 packed = message.get('positions')
                                 chunk_lengths = list(message.get('game_lengths', []) or [])
+                                chunk_job_ids = [
+                                    int(value)
+                                    for value in list(message.get('game_job_ids', []) or [])
+                                ]
+                                if global_game_stream_enabled and chunk_lengths:
+                                    if len(chunk_job_ids) != len(chunk_lengths):
+                                        raise RuntimeError(
+                                            "self-play stream payload has no exact game identity: "
+                                            f"{len(chunk_job_ids)} ids for {len(chunk_lengths)} games"
+                                        )
+                                    duplicate_ids = completed_stream_job_ids.intersection(
+                                        chunk_job_ids
+                                    )
+                                    if duplicate_ids:
+                                        if len(duplicate_ids) == len(chunk_job_ids):
+                                            continue
+                                        raise RuntimeError(
+                                            "self-play recovery produced a partially duplicated chunk: "
+                                            f"{sorted(duplicate_ids)[:8]}"
+                                        )
                                 chunk_stats = message.get('stats', {}) or {}
                                 if packed is not None:
                                     boards = packed.get('boards')
@@ -2721,6 +4160,14 @@ def play_games_parallel_mcts(
                                     orig_q_targets = packed.get('orig_q_targets')
                                     policy_kld_targets = packed.get('policy_kld_targets')
                                     search_visits = packed.get('search_visits')
+                                    game_ids = packed.get('game_ids')
+                                    game_ply_indices = packed.get('game_ply_indices')
+                                    regret_targets = packed.get('regret_targets')
+                                    archive_ids = packed.get('archive_ids')
+                                    search_budget_assigned = packed.get('search_budget_assigned')
+                                    search_simulations_effective = packed.get('search_simulations_effective')
+                                    search_simulations_fresh = packed.get('search_simulations_fresh')
+                                    search_visits_inherited_credit = packed.get('search_visits_inherited_credit')
                                     values = packed.get('values')
                                     chunk_positions = int(packed.get('num_positions', 0) or 0)
                                     if (
@@ -2754,6 +4201,14 @@ def play_games_parallel_mcts(
                                             orig_q_targets=orig_q_targets,
                                             policy_kld_targets=policy_kld_targets,
                                             search_visits=search_visits,
+                                            game_ids=game_ids,
+                                            game_ply_indices=game_ply_indices,
+                                            regret_targets=regret_targets,
+                                            archive_ids=archive_ids,
+                                            search_budget_assigned=search_budget_assigned,
+                                            search_simulations_effective=search_simulations_effective,
+                                            search_simulations_fresh=search_simulations_fresh,
+                                            search_visits_inherited_credit=search_visits_inherited_credit,
                                         )
                                     queue_total_positions += chunk_positions
                                     if values is not None:
@@ -2762,6 +4217,7 @@ def play_games_parallel_mcts(
                                         queue_total_value_sq_sum += float((flat_values * flat_values).sum().item())
                                         queue_total_value_count += int(flat_values.numel())
                                 queue_game_lengths.extend(chunk_lengths)
+                                completed_stream_job_ids.update(chunk_job_ids)
                                 queue_total_dropped_positions += int(chunk_stats.get('dropped_positions', 0))
                                 queue_total_truncated_games += int(chunk_stats.get('truncated_games', 0))
                                 queue_total_claimable_draw_ended_games += int(chunk_stats.get('claimable_draw_ended_games', 0))
@@ -2826,6 +4282,19 @@ def play_games_parallel_mcts(
                                 )
                                 queue_shared_tree_searches += int(chunk_stats.get('shared_tree_searches', 0))
                                 queue_hard_start_games += int(chunk_stats.get('hard_start_games', 0))
+                                queue_opening_prefix_sampled_games += int(
+                                    chunk_stats.get('opening_prefix_sampled_games', 0)
+                                )
+                                queue_opening_prefix_games += int(
+                                    chunk_stats.get('opening_prefix_games', 0)
+                                )
+                                queue_opening_prefix_plies_sum += int(
+                                    chunk_stats.get('opening_prefix_plies_sum', 0)
+                                )
+                                for sequence, count in dict(
+                                    chunk_stats.get('opening_sequence_counts', {}) or {}
+                                ).items():
+                                    queue_opening_sequence_counts[str(sequence)] += int(count)
                                 queue_search_simulations_used_samples.extend(list(chunk_stats.get('search_simulations_used_samples', []) or []))
                                 queue_search_simulations_budget_samples.extend(list(chunk_stats.get('search_simulations_budget_samples', []) or []))
                                 _accumulate_mcts_quality_stats(queue_mcts_quality_stats, chunk_stats)
@@ -2875,8 +4344,14 @@ def play_games_parallel_mcts(
                             if not message.get('ok', False):
                                 interrupted = bool(message.get('interrupt', False))
                                 if interrupted:
-                                    print("\nCtrl+C detected in self-play worker. Stopping workers...")
+                                    print("\r\nCtrl+C detected in self-play worker. Stopping workers...")
                                     raise RLTrainingInterrupted("self-play")
+                                if global_game_stream_enabled:
+                                    crashed_stream_workers[int(rank)] = str(
+                                        message.get('error', 'unknown worker error')
+                                    )
+                                    pending.discard(int(rank))
+                                    continue
                                 raise RuntimeError(
                                     f"Persistent self-play worker {rank} failed: {message.get('error', 'unknown error')}"
                                 )
@@ -2884,7 +4359,75 @@ def play_games_parallel_mcts(
                     except queue.Empty:
                         queue_wait_total_s += float(time.perf_counter() - queue_wait_t0)
                         queue_wait_events += 1
-                        pass
+                        if not pending and crashed_stream_workers:
+                            if recovery_quiet_since is None:
+                                recovery_quiet_since = time.perf_counter()
+                            elif time.perf_counter() - recovery_quiet_since >= 0.40:
+                                missing_ids = sorted(
+                                    set(stream_job_by_id).difference(completed_stream_job_ids)
+                                )
+                                if not missing_ids:
+                                    for recovery_rank in sorted(crashed_stream_workers):
+                                        selfplay_pool.restart_worker(recovery_rank)
+                                    crashed_stream_workers.clear()
+                                    continue
+                                stream_recovery_attempts += 1
+                                if stream_recovery_attempts > 2:
+                                    raise RuntimeError(
+                                        "Persistent self-play recovery failed twice; "
+                                        f"{len(missing_ids)} games remain unfinished."
+                                    )
+                                recovery_ranks = sorted(crashed_stream_workers)
+                                recovery_base, recovery_extra = divmod(
+                                    len(missing_ids), max(1, len(recovery_ranks))
+                                )
+                                cursor = 0
+                                print(
+                                    "\r\nSelf-play recovery: restarting "
+                                    f"{len(recovery_ranks)} worker(s) and replaying exactly "
+                                    f"{len(missing_ids)} unfinished game(s) "
+                                    f"(attempt {stream_recovery_attempts}/2).",
+                                    flush=True,
+                                )
+                                for recovery_idx, recovery_rank in enumerate(recovery_ranks):
+                                    count = recovery_base + int(recovery_idx < recovery_extra)
+                                    assigned_ids = missing_ids[cursor:cursor + count]
+                                    cursor += count
+                                    selfplay_pool.restart_worker(recovery_rank)
+                                    if count <= 0:
+                                        continue
+                                    recovery_jobs = [
+                                        {
+                                            **stream_job_by_id[job_id],
+                                            'task_id': str(task_id),
+                                        }
+                                        for job_id in assigned_ids
+                                    ]
+                                    result_file, progress_file = selfplay_pool.dispatch_task(
+                                        rank=int(recovery_rank),
+                                        task_id=task_id,
+                                        model_state_path=model_state_path,
+                                        model_state=model_state_cpu,
+                                        temperature=rl_cfg.get('mcts_temperature'),
+                                        runtime_overrides=_selfplay_runtime_overrides(),
+                                        num_games=0,
+                                        opponent_payload={},
+                                        stream_results_to_queue=True,
+                                        hard_start_positions=[],
+                                        stream_game_queue=True,
+                                        initial_game_jobs=recovery_jobs,
+                                    )
+                                    active_workers[int(recovery_rank)] = {
+                                        'chunk_games': 0,
+                                        'progress_file': progress_file,
+                                        'streaming': True,
+                                    }
+                                    current_progress_files[int(recovery_rank)] = progress_file
+                                    result_files.append(result_file)
+                                    progress_files.append(progress_file)
+                                    pending.add(int(recovery_rank))
+                                crashed_stream_workers.clear()
+                                recovery_quiet_since = None
 
                     for rank in list(pending):
                         proc = selfplay_pool.processes.get(rank)
@@ -2892,9 +4435,18 @@ def play_games_parallel_mcts(
                             continue
                         interrupted = _is_interrupt_exit_code(proc.exitcode)
                         if interrupted:
-                            print("\nCtrl+C detected in self-play worker. Stopping workers...")
+                            print("\r\nCtrl+C detected in self-play worker. Stopping workers...")
                             raise RLTrainingInterrupted("self-play")
-                        _redispatch_after_worker_crash(rank, proc.exitcode)
+                        if not global_game_stream_enabled:
+                            raise RuntimeError(
+                                f"Persistent self-play worker {int(rank)} exited "
+                                f"unexpectedly with code {proc.exitcode}."
+                            )
+                        crashed_stream_workers[int(rank)] = (
+                            f"native exit code {proc.exitcode}"
+                        )
+                        pending.discard(int(rank))
+                        active_workers.pop(int(rank), None)
                 else:
                     for rank in list(pending):
                         idx = rank_to_index[rank]
@@ -2905,7 +4457,7 @@ def play_games_parallel_mcts(
                         pending.remove(rank)
                         if _is_interrupt_exit_code(p.exitcode):
                             interrupted = True
-                            print("\nCtrl+C detected in self-play worker. Stopping workers...")
+                            print("\r\nCtrl+C detected in self-play worker. Stopping workers...")
                             raise RLTrainingInterrupted("self-play")
                 if pending:
                     time.sleep(0.05)
@@ -2921,7 +4473,7 @@ def play_games_parallel_mcts(
                     pass
     except KeyboardInterrupt:
         interrupted = True
-        print("\nCtrl+C detected during self-play. Stopping workers...")
+        print("\r\nCtrl+C detected during self-play. Stopping workers...")
         if use_persistent_pool:
             _shutdown_selfplay_pool()
         raise RLTrainingInterrupted("self-play")
@@ -2938,14 +4490,14 @@ def play_games_parallel_mcts(
                 model_state_path.unlink(missing_ok=True)
             except Exception:
                 pass
-    
+
     selfplay_finished_at = time.perf_counter()
     selfplay_time = time.time() - start_time
     selfplay_startup_time = max(0.0, float((startup_done_time or start_time) - start_time))
-    
+
     # Collect results
     collection_start = time.time()
-    
+
     all_positions = [] if not stream_to_replay else None
     total_positions = queue_total_positions if use_queue_transport else 0
     game_lengths = list(queue_game_lengths) if use_queue_transport else []
@@ -3010,6 +4562,16 @@ def play_games_parallel_mcts(
     )
     total_shared_tree_searches = queue_shared_tree_searches if use_queue_transport else 0
     total_hard_start_games = queue_hard_start_games if use_queue_transport else 0
+    total_opening_prefix_sampled_games = (
+        queue_opening_prefix_sampled_games if use_queue_transport else 0
+    )
+    total_opening_prefix_games = queue_opening_prefix_games if use_queue_transport else 0
+    total_opening_prefix_plies_sum = (
+        queue_opening_prefix_plies_sum if use_queue_transport else 0
+    )
+    total_opening_sequence_counts = (
+        dict(queue_opening_sequence_counts) if use_queue_transport else {}
+    )
     total_search_simulations_used_samples = list(queue_search_simulations_used_samples) if use_queue_transport else []
     total_search_simulations_budget_samples = list(queue_search_simulations_budget_samples) if use_queue_transport else []
     total_profile_stats = dict(queue_profile_stats) if use_queue_transport else {}
@@ -3029,7 +4591,7 @@ def play_games_parallel_mcts(
         if use_queue_transport
         else {}
     )
-    
+
     if not use_queue_transport:
         for idx, result_file in enumerate(result_files):
             if result_file.exists():
@@ -3124,6 +4686,23 @@ def play_games_parallel_mcts(
                             )
                             total_shared_tree_searches += int((stats or {}).get('shared_tree_searches', 0))
                             total_hard_start_games += int((stats or {}).get('hard_start_games', 0))
+                            total_opening_prefix_sampled_games += int(
+                                (stats or {}).get('opening_prefix_sampled_games', 0)
+                            )
+                            total_opening_prefix_games += int(
+                                (stats or {}).get('opening_prefix_games', 0)
+                            )
+                            total_opening_prefix_plies_sum += int(
+                                (stats or {}).get('opening_prefix_plies_sum', 0)
+                            )
+                            for sequence, count in dict(
+                                (stats or {}).get('opening_sequence_counts', {}) or {}
+                            ).items():
+                                sequence = str(sequence)
+                                total_opening_sequence_counts[sequence] = (
+                                    int(total_opening_sequence_counts.get(sequence, 0))
+                                    + int(count)
+                                )
                             total_search_simulations_used_samples.extend(list((stats or {}).get('search_simulations_used_samples', []) or []))
                             total_search_simulations_budget_samples.extend(list((stats or {}).get('search_simulations_budget_samples', []) or []))
                             _accumulate_mcts_quality_stats(total_mcts_quality_stats, stats or {})
@@ -3169,11 +4748,11 @@ def play_games_parallel_mcts(
                     print(f"Warning: Failed to load results from worker {idx}: {e}")
             else:
                 print(f"Warning: Worker {idx} result file not found")
-    
+
     collection_time = time.time() - collection_start
     _recompute_profile_ratios(total_profile_stats)
     total_time = time.time() - start_time
-    
+
     avg_length = np.mean(game_lengths) if game_lengths else 0
     filtered_positions = int(total_curriculum_dropped_positions + total_cap_dropped_positions)
     total_generated_positions = total_positions + total_dropped_positions + filtered_positions
@@ -3219,6 +4798,16 @@ def play_games_parallel_mcts(
     value_var = (total_value_sq_sum / total_value_count) - (avg_game_value ** 2) if total_value_count > 0 else 0.0
     value_std = math.sqrt(max(0.0, value_var))
     mcts_quality_samples = int(float(total_mcts_quality_stats.get('mcts_prior_agreement_samples', 0.0) or 0.0))
+    policy_target_sample_count = int(
+        float(total_mcts_quality_stats.get('policy_target_sample_count', 0.0) or 0.0)
+    )
+    policy_target_challenge_delta_intervention_count = int(
+        float(
+            total_mcts_quality_stats.get(
+                'policy_target_challenge_delta_intervention_count', 0.0
+            ) or 0.0
+        )
+    )
     mcts_q_delta_samples = int(float(total_mcts_quality_stats.get('mcts_q_delta_samples', 0.0) or 0.0))
     mcts_q_delta_values = list(total_mcts_quality_stats.get('mcts_q_delta_values', []) or [])
     mcts_q_delta_hist = list(total_mcts_quality_stats.get('mcts_q_delta_hist', []) or [])
@@ -3236,6 +4825,44 @@ def play_games_parallel_mcts(
         mcts_phase_stats[f'mcts_phase_{phase}_samples'] = int(samples)
         mcts_phase_stats[f'mcts_phase_{phase}_changed_count'] = int(changed)
         mcts_phase_stats[f'mcts_changed_{phase}_rate'] = changed / samples if samples > 0.0 else 0.0
+    budget_quality_stats = {}
+    for budget in (64, 128, 192, 256, 320):
+        prefix = f'mcts_budget_{budget}'
+        samples = float(total_mcts_quality_stats.get(f'{prefix}_samples', 0.0) or 0.0)
+        budget_sum = float(total_mcts_quality_stats.get(f'{prefix}_budget_sum', 0.0) or 0.0)
+        budget_quality_stats.update({
+            f'{prefix}_root_count': int(samples),
+            f'{prefix}_useful_change_rate': (
+                float(total_mcts_quality_stats.get(f'{prefix}_useful_change_count', 0.0) or 0.0)
+                / samples if samples > 0.0 else 0.0
+            ),
+            f'{prefix}_policy_kl_mean': (
+                float(total_mcts_quality_stats.get(f'{prefix}_policy_kl_sum', 0.0) or 0.0)
+                / samples if samples > 0.0 else 0.0
+            ),
+            f'{prefix}_target_entropy_mean': (
+                float(total_mcts_quality_stats.get(f'{prefix}_target_entropy_sum', 0.0) or 0.0)
+                / samples if samples > 0.0 else 0.0
+            ),
+            f'{prefix}_fresh_sim_share': (
+                float(total_mcts_quality_stats.get(f'{prefix}_fresh_sim_sum', 0.0) or 0.0)
+                / budget_sum if budget_sum > 0.0 else 0.0
+            ),
+        })
+    budget_quality_levels = _summarize_mcts_budget_quality_levels(
+        total_mcts_quality_stats.get('mcts_budget_quality_levels_raw', {})
+    )
+    budget_quality_samples = sum(
+        int(bucket['samples']) for bucket in budget_quality_levels.values()
+    )
+    budget_quality_stats.update({
+        'mcts_budget_quality_samples': int(budget_quality_samples),
+        'mcts_budget_quality_coverage': (
+            float(budget_quality_samples) / float(mcts_quality_samples)
+            if mcts_quality_samples > 0 else 0.0
+        ),
+        'mcts_budget_quality_levels': budget_quality_levels,
+    })
     if total_search_difficulty_samples > 0:
         difficulty_n = float(total_search_difficulty_samples)
         difficulty_mean = total_search_difficulty_sum / difficulty_n
@@ -3260,6 +4887,9 @@ def play_games_parallel_mcts(
     else:
         difficulty_mean = 0.0
         difficulty_budget_correlation = 0.0
+    opening_diversity = _summarize_opening_sequence_counts(
+        total_opening_sequence_counts
+    )
     worker_game_counts = np.asarray(
         [int(completed_games_by_rank.get(int(rank), 0)) for rank, _ in worker_specs],
         dtype=np.float32,
@@ -3267,6 +4897,16 @@ def play_games_parallel_mcts(
     worker_finish_values = list(worker_finished_at.values()) if 'worker_finished_at' in locals() else []
     selfplay_stats = {
         'startup_time': float(selfplay_startup_time),
+        # Completed chunks keep their replay rows across a worker restart, but
+        # pre-crash per-game aggregates are emitted only by the worker's final
+        # payload. Mark such rows explicitly instead of presenting partial
+        # Gumbel/opening telemetry as a complete iteration.
+        'telemetry_complete': int(
+            int(locals().get('stream_recovery_attempts', 0) or 0) == 0
+        ),
+        'recovery_attempts': int(
+            locals().get('stream_recovery_attempts', 0) or 0
+        ),
         'worker_count': int(len(worker_specs)),
         'games_per_worker_mean': (
             float(num_games) / float(len(worker_specs)) if worker_specs else 0.0
@@ -3290,6 +4930,7 @@ def play_games_parallel_mcts(
         'completed_draw_rate': float(completed_draw_rate),
         'avg_game_value': float(avg_game_value),
         'value_std': float(value_std),
+        **budget_quality_stats,
         'truncated_games': int(total_truncated_games),
         'claimable_draw_ended_games': int(total_claimable_draw_ended_games),
         'adjudicated_games': int(total_adjudicated_games),
@@ -3392,7 +5033,47 @@ def play_games_parallel_mcts(
             if total_search_samples > 0 else 0.0
         ),
         'hard_start_games': int(total_hard_start_games),
+        'normal_start_games': int(max(0, completed_games - total_hard_start_games)),
+        'normal_start_no_prefix_games': int(max(
+            0,
+            completed_games - total_hard_start_games - total_opening_prefix_games,
+        )),
+        'opening_prefix_sampled_games': int(total_opening_prefix_sampled_games),
+        'opening_prefix_games': int(total_opening_prefix_games),
+        'opening_prefix_applied_games': int(total_opening_prefix_games),
+        'opening_prefix_fraction': (
+            float(total_opening_prefix_games)
+            / float(max(0, completed_games - total_hard_start_games))
+            if completed_games > total_hard_start_games else 0.0
+        ),
+        'opening_prefix_coverage_normal_start': (
+            float(total_opening_prefix_games)
+            / float(max(0, completed_games - total_hard_start_games))
+            if completed_games > total_hard_start_games else 0.0
+        ),
+        'opening_prefix_coverage_completed': (
+            float(total_opening_prefix_games) / float(completed_games)
+            if completed_games > 0 else 0.0
+        ),
+        'opening_prefix_plies_avg': (
+            float(total_opening_prefix_plies_sum) / float(total_opening_prefix_games)
+            if total_opening_prefix_games > 0 else 0.0
+        ),
+        'opening_sequence_games': int(opening_diversity['games']),
+        'opening_unique_8ply': int(opening_diversity['unique']),
+        'opening_effective_8ply': float(opening_diversity['effective']),
+        'opening_top1_8ply_rate': float(opening_diversity['top1_rate']),
         'mcts_prior_agreement_samples': int(mcts_quality_samples),
+        'policy_target_sample_count': int(policy_target_sample_count),
+        'policy_target_challenge_delta_intervention_count': int(
+            policy_target_challenge_delta_intervention_count
+        ),
+        'policy_target_challenge_delta_intervention_rate': (
+            float(policy_target_challenge_delta_intervention_count)
+            / float(policy_target_sample_count)
+            if policy_target_sample_count > 0
+            else 0.0
+        ),
         'mcts_prior_agreement_rate': (
             float(total_mcts_quality_stats.get('mcts_prior_agreement_sum', 0.0) or 0.0) / float(mcts_quality_samples)
             if mcts_quality_samples > 0
@@ -3404,18 +5085,6 @@ def play_games_parallel_mcts(
             else 0.0
         ),
         **mcts_phase_stats,
-        'mcts_policy_uptake_weight_mean': (
-            float(total_mcts_quality_stats.get('mcts_policy_uptake_weight_sum', 0.0) or 0.0)
-            / float(total_mcts_quality_stats.get('mcts_policy_uptake_samples', 0.0) or 0.0)
-            if float(total_mcts_quality_stats.get('mcts_policy_uptake_samples', 0.0) or 0.0) > 0.0
-            else 1.0
-        ),
-        'mcts_policy_uptake_low_rate': (
-            float(total_mcts_quality_stats.get('mcts_policy_uptake_low_count', 0.0) or 0.0)
-            / float(total_mcts_quality_stats.get('mcts_policy_uptake_samples', 0.0) or 0.0)
-            if float(total_mcts_quality_stats.get('mcts_policy_uptake_samples', 0.0) or 0.0) > 0.0
-            else 0.0
-        ),
         'mcts_prior_top_visit_prob_mean': (
             float(total_mcts_quality_stats.get('mcts_prior_top_visit_prob_sum', 0.0) or 0.0) / float(mcts_quality_samples)
             if mcts_quality_samples > 0
@@ -3470,6 +5139,26 @@ def play_games_parallel_mcts(
             float(total_mcts_quality_stats.get('mcts_visit_coverage_ratio_sum', 0.0) or 0.0) / float(mcts_quality_samples)
             if mcts_quality_samples > 0
             else 0.0
+        ),
+        'gumbel_action_budget_mean': (
+            float(total_mcts_quality_stats.get('gumbel_action_budget_sum', 0.0) or 0.0)
+            / float(total_search_samples)
+            if total_search_samples > 0 else 0.0
+        ),
+        'gumbel_considered_actions_mean': (
+            float(total_mcts_quality_stats.get('gumbel_considered_actions_sum', 0.0) or 0.0)
+            / float(total_search_samples)
+            if total_search_samples > 0 else 0.0
+        ),
+        'gumbel_initial_round_visits_mean': (
+            float(total_mcts_quality_stats.get('gumbel_initial_round_visits_sum', 0.0) or 0.0)
+            / float(total_search_samples)
+            if total_search_samples > 0 else 0.0
+        ),
+        'gumbel_width_adapted_rate': (
+            float(total_mcts_quality_stats.get('gumbel_width_adapted_count', 0.0) or 0.0)
+            / float(total_search_samples)
+            if total_search_samples > 0 else 0.0
         ),
         'mcts_q_delta_samples': int(mcts_q_delta_samples),
         'mcts_q_delta_mean': (
@@ -3550,7 +5239,7 @@ def play_games_parallel_mcts(
         'opponent_debug': dict(opponent_debug or {}),
         'profile': dict(total_profile_stats),
     }
-    
+
     return (
         all_positions or [],
         total_positions,
@@ -3566,11 +5255,128 @@ def play_games_parallel_mcts(
 # MAIN TRAINING LOOP
 # ==============================================================================
 
-def main():
-    config_path = default_config_path()
-    
+def _validate_pause_after_iteration(pause_after_iteration, total_iterations):
+    """Validate an optional absolute completed-iteration pause target."""
+    if pause_after_iteration is None:
+        return None
+    pause_after_iteration = int(pause_after_iteration)
+    total_iterations = int(total_iterations)
+    if not 1 <= pause_after_iteration <= total_iterations:
+        raise ValueError(
+            "--pause-after-iteration must be between 1 and the configured "
+            f"total iterations ({total_iterations}); got {pause_after_iteration}."
+        )
+    return pause_after_iteration
+
+
+def _should_pause_after_iteration(completed_iteration, total_iterations, pause_after_iteration):
+    """Pause only at a requested boundary that has another iteration after it."""
+    return bool(
+        pause_after_iteration is not None
+        and int(completed_iteration) == int(pause_after_iteration)
+        and int(completed_iteration) < int(total_iterations)
+    )
+
+
+def _should_save_replay_sidecar_for_iteration(
+    completed_iteration,
+    total_iterations,
+    pause_after_iteration=None,
+):
+    """Keep periodic sidecars and force one at an explicitly requested pause."""
+    completed_iteration = int(completed_iteration)
+    return bool(
+        completed_iteration == 1
+        or completed_iteration % _REPLAY_SIDECAR_INTERVAL == 0
+        or completed_iteration == int(total_iterations)
+        or (
+            pause_after_iteration is not None
+            and completed_iteration == int(pause_after_iteration)
+        )
+    )
+
+
+def _parse_cli_args(argv=None):
+    parser = argparse.ArgumentParser(description="Train the chess RL learner.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="YAML override merged over the standard project configuration.",
+    )
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument(
+        "--fresh-canonical-il",
+        action="store_true",
+        help=(
+            "Run non-interactively from canonical best_model_il.pt with a new "
+            "optimizer, schedule and empty replay. Requires fresh_il_start=true."
+        ),
+    )
+    initialization.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Resume the exact checkpoint inside this config's RL checkpoint "
+            "directory, including optimizer and replay state when available."
+        ),
+    )
+    parser.add_argument(
+        "--require-resume-sidecars",
+        action="store_true",
+        help="Fail before self-play if replay sidecars cannot be restored; requires --resume-checkpoint.",
+    )
+    parser.add_argument(
+        "--allow-resume-source-amendment",
+        action="store_true",
+        help=(
+            "Allow an explicitly documented source-tree SHA change on strict resume; "
+            "seed, Git commit, and effective config identities must still match."
+        ),
+    )
+    parser.add_argument(
+        "--resume-source-amendment-reason",
+        default=None,
+        help="Required audit note when --allow-resume-source-amendment is used.",
+    )
+    parser.add_argument(
+        "--pause-after-iteration",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Save a synchronized model/replay checkpoint and stop cleanly "
+            "after completed iteration N."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_cli_args(argv)
+    if args.require_resume_sidecars and args.resume_checkpoint is None:
+        raise ValueError("--require-resume-sidecars requires --resume-checkpoint")
+    if args.allow_resume_source_amendment and args.resume_checkpoint is None:
+        raise ValueError("--allow-resume-source-amendment requires --resume-checkpoint")
+    if args.allow_resume_source_amendment and not str(args.resume_source_amendment_reason or "").strip():
+        raise ValueError("--allow-resume-source-amendment requires --resume-source-amendment-reason")
+    if args.resume_source_amendment_reason and not args.allow_resume_source_amendment:
+        raise ValueError("--resume-source-amendment-reason requires --allow-resume-source-amendment")
+    config_path = (
+        Path(args.config).resolve()
+        if args.config is not None
+        else default_config_path()
+    )
+
     print(f"Chess RL trainer | config: {compact_path(config_path, 3)}")
-    config = load_project_config()
+    config = load_project_config(config_path=config_path)
+    initial_rl_cfg = config.get('reinforcement_learning', {}) or {}
+    pause_after_iteration = _validate_pause_after_iteration(
+        args.pause_after_iteration,
+        initial_rl_cfg.get('iterations', 0),
+    )
 
     debug_cfg = config.get('debug', {}) or {}
     rl_debug_cfg = debug_cfg.get('rl', {}) or {}
@@ -3584,11 +5390,15 @@ def main():
         debug_enabled and rl_debug_cfg.get('log_gpu_memory', debug_cfg.get('log_gpu_memory', False))
     )
 
+    rl_cfg = config.get('reinforcement_learning', {})
+    _validate_promotion_confirmation_setup(rl_cfg, config)
+
     try:
         syzygy_bootstrap = ensure_syzygy_tables(config, chess_dir=script_dir.parent, logger=print)
         syzygy_status = describe_syzygy_status(config, chess_dir=script_dir.parent)
         syzygy_paths = syzygy_status.get('paths', [])
         syzygy_file_count = int(syzygy_status.get('wdl_files', 0))
+        syzygy_dtz_file_count = int(syzygy_status.get('dtz_files', 0))
         if syzygy_bootstrap.get('enabled', False):
             if int(syzygy_bootstrap.get('downloaded_files', 0)) > 0:
                 size_mb = float(syzygy_bootstrap.get('downloaded_bytes', 0)) / 1024 / 1024
@@ -3597,19 +5407,25 @@ def main():
                     f"{size_mb:.1f} MB -> {syzygy_bootstrap.get('destination')}"
                 )
             elif syzygy_file_count > 0:
-                print(f"Syzygy ready: {syzygy_file_count} WDL file(s) in {', '.join(str(p) for p in syzygy_paths)}")
+                print(
+                    f"Syzygy ready: {syzygy_file_count} WDL, {syzygy_dtz_file_count} DTZ "
+                    f"file(s) in {', '.join(str(p) for p in syzygy_paths)}"
+                )
+                if syzygy_dtz_file_count <= 0:
+                    print(
+                        "Syzygy DTZ unavailable: decisive positions with a non-zero "
+                        "50-move clock safely fall back to NN/MCTS."
+                    )
             else:
                 print("Syzygy enabled, but no local WDL files found yet.")
     except Exception as exc:
         print(f"Syzygy auto-download skipped: {exc}")
 
-    if not MCTS_SELFPLAY_AVAILABLE:
-        raise RuntimeError(
-            "RL requires MCTS self-play backend, but it is not available "
-            "(failed to import src.selfplay.workers.run_selfplay_worker)."
-        )
-
     rl_cfg = config.get('reinforcement_learning', {})
+    if args.fresh_canonical_il and not bool(rl_cfg.get('fresh_il_start', False)):
+        raise ValueError(
+            "--fresh-canonical-il requires reinforcement_learning.run.fresh_il_start=true"
+        )
     replay_multiplier = rl_cfg.get('replay_buffer_multiplier', 0)
     try:
         replay_multiplier = float(replay_multiplier)
@@ -3674,15 +5490,18 @@ def main():
     model_version = config.get('model', {}).get('version', 'v?.?')
     model_file_tag = build_model_file_tag(config)
     model_architecture = build_model_architecture_metadata(config)
-    
+
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
-    
+    random.seed(config['seed'])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config['seed'])
+
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-    
+
     device = torch.device(config['hardware']['device'])
     if profile_training_enabled or log_gpu_memory_enabled:
         print(
@@ -3690,31 +5509,60 @@ def main():
             f"profile_training={profile_training_enabled}, "
             f"log_gpu_memory={log_gpu_memory_enabled}"
         )
-    
+
     base_dir = script_dir.parent
     models_dir = base_dir / config['paths']['models_dir']
     logs_dir = base_dir / config['paths']['logs_dir']
     rl_dir = base_dir / config['paths']['rl_checkpoints_dir']
-    
+    best_model_rl_path = base_dir / config['paths']['best_model_rl']
+
+    if args.fresh_canonical_il:
+        collisions = [
+            path for path in (logs_dir, rl_dir, best_model_rl_path)
+            if path.exists()
+        ]
+        if collisions:
+            rendered = ", ".join(str(path) for path in collisions)
+            raise FileExistsError(
+                "Controlled fresh RL run refuses to reuse an existing output "
+                f"target: {rendered}. Choose a new experiment identity/path."
+            )
+
+    resume_checkpoint_path = None
+    if args.resume_checkpoint is not None:
+        resume_checkpoint_path = Path(args.resume_checkpoint).resolve()
+        if not resume_checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Explicit RL resume checkpoint does not exist: {resume_checkpoint_path}"
+            )
+        resolved_rl_dir = rl_dir.resolve()
+        try:
+            resume_checkpoint_path.relative_to(resolved_rl_dir)
+        except ValueError as exc:
+            raise ValueError(
+                "--resume-checkpoint must point inside the configured RL checkpoint "
+                f"directory ({resolved_rl_dir}); got {resume_checkpoint_path}"
+            ) from exc
+
     models_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
     rl_dir.mkdir(parents=True, exist_ok=True)
-    
+
     use_bfloat16 = config['hardware'].get('use_bfloat16', False)
     use_amp = config['hardware'].get('use_amp', True)
-    
+
     if use_bfloat16 and torch.cuda.is_available():
         if not torch.cuda.is_bf16_supported():
             print("Warning: bfloat16 not supported")
             use_bfloat16 = False
-    
+
     best_model_il_path = base_dir / config['paths']['best_model_il']
     fresh_il_start_recommended = bool(
         config['reinforcement_learning'].get('fresh_il_start', False)
     )
     if fresh_il_start_recommended:
         rl_init_checkpoint_path = best_model_il_path
-        rl_init_checkpoint_reason = "RL49 recommended fresh start from canonical best_model_il.pt"
+        rl_init_checkpoint_reason = "RL53 recommended fresh start from canonical best_model_il.pt"
     else:
         best_model_il_swa_path = best_model_il_path.parent / "best_model_il_swa.pt"
         rl_init_checkpoint_path, rl_init_checkpoint_reason = select_best_il_checkpoint(
@@ -3722,12 +5570,24 @@ def main():
             best_model_il_swa_path,
         )
     print(f"RL IL initialization: {rl_init_checkpoint_path.name} ({rl_init_checkpoint_reason}).")
-    best_model_rl_path = base_dir / config['paths']['best_model_rl']
     version_best_model_path = rl_dir / f"{model_file_tag}_best.pt"
-    candidate_checkpoint_path = rl_dir / f"{model_file_tag}_candidate.pt"
     latest_checkpoint_path = rl_dir / f"{model_file_tag}_latest.pt"
     total_iterations = int(config['reinforcement_learning']['iterations'])
 
+    if args.fresh_canonical_il:
+        forced_startup_plan = {
+            "start_mode": "new",
+            "new_init_mode": "default",
+        }
+    elif resume_checkpoint_path is not None:
+        forced_startup_plan = {
+            "start_mode": "resume",
+            "available_checkpoints": [resume_checkpoint_path],
+            "forced_checkpoint": resume_checkpoint_path,
+        }
+        print(f"Explicit RL resume checkpoint: {resume_checkpoint_path}")
+    else:
+        forced_startup_plan = None
     startup_choice = plan_rl_startup(
         model=None,
         device=device,
@@ -3736,6 +5596,7 @@ def main():
         rl_dir=rl_dir,
         default_new_checkpoint=rl_init_checkpoint_path,
         prefer_fresh_il=fresh_il_start_recommended,
+        initial_plan=forced_startup_plan,
     )
 
     # Build/load once in the parent before Windows spawn starts the persistent
@@ -3793,8 +5654,10 @@ def main():
         experiment_name=build_rl_experiment_name(config),
         mode="rl",
         config_snapshot={
+            "project": config.get("project", {}),
             "model": config.get("model", {}),
             "reinforcement_learning": config.get("reinforcement_learning", {}),
+            "central_inference": config.get("central_inference", {}),
         },
         verbose=False,
     )
@@ -3843,6 +5706,11 @@ def main():
     start_mode = startup_state.get("start_mode", "new")
     selected_checkpoint_label = startup_state.get("selected_checkpoint_label")
     start_iteration = int(startup_state.get("start_iteration", 0) or 0)
+    if pause_after_iteration is not None and pause_after_iteration <= start_iteration:
+        raise ValueError(
+            "--pause-after-iteration must be after the checkpoint's completed "
+            f"iteration ({start_iteration}); omit it to resume normally."
+        )
     resumed_best_win_rate = float(startup_state.get("best_win_rate", 0.0) or 0.0)
     selected_compatibility_ratio = startup_state.get("selected_compatibility_ratio")
     transfer_match_ratio = startup_state.get("transfer_match_ratio")
@@ -3850,17 +5718,19 @@ def main():
     selected_checkpoint_path = startup_state.get("selected_checkpoint")
     if fresh_il_start_recommended and not controlled_new_init:
         print(
-            "RL49 note: the recommended fresh canonical-IL start was explicitly "
+            "RL53 note: the recommended fresh canonical-IL start was explicitly "
             f"overridden by menu choice ({start_mode}/{new_init_mode})."
         )
     resume_runtime_payload = {}
     if start_mode == "resume" and selected_checkpoint_path is not None:
         with contextlib.suppress(Exception):
-            resume_runtime_payload = torch.load(
+            resume_runtime_payload = load_checkpoint_file(
                 selected_checkpoint_path,
-                map_location="cpu",
-                weights_only=False,
+                torch.device("cpu"),
             ) or {}
+        elo_coordinator.load_state_dict(
+            resume_runtime_payload.get("elo_coordinator_state")
+        )
         resume_history_csv = _resolve_resume_history_csv(
             resume_runtime_payload,
             checkpoint_path=selected_checkpoint_path,
@@ -3889,21 +5759,6 @@ def main():
                 "Resume plots: prior CSV was not found; continuing with a "
                 f"boundary before iteration {start_iteration + 1}."
             )
-    best_candidate_score_lower_bound = -1.0
-    if start_mode == "new":
-        with contextlib.suppress(OSError):
-            candidate_checkpoint_path.unlink(missing_ok=True)
-    elif candidate_checkpoint_path.exists():
-        with contextlib.suppress(Exception):
-            candidate_payload = torch.load(
-                candidate_checkpoint_path,
-                map_location="cpu",
-                weights_only=False,
-            )
-            best_candidate_score_lower_bound = float(
-                (candidate_payload or {}).get('eval_score_lower_bound', -1.0) or -1.0
-            )
-
     if start_mode == "new":
         if new_init_mode == "scratch":
             source_label = "random weights"
@@ -3926,11 +5781,64 @@ def main():
             elo_seed_checkpoint_path = rl_init_checkpoint_path
     elif start_mode in {"resume", "transfer"} and selected_checkpoint_path is not None:
         elo_seed_checkpoint_path = selected_checkpoint_path
+    manifest_checkpoint_path = (
+        selected_checkpoint_path
+        if selected_checkpoint_path is not None
+        else rl_init_checkpoint_path
+        if start_mode == 'new' and new_init_mode == 'default'
+        else None
+    )
+    manifest_path = _write_rl_run_manifest(
+        logger,
+        config,
+        manifest_checkpoint_path,
+        base_dir,
+    )
+    print(f"RL run manifest: {manifest_path}")
+    saved_candidate_archive_identity = (
+        resume_runtime_payload.get('mcts_candidate_archive_run_identity')
+        if start_mode == 'resume' else None
+    )
+    candidate_archive_identity = _restore_candidate_archive_identity(
+        manifest_path,
+        saved_identity=saved_candidate_archive_identity,
+        allow_source_amendment=bool(args.allow_resume_source_amendment),
+        source_amendment_reason=args.resume_source_amendment_reason,
+    )
+    archive_key = _json_sha256(candidate_archive_identity)[:12]
+    archive_manifest_path = Path(
+        str(candidate_archive_identity['run_manifest_path'])
+    )
+    archive_run_stem = archive_manifest_path.stem
+    if archive_run_stem.endswith('_manifest'):
+        archive_run_stem = archive_run_stem[:-len('_manifest')]
+    candidate_archive_dir = (
+        archive_manifest_path.parent
+        / f"{archive_run_stem}_candidate_archive_{archive_key}"
+    )
+    candidate_archive = MctsCandidateArchive(
+        candidate_archive_dir,
+        top_k=3,
+        run_identity=candidate_archive_identity,
+    )
+    _update_rl_run_manifest_runtime(
+        logger,
+        mcts_candidate_archive_directory=str(candidate_archive.directory),
+        mcts_candidate_archive_retention_limit=3,
+        resume_source_amendment_path=(
+            str(Path(manifest_path).with_name(
+                f"{Path(manifest_path).stem}_source_amendments.jsonl"
+            ))
+            if args.allow_resume_source_amendment
+            else None
+        ),
+    )
     if elo_seed_checkpoint_path is not None:
         _seed_rl_plot_elo_from_checkpoint(
             logger,
             elo_seed_checkpoint_path,
             base_dir=models_dir,
+            elo_config=config.get("elo_estimation", {}),
         )
 
     if start_mode == "new":
@@ -3948,7 +5856,7 @@ def main():
                 )
     elif start_mode == "resume":
         run_context = (
-            f"startup: resumed full state, next iteration {start_iteration + 1}, "
+            f"startup: resumed model/optimizer state, next iteration {start_iteration + 1}, "
             f"best score_rate={resumed_best_win_rate:.2%}"
         )
     else:
@@ -3993,6 +5901,7 @@ def main():
     # Redundant legacy model snapshots in old runtime checkpoints are ignored.
     best_model.eval()
     best_model.requires_grad_(False)
+    initial_learner_matches_best = _models_have_identical_state(model, best_model)
     best_iteration = int(
         resume_runtime_payload.get(
             'best_iteration',
@@ -4010,10 +5919,16 @@ def main():
             if not isinstance(model_state, dict):
                 raise KeyError("missing model_state_dict")
             normalized_state = normalize_state_dict_keys(model_state, target_keys=set(anchor_model.state_dict().keys()))
-            try:
-                anchor_model.load_state_dict(normalized_state)
-            except Exception:
-                transfer_matching_weights(anchor_model, normalized_state)
+            incompatible = anchor_model.load_state_dict(normalized_state, strict=False)
+            invalid_missing = [
+                key for key in incompatible.missing_keys
+                if not str(key).startswith('search_q_fc.')
+            ]
+            if invalid_missing or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    "IL anchor checkpoint is not architecture-compatible: "
+                    f"missing={invalid_missing}, unexpected={list(incompatible.unexpected_keys)}"
+                )
             anchor_model.eval()
             anchor_model.requires_grad_(False)
             anchor_model_available = True
@@ -4047,13 +5962,89 @@ def main():
             training_compile_enabled = False
             print(f"RL learner: torch.compile unavailable, using eager mode ({exc}).")
     rl_cfg = config['reinforcement_learning']
+    prior_confirmation_state = resume_runtime_payload.get(
+        'promotion_confirmation_state'
+    )
+    prior_confirmation_state = (
+        dict(prior_confirmation_state)
+        if isinstance(prior_confirmation_state, dict)
+        else {}
+    )
+    try:
+        promotion_confirmation_attempt_count = (
+            _restore_promotion_confirmation_attempt_count(resume_runtime_payload)
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            'RL startup aborted before self-play: saved promotion confirmation '
+            'attempt count is invalid.'
+        ) from exc
+    confirmation_suite_offset = int(
+        rl_cfg.get('promotion_confirmation_suite_offset', 0) or 0
+    )
+    confirmation_mode = str(rl_cfg.get('promotion_confirmation_mode', 'legacy_192'))
+    confirmation_suites_per_attempt = (
+        2 if confirmation_mode == 'independent_384' else 1
+    )
+    _validate_promotion_confirmation_resume_record(
+        promotion_confirmation_attempt_count,
+        prior_confirmation_state,
+        mode=confirmation_mode,
+        suite_offset=confirmation_suite_offset,
+        is_resume=(start_mode == 'resume'),
+    )
+    confirmation_suite_capacity = int(promotion_holdout_suite_capacity())
+    confirmation_reserved_indices = tuple(
+        int(index)
+        for index in (rl_cfg.get('promotion_confirmation_reserved_suite_indices') or ())
+    )
+    confirmation_ledger_status = promotion_holdout_ledger_status(
+        reserved_indices=confirmation_reserved_indices,
+        preferred_start_index=confirmation_suite_offset,
+    )
+    confirmation_remaining_suites = int(confirmation_ledger_status['remaining'])
+    if confirmation_remaining_suites < confirmation_suites_per_attempt:
+        raise RuntimeError(
+            'RL startup aborted before self-play: promotion confirmation holdout '
+            f'has {confirmation_remaining_suites} unused suites, but '
+            f'{confirmation_mode} needs {confirmation_suites_per_attempt}; '
+            f'capacity={confirmation_suite_capacity}, '
+            f'historically_consumed={confirmation_ledger_status.get("historical_suite_count", "unknown")}, '
+            f'ledger={confirmation_ledger_status.get("ledger_path", "unknown")}.'
+        )
+    print(
+        'Promotion confirmation holdout ledger: '
+        f'{confirmation_remaining_suites}/{confirmation_suite_capacity} suites remain '
+        f'(selection starts at suite {confirmation_suite_offset}; '
+        f'{confirmation_mode} needs {confirmation_suites_per_attempt} per attempt; '
+        f'legacy checkpoint counter={promotion_confirmation_attempt_count} is telemetry only).'
+    )
+    if confirmation_ledger_status.get('unverified_lineage'):
+        print(
+            'Promotion confirmation holdout lineage warning: '
+            f'{len(confirmation_ledger_status["unverified_lineage"])} suite IDs have '
+            'references without structured game-consumption proof; those references '
+            'were not counted as consumed. Review the listed artifact paths before relying '
+            'on this remaining-capacity estimate.'
+        )
+    last_promotion_confirmation_state = prior_confirmation_state
     # Best files are updated only when evaluation confirms model improvement.
     replay_fp16 = config['reinforcement_learning'].get('replay_fp16', False)
+    store_hard_positions = float(rl_cfg.get('self_play_hard_start_fraction', 0.0) or 0.0) > 0.0
     replay_max_policy_targets = _resolve_replay_max_policy_targets(config)
     replay_buffer = ReplayBuffer(
         config['reinforcement_learning']['replay_buffer_size'],
         max_policy_targets=replay_max_policy_targets,
         use_fp16=replay_fp16,
+        compact_boards=True,
+        store_hard_positions=store_hard_positions,
+    )
+    holdout_replay_buffer = ReplayBuffer(
+        _RL_HOLDOUT_MAX_POSITIONS,
+        max_policy_targets=replay_max_policy_targets,
+        use_fp16=replay_fp16,
+        compact_boards=True,
+        store_hard_positions=False,
     )
     champion_replay_fraction = max(
         0.0,
@@ -4063,15 +6054,87 @@ def main():
         max(1, int(round(replay_buffer.max_size * champion_replay_fraction))),
         max_policy_targets=replay_max_policy_targets,
         use_fp16=replay_fp16,
+        compact_boards=True,
+        store_hard_positions=False,
     )
+    configured_search_control_capacity = max(
+        1, int(rl_cfg.get('search_control_archive_capacity', 800))
+    )
+    planned_regret_starts = int(round(
+        int(rl_cfg.get('games_per_iteration', 0) or 0)
+        * max(0.0, min(1.0, float(
+            rl_cfg.get('self_play_hard_start_fraction', 0.0) or 0.0
+        )))
+    ))
+    derived_search_control_capacity = max(
+        configured_search_control_capacity,
+        4 * planned_regret_starts,
+    )
+    effective_search_control_capacity = max(
+        derived_search_control_capacity,
+        int(rl_cfg.get(
+            'search_control_effective_archive_capacity',
+            derived_search_control_capacity,
+        )),
+    )
+    search_control_archive = RegretOpeningArchive(
+        capacity=effective_search_control_capacity,
+        rank_alpha=float(rl_cfg.get('search_control_rank_alpha', 0.50)),
+        ema_alpha=float(rl_cfg.get('search_control_ema_alpha', 0.50)),
+    )
+    replay_sidecar_iteration = resume_runtime_payload.get("replay_state_iteration")
+    if replay_sidecar_iteration is not None:
+        replay_sidecar_iteration = int(replay_sidecar_iteration)
+    replay_sidecar_filename = (
+        resume_runtime_payload.get("replay_state_file")
+        if start_mode == "resume"
+        else None
+    )
+    previous_replay_sidecar_filename = (
+        resume_runtime_payload.get("replay_state_previous_file")
+        if start_mode == "resume"
+        else None
+    )
+    replay_resume_restored = False
+    if start_mode == "resume" and selected_checkpoint_path is not None:
+        replay_resume_restored, replay_resume_detail = _restore_rl_replay_sidecar(
+            resume_runtime_payload,
+            selected_checkpoint_path,
+            expected_completed_iteration=start_iteration,
+            replay_buffer=replay_buffer,
+            champion_replay_buffer=champion_replay_buffer,
+            search_control_archive=search_control_archive,
+        )
+        if replay_resume_restored:
+            print(
+                "Replay resume restored: "
+                f"rolling={replay_buffer.size}/{replay_buffer.max_size}, "
+                f"champion={champion_replay_buffer.size}/"
+                f"{champion_replay_buffer.max_size}, "
+                f"search-control={len(search_control_archive)}/"
+                f"{search_control_archive.capacity} "
+                f"({search_control_archive.last_restore_status})."
+            )
+        else:
+            if args.require_resume_sidecars:
+                raise RuntimeError(
+                    "Strict RL resume aborted before self-play because replay sidecars "
+                    f"could not be restored: {replay_resume_detail}"
+                )
+            print(
+                "Replay resume unavailable; buffers will rebuild from new self-play "
+                f"({replay_resume_detail})."
+            )
     replay_capacity_round_to = max(1, int(rl_cfg.get('replay_buffer_capacity_round_to', 256)))
     replay_buffer_min_size = max(1, int(rl_cfg.get('replay_buffer_min_size', replay_buffer.max_size)))
     replay_buffer_ema_alpha = max(
         0.0,
         min(1.0, float(rl_cfg.get('replay_buffer_ema_alpha', 0.25))),
     )
-    replay_positions_ema = None
-    
+    replay_positions_ema = resume_runtime_payload.get("replay_positions_ema")
+    if replay_positions_ema is not None:
+        replay_positions_ema = float(replay_positions_ema)
+
     # LR schedule (same shape as IL, but stepped per RL iteration)
     use_lr_schedule = config['reinforcement_learning'].get('use_lr_schedule', False)
     lr_base = float(config['reinforcement_learning']['learning_rate'])
@@ -4079,23 +6142,16 @@ def main():
     min_lr_ratio = float(config['reinforcement_learning'].get('min_lr_ratio', 0.25))
     warmup_pct = max(0.0, min(1.0, warmup_pct))
     min_lr_ratio = max(0.0, min(1.0, min_lr_ratio))
-    warmup_iters = int(math.ceil(total_iterations * warmup_pct)) if warmup_pct > 0.0 else 0
-    if use_lr_schedule and warmup_pct > 0.0 and total_iterations > 1:
-        # Need at least two scheduled points so one logged iteration is visibly below base LR.
-        warmup_iters = max(2, warmup_iters)
-    warmup_iters = min(max(0, warmup_iters), max(1, total_iterations))
-
+    warmup_iters = _resolve_rl_warmup_iterations(total_iterations, warmup_pct)
     def _compute_lr(iter_idx):
-        if not use_lr_schedule:
-            return lr_base
-        # Linear warmup: 0 -> base_lr over warmup_iters.
-        if iter_idx < warmup_iters:
-            return lr_base * ((iter_idx + 1) / warmup_iters)
-
-        # Cosine decay: base_lr -> base_lr * min_lr_ratio.
-        progress = (iter_idx - warmup_iters) / max(1, total_iterations - warmup_iters)
-        multiplier = min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
-        return lr_base * multiplier
+        return _compute_rl_learning_rate(
+            iter_idx,
+            use_schedule=use_lr_schedule,
+            lr_base=lr_base,
+            warmup_iters=warmup_iters,
+            min_lr_ratio=min_lr_ratio,
+            total_iterations=total_iterations,
+        )
 
     def _compute_value_loss_weight(iter_idx):
         rl_cfg_local = config.get('reinforcement_learning', {})
@@ -4130,7 +6186,6 @@ def main():
 
     fixed_mcts_temperature_threshold = int(rl_cfg.get('mcts_temperature_threshold', 16))
     score_rate_threshold = float(rl_cfg.get('score_rate_threshold', 0.55))
-    true_win_rate_threshold = float(rl_cfg.get('true_win_rate_threshold', 0.0))
     base_mcts_simulations = max(1, int(rl_cfg.get('mcts_simulations', 160) or 160))
 
     def _resolve_eval_stage_simulations(exact_key, multiplier_key, default_multiplier):
@@ -4169,19 +6224,46 @@ def main():
     )
     eval_every = max(1, int(rl_cfg.get('eval_every', 1) or 1))
     no_mcts_eval_enabled = bool(rl_cfg.get('eval_no_mcts_enabled', True))
-    no_mcts_eval_every = max(1, int(rl_cfg.get('eval_no_mcts_every', 2)))
+    no_mcts_eval_every = max(1, int(rl_cfg.get('eval_no_mcts_every', 4)))
     no_mcts_eval_games = max(1, int(rl_cfg.get('eval_no_mcts_games', 30)))
     diagnostic_ema_alpha = max(
         0.0,
         min(1.0, float(rl_cfg.get('rl_diagnostic_ema_alpha', 0.35) or 0.35)),
     )
     last_promotion_iteration = best_iteration if best_iteration > 0 else None
-    last_reanalyse_iteration = start_iteration if start_iteration > 0 else None
-    eval_score_rate_ema = None
-    eval_true_win_rate_ema = None
-    learner_selfplay_safe = True
+    champion_replay_refresh_iteration = resume_runtime_payload.get(
+        'champion_replay_refresh_iteration'
+    )
+    if champion_replay_refresh_iteration is not None:
+        champion_replay_refresh_iteration = int(champion_replay_refresh_iteration)
+    champion_replay_capture_iteration = resume_runtime_payload.get(
+        'champion_replay_capture_iteration'
+    )
+    if champion_replay_capture_iteration is not None:
+        champion_replay_capture_iteration = int(champion_replay_capture_iteration)
+    eval_score_rate_ema = resume_runtime_payload.get("eval_score_rate_ema")
+    if eval_score_rate_ema is not None:
+        eval_score_rate_ema = float(eval_score_rate_ema)
+    eval_true_win_rate_ema = resume_runtime_payload.get("eval_true_win_rate_ema")
+    if eval_true_win_rate_ema is not None:
+        eval_true_win_rate_ema = float(eval_true_win_rate_ema)
+    (
+        learner_selfplay_safe,
+        learner_guard_consecutive_failures,
+        learner_guard_confirmation_due,
+        learner_guard_state_migrated,
+    ) = _restore_actor_guard_state(
+        resume_runtime_payload,
+        is_resume=start_mode == 'resume',
+    )
+    if learner_guard_state_migrated:
+        print(
+            "Resume actor guard: reset legacy safety state because IL-anchor "
+            "promotion failures no longer select the self-play actor."
+        )
     training_interrupted = False
     interrupted_stage = None
+    paused_iteration = None
     last_logged_iteration = start_iteration if start_iteration > 0 else None
 
     funnel_stages = (
@@ -4205,15 +6287,29 @@ def main():
         use_amp=use_amp,
         use_bfloat16=use_bfloat16,
     )
+    elo_coordinator.print_startup_summary()
+
+    if start_mode == "resume":
+        restored_rng_domains = restore_rng_state(
+            resume_runtime_payload.get("rng_state")
+        )
+        if restored_rng_domains:
+            print(f"Resume RNG restored: {', '.join(restored_rng_domains)}.")
+        else:
+            print("Resume RNG unavailable; stochastic streams continue from startup state.")
 
     persistent_eval_runtime = None
     previous_correction_audit_batch = None
     previous_correction_audit_after = None
+    promotion_holdout_exhausted_iteration = None
+    promotion_holdout_exhausted_reason = None
     try:
         for iteration in range(start_iteration, total_iterations):
-            print(f"\n[Iteration {iteration + 1}/{total_iterations}] self-play -> replay -> train")
+            print(f"\r\n[Iteration {iteration + 1}/{total_iterations}] self-play -> replay -> train")
             replay_buffer.set_current_iteration(iteration + 1)
             champion_replay_buffer.set_current_iteration(iteration + 1)
+            holdout_replay_buffer.clear()
+            holdout_replay_buffer.set_current_iteration(iteration + 1)
             iteration_profile_printed = False
             iteration_stage_times = {}
             iteration_start_time = time.perf_counter()
@@ -4222,6 +6318,12 @@ def main():
             iteration_eval_setup_time = 0.0
             iteration_notes = []
             promotion_status = "not evaluated"
+            nn_safe = None
+            nn_score_upper = None
+            nn_safety_status = "not_run"
+            mcts_candidate_status = "not_qualified"
+            mcts_candidate_archive_record = None
+            promotion_confirmation_suite_index = None
 
             if device.type == 'cuda' and torch.cuda.is_available() and (profile_training_enabled or log_gpu_memory_enabled):
                 torch.cuda.reset_peak_memory_stats(device)
@@ -4248,6 +6350,12 @@ def main():
                         device,
                         use_amp=use_amp,
                         use_bfloat16=use_bfloat16,
+                        value_phase_opening_max=int(
+                            rl_cfg.get('value_phase_opening_max_fullmove', 12)
+                        ),
+                        value_phase_endgame_min=int(
+                            rl_cfg.get('value_phase_endgame_min_fullmove', 40)
+                        ),
                     )
                 except Exception as exc:
                     iteration_notes.append(
@@ -4333,23 +6441,24 @@ def main():
                     include_stage_times=profile_training_enabled,
                 )
                 iteration_profile_printed = True
-            
+
             # Update learning rate (cosine decay + warmup)
             current_lr = _compute_lr(iteration)
             for group in optimizer.param_groups:
                 group['lr'] = current_lr * float(group.get('lr_factor', 1.0))
-            
+
             # Search stays fixed; evaluation only promotes a new best checkpoint.
             current_temp = float(config['reinforcement_learning']['mcts_temperature'])
             current_temp_threshold = fixed_mcts_temperature_threshold
             config['reinforcement_learning']['mcts_temperature'] = current_temp
             config['reinforcement_learning']['mcts_temperature_threshold'] = current_temp_threshold
-            
+
             rl_cfg['current_iteration'] = int(iteration + 1)
 
             current_value_loss_weight = _compute_value_loss_weight(iteration)
             current_policy_loss_weight = float(rl_cfg.get('policy_loss_weight', 1.0))
-            current_correction_rank_weight = resolve_policy_correction_rank_loss_weight(config)
+            current_correction_rank_weight = 0.0
+            current_search_q_weight = 0.0
 
             _finish_stage('setup')
 
@@ -4360,68 +6469,127 @@ def main():
             hard_start_plan = [None] * games_this_iteration
             hard_start_fraction = max(
                 0.0,
-                min(1.0, float(rl_cfg.get('self_play_hard_start_fraction', 0.18))),
+                min(1.0, float(rl_cfg.get('self_play_hard_start_fraction', 0.0))),
             )
             hard_start_count = min(
                 games_this_iteration,
                 int(round(games_this_iteration * hard_start_fraction)),
             )
-            if hard_start_count > 0 and len(replay_buffer) > 0:
-                hard_indices = replay_buffer.select_hard_position_indices(
+            hard_positions = []
+            search_control_sampled = []
+            search_control_enabled = bool(rl_cfg.get('search_control_enabled', True))
+            search_control_min_size = max(
+                1, int(rl_cfg.get('search_control_min_archive_size', 16))
+            )
+            if (
+                hard_start_count > 0
+                and search_control_enabled
+                and len(search_control_archive) >= search_control_min_size
+            ):
+                search_control_sampled = search_control_archive.sample(
                     hard_start_count,
+                    iteration=iteration + 1,
+                )
+                hard_positions.extend(search_control_sampled)
+            fallback_requested = hard_start_count - len(hard_positions)
+            if fallback_requested > 0 and len(replay_buffer) > 0:
+                hard_indices = replay_buffer.select_hard_position_indices(
+                    fallback_requested,
                     min_age=int(rl_cfg.get('self_play_hard_start_min_age', 1)),
                 )
-                hard_positions = replay_buffer.hard_positions_for_indices(hard_indices)
-                if hard_positions:
-                    slots = np.random.choice(
-                        games_this_iteration,
-                        size=len(hard_positions),
-                        replace=False,
-                    )
-                    for slot, hard_position in zip(slots.tolist(), hard_positions):
-                        hard_start_plan[int(slot)] = hard_position
-                    iteration_notes.append(
-                        f"hard starts: {len(hard_positions)}/{games_this_iteration} games"
-                    )
+                hard_positions.extend(replay_buffer.hard_positions_for_indices(hard_indices))
+            if hard_positions:
+                slots = np.random.choice(
+                    games_this_iteration,
+                    size=len(hard_positions),
+                    replace=False,
+                )
+                for slot, hard_position in zip(slots.tolist(), hard_positions):
+                    hard_start_plan[int(slot)] = hard_position
+                iteration_notes.append(
+                    f"hard starts: {len(hard_positions)}/{games_this_iteration} games "
+                    f"({len(search_control_sampled)} regret-guided)"
+                )
             performance_profile = {}
-            learner_only_bootstrap_iterations = max(
-                0,
-                int(rl_cfg.get('self_play_learner_only_bootstrap_iterations', 0) or 0),
+            # Best-vs-best is an emergency recovery path only. A routine replay
+            # refresh used to consume a complete iteration and could evict the
+            # learner's own on-policy positions after closely spaced promotions.
+            use_best_for_selfplay = not bool(learner_selfplay_safe)
+            champion_bootstrap_due = _champion_replay_bootstrap_due(
+                iteration_number=iteration + 1,
+                first_iteration_number=start_iteration + 1,
+                champion_fraction=champion_replay_fraction,
+                champion_size=len(champion_replay_buffer),
+                selfplay_uses_best=use_best_for_selfplay,
+                initial_learner_matches_best=initial_learner_matches_best,
             )
             champion_refresh_due = bool(
-                iteration + 1 > learner_only_bootstrap_iterations
+                use_best_for_selfplay
                 and champion_replay_fraction > 0.0
                 and len(champion_replay_buffer) <= 0
-            )
-            use_best_for_selfplay = _use_best_for_selfplay_iteration(
-                iteration + 1,
-                learner_only_bootstrap_iterations=learner_only_bootstrap_iterations,
-                champion_refresh_due=champion_refresh_due,
-                learner_selfplay_safe=learner_selfplay_safe,
             )
             selfplay_model = best_model if use_best_for_selfplay else model
             selfplay_source_code = (
                 REPLAY_SOURCE_CHAMPION if use_best_for_selfplay else REPLAY_SOURCE_LEARNER
             )
-            if iteration + 1 <= learner_only_bootstrap_iterations:
-                selfplay_source_label = "learner snapshot (RL49 bootstrap)"
-            elif champion_refresh_due:
-                selfplay_source_label = "best bootstrap"
-            elif use_best_for_selfplay:
-                selfplay_source_label = "best safety fallback"
+            champion_capture_scheduled_now = bool(
+                champion_replay_capture_iteration is not None
+                and int(champion_replay_capture_iteration) == int(iteration + 1)
+            )
+            selfplay_actor_matches_best = bool(
+                use_best_for_selfplay
+                or (
+                    champion_capture_scheduled_now
+                    and _models_have_identical_state(model, best_model)
+                )
+            )
+            champion_capture_due = _champion_replay_capture_due(
+                iteration_number=iteration + 1,
+                scheduled_iteration=champion_replay_capture_iteration,
+                selfplay_actor_matches_best=selfplay_actor_matches_best,
+            )
+            if champion_capture_scheduled_now and not champion_capture_due:
+                iteration_notes.append(
+                    "champion replay capture cancelled: self-play actor no longer matches best"
+                )
+                champion_replay_capture_iteration = None
+            if use_best_for_selfplay:
+                selfplay_best_reasons = []
+                if not learner_selfplay_safe:
+                    selfplay_best_reasons.append("safety_fallback")
+                if champion_refresh_due:
+                    selfplay_best_reasons.append("champion_refresh")
+                selfplay_best_reason = "+".join(selfplay_best_reasons) or "other"
+                selfplay_source_label = {
+                    "safety_fallback": "best safety fallback",
+                    "champion_refresh": "best champion refresh",
+                    "safety_fallback+champion_refresh": "best safety fallback + champion refresh",
+                }.get(selfplay_best_reason, "best snapshot")
             else:
                 selfplay_source_label = "learner snapshot"
+                selfplay_best_reason = ""
             iteration_notes.append(f"self-play source: {selfplay_source_label}")
+            holdout_seed = int(config.get('seed', 490050)) + (iteration + 1) * 1_000_003
+            replay_router = _ReplayHoldoutRouter(
+                replay_buffer,
+                holdout_replay_buffer,
+                seed=holdout_seed,
+            )
             positions, positions_added, avg_game_length, positions_per_sec, selfplay_time, collection_time, selfplay_stats = \
                 play_games_parallel_mcts(
                     selfplay_model,
                     config,
                     device,
                     games_this_iteration,
-                    replay_buffer=replay_buffer,
+                    replay_buffer=replay_router,
                     hard_start_positions=hard_start_plan,
                 )
             selfplay_stats = dict(selfplay_stats or {})
+            if not bool(selfplay_stats.get('telemetry_complete', 1)):
+                iteration_notes.append(
+                    "self-play recovery completed; Gumbel/opening telemetry is partial "
+                    f"({int(selfplay_stats.get('recovery_attempts', 0) or 0)} attempt(s))"
+                )
             _finish_stage('selfplay')
             startup_time_in_selfplay = max(
                 0.0,
@@ -4433,14 +6601,70 @@ def main():
                 if transfer_time > 0.0:
                     iteration_stage_times['selfplay'] = float(current_selfplay_stage - transfer_time)
                     iteration_stage_times['setup'] = float(iteration_stage_times.get('setup', 0.0) or 0.0) + float(transfer_time)
-             
-            # Add to replay buffer
-            for position in positions:
+
+            training_positions, holdout_positions = _split_replay_holdout_positions(
+                positions,
+                seed=holdout_seed,
+            )
+            # Holdout rows are never inserted into the learner replay. They
+            # therefore measure transfer to fresh MCTS targets rather than
+            # memorisation of an optimizer batch.
+            for position in training_positions:
                 replay_buffer.add(position)
+            for position in holdout_positions:
+                holdout_replay_buffer.add(position)
             replay_buffer.relabel_iteration_source(
                 iteration + 1,
                 selfplay_source_code,
             )
+            holdout_replay_buffer.relabel_iteration_source(
+                iteration + 1,
+                selfplay_source_code,
+            )
+            training_position_count = int(replay_router.training_count + len(training_positions))
+            holdout_position_count = int(replay_router.holdout_count + len(holdout_positions))
+            positions_added = training_position_count
+            search_control_updates = search_control_archive.update_replayed(
+                replay_buffer.search_control_replay_updates(iteration + 1),
+                iteration + 1,
+            )
+            search_control_candidates = replay_buffer.search_control_candidates(iteration + 1)
+            search_control_merge = search_control_archive.add_candidates(
+                search_control_candidates,
+                iteration + 1,
+            )
+            replay_quality_stats = {
+                # Persist the actor selected before self-play. Replay composition
+                # and the post-evaluation guard state describe different moments
+                # and cannot identify exact best-vs-best iterations reliably.
+                'selfplay_actor': 'best' if use_best_for_selfplay else 'learner',
+                'selfplay_best_reason': selfplay_best_reason,
+                'selfplay_best_vs_best': int(use_best_for_selfplay),
+                'holdout_positions': holdout_position_count,
+                'holdout_games': int(len(replay_router.holdout_game_ids)),
+                'holdout_fraction': (
+                    float(holdout_position_count)
+                    / float(max(1, training_position_count + holdout_position_count))
+                ),
+                **search_control_archive.stats(search_control_sampled),
+                'search_control_candidates': len(search_control_candidates),
+                'search_control_added': int(search_control_merge['added']),
+                'search_control_updated': int(search_control_merge['updated']),
+                'search_control_replaced': int(search_control_merge.get('replaced', 0)),
+                'search_control_replayed': int(search_control_updates),
+                'search_control_requested_starts': int(hard_start_count),
+                'search_control_selected_starts': int(len(search_control_sampled)),
+                'search_control_fallback_requested': int(fallback_requested),
+                'search_control_fallback_selected': int(
+                    max(0, len(hard_positions) - len(search_control_sampled))
+                ),
+                'search_control_unfilled_starts': int(
+                    max(0, hard_start_count - len(hard_positions))
+                ),
+                'search_control_start_fraction': (
+                    float(len(search_control_sampled)) / float(max(1, games_this_iteration))
+                ),
+            }
 
             if positions_added > 0:
                 observed_positions = float(positions_added)
@@ -4470,27 +6694,31 @@ def main():
                 int(round(replay_buffer.max_size * champion_replay_fraction)),
             )
             champion_replay_buffer.resize(desired_champion_capacity)
+            _update_rl_run_manifest_runtime(
+                logger,
+                completed_iteration=int(iteration + 1),
+                replay_buffer_capacity=int(replay_buffer.max_size),
+                replay_buffer_size=int(len(replay_buffer)),
+                champion_replay_capacity=int(champion_replay_buffer.max_size),
+                champion_replay_size=int(len(champion_replay_buffer)),
+            )
             champion_rows_added = 0
             if champion_refresh_due:
-                champion_indices = replay_buffer.select_iteration_indices(
-                    iteration + 1,
-                    max_count=champion_replay_buffer.max_size,
-                    prefer_useful_search_corrections=True,
-                )
-                champion_rows_added = replay_buffer.copy_indices_to(
+                champion_rows_added = _refresh_champion_replay_snapshot(
+                    replay_buffer,
                     champion_replay_buffer,
-                    champion_indices,
-                    source_code=REPLAY_SOURCE_CHAMPION,
+                    iteration + 1,
                 )
                 if champion_rows_added > 0:
+                    champion_replay_refresh_iteration = int(iteration + 1)
                     iteration_notes.append(
                         f"champion replay: {len(champion_replay_buffer):,}/"
                         f"{champion_replay_buffer.max_size:,} pinned positions"
                     )
 
-            replay_quality_stats = replay_buffer.quality_stats(
+            replay_quality_stats.update(replay_buffer.quality_stats(
                 recent_window_fraction=config['reinforcement_learning'].get('replay_recent_window_fraction', None)
-            )
+            ))
             replay_quality_stats['champion_replay_size'] = int(len(champion_replay_buffer))
             replay_quality_stats['champion_replay_capacity'] = int(champion_replay_buffer.max_size)
             replay_quality_stats['champion_replay_added'] = int(champion_rows_added)
@@ -4538,16 +6766,25 @@ def main():
             correction_audit_after = None
             correction_audit_previous_now = None
             iteration_correction_audit_metrics = correction_audit_metrics(None, None)
-            champion_replay_age = (
-                int(iteration + 1) - int(last_promotion_iteration)
-                if last_promotion_iteration is not None
-                # Until this run proves a replacement, the startup champion is
-                # still the only verified policy anchor and must not decay.
-                else 0
+            correction_audit_candidate_rows = 0
+            correction_audit_eligible_rows = 0
+            correction_audit_correction_fraction = float('nan')
+            correction_audit_coverage = float('nan')
+            general_holdout_batch = None
+            general_holdout_before = None
+            general_holdout_after = None
+            iteration_holdout_metrics = holdout_metrics(None, None)
+            champion_replay_age = _champion_replay_age(
+                iteration + 1,
+                champion_replay_refresh_iteration,
             )
-            current_champion_replay_fraction = _resolve_champion_replay_sample_fraction(
-                champion_replay_fraction,
-                champion_replay_age,
+            current_champion_replay_fraction = (
+                _resolve_champion_replay_sample_fraction(
+                    champion_replay_fraction,
+                    champion_replay_age,
+                )
+                if len(champion_replay_buffer) > 0
+                else 0.0
             )
             replay_quality_stats['champion_replay_target_fraction'] = float(
                 current_champion_replay_fraction
@@ -4566,7 +6803,7 @@ def main():
             champion_sample_age_avg = None
             champion_sample_age_p50 = None
             champion_sample_age_p90 = None
-            
+
             # Training with metrics
             replay_size = len(replay_buffer)
             base_batch_size = _resolve_train_batch_size(
@@ -4589,14 +6826,13 @@ def main():
                 policy_correction_loss_sum = 0.0
                 policy_correction_rank_rows = 0
                 policy_correction_rank_loss_sum = 0.0
+                policy_correction_rank_objective_sum = 0.0
                 policy_correction_top1_correct = 0
-                policy_correction_sharpen_rows = 0
-                policy_correction_sharpen_top1_before_sum = 0.0
-                policy_correction_sharpen_top1_after_sum = 0.0
                 policy_effective_weight_sum = 0.0
                 policy_correction_effective_weight_sum = 0.0
                 value_primary_loss_total = 0.0
                 value_scalar_aux_loss_total = 0.0
+                value_search_consistency_loss_total = 0.0
                 moves_left_loss_total = 0.0
                 search_q_loss_total = 0.0
                 search_q_rows_total = 0
@@ -4612,10 +6848,6 @@ def main():
                 root_q_pred_sq_sum_total = 0.0
                 root_q_target_sq_sum_total = 0.0
                 root_q_cross_sum_total = 0.0
-                value_error_focus_rows_total = 0
-                value_error_focus_weight_sum_total = 0.0
-                value_effective_weight_sum_total = 0.0
-                value_error_focus_abs_error_sum_total = 0.0
                 wdl_pred_sums_total = np.zeros(3, dtype=np.float64)
                 wdl_target_sums_total = np.zeros(3, dtype=np.float64)
                 wdl_brier_sum_total = 0.0
@@ -4633,10 +6865,9 @@ def main():
                 sample_age_batches = []
                 recent_sample_age_batches = []
                 champion_sample_age_batches = []
-                
                 # Initialize metrics calculator
                 metrics_calc = MetricsCalculator()
-                
+
                 train_epochs = max(
                     1,
                     int(config['reinforcement_learning']['train_epochs_per_iteration']),
@@ -4661,7 +6892,10 @@ def main():
                         break
                     epoch_steps = min(replay_steps_per_epoch, remaining_train_steps)
                     epoch_sample_count = min(replay_size, epoch_steps * base_batch_size)
-                    epoch_indices = replay_buffer.select_indices(epoch_sample_count)
+                    epoch_indices = replay_buffer.select_game_balanced_indices(
+                        epoch_sample_count,
+                        seed=holdout_seed + 97_409 * (_ + 1),
+                    )
                     training_index_batches.extend(
                         epoch_indices[start:start + base_batch_size]
                         for start in range(0, int(epoch_indices.size), base_batch_size)
@@ -4704,24 +6938,59 @@ def main():
                 replay_quality_stats['champion_replay_selected_fraction'] = (
                     float(selected_champion_samples) / float(max(1, selected_samples))
                 )
-                planned_recent_parts = [
-                    indices for indices, _ in training_batch_specs if int(indices.size) > 0
-                ]
-                planned_recent_indices = (
-                    np.concatenate(planned_recent_parts)
-                    if planned_recent_parts
-                    else np.empty(0, dtype=np.int64)
+                holdout_candidate_indices = np.arange(
+                    len(holdout_replay_buffer),
+                    dtype=np.int64,
                 )
-                audit_indices = replay_buffer.select_policy_correction_audit_indices(
-                    planned_recent_indices,
-                    CORRECTION_AUDIT_MAX_ROWS,
+                replay_quality_stats.update(
+                    replay_buffer.game_diversity_stats(selected_recent_unique)
+                )
+                eligible_audit_indices = holdout_replay_buffer.select_policy_correction_audit_indices(
+                    holdout_candidate_indices,
+                    int(holdout_candidate_indices.size),
                     seed=0xC0DEC0DE + int(iteration),
+                )
+                correction_audit_candidate_rows = int(holdout_candidate_indices.size)
+                correction_audit_eligible_rows = int(eligible_audit_indices.size)
+                correction_audit_correction_fraction = (
+                    float(eligible_audit_indices.size) / float(holdout_candidate_indices.size)
+                    if holdout_candidate_indices.size > 0 else float('nan')
+                )
+                if eligible_audit_indices.size > CORRECTION_AUDIT_MAX_ROWS:
+                    audit_rng = np.random.default_rng(0xC0DEC0DE + int(iteration))
+                    audit_indices = np.sort(audit_rng.choice(
+                        eligible_audit_indices,
+                        CORRECTION_AUDIT_MAX_ROWS,
+                        replace=False,
+                    )).astype(np.int64)
+                else:
+                    audit_indices = eligible_audit_indices
+                correction_audit_coverage = (
+                    float(audit_indices.size) / float(eligible_audit_indices.size)
+                    if eligible_audit_indices.size > 0 else float('nan')
                 )
                 if int(audit_indices.size) > 0:
                     correction_audit_batch = freeze_replay_batch(
-                        replay_buffer.sample_from_indices(audit_indices)
+                        holdout_replay_buffer.sample_from_indices(audit_indices)
                     )
                     correction_audit_before = _evaluate_correction_audit(correction_audit_batch)
+                general_holdout_count = min(
+                    CORRECTION_AUDIT_MAX_ROWS,
+                    int(holdout_candidate_indices.size),
+                )
+                if general_holdout_count > 0:
+                    holdout_rng = np.random.default_rng(0xA11D17 + int(iteration))
+                    general_holdout_indices = np.sort(
+                        holdout_rng.choice(
+                            holdout_candidate_indices,
+                            general_holdout_count,
+                            replace=False,
+                        )
+                    ).astype(np.int64)
+                    general_holdout_batch = freeze_replay_batch(
+                        holdout_replay_buffer.sample_from_indices(general_holdout_indices)
+                    )
+                    general_holdout_before = _evaluate_correction_audit(general_holdout_batch)
                 for batch_index, (recent_indices, champion_count) in enumerate(
                     tqdm(training_batch_specs, desc="Training")
                 ):
@@ -4733,7 +7002,10 @@ def main():
                         recent_sample_age_batches.append(recent_ages.copy())
                     champion_batch = None
                     if champion_count > 0:
-                        champion_indices = champion_replay_buffer.select_indices(champion_count)
+                        champion_indices = champion_replay_buffer.select_game_balanced_indices(
+                            champion_count,
+                            seed=holdout_seed + 1_299_709 + batch_index,
+                        )
                         champion_batch = champion_replay_buffer.sample_from_indices(champion_indices)
                         champion_ages = getattr(champion_replay_buffer, 'last_sample_ages', None)
                         if champion_ages is not None and getattr(champion_ages, "size", 0) > 0:
@@ -4771,7 +7043,7 @@ def main():
                         policy_weight_override=current_policy_loss_weight,
                         collect_gradient_diagnostics=(batch_index == 0),
                     )
-                    
+
                     total_loss += loss
                     total_policy += policy_loss
                     total_value += value_loss
@@ -4789,21 +7061,20 @@ def main():
                     policy_correction_rank_loss_sum += float(
                         policy_diagnostics.get('correction_rank_loss_sum', 0.0) or 0.0
                     )
+                    policy_correction_rank_objective_sum += float(
+                        policy_diagnostics.get('correction_rank_objective', 0.0) or 0.0
+                    )
+                    current_correction_rank_weight = float(
+                        policy_diagnostics.get(
+                            'correction_rank_weight', current_correction_rank_weight
+                        ) or 0.0
+                    )
+                    current_search_q_weight = float(
+                        policy_diagnostics.get('search_q_weight', current_search_q_weight)
+                        or 0.0
+                    )
                     policy_correction_top1_correct += int(
                         policy_diagnostics.get('correction_top1_correct', 0) or 0
-                    )
-                    policy_correction_sharpen_rows += int(
-                        policy_diagnostics.get('correction_sharpen_rows', 0) or 0
-                    )
-                    policy_correction_sharpen_top1_before_sum += float(
-                        policy_diagnostics.get(
-                            'correction_sharpen_top1_before_sum', 0.0
-                        ) or 0.0
-                    )
-                    policy_correction_sharpen_top1_after_sum += float(
-                        policy_diagnostics.get(
-                            'correction_sharpen_top1_after_sum', 0.0
-                        ) or 0.0
                     )
                     policy_effective_weight_sum += float(
                         policy_diagnostics.get('effective_weight_sum', 0.0) or 0.0
@@ -4816,6 +7087,9 @@ def main():
                     )
                     value_scalar_aux_loss_total += float(
                         policy_diagnostics.get('value_scalar_aux_loss', 0.0) or 0.0
+                    )
+                    value_search_consistency_loss_total += float(
+                        policy_diagnostics.get('value_search_consistency_loss', 0.0) or 0.0
                     )
                     moves_left_loss_total += float(
                         policy_diagnostics.get('moves_left_loss', 0.0) or 0.0
@@ -4857,18 +7131,6 @@ def main():
                     )
                     root_q_cross_sum_total += float(
                         policy_diagnostics.get('root_q_cross_sum', 0.0) or 0.0
-                    )
-                    value_error_focus_rows_total += int(
-                        policy_diagnostics.get('value_error_focus_rows', 0) or 0
-                    )
-                    value_error_focus_weight_sum_total += float(
-                        policy_diagnostics.get('value_error_focus_weight_sum', 0.0) or 0.0
-                    )
-                    value_effective_weight_sum_total += float(
-                        policy_diagnostics.get('value_effective_weight_sum', 0.0) or 0.0
-                    )
-                    value_error_focus_abs_error_sum_total += float(
-                        policy_diagnostics.get('value_error_focus_abs_error_sum', 0.0) or 0.0
                     )
                     wdl_pred_sums_total += np.asarray(
                         policy_diagnostics.get('wdl_pred_sums', [0.0, 0.0, 0.0]),
@@ -4920,6 +7182,12 @@ def main():
                         gradient_probe_metrics = dict(policy_diagnostics)
                 if correction_audit_batch is not None:
                     correction_audit_after = _evaluate_correction_audit(correction_audit_batch)
+                if general_holdout_batch is not None:
+                    general_holdout_after = _evaluate_correction_audit(general_holdout_batch)
+                iteration_holdout_metrics = holdout_metrics(
+                    general_holdout_before,
+                    general_holdout_after,
+                )
                 if previous_correction_audit_batch is not None:
                     correction_audit_previous_now = _evaluate_correction_audit(
                         previous_correction_audit_batch
@@ -4930,6 +7198,12 @@ def main():
                     previous_after=previous_correction_audit_after,
                     previous_now=correction_audit_previous_now,
                 )
+                iteration_correction_audit_metrics.update({
+                    'correction_audit_candidate_rows': correction_audit_candidate_rows,
+                    'correction_audit_eligible_rows': correction_audit_eligible_rows,
+                    'correction_audit_correction_fraction': correction_audit_correction_fraction,
+                    'correction_audit_coverage': correction_audit_coverage,
+                })
                 previous_correction_audit_batch = correction_audit_batch
                 previous_correction_audit_after = correction_audit_after
                 avg_policy = total_policy / total_train_steps
@@ -4962,7 +7236,7 @@ def main():
                     champion_sample_age_avg = float(np.mean(champion_sample_ages))
                     champion_sample_age_p50 = float(np.percentile(champion_sample_ages, 50))
                     champion_sample_age_p90 = float(np.percentile(champion_sample_ages, 90))
-                
+
                 # Compute metrics
                 train_metrics = metrics_calc.compute()
                 value_prediction_mean = (
@@ -5026,6 +7300,7 @@ def main():
                     )
                 train_metrics.update({
                     'policy_correction_rank_weight': float(current_correction_rank_weight),
+                    'search_q_weight': float(current_search_q_weight),
                     'policy_correction_loss': (
                         policy_correction_loss_sum / float(policy_correction_rows)
                         if policy_correction_rows > 0
@@ -5036,6 +7311,20 @@ def main():
                         / float(policy_correction_rank_rows)
                         if policy_correction_rank_rows > 0
                         else 0.0
+                    ),
+                    'policy_correction_rank_objective': (
+                        policy_correction_rank_objective_sum / float(total_train_steps)
+                    ),
+                    'policy_correction_rank_contribution': (
+                        float(current_correction_rank_weight)
+                        * policy_correction_rank_objective_sum
+                        / float(total_train_steps)
+                    ),
+                    'policy_correction_rank_to_ce_ratio': (
+                        float(current_correction_rank_weight)
+                        * policy_correction_rank_objective_sum
+                        / float(total_train_steps)
+                        / max(float(avg_policy), 1.0e-12)
                     ),
                     'policy_correction_top1_acc': (
                         float(policy_correction_top1_correct) / float(policy_correction_rows)
@@ -5052,25 +7341,13 @@ def main():
                         if policy_effective_weight_sum > 0.0
                         else 0.0
                     ),
-                    'policy_correction_sharpened_fraction': (
-                        float(policy_correction_sharpen_rows) / float(policy_correction_rows)
-                        if policy_correction_rows > 0
-                        else 0.0
-                    ),
-                    'policy_correction_target_top1_before': (
-                        policy_correction_sharpen_top1_before_sum
-                        / float(policy_correction_sharpen_rows)
-                        if policy_correction_sharpen_rows > 0
-                        else 0.0
-                    ),
-                    'policy_correction_target_top1_after': (
-                        policy_correction_sharpen_top1_after_sum
-                        / float(policy_correction_sharpen_rows)
-                        if policy_correction_sharpen_rows > 0
-                        else 0.0
-                    ),
                     'value_primary_loss': value_primary_loss_total / float(total_train_steps),
-                    'value_scalar_aux_loss': value_scalar_aux_loss_total / float(total_train_steps),
+                    'value_scalar_aux_loss': (
+                        value_scalar_aux_loss_total / float(total_train_steps)
+                    ),
+                    'value_search_consistency_loss': (
+                        value_search_consistency_loss_total / float(total_train_steps)
+                    ),
                     'moves_left_loss': moves_left_loss_total / float(total_train_steps),
                     'search_q_loss': search_q_loss_total / float(total_train_steps),
                     'search_q_coverage': (
@@ -5094,18 +7371,6 @@ def main():
                         if root_q_rows_total > 0 else 0.0
                     ),
                     'value_root_q_correlation': value_root_q_correlation,
-                    'value_error_priority_fraction': (
-                        float(value_error_focus_rows_total) / float(value_rows_total)
-                        if value_rows_total > 0 else 0.0
-                    ),
-                    'value_error_priority_weight_share': (
-                        value_error_focus_weight_sum_total / value_effective_weight_sum_total
-                        if value_effective_weight_sum_total > 0.0 else 0.0
-                    ),
-                    'value_error_priority_mae': (
-                        value_error_focus_abs_error_sum_total / float(value_error_focus_rows_total)
-                        if value_error_focus_rows_total > 0 else 0.0
-                    ),
                     'value_wdl_brier': (
                         wdl_brier_sum_total / float(wdl_rows_total)
                         if wdl_rows_total > 0 else 0.0
@@ -5145,9 +7410,10 @@ def main():
                     'grad_value_probe_norm': float(gradient_probe_metrics.get('value_probe_norm', 0.0) or 0.0),
                     'grad_policy_value_cosine': float(gradient_probe_metrics.get('policy_value_cosine', 0.0) or 0.0),
                     **iteration_correction_audit_metrics,
+                    **iteration_holdout_metrics,
                     **phase_wdl_metrics,
                 })
-                
+
             else:
                 avg_loss = avg_policy = avg_value = 0
                 train_metrics = {}
@@ -5169,7 +7435,86 @@ def main():
                 replay_quality_stats['champion_sample_age_p50'] = champion_sample_age_p50
                 replay_quality_stats['champion_sample_age_p90'] = champion_sample_age_p90
             _finish_stage('train')
-             
+
+            capture_initial_champion = bool(
+                champion_bootstrap_due and len(champion_replay_buffer) <= 0
+            )
+            if capture_initial_champion or champion_capture_due:
+                # The targets came from a snapshot identical to best. Delay the
+                # copy until after training so the producing iteration does not
+                # oversample duplicates from its own rolling replay rows.
+                champion_rows_added = _refresh_champion_replay_snapshot(
+                    replay_buffer,
+                    champion_replay_buffer,
+                    iteration + 1,
+                )
+                if champion_capture_due:
+                    champion_replay_capture_iteration = None
+                if champion_rows_added > 0:
+                    champion_replay_refresh_iteration = int(iteration + 1)
+                    replay_quality_stats['champion_replay_size'] = int(
+                        len(champion_replay_buffer)
+                    )
+                    replay_quality_stats['champion_replay_added'] = int(
+                        champion_rows_added
+                    )
+                    capture_label = (
+                        "promoted best"
+                        if champion_capture_due
+                        else "initial best"
+                    )
+                    iteration_notes.append(
+                        f"champion replay captured from exact {capture_label} self-play: "
+                        f"{len(champion_replay_buffer):,} positions; active next iteration"
+                    )
+                elif champion_capture_due:
+                    iteration_notes.append(
+                        "champion replay capture failed: no positions from scheduled iteration"
+                    )
+
+            reanalyse_stats = _run_selective_reanalyse(
+                replay_buffer,
+                model,
+                config,
+                device,
+                iteration + 1,
+            )
+            _finish_stage('reanalyse')
+            replay_quality_stats['reanalyse_selected'] = int(
+                reanalyse_stats.get('selected', 0) or 0
+            )
+            replay_quality_stats['reanalyse_updated'] = int(
+                reanalyse_stats.get('updated', 0) or 0
+            )
+            replay_quality_stats['reanalyse_correction_fraction'] = (
+                float(reanalyse_stats.get('corrections', 0) or 0)
+                / float(max(1, int(reanalyse_stats.get('updated', 0) or 0)))
+            )
+            selfplay_stats = dict(selfplay_stats or {})
+            selfplay_stats['policy_target_sample_count'] = int(
+                selfplay_stats.get('policy_target_sample_count', 0) or 0
+            ) + int(reanalyse_stats.get('policy_target_sample_count', 0) or 0)
+            selfplay_stats['policy_target_challenge_delta_intervention_count'] = int(
+                selfplay_stats.get('policy_target_challenge_delta_intervention_count', 0) or 0
+            ) + int(
+                reanalyse_stats.get(
+                    'policy_target_challenge_delta_intervention_count', 0
+                ) or 0
+            )
+            selfplay_stats['policy_target_challenge_delta_intervention_rate'] = (
+                float(selfplay_stats['policy_target_challenge_delta_intervention_count'])
+                / float(max(1, selfplay_stats['policy_target_sample_count']))
+            )
+            if int(reanalyse_stats.get('updated', 0) or 0) > 0:
+                iteration_notes.append(
+                    "reanalyse: "
+                    f"{int(reanalyse_stats['updated'])}/{int(reanalyse_stats['selected'])} stale targets "
+                    f"@{int(reanalyse_stats['simulations'])} sims in "
+                    f"{float(reanalyse_stats.get('seconds', 0.0)):.1f}s"
+                )
+            elif reanalyse_stats.get('reason') not in {'cadence', 'disabled', 'below_fraction'}:
+                iteration_notes.append(f"reanalyse skipped: {reanalyse_stats.get('reason')}")
+
             # Evaluation
             score_rate = None
             true_win_rate = None
@@ -5187,6 +7532,7 @@ def main():
             anchor_no_mcts_score_lower_bound = None
             anchor_no_mcts_stats = None
             anchor_mcts_no_mcts_gap = None
+            anchor_gate_failed = False
             estimated_elo = None
             no_mcts_score_rate = None
             no_mcts_stats = None
@@ -5199,21 +7545,24 @@ def main():
             eval_mcts_reference_metrics = _eval_mcts_move_metrics(None, 'model2')
             eval_infrastructure_failed = False
             eval_infrastructure_error = None
+            promotion_confirmation_result = None
             promoted_best_this_iter = False
-            reanalyse_stats = {
-                'selected': 0,
-                'updated': 0,
-                'corrections': 0,
-                'seconds': 0.0,
-            }
-            should_run_no_mcts_eval = no_mcts_eval_enabled and ((iteration + 1) % no_mcts_eval_every == 0)
+            iteration_number = iteration + 1
+            # Raw-NN matches are a periodic diagnostic. Promotion candidates
+            # that fall between diagnostic iterations still get a fresh raw
+            # match below, in the same iteration as their MCTS evaluation.
+            should_run_no_mcts_eval = _raw_nn_evaluation_is_scheduled(
+                iteration_number=iteration_number,
+                cadence=no_mcts_eval_every,
+                enabled=no_mcts_eval_enabled,
+            )
             if should_run_no_mcts_eval:
                 regular_eval_t0 = _start_eval_substage()
                 model.eval()
                 if device.type == 'cuda' and torch.cuda.is_available():
                     with contextlib.suppress(Exception):
                         torch.cuda.empty_cache()
-                no_mcts_stats = evaluate_models_no_mcts(
+                no_mcts_stats = _evaluate_models_no_mcts_with_paired_scores(
                     model,
                     best_model,
                     config,
@@ -5221,17 +7570,18 @@ def main():
                     no_mcts_eval_games,
                     use_fixed_openings=bool(rl_cfg.get('eval_no_mcts_use_fixed_openings', True)),
                 )
-                no_mcts_score_rate = float((no_mcts_stats or {}).get('score_rate', 0.0))
-                no_mcts_true_win_rate = float((no_mcts_stats or {}).get('win_rate', 0.0))
-                no_mcts_draw_rate = float((no_mcts_stats or {}).get('draw_rate', 0.0))
-                no_mcts_loss_rate = float((no_mcts_stats or {}).get('loss_rate', 0.0))
-                no_mcts_wins = int((no_mcts_stats or {}).get('wins', 0))
-                no_mcts_draws = int((no_mcts_stats or {}).get('draws', 0))
-                no_mcts_losses = int((no_mcts_stats or {}).get('losses', 0))
-                no_mcts_unresolved = int((no_mcts_stats or {}).get('unresolved', 0))
-                no_mcts_games_total = int((no_mcts_stats or {}).get('num_games', 0) or 0)
+                (
+                    no_mcts_score_rate,
+                    no_mcts_true_win_rate,
+                    no_mcts_draw_rate,
+                    no_mcts_loss_rate,
+                    no_mcts_wins,
+                    no_mcts_draws,
+                    no_mcts_losses,
+                    no_mcts_unresolved,
+                    no_mcts_games_total,
+                ) = _raw_eval_metric_values(no_mcts_stats)
                 _finish_eval_substage('regular_eval', regular_eval_t0)
-            iteration_number = iteration + 1
             should_run_mcts_eval = (iteration_number % eval_every) == 0
             if should_run_mcts_eval:
                 promotion_eval_t0 = _start_eval_substage()
@@ -5273,6 +7623,7 @@ def main():
                         preliminary_true_win_rate=funnel_preliminary_true_win_rate,
                         medium_score_rate=funnel_medium_score_rate,
                         medium_true_win_rate=funnel_medium_true_win_rate,
+                        force_medium=learner_guard_confirmation_due,
                         game_index_offset=eval_game_index_offset,
                         use_fixed_openings=bool(rl_cfg.get('eval_fixed_openings_enabled', True)),
                         central_runtime=eval_runtime,
@@ -5291,58 +7642,6 @@ def main():
                         'completed_before_failure': 0,
                     })
                     eval_stage = "infrastructure_error"
-                if (
-                    eval_stage == "funnel:advanced"
-                    and not (eval_stats or {}).get('infrastructure_error')
-                ):
-                    provisional_score = float((eval_stats or {}).get('score_rate', 0.0) or 0.0)
-                    provisional_games = int((eval_stats or {}).get('num_games', 0) or 0)
-                    provisional_z = max(
-                        0.0,
-                        float(rl_cfg.get('promotion_stat_gate_z', 1.28) or 1.28),
-                    )
-                    provisional_lb = _score_rate_lower_bound(
-                        provisional_score,
-                        provisional_games,
-                        provisional_z,
-                        standard_error=(eval_stats or {}).get('paired_score_se'),
-                    )
-                    required_lb = float(
-                        rl_cfg.get('promotion_score_lower_bound_min', 0.50) or 0.50
-                    )
-                    # Only a point-score winner that narrowly misses confidence
-                    # pays for another 128 paired games. Obvious losers retain
-                    # the existing cheap funnel behavior.
-                    if (
-                        provisional_score >= score_rate_threshold
-                        and _PROMOTION_CONFIRMATION_LB_FLOOR <= provisional_lb < required_lb
-                    ):
-                        confirmation_config = _build_eval_config_with_exact_simulations(
-                            config,
-                            funnel_advanced_simulations,
-                        )
-                        confirmation_stats = _evaluate_models_with_paired_scores(
-                            eval_subject_model,
-                            best_model,
-                            confirmation_config,
-                            device,
-                            _PROMOTION_CONFIRMATION_GAMES,
-                            game_index_offset=eval_game_index_offset + provisional_games,
-                            use_fixed_openings=bool(
-                                rl_cfg.get('eval_fixed_openings_enabled', True)
-                            ),
-                            central_runtime=eval_runtime,
-                        )
-                        if (confirmation_stats or {}).get('infrastructure_error'):
-                            eval_stats = confirmation_stats
-                            eval_stage = "infrastructure_error"
-                        else:
-                            eval_stats = _combine_eval_stats(eval_stats, confirmation_stats)
-                            eval_stage = "funnel:confirmation"
-                            iteration_notes.append(
-                                "promotion confidence extension: "
-                                f"{int((eval_stats or {}).get('num_games', 0) or 0)} games"
-                            )
                 _finish_eval_substage('promotion_eval', promotion_eval_t0)
                 eval_infrastructure_error = (eval_stats or {}).get('infrastructure_error')
                 if eval_infrastructure_error:
@@ -5389,7 +7688,10 @@ def main():
                     if no_mcts_score_rate is not None
                     else None
                 )
-                full_eval_evidence = _promotion_eval_has_full_evidence(eval_stage)
+                full_eval_evidence = _promotion_eval_has_full_evidence(
+                    eval_stage, eval_stats or {},
+                    funnel_preliminary_games + funnel_medium_games + funnel_advanced_games,
+                )
                 # Short funnel stages are rejection tests, not equally precise
                 # observations. Letting preliminary/intermediate scores update
                 # the promotion EMA made a later full decision depend on noise.
@@ -5413,18 +7715,14 @@ def main():
                 is_new_best_candidate = bool(
                     full_eval_evidence
                     and score_rate >= score_rate_threshold
-                    and true_win_rate >= true_win_rate_threshold
                 )
                 promotion_status = (
-                    "candidate passed score/win gate"
+                    "candidate passed MCTS score gate"
                     if is_new_best_candidate
                     else (
                         f"hold: incomplete eval ({eval_stage}, {eval_games_total} games)"
                         if not full_eval_evidence
-                        else (
-                            f"hold: score/win gate (score {score_rate:.1%}/{score_rate_threshold:.1%}, "
-                            f"true win {true_win_rate:.1%}/{true_win_rate_threshold:.1%})"
-                        )
+                        else f"hold: MCTS score gate ({score_rate:.1%}/{score_rate_threshold:.1%})"
                     )
                 )
                 promotion_stat_gate_enabled = bool(rl_cfg.get('promotion_stat_gate_enabled', True))
@@ -5446,15 +7744,160 @@ def main():
                         promotion_status = (
                             f"blocked: confidence LB {score_lower_bound:.1%} < {stat_gate_min_score_lb:.1%}"
                         )
-                if is_new_best_candidate:
-                    nn_safe, nn_block_reason, nn_score_floor, nn_score_upper = (
-                        _promotion_nn_safety_decision(
-                            no_mcts_score_rate,
-                            no_mcts_games_total,
-                            stat_gate_z,
-                            rl_cfg,
+                # Preserve a fully qualified MCTS selector candidate immediately,
+                # before raw-NN and later promotion gates can reject it. This is
+                # diagnostic storage only; the archive is never a startup source.
+                mcts_selector_gate_passed = bool(is_new_best_candidate)
+                if mcts_selector_gate_passed:
+                    candidate_model_sha = _model_state_sha256(model)
+                    opponent_identity = {
+                        'model_state_sha256': _model_state_sha256(best_model),
+                        'best_iteration': int(best_iteration),
+                        'checkpoint_path': str(best_model_rl_path.resolve()),
+                        'checkpoint_sha256': (
+                            _sha256_file(best_model_rl_path)
+                            if best_model_rl_path.is_file()
+                            else None
+                        ),
+                    }
+                    candidate_eval_protocol = {
+                        'configured_simulations': int(funnel_advanced_simulations),
+                        'fresh_simulations_per_root': int(funnel_advanced_simulations),
+                        'avg_simulations_per_root': eval_mcts_candidate_metrics.get(
+                            'avg_simulations'
+                        ),
+                        'eval_dynamic_budget_enabled': False,
+                        'eval_tree_reuse_visit_credit_active': False,
+                        'selfplay_dynamic_budget_enabled': bool(
+                            rl_cfg.get('mcts_dynamic_budget_enabled', False)
+                        ),
+                        'selfplay_tree_reuse_visit_credit_enabled': bool(
+                            rl_cfg.get('mcts_tree_reuse_visit_credit_enabled', False)
+                        ),
+                        'effective_config_sha256': candidate_archive.run_identity.get(
+                            'effective_config_sha256'
+                        ),
+                    }
+                    checkpoint_metadata = {
+                        'checkpoint_role': 'mcts_selector_candidate_archive',
+                        'iteration': int(iteration + 1),
+                        'model_state_sha256': candidate_model_sha,
+                        'immutable_run_identity': dict(candidate_archive.run_identity),
+                        'run_manifest_path': str(Path(manifest_path).resolve()),
+                        'mcts_selector': {
+                            'score_rate': float(score_rate),
+                            'lower_bound': float(score_lower_bound),
+                            'score_se': (eval_stats or {}).get('paired_score_se'),
+                            'games': int(eval_games_total),
+                            'unique_openings': int(
+                                (eval_stats or {}).get(
+                                    'paired_score_unique_openings', 0
+                                ) or 0
+                            ),
+                            'protocol': candidate_eval_protocol,
+                        },
+                        'opponent_identity': opponent_identity,
+                        'version': model_version,
+                        'startup_mode': start_mode,
+                        'model_architecture': model_architecture,
+                        'rl_run_artifacts': _rl_run_artifact_metadata(logger, base_dir),
+                    }
+
+                    def _write_mcts_candidate_checkpoint(path):
+                        save_checkpoint(
+                            model,
+                            None,
+                            iteration,
+                            avg_loss,
+                            str(path),
+                            checkpoint_metadata,
+                            save_optimizer=False,
+                            save_dtype=None,
                         )
+
+                    mcts_candidate_archive_record = candidate_archive.consider(
+                        iteration=iteration + 1,
+                        mcts_score_rate=score_rate,
+                        mcts_lower_bound=score_lower_bound,
+                        mcts_score_se=(eval_stats or {}).get('paired_score_se'),
+                        mcts_games=eval_games_total,
+                        unique_openings=int(
+                            (eval_stats or {}).get(
+                                'paired_score_unique_openings', 0
+                            ) or 0
+                        ),
+                        simulation_budget=funnel_advanced_simulations,
+                        opponent_identity=opponent_identity,
+                        checkpoint_metadata=checkpoint_metadata,
+                        write_checkpoint=_write_mcts_candidate_checkpoint,
                     )
+                    mcts_candidate_status = (
+                        'archived'
+                        if mcts_candidate_archive_record.get('retained')
+                        else 'qualified_not_retained'
+                    )
+                    iteration_notes.append(
+                        'MCTS selector candidate '
+                        + ('archived' if mcts_candidate_status == 'archived' else 'qualified; archive full')
+                    )
+                if is_new_best_candidate:
+                    raw_promotion_gate_enabled = bool(
+                        rl_cfg.get('promotion_no_mcts_gate_enabled', True)
+                    )
+                    if _raw_nn_candidate_match_required(
+                        is_candidate=is_new_best_candidate,
+                        promotion_gate_enabled=raw_promotion_gate_enabled,
+                        stats=no_mcts_stats,
+                    ):
+                        # The raw-NN gate is mandatory for an MCTS candidate,
+                        # even when periodic raw diagnostics are disabled or
+                        # this iteration is outside their cadence.
+                        regular_eval_t0 = _start_eval_substage()
+                        no_mcts_stats = _evaluate_models_no_mcts_with_paired_scores(
+                            model,
+                            best_model,
+                            config,
+                            device,
+                            no_mcts_eval_games,
+                            use_fixed_openings=bool(
+                                rl_cfg.get('eval_no_mcts_use_fixed_openings', True)
+                            ),
+                        )
+                        (
+                            no_mcts_score_rate,
+                            no_mcts_true_win_rate,
+                            no_mcts_draw_rate,
+                            no_mcts_loss_rate,
+                            no_mcts_wins,
+                            no_mcts_draws,
+                            no_mcts_losses,
+                            no_mcts_unresolved,
+                            no_mcts_games_total,
+                        ) = _raw_eval_metric_values(no_mcts_stats)
+                        _finish_eval_substage('regular_eval', regular_eval_t0)
+                    nn_block_reason = ""
+                    nn_score_floor = float(
+                        rl_cfg.get('promotion_no_mcts_score_rate_min', 0.48) or 0.48
+                    )
+                    if raw_promotion_gate_enabled or no_mcts_score_rate is not None:
+                        # Keep the previous pass/fail bit as telemetry in
+                        # MCTS-only mode without letting it affect promotion.
+                        (
+                            nn_safe,
+                            nn_block_reason,
+                            nn_score_floor,
+                            nn_score_upper,
+                            nn_safety_status,
+                        ) = (
+                            _promotion_nn_safety_decision(
+                                no_mcts_score_rate,
+                                no_mcts_games_total,
+                                stat_gate_z,
+                                rl_cfg,
+                                enabled_override=True,
+                                standard_error=(no_mcts_stats or {}).get('paired_score_se'),
+                            )
+                        )
                     # Raw policy matches are discontinuous: one changed move can
                     # flip an entire deterministic game.  Spend more cheap raw
                     # games only after the expensive MCTS gate has passed and
@@ -5463,19 +7906,18 @@ def main():
                         _next_raw_candidate_retest_target(
                             nn_safe=nn_safe,
                             games_played=no_mcts_games_total,
-                            score_upper_bound=nn_score_upper,
-                            score_floor=nn_score_floor,
+                            max_games=int(
+                                rl_cfg.get('promotion_no_mcts_max_games', 192) or 192
+                            ),
                         )
-                        if should_run_no_mcts_eval
+                        if raw_promotion_gate_enabled and no_mcts_stats is not None
                         else None
                     )
-                    while raw_target_games is not None:
+                    if raw_target_games is not None:
                         raw_target_games = int(raw_target_games)
                         raw_extra_games = max(0, raw_target_games - int(no_mcts_games_total or 0))
-                        if raw_extra_games <= 0:
-                            continue
                         regular_eval_t0 = _start_eval_substage()
-                        raw_extra_stats = evaluate_models_no_mcts(
+                        raw_extra_stats = _evaluate_models_no_mcts_with_paired_scores(
                             model,
                             best_model,
                             config,
@@ -5487,41 +7929,63 @@ def main():
                             ),
                         )
                         no_mcts_stats = _combine_eval_stats(no_mcts_stats, raw_extra_stats)
-                        no_mcts_score_rate = float((no_mcts_stats or {}).get('score_rate', 0.0))
-                        no_mcts_true_win_rate = float((no_mcts_stats or {}).get('win_rate', 0.0))
-                        no_mcts_draw_rate = float((no_mcts_stats or {}).get('draw_rate', 0.0))
-                        no_mcts_loss_rate = float((no_mcts_stats or {}).get('loss_rate', 0.0))
-                        no_mcts_wins = int((no_mcts_stats or {}).get('wins', 0))
-                        no_mcts_draws = int((no_mcts_stats or {}).get('draws', 0))
-                        no_mcts_losses = int((no_mcts_stats or {}).get('losses', 0))
-                        no_mcts_unresolved = int((no_mcts_stats or {}).get('unresolved', 0))
-                        no_mcts_games_total = int((no_mcts_stats or {}).get('num_games', 0) or 0)
+                        (
+                            no_mcts_score_rate,
+                            no_mcts_true_win_rate,
+                            no_mcts_draw_rate,
+                            no_mcts_loss_rate,
+                            no_mcts_wins,
+                            no_mcts_draws,
+                            no_mcts_losses,
+                            no_mcts_unresolved,
+                            no_mcts_games_total,
+                        ) = _raw_eval_metric_values(no_mcts_stats)
                         _finish_eval_substage('regular_eval', regular_eval_t0)
-                        nn_safe, nn_block_reason, nn_score_floor, nn_score_upper = (
+                        (
+                            nn_safe,
+                            nn_block_reason,
+                            nn_score_floor,
+                            nn_score_upper,
+                            nn_safety_status,
+                        ) = (
                             _promotion_nn_safety_decision(
                                 no_mcts_score_rate,
                                 no_mcts_games_total,
                                 stat_gate_z,
                                 rl_cfg,
+                                standard_error=(no_mcts_stats or {}).get('paired_score_se'),
                             )
                         )
                         iteration_notes.append(
                             f"raw candidate retest: {no_mcts_games_total} games -> "
                             f"{no_mcts_score_rate:.1%}"
                         )
-                        raw_target_games = _next_raw_candidate_retest_target(
-                            nn_safe=nn_safe,
-                            games_played=no_mcts_games_total,
-                            score_upper_bound=nn_score_upper,
-                            score_floor=nn_score_floor,
-                        )
                     current_mcts_no_mcts_gap = (
                         float(score_rate) - float(no_mcts_score_rate)
                         if no_mcts_score_rate is not None else None
                     )
-                    if not nn_safe:
+                    if raw_promotion_gate_enabled and not nn_safe:
                         is_new_best_candidate = False
                         promotion_status = nn_block_reason
+                if (
+                    no_mcts_eval_enabled
+                    and not should_run_no_mcts_eval
+                    and no_mcts_stats is None
+                ):
+                    skip_reason = (
+                        "MCTS evaluation incomplete"
+                        if not full_eval_evidence
+                        else (
+                            "raw-NN promotion gate disabled"
+                            if is_new_best_candidate
+                            else "MCTS promotion gates did not nominate a candidate"
+                        )
+                    )
+                    iteration_notes.append(
+                        f"raw NN diagnostic skipped (periodic cadence every "
+                        f"{no_mcts_eval_every} iterations; {skip_reason}; "
+                        "MCTS candidates receive an on-demand same-iteration check)"
+                    )
                 anchor_gate_enabled = bool(rl_cfg.get('promotion_require_anchor_non_regression', True))
                 min_anchor_score_for_progress = float(rl_cfg.get('promotion_anchor_min_score_rate', 0.50))
                 min_anchor_true_win_for_progress = float(
@@ -5638,7 +8102,7 @@ def main():
                         rl_cfg.get('promotion_anchor_no_mcts_gate_enabled', True)
                     )
                     raw_anchor_required = bool(anchor_decision_due and raw_anchor_gate_enabled)
-                    if raw_anchor_required or should_run_no_mcts_eval:
+                    if raw_anchor_required:
                         anchor_regular_eval_t0 = _start_eval_substage()
                         anchor_no_mcts_max_games = (
                             max(
@@ -5743,45 +8207,208 @@ def main():
                         if anchor_gate_failed:
                             is_new_best_candidate = False
                             promotion_status = f"blocked: {anchor_reason}"
-                if (
-                    candidate_passed_best_gate
-                    and not is_new_best_candidate
-                    and float(score_lower_bound or 0.0) > float(best_candidate_score_lower_bound)
-                ):
-                    candidate_metadata = {
-                        'candidate_status': promotion_status,
-                        'score_rate': score_rate,
-                        'win_rate': true_win_rate,
-                        'eval_score_rate': score_rate,
-                        'eval_true_win_rate': true_win_rate,
-                        'eval_score_lower_bound': score_lower_bound,
-                        'anchor_score_rate': anchor_score_rate,
-                        'anchor_true_win_rate': anchor_true_win_rate,
-                        'anchor_score_lower_bound': anchor_score_lower_bound,
-                        'anchor_no_mcts_score_rate': anchor_no_mcts_score_rate,
-                        'anchor_no_mcts_score_lower_bound': anchor_no_mcts_score_lower_bound,
-                        'policy_loss': avg_policy,
-                        'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
-                        'value_mae': train_metrics.get('value_mae', 0),
-                        'version': model_version,
-                        'startup_mode': start_mode,
-                        'model_architecture': model_architecture,
-                        'rl_run_artifacts': _rl_run_artifact_metadata(logger, base_dir),
+                if is_new_best_candidate:
+                    primary_mcts_simulations = int(
+                        (eval_stats or {}).get('promotion_mcts_simulations', 0) or 0
+                    )
+                    confirmation_attempt_index = (
+                        promotion_confirmation_attempt_count
+                    )
+                    promotion_confirmation_attempt_count += 1
+                    confirmation_suite_id = ''
+                    confirmation_suite_ids = None
+                    confirmation_opening_lines = ()
+                    confirmation_suite_opening_lines = None
+                    confirmation_suite_error = None
+                    confirmation_suite_index = None
+                    confirmation_suite_indices = []
+                    confirmation_reservation = None
+                    try:
+                        confirmation_reservation = reserve_promotion_holdout_suites(
+                            run_identity=candidate_archive.run_identity,
+                            attempt_index=confirmation_attempt_index,
+                            mode=confirmation_mode,
+                            count=confirmation_suites_per_attempt,
+                            reserved_indices=confirmation_reserved_indices,
+                            preferred_start_index=confirmation_suite_offset,
+                        )
+                        reserved_suites = confirmation_reservation['suites']
+                        confirmation_suite_indices = [
+                            int(item['suite_index']) for item in reserved_suites
+                        ]
+                        confirmation_suite_ids = [
+                            str(item['suite_id']) for item in reserved_suites
+                        ]
+                        confirmation_suite_opening_lines = [
+                            item['openings'] for item in reserved_suites
+                        ]
+                        confirmation_suite_index = confirmation_suite_indices[0]
+                        confirmation_suite_id = ','.join(confirmation_suite_ids)
+                        confirmation_opening_lines = tuple(
+                            line
+                            for suite_lines in confirmation_suite_opening_lines
+                            for line in suite_lines
+                        )
+                    except Exception as exc:
+                        # Concurrent runs can exhaust the bank after startup. Keep
+                        # this iteration's normal checkpoint path, but fail closed:
+                        # no evaluator is called and no candidate is promoted.
+                        confirmation_suite_error = f'{type(exc).__name__}: {exc}'
+                        if 'holdout exhausted' in str(exc).lower():
+                            promotion_holdout_exhausted_iteration = iteration + 1
+                            promotion_holdout_exhausted_reason = str(exc)
+                    promotion_confirmation_result = _run_promotion_confirmation(
+                        model=model,
+                        best_model=best_model,
+                        config=config,
+                        device=device,
+                        rl_cfg=rl_cfg,
+                        central_runtime=eval_runtime,
+                        suite_id=confirmation_suite_id,
+                        opening_lines=confirmation_opening_lines,
+                        suite_ids=confirmation_suite_ids,
+                        suite_opening_lines=confirmation_suite_opening_lines,
+                        expected_candidate_model_state_sha256=candidate_model_sha,
+                        expected_opponent_model_state_sha256=opponent_identity.get(
+                            'model_state_sha256'
+                        ),
+                        simulation_budget=primary_mcts_simulations,
+                        configured_simulation_budget=funnel_advanced_simulations,
+                        suite_error=confirmation_suite_error,
+                        start_substage=_start_eval_substage,
+                        finish_substage=_finish_eval_substage,
+                        discard_failed_runtime=_discard_failed_eval_runtime,
+                    )
+                    if confirmation_reservation is not None:
+                        try:
+                            finish_promotion_holdout_reservation(
+                                confirmation_reservation['token'],
+                                state=(
+                                    'completed' if promotion_confirmation_result.get('games', 0)
+                                    else 'failed_or_aborted'
+                                ),
+                                detail={
+                                    'status': promotion_confirmation_result.get('status'),
+                                    'games': promotion_confirmation_result.get('games', 0),
+                                    'passed': bool(promotion_confirmation_result.get('passed')),
+                                },
+                            )
+                        except Exception as exc:
+                            # Reservation and root burn committed before games began;
+                            # outcome bookkeeping failure must not lose this iteration.
+                            print(
+                                'Promotion holdout result bookkeeping failed; '
+                                f'the suite remains burned ({type(exc).__name__}: {exc}).',
+                                flush=True,
+                            )
+                    promotion_confirmation_suite_index = confirmation_suite_index
+                    promotion_confirmation_result.setdefault(
+                        'suite_ids', list(confirmation_suite_ids or [])
+                    )
+                    promotion_confirmation_result['suite_indices'] = list(
+                        confirmation_suite_indices
+                    )
+                    promotion_confirmation_result['suite_bank_index'] = (
+                        confirmation_suite_index
+                    )
+                    if confirmation_reservation is not None:
+                        promotion_confirmation_result['reservation_token'] = (
+                            confirmation_reservation['token']
+                        )
+                        promotion_confirmation_result['bank_identity'] = (
+                            confirmation_reservation['bank_identity']
+                        )
+                    last_promotion_confirmation_state = {
+                        **promotion_confirmation_result,
+                        'mode': confirmation_mode,
+                        'suite_indices': list(confirmation_suite_indices),
+                        'suite_ids': list(confirmation_suite_ids or []),
+                        'attempt_count': int(promotion_confirmation_attempt_count),
+                        'iteration': int(iteration + 1),
+                        'selection_counter': int(confirmation_attempt_index),
                     }
-                    save_checkpoint(
-                        model,
-                        None,
-                        iteration,
-                        avg_loss,
-                        str(candidate_checkpoint_path),
-                        candidate_metadata,
-                        save_optimizer=False,
-                        save_dtype=torch.bfloat16 if use_bfloat16 else None,
-                    )
-                    best_candidate_score_lower_bound = float(score_lower_bound or 0.0)
                     iteration_notes.append(
-                        f"preserved candidate (best LB {best_candidate_score_lower_bound:.1%})"
+                        'independent holdout confirmation: '
+                        + str(promotion_confirmation_result.get('status', 'blocked'))
                     )
+                    if not bool(promotion_confirmation_result.get('passed', False)):
+                        is_new_best_candidate = False
+                        promotion_status = str(
+                            promotion_confirmation_result.get(
+                                'status',
+                                'blocked: independent holdout confirmation unavailable',
+                            )
+                        )
+                if nn_safety_status == 'not_run' and no_mcts_score_rate is not None:
+                    # Periodic raw-NN points are diagnostic even when they are
+                    # not an active promotion gate on this iteration.
+                    (
+                        _,
+                        _,
+                        _,
+                        nn_score_upper,
+                        nn_safety_status,
+                    ) = _promotion_nn_safety_decision(
+                        no_mcts_score_rate,
+                        no_mcts_games_total,
+                        stat_gate_z,
+                        rl_cfg,
+                        enabled_override=True,
+                        standard_error=(no_mcts_stats or {}).get('paired_score_se'),
+                    )
+                if mcts_candidate_archive_record is not None:
+                    raw_lower_bound = (
+                        _score_rate_lower_bound(
+                            no_mcts_score_rate,
+                            no_mcts_games_total,
+                            stat_gate_z,
+                            standard_error=(no_mcts_stats or {}).get('paired_score_se'),
+                        )
+                        if no_mcts_score_rate is not None else None
+                    )
+                    raw_upper_bound = (
+                        _score_rate_upper_bound(
+                            no_mcts_score_rate,
+                            no_mcts_games_total,
+                            stat_gate_z,
+                            standard_error=(no_mcts_stats or {}).get('paired_score_se'),
+                        )
+                        if no_mcts_score_rate is not None else None
+                    )
+                    final_promotion_status = (
+                        'PROMOTED: new best model'
+                        if is_new_best_candidate else promotion_status
+                    )
+                    if not candidate_archive.record_outcomes(
+                        iteration + 1,
+                        {
+                            'selector_status': mcts_candidate_status,
+                            'mcts_score_rate': score_rate,
+                            'mcts_score_lower_bound': score_lower_bound,
+                            'mcts_score_se': (eval_stats or {}).get('paired_score_se'),
+                            'mcts_games': eval_games_total,
+                            'mcts_unique_openings': (eval_stats or {}).get(
+                                'paired_score_unique_openings'
+                            ),
+                            'raw_nn_status': nn_safety_status,
+                            'raw_nn_score_rate': no_mcts_score_rate,
+                            'raw_nn_games': no_mcts_games_total,
+                            'raw_nn_score_lower_bound': raw_lower_bound,
+                            'raw_nn_score_upper_bound': raw_upper_bound,
+                            'anchor_score_rate': anchor_score_rate,
+                            'anchor_score_lower_bound': anchor_score_lower_bound,
+                            'anchor_no_mcts_score_rate': anchor_no_mcts_score_rate,
+                            'confirmation': dict(promotion_confirmation_result or {}),
+                            'promoted': bool(is_new_best_candidate),
+                            'promotion_status': final_promotion_status,
+                        },
+                    ):
+                        raise RuntimeError(
+                            'A selector-qualified MCTS candidate was not found in '
+                            'its archive index when recording outcomes.'
+                        )
+                    if is_new_best_candidate:
+                        mcts_candidate_status = 'promoted'
                 estimated_elo = None
                 if is_new_best_candidate:
                     elo_eval_t0 = _start_eval_substage()
@@ -5857,10 +8484,84 @@ def main():
                     eval_losses=eval_losses,
                     eval_unresolved=eval_unresolved,
                     eval_score_lower_bound=score_lower_bound,
+                    eval_score_upper_bound=(
+                        _score_rate_upper_bound(
+                            score_rate,
+                            eval_games_total,
+                            stat_gate_z,
+                            standard_error=(eval_stats or {}).get('paired_score_se'),
+                        )
+                        if score_rate is not None else ''
+                    ),
+                    eval_score_se=(eval_stats or {}).get('paired_score_se'),
+                    eval_unique_openings=(eval_stats or {}).get('paired_score_unique_openings'),
                     eval_stat_gate_z=stat_gate_z,
                     no_mcts_score_rate=no_mcts_score_rate,
                     no_mcts_win_rate=no_mcts_true_win_rate,
                     no_mcts_games=no_mcts_games_total,
+                    no_mcts_score_se=(no_mcts_stats or {}).get('paired_score_se'),
+                    no_mcts_unique_openings=(no_mcts_stats or {}).get('paired_score_unique_openings'),
+                    no_mcts_score_lower_bound=(
+                        _score_rate_lower_bound(no_mcts_score_rate, no_mcts_games_total,
+                            stat_gate_z, standard_error=(no_mcts_stats or {}).get('paired_score_se'))
+                        if no_mcts_score_rate is not None else ''
+                    ),
+                    no_mcts_score_upper_bound=(
+                        _score_rate_upper_bound(no_mcts_score_rate, no_mcts_games_total,
+                            stat_gate_z, standard_error=(no_mcts_stats or {}).get('paired_score_se'))
+                        if no_mcts_score_rate is not None else ''
+                    ),
+                    promotion_status=(
+                        "PROMOTED: new best model"
+                        if is_new_best_candidate else promotion_status
+                    ),
+                    promotion_raw_nn_pass=(
+                        "" if nn_safe is None else int(bool(nn_safe))
+                    ),
+                    promotion_raw_nn_status=nn_safety_status,
+                    mcts_candidate_status=mcts_candidate_status,
+                    promotion_confirmation_status=(
+                        (promotion_confirmation_result or {}).get(
+                            'status',
+                            'not run: prior gates did not pass' if eval_stage else '',
+                        )
+                    ),
+                    promotion_confirmation_score_rate=(
+                        (promotion_confirmation_result or {}).get('score_rate', '')
+                    ),
+                    promotion_confirmation_score_lower_bound=(
+                        (promotion_confirmation_result or {}).get('score_lower_bound', '')
+                    ),
+                    promotion_confirmation_score_upper_bound=(
+                        (promotion_confirmation_result or {}).get('score_upper_bound', '')
+                    ),
+                    promotion_confirmation_score_se=(
+                        (promotion_confirmation_result or {}).get('score_se', '')
+                    ),
+                    promotion_confirmation_games=(
+                        (promotion_confirmation_result or {}).get('games', '')
+                    ),
+                    promotion_confirmation_unique_openings=(
+                        (promotion_confirmation_result or {}).get('unique_openings', '')
+                    ),
+                    promotion_confirmation_mode=confirmation_mode,
+                    promotion_confirmation_suite_id=(
+                        (promotion_confirmation_result or {}).get('suite_id', '')
+                    ),
+                    promotion_confirmation_suite_ids=','.join(
+                        str(value)
+                        for value in (
+                            (promotion_confirmation_result or {}).get('suite_ids')
+                            or []
+                        )
+                    ),
+                    promotion_confirmation_suite_index=(
+                        '' if promotion_confirmation_suite_index is None
+                        else int(promotion_confirmation_suite_index)
+                    ),
+                    promotion_confirmation_simulations=(
+                        (promotion_confirmation_result or {}).get('simulations', '')
+                    ),
                     anchor_score_rate=anchor_score_rate,
                     anchor_true_win_rate=anchor_true_win_rate,
                     anchor_games=anchor_eval_games_total,
@@ -5884,7 +8585,15 @@ def main():
                     best_iteration = int(iteration + 1)
                     best_model.load_state_dict(model.state_dict())
                     best_model.eval()
-                    champion_replay_buffer.clear()
+                    # Before the next optimizer step, learner and the promoted
+                    # best are identical. Capture that next self-play iteration
+                    # instead of pinning targets generated by the pre-update model.
+                    if champion_replay_fraction > 0.0:
+                        champion_replay_capture_iteration = int(iteration + 2)
+                        iteration_notes.append(
+                            "champion replay capture scheduled from the promoted "
+                            f"best-equivalent actor at iteration {iteration + 2}"
+                        )
                     # The comparison baseline changed; old best-relative EMA is
                     # not commensurate with the new champion.
                     eval_score_rate_ema = 0.50
@@ -5892,7 +8601,7 @@ def main():
                     best_win_rate_so_far = max(best_win_rate_so_far, float(score_rate))
                     if anchor_model_available:
                         best_differs_from_anchor = True
-                    
+
                     model_to_save = model
                     best_metadata = {
                         'win_rate': true_win_rate,
@@ -5902,6 +8611,9 @@ def main():
                         'anchor_true_win_rate': anchor_true_win_rate,
                         'anchor_no_mcts_score_rate': anchor_no_mcts_score_rate,
                         'anchor_no_mcts_score_lower_bound': anchor_no_mcts_score_lower_bound,
+                        'promotion_confirmation': dict(
+                            last_promotion_confirmation_state
+                        ),
                         'policy_loss': avg_policy,
                         'policy_top1_acc': train_metrics.get('policy_top1_acc', 0),
                         'value_mae': train_metrics.get('value_mae', 0),
@@ -5918,14 +8630,21 @@ def main():
                         save_optimizer=False,
                         save_dtype=torch.bfloat16 if use_bfloat16 else None
                     )
-                    
+
                     size_mb = best_model_rl_path.stat().st_size / (1024**2)
                     iteration_notes.append(f"saved promoted best ({size_mb:.1f} MB)")
                     if version_best_model_path != best_model_rl_path:
                         shutil.copy2(best_model_rl_path, version_best_model_path)
-                    with contextlib.suppress(OSError):
-                        candidate_checkpoint_path.unlink(missing_ok=True)
-                    best_candidate_score_lower_bound = -1.0
+                if (
+                    not elo_coordinator.interrupted_during_elo
+                    and elo_coordinator.pending_promoted_mcts_due(iteration + 1)
+                ):
+                    deferred_elo_t0 = _start_eval_substage()
+                    elo_coordinator.evaluate_pending_promoted_mcts(
+                        iteration + 1,
+                        best_model,
+                    )
+                    _finish_eval_substage('elo_eval', deferred_elo_t0)
             else:
                 logger.log(
                     iteration + 1,
@@ -5942,53 +8661,23 @@ def main():
                     temperature=current_temp,
                 )
                 last_logged_iteration = iteration + 1
-            reanalyse_interval = max(
-                1,
-                int(rl_cfg.get('replay_reanalyse_stall_interval', 10) or 10),
-            )
-            stalled_reanalyse_due = bool(
-                should_run_mcts_eval
-                and not promoted_best_this_iter
-                and int(iteration + 1) >= reanalyse_interval
-                and (
-                    last_reanalyse_iteration is None
-                    or int(iteration + 1) - int(last_reanalyse_iteration) >= reanalyse_interval
-                )
-            )
-            if promoted_best_this_iter or stalled_reanalyse_due:
-                reanalyse_t0 = _start_eval_substage()
-                reanalyse_stats = _run_selective_reanalyse(
-                    replay_buffer,
-                    model,
-                    config,
-                    device,
-                )
-                _finish_eval_substage('reanalyse', reanalyse_t0)
-                last_reanalyse_iteration = int(iteration + 1)
-                if int(reanalyse_stats.get('updated', 0)) > 0:
-                    reason = "promotion" if promoted_best_this_iter else "stalled learner"
-                    iteration_notes.append(
-                        f"reanalyse ({reason}): "
-                        f"{int(reanalyse_stats['updated'])}/{int(reanalyse_stats['selected'])} hard positions "
-                        f"({int(reanalyse_stats.get('corrections', 0))} corrections) "
-                        f"@{int(reanalyse_stats['simulations'])} sims in "
-                        f"{float(reanalyse_stats.get('seconds', 0.0)):.1f}s"
-                    )
             if promoted_best_this_iter:
                 learner_selfplay_safe = True
+                learner_guard_consecutive_failures = 0
+                learner_guard_confirmation_due = False
             elif (
                 not eval_infrastructure_failed
                 and (no_mcts_score_rate is not None or score_rate is not None)
             ):
                 selfplay_guard_z = max(
                     0.0,
-                    float(rl_cfg.get('promotion_stat_gate_z', 1.28) or 1.28),
+                    float(rl_cfg.get('actor_guard_confidence_z', 1.28) or 1.28),
                 )
                 guard_failures = []
                 raw_selfplay_safe = True
                 if no_mcts_score_rate is not None:
                     raw_selfplay_floor = float(
-                        rl_cfg.get('promotion_no_mcts_score_rate_min', 0.40) or 0.40
+                        rl_cfg.get('promotion_no_mcts_score_rate_min', 0.48) or 0.48
                     )
                     raw_selfplay_upper = _score_rate_upper_bound(
                         no_mcts_score_rate,
@@ -5998,8 +8687,10 @@ def main():
                     )
                     raw_selfplay_safe = bool(raw_selfplay_upper >= raw_selfplay_floor)
                     if not raw_selfplay_safe:
-                        guard_failures.append(
-                            f"raw UCB {raw_selfplay_upper:.1%} < {raw_selfplay_floor:.1%}"
+                        iteration_notes.append(
+                            "raw NN warning: "
+                            f"UCB {raw_selfplay_upper:.1%} < {raw_selfplay_floor:.1%}; "
+                            "diagnostic only; learner MCTS keeps generating replay"
                         )
 
                 # Raw policy can look strong while its value-guided search is
@@ -6025,41 +8716,61 @@ def main():
                         guard_failures.append(
                             f"MCTS UCB {mcts_selfplay_upper:.1%} < 50.0%"
                         )
-                    if no_mcts_score_rate is not None:
-                        raw_score_se = _score_rate_standard_error(
-                            no_mcts_score_rate,
-                            no_mcts_games_total,
-                            (no_mcts_stats or {}).get('paired_score_se'),
-                        )
-                        relative_search_gap = (
-                            float(score_rate) - float(no_mcts_score_rate)
-                        )
-                        relative_search_gap_upper = (
-                            relative_search_gap
-                            + selfplay_guard_z
-                            * math.sqrt(eval_score_se ** 2 + raw_score_se ** 2)
-                        )
-                        relative_search_safe = bool(relative_search_gap_upper >= 0.0)
-                        mcts_selfplay_safe = bool(
-                            mcts_selfplay_safe and relative_search_safe
-                        )
-                        if not relative_search_safe:
-                            guard_failures.append(
-                                "relative MCTS-NN UCB "
-                                f"{relative_search_gap_upper:+.1%} < 0.0%"
-                            )
+                    # Raw and MCTS matches are separate paired-opening
+                    # tournaments, not paired observations of the same games.
+                    # Raw strength gates promotion; only MCTS evidence controls
+                    # whether the learner remains the self-play actor.
 
-                learner_selfplay_safe = bool(raw_selfplay_safe and mcts_selfplay_safe)
-                if not learner_selfplay_safe:
-                    iteration_notes.append(
-                        "learner self-play guard: "
-                        f"{', '.join(guard_failures)}; "
-                        "next iteration uses best"
+                guard_safe_now = _actor_guard_evidence_is_safe(mcts_selfplay_safe)
+                actor_was_safe = bool(learner_selfplay_safe)
+                guard_failure_actionable = _actor_guard_failure_is_actionable(eval_stage)
+                guard_observation_recorded = bool(
+                    guard_safe_now or guard_failure_actionable
+                )
+                if eval_stage == 'funnel:preliminary_reject' and not guard_safe_now:
+                    learner_guard_confirmation_due = True
+                elif eval_stage != 'infrastructure_error':
+                    learner_guard_confirmation_due = False
+                if guard_observation_recorded:
+                    learner_selfplay_safe, learner_guard_consecutive_failures = (
+                        _update_actor_guard_state(
+                            learner_guard_consecutive_failures,
+                            guard_safe_now,
+                        )
                     )
+                if actor_was_safe and not learner_selfplay_safe:
+                    # The next champion-generated iteration should refresh both
+                    # the rolling replay and its pinned rehearsal reservoir.
+                    champion_replay_buffer.clear()
+                    champion_replay_refresh_iteration = None
+                if not guard_safe_now:
+                    confirmed_failures = int(learner_guard_consecutive_failures)
+                    if guard_observation_recorded:
+                        iteration_notes.append(
+                            "learner self-play guard: "
+                            f"{', '.join(guard_failures)}; "
+                            f"confirmation {confirmed_failures}/{_ACTOR_GUARD_FAILURES}; "
+                            + (
+                                "champion will generate the next replay; learner, optimizer and replay retained"
+                                if not learner_selfplay_safe
+                                else "learner retained pending confirmation"
+                            )
+                        )
+                    else:
+                        iteration_notes.append(
+                            "learner self-play guard: preliminary evidence ignored; "
+                            f"confirmation unchanged at {confirmed_failures}/{_ACTOR_GUARD_FAILURES}; "
+                            "actor state retained and 96-game confirmation scheduled"
+                        )
             _finish_stage('eval_log')
             eval_region_total = float(iteration_stage_times.pop('eval_log', 0.0) or 0.0)
             measured_eval_total = 0.0
-            for stage_name in ('regular_eval', 'promotion_eval', 'reanalyse', 'elo_eval'):
+            for stage_name in (
+                'regular_eval',
+                'promotion_eval',
+                'promotion_confirmation',
+                'elo_eval',
+            ):
                 stage_seconds = float(iteration_eval_substage_times.get(stage_name, 0.0) or 0.0)
                 iteration_stage_times[stage_name] = stage_seconds
                 measured_eval_total += stage_seconds
@@ -6084,10 +8795,12 @@ def main():
                 'startup_mode': start_mode,
                 'model_architecture': model_architecture,
                 'rl_run_artifacts': _rl_run_artifact_metadata(logger, base_dir),
+                'promotion_confirmation': dict(last_promotion_confirmation_state),
                 'rl_surpassed_il_anchor': bool(elo_coordinator.il_anchor_surpassed),
                 'rl_best_il_anchor_score_rate': elo_coordinator.best_il_anchor_score_rate,
                 'rl_best_il_anchor_true_win_rate': elo_coordinator.best_il_anchor_true_win_rate,
                 'rl_best_il_anchor_iteration': elo_coordinator.best_il_anchor_iteration,
+                'learner_actor_safe': bool(learner_selfplay_safe),
             }
             latest_metadata.update(elo_coordinator.metadata_for_iteration(iteration + 1))
             runtime_snapshot_dtype = (
@@ -6097,6 +8810,31 @@ def main():
                 best_model,
                 dtype=runtime_snapshot_dtype,
             )
+            should_save_replay_sidecar = _should_save_replay_sidecar_for_iteration(
+                iteration + 1,
+                total_iterations,
+                pause_after_iteration=pause_after_iteration,
+            ) or promotion_holdout_exhausted_iteration == iteration + 1
+            checkpoint_replay_sidecar_filename = replay_sidecar_filename
+            checkpoint_previous_replay_sidecar_filename = (
+                previous_replay_sidecar_filename
+            )
+            obsolete_replay_sidecar_filename = None
+            if should_save_replay_sidecar:
+                new_replay_sidecar_path = _new_rl_replay_sidecar_path(
+                    latest_checkpoint_path,
+                    iteration + 1,
+                )
+                _save_rl_replay_sidecar(
+                    new_replay_sidecar_path,
+                    completed_iteration=iteration + 1,
+                    replay_buffer=replay_buffer,
+                    champion_replay_buffer=champion_replay_buffer,
+                    search_control_archive=search_control_archive,
+                )
+                checkpoint_previous_replay_sidecar_filename = replay_sidecar_filename
+                checkpoint_replay_sidecar_filename = new_replay_sidecar_path.name
+                obsolete_replay_sidecar_filename = previous_replay_sidecar_filename
             save_checkpoint(
                 model,
                 optimizer,
@@ -6111,9 +8849,59 @@ def main():
                     'best_win_rate': best_win_rate_so_far,
                     'best_model_state_dict': best_runtime_state,
                     'best_iteration': best_iteration,
+                    'replay_state_file': checkpoint_replay_sidecar_filename,
+                    'replay_state_iteration': (
+                        iteration + 1
+                        if should_save_replay_sidecar
+                        else replay_sidecar_iteration
+                    ),
+                    'replay_state_previous_file': (
+                        checkpoint_previous_replay_sidecar_filename
+                    ),
+                    'replay_positions_ema': replay_positions_ema,
+                    'eval_score_rate_ema': eval_score_rate_ema,
+                    'eval_true_win_rate_ema': eval_true_win_rate_ema,
+                    'elo_coordinator_state': elo_coordinator.state_dict(),
+                    'promotion_confirmation_state': dict(
+                        last_promotion_confirmation_state
+                    ),
+                    'promotion_confirmation_attempt_count': int(
+                        promotion_confirmation_attempt_count
+                    ),
+                    'mcts_candidate_archive_run_identity': dict(
+                        candidate_archive.run_identity
+                    ),
+                    'mcts_candidate_archive_directory': str(
+                        candidate_archive.directory
+                    ),
+                    'learner_selfplay_safe': learner_selfplay_safe,
+                    'learner_guard_contract_version': _ACTOR_GUARD_CONTRACT_VERSION,
+                    'learner_guard_consecutive_failures': (
+                        learner_guard_consecutive_failures
+                    ),
+                    'learner_guard_confirmation_due': (
+                        learner_guard_confirmation_due
+                    ),
+                    'champion_replay_refresh_iteration': (
+                        champion_replay_refresh_iteration
+                    ),
+                    'champion_replay_capture_iteration': (
+                        champion_replay_capture_iteration
+                    ),
                 },
             )
-            
+            if should_save_replay_sidecar:
+                replay_sidecar_iteration = iteration + 1
+                previous_replay_sidecar_filename = (
+                    checkpoint_previous_replay_sidecar_filename
+                )
+                replay_sidecar_filename = checkpoint_replay_sidecar_filename
+                _remove_obsolete_rl_replay_sidecar(
+                    latest_checkpoint_path,
+                    obsolete_replay_sidecar_filename,
+                    current_filename=replay_sidecar_filename,
+                    previous_filename=previous_replay_sidecar_filename,
+                )
             _finish_stage('checkpoint')
             gc.collect()
             _finish_stage('gc')
@@ -6131,29 +8919,17 @@ def main():
                 if last_promotion_iteration is not None
                 else None
             )
-            replay_quality_stats['train_policy_correction_sharpened_fraction'] = (
-                train_metrics.get('policy_correction_sharpened_fraction', 0.0)
-            )
-            replay_quality_stats['train_policy_correction_target_top1_before'] = (
-                train_metrics.get('policy_correction_target_top1_before', 0.0)
-            )
-            replay_quality_stats['train_policy_correction_target_top1_after'] = (
-                train_metrics.get('policy_correction_target_top1_after', 0.0)
-            )
             replay_quality_stats.update({
                 key: train_metrics.get(key, value)
-                for key, value in iteration_correction_audit_metrics.items()
+                for key, value in {
+                    **iteration_correction_audit_metrics,
+                    **iteration_holdout_metrics,
+                }.items()
             })
-            replay_quality_stats['reanalyse_selected'] = int(
-                reanalyse_stats.get('selected', 0) or 0
+            replay_quality_stats['learner_guard_failures'] = int(
+                learner_guard_consecutive_failures
             )
-            replay_quality_stats['reanalyse_updated'] = int(
-                reanalyse_stats.get('updated', 0) or 0
-            )
-            replay_quality_stats['reanalyse_correction_fraction'] = (
-                float(reanalyse_stats.get('corrections', 0) or 0)
-                / float(max(1, int(reanalyse_stats.get('updated', 0) or 0)))
-            )
+            replay_quality_stats['learner_actor_safe'] = int(learner_selfplay_safe)
             logger.log_rl_data_quality(
                 iteration + 1,
                 positions_added=positions_added,
@@ -6172,7 +8948,13 @@ def main():
                 int((selfplay_stats or {}).get('curriculum_dropped_positions', 0) or 0)
                 + int((selfplay_stats or {}).get('cap_dropped_positions', 0) or 0)
             )
-            storage_keep_rate = float(positions_added) / max(1.0, float(positions_added + storage_drops))
+            retained_positions = int(positions_added) + int(
+                replay_quality_stats.get('holdout_positions', 0) or 0
+            )
+            storage_keep_rate = float(retained_positions) / max(
+                1.0,
+                float(retained_positions + storage_drops),
+            )
 
             sims_used = float((selfplay_stats or {}).get('search_simulations_used_avg', 0.0) or 0.0)
             sims_budget = float((selfplay_stats or {}).get('search_simulations_budget_avg', 0.0) or 0.0)
@@ -6225,17 +9007,14 @@ def main():
             if mcts_samples > 0:
                 search_summary = (
                     f"{completed_visits_per_sec:,.0f} completed visits/s, "
-                    f"{nn_evaluations_per_sec:,.0f} NN evals/s | "
-                    f"{sims_used:.0f}/{sims_budget:.0f} avg sims ({budget_utilization:.0%}), {budget_spread} | "
-                    f"difficulty corr {difficulty_budget_corr:.2f} | "
-                    f"tree reuse {tree_reuse_hit_rate:.0%}, inherited {tree_inherited_visits:.1f}, "
-                    f"quality/coverage {tree_reuse_quality:.0%}/{tree_candidate_coverage:.0%}, "
-                    f"scout stability/cut {tree_scout_stability:.0%}/{tree_scout_reduction:.0%}, "
-                    f"fresh floor {tree_fresh_floor:.0f} | "
-                    f"top changed {changed_rate:.1%}: useful {useful_rate:.1%}, harmful {harmful_rate:.1%} | "
-                    f"KL {float((selfplay_stats or {}).get('mcts_policy_kl_mean', 0.0) or 0.0):.3f} | "
-                    f"visited {float((selfplay_stats or {}).get('mcts_visited_move_count_mean', 0.0) or 0.0):.1f}/"
-                    f"{float((selfplay_stats or {}).get('mcts_legal_move_count_mean', 0.0) or 0.0):.1f}"
+                    f"{sims_used:.0f}/{sims_budget:.0f} sims ({budget_utilization:.0%}) | "
+                    f"root K {float((selfplay_stats or {}).get('gumbel_considered_actions_mean', 0.0) or 0.0):.1f}, "
+                    f"initial {float((selfplay_stats or {}).get('gumbel_initial_round_visits_mean', 0.0) or 0.0):.1f} "
+                    f"({float((selfplay_stats or {}).get('gumbel_width_adapted_rate', 0.0) or 0.0):.0%} narrowed) | "
+                    f"top changed {changed_rate:.1%}, higher-Q among changes "
+                    f"{float((selfplay_stats or {}).get('mcts_changed_to_higher_q_rate', 0.0) or 0.0):.1%}, "
+                    f"harmful {harmful_rate:.1%} | "
+                    f"policy KL {float((selfplay_stats or {}).get('mcts_policy_kl_mean', 0.0) or 0.0):.3f}"
                 )
             else:
                 search_summary = (
@@ -6258,24 +9037,24 @@ def main():
                 return value if math.isfinite(value) else float(default)
 
             train_summary = (
-                f"{total_train_steps} x {base_batch_size:,} | replay unique {replay_coverage:.0%}, "
-                f"recent {replay_passes:.2f}x, "
+                f"{total_train_steps} x {base_batch_size:,} | replay rows/games "
+                f"{replay_coverage:.0%}/{float(replay_quality_stats.get('train_game_coverage', 0.0) or 0.0):.0%}, "
+                f"{replay_passes:.2f}x, "
                 f"champion {champion_selected_fraction:.0%} | "
                 f"loss {avg_loss:.3f} (P {avg_policy:.3f}, V {avg_value:.3f}) | "
                 f"policy top1/top3 {float(train_metrics.get('policy_top1_acc', 0.0) or 0.0):.1%}/"
                 f"{float(train_metrics.get('policy_top3_acc', 0.0) or 0.0):.1%} | "
-                f"batch hard-top1 {float(train_metrics.get('policy_correction_top1_acc', 0.0) or 0.0):.1%} "
-                f"({float(train_metrics.get('policy_correction_fraction', 0.0) or 0.0):.0%} rows), "
-                f"rank debt {float(train_metrics.get('policy_correction_rank_loss', 0.0) or 0.0):.3f} "
-                f"x{float(train_metrics.get('policy_correction_rank_weight', 0.0) or 0.0):.3f}, "
-                f"sharpen {float(train_metrics.get('policy_correction_sharpened_fraction', 0.0) or 0.0):.0%} "
-                f"({float(train_metrics.get('policy_correction_target_top1_before', 0.0) or 0.0):.0%}->"
-                f"{float(train_metrics.get('policy_correction_target_top1_after', 0.0) or 0.0):.0%}) | "
-                f"audit {int(train_metrics.get('correction_audit_rows', 0) or 0):,}: "
+                f"correction audit top1 "
                 f"{_audit_metric('correction_audit_top1_before'):.1%}->"
                 f"{_audit_metric('correction_audit_top1_after'):.1%}, "
-                f"rank +{_audit_metric('correction_audit_rank_gain'):.2f}, "
-                f"retain {_audit_metric('correction_audit_retention'):.1%} | "
+                f"KL {_audit_metric('correction_audit_target_kl_reduction'):+.3f}, "
+                f"Q-gap {_audit_metric('correction_audit_q_delta_mean'):.3f}, "
+                f"H {_audit_metric('correction_audit_target_entropy_mean'):.2f}, "
+                f"share {_audit_metric('correction_audit_correction_fraction'):.1%} "
+                f"(audit {_audit_metric('correction_audit_coverage'):.1%}) | "
+                f"holdout {int(train_metrics.get('holdout_rows', 0) or 0):,}: "
+                f"P-KL {_audit_metric('holdout_policy_kl_reduction'):+.3f}, "
+                f"V-CE {_audit_metric('holdout_value_wdl_ce_reduction'):+.3f} | "
                 f"LR {current_lr:.2e}"
             )
             value_std_ratio = (
@@ -6293,11 +9072,8 @@ def main():
                 f"WDL acc {float(train_metrics.get('value_wdl_acc', 0.0) or 0.0):.1%} | "
                 f"draw P/target {float(train_metrics.get('value_pred_draw_probability', 0.0) or 0.0):.1%}/"
                 f"{float(train_metrics.get('value_target_draw_fraction', 0.0) or 0.0):.1%} | "
-                f"Brier/ECE {float(train_metrics.get('value_wdl_brier', 0.0) or 0.0):.3f}/"
-                f"{float(train_metrics.get('value_wdl_ece', 0.0) or 0.0):.3f} | "
-                f"error focus {float(train_metrics.get('value_error_priority_fraction', 0.0) or 0.0):.0%} rows/"
-                f"{float(train_metrics.get('value_error_priority_weight_share', 0.0) or 0.0):.0%} weight | "
-                f"pred/target std {value_std_ratio:.2f} | replay age {age_summary}"
+                f"opening std ratio {float(train_metrics.get('value_std_ratio_opening', value_std_ratio) or value_std_ratio):.2f} | "
+                f"replay age {age_summary}"
             )
             if eval_infrastructure_failed:
                 eval_summary = (
@@ -6307,11 +9083,13 @@ def main():
             elif score_rate is not None:
                 eval_parts = [
                     f"MCTS {score_rate:.1%} (LB {float(score_lower_bound or 0.0):.1%}, "
-                    f"W/D/L {eval_wins}/{eval_draws}/{eval_losses}, {eval_stage})"
+                    f"W/D/L {eval_wins}/{eval_draws}/{eval_losses}, "
+                    f"{int(eval_games_total or 0)}/"
+                    f"{funnel_preliminary_games + funnel_medium_games + funnel_advanced_games} games)"
                 ]
                 if no_mcts_score_rate is not None:
                     eval_parts.append(
-                        f"raw match {no_mcts_score_rate:.1%}; relative search shift "
+                        f"raw match {no_mcts_score_rate:.1%}; independent search shift "
                         f"{float(score_rate - no_mcts_score_rate):+.1%}"
                     )
                 if anchor_score_rate is not None:
@@ -6330,11 +9108,7 @@ def main():
                 eval_summary = f"not scheduled; MCTS eval in {until_mcts_eval} iter"
 
             bottleneck, bottleneck_share = dominant_stage(iteration_stage_times)
-            stage_summary = " | ".join(
-                f"{name} {format_duration(seconds)}"
-                for name, seconds in iteration_stage_times.items()
-                if float(seconds or 0.0) >= 0.5
-            )
+            stage_summary = _format_iteration_stage_summary(iteration_stage_times)
             print_panel(
                 f"ITERATION {iteration + 1}/{total_iterations} | {format_duration(iteration_total_time_s)}",
                 [
@@ -6359,6 +9133,26 @@ def main():
                 notes=iteration_notes[:4],
             )
             _emit_iteration_profile()
+            if promotion_holdout_exhausted_iteration == iteration + 1:
+                print(
+                    '\r\n=== Training stopped after saving the trained iteration: '
+                    'promotion confirmation holdout exhausted ===\n'
+                    f'{promotion_holdout_exhausted_reason}\n'
+                    'Latest checkpoint and replay sidecar are synchronized; '
+                    'refresh the holdout bank with demonstrably disjoint roots before resuming.'
+                )
+                break
+            if _should_pause_after_iteration(
+                iteration + 1,
+                total_iterations,
+                pause_after_iteration,
+            ):
+                paused_iteration = iteration + 1
+                print(
+                    f"\r\n=== Training paused after iteration "
+                    f"{paused_iteration}/{total_iterations} ==="
+                )
+                break
     except RLTrainingInterrupted as exc:
         training_interrupted = True
         interrupted_stage = str(exc) or "self-play"
@@ -6374,6 +9168,19 @@ def main():
     logger.plot_rl_data_quality()
     if training_interrupted:
         _handle_graceful_interrupt(logger=logger, stage=interrupted_stage)
+        return
+    if paused_iteration is not None:
+        print(
+            f"\r\nCheckpoint and replay state are synchronized at iteration "
+            f"{paused_iteration}. Resume this run without --fresh-canonical-il "
+            "to continue the configured schedule."
+        )
+        return
+    if promotion_holdout_exhausted_iteration is not None:
+        print(
+            'Training stopped cleanly after persisting the final completed iteration. '
+            'No candidate was promoted because confirmation capacity was exhausted.'
+        )
         return
 
     # `0` is a real best iteration: it means the immutable IL initialization
@@ -6395,7 +9202,7 @@ def main():
         logger.plot_rl_performance()
         logger.plot_rl_data_quality()
 
-    print("\n=== Training complete ===")
+    print("\r\n=== Training complete ===")
 
 
 if __name__ == "__main__":
@@ -6405,5 +9212,3 @@ if __name__ == "__main__":
         _handle_graceful_interrupt(logger=None, stage="runtime")
     finally:
         _shutdown_selfplay_pool()
-
-

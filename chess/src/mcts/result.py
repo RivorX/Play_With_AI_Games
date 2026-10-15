@@ -14,6 +14,7 @@ class SearchResult:
     improved_policy: Mapping[Any, float]
     selection_score: Mapping[Any, float]
     metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    training_policy: Mapping[Any, float] = field(default_factory=dict)
 
     def __bool__(self) -> bool:
         return self.selected_move is not None and bool(self.visits)
@@ -35,4 +36,9 @@ class SearchResult:
             improved_policy=dict(metadata_map.get("improved_policy_by_move") or {}),
             selection_score=dict(metadata_map.get("selection_score_by_move") or {}),
             metadata=metadata_map,
+            training_policy=dict(
+                metadata_map.get("policy_target_by_move")
+                or metadata_map.get("policy_target_probs_override")
+                or {}
+            ),
         )

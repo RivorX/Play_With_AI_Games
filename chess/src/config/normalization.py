@@ -146,6 +146,11 @@ _CENTRAL_INFERENCE_DEFAULTS = {
     'cache_enabled': False,
     'cache_max_entries': 50000,
     'pinned_staging_enabled': False,
+    # Measured on the production compiled path: overlapping compact D2H output
+    # with the next forward improved long-run saturated throughput by 8.6%
+    # (short runs varied) and reduced p95 latency by 10%. This remains an
+    # internal implementation choice rather than a user-facing YAML knob.
+    'output_pipeline_enabled': True,
     'use_bfloat16': False,
     'timeout_s': 0,
     'stall_warning_s': 15,
@@ -183,6 +188,7 @@ _ELO_DEFAULTS = {
     'reserve_dataloader_workers': True,
     'stockfish_priority': 'below_normal',
     'paired_openings_enabled': True,
+    'paired_openings_max_plies': 8,
     'nn_eval_workers': 4,
     'nn_eval_free_threads_utilization': 0.35,
     'il_async_process_restart_limit': 2,
@@ -202,21 +208,20 @@ _ELO_DEFAULTS = {
     'adaptive_min_batch_games': 36,
     'adaptive_focus_games_per_level': 48,
     'adaptive_extra_games_per_level': 12,
-    'adaptive_target_focus_levels': 3,
-    'adaptive_max_total_games': 288,
-    'adaptive_hard_max_total_games': 720,
-    'adaptive_budget_extension_games': 72,
+    'adaptive_target_focus_levels': 2,
+    'adaptive_max_total_games': 240,
+    'adaptive_hard_max_total_games': 384,
+    'adaptive_budget_extension_games': 48,
     'adaptive_target_standard_error': 35.0,
     'adaptive_min_games_for_se_stop': 144,
     'adaptive_refine_until_target_se': True,
-    'paired_openings_max_plies': 6,
     'nn_eval_adaptive_probe_games_per_level': 12,
     'nn_eval_adaptive_min_batch_games': 36,
     'nn_eval_adaptive_focus_games_per_level': 64,
     'nn_eval_adaptive_extra_games_per_level': 16,
-    'nn_eval_adaptive_max_total_games': 384,
+    'nn_eval_adaptive_max_total_games': 256,
     'nn_eval_adaptive_target_standard_error': 30.0,
-    'nn_eval_adaptive_min_games_for_se_stop': 192,
+    'nn_eval_adaptive_min_games_for_se_stop': 128,
     'mcts_eval_workers': 0,
     'mcts_eval_simulations': 192,
     'final_mcts_profile_multipliers': [0.5, 1.0, 2.0],
@@ -250,6 +255,7 @@ _RL_SECTION_PREFIXES = {
     'self_play': 'self_play_',
     'search': 'mcts_',
     'training': '',
+    'optimization': '',
     'replay': 'replay_',
     'evaluation': '',
     'losses': '',
@@ -260,14 +266,10 @@ _RL_KEY_ALIASES = {
     'self_play.syzygy_paths': 'syzygy_paths',
     'losses.policy': 'policy_loss_weight',
     'losses.value': 'value_loss_weight',
-    'losses.value_scalar_aux': 'value_aux_scalar_loss_weight',
+    'losses.value_scalar_aux': 'value_scalar_aux_loss_weight',
+    'losses.value_search_consistency': 'value_search_consistency_loss_weight',
     'losses.moves_left': 'moves_left_loss_weight',
     'losses.search_q': 'search_q_loss_weight',
-    'losses.policy_correction_rank_weight': 'policy_correction_rank_weight',
-    'losses.policy_correction_rank_warmup_iterations': 'policy_correction_rank_warmup_iterations',
-    'losses.value_error_focus_fraction': 'value_error_focus_fraction',
-    'losses.value_error_focus_max_multiplier': 'value_error_focus_max_multiplier',
-    'losses.wdl_label_smoothing': 'value_wdl_label_smoothing',
 }
 
 
@@ -283,15 +285,38 @@ _RL_DEFAULTS = {
     'self_play_claim_draw_after_moves': 120, 'syzygy_enabled': True,
     'syzygy_auto_download_enabled': True, 'self_play_progress_interval_games': 5,
     'self_play_opening_diversity_enabled': True,
-    'self_play_device': 'cuda', 'self_play_worker_auto_multiplier': 1.50,
+    'self_play_opening_pool_path': None, 'self_play_opening_pool_sha256': None,
+    # A bounded archive-start share improves value-target independence without
+    # replacing the normal initial-position distribution.
+    'self_play_hard_start_fraction': 0.20, 'self_play_hard_start_min_age': 1,
+    # Trajectory-RGSC keeps one bounded prioritized opening archive. The paper's
+    # 50% restart rate is deliberately not copied before a chess ablation; the
+    # existing 20% total hard-start budget remains the distribution guard.
+    'search_control_enabled': True, 'search_control_archive_capacity': 800,
+    'search_control_min_archive_size': 16, 'search_control_rank_alpha': 0.50,
+    'search_control_ema_alpha': 0.50,
+    # Reanalyse is a small freshness budget, not a second self-play phase. It
+    # must not replace normal 192-sim targets with a cheaper search target.
+    'replay_reanalyse_enabled': True, 'replay_reanalyse_interval': 4,
+    'replay_reanalyse_fraction': 0.02, 'replay_reanalyse_max_positions': 64,
+    'replay_reanalyse_min_age': 2, 'replay_reanalyse_min_staleness': 2,
+    'replay_reanalyse_max_refreshes': 2, 'replay_reanalyse_simulations': 192,
+    'replay_reanalyse_batch_positions': 16,
+    # Importing PyTorch commits about 1 GiB per Windows process even when the
+    # central-inference worker holds no model. Nine workers still provide broad
+    # 48-game request batches while avoiding the 18-process RAM cliff on 32 GiB.
+    'self_play_device': 'cuda', 'self_play_worker_auto_multiplier': 0.75,
     'max_batch_games_per_worker': 48,
     'self_play_randomize_learner_color': True, 'self_play_store_frozen_best_positions': False,
     'mcts_gumbel_c_scale': 0.10, 'mcts_gumbel_q_range_floor': 0.25,
-    'mcts_gumbel_target_temperature': 1.00,
+    'mcts_gumbel_target_temperature': 0.95,
     'mcts_reuse_tree': True, 'mcts_tree_reuse_visit_credit_enabled': True,
     'mcts_cache_history_tensors': True,
     'mcts_temperature': 0.0, 'mcts_temperature_threshold': 0,
     # Optimizer/replay mechanics.
+    # When opted in, training forwards use stored BatchNorm running statistics
+    # while keeping affine gradients and all other train-mode modules active.
+    'freeze_batchnorm_stats': False,
     'train_dynamic_batch_size_enabled': True, 'train_batch_size_round_to': 256,
     'train_batch_size_min': 1024, 'train_batch_size_max': 6144,
     'train_epochs_per_iteration': 1, 'train_max_steps_per_iteration': 0,
@@ -305,10 +330,6 @@ _RL_DEFAULTS = {
     'replay_dynamic_cap_enabled': True, 'replay_champion_fraction': 0.15,
     'replay_cap_fraction_decisive': 0.70, 'replay_cap_fraction_draw': 0.65,
     'replay_cap_min_positions': 24, 'replay_cap_max_positions': 120,
-    'value_error_focus_fraction': 0.25, 'value_error_focus_max_multiplier': 1.50,
-    'search_q_loss_weight': 0.20,
-    'deblunder_threshold': 0.15, 'deblunder_width': 0.10,
-    'deblunder_value_min_weight': 0.35, 'deblunder_policy_boost_max': 2.00,
     # Evaluation/promotion mechanics.
     'eval_worker_restart_limit': 2, 'eval_cpu_threads_to_reserve': 0, 'eval_torch_threads': 1,
     'eval_workers': 'auto', 'eval_batch_games': 32,
@@ -317,8 +338,7 @@ _RL_DEFAULTS = {
     'eval_central_inference_enabled': True,
     'eval_central_inference_min_games': 2, 'eval_auto_claim_draw': True,
     'eval_claim_repetition_after_moves': 70, 'eval_claim_draw_after_moves': 180,
-    # Raw-NN safety is consumed by the promotion gate on MCTS-eval iterations.
-    # Running it between those decisions only adds chart density.
+    # Raw NN remains a same-cadence diagnostic for MCTS-to-network absorption.
     'eval_no_mcts_enabled': True, 'eval_no_mcts_every': 2,
     'eval_no_mcts_use_fixed_openings': True, 'eval_funnel_preliminary_simulations': 'auto',
     'eval_funnel_preliminary_simulations_multiplier': 1.0,
@@ -326,21 +346,22 @@ _RL_DEFAULTS = {
     # Funnel stages use one search budget and disjoint paired openings, so every
     # completed game contributes to the cumulative decision.
     'eval_funnel_preliminary_true_win_rate': 0.0,
-    'eval_funnel_medium_simulations': 'auto', 'eval_funnel_medium_true_win_rate': 0.02,
+    'eval_funnel_medium_simulations': 'auto', 'eval_funnel_medium_true_win_rate': 0.0,
     'eval_funnel_advanced_simulations': 'auto', 'eval_fixed_openings_enabled': True,
-    'eval_fixed_openings_pair_games': True, 'eval_fixed_openings_max_plies': 6,
-    'promotion_stat_gate_enabled': True, 'promotion_stat_gate_z': 1.28,
-    'promotion_score_lower_bound_min': 0.50, 'promotion_require_anchor_non_regression': True,
-    'promotion_no_mcts_gate_enabled': True, 'promotion_no_mcts_score_rate_min': 0.40,
-    'promotion_no_mcts_upper_bound_min': 0.50,
+    'eval_fixed_openings_pair_games': True, 'eval_fixed_openings_max_plies': 8,
+    'score_rate_threshold': 0.53,
+    'promotion_stat_gate_enabled': True, 'promotion_stat_gate_z': 1.645,
+    'actor_guard_confidence_z': 1.28,
+    'promotion_score_lower_bound_min': 0.50, 'promotion_require_anchor_non_regression': False,
+    'promotion_no_mcts_gate_enabled': True, 'promotion_no_mcts_score_rate_min': 0.48,
     'promotion_anchor_min_score_rate': 0.50, 'promotion_anchor_min_true_win_rate': 0.0,
-    'promotion_anchor_no_mcts_gate_enabled': True,
+    'promotion_anchor_no_mcts_gate_enabled': False,
     'promotion_anchor_no_mcts_score_rate_min': 0.50,
     'promotion_anchor_no_mcts_score_lower_bound_min': 0.47,
     'anchor_no_mcts_max_games': 512,
-    # Promotion candidates always force a direct anchor match. There is no
-    # periodic anchor diagnostic between promotion attempts.
-    'anchor_eval_enabled': True,
+    # MCTS-only promotion compares directly with the current champion. The IL
+    # anchor path remains available for legacy/ablation configs but is not loaded.
+    'anchor_eval_enabled': False,
     'anchor_eval_mcts_simulations': 'auto', 'anchor_eval_mcts_simulations_multiplier': 1.0,
     'anchor_eval_use_fixed_openings': True,
     'value_metric_weight_min': 0.20,
@@ -391,6 +412,18 @@ def normalize_data_config(config):
     return config
 
 
+def _effective_search_control_archive_capacity(rl_cfg):
+    """Keep enough archive diversity for each iteration's regret starts."""
+    planned_regret_starts = int(round(
+        int(rl_cfg.get('games_per_iteration', 0) or 0)
+        * max(0.0, min(1.0, float(rl_cfg.get('self_play_hard_start_fraction', 0.0) or 0.0)))
+    ))
+    return max(
+        max(1, int(rl_cfg.get('search_control_archive_capacity', 800) or 800)),
+        4 * planned_regret_starts,
+    )
+
+
 def normalize_rl_config(config):
     """Flatten the grouped RL YAML and inject stable runtime defaults."""
     if not isinstance(config, dict):
@@ -401,9 +434,19 @@ def normalize_rl_config(config):
 
     has_grouped_rl = any(section in rl_cfg for section in _RL_SECTION_PREFIXES)
     if not has_grouped_rl:
+        rl_cfg['search_control_effective_archive_capacity'] = (
+            _effective_search_control_archive_capacity(rl_cfg)
+        )
+        _preflight_configured_opening_pool(config, rl_cfg)
         return config
 
     normalized = dict(_RL_DEFAULTS)
+    # Mixed configs appear during staged migrations and manual experiments.
+    # Preserve legacy flat values, then let the grouped representation win on
+    # conflicts because it is the current public format.
+    for key, value in rl_cfg.items():
+        if key not in _RL_SECTION_PREFIXES and key != 'stockfish_elo':
+            normalized[key] = value
     for section, prefix in _RL_SECTION_PREFIXES.items():
         values = rl_cfg.get(section, {})
         if not isinstance(values, dict):
@@ -417,13 +460,44 @@ def normalize_rl_config(config):
         normalized['stockfish_elo'] = stockfish_cfg
 
     normalized['mcts_batch_size'] = int(normalized.get('mcts_simulations', 192))
+    normalized['search_control_effective_archive_capacity'] = (
+        _effective_search_control_archive_capacity(normalized)
+    )
     config['reinforcement_learning'] = normalized
+    _preflight_configured_opening_pool(config, normalized)
     return config
+
+
+def _preflight_configured_opening_pool(config, rl_cfg):
+    """Fail before model/device setup if an opt-in opening pool is invalid."""
+    path = rl_cfg.get('self_play_opening_pool_path')
+    if path is None or not str(path).strip():
+        return
+    from src.selfplay.opening_pool import preflight_opening_pool
+
+    history_positions = int(config.get('model', {}).get('history_positions', 0) or 0)
+    digest = preflight_opening_pool(
+        path,
+        history_positions=history_positions,
+        config=config,
+    )
+    configured_digest = rl_cfg.get('self_play_opening_pool_sha256')
+    if configured_digest and str(configured_digest) != digest:
+        raise ValueError(
+            "Configured self-play opening pool SHA changed after preflight: "
+            f"{configured_digest} != {digest}"
+        )
+    rl_cfg['self_play_opening_pool_sha256'] = digest
 
 
 def normalize_config(config):
     """Normalize every grouped presentation section used by the runtime."""
     config = normalize_rl_config(normalize_data_config(config))
+    project_cfg = config.get('project', {}) or {}
+    # Training code consumes one root seed. Keep its user-facing owner in the
+    # project section so every architecture and pipeline stage shares the same
+    # reproducibility contract.
+    config['seed'] = int(project_cfg.get('seed', config.get('seed', 490050)))
     config['auto_tune'] = _with_defaults(
         _AUTO_TUNE_DEFAULTS,
         config.get('auto_tune', {}),

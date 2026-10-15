@@ -639,6 +639,7 @@ class TrainingLogger(RLLoggerMixin, ILLoggerMixin):
                 by_sims_idx = header.index('estimated_elo_mcts_by_simulations')
                 iter_col = 'iteration' if 'iteration' in header else 'epoch'
                 iter_idx = header.index(iter_col)
+                updated_existing_row = False
                 for row in rows[1:]:
                     while len(row) < len(header):
                         row.append('')
@@ -666,11 +667,15 @@ class TrainingLogger(RLLoggerMixin, ILLoggerMixin):
                                 std_error=std_error,
                                 ci95=(ci_low, ci_high),
                             )
+                        updated_existing_row = True
+                        break
                 with open(self.csv_path, 'w', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerows(metadata_rows)
                     writer.writerow(header)
                     writer.writerows(rows[1:])
+                if updated_existing_row:
+                    self._pending_rl_elo_by_iteration.pop(int(iteration), None)
             except Exception:
                 pass
 

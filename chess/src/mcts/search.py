@@ -4,10 +4,12 @@ Sequential Halving selects root actions and completed-Q policy improvement is
 used below the root and for replay targets.
 """
 
+import errno
 import logging
 import math
 import os
 import shutil
+import struct
 import tempfile
 import time
 import weakref
@@ -22,6 +24,7 @@ from src.common.syzygy import resolve_syzygy_paths, syzygy_piece_counts
 from src.game import backend as chess
 from src.common.torch_cache import configure_torch_compile_cache, torch_compile_cache_paths
 from src.models.data.se_cnn_v9.helpers import (
+    ACTION_SIZE,
     MAX_LEGAL_MOVES,
     _move_to_index_cached,
     board_to_tensor,
@@ -29,8 +32,8 @@ from src.models.data.se_cnn_v9.helpers import (
     move_to_index,
 )
 from src.mcts.native import get_native_mcts
-from src.mcts.q_delta import USEFUL_SEARCH_Q_DELTA_MIN as _POLICY_CORRECTION_Q_DELTA_MIN
 from src.mcts.result import SearchResult
+from src.mcts.q_delta import USEFUL_SEARCH_Q_DELTA_MIN
 
 
 _EMPTY_HISTORY_TENSOR = np.zeros((16, 8, 8), dtype=np.float32)
@@ -66,19 +69,16 @@ _REPLAY_SOURCE_UNKNOWN = 0
 _REPLAY_SOURCE_LEARNER = 1
 _REPLAY_SOURCE_FROZEN_BEST = 2
 
-# Gumbel search is the policy-improvement operator. Inside each complete target,
-# give a modest extra weight only when search changes the best's top
-# move and both visited moves show a positive Q delta.  This focuses limited
-# policy capacity on actual improvements without discarding agreement rows or
-# letting a noisy Q estimate dominate the objective.
-_POLICY_UPTAKE_LOW_THRESHOLD = 0.75
-_POLICY_CORRECTION_WEIGHT_MULTIPLIER = 2.00
+# Gumbel search is the policy-improvement operator. Target confidence controls
+# the regular policy CE weight, while useful top-move changes are handled by the
+# separate bounded rank objective. Do not boost the same correction again here:
+# doing so stacks with policy-surprise sampling and lets a minority of rows own
+# most of the policy gradient.
 _DYNAMIC_BUDGET_MARGINAL_PENALTY = 0.35
 _DYNAMIC_BUDGET_TARGET_CHUNKS = 12
 _TREE_REUSE_MIN_FRESH_SIMULATIONS = 64
 _TREE_REUSE_CONSERVATIVE_FRESH_FRACTION = 0.50
 _TREE_REUSE_HIGH_QUALITY_FRESH_FRACTION = 1.0 / 3.0
-_TREE_REUSE_BASE_VISIT_CREDIT_DISCOUNT = 0.50
 _TREE_REUSE_MAX_VISIT_CREDIT_DISCOUNT = 0.75
 _TREE_REUSE_CANDIDATE_SUPPORT_VISITS = 2.0
 _TREE_REUSE_SCOUT_SIMULATIONS = 32
@@ -87,6 +87,122 @@ _TREE_REUSE_SCOUT_MIN_CANDIDATE_COVERAGE = 0.75
 _TREE_REUSE_SCOUT_STABILITY_MIN = 0.70
 _TREE_REUSE_SCOUT_POLICY_JS_SCALE = 0.05
 _TREE_REUSE_SCOUT_MIN_FRESH_FRACTION = 1.0 / 6.0
+# At the low end of the dynamic budget, one noisy leaf evaluation per root
+# candidate is too little evidence for the first Sequential-Halving cut. Keep
+# the configured action count as a cap and narrow only when the *fresh* action
+# budget cannot fund two complete first-round passes.
+_GUMBEL_MIN_INITIAL_VISITS_PER_ACTION = 2
+
+
+_POLICY_TARGET_MODES = frozenset({'baseline', 'challenge_delta'})
+_POLICY_TARGET_DEFAULT_PRIOR_FRACTION = 0.5
+
+
+def _resolve_policy_target_config(rl_cfg):
+    """Validate the optional one-axis stored policy-target experiment."""
+    rl_cfg = rl_cfg if isinstance(rl_cfg, dict) else {}
+    mode = str(rl_cfg.get('mcts_policy_target_mode', 'baseline')).strip().lower()
+    if mode not in _POLICY_TARGET_MODES:
+        choices = ', '.join(sorted(_POLICY_TARGET_MODES))
+        raise ValueError(
+            f"reinforcement_learning.search.policy_target_mode must be one of {choices}; got {mode!r}"
+        )
+    try:
+        prior_fraction = float(rl_cfg.get(
+            'mcts_challenge_delta_prior_fraction',
+            _POLICY_TARGET_DEFAULT_PRIOR_FRACTION,
+        ))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            'reinforcement_learning.search.challenge_delta_prior_fraction must be a finite number in (0, 1)'
+        ) from exc
+    if not math.isfinite(prior_fraction) or not 0.0 < prior_fraction < 1.0:
+        raise ValueError(
+            'reinforcement_learning.search.challenge_delta_prior_fraction must be a finite number in (0, 1)'
+        )
+    return mode, prior_fraction
+
+
+def _build_challenge_delta_policy_target(
+    policy_target,
+    prior_distribution,
+    *,
+    changed_top,
+    q_delta,
+    prior_fraction=_POLICY_TARGET_DEFAULT_PRIOR_FRACTION,
+):
+    """Subtract prior-aligned mass from a useful completed-Q correction.
+
+    For normalized completed-Q target ``pi`` and prior ``p``, the treatment is
+    ``q_i = max(pi_i - alpha * p_i, 0) / Z``. Invalid inputs, unchanged top
+    moves, or weak Q evidence return the original target unchanged.
+    """
+    fallback = {'applied': False, 'removed_prior_mass': 0.0}
+    if not changed_top:
+        return policy_target, fallback
+    try:
+        delta = float(q_delta)
+        alpha = float(prior_fraction)
+    except (TypeError, ValueError):
+        return policy_target, fallback
+    if (
+        not math.isfinite(delta)
+        or delta <= USEFUL_SEARCH_Q_DELTA_MIN
+        or not math.isfinite(alpha)
+        or not 0.0 < alpha < 1.0
+        or not isinstance(policy_target, dict)
+        or not policy_target
+        or not isinstance(prior_distribution, dict)
+        or not prior_distribution
+    ):
+        return policy_target, fallback
+    try:
+        if not set(policy_target).issubset(prior_distribution):
+            return policy_target, fallback
+        target_values = {move: float(value) for move, value in policy_target.items()}
+        prior_values = {move: float(value) for move, value in prior_distribution.items()}
+    except (TypeError, ValueError):
+        return policy_target, fallback
+    if (
+        any(not math.isfinite(value) or value < 0.0 for value in target_values.values())
+        or any(not math.isfinite(value) or value < 0.0 for value in prior_values.values())
+    ):
+        return policy_target, fallback
+    try:
+        target_total = math.fsum(target_values.values())
+        prior_total = math.fsum(prior_values.values())
+    except OverflowError:
+        return policy_target, fallback
+    if (
+        not math.isfinite(target_total)
+        or not math.isfinite(prior_total)
+        or target_total <= 1e-12
+        or prior_total <= 1e-12
+    ):
+        return policy_target, fallback
+
+    transformed = {}
+    removed_prior_mass = 0.0
+    for move, prior_value in prior_values.items():
+        prior_probability = prior_value / prior_total
+        search_probability = target_values.get(move, 0.0) / target_total
+        retained = max(0.0, search_probability - alpha * prior_probability)
+        removed_prior_mass += search_probability - retained
+        if retained > 0.0:
+            transformed[move] = retained
+    transformed_total = math.fsum(transformed.values())
+    if not transformed or not math.isfinite(transformed_total) or transformed_total <= 1e-12:
+        return policy_target, fallback
+    normalized = {
+        move: probability / transformed_total
+        for move, probability in transformed.items()
+    }
+    if any(not math.isfinite(value) or value < 0.0 for value in normalized.values()):
+        return policy_target, fallback
+    return normalized, {
+        'applied': True,
+        'removed_prior_mass': float(max(0.0, min(1.0, removed_prior_mass))),
+    }
 
 
 def _summarize_tree_reuse_quality(root, gumbel, max_considered_actions):
@@ -203,13 +319,12 @@ def _resolve_tree_reuse_visit_credit(
         return 0
     quality = max(0.0, min(1.0, float(quality)))
     fresh_floor = _resolve_tree_reuse_fresh_floor(budget, quality)
-    visit_discount = (
-        _TREE_REUSE_BASE_VISIT_CREDIT_DISCOUNT
-        + quality * (
-            _TREE_REUSE_MAX_VISIT_CREDIT_DISCOUNT
-            - _TREE_REUSE_BASE_VISIT_CREDIT_DISCOUNT
-        )
-    )
+    # Reuse quality must gate whether inherited work counts at all.  The old
+    # 0.50 base credited half of a subtree even at quality == 0, so narrow trees
+    # routinely replaced fresh root search despite missing the new Gumbel
+    # candidate set.  Keep the throughput win for broad trees, but make the
+    # credit proportional to measured relevance.
+    visit_discount = quality * _TREE_REUSE_MAX_VISIT_CREDIT_DISCOUNT
     discounted_visits = int(math.floor(inherited_visits * visit_discount))
     return min(discounted_visits, max(0, budget - fresh_floor))
 
@@ -411,6 +526,98 @@ def _allocate_eval_easy_cut_simulation_budgets(
     return budgets
 
 
+def _gumbel_policy_target_telemetry(target_probs, prior_probs, visit_counts, value_sums):
+    """Describe one stored target; attach measured Q labels only to its top move."""
+    target = np.asarray(target_probs, dtype=np.float64)
+    prior = np.asarray(prior_probs, dtype=np.float64)
+    visits = np.asarray(visit_counts, dtype=np.float64)
+    values = np.asarray(value_sums, dtype=np.float64)
+    if (
+        target.ndim != 1
+        or target.size == 0
+        or prior.shape != target.shape
+        or visits.shape != target.shape
+        or values.shape != target.shape
+        or not np.all(np.isfinite(target))
+        or not np.all(np.isfinite(prior))
+        or not np.all(np.isfinite(visits))
+        or not np.all(np.isfinite(values))
+        or np.any(target < 0.0)
+        or np.any(prior < 0.0)
+        or np.any(visits < 0.0)
+    ):
+        return None
+    target_total = float(target.sum())
+    prior_total = float(prior.sum())
+    if target_total <= 1e-12 or prior_total <= 1e-12:
+        return None
+    target = target / target_total
+    prior = prior / prior_total
+    prior_top_idx = int(np.argmax(prior))
+    target_top_idx = int(np.argmax(target))
+    ordered = np.sort(target)
+    top = float(ordered[-1])
+    second = float(ordered[-2]) if ordered.size > 1 else 0.0
+    entropy = float(-np.sum(target * np.log(np.clip(target, 1e-12, 1.0))))
+    result = {
+        'prior_mcts_agree': 1.0 if prior_top_idx == target_top_idx else 0.0,
+        'prior_top_visit_prob': float(target[prior_top_idx]),
+        'mcts_top_prior_prob': float(prior[target_top_idx]),
+        'mcts_policy_kl': float(np.sum(
+            target * (
+                np.log(np.clip(target, 1e-12, 1.0))
+                - np.log(np.clip(prior, 1e-12, 1.0))
+            )
+        )),
+        'policy_kld': None,
+        'top_visit_prob': top,
+        'visit_gap': max(0.0, top - second),
+        'visit_entropy': (
+            entropy / max(1e-12, math.log(len(target))) if len(target) > 1 else 0.0
+        ),
+        'best_q': None,
+        'mcts_q_delta': None,
+        'mcts_changed_to_lower_q': None,
+    }
+    result['policy_kld'] = result['mcts_policy_kl']
+    if visits[target_top_idx] > 0.0:
+        target_q = -float(values[target_top_idx]) / float(visits[target_top_idx])
+        if math.isfinite(target_q):
+            result['best_q'] = float(max(-1.0, min(1.0, target_q)))
+            if visits[prior_top_idx] > 0.0:
+                prior_q = -float(values[prior_top_idx]) / float(visits[prior_top_idx])
+                if math.isfinite(prior_q):
+                    q_delta = float(max(-2.0, min(2.0, target_q - prior_q)))
+                    result['mcts_q_delta'] = q_delta
+                    result['mcts_changed_to_lower_q'] = (
+                        1.0 if prior_top_idx != target_top_idx and q_delta < -0.02 else 0.0
+                    )
+    return result
+
+
+def _clear_gumbel_policy_target_telemetry(metadata):
+    """Mark target-derived measurements unavailable when the target is invalid.
+
+    In particular, an invalid distribution cannot be counted as agreement with
+    the prior: self-play aggregation treats ``prior_mcts_agree is None`` as an
+    unavailable sample and excludes it from agreement/correction rates.
+    """
+    for key in (
+        'prior_mcts_agree',
+        'prior_top_visit_prob',
+        'mcts_top_prior_prob',
+        'mcts_policy_kl',
+        'policy_kld',
+        'top_visit_prob',
+        'visit_gap',
+        'visit_entropy',
+        'best_q',
+        'mcts_q_delta',
+        'mcts_changed_to_lower_q',
+    ):
+        metadata[key] = None
+
+
 def _gumbel_prior_difficulty(root):
     """Prior-only uncertainty used to assign a budget before Gumbel search.
 
@@ -480,6 +687,56 @@ def _gumbel_considered_visit_sequence(max_num_considered_actions, num_simulation
     return tuple(sequence[:simulation_count])
 
 
+@lru_cache(maxsize=256)
+def _resolve_gumbel_considered_actions(
+    max_num_considered_actions,
+    legal_action_count,
+    num_simulations,
+):
+    """Resolve root width from the fresh Sequential-Halving budget.
+
+    MCTX permits a single first-round visit, so this is a chess-specific quality
+    guard rather than a correctness fix. The configured value remains the cap.
+    When it cannot receive two complete passes, step down to the next lower
+    power of two; this avoids unstable 16 -> 15 boundary changes.
+    """
+    simulation_count = max(0, int(num_simulations))
+    limit = min(
+        max(1, int(max_num_considered_actions)),
+        max(1, int(legal_action_count)),
+        max(1, simulation_count),
+    )
+    if limit <= 1 or simulation_count <= 0:
+        return 1
+
+    rounds = int(math.ceil(math.log2(limit)))
+    initial_visits = simulation_count // max(1, rounds * limit)
+    if initial_visits >= _GUMBEL_MIN_INITIAL_VISITS_PER_ACTION:
+        return int(limit)
+
+    candidate = 1 << (int(limit).bit_length() - 1)
+    if candidate == limit:
+        candidate //= 2
+    while candidate > 1:
+        rounds = int(math.ceil(math.log2(candidate)))
+        initial_visits = simulation_count // max(1, rounds * candidate)
+        if initial_visits >= _GUMBEL_MIN_INITIAL_VISITS_PER_ACTION:
+            return int(candidate)
+        candidate //= 2
+    return 1
+
+
+def _gumbel_initial_round_visits(considered_actions, num_simulations):
+    considered = max(1, int(considered_actions))
+    simulations = max(0, int(num_simulations))
+    if simulations <= 0:
+        return 0
+    if considered <= 1:
+        return simulations
+    rounds = int(math.ceil(math.log2(considered)))
+    return max(1, simulations // max(1, rounds * considered))
+
+
 def _replay_source_code(learner_turn, game_opponent_mcts, opponent_label):
     if learner_turn or game_opponent_mcts is None:
         return _REPLAY_SOURCE_LEARNER
@@ -489,63 +746,19 @@ def _replay_source_code(learner_turn, game_opponent_mcts, opponent_label):
     return _REPLAY_SOURCE_UNKNOWN
 
 
-def _policy_uptake_weight(
-    search_metadata,
-    *,
-    good_target_min_top_visit_prob=0.55,
-    good_target_min_visit_gap=0.12,
-):
-    """Weight full-search policy targets by their decision confidence.
-
-    A complete but nearly tied Gumbel target remains useful, so it keeps a 35%
-    floor. Targets whose top probability and winner margin both reach the
-    established good-target thresholds receive full weight. This stops a
-    growing population of diffuse roots from dominating policy CE while every
-    searched root keeps outcome-value supervision.
-    """
-    metadata = search_metadata if isinstance(search_metadata, dict) else {}
-    try:
-        completeness = float(metadata.get('policy_weight', 1.0) or 0.0)
-    except (TypeError, ValueError):
-        completeness = 1.0
-    completeness = max(0.0, min(1.0, completeness))
-    try:
-        top_probability = float(metadata.get("top_visit_prob", float("nan")))
-        visit_gap = float(metadata.get("visit_gap", float("nan")))
-    except (TypeError, ValueError):
-        return completeness
-    if not math.isfinite(top_probability) or not math.isfinite(visit_gap):
-        return completeness
-
-    top_threshold = max(1e-6, float(good_target_min_top_visit_prob))
-    gap_threshold = max(1e-6, float(good_target_min_visit_gap))
-    confidence = min(
-        max(0.0, min(1.0, top_probability / top_threshold)),
-        max(0.0, min(1.0, visit_gap / gap_threshold)),
-    )
-    confidence = confidence * confidence * (3.0 - 2.0 * confidence)
-    quality_weight = 0.35 + 0.65 * confidence
-    return completeness * quality_weight
-
-
 def _search_correction_metadata(search_metadata):
-    """Return persisted correction flag, Q delta and bounded policy weight."""
+    """Return the persisted top-change flag and measured Q delta."""
     metadata = search_metadata if isinstance(search_metadata, dict) else {}
     try:
-        changed_top = float(metadata.get('prior_mcts_agree', 1.0) or 0.0) < 0.5
-    except (TypeError, ValueError):
+        prior_mcts_agree = float(metadata.get('prior_mcts_agree'))
+        changed_top = math.isfinite(prior_mcts_agree) and prior_mcts_agree < 0.5
+    except (TypeError, ValueError, OverflowError):
         changed_top = False
     try:
         q_delta = float(metadata.get('mcts_q_delta', float('nan')))
     except (TypeError, ValueError):
         q_delta = float('nan')
-    useful_correction = bool(
-        changed_top
-        and math.isfinite(q_delta)
-        and q_delta > _POLICY_CORRECTION_Q_DELTA_MIN
-    )
-    multiplier = _POLICY_CORRECTION_WEIGHT_MULTIPLIER if useful_correction else 1.0
-    return changed_top, q_delta, multiplier
+    return changed_top, q_delta
 
 
 def _debug_scope(config, name):
@@ -623,8 +836,14 @@ class _SyzygyOracle:
         # Avoid allocating a piece map on every self-play ply; native color
         # bitboards provide the same count directly.
         piece_count = chess.piece_count(board)
+        has_castling_rights = any(
+            chess.has_kingside_castling_rights(board, color)
+            or chess.has_queenside_castling_rights(board, color)
+            for color in (chess.WHITE, chess.BLACK)
+        )
         return (
             self.enabled
+            and not has_castling_rights
             and piece_count <= self.max_pieces
             and (piece_count <= 2 or piece_count in self.wdl_piece_counts)
         )
@@ -715,6 +934,134 @@ def _get_syzygy_oracle(config):
     return oracle if oracle.enabled else None
 
 
+
+def _lock_file_identity(stat_result):
+    return (
+        getattr(stat_result, "st_dev", None),
+        getattr(stat_result, "st_ino", None),
+        getattr(stat_result, "st_size", None),
+        getattr(stat_result, "st_mtime_ns", None),
+        getattr(stat_result, "st_ctime_ns", None),
+    )
+
+
+def _windows_process_creation_generation(process_handle):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_times = kernel32.GetProcessTimes
+    get_times.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    )
+    get_times.restype = wintypes.BOOL
+    created = wintypes.FILETIME()
+    exited = wintypes.FILETIME()
+    kernel = wintypes.FILETIME()
+    user = wintypes.FILETIME()
+    if not get_times(
+        process_handle,
+        ctypes.byref(created),
+        ctypes.byref(exited),
+        ctypes.byref(kernel),
+        ctypes.byref(user),
+    ):
+        return None
+    return (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+
+
+def _current_process_creation_generation():
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_current_process = kernel32.GetCurrentProcess
+        get_current_process.restype = wintypes.HANDLE
+        return _windows_process_creation_generation(get_current_process())
+    except (AttributeError, OSError):
+        return None
+
+
+def _process_liveness(pid, expected_generation=None):
+    """Return True for live, False for verified dead, or None if unknown."""
+    if int(pid) <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_process.restype = wintypes.HANDLE
+        wait_for_single = kernel32.WaitForSingleObject
+        wait_for_single.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        wait_for_single.restype = wintypes.DWORD
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(0x00101000, False, int(pid))  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            # ERROR_INVALID_PARAMETER means the PID does not identify a process.
+            # Access denied and all other errors are unknown: fail closed.
+            return False if ctypes.get_last_error() == 87 else None
+        try:
+            wait_result = wait_for_single(handle, 0)
+            if wait_result == 0:  # WAIT_OBJECT_0: process exited.
+                return False
+            if wait_result != 0x102:  # Anything except WAIT_TIMEOUT is unknown.
+                return None
+            generation = _windows_process_creation_generation(handle)
+            if generation is None:
+                return None
+            if expected_generation is not None:
+                return generation == expected_generation
+            return True
+        finally:
+            close_handle(handle)
+
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
+            return None
+        return None
+    return True
+
+
+
+def _unlink_lock_if_unchanged(lock_path, expected_identity, expected_payload=None):
+    """Remove a lock only when its path still names the inspected file."""
+    try:
+        before = lock_path.stat()
+        if _lock_file_identity(before) != expected_identity:
+            return False
+        payload = lock_path.read_bytes()
+        after = lock_path.stat()
+        if _lock_file_identity(after) != expected_identity:
+            return False
+        if expected_payload is not None and payload != expected_payload:
+            return False
+        lock_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
 class _SelfPlayCompileLock:
     def __init__(self, lock_path, timeout_s=900.0, poll_s=0.2, stale_after_s=1800.0):
         self.lock_path = Path(lock_path)
@@ -722,6 +1069,8 @@ class _SelfPlayCompileLock:
         self.poll_s = max(0.05, float(poll_s))
         self.stale_after_s = max(self.timeout_s, float(stale_after_s))
         self._fd = None
+        self._owned_identity = None
+        self._owned_payload = None
 
     def __enter__(self):
         start_t = time.perf_counter()
@@ -729,18 +1078,67 @@ class _SelfPlayCompileLock:
         while True:
             try:
                 self._fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                payload = f"{os.getpid()} {time.time():.6f}\n".encode("ascii", errors="ignore")
-                os.write(self._fd, payload)
+                lock_created_at = time.time()
+                generation = _current_process_creation_generation()
+                generation_field = f" {generation}" if generation is not None else ""
+                payload = (
+                    f"{os.getpid()} {lock_created_at:.6f}{generation_field}\n"
+                    .encode("ascii", errors="ignore")
+                )
+                written = 0
+                while written < len(payload):
+                    written += os.write(self._fd, payload[written:])
+                fd_identity = _lock_file_identity(os.fstat(self._fd))
+                self._owned_payload = self.lock_path.read_bytes()
+                self._owned_identity = _lock_file_identity(self.lock_path.stat())
+                if fd_identity[:2] != self._owned_identity[:2]:
+                    os.close(self._fd)
+                    self._fd = None
+                    self._owned_identity = None
+                    self._owned_payload = None
+                    continue
                 return self
             except FileExistsError:
                 try:
                     stat = self.lock_path.stat()
+                    identity = _lock_file_identity(stat)
                     age_s = max(0.0, time.time() - float(stat.st_mtime))
-                    if age_s > self.stale_after_s:
-                        self.lock_path.unlink(missing_ok=True)
+                    payload = self.lock_path.read_bytes()
+                    if _lock_file_identity(self.lock_path.stat()) != identity:
                         continue
-                except Exception:
-                    pass
+                except OSError:
+                    identity = None
+                    age_s = 0.0
+                    payload = b""
+
+                owner_pid = None
+                owner_generation = None
+                if identity is not None:
+                    try:
+                        fields = payload.decode("ascii", errors="strict").strip().split()
+                        if len(fields) >= 2:
+                            parsed_pid = int(fields[0])
+                            float(fields[1])  # Keep malformed records on age fallback.
+                            if parsed_pid > 0:
+                                owner_pid = parsed_pid
+                                if len(fields) >= 3:
+                                    try:
+                                        owner_generation = int(fields[2])
+                                    except ValueError:
+                                        owner_generation = None
+                    except (UnicodeError, ValueError, IndexError):
+                        pass
+
+                reclaim = False
+                if owner_pid is not None:
+                    reclaim = _process_liveness(owner_pid, owner_generation) is False
+                elif identity is not None and age_s > self.stale_after_s:
+                    # Only legacy malformed/empty files use age fallback. Never
+                    # unlink a fresh file that may be between create and write.
+                    reclaim = True
+                if reclaim and identity is not None:
+                    if _unlink_lock_if_unchanged(self.lock_path, identity, payload):
+                        continue
                 if (time.perf_counter() - start_t) >= self.timeout_s:
                     raise TimeoutError(f"Timed out waiting for compile lock: {self.lock_path}")
                 time.sleep(self.poll_s)
@@ -752,10 +1150,15 @@ class _SelfPlayCompileLock:
         finally:
             self._fd = None
             try:
-                self.lock_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
+                if self._owned_identity is not None:
+                    _unlink_lock_if_unchanged(
+                        self.lock_path,
+                        self._owned_identity,
+                        self._owned_payload,
+                    )
+            finally:
+                self._owned_identity = None
+                self._owned_payload = None
 
 def _resolve_selfplay_compile_enabled(config, device):
     if device.type != 'cuda' or not torch.cuda.is_available():
@@ -951,8 +1354,44 @@ def _copy_board_fast(board):
 
 def _board_position_key(board):
     """
-    Fast board identity for tree reuse.
+    Repetition identity for FIDE position matching.
+
+    The halfmove and fullmove counters do not define a position for repetition
+    purposes. An en-passant target does define one only when the side to move
+    has a legal en-passant capture; an uncapturable or pinned capture must not
+    distinguish otherwise identical positions.
     """
+    piece_masks = tuple(
+        int(board[color, piece_type])
+        for color, piece_type in _INPUT_PIECE_SPECS
+    )
+    castling_rights = (
+        int(chess.has_kingside_castling_rights(board, chess.WHITE))
+        | (int(chess.has_queenside_castling_rights(board, chess.WHITE)) << 1)
+        | (int(chess.has_kingside_castling_rights(board, chess.BLACK)) << 2)
+        | (int(chess.has_queenside_castling_rights(board, chess.BLACK)) << 3)
+    )
+    ep_square = board.en_passant_square
+    if ep_square is not None and any(
+        chess.is_en_passant(board, move) for move in chess.legal_moves(board)
+    ):
+        ep_square = chess.square_index(ep_square) + 1
+    else:
+        ep_square = 0
+    # Twelve 64-bit piece masks plus side, rights and EP sentinel/index. This
+    # exact fixed-width encoding avoids retaining a nested tuple and 12 PyLongs
+    # on every node whose repetition key is cached.
+    return struct.pack(
+        "<12QBBB",
+        *piece_masks,
+        int(board.turn == chess.BLACK),
+        castling_rights,
+        ep_square,
+    )
+
+
+def _board_tree_reuse_key(board):
+    """Keep root reuse tied to the backend's full board hash, including clocks."""
     return chess.position_key(board)
 
 
@@ -1091,6 +1530,77 @@ _SELFPLAY_SHARP_OPENING_LINES = (
     ("d2d4", "g8f6", "c2c4", "e7e5", "d4e5", "f6g4"),
 )
 _SELFPLAY_SELFPLAY_OPENING_LINES = _SELFPLAY_OPENING_LINES + _SELFPLAY_SHARP_OPENING_LINES
+
+
+def _stratify_eval_opening_lines(lines):
+    """Interleave opening families and line depths across every suite prefix."""
+    groups = {}
+    family_counts = {}
+    depth_counts = {}
+    for line in lines:
+        family = tuple(line[:2])
+        depth = len(line)
+        groups.setdefault((family, depth), []).append(line)
+        family_counts[family] = family_counts.get(family, 0) + 1
+        depth_counts[depth] = depth_counts.get(depth, 0) + 1
+    rng = np.random.default_rng(490050)
+    for group in groups.values():
+        rng.shuffle(group)
+    used_families = dict.fromkeys(family_counts, 0)
+    used_depths = dict.fromkeys(depth_counts, 0)
+    ordered = []
+    for index in range(len(lines)):
+        candidates = []
+        for (family, depth), group in groups.items():
+            if not group:
+                continue
+            family_deficit = (
+                (index + 1) * family_counts[family] / len(lines)
+                - used_families[family]
+            )
+            depth_deficit = (
+                (index + 1) * depth_counts[depth] / len(lines)
+                - used_depths[depth]
+            )
+            candidates.append((family_deficit + depth_deficit, family, depth))
+        best_score = max(candidate[0] for candidate in candidates)
+        best = [
+            (family, depth)
+            for score, family, depth in candidates
+            if math.isclose(score, best_score, rel_tol=0.0, abs_tol=1e-12)
+        ]
+        family, depth = best[int(rng.integers(len(best)))]
+        ordered.append(groups[(family, depth)].pop())
+        used_families[family] += 1
+        used_depths[depth] += 1
+    return tuple(ordered)
+
+
+def _build_eval_opening_lines():
+    """Deduplicate the original 96 positions, then stratify their stage order."""
+    lines = _SELFPLAY_OPENING_LINES + _SELFPLAY_SHARP_OPENING_LINES
+    unique = []
+    seen_positions = set()
+    for depth in range(4, 11):
+        for line in lines:
+            if len(line) < depth:
+                continue
+            prefix = tuple(line[:depth])
+            board = chess.new_board()
+            for uci in prefix:
+                chess.apply_move(board, chess.move_from_uci(uci))
+            position_key = _board_position_key(board)
+            if position_key in seen_positions:
+                continue
+            seen_positions.add(position_key)
+            unique.append(prefix)
+            if len(unique) >= 96:
+                return _stratify_eval_opening_lines(unique)
+    return _stratify_eval_opening_lines(unique)
+
+
+_EVAL_OPENING_SUITE_ID = "curated-family-depth-stratified-v3"
+_EVAL_OPENING_LINES = _build_eval_opening_lines()
 
 
 class MCTSEdgeStats:
@@ -1251,6 +1761,7 @@ class MCTSNode:
         "expanded",
         "_root_virtual_loss",
         "_position_key_cache",
+        "_tree_reuse_key_cache",
         "_board_tensor",
         "_legal_moves",
         "_legal_indices",
@@ -1275,6 +1786,7 @@ class MCTSNode:
         self._root_virtual_loss = 0
 
         self._position_key_cache = None
+        self._tree_reuse_key_cache = None
         self._board_tensor = None
         self._legal_moves = None
         self._legal_indices = None
@@ -1413,6 +1925,7 @@ class MCTSNode:
         self._legal_moves = None
         self._legal_indices = None
         self._position_key_cache = None
+        self._tree_reuse_key_cache = None
 
     def iter_child_nodes(self):
         return self.edges.iter_nodes()
@@ -1427,6 +1940,11 @@ class MCTSNode:
         if self._position_key_cache is None:
             self._position_key_cache = _board_position_key(self.board)
         return self._position_key_cache
+
+    def get_tree_reuse_key(self):
+        if self._tree_reuse_key_cache is None:
+            self._tree_reuse_key_cache = _board_tree_reuse_key(self.board)
+        return self._tree_reuse_key_cache
 
     def get_legal_moves(self):
         if self._legal_moves is None:
@@ -1493,6 +2011,16 @@ def _build_sparse_policy_target_from_visits(visit_counts, board):
     )
 
 
+def _optional_int32_search_count(value):
+    if value is None:
+        return -1
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return -1
+    return count if 0 <= count <= (1 << 31) - 1 else -1
+
+
 def _pack_positions_for_transfer(positions, max_policy_targets=None):
     """
     Pack self-play positions into batched tensors for queue transport.
@@ -1529,6 +2057,14 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     orig_q_targets = torch.full((batch_size, 1), float('nan'), dtype=torch.float32)
     policy_kld_targets = torch.full((batch_size,), float('nan'), dtype=torch.float32)
     search_visits = torch.zeros((batch_size,), dtype=torch.int32)
+    game_ids = torch.full((batch_size,), -1, dtype=torch.int64)
+    game_ply_indices = torch.full((batch_size,), -1, dtype=torch.int16)
+    regret_targets = torch.full((batch_size,), float('nan'), dtype=torch.float32)
+    archive_ids = torch.full((batch_size,), -1, dtype=torch.int64)
+    search_budget_assigned = torch.full((batch_size,), -1, dtype=torch.int32)
+    search_simulations_effective = torch.full((batch_size,), -1, dtype=torch.int32)
+    search_simulations_fresh = torch.full((batch_size,), -1, dtype=torch.int32)
+    search_visits_inherited_credit = torch.full((batch_size,), -1, dtype=torch.int32)
     fens = []
     history_fens = []
 
@@ -1564,6 +2100,22 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
             policy_kld_targets[row_idx] = float(pos[18])
         if len(pos) > 19 and pos[19] is not None:
             search_visits[row_idx] = int(pos[19])
+        if len(pos) > 20 and pos[20] is not None:
+            game_ids[row_idx] = int(pos[20])
+        if len(pos) > 21 and pos[21] is not None:
+            game_ply_indices[row_idx] = int(pos[21])
+        if len(pos) > 22 and pos[22] is not None:
+            regret_targets[row_idx] = float(pos[22])
+        if len(pos) > 23 and pos[23] is not None:
+            archive_ids[row_idx] = int(pos[23])
+        if len(pos) > 24:
+            search_budget_assigned[row_idx] = _optional_int32_search_count(pos[24])
+        if len(pos) > 25:
+            search_simulations_effective[row_idx] = _optional_int32_search_count(pos[25])
+        if len(pos) > 26:
+            search_simulations_fresh[row_idx] = _optional_int32_search_count(pos[26])
+        if len(pos) > 27:
+            search_visits_inherited_credit[row_idx] = _optional_int32_search_count(pos[27])
         if count <= 0:
             continue
         policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
@@ -1593,6 +2145,14 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         'orig_q_targets': orig_q_targets,
         'policy_kld_targets': policy_kld_targets,
         'search_visits': search_visits,
+        'game_ids': game_ids,
+        'game_ply_indices': game_ply_indices,
+        'regret_targets': regret_targets,
+        'archive_ids': archive_ids,
+        'search_budget_assigned': search_budget_assigned,
+        'search_simulations_effective': search_simulations_effective,
+        'search_simulations_fresh': search_simulations_fresh,
+        'search_visits_inherited_credit': search_visits_inherited_credit,
         'num_positions': batch_size,
     }
 
@@ -1610,11 +2170,13 @@ def _select_move_from_visits_safe(visit_counts, temperature):
     """
     Select move from visit counts with numeric safeguards.
     """
+    if temperature == 0 or len(visit_counts) == 1:
+        # Preserve insertion-order tie breaking without allocating a key list
+        # and a NumPy array for the common deterministic-selection path.
+        return max(visit_counts, key=visit_counts.get)
+
     moves = list(visit_counts.keys())
     visits = np.fromiter(visit_counts.values(), dtype=np.float64, count=len(moves))
-
-    if temperature == 0 or len(moves) == 1:
-        return moves[int(np.argmax(visits))]
 
     visits_temp = visits ** (1.0 / temperature)
     total = float(visits_temp.sum())
@@ -1692,6 +2254,10 @@ class MultiGameBatchMCTS:
         self.config = config
         self.device = device
         rl_cfg = config['reinforcement_learning']
+        (
+            self.policy_target_mode,
+            self.challenge_delta_prior_fraction,
+        ) = _resolve_policy_target_config(rl_cfg)
 
         self.gumbel_max_considered_actions = max(
             1,
@@ -1706,8 +2272,8 @@ class MultiGameBatchMCTS:
             float(rl_cfg.get('mcts_gumbel_q_range_floor', 0.25)),
         )
         self.gumbel_target_temperature = max(
-            1.0,
-            float(rl_cfg.get('mcts_gumbel_target_temperature', 1.00)),
+            0.05,
+            float(rl_cfg.get('mcts_gumbel_target_temperature', 0.95)),
         )
         self.gumbel_use_mixed_value = bool(
             rl_cfg.get('mcts_gumbel_use_mixed_value', True)
@@ -1930,6 +2496,8 @@ class MultiGameBatchMCTS:
             'nn_legal_move_items': 0,
             'central_inference_shared_requests': 0,
             'central_inference_shared_bytes_avoided': 0,
+            'central_inference_compact_policy_requests': 0,
+            'central_inference_compact_output_bytes_avoided': 0,
             'central_inference_shared_slot_wait_time': 0.0,
             'central_inference_cache_queries': 0,
             'central_inference_cache_bypassed_positions': 0,
@@ -2023,6 +2591,164 @@ class MultiGameBatchMCTS:
         while len(self._history_tensor_cache) > self._history_tensor_cache_capacity:
             self._history_tensor_cache.popitem(last=False)
         return cached
+
+    def _encode_native_history_pairs(self, pending):
+        """Encode the cache misses from one leaf batch in a single native call."""
+        if not pending:
+            return {}
+
+        profile_t0 = time.perf_counter() if self.profile_enabled else None
+        pending_items = list(pending.items())
+        pair_count = len(pending_items)
+        row_count = pair_count * 2
+        (
+            piece_masks,
+            black_to_move,
+            castling_masks,
+            en_passant_masks,
+            halfmove_values,
+            fullmove_values,
+        ) = self._get_native_board_plane_scratch(row_count)
+        encoded_pairs = np.empty(
+            (row_count, 16, 8, 8),
+            dtype=self.history_storage_dtype,
+        )
+        for pair_idx, (_cache_key, node) in enumerate(pending_items):
+            board = node.board
+            white_row = pair_idx * 2
+            black_row = white_row + 1
+            for plane_idx, (color, piece_type) in enumerate(_INPUT_PIECE_SPECS):
+                mask = int(board[color, piece_type])
+                piece_masks[white_row, plane_idx] = mask
+                piece_masks[black_row, plane_idx] = mask
+
+            castling_rights = board.castling_rights
+            ep_square = board.en_passant_square
+            ep_mask = 0 if ep_square is None else 1 << chess.square_index(ep_square)
+            halfmove_value = min(float(board.halfmove_clock) / 50.0, 1.0)
+            fullmove_value = min(float(board.fullmove_number) / 100.0, 1.0)
+            for row_idx, is_black in ((white_row, False), (black_row, True)):
+                black_to_move[row_idx] = int(is_black)
+                pov_color = chess.BLACK if is_black else chess.WHITE
+                kingside_flag = (
+                    chess.BLACK_KINGSIDE if is_black else chess.WHITE_KINGSIDE
+                )
+                queenside_flag = (
+                    chess.BLACK_QUEENSIDE if is_black else chess.WHITE_QUEENSIDE
+                )
+                kingside = kingside_flag in castling_rights
+                queenside = queenside_flag in castling_rights
+                castling_mask = 0
+                if kingside or queenside:
+                    king_square = chess.king_square(board, pov_color)
+                    if king_square is not None:
+                        king_index = chess.square_index(king_square)
+                        castling_mask |= 1 << king_index
+                        back_rank_base = (king_index >> 3) << 3
+                        if kingside:
+                            castling_mask |= 1 << (back_rank_base + 7)
+                        if queenside:
+                            castling_mask |= 1 << back_rank_base
+                castling_masks[row_idx] = castling_mask
+                en_passant_masks[row_idx] = ep_mask
+                halfmove_values[row_idx] = halfmove_value
+                fullmove_values[row_idx] = fullmove_value
+
+        self._native_mcts.encode_board_planes(
+            piece_masks,
+            black_to_move,
+            castling_masks,
+            en_passant_masks,
+            halfmove_values,
+            fullmove_values,
+            encoded_pairs,
+        )
+        resolved = {}
+        cache = self._history_tensor_cache
+        for pair_idx, (cache_key, node) in enumerate(pending_items):
+            pair = encoded_pairs[pair_idx * 2:pair_idx * 2 + 2].copy()
+            cached = (pair[0], pair[1])
+            cache[cache_key] = (weakref.ref(node), cached)
+            cache.move_to_end(cache_key)
+            resolved[cache_key] = (node, cached)
+            while len(cache) > self._history_tensor_cache_capacity:
+                cache.popitem(last=False)
+
+        if profile_t0 is not None:
+            self._profile_add('board_to_tensor_time', time.perf_counter() - profile_t0)
+            self._profile_inc('board_to_tensor_calls', pair_count * 2)
+        return resolved
+
+    def _fill_history_prefixes_for_nodes(
+        self,
+        nodes,
+        game_indices,
+        board_histories,
+        destinations,
+    ):
+        """Fill a leaf batch's histories while batching newly used MCTS ancestors."""
+        if self.history_positions <= 0:
+            return
+
+        profile_t0 = time.perf_counter() if self.profile_detail_enabled else None
+        native_batch = (
+            self._native_input_planes_enabled
+            and self.cache_history_tensors
+        )
+        cache = self._history_tensor_cache
+        pending = {}
+        resolved = {}
+        rows = []
+        history_positions = int(self.history_positions)
+        for row_idx, node in enumerate(nodes):
+            entries = self._collect_node_history_entries(
+                node,
+                board_histories[game_indices[row_idx]],
+            )
+            use_black_pov = node.board.turn == chess.BLACK
+            first_slot = max(0, history_positions - len(entries))
+            if native_batch:
+                for entry in entries:
+                    if not isinstance(entry, MCTSNode):
+                        continue
+                    cache_key = id(entry)
+                    already_resolved = resolved.get(cache_key)
+                    if already_resolved is not None and already_resolved[0] is entry:
+                        continue
+                    cached_entry = cache.get(cache_key)
+                    if cached_entry is not None:
+                        node_ref, cached = cached_entry
+                        if node_ref() is entry:
+                            cache.move_to_end(cache_key)
+                            resolved[cache_key] = (entry, cached)
+                            continue
+                        del cache[cache_key]
+                    pending.setdefault(cache_key, entry)
+            rows.append(
+                (node, entries, first_slot, use_black_pov, destinations[row_idx])
+            )
+
+        if pending:
+            resolved.update(self._encode_native_history_pairs(pending))
+
+        for _node, entries, first_slot, use_black_pov, destination in rows:
+            destination.fill(0.0)
+            for slot, entry in enumerate(entries, start=first_slot):
+                begin = slot * self._board_planes
+                end = begin + self._board_planes
+                if native_batch and isinstance(entry, MCTSNode):
+                    cached = resolved.get(id(entry))
+                    if cached is not None and cached[0] is entry:
+                        pair = cached[1]
+                        tensor = pair[1] if use_black_pov else pair[0]
+                    else:
+                        tensor = self._history_tensor_for_entry(entry, use_black_pov)
+                else:
+                    tensor = self._history_tensor_for_entry(entry, use_black_pov)
+                destination[begin:end] = tensor
+
+        if profile_t0 is not None:
+            self._profile_add('batch_expand_history_time', time.perf_counter() - profile_t0)
 
     @staticmethod
     def _is_encoded_history_entry(entry):
@@ -2185,11 +2911,7 @@ class MultiGameBatchMCTS:
         for row_idx, node in enumerate(nodes):
             board = node.board
             for plane_idx, (color, piece_type) in enumerate(_INPUT_PIECE_SPECS):
-                piece_masks[row_idx, plane_idx] = chess.piece_mask(
-                    board,
-                    piece_type,
-                    color,
-                )
+                piece_masks[row_idx, plane_idx] = int(board[color, piece_type])
             is_black = board.turn == chess.BLACK
             black_to_move[row_idx] = int(is_black)
             pov_color = chess.BLACK if is_black else chess.WHITE
@@ -2618,9 +3340,9 @@ class MultiGameBatchMCTS:
         return probs
 
     def _gumbel_policy_target(self, improved_policy):
-        """Soften only the stored training target, not search action selection."""
+        """Temperature-scale only the training target, not action selection."""
         probs = np.asarray(improved_policy)
-        if probs.size <= 1 or self.gumbel_target_temperature <= 1.0 + 1e-8:
+        if probs.size <= 1 or abs(self.gumbel_target_temperature - 1.0) <= 1e-8:
             return probs.astype(np.float32, copy=False)
         native = self._native_mcts
         if native is not None:
@@ -2834,10 +3556,6 @@ class MultiGameBatchMCTS:
         scores[~eligible] = -np.inf
         return int(np.argmax(scores))
 
-    def _select_child(self, node):
-        """Select an interior child using completed-Q policy improvement."""
-        return self._select_child_gumbel(node)
-
     def _backpropagate_and_remove_virtual_loss(self, search_path, value):
         """Commit visits and release virtual loss in one reverse traversal."""
         for node in reversed(search_path):
@@ -2915,6 +3633,8 @@ class MultiGameBatchMCTS:
             'played_q': None,
             'orig_q': None,
             'policy_kld': None,
+            'policy_target_intervention_applied': False,
+            'policy_target_removed_prior_mass': 0.0,
             'search_visits': int(fresh_used),
             'stopped_early': effective_used < budget,
             'policy_weight': float(max(0.0, min(1.0, effective_used / float(budget)))),
@@ -3100,13 +3820,13 @@ class MultiGameBatchMCTS:
                     root_synced = False
                     root_reused_flags[idx] = True
                 else:
-                    target_key = _board_position_key(board)
-                    if root.get_position_key() == target_key:
+                    target_key = _board_tree_reuse_key(board)
+                    if root.get_tree_reuse_key() == target_key:
                         root_reused_flags[idx] = True
                     else:
                         for move in root.edges.moves:
                             child = root.get_child_for_move(move)
-                            if child is not None and child.get_position_key() == target_key:
+                            if child is not None and child.get_tree_reuse_key() == target_key:
                                 _ = child.board  # Ensure board is instantiated
                                 root = child.detach_as_root()
                                 root_reused_flags[idx] = True
@@ -3449,12 +4169,17 @@ class MultiGameBatchMCTS:
             )
             root_gumbel_noises[idx] = noise
             if root_reused_flags[idx]:
+                pre_credit_budget = max(
+                    0,
+                    int(simulation_budgets[idx]) - int(setup_visits[idx]),
+                )
                 tree_reuse_quality[idx] = _summarize_tree_reuse_quality(
                     root,
                     noise,
-                    min(
+                    _resolve_gumbel_considered_actions(
                         self.gumbel_max_considered_actions,
-                        max(1, int(simulation_budgets[idx])),
+                        len(root.edges.moves),
+                        pre_credit_budget,
                     ),
                 )
         inherited_visit_credits = [0] * game_count
@@ -3476,6 +4201,10 @@ class MultiGameBatchMCTS:
             )
             for idx in range(game_count)
         ]
+        # ``_run_simulation_phase`` consumes its mutable remaining-budget list
+        # in place. Preserve the assigned budget for post-search telemetry and
+        # Sequential Halving diagnostics before that mutation starts.
+        gumbel_action_budgets = tuple(action_budgets)
         pre_scout_winners = [None] * game_count
         pre_scout_policies = [None] * game_count
         tree_reuse_scout_results = [
@@ -3504,10 +4233,10 @@ class MultiGameBatchMCTS:
             initial = initial_child_visits[idx]
             if initial is None or len(initial) != len(root.edges.moves):
                 initial = np.zeros(len(root.edges.moves), dtype=np.int32)
-            considered = min(
-                len(root.edges.moves),
+            considered = _resolve_gumbel_considered_actions(
                 self.gumbel_max_considered_actions,
-                max(1, action_budgets[idx]),
+                len(root.edges.moves),
+                action_budgets[idx],
             )
             gumbel_root_states[idx] = {
                 'initial_visits': np.asarray(initial, dtype=np.int32),
@@ -3726,8 +4455,20 @@ class MultiGameBatchMCTS:
                 }
                 if policy_target:
                     metadata['policy_target_probs_override'] = policy_target
+                    metadata['policy_target_by_move'] = policy_target
                 metadata['gumbel_considered_actions'] = int(
                     gumbel_state.get('considered_actions', 0) or 0
+                )
+                metadata['gumbel_action_budget'] = int(gumbel_action_budgets[idx])
+                metadata['gumbel_initial_round_visits'] = int(
+                    _gumbel_initial_round_visits(
+                        gumbel_state.get('considered_actions', 0),
+                        gumbel_action_budgets[idx],
+                    )
+                )
+                metadata['gumbel_width_adapted'] = bool(
+                    int(gumbel_state.get('considered_actions', 0) or 0)
+                    < min(len(root.edges.moves), self.gumbel_max_considered_actions)
                 )
                 metadata['gumbel_scale'] = float(
                     self.gumbel_scale if add_root_noise else self.gumbel_eval_scale
@@ -3749,60 +4490,35 @@ class MultiGameBatchMCTS:
                     for move, value in zip(root.edges.moves, selection_scores)
                 }
 
-                # Full Gumbel trains against the improved completed-Q policy,
-                # so quality telemetry must compare the prior to that policy
-                # rather than to the incidental Sequential-Halving visit shape.
+                # Full Gumbel trains against the temperature-scaled completed-Q
+                # target; target telemetry and Q labels must use that exact map.
                 priors = root.edges.base_priors.astype(np.float64, copy=False)
                 prior_total = float(priors.sum())
-                prior_probs = priors / prior_total if prior_total > 0.0 else np.full_like(priors, 1.0 / len(priors))
+                prior_probs = (
+                    priors / prior_total
+                    if prior_total > 0.0
+                    else np.full_like(priors, 1.0 / len(priors))
+                )
                 prior_top_idx = int(np.argmax(prior_probs))
-                improved_top_idx = int(np.argmax(improved))
-                selected_prior_agree = (
-                    None if selected_idx is None else (1.0 if prior_top_idx == selected_idx else 0.0)
+                target_probs = policy_target_probs.astype(np.float64, copy=False)
+                original_changed_top = prior_top_idx != int(np.argmax(target_probs))
+                metadata['selected_prior_agree'] = (
+                    None
+                    if selected_idx is None
+                    else (1.0 if prior_top_idx == selected_idx else 0.0)
                 )
-                metadata['selected_prior_agree'] = selected_prior_agree
                 metadata['selected_q_delta'] = None
-                metadata['prior_mcts_agree'] = 1.0 if prior_top_idx == improved_top_idx else 0.0
-                metadata['prior_top_visit_prob'] = float(improved[prior_top_idx])
-                metadata['mcts_top_prior_prob'] = float(prior_probs[improved_top_idx])
-                metadata['mcts_policy_kl'] = float(np.sum(
-                    improved.astype(np.float64) * (
-                        np.log(np.clip(improved.astype(np.float64), 1e-12, 1.0))
-                        - np.log(np.clip(prior_probs, 1e-12, 1.0))
-                    )
-                ))
-                metadata['policy_kld'] = metadata['mcts_policy_kl']
-                ordered = np.sort(improved.astype(np.float64))
-                top = float(ordered[-1])
-                second = float(ordered[-2]) if ordered.size > 1 else 0.0
-                metadata['top_visit_prob'] = top
-                metadata['visit_gap'] = max(0.0, top - second)
-                target_entropy = float(-np.sum(
-                    improved.astype(np.float64) * np.log(np.clip(improved.astype(np.float64), 1e-12, 1.0))
-                ))
-                metadata['visit_entropy'] = (
-                    target_entropy / max(1e-12, math.log(len(improved)))
-                    if len(improved) > 1 else 0.0
-                )
-
                 cumulative = root.edges.visit_counts.astype(np.float64, copy=False)
-                if cumulative[improved_top_idx] > 0.0:
-                    metadata['best_q'] = float(max(
-                        -1.0,
-                        min(
-                            1.0,
-                            -float(root.edges.value_sums[improved_top_idx])
-                            / float(cumulative[improved_top_idx]),
-                        ),
-                    ))
-                if cumulative[prior_top_idx] > 0.0 and cumulative[improved_top_idx] > 0.0:
-                    prior_q = -float(root.edges.value_sums[prior_top_idx]) / cumulative[prior_top_idx]
-                    improved_q = -float(root.edges.value_sums[improved_top_idx]) / cumulative[improved_top_idx]
-                    q_delta = float(max(-2.0, min(2.0, improved_q - prior_q)))
-                    metadata['mcts_q_delta'] = q_delta
-                    metadata['mcts_changed_to_lower_q'] = (
-                        1.0 if prior_top_idx != improved_top_idx and q_delta < -0.02 else 0.0
-                    )
+                target_telemetry = _gumbel_policy_target_telemetry(
+                    target_probs,
+                    prior_probs,
+                    cumulative,
+                    root.edges.value_sums,
+                )
+                if target_telemetry is not None:
+                    metadata.update(target_telemetry)
+                else:
+                    _clear_gumbel_policy_target_telemetry(metadata)
                 if (
                     selected_idx is not None
                     and cumulative[prior_top_idx] > 0.0
@@ -3813,6 +4529,43 @@ class MultiGameBatchMCTS:
                     metadata['selected_q_delta'] = float(
                         max(-2.0, min(2.0, selected_q - prior_q))
                     )
+
+                # Transform eligibility uses the original improved target and its
+                # measured Q evidence. Only after an applied transformation do we
+                # recalculate target telemetry for the distribution stored in replay.
+                if self.policy_target_mode == 'challenge_delta' and policy_target:
+                    prior_by_move = {
+                        move: float(probability)
+                        for move, probability in zip(root.edges.moves, prior_probs)
+                    }
+                    transformed_target, intervention = _build_challenge_delta_policy_target(
+                        policy_target,
+                        prior_by_move,
+                        changed_top=original_changed_top,
+                        q_delta=metadata.get('mcts_q_delta'),
+                        prior_fraction=self.challenge_delta_prior_fraction,
+                    )
+                    if intervention['applied']:
+                        metadata['policy_target_probs_override'] = transformed_target
+                        metadata['policy_target_by_move'] = transformed_target
+                        metadata['policy_target_intervention_applied'] = True
+                        metadata['policy_target_removed_prior_mass'] = float(
+                            intervention['removed_prior_mass']
+                        )
+                        transformed_probs = np.asarray([
+                            float(transformed_target.get(move, 0.0))
+                            for move in root.edges.moves
+                        ], dtype=np.float64)
+                        transformed_telemetry = _gumbel_policy_target_telemetry(
+                            transformed_probs,
+                            prior_probs,
+                            cumulative,
+                            root.edges.value_sums,
+                        )
+                        if transformed_telemetry is not None:
+                            metadata.update(transformed_telemetry)
+                        else:
+                            _clear_gumbel_policy_target_telemetry(metadata)
 
                 root_result = {
                     move: float(count)
@@ -3971,21 +4724,19 @@ class MultiGameBatchMCTS:
                     non_terminal_nodes,
                     boards_np[:, self._history_planes:, :, :],
                 )
+            if self.history_positions > 0:
+                self._fill_history_prefixes_for_nodes(
+                    non_terminal_nodes,
+                    non_terminal_game_indices,
+                    board_histories,
+                    boards_np[:, :self._history_planes, :, :],
+                )
             for row_idx, (node, gi) in enumerate(zip(non_terminal_nodes, non_terminal_game_indices)):
                 if not self._native_input_planes_enabled:
                     self._current_tensor_for_node(
                         node,
                         out=boards_np[row_idx, self._history_planes:, :, :],
                     )
-                history_t0 = perf_counter() if profile_detail else None
-                if self.history_positions > 0:
-                    self._fill_history_prefix_for_node(
-                        node,
-                        board_histories[gi],
-                        boards_np[row_idx, :self._history_planes],
-                    )
-                if profile_detail:
-                    self._profile_add('batch_expand_history_time', perf_counter() - history_t0)
             if profile_timing:
                 self._profile_add('batch_expand_tensor_pack_time', perf_counter() - tensor_pack_t0)
 
@@ -4130,6 +4881,12 @@ class MultiGameBatchMCTS:
             )
             if remote_request_seen:
                 self._profile_inc('central_inference_requests', 1)
+                if compact_policy_response:
+                    self._profile_inc('central_inference_compact_policy_requests', 1)
+                    self._profile_inc(
+                        'central_inference_compact_output_bytes_avoided',
+                        max(0, batch_n * (ACTION_SIZE - max_legal_count) * 2),
+                    )
                 self._profile_inc('central_inference_server_batch_items', server_batch_size)
                 self._profile_add(
                     'central_inference_remote_wait_time',

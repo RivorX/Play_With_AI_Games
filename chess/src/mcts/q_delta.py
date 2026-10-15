@@ -9,6 +9,12 @@ Q_DELTA_HIST_MIN = -2.0
 Q_DELTA_HIST_MAX = 2.0
 Q_DELTA_HIST_BINS = 200
 USEFUL_SEARCH_Q_DELTA_MIN = 0.02
+# A correction is safe to force as the policy winner only when the improved
+# Gumbel target has both enough mass on its best move and a material gap over
+# the runner-up.  Keep this contract shared by self-play, replay audits and the
+# learner so telemetry and training never disagree about a "good target".
+RELIABLE_POLICY_TARGET_TOP1_MIN = 0.55
+RELIABLE_POLICY_TARGET_GAP_MIN = 0.12
 
 
 def q_delta_histogram(values):

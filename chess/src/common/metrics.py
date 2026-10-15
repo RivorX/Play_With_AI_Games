@@ -303,7 +303,7 @@ class MetricsCalculator:
         # Get top-k predictions. IL/RL policy loss is legal-only, so metrics must
         # also rank only legal moves; otherwise high illegal logits create a false
         # low Top-K signal even though gameplay gathers legal logits.
-        if self.expensive_policy_diagnostics and legal_indices is not None:
+        if legal_indices is not None:
             if legal_indices.dim() == 1:
                 legal_indices = legal_indices.unsqueeze(0)
             legal_indices = legal_indices.to(device=policy_pred.device, dtype=torch.long)
