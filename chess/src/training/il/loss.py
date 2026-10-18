@@ -206,7 +206,7 @@ class CombinedLoss(nn.Module):
             float(config['imitation_learning'].get('moves_left_loss_weight', 0.05)),
         )
     
-    def forward(self, predictions, targets):
+    def forward(self, predictions, targets, *, include_scalar_metrics=True):
         """
         Compute combined loss
         
@@ -313,11 +313,13 @@ class CombinedLoss(nn.Module):
             self.moves_left_weight * moves_left_loss
         )
 
-        loss_dict = {
-            'policy': policy_loss.item(),
-            'value': value_loss.item(),
-            'moves_left': moves_left_loss.item(),
-        }
+        loss_dict = {}
+        if include_scalar_metrics:
+            loss_dict.update({
+                'policy': policy_loss.item(),
+                'value': value_loss.item(),
+                'moves_left': moves_left_loss.item(),
+            })
         if self.capture_task_objectives:
             # Training diagnostics consume these tensors before backward.  They
             # are deliberately absent from validation to avoid retaining graphs.
@@ -327,5 +329,6 @@ class CombinedLoss(nn.Module):
                 + self.moves_left_weight * moves_left_loss
             )
         
-        loss_dict['total'] = total_loss.item()
+        if include_scalar_metrics:
+            loss_dict['total'] = total_loss.item()
         return total_loss, loss_dict

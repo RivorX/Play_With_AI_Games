@@ -1,6 +1,7 @@
 """Central batched NN inference shared by self-play and evaluation."""
 
 import hashlib
+import json
 import os
 import queue
 import threading
@@ -805,6 +806,22 @@ def central_inference_server(
         _central_inference_option(config, 'output_pipeline_enabled', True)
     )
     sync_timing = bool(_central_inference_option(config, 'sync_timing', debug_enabled))
+    profile_forward_shapes = bool(
+        _central_inference_option(config, 'profile_forward_shapes', False)
+    )
+    profile_cuda_graphs = bool(
+        _central_inference_option(config, 'profile_cuda_graphs', False)
+    )
+    cuda_graph_forward_enabled = bool(
+        _central_inference_option(config, 'cuda_graph_forward_enabled', False)
+    ) and not central_use_compile
+    cuda_graph_hot_shapes = _central_inference_option(
+        config, 'cuda_graph_forward_hot_shapes', {}
+    ) or {}
+    cuda_graph_min_observations = max(
+        1,
+        int(_central_inference_option(config, 'cuda_graph_forward_min_observations', 4) or 4),
+    )
     transport_dtype = str(_central_inference_option(config, 'transport_dtype', 'float16') or 'float16').lower()
     transport_np_dtype = np.float32 if transport_dtype in {'float32', 'fp32'} else np.float16
     shared_buffers = {
@@ -872,6 +889,9 @@ def central_inference_server(
     try:
         _prioritize_central_inference_process()
         device = _configure_selfplay_worker_runtime(config, device_id)
+        cuda_graph_forward_enabled = (
+            cuda_graph_forward_enabled and device.type == 'cuda'
+        )
         output_copy_stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
         fused_legal_output = None
         if device.type == 'cuda':
@@ -941,6 +961,9 @@ def central_inference_server(
             )
         models = {}
         model_specs = {}
+        forward_shape_histogram = {}
+        forward_graph_runners = {}
+        forward_graph_hot_shapes = {}
         compiled_base_models = {}
         compiled_wrappers = {}
 
@@ -1040,6 +1063,10 @@ def central_inference_server(
             from src.models.registry import config_for_model_spec
 
             label = str(label or "learner")
+            forward_graph_hot_shapes.pop(label, None)
+            previous_runner = forward_graph_runners.pop(label, None)
+            if previous_runner is not None:
+                previous_runner.clear()
             model_spec = _validate_central_model_input_contract(
                 config,
                 label,
@@ -1052,6 +1079,10 @@ def central_inference_server(
                 "compiled": bool(central_use_compile),
                 "reused": False,
                 "warmup_s": None,
+                "folded_conv_bn_pairs": 0,
+                "fvi_inference_copy": False,
+                "fvi_scale_modules_folded": 0,
+                "fvi_runtime_scale_modules": 0,
             }
             if debug_enabled:
                 print(f"[{_ts()}] Central inference: loading model '{label}' on {device}...", flush=True)
@@ -1124,11 +1155,95 @@ def central_inference_server(
                 )
                 _load_worker_model_state(model, state, rank=-1)
                 model.eval()
+            # v10 keeps fixed variance scales explicit in the trainable
+            # module. Fold adjacent scales only on a fresh eval copy, after
+            # checkpoint weights are loaded and before CUDA graphs are built.
+            # Compiled models retain the explicit scales for compiler fusion.
+            if (
+                not load_info["compiled"]
+                and str(model_spec.get("architecture_id", "")) == "nested_cnn_v10"
+            ):
+                try:
+                    model = model.make_inference_copy()
+                    load_info["fvi_inference_copy"] = True
+                    load_info["fvi_scale_modules_folded"] = int(
+                        getattr(model, "_fvi_folded_scale_count", 0)
+                    )
+                    load_info["fvi_runtime_scale_modules"] = int(
+                        getattr(model, "_fvi_runtime_scale_count", 0)
+                    )
+                except Exception as exc:
+                    print(
+                        f"WARNING: Central inference: v10 FVI scale folding skipped "
+                        f"for '{label}' ({type(exc).__name__}: {exc}); using the "
+                        "correct explicit-scale eval model.",
+                        flush=True,
+                    )
+            elif (
+                not load_info["compiled"]
+                and bool(_central_inference_option(config, 'fold_eval_conv_bn', False))
+            ):
+                try:
+                    from src.inference.conv_bn_folding import fold_eval_conv_bn_copy
+
+                    model, folded_pairs = fold_eval_conv_bn_copy(model)
+                    load_info["folded_conv_bn_pairs"] = int(folded_pairs)
+                except Exception as exc:
+                    # Folding is an optional inference optimization. Keep
+                    # the original, checkpoint-loaded model if its topology
+                    # or frozen BN state is not one of the validated cases.
+                    print(
+                        f"WARNING: Central inference: Conv-BN folding skipped for '{label}' "
+                        f"({type(exc).__name__}: {exc}); using the original model.",
+                        flush=True,
+                    )
             models[label] = model
             model_specs[label] = model_spec
             if debug_enabled:
                 print(f"[{_ts()}] Central inference: model '{label}' ready.", flush=True)
             return load_info
+
+        def _graph_forward_hot_sizes(model_label):
+            if not cuda_graph_forward_enabled:
+                return ()
+            model_label = str(model_label)
+            if model_label in forward_graph_hot_shapes:
+                return forward_graph_hot_shapes[model_label]
+            spec = model_specs.get(str(model_label), {}) or {}
+            architecture_id = str(spec.get('architecture_id', '') or '')
+            if architecture_id not in {'se_cnn_v9', 'nested_cnn_v10'}:
+                forward_graph_hot_shapes[model_label] = ()
+                return ()
+            hot_shapes = cuda_graph_hot_shapes.get(architecture_id, ())
+            try:
+                hot_shapes = tuple(sorted({int(size) for size in hot_shapes if 0 < int(size) <= max_batch}))
+            except (TypeError, ValueError):
+                hot_shapes = ()
+            forward_graph_hot_shapes[model_label] = hot_shapes
+            return hot_shapes
+
+        def _graph_forward_runner(model_label, model):
+            hot_shapes = _graph_forward_hot_sizes(model_label)
+            if not hot_shapes:
+                return None
+            runner = forward_graph_runners.get(str(model_label))
+            if runner is None:
+                from src.inference.cuda_graph_forward import CUDAGraphForwardRunner
+
+                runner = CUDAGraphForwardRunner(
+                    model,
+                    device,
+                    use_amp=bool(config.get('hardware', {}).get('use_amp', False)),
+                    amp_dtype=central_amp_dtype,
+                    exact_batch_sizes=hot_shapes,
+                    min_capture_observations=cuda_graph_min_observations,
+                    max_entries=min(8, len(hot_shapes)),
+                    max_graph_memory_fraction=0.04,
+                    min_free_memory_bytes=512 * 1024 * 1024,
+                    warmup_iterations=3,
+                )
+                forward_graph_runners[str(model_label)] = runner
+            return runner
 
         def _response_queue_for(req):
             if isinstance(response_queues, dict):
@@ -1817,7 +1932,14 @@ def central_inference_server(
                 with torch.inference_mode():
                     forward_t0 = time.perf_counter()
                     try:
-                        if use_amp and device.type == 'cuda':
+                        graph_runner = (
+                            _graph_forward_runner(model_label, model)
+                            if actual_batch_size in _graph_forward_hot_sizes(model_label)
+                            else None
+                        )
+                        if graph_runner is not None:
+                            policy_logits, value_logits = graph_runner.run_forward(tensor)
+                        elif use_amp and device.type == 'cuda':
                             with torch.autocast(device_type='cuda', dtype=central_amp_dtype):
                                 policy_logits, value_logits = model(
                                     tensor, apply_log_softmax=False
@@ -1858,6 +1980,10 @@ def central_inference_server(
                     if int(policy_logits.shape[0]) != actual_batch_size:
                         policy_logits = policy_logits[:actual_batch_size]
                         value_logits = value_logits[:actual_batch_size]
+                    if profile_forward_shapes:
+                        per_model_shapes = forward_shape_histogram.setdefault(model_label, {})
+                        shape_key = str(actual_batch_size)
+                        per_model_shapes[shape_key] = int(per_model_shapes.get(shape_key, 0)) + 1
                     if sync_timing and device.type == 'cuda':
                         torch.cuda.synchronize(device)
                     forward_time += time.perf_counter() - forward_t0
@@ -2118,6 +2244,10 @@ def central_inference_server(
                     raise
 
                 if bool(item.get("clear", False)):
+                    for runner in list(forward_graph_runners.values()):
+                        runner.clear()
+                    forward_graph_runners.clear()
+                    forward_graph_hot_shapes.clear()
                     models.clear()
                     model_specs.clear()
                     cache.clear()
@@ -2146,6 +2276,15 @@ def central_inference_server(
                         label = str(info.get("label", "model"))
                         if info.get("reused"):
                             return f"{label}(reused)"
+                        folded_pairs = int(info.get("folded_conv_bn_pairs", 0) or 0)
+                        if folded_pairs:
+                            return f"{label}(folded {folded_pairs} Conv-BN)"
+                        if info.get("fvi_inference_copy"):
+                            return (
+                                f"{label}(FVI scales folded "
+                                f"{info.get('fvi_scale_modules_folded', 0)}, "
+                                f"runtime {info.get('fvi_runtime_scale_modules', 0)})"
+                            )
                         warmup_s = info.get("warmup_s")
                         if warmup_s is not None:
                             return f"{label}(warmup {float(warmup_s):.2f}s)"
@@ -2495,5 +2634,27 @@ def central_inference_server(
         import traceback
         traceback.print_exc()
     finally:
+        graph_stats = {
+            label: runner.stats
+            for label, runner in sorted(forward_graph_runners.items())
+        }
+        for runner in list(forward_graph_runners.values()):
+            runner.clear()
+        forward_graph_runners.clear()
+        if profile_forward_shapes or profile_cuda_graphs:
+            histogram = {
+                label: {
+                    int(size): int(count)
+                    for size, count in sorted(shapes.items(), key=lambda item: int(item[0]))
+                }
+                for label, shapes in sorted(forward_shape_histogram.items())
+            } if profile_forward_shapes else {}
+            if control_queue is not None:
+                control_queue.put({
+                    "type": "forward_shape_diagnostics",
+                    "server_rank": int(compile_rank),
+                    "histogram": histogram,
+                    "cuda_graph_stats": graph_stats if profile_cuda_graphs else {},
+                })
         if prepare_executor is not None:
             prepare_executor.shutdown(wait=True, cancel_futures=True)

@@ -47,9 +47,8 @@ def architecture_scoped_file(path, architecture_id):
 def model_alias_file(path, architecture_id, alias_kind, rl_version=None):
     """Return the stable root-level alias for a model family.
 
-    V9 keeps its historical configured filename. V10 aliases use a short
-    family name independent of the profile's minor version (for example,
-    ``v10.0`` still maps to ``best_model_v10_il.pt``).
+    V9 keeps its historical configured filename. V10 aliases use a stable
+    family name independent of the displayed model version.
     """
     path = Path(path)
     architecture_id = str(architecture_id or "se_cnn_v9").strip()

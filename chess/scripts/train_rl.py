@@ -1071,33 +1071,59 @@ def _build_rl_optimizer_param_groups(model, rl_config, base_lr):
     buckets = {
         'backbone_decay': {'params': [], 'weight_decay': backbone_weight_decay},
         'backbone_no_decay': {'params': [], 'weight_decay': no_decay_weight_decay},
+        'backbone_fvi_beta': {'params': [], 'weight_decay': 0.0},
         'policy_decay': {'params': [], 'weight_decay': backbone_weight_decay},
         'policy_no_decay': {'params': [], 'weight_decay': no_decay_weight_decay},
+        'policy_fvi_beta': {'params': [], 'weight_decay': 0.0},
         'value_decay': {'params': [], 'weight_decay': backbone_weight_decay},
         'value_no_decay': {'params': [], 'weight_decay': no_decay_weight_decay},
+        'value_fvi_beta': {'params': [], 'weight_decay': 0.0},
     }
 
     def _family_for_name(name):
         lowered = name.lower()
+        while True:
+            if lowered.startswith('_orig_mod.'):
+                lowered = lowered[len('_orig_mod.'):]
+            elif lowered.startswith('module.'):
+                lowered = lowered[len('module.'):]
+            else:
+                break
         if (
-            lowered.startswith('value_')
-            or '.value_' in lowered
-            or lowered.startswith('moves_left_')
-            or '.moves_left_' in lowered
+            lowered.startswith((
+                'value_', 'bn_value_', 'moves_left_', 'bn_moves_left_',
+                'bn_search_q_',
+            ))
+            or any(token in lowered for token in (
+                '.value_', '.bn_value_', '.moves_left_', '.bn_moves_left_',
+                '.bn_search_q_',
+            ))
         ):
             return 'value'
-        if lowered.startswith('policy_') or '.policy_' in lowered:
+        if lowered.startswith((
+            'policy_', 'bn_policy_', 'soft_policy_', 'bn_soft_policy_',
+        )) or any(token in lowered for token in (
+            '.policy_', '.bn_policy_', '.soft_policy_', '.bn_soft_policy_',
+        )):
             return 'policy'
         return 'backbone'
 
     def _uses_no_decay(name, param):
         lowered = name.lower()
+        while True:
+            if lowered.startswith('_orig_mod.'):
+                lowered = lowered[len('_orig_mod.'):]
+            elif lowered.startswith('module.'):
+                lowered = lowered[len('module.'):]
+            else:
+                break
+        # Normalization scales and FVI channel offsets are vectors (or scalar parameters).
+        # Do not exempt every tensor whose branch name starts with ``bn_``:
+        # e.g. bn_policy_conv.weight is a convolution kernel and must decay.
         return (
-            param.ndim < 2
-            or lowered.endswith('.bias')
-            or lowered.endswith('_bias')
-            or 'bn' in lowered
-            or 'norm' in lowered
+            lowered.endswith('.beta')
+            or param.ndim < 2
+            or lowered.endswith(('.bias', '_bias', 'bias'))
         )
 
     param_groups = []
@@ -1106,7 +1132,11 @@ def _build_rl_optimizer_param_groups(model, rl_config, base_lr):
         if not param.requires_grad:
             continue
         family = _family_for_name(name)
-        decay_kind = 'no_decay' if _uses_no_decay(name, param) else 'decay'
+        decay_kind = (
+            'fvi_beta'
+            if name.lower().endswith('.beta')
+            else ('no_decay' if _uses_no_decay(name, param) else 'decay')
+        )
         bucket_name = f'{family}_{decay_kind}'
         buckets[bucket_name]['params'].append(param)
 
@@ -1143,7 +1173,12 @@ def _enforce_uniform_rl_optimizer_contract(optimizer, rl_config, current_lr=None
         group['lr_factor'] = 1.0
         group['lr'] = base_lr
         group_name = str(group.get('name', ''))
-        group['weight_decay'] = no_decay if group_name.endswith('no_decay') else decay
+        if group_name.endswith('fvi_beta'):
+            group['weight_decay'] = 0.0
+        else:
+            group['weight_decay'] = (
+                no_decay if group_name.endswith('no_decay') else decay
+            )
 
 
 def _merge_q_delta_histogram(target, key, source_hist=None, source_values=None):
@@ -6985,6 +7020,15 @@ def main(argv=None):
                 value_primary_loss_total = 0.0
                 value_scalar_aux_loss_total = 0.0
                 value_search_consistency_loss_total = 0.0
+                bn_head_loss_weight_total = 0.0
+                bn_policy_loss_total = 0.0
+                bn_value_loss_total = 0.0
+                soft_policy_loss_total = 0.0
+                soft_policy_main_loss_total = 0.0
+                soft_policy_bn_loss_total = 0.0
+                soft_policy_valid_rows_total = 0
+                soft_policy_loss_weight_total = 0.0
+                soft_policy_temperature_total = 0.0
                 moves_left_loss_total = 0.0
                 search_q_loss_total = 0.0
                 search_q_rows_total = 0
@@ -7243,6 +7287,33 @@ def main(argv=None):
                     value_search_consistency_loss_total += float(
                         policy_diagnostics.get('value_search_consistency_loss', 0.0) or 0.0
                     )
+                    bn_head_loss_weight_total += float(
+                        policy_diagnostics.get('bn_head_loss_weight', 0.0) or 0.0
+                    )
+                    bn_policy_loss_total += float(
+                        policy_diagnostics.get('bn_policy_loss', 0.0) or 0.0
+                    )
+                    bn_value_loss_total += float(
+                        policy_diagnostics.get('bn_value_loss', 0.0) or 0.0
+                    )
+                    soft_policy_loss_total += float(
+                        policy_diagnostics.get('soft_policy_loss', 0.0) or 0.0
+                    )
+                    soft_policy_main_loss_total += float(
+                        policy_diagnostics.get('soft_policy_main_loss', 0.0) or 0.0
+                    )
+                    soft_policy_bn_loss_total += float(
+                        policy_diagnostics.get('soft_policy_bn_loss', 0.0) or 0.0
+                    )
+                    soft_policy_valid_rows_total += int(
+                        policy_diagnostics.get('soft_policy_valid_rows', 0) or 0
+                    )
+                    soft_policy_loss_weight_total += float(
+                        policy_diagnostics.get('soft_policy_loss_weight', 0.0) or 0.0
+                    )
+                    soft_policy_temperature_total += float(
+                        policy_diagnostics.get('soft_policy_temperature', 0.0) or 0.0
+                    )
                     moves_left_loss_total += float(
                         policy_diagnostics.get('moves_left_loss', 0.0) or 0.0
                     )
@@ -7499,6 +7570,37 @@ def main(argv=None):
                     ),
                     'value_search_consistency_loss': (
                         value_search_consistency_loss_total / float(total_train_steps)
+                    ),
+                    # Existing policy/value metrics remain the deployment-head
+                    # losses returned by train_on_batch_rl. These additional
+                    # scalars expose the training-only BN/soft-policy branches.
+                    'bn_head_loss_weight': (
+                        bn_head_loss_weight_total / float(total_train_steps)
+                    ),
+                    'bn_policy_loss': (
+                        bn_policy_loss_total / float(total_train_steps)
+                    ),
+                    'bn_value_loss': (
+                        bn_value_loss_total / float(total_train_steps)
+                    ),
+                    'soft_policy_loss': (
+                        soft_policy_loss_total / float(total_train_steps)
+                    ),
+                    'soft_policy_main_loss': (
+                        soft_policy_main_loss_total / float(total_train_steps)
+                    ),
+                    'soft_policy_bn_loss': (
+                        soft_policy_bn_loss_total / float(total_train_steps)
+                    ),
+                    'soft_policy_valid_rows': int(soft_policy_valid_rows_total),
+                    'soft_policy_valid_fraction': (
+                        float(soft_policy_valid_rows_total) / float(max(1, policy_rows))
+                    ),
+                    'soft_policy_loss_weight': (
+                        soft_policy_loss_weight_total / float(total_train_steps)
+                    ),
+                    'soft_policy_temperature': (
+                        soft_policy_temperature_total / float(total_train_steps)
                     ),
                     'moves_left_loss': moves_left_loss_total / float(total_train_steps),
                     'search_q_loss': search_q_loss_total / float(total_train_steps),

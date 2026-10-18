@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 
 from src.models.contracts import (
+    V10_ARCHITECTURE_ID,
+    V10_DEFAULT_REPETITION_PLANE_MODE,
     legacy_model_spec,
     model_spec_from_config,
     validate_model_spec,
@@ -18,6 +20,20 @@ MODEL_REGISTRY = {
     "se_cnn_v9": SECNNV9,
     "nested_cnn_v10": NestedCNNV10,
 }
+
+
+def _with_model_spec_defaults(spec: dict) -> dict:
+    """Materialize compatibility defaults that old checkpoints omitted."""
+    normalized = deepcopy(spec)
+    if normalized.get("architecture_id") == V10_ARCHITECTURE_ID:
+        input_spec = normalized.setdefault("input_spec", {})
+        input_spec.setdefault(
+            "repetition_plane_mode", V10_DEFAULT_REPETITION_PLANE_MODE
+        )
+        normalized.setdefault("model_kwargs", {})[
+            "repetition_plane_mode"
+        ] = input_spec["repetition_plane_mode"]
+    return normalized
 
 
 def register_model(architecture_id: str, model_class) -> None:
@@ -41,6 +57,7 @@ def resolve_model_spec(
         spec = model_spec_from_config(config)
     else:
         spec = legacy_model_spec(checkpoint, config)
+    spec = _with_model_spec_defaults(spec)
     validate_model_spec(spec)
     validate_data_contract(spec)
     return spec
@@ -59,6 +76,10 @@ def config_for_model_spec(config: dict, spec: dict) -> dict:
         )
     )
     model_cfg["input_planes"] = int(spec["input_spec"]["input_planes"])
+    if spec["architecture_id"] == V10_ARCHITECTURE_ID:
+        model_cfg["repetition_plane_mode"] = spec["input_spec"].get(
+            "repetition_plane_mode", V10_DEFAULT_REPETITION_PLANE_MODE
+        )
     model_cfg["policy_codec_id"] = spec["policy_spec"]["codec_id"]
     model_cfg["value_head_id"] = spec.get("value_spec", {}).get(
         "head_id", "wdl_search_aux_v1"
@@ -73,6 +94,7 @@ def create_model(config: dict, *, model_spec: dict | None = None):
     spec = deepcopy(model_spec) if model_spec is not None else model_spec_from_config(
         config
     )
+    spec = _with_model_spec_defaults(spec)
     validate_model_spec(spec)
     validate_data_contract(spec)
     architecture_id = spec["architecture_id"]

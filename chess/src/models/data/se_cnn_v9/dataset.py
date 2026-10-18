@@ -4290,7 +4290,8 @@ class BinaryChessDataset(Dataset):
                  index_cache_path=None, use_index_mmap=True,
                  soft_targets=None, soft_target_paths=None, board_dtype='float32',
                  return_numpy=False, filter_stats=None,
-                 input_encoder_id='planes_history_v1'):
+                 input_encoder_id='planes_history_v1',
+                 repetition_plane_mode='unknown', repetition_sidecar_file=None):
         """
         Args:
             binary_file: Path to binary file
@@ -4311,6 +4312,29 @@ class BinaryChessDataset(Dataset):
         self.input_encoder_id = str(input_encoder_id or 'planes_history_v1')
         if self.input_encoder_id not in {'planes_history_v1', 'planes_history_v2'}:
             raise ValueError(f"Unsupported dataset input encoder: {self.input_encoder_id!r}")
+        self.repetition_plane_mode = 'unknown'
+        self.repetition_sidecar_file = None
+        if self.input_encoder_id == 'planes_history_v2':
+            from src.models.data.nested_cnn_v10.encoder import normalize_repetition_plane_mode
+
+            self.repetition_plane_mode = normalize_repetition_plane_mode(repetition_plane_mode)
+            if self.repetition_plane_mode == 'exact':
+                if not repetition_sidecar_file:
+                    raise ValueError(
+                        'v10 exact repetition mode requires a PGN repetition sidecar; '
+                        'reprocess the source PGNs with the exact v10 profile.'
+                    )
+                self.repetition_sidecar_file = str(repetition_sidecar_file)
+                sidecar_path = Path(self.repetition_sidecar_file)
+                expected_sidecar_size = Path(binary_file).stat().st_size // int(position_size)
+                if (
+                    not sidecar_path.exists()
+                    or sidecar_path.stat().st_size != expected_sidecar_size
+                ):
+                    raise ValueError(
+                        f'Invalid v10 repetition sidecar {sidecar_path}; '
+                        f'expected {expected_sidecar_size} bytes.'
+                    )
         self.game_length_by_id = game_length_by_id
         board_dtype = str(board_dtype or 'float32').strip().lower()
         self.board_np_dtype = np.float16 if board_dtype in {'float16', 'fp16', 'half'} else np.float32
@@ -4330,6 +4354,8 @@ class BinaryChessDataset(Dataset):
         )
         self._mmap = None
         self._file = None
+        self._repetition_mmap = None
+        self._repetition_file = None
         input_count = len(indices)
         self.indices = self._as_index_array(indices)
 
@@ -4382,6 +4408,8 @@ class BinaryChessDataset(Dataset):
         state = self.__dict__.copy()
         state['_mmap'] = None
         state['_file'] = None
+        state['_repetition_mmap'] = None
+        state['_repetition_file'] = None
         if self.use_index_mmap and self.index_cache_path:
             state['indices'] = None
         if self.soft_target_paths:
@@ -4392,6 +4420,8 @@ class BinaryChessDataset(Dataset):
         self.__dict__.update(state)
         self._mmap = None
         self._file = None
+        self._repetition_mmap = None
+        self._repetition_file = None
         if not hasattr(self, 'return_numpy'):
             self.return_numpy = False
         if self.indices is None and self.use_index_mmap and self.index_cache_path:
@@ -4404,6 +4434,22 @@ class BinaryChessDataset(Dataset):
         if self._mmap is None:
             self._file = open(self.binary_file, 'rb')
             self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        if self.repetition_sidecar_file and self._repetition_mmap is None:
+            self._repetition_file = open(self.repetition_sidecar_file, 'rb')
+            self._repetition_mmap = mmap.mmap(
+                self._repetition_file.fileno(), 0, access=mmap.ACCESS_READ
+            )
+
+    def _repetition_count_at(self, position_index):
+        if self._repetition_mmap is None:
+            return None
+        value = int(self._repetition_mmap[int(position_index)])
+        return None if value == 255 else min(2, value)
+
+    @staticmethod
+    def _set_repetition_plane(tensor, repetition_count):
+        value = -1.0 if repetition_count is None else min(2, int(repetition_count)) / 2.0
+        tensor[12].fill(value)
     
     def __len__(self):
         return len(self.indices)
@@ -4457,6 +4503,10 @@ class BinaryChessDataset(Dataset):
                 flip_perspective=is_black_turn,
                 dtype=self.board_np_dtype,
             )
+            if self.repetition_plane_mode == 'exact':
+                self._set_repetition_plane(
+                    board_tensor, self._repetition_count_at(position_idx)
+                )
             if board_tensor.shape != (20, 8, 8):
                 raise ValueError(
                     f"Invalid v10 current tensor shape: {board_tensor.shape} (expected (20, 8, 8))"
@@ -4500,6 +4550,10 @@ class BinaryChessDataset(Dataset):
                         flip_perspective=is_black_turn,
                         dtype=self.board_np_dtype,
                     )
+                    if self.repetition_plane_mode == 'exact':
+                        self._set_repetition_plane(
+                            hist_tensor, self._repetition_count_at(current_offset)
+                        )
                     history_tensors.append(hist_tensor[:13])
                 else:
                     hist_tensor = compact_to_tensor(hist_compact_board, flip_perspective=is_black_turn)
@@ -4516,9 +4570,8 @@ class BinaryChessDataset(Dataset):
                 history_tensors.insert(0, self._empty_history_tensor)
         
         if self.input_encoder_id == 'planes_history_v2':
-            # Prior positions carry only pieces + repetition. Compact PGN records
-            # do not preserve repetition provenance, so all such planes remain
-            # explicitly unknown (-1); the current frame retains its own metadata.
+            # Repetition planes are either the exact aligned PGN sidecar values
+            # or explicit unknown sentinels under the legacy checkpoint contract.
             if history_tensors:
                 all_tensors = history_tensors + [board_tensor[:13], board_tensor[13:20]]
             else:
@@ -4633,6 +4686,12 @@ class BinaryChessDataset(Dataset):
             mmap_obj.close()
         if file_obj is not None:
             file_obj.close()
+        repetition_mmap = getattr(self, '_repetition_mmap', None)
+        repetition_file = getattr(self, '_repetition_file', None)
+        if repetition_mmap is not None:
+            repetition_mmap.close()
+        if repetition_file is not None:
+            repetition_file.close()
 
 
 def _il_collate_value(values, key):
@@ -5388,6 +5447,32 @@ def create_dataloaders(metadata, config):
     index_cache_paths = _build_index_cache_paths(metadata, config)
     history_positions = config['model'].get('history_positions', 0)
     input_encoder_id = str(config.get('model', {}).get('input_encoder_id', 'planes_history_v1'))
+    repetition_plane_mode = 'unknown'
+    repetition_sidecar_file = None
+    if input_encoder_id == 'planes_history_v2':
+        from src.models.data.nested_cnn_v10.encoder import resolve_repetition_plane_mode
+
+        repetition_plane_mode = resolve_repetition_plane_mode(
+            model_config=config.get('model', {}) or {}
+        )
+        if repetition_plane_mode == 'exact':
+            repetition_sidecar_file = metadata.get('repetition_sidecar_file')
+            if (
+                not repetition_sidecar_file
+                or metadata.get('repetition_sidecar_format') != 'u8_occurrences_v1'
+            ):
+                raise ValueError(
+                    'v10 exact repetition mode requires preprocessing metadata with a '
+                    'u8_occurrences_v1 repetition_sidecar_file. Re-run PGN preprocessing '
+                    'using the exact v10 profile.'
+                )
+            repetition_path = Path(repetition_sidecar_file)
+            expected_bytes = int(total_positions)
+            if not repetition_path.exists() or repetition_path.stat().st_size != expected_bytes:
+                raise ValueError(
+                    f'Invalid v10 repetition sidecar {repetition_path}; '
+                    f'expected {expected_bytes} bytes for {total_positions} positions.'
+                )
     from src.models.data.registry import get_input_encoder
 
     encoder = get_input_encoder(input_encoder_id)
@@ -5741,6 +5826,8 @@ def create_dataloaders(metadata, config):
         return_numpy=dataloader_return_numpy,
         filter_stats=train_filter_stats,
         input_encoder_id=input_encoder_id,
+        repetition_plane_mode=repetition_plane_mode,
+        repetition_sidecar_file=repetition_sidecar_file,
     )
     if epoch_train_count is not None:
         train_dataset.epoch_sample_count = max(1, min(len(train_dataset), int(epoch_train_count)))
@@ -5759,6 +5846,8 @@ def create_dataloaders(metadata, config):
         return_numpy=dataloader_return_numpy,
         filter_stats=val_filter_stats,
         input_encoder_id=input_encoder_id,
+        repetition_plane_mode=repetition_plane_mode,
+        repetition_sidecar_file=repetition_sidecar_file,
     )
 
     # Debug: show progress histogram after per-game selection

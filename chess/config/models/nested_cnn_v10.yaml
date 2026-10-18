@@ -1,11 +1,26 @@
 # Independent v10 architecture and data contract. The se_cnn_v9 profile remains intact.
 model:
   architecture_id: "nested_cnn_v10"
-  version: "v10.0"
+  version: "v10"
+  normalization_mode: "fixed_variance_one_bn"
+  auxiliary_soft_policy: true
+  # The BN-normalized training branch carries 80% of the ordinary head loss;
+  # the unnormalized deployment branch carries the remaining 20%.
+  bn_head_loss_weight: 0.8
+  soft_policy_temperature: 4.0
+  # Conservative chess starting value; KataGo's Go-specific weighting is not
+  # assumed to transfer unchanged.
+  soft_policy_loss_weight: 0.25
+  # The value MLP consumes LayerNorm-normalized features; use fan-in He for
+  # its hidden WDL layers rather than scaling variance with output width.
+  value_hidden_init: "fan_in_he"
 
   history_positions: 4
   input_planes: 72
   input_encoder_id: "planes_history_v2"
+  # Fresh v10 training builds exact, position-aligned PGN repetition sidecars.
+  # Historical checkpoints keep the mode stored in their own model_spec.
+  repetition_plane_mode: "exact"
   policy_codec_id: "lc0_1858_v1"
   value_head_id: "wdl_search_aux_v1"
 
@@ -13,6 +28,8 @@ model:
   bottleneck_channels: 96
   outer_blocks: 6
   inner_residual_units: 2
+  # Trunk context uses identity-initialized global mean/max gated affine
+  # modulation. Policy-head context remains additive.
   global_pool_blocks: [2, 4, 6]
   drop_path_rate: 0.05
 

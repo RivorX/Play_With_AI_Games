@@ -87,6 +87,10 @@ reinforcement_learning:
   # completed-Q policy improvement below it.
   search:
     simulations: 192
+    # Interactive one-root searches otherwise shrink each batch to a quarter
+    # of the remaining budget, creating many tiny GPU calls. 0 preserves that
+    # legacy schedule; positive caps apply only to one root.
+    single_root_batch_cap: 0
     # Assign the complete budget before Sequential Halving. `simulations` is
     # the exact group average. Difficulty combines prior ambiguity/entropy,
     # branching and value uncertainty on a smooth 16-sim grid in the strict
@@ -242,6 +246,27 @@ hardware:
 central_inference:
   max_batch_size: 384            # Production 192-sim throughput optimum.
   flush_ms: 0.5                  # Coalesce concurrent MCTS requests.
+
+
+# ------------------------------------------------------------------------------
+# PLAY UI
+# ------------------------------------------------------------------------------
+play:
+  # Batch up to 32 leaves for the visible one-game UI search. Set to 0 to
+  # restore the legacy shrinking-batch schedule. This does not affect RL,
+  # UCI/Elo, or background multi-game matches.
+  single_game_mcts_batch_cap: 32
+  # Minimum on-screen time before a fast AI move is applied; background games
+  # and evaluation workers are unaffected. Set 0 to disable presentation pacing.
+  min_visible_move_seconds: 1.0
+  # Auto keeps a single-worker match in-process and only uses the central
+  # server when multiple workers can batch inference. Central compilation is
+  # opt-in because cold compile warmup delayed the first move by over a minute.
+  match_central_inference: auto
+  match_central_inference_compile: false
+  # Model matches end by chess rules. Set a positive ply count only for short
+  # diagnostic runs; capped games are unresolved and excluded from match score.
+  match_max_moves: null
 
 
 # ------------------------------------------------------------------------------

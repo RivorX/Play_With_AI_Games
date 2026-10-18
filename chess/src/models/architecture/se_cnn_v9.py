@@ -506,10 +506,11 @@ class SECNNV9(nn.Module):
         value = self.value_ln(value)
         value_hidden = F.silu(self.value_fc1(value), inplace=True)
         value = self.value_fc2(self.value_dropout(value_hidden))  # (B, 3) WDL logits
-        search_q_raw = self.search_q_fc(value_hidden)
 
         if not return_moves_left and not return_search_aux:
             return policy, value
+
+        search_q_raw = self.search_q_fc(value_hidden) if return_search_aux else None
 
         moves_left = None
         if return_moves_left:

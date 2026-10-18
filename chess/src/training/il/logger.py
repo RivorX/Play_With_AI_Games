@@ -308,7 +308,28 @@ class ILLoggerMixin:
                 getattr(self, attr).append(_csv_float(row, col, 0.0))
             self._ensure_il_gradient_storage()
             for key, column in zip(IL_GRADIENT_METRIC_KEYS, IL_GRADIENT_COLUMNS):
-                getattr(self, f'train_{key}').append(_csv_float(row, column, 0.0))
+                getattr(self, f'train_{key}').append(_csv_float(row, column, None))
+            # Older CSVs lack a validity marker, so all-zero probe triplets
+            # cannot be distinguished from unsupported probes. Treat them as
+            # missing instead of presenting them as evidence of neutral gradients.
+            policy_probe = _csv_float(row, 'train_grad_policy_probe_norm')
+            value_probe = _csv_float(row, 'train_grad_value_probe_norm')
+            if not (policy_probe is not None and policy_probe > 0.0) and not (
+                value_probe is not None and value_probe > 0.0
+            ):
+                policy_probe = None
+                value_probe = None
+            cosine = _csv_float(row, 'train_grad_policy_value_cosine')
+            if (
+                policy_probe is None
+                or value_probe is None
+                or policy_probe <= 0.0
+                or value_probe <= 0.0
+            ):
+                cosine = None
+            self.train_grad_policy_probe_norm[-1] = policy_probe
+            self.train_grad_value_probe_norm[-1] = value_probe
+            self.train_grad_policy_value_cosine[-1] = cosine
             if _csv_float(row, 'val_loss') is not None:
                 for attr, col in [
                     ('val_policy_top1', 'val_policy_top1'),
@@ -1683,28 +1704,40 @@ class ILLoggerMixin:
         self._ensure_il_gradient_storage()
 
         ax = axes[4, 0]
-        _style_axis(ax, 'Policy vs Value Gradient Interaction', 'Shared gradient norm (log)')
+        _style_axis(ax, 'Policy vs Value + Moves-Left Gradient Probe', 'Probe grad norm (log)')
         policy_probe = self.train_grad_policy_probe_norm
         value_probe = self.train_grad_value_probe_norm
         cosine_values = self.train_grad_policy_value_cosine
-        has_task_gradient = any(float(v or 0.0) != 0.0 for v in policy_probe + value_probe)
+        has_task_gradient = any(float(v or 0.0) > 0.0 for v in policy_probe + value_probe)
         if has_task_gradient:
-            _plot_line(ax, self.iterations, policy_probe, 'Policy @ shared tower', colors['train'], smooth=False)
-            _plot_line(ax, self.iterations, value_probe, 'Value @ shared tower', colors['value'], smooth=False)
+            policy_plot = [
+                float(v) if v is not None and float(v) > 0.0 else float('nan')
+                for v in policy_probe
+            ]
+            value_plot = [
+                float(v) if v is not None and float(v) > 0.0 else float('nan')
+                for v in value_probe
+            ]
+            cosine_plot = [
+                float(v) if v is not None else float('nan')
+                for v in cosine_values
+            ]
+            _plot_line(ax, self.iterations, policy_plot, 'Policy objective', colors['train'], marker='o', smooth=False)
+            _plot_line(ax, self.iterations, value_plot, 'Value + MLH objective', colors['value'], marker='o', smooth=False)
             ax.set_yscale('log')
             cosine_ax = ax.twinx()
-            _plot_line(cosine_ax, self.iterations, cosine_values, 'Policy/value cosine', colors['gap'], style='--', smooth=False)
+            _plot_line(cosine_ax, self.iterations, cosine_plot, 'Policy/value cosine', colors['gap'], style='--', marker='o', smooth=False)
             cosine_ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.0)
             cosine_ax.set_ylim(-1.05, 1.05)
             cosine_ax.tick_params(axis='y', labelcolor=colors['gap'])
             cosine_ax.spines['right'].set_alpha(0.18)
             ax.text(
-                0.02, 0.96, 'cosine: + support   0 neutral   - conflict',
+                0.02, 0.96, 'cosine: + aligned, - conflicting; value objective includes moves-left loss',
                 transform=ax.transAxes, ha='left', va='top', fontsize=7.5, color='#475569',
             )
             _legend_below(ax, cosine_ax, ncol=3)
         else:
-            _show_no_data(ax, 'Gradient telemetry is available in the next epoch')
+            _show_no_data(ax, 'No valid shared-norm probe samples recorded')
 
         ax = axes[4, 1]
         _style_axis(ax, 'Gradient Norms by Parameter Family', 'Gradient norm (log)')
@@ -2075,7 +2108,7 @@ class ILLoggerMixin:
         self._ensure_il_gradient_storage()
         for key in IL_GRADIENT_METRIC_KEYS:
             getattr(self, f'train_{key}').append(
-                train_metrics.get(key, 0.0) if train_metrics else 0.0
+                train_metrics.get(key) if train_metrics else None
             )
 
         if train_metrics:

@@ -242,6 +242,14 @@ class DatasetTracker:
             'action_size': ACTION_SIZE,
             'wdl_mode': 'always',
         }
+        model_cfg = config.get('model', {}) or {}
+        if (
+            str(model_cfg.get('input_encoder_id', '')) == 'planes_history_v2'
+            and str(model_cfg.get('repetition_plane_mode', 'unknown')).strip().lower() == 'exact'
+        ):
+            # Exact repetition labels are a separate aligned sidecar. Bump its
+            # cache contract without invalidating the long-lived v9/unknown cache.
+            relevant_config['repetition_sidecar'] = 'u8_occurrences_v1'
         
         config_str = json.dumps(relevant_config, sort_keys=True)
         return hashlib.md5(config_str.encode()).hexdigest()
@@ -267,6 +275,25 @@ class DatasetTracker:
             
             # Verify files still exist
             if binary_path.exists() and metadata_path.exists():
+                if str(config.get('model', {}).get('input_encoder_id', '')) == 'planes_history_v2' and str(
+                    config.get('model', {}).get('repetition_plane_mode', 'unknown')
+                ).strip().lower() == 'exact':
+                    try:
+                        with open(metadata_path, 'rb') as f:
+                            metadata = pickle.load(f)
+                        repetition_path = Path(metadata['repetition_sidecar_file'])
+                        if (
+                            metadata.get('repetition_sidecar_format') != 'u8_occurrences_v1'
+                            or
+                            not repetition_path.exists()
+                            or repetition_path.stat().st_size != int(metadata['total_positions'])
+                            or
+                            binary_path.stat().st_size
+                            != int(metadata['total_positions']) * int(metadata['position_size'])
+                        ):
+                            return None, None
+                    except (KeyError, OSError, TypeError, ValueError, pickle.PickleError):
+                        return None, None
                 return binary_path, metadata_path
         
         return None, None
@@ -349,6 +376,30 @@ def merge_binary_datasets(binary_files, metadata_files, output_binary, output_me
     for meta in all_metadata[1:]:
         if meta['position_size'] != position_size:
             raise ValueError("Cannot merge incompatible datasets! Different configs detected.")
+
+    repetition_sidecars = [meta.get('repetition_sidecar_file') for meta in all_metadata]
+    has_repetition_sidecar = any(repetition_sidecars)
+    if has_repetition_sidecar and not all(repetition_sidecars):
+        raise ValueError(
+            "Cannot merge datasets with mixed repetition provenance: every input must "
+            "have a repetition sidecar or none may have one. Reprocess the exact-mode inputs."
+        )
+    if has_repetition_sidecar:
+        for meta, sidecar in zip(all_metadata, repetition_sidecars):
+            sidecar_path = Path(sidecar)
+            expected_size = int(meta['total_positions'])
+            binary_path = Path(meta['binary_file'])
+            if (
+                meta.get('repetition_sidecar_format') != 'u8_occurrences_v1'
+                or not sidecar_path.exists()
+                or sidecar_path.stat().st_size != expected_size
+                or not binary_path.exists()
+                or binary_path.stat().st_size != expected_size * int(meta['position_size'])
+            ):
+                raise ValueError(
+                    f"Invalid repetition dataset {sidecar_path}: expected {expected_size} aligned "
+                    "records in both the binary and u8_occurrences_v1 sidecar."
+                )
     
     print(f"\n  ✅ All datasets compatible")
     print(f"  📊 Total positions: {total_positions:,}")
@@ -369,49 +420,78 @@ def merge_binary_datasets(binary_files, metadata_files, output_binary, output_me
         'offsets': [38],
         'itemsize': int(position_size),
     })
+    output_repetition_file = Path(str(output_binary) + '.repetition.bin')
+    output_repetition_building = Path(str(output_repetition_file) + '.building')
 
     # Rewrite GameIDs in large vectorized chunks. This keeps the same binary layout, but avoids
     # millions of tiny struct.unpack/pack calls while merging large PGN months.
     game_id_offset = 0
     
     with open(output_binary, 'wb') as outfile:
-        for i, (binary_file, meta) in enumerate(zip(binary_files, all_metadata), 1):
-            print(f"     Merging file {i}/{len(binary_files)}: {Path(binary_file).name} "
-                  f"(GameID offset: {game_id_offset})")
-            
-            file_positions = int(meta['total_positions'])
-            max_game_id_in_file = 0
-            
-            with open(binary_file, 'rb') as infile:
-                remaining = file_positions
-                while remaining > 0:
-                    requested_records = min(records_per_chunk, remaining)
-                    raw = infile.read(requested_records * int(position_size))
-                    if not raw:
-                        break
+        repetition_out = open(output_repetition_building, 'wb') if has_repetition_sidecar else None
+        try:
+            for i, (binary_file, meta) in enumerate(zip(binary_files, all_metadata), 1):
+                print(f"     Merging file {i}/{len(binary_files)}: {Path(binary_file).name} "
+                      f"(GameID offset: {game_id_offset})")
 
-                    actual_records = len(raw) // int(position_size)
-                    if actual_records <= 0:
-                        break
-                    if len(raw) != actual_records * int(position_size):
-                        raw = raw[:actual_records * int(position_size)]
+                file_positions = int(meta['total_positions'])
+                max_game_id_in_file = 0
+                repetition_in = (
+                    open(repetition_sidecars[i - 1], 'rb')
+                    if has_repetition_sidecar else None
+                )
+                try:
+                    with open(binary_file, 'rb') as infile:
+                        remaining = file_positions
+                        while remaining > 0:
+                            requested_records = min(records_per_chunk, remaining)
+                            raw = infile.read(requested_records * int(position_size))
+                            if not raw:
+                                break
 
-                    chunk = bytearray(raw)
-                    records = np.frombuffer(chunk, dtype=record_dtype, count=actual_records)
-                    game_ids = records['game_id']
-                    if len(game_ids):
-                        max_game_id_in_file = max(max_game_id_in_file, int(game_ids.max()))
-                        if game_id_offset:
-                            remapped = game_ids.astype(np.uint64, copy=False) + np.uint64(game_id_offset)
-                            if int(remapped.max()) > np.iinfo(np.uint32).max:
-                                raise ValueError("Merged GameID exceeds uint32 range.")
-                            game_ids[:] = remapped.astype(np.uint32, copy=False)
+                            actual_records = len(raw) // int(position_size)
+                            if actual_records <= 0:
+                                break
+                            if len(raw) != actual_records * int(position_size):
+                                raw = raw[:actual_records * int(position_size)]
 
-                    outfile.write(chunk)
-                    remaining -= actual_records
-            
-            # Next file's IDs start after the highest ID we just wrote
-            game_id_offset += max_game_id_in_file + 1
+                            if repetition_in is not None:
+                                repetition_chunk = repetition_in.read(actual_records)
+                                if len(repetition_chunk) != actual_records:
+                                    raise ValueError(
+                                        f"Repetition sidecar ended early for {Path(binary_file).name}."
+                                    )
+                                repetition_out.write(repetition_chunk)
+
+                            chunk = bytearray(raw)
+                            records = np.frombuffer(chunk, dtype=record_dtype, count=actual_records)
+                            game_ids = records['game_id']
+                            if len(game_ids):
+                                max_game_id_in_file = max(max_game_id_in_file, int(game_ids.max()))
+                                if game_id_offset:
+                                    remapped = game_ids.astype(np.uint64, copy=False) + np.uint64(game_id_offset)
+                                    if int(remapped.max()) > np.iinfo(np.uint32).max:
+                                        raise ValueError("Merged GameID exceeds uint32 range.")
+                                    game_ids[:] = remapped.astype(np.uint32, copy=False)
+
+                            outfile.write(chunk)
+                            remaining -= actual_records
+                    if repetition_in is not None and repetition_in.read(1):
+                        raise ValueError(
+                            f"Repetition sidecar contains extra records for {Path(binary_file).name}."
+                        )
+                finally:
+                    if repetition_in is not None:
+                        repetition_in.close()
+
+                # Next file's IDs start after the highest ID we just wrote.
+                game_id_offset += max_game_id_in_file + 1
+        finally:
+            if repetition_out is not None:
+                repetition_out.close()
+
+    if has_repetition_sidecar:
+        os.replace(output_repetition_building, output_repetition_file)
     
     # Create combined metadata
     combined_metadata = {
@@ -422,6 +502,11 @@ def merge_binary_datasets(binary_files, metadata_files, output_binary, output_me
         'source_files': [str(Path(meta['binary_file']).name) for meta in all_metadata],
         'merged_date': datetime.now().isoformat()
     }
+    if has_repetition_sidecar:
+        if output_repetition_file.stat().st_size != total_positions:
+            raise ValueError("Merged repetition sidecar does not align with merged positions.")
+        combined_metadata['repetition_sidecar_file'] = str(output_repetition_file)
+        combined_metadata['repetition_sidecar_format'] = 'u8_occurrences_v1'
     
     with open(output_metadata, 'wb') as f:
         pickle.dump(combined_metadata, f)
@@ -485,6 +570,7 @@ def _game_data_from_headers_moves(headers, move_objects):
         'black_elo': headers.get('BlackElo', '?'),
         'result': headers.get('Result', '*'),
         'termination': headers.get('Termination', ''),
+        'start_fen': headers.get('FEN') if headers.get('SetUp') == '1' else None,
         'moves': [move.uci() for move in move_objects],
     }
 
@@ -559,6 +645,7 @@ def _stream_pgn_positions_shard_worker(args):
         min_elo,
         max_moves_per_game,
         filters_cfg,
+        collect_repetition_counts,
     ) = args
     import chess.pgn
 
@@ -567,36 +654,67 @@ def _stream_pgn_positions_shard_worker(args):
     positions_written = 0
     parsed_games = 0
     Path(part_path).parent.mkdir(parents=True, exist_ok=True)
+    repetition_part_path = str(part_path) + '.repetition'
 
     with open(part_path, 'wb') as part_file:
-        with open(pgn_path, 'rb') as raw_file:
-            raw_file.seek(int(start_offset))
-            with io.TextIOWrapper(raw_file, encoding='utf-8', errors='ignore', newline='') as pgn_file:
-                for _ in range(int(game_count)):
-                    headers, move_objects = _read_mainline_game(pgn_file)
-                    if headers is None:
-                        break
-                    game_data = _game_data_from_headers_moves(headers, move_objects)
-                    parsed_games += 1
-                    signature = hashlib.md5(
-                        (str(game_data.get('result', '')) + '|' + ' '.join(game_data.get('moves') or [])).encode('utf-8')
-                    ).digest()
-                    filter_reason = _game_filter_reason(game_data, filters_cfg)
-                    start = int(part_file.tell())
-                    if filter_reason is None:
-                        positions = extract_positions_from_game_worker(
-                            (game_data, local_game_id, min_elo, max_moves_per_game, move_objects)
+        repetition_part_file = (
+            open(repetition_part_path, 'wb') if collect_repetition_counts else None
+        )
+        try:
+            with open(pgn_path, 'rb') as raw_file:
+                raw_file.seek(int(start_offset))
+                with io.TextIOWrapper(raw_file, encoding='utf-8', errors='ignore', newline='') as pgn_file:
+                    for _ in range(int(game_count)):
+                        headers, move_objects = _read_mainline_game(pgn_file)
+                        if headers is None:
+                            break
+                        game_data = _game_data_from_headers_moves(headers, move_objects)
+                        parsed_games += 1
+                        signature_payload = (
+                            str(game_data.get('result', '')) + '|'
+                            + str(game_data.get('start_fen') or '') + '|'
+                            + ' '.join(game_data.get('moves') or [])
                         )
-                        local_game_id += 1
-                        if positions:
-                            raw_positions = b''.join(positions)
-                            part_file.write(raw_positions)
-                            positions_written += len(positions)
-                    end = int(part_file.tell())
-                    games.append((signature, start, end, filter_reason))
+                        signature = hashlib.md5(signature_payload.encode('utf-8')).digest()
+                        filter_reason = _game_filter_reason(game_data, filters_cfg)
+                        start = int(part_file.tell())
+                        if filter_reason is None:
+                            extracted = extract_positions_from_game_worker((
+                                game_data,
+                                local_game_id,
+                                min_elo,
+                                max_moves_per_game,
+                                move_objects,
+                                collect_repetition_counts,
+                            ))
+                            local_game_id += 1
+                            if collect_repetition_counts:
+                                positions, repetition_counts = extracted
+                            else:
+                                positions = extracted
+                                repetition_counts = None
+                            if positions:
+                                raw_positions = b''.join(positions)
+                                part_file.write(raw_positions)
+                                positions_written += len(positions)
+                                if repetition_part_file is not None:
+                                    if len(repetition_counts) != len(positions):
+                                        raise ValueError(
+                                            'PGN repetition count sidecar lost position alignment.'
+                                        )
+                                    repetition_part_file.write(bytes(
+                                        255 if count is None else min(2, int(count))
+                                        for count in repetition_counts
+                                    ))
+                        end = int(part_file.tell())
+                        games.append((signature, start, end, filter_reason))
+        finally:
+            if repetition_part_file is not None:
+                repetition_part_file.close()
 
     return {
         'part_path': str(part_path),
+        'repetition_part_path': repetition_part_path if collect_repetition_counts else None,
         'games': games,
         'parsed_games': int(parsed_games),
         'positions': int(positions_written),
@@ -635,6 +753,13 @@ def _stream_pgn_to_binary(pgn_path, binary_file, config, workers):
     part_dir = Path(binary_file).parent / f'.{Path(binary_file).stem}_parts'
     temp_binary = Path(binary_file).with_suffix(Path(binary_file).suffix + '.building')
     filters_cfg = dict(data_cfg.get('game_filters', {}) or {})
+    model_cfg = config.get('model', {}) or {}
+    collect_repetition_counts = (
+        str(model_cfg.get('input_encoder_id', '')) == 'planes_history_v2'
+        and str(model_cfg.get('repetition_plane_mode', 'unknown')).strip().lower() == 'exact'
+    )
+    repetition_file = Path(str(binary_file) + '.repetition.bin')
+    temp_repetition_file = Path(str(repetition_file) + '.building')
     tasks = []
     for task_id, start_index in enumerate(range(0, len(offsets), games_per_task)):
         count = min(games_per_task, len(offsets) - start_index)
@@ -643,6 +768,7 @@ def _stream_pgn_to_binary(pgn_path, binary_file, config, workers):
             str(part_dir / f'shard_{task_id:04d}.bin'),
             int(data_cfg.get('min_elo', 0) or 0),
             int(data_cfg.get('max_moves_per_game', 0) or 0), filters_cfg,
+            collect_repetition_counts,
         ))
 
     if part_dir.exists():
@@ -683,31 +809,63 @@ def _stream_pgn_to_binary(pgn_path, binary_file, config, workers):
         next_game_id = 0
         written_positions = 0
         write_buffer = bytearray()
+        repetition_write_buffer = bytearray()
+        repetition_records_written = 0
         flush_threshold = 8 * 1024 * 1024
         position_size = get_position_size(history_positions=0)
         with open(temp_binary, 'wb') as output_file:
-            for result in results:
-                with open(result['part_path'], 'rb') as part_file:
-                    for signature, start, end, filter_reason in result['games']:
-                        if signature in seen_signatures:
-                            duplicate_count += 1
-                            continue
-                        seen_signatures.add(signature)
-                        if filter_reason is not None:
-                            filter_counts[filter_reason] += 1
-                            continue
-                        part_file.seek(int(start))
-                        raw_records = part_file.read(int(end) - int(start))
-                        if raw_records:
-                            remapped = _rewrite_game_id(raw_records, position_size, next_game_id)
-                            write_buffer.extend(remapped)
-                            written_positions += len(remapped) // position_size
-                            if len(write_buffer) >= flush_threshold:
-                                output_file.write(write_buffer)
-                                write_buffer.clear()
-                        next_game_id += 1
-            if write_buffer:
-                output_file.write(write_buffer)
+            repetition_output = (
+                open(temp_repetition_file, 'wb') if collect_repetition_counts else None
+            )
+            try:
+                for result in results:
+                    with open(result['part_path'], 'rb') as part_file:
+                        repetition_input = (
+                            open(result['repetition_part_path'], 'rb')
+                            if collect_repetition_counts else None
+                        )
+                        try:
+                            for signature, start, end, filter_reason in result['games']:
+                                if signature in seen_signatures:
+                                    duplicate_count += 1
+                                    continue
+                                seen_signatures.add(signature)
+                                if filter_reason is not None:
+                                    filter_counts[filter_reason] += 1
+                                    continue
+                                part_file.seek(int(start))
+                                raw_records = part_file.read(int(end) - int(start))
+                                if raw_records:
+                                    remapped = _rewrite_game_id(raw_records, position_size, next_game_id)
+                                    record_count = len(remapped) // position_size
+                                    write_buffer.extend(remapped)
+                                    written_positions += record_count
+                                    if repetition_input is not None:
+                                        repetition_input.seek(int(start) // position_size)
+                                        repetition_counts = repetition_input.read(record_count)
+                                        if len(repetition_counts) != record_count:
+                                            raise ValueError(
+                                                'PGN repetition sidecar is not aligned to position records.'
+                                            )
+                                        repetition_write_buffer.extend(repetition_counts)
+                                        repetition_records_written += record_count
+                                    if len(write_buffer) >= flush_threshold:
+                                        output_file.write(write_buffer)
+                                        write_buffer.clear()
+                                        if repetition_output is not None:
+                                            repetition_output.write(repetition_write_buffer)
+                                            repetition_write_buffer.clear()
+                                next_game_id += 1
+                        finally:
+                            if repetition_input is not None:
+                                repetition_input.close()
+                if write_buffer:
+                    output_file.write(write_buffer)
+                if repetition_output is not None and repetition_write_buffer:
+                    repetition_output.write(repetition_write_buffer)
+            finally:
+                if repetition_output is not None:
+                    repetition_output.close()
 
         if filters_cfg.get('enabled', False) or duplicate_count:
             kept_games = len(seen_signatures) - sum(filter_counts.values())
@@ -724,11 +882,19 @@ def _stream_pgn_to_binary(pgn_path, binary_file, config, workers):
             removed.extend(f'{count:,} {labels[name]}' for name, count in filter_counts.items() if count)
             suffix = f"  |  removed: {', '.join(removed)}" if removed else ''
             print(f"  Games: {len(seen_signatures):,} -> {kept_games:,} kept{suffix}")
+        if collect_repetition_counts:
+            if repetition_records_written != written_positions:
+                raise ValueError(
+                    'Final repetition sidecar does not align with the materialized PGN positions.'
+                )
+            os.replace(temp_repetition_file, repetition_file)
         os.replace(temp_binary, binary_file)
         return int(written_positions)
     except Exception:
         if temp_binary.exists():
             temp_binary.unlink()
+        if temp_repetition_file.exists():
+            temp_repetition_file.unlink()
         raise
     finally:
         shutil.rmtree(part_dir, ignore_errors=True)
@@ -747,7 +913,9 @@ def extract_positions_from_game_worker(args):
     🔧 FIXED BINARY FORMAT:
     [Board (38B)] + [GameID (4B)] + [MoveIdx (2B)] + [MoveTarget (2B)] + [Outcome (4B)] + [ActorElo (2B)]
     """
-    game_data, game_id, min_elo, max_moves_per_game, *optional_moves = args
+    game_data, game_id, min_elo, max_moves_per_game, *optional_args = args
+    collect_repetition_counts = bool(optional_args[1]) if len(optional_args) > 1 else False
+    empty_result = ([], []) if collect_repetition_counts else []
     
     import struct
     from src.game import backend as native_chess
@@ -765,25 +933,43 @@ def extract_positions_from_game_worker(args):
         black_elo = game_data['black_elo']
         
         if white_elo == '?' or black_elo == '?':
-            return []
+            return empty_result
         
         white_elo_int = int(white_elo)
         black_elo_int = int(black_elo)
         
         if white_elo_int < min_elo or black_elo_int < min_elo:
-            return []
+            return empty_result
         
         # Check game length (drop if too long)
-        moves = optional_moves[0] if optional_moves else game_data['moves']
+        moves = optional_args[0] if optional_args else game_data['moves']
         if max_moves_per_game and max_moves_per_game > 0 and len(moves) > max_moves_per_game:
-            return []
+            return empty_result
         
         # Replay game
-        board = native_chess.new_board()
+        start_fen = game_data.get('start_fen')
+        board = native_chess.new_board(start_fen) if start_fen else native_chess.new_board()
         result = game_data['result']
-        
+
         positions = []
-        move_idx = 0
+        repetition_counts = []
+        move_idx = max(
+            0,
+            (int(board.fullmove_number) - 1) * 2
+            + (1 if board.turn == native_chess.BLACK else 0),
+        )
+
+        repetition_board = None
+        repetition_known = False
+        seen_positions = {}
+        if collect_repetition_counts:
+            # A standard-start PGN proves the whole path. A FEN header supplies
+            # only the current board, so keep counts unknown until an irreversible
+            # move removes all possible prehistory from repetition consideration.
+            repetition_board = chess.Board(start_fen) if start_fen else chess.Board()
+            repetition_known = start_fen is None
+            if repetition_known:
+                seen_positions[repetition_board._transposition_key()] = 1
         
         moves_are_objects = bool(moves) and isinstance(moves[0], chess.Move)
         for raw_move in moves:
@@ -792,6 +978,20 @@ def extract_positions_from_game_worker(args):
                 move = native_chess.move_from_uci(move_uci)
                 if move is None:
                     break
+                repetition_count = None
+                repetition_move = None
+                repetition_irreversible = False
+                if repetition_board is not None:
+                    repetition_move = (
+                        raw_move if moves_are_objects
+                        else repetition_board.parse_uci(move_uci)
+                    )
+                    if repetition_known:
+                        prior_occurrences = seen_positions.get(
+                            repetition_board._transposition_key(), 1
+                        ) - 1
+                        repetition_count = min(2, max(0, int(prior_occurrences)))
+                    repetition_irreversible = repetition_board.is_irreversible(repetition_move)
                 # chess.pgn already validates mainline moves while parsing SAN.
                 # Re-generating every legal move here costs ~15% of preprocessing
                 # time and does not add safety for these parsed mainlines.
@@ -819,18 +1019,28 @@ def extract_positions_from_game_worker(args):
                 )
                 
                 positions.append(position_data)
+                if repetition_board is not None:
+                    repetition_counts.append(repetition_count)
                 
                 # Make move and increment index
                 native_chess.apply_move(board, move)
+                if repetition_board is not None:
+                    repetition_board.push(repetition_move)
+                    if repetition_irreversible:
+                        seen_positions.clear()
+                        repetition_known = True
+                    if repetition_known:
+                        next_key = repetition_board._transposition_key()
+                        seen_positions[next_key] = seen_positions.get(next_key, 0) + 1
                 move_idx += 1
                 
             except Exception as e:
                 break
         
-        return positions
+        return (positions, repetition_counts) if collect_repetition_counts else positions
         
     except Exception as e:
-        return []
+        return empty_result
 
 
 def get_dataset_metadata(binary_file, config):
@@ -854,6 +1064,19 @@ def get_dataset_metadata(binary_file, config):
         'input_planes': 16,  # 🔧 v4.5 FIX: 16 planes (12 pieces + 4 metadata)
         'created_date': datetime.now().isoformat()
     }
+    model_cfg = config.get('model', {}) or {}
+    if (
+        str(model_cfg.get('input_encoder_id', '')) == 'planes_history_v2'
+        and str(model_cfg.get('repetition_plane_mode', 'unknown')).strip().lower() == 'exact'
+    ):
+        repetition_file = Path(str(binary_file) + '.repetition.bin')
+        if not repetition_file.exists() or repetition_file.stat().st_size != total_positions:
+            raise ValueError(
+                f"Exact repetition sidecar is missing or misaligned: {repetition_file}; "
+                f"expected {total_positions} bytes."
+            )
+        metadata['repetition_sidecar_file'] = str(repetition_file)
+        metadata['repetition_sidecar_format'] = 'u8_occurrences_v1'
     
     return metadata
 
@@ -931,7 +1154,23 @@ def process_pgn_files(pgn_files, config):
                 flush=True,
             )
             
-            binary_file = preprocessing_dir / f"{Path(pgn_file).stem}_positions.bin"
+            model_cfg = config.get('model', {}) or {}
+            exact_repetition = (
+                str(model_cfg.get('input_encoder_id', '')) == 'planes_history_v2'
+                and str(model_cfg.get('repetition_plane_mode', 'unknown')).strip().lower() == 'exact'
+            )
+            if exact_repetition:
+                config_hash = tracker._compute_config_hash(config)
+                pgn_hash = tracker._compute_file_hash(pgn_file)
+                binary_file = preprocessing_dir / (
+                    f"{Path(pgn_file).stem}_{pgn_hash}_{config_hash}_positions.bin"
+                )
+                metadata_file = preprocessing_dir / (
+                    f"{Path(pgn_file).stem}_{pgn_hash}_{config_hash}_meta.pkl"
+                )
+            else:
+                binary_file = preprocessing_dir / f"{Path(pgn_file).stem}_positions.bin"
+                metadata_file = preprocessing_dir / f"{Path(pgn_file).stem}_meta.pkl"
             position_count = _stream_pgn_to_binary(
                 pgn_file,
                 binary_file,
@@ -942,11 +1181,13 @@ def process_pgn_files(pgn_files, config):
                 print("  ⚠️ No positions extracted!")
                 if binary_file.exists():
                     binary_file.unlink()
+                stale_repetition = Path(str(binary_file) + '.repetition.bin')
+                if stale_repetition.exists():
+                    stale_repetition.unlink()
                 continue
             
             # The final binary is atomically ready; now persist its metadata.
             metadata = get_dataset_metadata(binary_file, config)
-            metadata_file = preprocessing_dir / f"{Path(pgn_file).stem}_meta.pkl"
             
             with open(metadata_file, 'wb') as f:
                 pickle.dump(metadata, f)

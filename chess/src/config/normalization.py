@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 
 
 def _with_defaults(defaults, values):
@@ -165,9 +166,20 @@ _CENTRAL_INFERENCE_DEFAULTS = {
 }
 
 _PLAY_DEFAULTS = {
+    # Minimum time a completed move remains visible in the local play screen.
+    # This is consumed only by the GUI turn worker, never by match/eval workers.
+    'min_visible_move_seconds': 1.0,
     'match_workers': 'auto',
     'match_batch_games': 'auto',
-    'match_max_moves': 220,
+    # Auto uses the already-loaded in-process models for a one-worker match;
+    # central GPU batching remains available when multiple MCTS workers help.
+    'match_central_inference': 'auto',
+    # Play sessions are short-lived, so cold torch.compile warmup is usually
+    # slower than eager startup. Set true only when the process/cache is warm.
+    'match_central_inference_compile': False,
+    # None means GUI matches end only on a legal chess result. Set a positive
+    # ply count explicitly for short diagnostic matches.
+    'match_max_moves': None,
 }
 
 _LOGGING_DEFAULTS = {
@@ -310,6 +322,7 @@ _RL_DEFAULTS = {
     'self_play_randomize_learner_color': True, 'self_play_store_frozen_best_positions': False,
     'mcts_gumbel_c_scale': 0.10, 'mcts_gumbel_q_range_floor': 0.25,
     'mcts_gumbel_target_temperature': 0.95,
+    'mcts_single_root_batch_cap': 0,
     'mcts_reuse_tree': True, 'mcts_tree_reuse_visit_credit_enabled': True,
     'mcts_cache_history_tensors': True,
     'mcts_temperature': 0.0, 'mcts_temperature_threshold': 0,
@@ -515,6 +528,17 @@ def normalize_config(config):
         config.get('central_inference', {}),
     )
     config['play'] = _with_defaults(_PLAY_DEFAULTS, config.get('play', {}))
+    try:
+        visible_seconds = float(config['play']['min_visible_move_seconds'])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            'play.min_visible_move_seconds must be a finite non-negative number'
+        ) from exc
+    if not math.isfinite(visible_seconds) or visible_seconds < 0:
+        raise ValueError(
+            'play.min_visible_move_seconds must be a finite non-negative number'
+        )
+    config['play']['min_visible_move_seconds'] = visible_seconds
     config['logging'] = _with_defaults(
         _LOGGING_DEFAULTS,
         config.get('logging', {}),

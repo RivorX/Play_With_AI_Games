@@ -15,20 +15,69 @@ from src.models.data.se_cnn_v9.helpers import (
 
 from .loss import CombinedLoss
 from src.common.metrics import MetricsCalculator
+from src.training.soft_policy import (
+    legal_masked_soft_policy_loss_from_prepared,
+    prepare_legal_masked_soft_policy_target,
+)
 
 
 _IL_HFLIP_FORWARD_INDEX_MAP = None
 
 
+def _unwrap_model_for_training_capabilities(model):
+    """Follow common wrappers so capability flags survive compile/DDP wrappers."""
+    seen = set()
+    current = model
+    while id(current) not in seen:
+        seen.add(id(current))
+        next_model = getattr(current, "_orig_mod", None)
+        if next_model is None:
+            next_model = getattr(current, "module", None)
+        if next_model is None:
+            break
+        current = next_model
+    return current
+
+
+def _supports_training_aux(model):
+    return bool(getattr(_unwrap_model_for_training_capabilities(model), "supports_training_aux", False))
+
+
+def _branch_predictions(outputs):
+    """Translate a model's four-head training tuple to CombinedLoss inputs."""
+    if not isinstance(outputs, (tuple, list)) or len(outputs) < 3:
+        raise TypeError("V10 training branches must return policy, WDL, and moves-left outputs")
+    policy_logits, value_logits, moves_left = outputs[:3]
+    return {
+        "policy": policy_logits,
+        "value": value_logits,
+        "moves_left": moves_left,
+    }
+
+
 def _gradient_family(name):
     lowered = str(name).lower()
-    if lowered.startswith('policy_') or '.policy_' in lowered:
+    while True:
+        if lowered.startswith('_orig_mod.'):
+            lowered = lowered[len('_orig_mod.'):]
+        elif lowered.startswith('module.'):
+            lowered = lowered[len('module.'):]
+        else:
+            break
+    if lowered.startswith(('policy_', 'bn_policy_', 'soft_policy_', 'bn_soft_policy_')) or any(
+        token in lowered
+        for token in ('.policy_', '.bn_policy_', '.soft_policy_', '.bn_soft_policy_')
+    ):
         return 'policy'
     if (
-        lowered.startswith('value_')
-        or '.value_' in lowered
-        or lowered.startswith('moves_left_')
-        or '.moves_left_' in lowered
+        lowered.startswith((
+            'value_', 'bn_value_', 'moves_left_', 'bn_moves_left_',
+            'bn_search_q_',
+        ))
+        or any(token in lowered for token in (
+            '.value_', '.bn_value_', '.moves_left_', '.bn_moves_left_',
+            '.bn_search_q_',
+        ))
     ):
         return 'value'
     return 'backbone'
@@ -49,13 +98,24 @@ def _gradient_family_norms(model):
 
 
 def _task_gradient_probe(policy_objective, value_objective, model):
-    """Measure policy/value agreement at the output of the shared tower."""
-    probe_owner = getattr(model, '_orig_mod', model)
-    probe = getattr(getattr(probe_owner, 'final_bn', None), 'weight', None)
+    """Measure task interaction on a shared norm or final trunk projection.
+
+    V9 uses ``final_bn``. V10 has no trainable final trunk norm, so probe its
+    last shared expansion convolution instead. This is not a full-backbone norm.
+    """
+    probe_owner = _unwrap_model_for_training_capabilities(model)
+    probe_layer = getattr(probe_owner, 'final_norm', None)
+    if probe_layer is None:
+        probe_layer = getattr(probe_owner, 'final_bn', None)
+    probe = getattr(probe_layer, 'weight', None)
+    if probe is None:
+        tower = getattr(probe_owner, 'residual_tower', None)
+        if tower:
+            probe = getattr(getattr(tower[-1], 'expand', None), 'weight', None)
     empty = {
-        'policy_probe_norm': 0.0,
-        'value_probe_norm': 0.0,
-        'policy_value_cosine': 0.0,
+        'policy_probe_norm': None,
+        'value_probe_norm': None,
+        'policy_value_cosine': None,
     }
     if probe is None or not probe.requires_grad:
         return empty
@@ -65,22 +125,24 @@ def _task_gradient_probe(policy_objective, value_objective, model):
     value_grad = torch.autograd.grad(
         value_objective, probe, retain_graph=True, allow_unused=True,
     )[0]
-    if policy_grad is None or value_grad is None:
-        return empty
-    policy_flat = policy_grad.detach().float().reshape(-1)
-    value_flat = value_grad.detach().float().reshape(-1)
-    policy_norm = torch.linalg.vector_norm(policy_flat)
-    value_norm = torch.linalg.vector_norm(value_flat)
-    denominator = policy_norm * value_norm
-    cosine = (
-        torch.dot(policy_flat, value_flat) / denominator
-        if float(denominator.item()) > 0.0
-        else torch.zeros((), device=policy_flat.device)
-    )
+    policy_flat = policy_grad.detach().float().reshape(-1) if policy_grad is not None else None
+    value_flat = value_grad.detach().float().reshape(-1) if value_grad is not None else None
+    policy_norm = torch.linalg.vector_norm(policy_flat) if policy_flat is not None else None
+    value_norm = torch.linalg.vector_norm(value_flat) if value_flat is not None else None
+    cosine = None
+    if (
+        policy_flat is not None
+        and value_flat is not None
+        and float(policy_norm.item()) > 0.0
+        and float(value_norm.item()) > 0.0
+    ):
+        cosine = torch.dot(policy_flat, value_flat) / (policy_norm * value_norm)
     return {
-        'policy_probe_norm': float(policy_norm.item()),
-        'value_probe_norm': float(value_norm.item()),
-        'policy_value_cosine': float(torch.clamp(cosine, -1.0, 1.0).item()),
+        'policy_probe_norm': float(policy_norm.item()) if policy_norm is not None else None,
+        'value_probe_norm': float(value_norm.item()) if value_norm is not None else None,
+        'policy_value_cosine': (
+            float(torch.clamp(cosine, -1.0, 1.0).item()) if cosine is not None else None
+        ),
     }
 
 
@@ -403,6 +465,22 @@ def train_epoch_il(
         Tuple of (losses_dict, metrics_dict, profile_stats or None)
     """
     model.train()
+    v10_aux_enabled = _supports_training_aux(model)
+    model_cfg = config.get('model', {}) or {}
+    bn_head_loss_weight = float(model_cfg.get('bn_head_loss_weight', 0.8)) if v10_aux_enabled else 0.0
+    soft_policy_temperature = float(model_cfg.get('soft_policy_temperature', 4.0)) if v10_aux_enabled else 4.0
+    soft_policy_loss_weight = float(model_cfg.get('soft_policy_loss_weight', 0.25)) if v10_aux_enabled else 0.0
+    if v10_aux_enabled:
+        if not 0.0 <= bn_head_loss_weight <= 1.0:
+            raise ValueError(f"model.bn_head_loss_weight must be in [0, 1], got {bn_head_loss_weight}")
+        if soft_policy_temperature <= 0.0:
+            raise ValueError(
+                f"model.soft_policy_temperature must be positive, got {soft_policy_temperature}"
+            )
+        if soft_policy_loss_weight < 0.0:
+            raise ValueError(
+                f"model.soft_policy_loss_weight must be non-negative, got {soft_policy_loss_weight}"
+            )
 
     debug_cfg = config.get('debug', {}) or {}
     il_debug_cfg = debug_cfg.get('il', {}) or {}
@@ -422,14 +500,17 @@ def train_epoch_il(
     total_policy_loss = 0
     total_value_loss = 0
     total_moves_left_loss = 0
+    total_optimization_objective = None
+    total_bn_branch_loss = None
+    total_soft_policy_aux_loss = None
     grad_total_norm_sum = 0.0
     grad_clip_scale_sum = 0.0
     grad_clipped_batches = 0
     gradient_family_norms = {'backbone': 0.0, 'policy': 0.0, 'value': 0.0}
     task_gradient_diagnostics = {
-        'policy_probe_norm': 0.0,
-        'value_probe_norm': 0.0,
-        'policy_value_cosine': 0.0,
+        'policy_probe_norm': None,
+        'value_probe_norm': None,
+        'policy_value_cosine': None,
     }
     
     metrics_calc = MetricsCalculator()
@@ -535,6 +616,7 @@ def train_epoch_il(
             value_wdl = batch_data.get('value_wdl', None)
             occurrence_count = batch_data.get('occurrence_count', None)
             sample_weight = batch_data.get('sample_weight', None)
+            policy_sample_weight = batch_data.get('policy_sample_weight', sample_weight)
             value_sample_weight = batch_data.get('value_sample_weight', None)
             moves_left_log = batch_data.get('moves_left_log', None)
             policy_mass_kept = batch_data.get('policy_mass_kept', None)
@@ -555,6 +637,7 @@ def train_epoch_il(
             value_wdl = None
             occurrence_count = None
             sample_weight = None
+            policy_sample_weight = None
             value_sample_weight = None
             moves_left_log = None
             policy_mass_kept = None
@@ -581,6 +664,8 @@ def train_epoch_il(
             occurrence_count = occurrence_count.to(device, non_blocking=non_blocking)
         if sample_weight is not None:
             sample_weight = sample_weight.to(device, non_blocking=non_blocking)
+        if policy_sample_weight is not None:
+            policy_sample_weight = policy_sample_weight.to(device, non_blocking=non_blocking)
         if value_sample_weight is not None:
             value_sample_weight = value_sample_weight.to(device, non_blocking=non_blocking)
         if moves_left_log is not None:
@@ -613,21 +698,6 @@ def train_epoch_il(
             t0 = time.perf_counter()
         
         with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-            # Forward pass
-            policy_pred, value_pred, moves_left_pred = model(
-                boards,
-                apply_log_softmax=False,
-                return_moves_left=True,
-            )
-            
-            # đź†• v4.3: Compute loss using CombinedLoss
-            # Pack predictions and targets for CombinedLoss
-            predictions = {
-                'policy': policy_pred,
-                'moves_left': moves_left_pred,
-                'value': value_pred,  # đź†• Now (B, 3) WDL logits!
-            }
-                
             targets = {
                 'moves': moves,
                 'values': outcomes,  # Still scalar {-1, 0, +1}
@@ -641,6 +711,8 @@ def train_epoch_il(
                 targets['value_wdl'] = value_wdl
             if sample_weight is not None:
                 targets['sample_weight'] = sample_weight
+            if policy_sample_weight is not None:
+                targets['policy_sample_weight'] = policy_sample_weight
             if value_sample_weight is not None:
                 targets['value_sample_weight'] = value_sample_weight
             if moves_left_log is not None:
@@ -654,6 +726,33 @@ def train_epoch_il(
                             - move_indices.reshape(-1).to(dtype=torch.float32),
                             min=0.0,
                         )
+
+            if v10_aux_enabled:
+                training_outputs = model(
+                    boards,
+                    apply_log_softmax=False,
+                    return_moves_left=True,
+                    return_training_aux=True,
+                )
+                if not isinstance(training_outputs, dict):
+                    raise TypeError("V10 return_training_aux=True must return a mapping")
+                main_predictions = _branch_predictions(training_outputs['main'])
+                bn_predictions = _branch_predictions(training_outputs['bn'])
+            else:
+                policy_pred, value_pred, moves_left_pred = model(
+                    boards,
+                    apply_log_softmax=False,
+                    return_moves_left=True,
+                )
+                main_predictions = {
+                    'policy': policy_pred,
+                    'moves_left': moves_left_pred,
+                    'value': value_pred,
+                }
+            policy_pred = main_predictions['policy']
+            value_pred = main_predictions['value']
+            moves_left_pred = main_predictions['moves_left']
+
             # đź”Ť DIAGNOSTIC: Print WDL predictions for first batch
             if show_batch0_diagnostics and first_batch_predictions and batch_idx == 0:
                 wdl_probs = torch.softmax(value_pred[:10], dim=1)
@@ -672,11 +771,69 @@ def train_epoch_il(
                 first_batch_predictions = False
                 
 
-            # Single loss computation
-            loss, loss_dict = criterion(predictions, targets)
+            # Keep the unweighted inference-head metrics comparable with
+            # validation; optimize both V10 branches and the training-only soft
+            # policy heads through the separate `loss` tensor.
+            main_loss, loss_dict = criterion(main_predictions, targets)
+            loss = main_loss
+            policy_objective = loss_dict.pop('_policy_objective')
+            value_objective = loss_dict.pop('_value_objective')
+            optimization_loss = main_loss
+            bn_branch_loss = torch.zeros((), device=main_loss.device, dtype=main_loss.dtype)
+            soft_policy_aux_loss = torch.zeros((), device=main_loss.device, dtype=main_loss.dtype)
 
-        policy_objective = loss_dict.pop('_policy_objective')
-        value_objective = loss_dict.pop('_value_objective')
+            if v10_aux_enabled:
+                bn_loss, bn_loss_dict = criterion(
+                    bn_predictions,
+                    targets,
+                    include_scalar_metrics=False,
+                )
+                bn_policy_objective = bn_loss_dict.pop('_policy_objective')
+                bn_value_objective = bn_loss_dict.pop('_value_objective')
+                main_weight = 1.0 - bn_head_loss_weight
+                supervised_objective = main_loss * main_weight + bn_loss * bn_head_loss_weight
+                policy_objective = (
+                    policy_objective * main_weight
+                    + bn_policy_objective * bn_head_loss_weight
+                )
+                value_objective = (
+                    value_objective * main_weight
+                    + bn_value_objective * bn_head_loss_weight
+                )
+                bn_branch_loss = bn_loss.detach()
+
+                if (
+                    soft_policy_loss_weight > 0.0
+                    and policy_indices is not None
+                    and policy_values is not None
+                ):
+                    soft_target = (policy_indices, policy_values)
+                    prepared_soft_target = prepare_legal_masked_soft_policy_target(
+                        training_outputs['soft_policy'],
+                        soft_target,
+                        row_weights=policy_sample_weight,
+                        temperature=soft_policy_temperature,
+                    )
+                    main_soft_loss, _, _ = legal_masked_soft_policy_loss_from_prepared(
+                        training_outputs['soft_policy'], prepared_soft_target
+                    )
+                    bn_soft_loss, _, _ = legal_masked_soft_policy_loss_from_prepared(
+                        training_outputs['bn_soft_policy'], prepared_soft_target
+                    )
+                    soft_policy_aux_loss = (
+                        main_soft_loss * main_weight
+                        + bn_soft_loss * bn_head_loss_weight
+                    )
+                    policy_objective = (
+                        policy_objective + soft_policy_aux_loss * soft_policy_loss_weight
+                    )
+
+                optimization_loss = (
+                    supervised_objective
+                    + soft_policy_aux_loss * soft_policy_loss_weight
+                )
+                loss = optimization_loss
+
         if batch_idx == 0:
             task_gradient_diagnostics = _task_gradient_probe(
                 policy_objective,
@@ -802,6 +959,22 @@ def train_epoch_il(
         total_policy_loss += loss_dict['policy']
         total_value_loss += loss_dict['value']
         total_moves_left_loss += loss_dict.get('moves_left', 0.0)
+        optimization_batch = optimization_loss.detach().float()
+        bn_batch = bn_branch_loss.detach().float()
+        soft_batch = soft_policy_aux_loss.detach().float()
+        total_optimization_objective = (
+            optimization_batch
+            if total_optimization_objective is None
+            else total_optimization_objective + optimization_batch
+        )
+        total_bn_branch_loss = (
+            bn_batch if total_bn_branch_loss is None else total_bn_branch_loss + bn_batch
+        )
+        total_soft_policy_aux_loss = (
+            soft_batch
+            if total_soft_policy_aux_loss is None
+            else total_soft_policy_aux_loss + soft_batch
+        )
         
         # Update progress bar less often; formatting and terminal writes are
         # surprisingly expensive with very large IL batches.
@@ -835,7 +1008,19 @@ def train_epoch_il(
         'policy': total_policy_loss / n,
         'value': total_value_loss / n,
         'moves_left': total_moves_left_loss / n,
+        'optimization_total': (
+            float(total_optimization_objective.item()) / n
+            if total_optimization_objective is not None else 0.0
+        ),
     }
+    if v10_aux_enabled:
+        losses['bn_branch_total'] = (
+            float(total_bn_branch_loss.item()) / n if total_bn_branch_loss is not None else 0.0
+        )
+        losses['soft_policy_aux'] = (
+            float(total_soft_policy_aux_loss.item()) / n
+            if total_soft_policy_aux_loss is not None else 0.0
+        )
     
     metrics = metrics_calc.compute()
     metrics.update({

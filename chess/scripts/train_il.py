@@ -60,7 +60,10 @@ from src.training.il.startup import (
     ask_il_start_mode,
     has_il_checkpoints,
 )
-from src.training.il.auto_tune import resolve_il_hyperparameters
+from src.training.il.auto_tune import (
+    resolve_il_hyperparameters,
+    validate_v10_il_training_compile_path,
+)
 from src.training.il.elo_async import ILEloCoordinator
 from src.training.il.checkpointing import (
     build_runtime_state,
@@ -91,6 +94,95 @@ from src.models.view import (
 
 _LAST_RUN_LOG_CSV = None
 _LAST_RUN_LOG_PNG = None
+
+
+def _build_il_optimizer_param_groups(named_params, base_lr, value_head_lr_factor):
+    """Create IL AdamW groups while exempting learnable FVI beta from decay."""
+    named_params = list(named_params)
+    base_lr = float(base_lr)
+    value_head_lr_factor = float(value_head_lr_factor)
+    beta_params = [param for name, param in named_params if name.endswith('.beta')]
+    beta_ids = {id(param) for param in beta_params}
+    value_head_params = [
+        param
+        for name, param in named_params
+        if id(param) not in beta_ids and ('value_' in name or 'moves_left_' in name)
+    ]
+    value_head_ids = {id(param) for param in value_head_params}
+    other_params = [
+        param
+        for _, param in named_params
+        if id(param) not in beta_ids and id(param) not in value_head_ids
+    ]
+
+    # Keep v9/legacy-v10 groups byte-for-byte equivalent. The additional
+    # zero-decay groups exist only when learnable FVI offsets are present.
+    if not beta_params:
+        if value_head_lr_factor != 1.0:
+            return [
+                {'params': other_params, 'lr': base_lr, 'lr_multiplier': 1.0},
+                {
+                    'params': value_head_params,
+                    'lr': base_lr * value_head_lr_factor,
+                    'lr_multiplier': value_head_lr_factor,
+                },
+            ]
+        return [{
+            'params': [param for _, param in named_params],
+            'lr': base_lr,
+            'lr_multiplier': 1.0,
+        }]
+
+    if value_head_lr_factor != 1.0:
+        beta_value_params = [
+            param
+            for name, param in named_params
+            if id(param) in beta_ids and ('value_' in name or 'moves_left_' in name)
+        ]
+        beta_value_ids = {id(param) for param in beta_value_params}
+        beta_other_params = [
+            param
+            for _, param in named_params
+            if id(param) in beta_ids and id(param) not in beta_value_ids
+        ]
+        groups = []
+        if other_params:
+            groups.append({'params': other_params, 'lr': base_lr, 'lr_multiplier': 1.0})
+        if value_head_params:
+            groups.append({
+                'params': value_head_params,
+                'lr': base_lr * value_head_lr_factor,
+                'lr_multiplier': value_head_lr_factor,
+            })
+        if beta_other_params:
+            groups.append({
+                'params': beta_other_params,
+                'lr': base_lr,
+                'lr_multiplier': 1.0,
+                'weight_decay': 0.0,
+            })
+        if beta_value_params:
+            groups.append({
+                'params': beta_value_params,
+                'lr': base_lr * value_head_lr_factor,
+                'lr_multiplier': value_head_lr_factor,
+                'weight_decay': 0.0,
+            })
+        return groups
+
+    return [
+        {
+            'params': other_params + value_head_params,
+            'lr': base_lr,
+            'lr_multiplier': 1.0,
+        },
+        {
+            'params': beta_params,
+            'lr': base_lr,
+            'lr_multiplier': 1.0,
+            'weight_decay': 0.0,
+        },
+    ]
 
 
 def _is_fatal_cuda_error(exc):
@@ -997,29 +1089,15 @@ def main(argv=None):
     base_lr = config['imitation_learning']['learning_rate']
 
     def _build_optimizer_for_model(target_model, *, announce_per_layer_lr=False):
-        if value_head_lr_factor != 1.0:
-            # Separate value head parameters
-            value_head_params = []
-            other_params = []
+        param_groups = _build_il_optimizer_param_groups(
+            target_model.named_parameters(), base_lr, value_head_lr_factor
+        )
 
-            for name, param in target_model.named_parameters():
-                if 'value_' in name or 'moves_left_' in name:
-                    value_head_params.append(param)
-                else:
-                    other_params.append(param)
-
-            param_groups = [
-                {'params': other_params, 'lr': base_lr, 'lr_multiplier': 1.0},
-                {'params': value_head_params, 'lr': base_lr * value_head_lr_factor, 'lr_multiplier': value_head_lr_factor}
-            ]
-
-            if announce_per_layer_lr:
-                print(
-                    f"Per-layer LR: trunk/policy={base_lr:.4f}, "
-                    f"value={base_lr * value_head_lr_factor:.4f} ({value_head_lr_factor}x)"
-                )
-        else:
-            param_groups = [{'params': list(target_model.parameters()), 'lr': base_lr, 'lr_multiplier': 1.0}]
+        if value_head_lr_factor != 1.0 and announce_per_layer_lr:
+            print(
+                f"Per-layer LR: trunk/policy={base_lr:.4f}, "
+                f"value={base_lr * value_head_lr_factor:.4f} ({value_head_lr_factor}x)"
+            )
 
         return optim.AdamW(
             param_groups,
@@ -2066,22 +2144,42 @@ def main(argv=None):
                         _compiled = torch.compile(current_model, backend=backend_or_mode, dynamic=True)
                     except TypeError:
                         _compiled = torch.compile(current_model, backend=backend_or_mode)
-                # Compile/warm up with the real train/eval batch sizes. This
-                # avoids paying the first large-batch graph/autotune cost inside
-                # the epoch after compiling only a tiny batch=1 probe.
-                with torch.no_grad():
-                    with torch.amp.autocast(
-                        "cuda",
-                        enabled=amp_enabled_for_compile,
-                        dtype=amp_dtype_for_compile,
-                    ):
-                        for warmup_batch_size in _compile_warmup_batch_sizes():
-                            _dummy = torch.zeros(
-                                warmup_batch_size, expected_input_planes, 8, 8,
-                                device=device,
-                                dtype=torch.float32,
-                            ).to(memory_format=torch.channels_last)
-                            _compiled(_dummy, apply_log_softmax=False)
+                # Select a backend against the graph used by the learner, not
+                # just an inference-style forward. V10's actual IL step returns
+                # both supervised branches and soft-policy logits, then runs
+                # backward through those outputs. V9 keeps its prior warmup.
+                if bool(getattr(current_model, "supports_training_aux", False)):
+                    probe_results = validate_v10_il_training_compile_path(
+                        _compiled,
+                        config,
+                        device,
+                        _compile_warmup_batch_sizes(),
+                        use_amp=amp_enabled_for_compile,
+                        use_bfloat16=use_bfloat16,
+                    )
+                    if debug_enabled:
+                        tested = ", ".join(
+                            str(result["batch_size"]) for result in probe_results
+                        )
+                        print(
+                            "  V10 compile validation passed on full IL auxiliary "
+                            f"forward/backward (batch sizes: {tested}; no optimizer step)."
+                        )
+                else:
+                    # Preserve the legacy/V9 compile-selection behavior.
+                    with torch.no_grad():
+                        with torch.amp.autocast(
+                            "cuda",
+                            enabled=amp_enabled_for_compile,
+                            dtype=amp_dtype_for_compile,
+                        ):
+                            for warmup_batch_size in _compile_warmup_batch_sizes():
+                                _dummy = torch.zeros(
+                                    warmup_batch_size, expected_input_planes, 8, 8,
+                                    device=device,
+                                    dtype=torch.float32,
+                                ).to(memory_format=torch.channels_last)
+                                _compiled(_dummy, apply_log_softmax=False)
                 return _compiled
             except Exception as _e:
                 if debug_enabled:
@@ -2292,6 +2390,16 @@ def main(argv=None):
                   f"Policy: {train_losses['policy']:.4f}, "
                   f"Value: {train_losses['value']:.4f}, "
                   f"LR: {epoch_lr:.2e}")
+            if 'optimization_total' in train_losses and 'bn_branch_total' in train_losses:
+                model_train_cfg = config.get('model', {}) or {}
+                print(
+                    "       V10 objective: "
+                    f"{train_losses['optimization_total']:.4f} "
+                    f"(BN branch {train_losses['bn_branch_total']:.4f} @ "
+                    f"{float(model_train_cfg.get('bn_head_loss_weight', 0.8)):.2f}; "
+                    f"soft policy CE {train_losses.get('soft_policy_aux', 0.0):.4f} × "
+                    f"{float(model_train_cfg.get('soft_policy_loss_weight', 0.25)):.2f})"
+                )
 
             print(f"       📊 Top-1: {train_metrics['policy_top1_acc']:.2%}, "
                   f"Top-3: {train_metrics['policy_top3_acc']:.2%}, "

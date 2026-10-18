@@ -10,6 +10,7 @@ import copy
 import math
 import threading
 import time
+from multiprocessing.connection import wait as wait_process_connections
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +48,10 @@ from src.mcts.q_delta import (
     USEFUL_SEARCH_Q_DELTA_MIN,
 )
 from src.inference.shared_memory import create_shared_inference_buffer
+from src.training.soft_policy import (
+    legal_masked_soft_policy_loss_from_prepared,
+    prepare_legal_masked_soft_policy_target,
+)
 from .batch import ReplayBatch
 
 
@@ -80,6 +85,33 @@ _TRANSIENT_CUDA_ERROR_MARKERS = (
 )
 
 
+class _EvalCancelled(Exception):
+    """Internal signal used to unwind cancellable evaluation startup."""
+
+    def __init__(self, stage):
+        self.stage = str(stage or "evaluation")
+        super().__init__(f"Evaluation cancelled during {self.stage}.")
+
+
+def _eval_stop_requested(stop_event):
+    return bool(stop_event is not None and stop_event.is_set())
+
+
+def _notify_eval_runtime(callback, **details):
+    if callback is None:
+        return
+    try:
+        callback(dict(details))
+    except Exception:
+        # Runtime telemetry must never abort or strand the evaluation itself.
+        pass
+
+
+def _raise_if_eval_stopped(stop_event, stage):
+    if _eval_stop_requested(stop_event):
+        raise _EvalCancelled(stage)
+
+
 @contextlib.contextmanager
 def _freeze_batchnorm_running_stats(model, enabled):
     """Use stored BatchNorm statistics for one forward without freezing affine weights.
@@ -103,6 +135,25 @@ def _freeze_batchnorm_running_stats(model, enabled):
     finally:
         for module, was_training in batchnorm_modes:
             module.training = was_training
+
+
+def _training_model_owner(model):
+    """Unwrap common training wrappers when inspecting model capabilities/config."""
+    owner = model
+    seen = set()
+    while owner is not None and id(owner) not in seen:
+        seen.add(id(owner))
+        nested = getattr(owner, "_orig_mod", None)
+        if nested is None:
+            nested = getattr(owner, "module", None)
+        if nested is None or nested is owner:
+            break
+        owner = nested
+    return owner
+
+
+def _model_supports_training_aux(model):
+    return bool(getattr(_training_model_owner(model), "supports_training_aux", False))
 
 
 def is_transient_cuda_error(error):
@@ -131,14 +182,32 @@ def _cpu_only_eval_worker_config(config):
 
 def _gradient_family(name):
     lowered = str(name).lower()
-    if lowered.startswith('policy_') or '.policy_' in lowered:
+    while True:
+        if lowered.startswith('_orig_mod.'):
+            lowered = lowered[len('_orig_mod.'):]
+        elif lowered.startswith('module.'):
+            lowered = lowered[len('module.'):]
+        else:
+            break
+    if (
+        lowered.startswith((
+            'policy_', 'bn_policy_', 'soft_policy_', 'bn_soft_policy_'
+        ))
+        or any(token in lowered for token in (
+            '.policy_', '.bn_policy_', '.soft_policy_', '.bn_soft_policy_'
+        ))
+    ):
         return 'policy'
     if (
         lowered.startswith('value_')
+        or lowered.startswith('bn_value_')
         or '.value_' in lowered
+        or '.bn_value_' in lowered
         or lowered.startswith('moves_left_')
+        or lowered.startswith('bn_moves_left_')
         or '.moves_left_' in lowered
         or lowered.startswith('search_q_')
+        or lowered.startswith('bn_search_q_')
         or '.search_q_' in lowered
     ):
         return 'value'
@@ -160,9 +229,19 @@ def _gradient_family_norms(model):
 
 
 def _task_gradient_probe(policy_objective, value_objective, model):
-    """Measure task conflict at the shared tower output once per iteration."""
-    probe_owner = getattr(model, '_orig_mod', model)
-    probe = getattr(getattr(probe_owner, 'final_bn', None), 'weight', None)
+    """Measure policy/value gradient interaction on one shared trunk parameter."""
+    probe_owner = _training_model_owner(model)
+    probe = None
+    probe_layer = getattr(probe_owner, 'final_bn', None)
+    if probe_layer is None:
+        probe_layer = getattr(probe_owner, 'final_norm', None)
+    if probe_layer is None:
+        tower = getattr(probe_owner, 'residual_tower', None)
+        if tower:
+            last_block = tower[-1]
+            probe = getattr(getattr(last_block, 'expand', None), 'weight', None)
+    else:
+        probe = getattr(probe_layer, 'weight', None)
     empty = {
         'policy_probe_norm': 0.0,
         'value_probe_norm': 0.0,
@@ -317,23 +396,84 @@ def _resolve_eval_batch_games(config, num_games):
     return max(1, min(int(num_games), value))
 
 
-def _terminate_eval_processes(processes, timeout_s=0.5):
+def _terminate_eval_processes(processes, timeout_s=0.5, graceful_timeout_s=0.0):
+    """Stop only these evaluation-owned processes with one bounded grace period.
+
+    Joining each process for the full timeout made menu cancellation scale with
+    the worker count. Signal all owned children first, wait on their sentinels
+    together, and escalate only the survivors.
+    """
+    unique = []
+    seen = set()
     for proc in list(processes or []):
+        if proc is None or id(proc) in seen:
+            continue
+        seen.add(id(proc))
+        unique.append(proc)
+
+    alive = []
+    for proc in unique:
+        try:
+            if proc.is_alive():
+                alive.append(proc)
+        except Exception:
+            continue
+
+    def _wait_bounded(candidates, total_timeout):
+        deadline = time.monotonic() + max(0.0, float(total_timeout))
+        pending = list(candidates)
+        while pending:
+            pending = [proc for proc in pending if _process_is_alive(proc)]
+            if not pending:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sentinels = []
+            for proc in pending:
+                with contextlib.suppress(Exception):
+                    sentinels.append(proc.sentinel)
+            if sentinels:
+                with contextlib.suppress(Exception):
+                    wait_process_connections(sentinels, timeout=min(remaining, 0.05))
+            else:
+                time.sleep(min(remaining, 0.01))
+        return [proc for proc in candidates if _process_is_alive(proc)]
+
+    def _process_is_alive(proc):
+        try:
+            return bool(proc.is_alive())
+        except Exception:
+            return False
+
+    if graceful_timeout_s > 0.0:
+        alive = _wait_bounded(alive, graceful_timeout_s)
+    for proc in alive:
         with contextlib.suppress(Exception):
-            if proc is None or not proc.is_alive():
-                continue
             proc.terminate()
+
+    pending = _wait_bounded(alive, timeout_s)
+    for proc in pending:
         with contextlib.suppress(Exception):
-            proc.join(timeout=max(0.0, float(timeout_s)))
+            proc.kill()
+    # Windows may return from TerminateProcess before the process handle becomes
+    # signaled, especially while a CUDA context is tearing down. Keep the drain
+    # bounded, but wait long enough that a subsequent match cannot overlap it.
+    survivors = _wait_bounded(pending, 1.0)
+
+    for proc in unique:
         with contextlib.suppress(Exception):
-            if proc is not None and proc.is_alive():
-                proc.kill()
-        with contextlib.suppress(Exception):
-            proc.join(timeout=0.2)
+            proc.join(timeout=0)
+        if not _process_is_alive(proc):
+            with contextlib.suppress(Exception):
+                proc.close()
+    return survivors
 
 
 def _resolve_eval_max_moves(config):
-    rl_cfg = config.get("reinforcement_learning", {})
+    rl_cfg = config.get("reinforcement_learning", {}) or {}
+    if bool(rl_cfg.get("eval_finish_by_rules", False)):
+        return None
     raw_value = rl_cfg.get("eval_max_moves", 300)
     try:
         return max(1, int(raw_value))
@@ -341,18 +481,67 @@ def _resolve_eval_max_moves(config):
         return 300
 
 
+def _eval_finish_by_rules(config):
+    return bool(
+        (config.get("reinforcement_learning", {}) or {}).get(
+            "eval_finish_by_rules", False
+        )
+    )
+
+
+def _eval_ply_cap_reached(move_count, max_moves):
+    return max_moves is not None and int(move_count) >= int(max_moves)
+
+
+def _eval_game_is_over(board, config):
+    return chess.is_game_over(board, claim_draw=_eval_finish_by_rules(config))
+
+
+def _eval_terminal_reason(board, config, *, cap_reached=False):
+    if cap_reached and not _eval_game_is_over(board, config):
+        return "diagnostic_ply_cap"
+    if board in chess.CHECKMATE:
+        return "checkmate"
+    if board in chess.STALEMATE:
+        return "stalemate"
+    if board in chess.INSUFFICIENT_MATERIAL:
+        return "insufficient_material"
+    if board in chess.FORCED_DRAW:
+        return "automatic_draw"
+    if _eval_finish_by_rules(config) and board in chess.DRAW:
+        return "claimable_draw"
+    return "unresolved"
+
+
+def _merge_eval_terminal_reasons(target, source):
+    for reason, count in dict(source or {}).items():
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            target[str(reason)] = int(target.get(str(reason), 0)) + count
+
+
 def _resolve_eval_auto_claim_draw(config):
     rl_cfg = config.get("reinforcement_learning", {})
     return bool(rl_cfg.get("eval_auto_claim_draw", False))
 
 
+def _resolve_eval_unresolved_score_neutral(config):
+    rl_cfg = config.get("reinforcement_learning", {}) or {}
+    return bool(rl_cfg.get("eval_unresolved_score_neutral", True))
+
+
 def _resolve_eval_claim_draw_after_moves(config):
-    rl_cfg = config.get("reinforcement_learning", {})
-    raw_value = rl_cfg.get("eval_claim_draw_after_moves", _resolve_eval_max_moves(config))
+    rl_cfg = config.get("reinforcement_learning", {}) or {}
+    eval_max_moves = _resolve_eval_max_moves(config)
+    default_value = 0 if eval_max_moves is None else eval_max_moves
+    raw_value = rl_cfg.get("eval_claim_draw_after_moves", default_value)
     try:
         return max(0, int(raw_value))
     except Exception:
-        return _resolve_eval_max_moves(config)
+        return default_value
 
 
 def _resolve_eval_claim_repetition_after_moves(config):
@@ -439,12 +628,30 @@ def _build_eval_stats(wins, draws, losses, unresolved, num_games):
     }
 
 
-def _print_eval_unresolved(label, unresolved, num_games, max_moves):
+def _print_eval_unresolved(
+    label,
+    unresolved,
+    num_games,
+    max_moves,
+    *,
+    neutral_score=True,
+):
     if int(unresolved) <= 0:
         return
+    if max_moves is None:
+        print(
+            f"{label} unresolved without a ply cap: {unresolved}/{num_games}; "
+            "the evaluator did not produce a rules-based result"
+        )
+        return
+    score_note = (
+        "scored as 0.5 and tracked separately"
+        if neutral_score
+        else "excluded from the match score"
+    )
     print(
         f"{label} unresolved at ply cap ({max_moves}, ~{max_moves / 2.0:.1f} full moves): "
-        f"{unresolved}/{num_games} -> scored as 0.5 and tracked separately"
+        f"{unresolved}/{num_games} -> {score_note}"
     )
 
 
@@ -561,6 +768,13 @@ def _build_no_mcts_eval_input(
         str(model_cfg.get('input_encoder_id', 'planes_history_v1'))
     )
     if encoder.ENCODER_ID == 'planes_history_v2':
+        repetition_mode = encoder.resolve_repetition_plane_mode(
+            model_config=model_cfg,
+        )
+        repetition_count = encoder.repetition_count_for_mode(
+            repetition_mode,
+            repetition_count,
+        )
         current_tensor = encoder.encode(
             board,
             repetition_count=repetition_count,
@@ -575,8 +789,18 @@ def _build_no_mcts_eval_input(
     history_tensors = []
     for encoded in history_slice:
         # Evaluation stores one history cache per model, so these are already
-        # encoded with this model's encoder contract.
-        history_tensors.append(encoded[1] if use_black_pov else encoded[0])
+        # encoded with this model's encoder contract. Older v10 caches can
+        # still contain exact repetition counts even when the checkpoint was
+        # trained with unknown (-1) repetition planes; sanitize a copy so the
+        # raw-policy path matches MCTS without mutating shared history.
+        history_tensor = encoded[1] if use_black_pov else encoded[0]
+        if (
+            encoder.ENCODER_ID == 'planes_history_v2'
+            and repetition_mode != 'exact'
+        ):
+            history_tensor = np.array(history_tensor, copy=True)
+            history_tensor[12].fill(-1.0)
+        history_tensors.append(history_tensor)
     if encoder.ENCODER_ID == 'planes_history_v2':
         from src.models.data.nested_cnn_v10.helpers import stack_encoded_history
 
@@ -775,8 +999,8 @@ def _evaluate_single_game_no_mcts(
     )
     ended_by_auto_claim_draw = False
 
-    while move_count < max_moves:
-        if chess.is_game_over(board, claim_draw=False):
+    while max_moves is None or move_count < max_moves:
+        if _eval_game_is_over(board, config):
             break
 
         model = model_white if board.turn == chess.WHITE else model_black
@@ -822,7 +1046,7 @@ def _evaluate_single_game_no_mcts(
     if ended_by_auto_claim_draw:
         return "1/2-1/2", False
 
-    result = chess.result(board, claim_draw=False)
+    result = chess.result(board, claim_draw=_eval_finish_by_rules(config))
     return result, (result == "*")
 
 
@@ -849,6 +1073,7 @@ def _evaluate_games_batched(
     use_mcts_model1=True,
     use_mcts_model2=True,
     stop_event=None,
+    runtime_progress_callback=None,
 ):
     game_indices = list(game_indices or [])
     if not game_indices:
@@ -861,6 +1086,7 @@ def _evaluate_games_batched(
     sims1 = _resolve_eval_mcts_simulations(model1_search_config)
     sims2 = _resolve_eval_mcts_simulations(model2_search_config)
     max_moves = _resolve_eval_max_moves(config)
+    finish_by_rules = _eval_finish_by_rules(config)
     auto_claim_draw = _resolve_eval_auto_claim_draw(config)
     claim_draw_after_moves = _resolve_eval_claim_draw_after_moves(config)
     claim_repetition_after_moves = _resolve_eval_claim_repetition_after_moves(config)
@@ -871,9 +1097,42 @@ def _evaluate_games_batched(
     losses = 0
     unresolved = 0
     completed = 0
+    terminal_reasons = {}
     cursor = 0
     active_games = []
     eval_search_profile = {}
+    runtime_started_at = time.perf_counter()
+    runtime_last_emit = runtime_started_at
+    runtime_plies_processed = 0
+    runtime_nn_batches = 0
+    runtime_search_batches = 0
+
+    def _emit_runtime_progress(
+        *, force=False, activity=None, inference_side=None, inference_batch_size=None
+    ):
+        nonlocal runtime_last_emit
+        if runtime_progress_callback is None:
+            return
+        now = time.perf_counter()
+        if not force and now - runtime_last_emit < 0.75:
+            return
+        runtime_last_emit = now
+        _notify_eval_runtime(
+            runtime_progress_callback,
+            status="running",
+            ready=True,
+            active_games=int(len(active_games)),
+            completed_games=int(completed),
+            plies_processed=int(runtime_plies_processed),
+            nn_batches=int(runtime_nn_batches),
+            search_batches=int(runtime_search_batches),
+            runtime_activity=str(activity or "advancing_games"),
+            inference_side=inference_side,
+            inference_batch_size=(
+                None if inference_batch_size is None else int(inference_batch_size)
+            ),
+            activity_elapsed_s=float(now - runtime_started_at),
+        )
 
     def _record_eval_search(prefix, metadata):
         if not isinstance(metadata, dict):
@@ -960,7 +1219,10 @@ def _evaluate_games_batched(
             "model1_synced": False,
             "model2_root": None,
             "model2_synced": False,
-            "done": bool(chess.is_game_over(board, claim_draw=False) or move_count >= max_moves),
+            "done": bool(
+                _eval_game_is_over(board, config)
+                or _eval_ply_cap_reached(move_count, max_moves)
+            ),
             "auto_claim_draw": False,
         }
 
@@ -981,8 +1243,21 @@ def _evaluate_games_batched(
             result = "1/2-1/2"
             was_unresolved = False
         else:
-            result = chess.result(board, claim_draw=False)
+            result = chess.result(board, claim_draw=finish_by_rules)
             was_unresolved = (result == "*")
+
+        reason = (
+            "auto_claimed_draw"
+            if bool(gs.get("auto_claim_draw", False))
+            else _eval_terminal_reason(
+                board,
+                config,
+                cap_reached=_eval_ply_cap_reached(
+                    gs.get("move_count", 0), max_moves
+                ),
+            )
+        )
+        terminal_reasons[reason] = int(terminal_reasons.get(reason, 0)) + 1
 
         if was_unresolved:
             unresolved += 1
@@ -1036,7 +1311,9 @@ def _evaluate_games_batched(
             if gs["done"]:
                 continue
             board = gs["board"]
-            if chess.is_game_over(board, claim_draw=False) or gs["move_count"] >= max_moves:
+            if _eval_game_is_over(board, config) or _eval_ply_cap_reached(
+                gs["move_count"], max_moves
+            ):
                 gs["done"] = True
                 continue
             model1_turn = bool(board.turn == chess.WHITE) == bool(gs["model1_as_white"])
@@ -1048,6 +1325,7 @@ def _evaluate_games_batched(
         moves_by_index = {}
 
         def _run_group(indices, model, search_config, mcts, sims, root_key, synced_key, history_key, profile_prefix):
+            nonlocal runtime_nn_batches, runtime_search_batches
             if not indices:
                 return
             group_states = []
@@ -1073,7 +1351,14 @@ def _evaluate_games_batched(
                         id(gs["board"]),
                     ),
                 })
+            _emit_runtime_progress(
+                force=(runtime_nn_batches + runtime_search_batches == 0),
+                activity="mcts_search" if mcts is not None else "nn_forward",
+                inference_side=str(profile_prefix),
+                inference_batch_size=len(indices),
+            )
             if mcts is not None:
+                runtime_search_batches += 1
                 moves = []
                 search_results = mcts.search_results_many(
                     group_states,
@@ -1084,6 +1369,7 @@ def _evaluate_games_batched(
                     moves.append(search_result.selected_move)
                     _record_eval_search(profile_prefix, search_result.metadata)
             else:
+                runtime_nn_batches += 1
                 moves = _select_no_mcts_policy_moves_batched(
                     model,
                     [
@@ -1111,10 +1397,14 @@ def _evaluate_games_batched(
             model1_indices, model1, model1_search_config, mcts1, sims1,
             "model1_root", "model1_synced", "model1_board_history", "model1",
         )
+        if _eval_stop_requested(stop_event):
+            break
         _run_group(
             model2_indices, model2, model2_search_config, mcts2, sims2,
             "model2_root", "model2_synced", "model2_board_history", "model2",
         )
+        if _eval_stop_requested(stop_event):
+            break
 
         for idx, gs in enumerate(active_games):
             if gs["done"]:
@@ -1148,11 +1438,12 @@ def _evaluate_games_batched(
             gs["model2_root"], gs["model2_synced"] = _advance_eval_root(gs.get("model2_root"), move)
             chess.apply_move(board, move)
             gs["move_count"] += 1
+            runtime_plies_processed += 1
             _record_position_count(gs["position_counts"], board)
 
             if (
-                chess.is_game_over(board, claim_draw=False)
-                or gs["move_count"] >= max_moves
+                _eval_game_is_over(board, config)
+                or _eval_ply_cap_reached(gs["move_count"], max_moves)
                 or _claim_draw_if_needed(gs)
             ):
                 gs["done"] = True
@@ -1165,14 +1456,19 @@ def _evaluate_games_batched(
                 next_active.append(gs)
         active_games = next_active
         _fill_active()
+        _emit_runtime_progress()
 
     stats = _build_eval_stats(wins, draws, losses, unresolved, len(game_indices))
     stats["completed"] = int(completed)
+    stats["terminal_reasons"] = terminal_reasons
     stats["cancelled"] = bool(
         stop_event is not None
         and stop_event.is_set()
         and completed < len(game_indices)
     )
+    if stats["cancelled"]:
+        stats["cancel_reason"] = "stop requested during game evaluation"
+        stats["cancel_stage"] = "game evaluation"
     profile = {}
     for mcts in (mcts1, mcts2):
         if mcts is None:
@@ -1264,6 +1560,7 @@ def _eval_worker(
                 "draws": int(stats.get("draws", 0)),
                 "losses": int(stats.get("losses", 0)),
                 "unresolved": int(stats.get("unresolved", 0)),
+                "terminal_reasons": dict(stats.get("terminal_reasons", {}) or {}),
                 "profile": dict(stats.get("profile", {}) or {}),
             }
         )
@@ -1380,6 +1677,7 @@ def _eval_central_worker(
                 "draws": int(stats.get("draws", 0)),
                 "losses": int(stats.get("losses", 0)),
                 "unresolved": int(stats.get("unresolved", 0)),
+                "terminal_reasons": dict(stats.get("terminal_reasons", {}) or {}),
                 "profile": dict(stats.get("profile", {}) or {}),
             }
         )
@@ -1400,7 +1698,34 @@ def _close_eval_central_runtime(runtime):
     for request_queue in request_queues:
         with contextlib.suppress(Exception):
             request_queue.put({"cmd": "stop"})
-    _terminate_eval_processes(runtime.get("server_processes", []), timeout_s=1.0)
+    profile_forward_shapes = bool(runtime.get("profile_forward_shapes", False))
+    profile_cuda_graphs = bool(runtime.get("profile_cuda_graphs", False))
+    if profile_forward_shapes or profile_cuda_graphs:
+        # The opt-in batch-shape diagnostic needs one clean server shutdown to
+        # publish its aggregate through the control queue. Keep the normal
+        # menu/evaluation shutdown path unchanged and bound this diagnostic
+        # grace period to two seconds total.
+        _terminate_eval_processes(
+            runtime.get("server_processes", []),
+            timeout_s=0.2,
+            graceful_timeout_s=2.0,
+        )
+        histograms = []
+        for control_queue in list(runtime.get("control_queues", []) or []):
+            while True:
+                try:
+                    message = control_queue.get_nowait()
+                except Exception:
+                    break
+                if message and message.get("type") == "forward_shape_diagnostics":
+                    histograms.append({
+                        "server_rank": int(message.get("server_rank", -1)),
+                        "histogram": dict(message.get("histogram", {}) or {}),
+                        "cuda_graph_stats": dict(message.get("cuda_graph_stats", {}) or {}),
+                    })
+        runtime["forward_shape_histograms"] = histograms
+    else:
+        _terminate_eval_processes(runtime.get("server_processes", []), timeout_s=0.2)
     for queue_obj in request_queues + list(runtime.get("control_queues", []) or []):
         with contextlib.suppress(Exception):
             queue_obj.close()
@@ -1434,11 +1759,22 @@ def _start_eval_central_runtime(
     *,
     verbose=False,
     ready_callback=None,
+    stop_event=None,
 ):
     """Start one reusable GPU inference server for all stages of an eval funnel."""
     startup_t0 = time.perf_counter()
+    _raise_if_eval_stopped(stop_event, "central server startup")
     workers = _resolve_eval_workers(config, device, num_games)
     server_count = _resolve_eval_central_server_count(config, workers)
+    _notify_eval_runtime(
+        ready_callback,
+        status="starting_server",
+        ready=False,
+        workers=int(workers),
+        server_count=int(server_count),
+        central_inference=True,
+        central_compile_enabled=bool(_central_inference_option(config, "use_compile", False)),
+    )
     ctx = mp.get_context("spawn")
     request_queues = [ctx.Queue() for _ in range(server_count)]
     control_queues = [ctx.Queue() for _ in range(server_count)]
@@ -1499,9 +1835,16 @@ def _start_eval_central_runtime(
         "server_processes": [],
         "closed": False,
         "stage_count": 0,
+        "profile_forward_shapes": bool(
+            (config.get("central_inference", {}) or {}).get("profile_forward_shapes", False)
+        ),
+        "profile_cuda_graphs": bool(
+            (config.get("central_inference", {}) or {}).get("profile_cuda_graphs", False)
+        ),
     }
     try:
         for server_idx in range(server_count):
+            _raise_if_eval_stopped(stop_event, "central server startup")
             configured_cache_rank = _central_inference_option(config, "compile_cache_rank", None)
             if configured_cache_rank is None:
                 compile_rank = (
@@ -1536,11 +1879,36 @@ def _start_eval_central_runtime(
             runtime["server_processes"].append(proc)
         runtime["server_spawn_s"] = time.perf_counter() - startup_t0
 
+        _raise_if_eval_stopped(stop_event, "model snapshot")
+        _notify_eval_runtime(
+            ready_callback,
+            status="snapshotting_models",
+            ready=False,
+            workers=int(workers),
+            server_count=int(server_count),
+            central_inference=True,
+            central_compile_enabled=bool(_central_inference_option(config, "use_compile", False)),
+            server_spawn_s=float(runtime.get("server_spawn_s", 0.0) or 0.0),
+            server_pids=[int(proc.pid) for proc in runtime["server_processes"] if proc.pid is not None],
+        )
         task_id = f"eval_runtime_{os.getpid()}_{id(model1)}_{id(model2)}"
         snapshot_t0 = time.perf_counter()
         model1_state = _snapshot_state_dict_cpu_shared(model1)
         model2_state = _snapshot_state_dict_cpu_shared(model2)
         runtime["snapshot_s"] = time.perf_counter() - snapshot_t0
+        _raise_if_eval_stopped(stop_event, "model snapshot")
+        _notify_eval_runtime(
+            ready_callback,
+            status="loading_models",
+            ready=False,
+            workers=int(workers),
+            server_count=int(server_count),
+            central_inference=True,
+            central_compile_enabled=bool(_central_inference_option(config, "use_compile", False)),
+            server_spawn_s=float(runtime.get("server_spawn_s", 0.0) or 0.0),
+            snapshot_s=float(runtime["snapshot_s"]),
+            server_pids=[int(proc.pid) for proc in runtime["server_processes"] if proc.pid is not None],
+        )
         for request_queue in request_queues:
             request_queue.put({
                 "cmd": "load_models",
@@ -1567,6 +1935,7 @@ def _start_eval_central_runtime(
         pending_servers = set(range(server_count))
         load_messages = []
         while pending_servers:
+            _raise_if_eval_stopped(stop_event, "central model loading")
             if time.time() >= deadline:
                 raise TimeoutError(
                     "Eval central inference did not acknowledge model load "
@@ -1574,7 +1943,7 @@ def _start_eval_central_runtime(
                 )
             for server_idx in list(pending_servers):
                 try:
-                    message = control_queues[server_idx].get(timeout=0.25)
+                    message = control_queues[server_idx].get(timeout=0.1)
                 except Exception:
                     continue
                 if message.get("type") == "models_loaded" and str(message.get("task_id")) == task_id:
@@ -1596,20 +1965,32 @@ def _start_eval_central_runtime(
             if message.get("pid") is not None
         )
         runtime["model_summary"] = model_summary
+        actual_cudnn_benchmark = (
+            bool(load_messages[0].get("cudnn_benchmark"))
+            if load_messages and load_messages[0].get("cudnn_benchmark") is not None
+            else None
+        )
+        runtime["central_cudnn_benchmark"] = actual_cudnn_benchmark
         runtime["load_s"] = max(load_times) if load_times else 0.0
         runtime["pid_summary"] = pid_summary
         runtime["startup_s"] = time.perf_counter() - startup_t0
-        if ready_callback is not None:
-            ready_callback({
-                "ready": False,
-                "models_ready": True,
-                "workers": int(workers),
-                "server_count": int(server_count),
-                "central_inference": True,
-                "load_s": float(runtime["load_s"]),
-                "startup_s": float(runtime["startup_s"]),
-                "snapshot_s": float(runtime.get("snapshot_s", 0.0) or 0.0),
-            })
+        _notify_eval_runtime(
+            ready_callback,
+            status="models_loaded",
+            ready=False,
+            models_ready=True,
+            workers=int(workers),
+            server_count=int(server_count),
+            central_inference=True,
+            central_compile_enabled=any(bool(message.get("compile")) for message in load_messages),
+            central_cudnn_benchmark=actual_cudnn_benchmark,
+            model_summary=model_summary,
+            server_spawn_s=float(runtime.get("server_spawn_s", 0.0) or 0.0),
+            load_s=float(runtime["load_s"]),
+            startup_s=float(runtime["startup_s"]),
+            snapshot_s=float(runtime.get("snapshot_s", 0.0) or 0.0),
+            server_pids=[int(message["pid"]) for message in load_messages if message.get("pid") is not None],
+        )
         if verbose:
             print(
                 "Eval inference runtime: "
@@ -1697,6 +2078,12 @@ def _refresh_eval_central_runtime(
         if message.get("pid") is not None
     )
     runtime["load_s"] = max(load_times) if load_times else 0.0
+    actual_cudnn_benchmark = (
+        bool(load_messages[0].get("cudnn_benchmark"))
+        if load_messages and load_messages[0].get("cudnn_benchmark") is not None
+        else None
+    )
+    runtime["central_cudnn_benchmark"] = actual_cudnn_benchmark
     runtime["model_specs"] = model_specs
     runtime["snapshot_s"] = snapshot_s
     runtime["startup_s"] = time.perf_counter() - refresh_t0
@@ -1707,6 +2094,7 @@ def _refresh_eval_central_runtime(
             "workers": int(runtime["workers"]),
             "server_count": int(runtime["server_count"]),
             "central_inference": True,
+            "central_cudnn_benchmark": actual_cudnn_benchmark,
             "load_s": float(runtime["load_s"]),
             "startup_s": float(runtime["startup_s"]),
             "snapshot_s": float(snapshot_s),
@@ -1854,6 +2242,7 @@ def _evaluate_models_with_central_inference(
         return proc
 
     def _start_all_workers(active_runtime):
+        _raise_if_eval_stopped(stop_event, "worker startup")
         pending = [
             (int(rank), _build_eval_worker(active_runtime, rank, game_indices_per_worker[rank]))
             for rank in active_worker_ranks
@@ -1872,11 +2261,13 @@ def _evaluate_models_with_central_inference(
                     futures = [executor.submit(proc.start) for _rank, proc in pending]
                     for future in futures:
                         future.result()
+                _raise_if_eval_stopped(stop_event, "worker startup")
             except Exception:
                 _terminate_eval_processes([proc for _rank, proc in pending])
                 raise
         else:
             for _rank, proc in pending:
+                _raise_if_eval_stopped(stop_event, "worker startup")
                 proc.start()
         for rank, proc in pending:
             _register_started_worker(rank, proc)
@@ -1885,15 +2276,37 @@ def _evaluate_models_with_central_inference(
     runtime = central_runtime
     try:
         if runtime is None:
-            runtime = _start_eval_central_runtime(
-                model1,
-                model2,
-                config,
-                device,
-                num_games,
-                verbose=verbose,
-                ready_callback=runtime_ready_callback,
-            )
+            try:
+                runtime = _start_eval_central_runtime(
+                    model1,
+                    model2,
+                    config,
+                    device,
+                    num_games,
+                    verbose=verbose,
+                    ready_callback=runtime_ready_callback,
+                    stop_event=stop_event,
+                )
+            except _EvalCancelled as exc:
+                stats = _build_eval_stats(0, 0, 0, 0, num_games)
+                stats.update({
+                    "cancelled": True,
+                    "cancel_reason": str(exc),
+                    "cancel_stage": exc.stage,
+                    "completed": 0,
+                })
+                return stats
+        _raise_if_eval_stopped(stop_event, "worker startup")
+        _notify_eval_runtime(
+            runtime_ready_callback,
+            status="starting_workers",
+            ready=False,
+            workers=len(active_worker_ranks),
+            server_count=int(runtime.get("server_count", 0) or 0),
+            central_inference=True,
+            server_pids=[int(proc.pid) for proc in runtime.get("server_processes", []) if proc.pid is not None],
+            central_cudnn_benchmark=runtime.get("central_cudnn_benchmark"),
+        )
         worker_launch_t0 = time.perf_counter()
         _start_all_workers(runtime)
         runtime["worker_launch_s"] = time.perf_counter() - worker_launch_t0
@@ -1914,24 +2327,29 @@ def _evaluate_models_with_central_inference(
                 f"server={'new' if owns_runtime else 'reused'}"
             )
 
-        if runtime_ready_callback is not None:
-            runtime_ready_callback({
-                "ready": True,
-                "models_ready": True,
-                "workers": len(active_worker_ranks),
-                "server_count": int(server_count),
-                "central_inference": True,
-                "load_s": float(runtime.get("load_s", 0.0) or 0.0),
-                "startup_s": float(runtime.get("startup_s", 0.0) or 0.0),
-                "snapshot_s": float(runtime.get("snapshot_s", 0.0) or 0.0),
-                "worker_launch_s": float(runtime.get("worker_launch_s", 0.0) or 0.0),
-            })
+        _notify_eval_runtime(
+            runtime_ready_callback,
+            status="running",
+            ready=True,
+            models_ready=True,
+            workers=len(active_worker_ranks),
+            server_count=int(server_count),
+            central_inference=True,
+            load_s=float(runtime.get("load_s", 0.0) or 0.0),
+            startup_s=float(runtime.get("startup_s", 0.0) or 0.0),
+            snapshot_s=float(runtime.get("snapshot_s", 0.0) or 0.0),
+            worker_launch_s=float(runtime.get("worker_launch_s", 0.0) or 0.0),
+            server_pids=[int(proc.pid) for proc in server_processes if proc.pid is not None],
+            worker_pids=[int(proc.pid) for proc in worker_processes if proc.pid is not None],
+            central_cudnn_benchmark=runtime.get("central_cudnn_benchmark"),
+        )
 
         wins = 0
         draws = 0
         losses = 0
         unresolved = 0
         completed = 0
+        terminal_reasons = {}
         finished_worker_ranks = set()
         eval_profile = {}
         eval_bar = tqdm(total=num_games, desc=progress_desc, unit="game", disable=not show_progress)
@@ -1942,10 +2360,20 @@ def _evaluate_models_with_central_inference(
             while len(finished_worker_ranks) < len(active_worker_ranks):
                 if stop_event is not None and stop_event.is_set():
                     cancelled = True
+                    _notify_eval_runtime(
+                        runtime_ready_callback,
+                        status="cancelling",
+                        ready=False,
+                        cancel_stage="game evaluation",
+                        completed=int(completed),
+                        requested_games=int(num_games),
+                        server_pids=[int(proc.pid) for proc in server_processes if proc.pid is not None],
+                        worker_pids=[int(proc.pid) for proc in worker_processes if proc.pid is not None],
+                    )
                     _terminate_eval_processes(list(worker_processes_by_rank.values()))
                     break
                 try:
-                    message = result_queue.get(timeout=1.0)
+                    message = result_queue.get(timeout=0.1)
                 except Exception:
                     dead_workers = [
                         (rank, proc.exitcode)
@@ -1991,8 +2419,7 @@ def _evaluate_models_with_central_inference(
                             )
                             old_proc = worker_processes_by_rank.get(int(rank))
                             if old_proc is not None:
-                                with contextlib.suppress(Exception):
-                                    old_proc.join(timeout=0.2)
+                                _terminate_eval_processes([old_proc], timeout_s=0.05)
                             pending_game_indices_by_rank[int(rank)] = remaining
                             _start_eval_worker(runtime, int(rank), remaining)
                         if worker_error is not None:
@@ -2044,6 +2471,9 @@ def _evaluate_models_with_central_inference(
                             )
                 elif message_type == "result":
                     rank = int(message.get("rank", -1))
+                    _merge_eval_terminal_reasons(
+                        terminal_reasons, message.get("terminal_reasons")
+                    )
                     for key, value in dict(message.get("profile", {}) or {}).items():
                         if isinstance(value, (int, float)):
                             eval_profile[key] = eval_profile.get(key, 0) + value
@@ -2077,8 +2507,7 @@ def _evaluate_models_with_central_inference(
                         )
                         old_proc = worker_processes_by_rank.get(rank)
                         if old_proc is not None:
-                            with contextlib.suppress(Exception):
-                                old_proc.join(timeout=0.2)
+                            _terminate_eval_processes([old_proc], timeout_s=0.05)
                         pending_game_indices_by_rank[rank] = remaining
                         _start_eval_worker(runtime, rank, remaining)
                     else:
@@ -2095,6 +2524,7 @@ def _evaluate_models_with_central_inference(
             stats = _build_eval_stats(0, 0, 0, 0, 0)
             stats.update({
                 "infrastructure_error": str(infrastructure_error),
+                "error": str(infrastructure_error),
                 "transient_cuda_error": bool(is_transient_cuda_error(infrastructure_error)),
                 "completed_before_failure": int(completed),
                 "requested_games": int(num_games),
@@ -2104,9 +2534,16 @@ def _evaluate_models_with_central_inference(
         if worker_error is not None:
             raise RuntimeError(f"Eval worker failed: {worker_error}")
         if unresolved > 0 and verbose:
-            _print_eval_unresolved("Eval", unresolved, num_games, max_moves)
+            _print_eval_unresolved(
+                "Eval",
+                unresolved,
+                num_games,
+                max_moves,
+                neutral_score=_resolve_eval_unresolved_score_neutral(config),
+            )
         stats = _build_eval_stats(wins, draws, losses, unresolved, num_games)
         stats["profile"] = eval_profile
+        stats["terminal_reasons"] = terminal_reasons
         requests = int(eval_profile.get("central_inference_requests", 0) or 0)
         if requests > 0 and verbose:
             remote_ms = 1000.0 * float(
@@ -2154,14 +2591,51 @@ def _evaluate_models_with_central_inference(
                 f"MCTS waiting for inference={wait_share:.0%}"
             )
         stats["cancelled"] = bool(cancelled)
+        if cancelled:
+            stats["cancel_reason"] = "stop requested during game evaluation"
+            stats["cancel_stage"] = "game evaluation"
         stats["completed"] = int(completed)
         return stats
+    except _EvalCancelled as exc:
+        stats = _build_eval_stats(0, 0, 0, 0, num_games)
+        stats.update({
+            "cancelled": True,
+            "cancel_reason": str(exc),
+            "cancel_stage": exc.stage,
+            "completed": 0,
+        })
+        return stats
     finally:
-        _terminate_eval_processes(worker_processes)
+        _terminate_eval_processes(
+            worker_processes,
+            timeout_s=0.1,
+            graceful_timeout_s=0.4,
+        )
+        with contextlib.suppress(Exception):
+            result_queue.cancel_join_thread()
         with contextlib.suppress(Exception):
             result_queue.close()
         if owns_runtime:
             _close_eval_central_runtime(runtime)
+            if (
+                (
+                    bool(runtime.get("profile_forward_shapes", False))
+                    or bool(runtime.get("profile_cuda_graphs", False))
+                )
+                and isinstance(locals().get("stats"), dict)
+            ):
+                diagnostic_results = list(runtime.get("forward_shape_histograms", []) or [])
+                eval_profile = stats.setdefault("profile", {})
+                if bool(runtime.get("profile_forward_shapes", False)):
+                    eval_profile["central_forward_shape_histogram"] = [
+                        {"server_rank": item["server_rank"], "histogram": item["histogram"]}
+                        for item in diagnostic_results
+                    ]
+                if bool(runtime.get("profile_cuda_graphs", False)):
+                    eval_profile["central_cuda_graph_stats"] = [
+                        {"server_rank": item["server_rank"], "stats": item["cuda_graph_stats"]}
+                        for item in diagnostic_results
+                    ]
 
 
 def _get_hflip_inverse_index_map():
@@ -2706,6 +3180,22 @@ def train_on_batch_rl(
     optimizer.zero_grad(set_to_none=True)
 
     rl_cfg = config.get("reinforcement_learning", {})
+    v10_training_aux = _model_supports_training_aux(model)
+    model_cfg = dict(
+        getattr(_training_model_owner(model), "model_config", None)
+        or config.get("model", {})
+        or {}
+    )
+    bn_head_loss_weight = min(
+        1.0,
+        max(0.0, float(model_cfg.get("bn_head_loss_weight", 0.8))),
+    )
+    main_head_loss_weight = 1.0 - bn_head_loss_weight
+    soft_policy_temperature = float(model_cfg.get("soft_policy_temperature", 4.0))
+    soft_policy_loss_weight = max(
+        0.0,
+        float(model_cfg.get("soft_policy_loss_weight", 0.25)),
+    )
     use_amp = config["hardware"].get("use_amp", True)
     amp_dtype = torch.bfloat16 if config["hardware"].get("use_bfloat16", False) else torch.float16
 
@@ -2722,12 +3212,45 @@ def train_on_batch_rl(
     freeze_batchnorm_stats = bool(rl_cfg.get("freeze_batchnorm_stats", False))
     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
         with _freeze_batchnorm_running_stats(model, freeze_batchnorm_stats):
-            policy_logits, value_pred, moves_left_pred, search_q_pred = model(
-                boards,
-                apply_log_softmax=False,
-                return_moves_left=True,
-                return_search_aux=True,
-            )
+            if v10_training_aux:
+                training_outputs = model(
+                    boards,
+                    apply_log_softmax=False,
+                    return_moves_left=True,
+                    return_search_aux=True,
+                    return_training_aux=True,
+                )
+                if not isinstance(training_outputs, dict):
+                    raise RuntimeError(
+                        "A model advertising supports_training_aux must return a mapping."
+                    )
+                try:
+                    (
+                        policy_logits,
+                        value_pred,
+                        moves_left_pred,
+                        search_q_pred,
+                    ) = training_outputs["main"]
+                    (
+                        bn_policy_logits,
+                        bn_value_pred,
+                        bn_moves_left_pred,
+                        bn_search_q_pred,
+                    ) = training_outputs["bn"]
+                    soft_policy_logits = training_outputs["soft_policy"]
+                    bn_soft_policy_logits = training_outputs["bn_soft_policy"]
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "v10 training auxiliaries must contain main, bn, soft_policy, "
+                        "and bn_soft_policy outputs."
+                    ) from exc
+            else:
+                policy_logits, value_pred, moves_left_pred, search_q_pred = model(
+                    boards,
+                    apply_log_softmax=False,
+                    return_moves_left=True,
+                    return_search_aux=True,
+                )
         policy_pred = F.log_softmax(policy_logits.float(), dim=1)
         legal_policy_log_probs, valid_legal_mask, safe_legal_indices = _legal_only_log_probs(
             policy_logits,
@@ -2905,6 +3428,140 @@ def train_on_batch_rl(
             if value_weight_override is None
             else float(value_weight_override)
         )
+        bn_policy_loss = torch.zeros_like(policy_loss)
+        bn_policy_correction_rank_loss = torch.zeros_like(policy_correction_rank_loss)
+        bn_value_primary_loss = torch.zeros_like(value_primary_loss)
+        bn_value_scalar_aux_loss = torch.zeros_like(value_scalar_aux_loss)
+        bn_value_loss = torch.zeros_like(value_loss)
+        bn_value_search_consistency_loss = torch.zeros_like(value_search_consistency_loss)
+        bn_moves_left_loss = torch.zeros_like(moves_left_loss)
+        bn_search_q_loss = torch.zeros_like(search_q_loss)
+        soft_policy_main_loss = torch.zeros_like(policy_loss)
+        soft_policy_bn_loss = torch.zeros_like(policy_loss)
+        soft_policy_loss = torch.zeros_like(policy_loss)
+        soft_policy_valid_rows = torch.zeros_like(policy_rows_mask)
+        if v10_training_aux:
+            bn_policy_log_probs, bn_valid_legal_mask, bn_safe_legal_indices = (
+                _legal_only_log_probs(bn_policy_logits, legal_indices, legal_mask)
+            )
+            if policy_indices.numel() == 0:
+                bn_policy_loss_per_row = torch.zeros(
+                    policy_pred.size(0),
+                    device=policy_pred.device,
+                    dtype=policy_pred.dtype,
+                )
+            else:
+                bn_policy_loss_per_row = _legal_only_sparse_policy_loss(
+                    bn_policy_logits,
+                    policy_indices,
+                    policy_training_values,
+                    effective_policy_mask,
+                    legal_indices,
+                    legal_mask,
+                )
+            bn_policy_loss = _weighted_mean(
+                bn_policy_loss_per_row,
+                policy_effective_weights,
+            )
+            (
+                bn_policy_correction_rank_loss,
+                _,
+                _,
+            ) = _useful_policy_correction_rank_loss(
+                bn_policy_log_probs,
+                bn_valid_legal_mask,
+                bn_safe_legal_indices,
+                target_moves,
+                correction_policy_mask,
+                search_q_deltas,
+                policy_effective_weights,
+            )
+
+            if bn_value_pred.dim() == 2 and bn_value_pred.size(1) == 3:
+                bn_value_probs = torch.softmax(bn_value_pred, dim=1)
+                bn_value_scalar = bn_value_probs[:, 0] - bn_value_probs[:, 2]
+                bn_value_primary_rows = -(
+                    hard_target_wdl * F.log_softmax(bn_value_pred, dim=1)
+                ).sum(dim=1)
+            else:
+                bn_value_probs = None
+                bn_value_scalar = bn_value_pred.squeeze()
+                bn_value_primary_rows = (bn_value_scalar - target_scalar) ** 2
+            bn_value_primary_loss = _weighted_mean(
+                bn_value_primary_rows,
+                effective_value_sample_weights,
+            )
+            if hard_target_wdl is not None and value_scalar_aux_loss_weight > 0.0:
+                bn_value_scalar_aux_loss = _weighted_mean(
+                    F.smooth_l1_loss(
+                        bn_value_scalar,
+                        target_scalar.to(dtype=bn_value_scalar.dtype),
+                        beta=0.25,
+                        reduction="none",
+                    ),
+                    effective_value_sample_weights,
+                )
+            bn_value_loss = (
+                bn_value_primary_loss
+                + value_scalar_aux_loss_weight * bn_value_scalar_aux_loss
+            )
+            bn_value_search_consistency_loss, _, _ = _value_search_consistency_loss(
+                bn_value_scalar,
+                root_q_targets,
+                search_visits,
+                effective_value_sample_weights,
+                reference_visits=search_reference_visits,
+            )
+            if bn_moves_left_pred is not None and moves_left_loss_weight > 0.0:
+                bn_moves_left_loss, _ = _moves_left_auxiliary_loss(
+                    bn_moves_left_pred,
+                    moves_left_targets,
+                    effective_value_sample_weights,
+                )
+            if bn_search_q_pred is not None and search_q_loss_weight > 0.0:
+                bn_search_q_loss, _, _ = _search_q_auxiliary_loss(
+                    bn_search_q_pred,
+                    root_q_targets,
+                    search_visits,
+                    effective_value_sample_weights,
+                    reference_visits=search_reference_visits,
+                )
+
+            soft_row_mask = policy_rows_mask & (policy_effective_weights > 0.0)
+            # Replay stores legality as padded (index,slot-mask) pairs, whereas
+            # the shared helper accepts a list of usable indices. Drop masked
+            # slots before passing support so an inactive non-negative index
+            # cannot enter the softmax denominator.
+            soft_legal_indices = torch.where(
+                legal_mask.bool(),
+                legal_indices,
+                torch.full_like(legal_indices, -1),
+            )
+            prepared_soft_target = prepare_legal_masked_soft_policy_target(
+                soft_policy_logits,
+                (policy_indices, policy_values),
+                row_weights=policy_effective_weights,
+                temperature=soft_policy_temperature,
+                row_mask=soft_row_mask,
+                legal_indices=soft_legal_indices,
+                min_support=2,
+            )
+            soft_policy_main_loss, _, soft_policy_valid_rows = (
+                legal_masked_soft_policy_loss_from_prepared(
+                    soft_policy_logits, prepared_soft_target
+                )
+            )
+            soft_policy_bn_loss, _, bn_soft_policy_valid_rows = (
+                legal_masked_soft_policy_loss_from_prepared(
+                    bn_soft_policy_logits, prepared_soft_target
+                )
+            )
+            soft_policy_loss = (
+                main_head_loss_weight * soft_policy_main_loss
+                + bn_head_loss_weight * soft_policy_bn_loss
+            )
+            soft_policy_valid_rows = soft_policy_valid_rows & bn_soft_policy_valid_rows
+
         legal_policy_probs = torch.exp(legal_policy_log_probs) * valid_legal_mask
         legal_entropy_per_row = -(
             legal_policy_probs * legal_policy_log_probs
@@ -2915,18 +3572,56 @@ def train_on_batch_rl(
             if rows_with_legal_moves.any()
             else torch.zeros((), device=policy_pred.device, dtype=policy_pred.dtype)
         )
-        policy_objective = policy_weight * (
+        main_policy_objective = policy_weight * (
             policy_loss
             + float(_POLICY_CORRECTION_RANK_WEIGHT)
             * policy_correction_rank_loss
         )
-        value_objective = (
+        main_value_objective = (
             value_weight * value_loss
             + value_search_consistency_loss_weight * value_search_consistency_loss
             + moves_left_loss_weight * moves_left_loss
             + search_q_loss_weight * search_q_loss
         )
-        loss = policy_objective + value_objective
+        if v10_training_aux:
+            bn_policy_objective = policy_weight * (
+                bn_policy_loss
+                + float(_POLICY_CORRECTION_RANK_WEIGHT)
+                * bn_policy_correction_rank_loss
+            )
+            bn_value_objective = (
+                value_weight * bn_value_loss
+                + value_search_consistency_loss_weight
+                * bn_value_search_consistency_loss
+                + moves_left_loss_weight * bn_moves_left_loss
+                + search_q_loss_weight * bn_search_q_loss
+            )
+            policy_objective = (
+                main_head_loss_weight * main_policy_objective
+                + bn_head_loss_weight * bn_policy_objective
+            )
+            # Keep the task-gradient probe aligned with the policy gradient
+            # actually used by the optimizer. The soft-policy auxiliary is
+            # policy-only and contributes to `loss` below; omitting it here
+            # understated the policy norm and distorted the policy/value
+            # cosine in RL diagnostics.
+            policy_diagnostic_objective = (
+                policy_objective + soft_policy_loss_weight * soft_policy_loss
+            )
+            value_objective = (
+                main_head_loss_weight * main_value_objective
+                + bn_head_loss_weight * bn_value_objective
+            )
+            loss = (
+                policy_objective
+                + value_objective
+                + soft_policy_loss_weight * soft_policy_loss
+            )
+        else:
+            policy_objective = main_policy_objective
+            policy_diagnostic_objective = policy_objective
+            value_objective = main_value_objective
+            loss = policy_objective + value_objective
 
     if not bool(torch.isfinite(loss.detach()).item()):
         raise FloatingPointError(
@@ -2935,7 +3630,7 @@ def train_on_batch_rl(
 
     if collect_gradient_diagnostics:
         task_gradient_diagnostics = _task_gradient_probe(
-            policy_objective,
+            policy_diagnostic_objective,
             value_objective,
             model,
         )
@@ -3112,6 +3807,25 @@ def train_on_batch_rl(
         "correction_rank_loss_sum": correction_rank_loss_sum,
         "correction_rank_objective": float(policy_correction_rank_loss.detach().item()),
         "correction_rank_weight": float(_POLICY_CORRECTION_RANK_WEIGHT),
+        "bn_head_loss_weight": bn_head_loss_weight if v10_training_aux else 0.0,
+        "bn_policy_loss": float(bn_policy_loss.detach().item()),
+        "bn_policy_correction_rank_loss": float(
+            bn_policy_correction_rank_loss.detach().item()
+        ),
+        "bn_value_primary_loss": float(bn_value_primary_loss.detach().item()),
+        "bn_value_loss": float(bn_value_loss.detach().item()),
+        "bn_value_scalar_aux_loss": float(bn_value_scalar_aux_loss.detach().item()),
+        "bn_value_search_consistency_loss": float(
+            bn_value_search_consistency_loss.detach().item()
+        ),
+        "bn_moves_left_loss": float(bn_moves_left_loss.detach().item()),
+        "bn_search_q_loss": float(bn_search_q_loss.detach().item()),
+        "soft_policy_loss": float(soft_policy_loss.detach().item()),
+        "soft_policy_main_loss": float(soft_policy_main_loss.detach().item()),
+        "soft_policy_bn_loss": float(soft_policy_bn_loss.detach().item()),
+        "soft_policy_valid_rows": int(soft_policy_valid_rows.sum().item()),
+        "soft_policy_loss_weight": soft_policy_loss_weight if v10_training_aux else 0.0,
+        "soft_policy_temperature": soft_policy_temperature if v10_training_aux else 0.0,
         "correction_top1_correct": correction_top1_correct,
         "effective_weight_sum": policy_effective_weight_sum,
         "correction_effective_weight_sum": correction_effective_weight_sum,
@@ -3189,7 +3903,25 @@ def evaluate_models(
     show_progress=True,
     verbose=False,
     runtime_ready_callback=None,
+    runtime_progress_callback=None,
 ):
+    if _eval_stop_requested(stop_event):
+        stats = _build_eval_stats(0, 0, 0, 0, num_games)
+        stats.update({
+            "cancelled": True,
+            "cancel_reason": "stop requested before evaluation startup",
+            "cancel_stage": "startup",
+            "completed": 0,
+        })
+        _notify_eval_runtime(
+            runtime_ready_callback,
+            status="cancelled",
+            ready=False,
+            cancel_stage="startup",
+            completed=0,
+            requested_games=int(num_games),
+        )
+        return stats
     config = _build_eval_mcts_config(config)
     model1_mcts_config = _build_eval_mcts_config(model1_mcts_config or config)
     model2_mcts_config = _build_eval_mcts_config(model2_mcts_config or config)
@@ -3219,14 +3951,15 @@ def evaluate_models(
 
     workers = _resolve_eval_workers(config, device, num_games)
     if workers <= 1:
-        if runtime_ready_callback is not None:
-            runtime_ready_callback({
-                "ready": True,
-                "workers": 1,
-                "server_count": 0,
-                "central_inference": False,
-                "load_s": 0.0,
-            })
+        _notify_eval_runtime(
+            runtime_ready_callback,
+            status="running",
+            ready=True,
+            workers=1,
+            server_count=0,
+            central_inference=False,
+            load_s=0.0,
+        )
         max_moves = _resolve_eval_max_moves(config)
         game_indices = list(range(game_index_offset, game_index_offset + num_games))
         eval_bar = tqdm(total=num_games, desc=progress_desc, unit="game", disable=not show_progress)
@@ -3248,18 +3981,59 @@ def evaluate_models(
                 use_mcts_model1=use_mcts_model1,
                 use_mcts_model2=use_mcts_model2,
                 stop_event=stop_event,
+                runtime_progress_callback=runtime_progress_callback,
             )
         finally:
             eval_bar.close()
 
         unresolved = int((stats or {}).get("unresolved", 0))
         if unresolved > 0 and verbose:
-            _print_eval_unresolved("Eval", unresolved, num_games, max_moves)
+            _print_eval_unresolved(
+                "Eval",
+                unresolved,
+                num_games,
+                max_moves,
+                neutral_score=_resolve_eval_unresolved_score_neutral(config),
+            )
+
+        _notify_eval_runtime(
+            runtime_ready_callback,
+            status="cancelled" if bool((stats or {}).get("cancelled", False)) else "completed",
+            ready=False,
+            completed=int((stats or {}).get("completed", 0) or 0),
+            requested_games=int(num_games),
+            cancel_stage="game evaluation" if bool((stats or {}).get("cancelled", False)) else None,
+        )
 
         return stats
 
+    if _eval_stop_requested(stop_event):
+        stats = _build_eval_stats(0, 0, 0, 0, num_games)
+        stats.update({
+            "cancelled": True,
+            "cancel_reason": "stop requested before model snapshot",
+            "cancel_stage": "model snapshot",
+            "completed": 0,
+        })
+        return stats
+    _notify_eval_runtime(
+        runtime_ready_callback,
+        status="snapshotting_models",
+        ready=False,
+        workers=int(workers),
+        central_inference=False,
+    )
     model1_state = _snapshot_state_dict_cpu_shared(model1)
     model2_state = _snapshot_state_dict_cpu_shared(model2)
+    if _eval_stop_requested(stop_event):
+        stats = _build_eval_stats(0, 0, 0, 0, num_games)
+        stats.update({
+            "cancelled": True,
+            "cancel_reason": "stop requested during model snapshot",
+            "cancel_stage": "model snapshot",
+            "completed": 0,
+        })
+        return stats
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
     processes = []
@@ -3268,43 +4042,64 @@ def evaluate_models(
     for offset, game_idx in enumerate(range(game_index_offset, game_index_offset + num_games)):
         game_indices_per_worker[offset % workers].append(game_idx)
 
-    for rank, game_indices in enumerate(game_indices_per_worker):
-        if not game_indices:
-            continue
-        p = ctx.Process(
-            target=_eval_worker,
-            args=(
-                rank,
-                model1_state,
-                model2_state,
-                config,
-                str(device),
-                game_indices,
-                result_queue,
-                use_fixed_openings,
-                model1_mcts_config,
-                model2_mcts_config,
-                use_mcts_model1,
-                use_mcts_model2,
-            ),
-        )
-        p.start()
-        processes.append(p)
-
-    if runtime_ready_callback is not None:
-        runtime_ready_callback({
-            "ready": True,
-            "workers": len(processes),
-            "server_count": 0,
-            "central_inference": False,
-            "load_s": 0.0,
+    try:
+        for rank, game_indices in enumerate(game_indices_per_worker):
+            if not game_indices:
+                continue
+            _raise_if_eval_stopped(stop_event, "worker startup")
+            p = ctx.Process(
+                target=_eval_worker,
+                args=(
+                    rank,
+                    model1_state,
+                    model2_state,
+                    config,
+                    str(device),
+                    game_indices,
+                    result_queue,
+                    use_fixed_openings,
+                    model1_mcts_config,
+                    model2_mcts_config,
+                    use_mcts_model1,
+                    use_mcts_model2,
+                ),
+            )
+            processes.append(p)
+            p.start()
+    except _EvalCancelled as exc:
+        _terminate_eval_processes(processes, timeout_s=0.2)
+        with contextlib.suppress(Exception):
+            result_queue.close()
+        stats = _build_eval_stats(0, 0, 0, 0, num_games)
+        stats.update({
+            "cancelled": True,
+            "cancel_reason": str(exc),
+            "cancel_stage": exc.stage,
+            "completed": 0,
         })
+        return stats
+    except Exception:
+        _terminate_eval_processes(processes, timeout_s=0.2)
+        with contextlib.suppress(Exception):
+            result_queue.close()
+        raise
+
+    _notify_eval_runtime(
+        runtime_ready_callback,
+        status="running",
+        ready=True,
+        workers=len(processes),
+        server_count=0,
+        central_inference=False,
+        load_s=0.0,
+    )
 
     wins = 0
     draws = 0
     losses = 0
     unresolved = 0
     completed = 0
+    terminal_reasons = {}
     eval_profile = {}
     eval_bar = tqdm(total=num_games, desc=progress_desc, unit="game", disable=not show_progress)
     worker_error = None
@@ -3312,12 +4107,12 @@ def evaluate_models(
     try:
         finished_workers = 0
         while finished_workers < len(processes):
-            if stop_event is not None and stop_event.is_set():
+            if _eval_stop_requested(stop_event):
                 cancelled = True
                 _terminate_eval_processes(processes)
                 break
             try:
-                message = result_queue.get(timeout=1.0)
+                message = result_queue.get(timeout=0.1)
             except Exception:
                 continue
             message_type = message.get("type")
@@ -3342,6 +4137,9 @@ def evaluate_models(
                 draws += int(message.get("draws", 0))
                 losses += int(message.get("losses", 0))
                 unresolved += int(message.get("unresolved", 0))
+                _merge_eval_terminal_reasons(
+                    terminal_reasons, message.get("terminal_reasons")
+                )
                 for key, value in dict(message.get("profile", {}) or {}).items():
                     if isinstance(value, (int, float)):
                         eval_profile[key] = eval_profile.get(key, 0) + value
@@ -3354,21 +4152,45 @@ def evaluate_models(
                 break
     finally:
         eval_bar.close()
-        for p in processes:
-            with contextlib.suppress(Exception):
-                p.join(timeout=0.5)
+        _terminate_eval_processes(
+            processes,
+            timeout_s=0.1,
+            graceful_timeout_s=0.4,
+        )
+        with contextlib.suppress(Exception):
+            result_queue.cancel_join_thread()
+        with contextlib.suppress(Exception):
+            result_queue.close()
 
     if worker_error is not None:
         raise RuntimeError(f"Eval worker failed: {worker_error}")
 
     if unresolved > 0 and verbose:
         max_moves = _resolve_eval_max_moves(config)
-        _print_eval_unresolved("Eval", unresolved, num_games, max_moves)
+        _print_eval_unresolved(
+            "Eval",
+            unresolved,
+            num_games,
+            max_moves,
+            neutral_score=_resolve_eval_unresolved_score_neutral(config),
+        )
 
     stats = _build_eval_stats(wins, draws, losses, unresolved, num_games)
     stats["profile"] = eval_profile
+    stats["terminal_reasons"] = terminal_reasons
     stats["cancelled"] = bool(cancelled)
+    if cancelled:
+        stats["cancel_reason"] = "stop requested during game evaluation"
+        stats["cancel_stage"] = "game evaluation"
     stats["completed"] = int(completed)
+    _notify_eval_runtime(
+        runtime_ready_callback,
+        status="cancelled" if cancelled else "completed",
+        ready=False,
+        completed=int(completed),
+        requested_games=int(num_games),
+        cancel_stage="game evaluation" if cancelled else None,
+    )
     return stats
 
 
@@ -3439,6 +4261,12 @@ def evaluate_models_no_mcts(
         eval_bar.close()
 
     if unresolved > 0:
-        _print_eval_unresolved("No-MCTS eval", unresolved, num_games, max_moves)
+        _print_eval_unresolved(
+            "No-MCTS eval",
+            unresolved,
+            num_games,
+            max_moves,
+            neutral_score=_resolve_eval_unresolved_score_neutral(config),
+        )
 
     return _build_eval_stats(wins, draws, losses, unresolved, num_games)

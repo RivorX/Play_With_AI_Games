@@ -1,23 +1,30 @@
-# CNN v10 — nested bottleneck i global pooling
+# CNN v10 — nested trunk, FVI and One-BN
 
-`nested_cnn_v10` to osobna architektura CNN. Jej celem jest bogatsze przetwarzanie pozycji i globalnego kontekstu przy podobnym budżecie obliczeń do [v9](cnn_v9.md). Wyższa siła gry wymaga potwierdzenia treningiem i areną.
+`nested_cnn_v10` is the current v10 architecture profile. It keeps the six-block nested trunk and uses Fixed Variance Initialization (FVI), one training-only trunk BatchNorm, independent normalized and deployment heads, and an auxiliary soft-policy target. v9 remains a separate, unchanged architecture.
 
 ```text
-72 kanały wejścia → CoordConv 3×3 → 192 kanały
-→ 6 bloków nested bottleneck 192/96 → policy i value
+72 planes → CoordConv 3×3 → 192 trunk channels
+→ 6 nested residual blocks (192 / 96; two inner residual units each)
+→ policy and value heads
 ```
 
-- **Wejście:** bieżąca plansza i cztery poprzednie. Każda ma 12 kanałów figur oraz kanał powtórzeń; dodatkowe 7 kanałów opisuje bieżące prawa obu stron do roszady, en passant, licznik półruchów i obszar planszy. Nieznana historia powtórzeń ma wartość `-1`.
-- **Nested bottleneck:** blok zwęża cechy z 192 do 96 kanałów przez 1×1, wykonuje dwie wewnętrzne jednostki residual (łącznie cztery 3×3), po czym wraca do 192 kanałów. Szerokie cechy są zachowane przez zewnętrzne połączenie residual.
-- **Global pooling:** w blokach 2, 4 i 6 oraz w policy średnie i maksima kanałów sterują dodatkowymi przesunięciami cech. Przekazuje to kontekst całej planszy do lokalnego przetwarzania; mapa 8×8 pozostaje zachowana.
-- **Policy:** dwie konwolucje 3×3, 192→96→73, z globalnym kontekstem i mapowaniem na te same 1858 ruchów co v9.
-- **Value:** konwolucja 1×1 do 32 kanałów, spłaszczenie oraz średnie i maksima trunku, następnie FC192→WDL3. Pozostają opcjonalne search-Q i moves-left.
+- **Input and repetition:** 72-plane `planes_history_v2` input. New IL training uses exact repetition sidecars; each checkpoint records its input and repetition contract.
+- **Trunk and context:** six outer blocks remain. Blocks 2, 4 and 6 use global mean/max gated affine modulation of the 96-channel residual map. Each module predicts a channel gate and shift; its projection is zero-initialized, making the initial gate exactly one and shift zero. The residual branch therefore starts with the same behavior as the former neutral additive context, then can learn to amplify or suppress channels as well as shift them. The policy-head context remains additive. Inner depth and head shapes are unchanged.
+- **FVI and learned offsets:** every one of the 48 fixed positive FVI scales has a zero-initialized per-channel `beta`. Learned `gamma` is not used. These scales follow the residual graph's unit-variance approximation; they are initialization structure, not runtime statistics. Convolutions use fan-in He initialization. WDL hidden layers use fan-in He because LayerNorm normalizes their input. This profile has 4,172,526 training parameters, including 5,824 FVI beta parameters; 3,251,150 are active in ordinary inference. The gated context adds 55,584 parameters (18,528 per context block).
+- **One-BN training:** the raw trunk feeds one BatchNorm and an independently learned policy/value/auxiliary head set. The normalized branch receives 80% of the ordinary policy/value loss and the deployment branch receives 20%. Evaluation and play use the deployment branch. The BN branch and its running statistics are training-only.
+- **Soft policy:** each branch has a separate lightweight 1858-logit projection from its policy features. Training softens the MCTS visit distribution with temperature `4.0` and weight `0.25`. These are conservative chess settings; KataGo's Go-specific loss weights are not assumed to transfer.
+- **Inference folding:** central eager inference folds adjacent FVI scales and learned offsets into a disposable eval copy. It removes 47 of 48 scale operations; 18 pre-ReLU thresholds remain as activation-dtype shifts and one shared trunk scale remains. Source training weights and checkpoints are unchanged. CUDA latency and playing-strength gains have not been established by this folding check.
+- **Eager inference dtype cache:** the disposable copy stores non-persistent FP16 and BF16 versions of the 18 retained shifts. Eager inference reuses these values instead of converting each small offset on every forward. The cache does not change checkpoint keys or training parameters; compiled inference keeps its existing path. A local full-model CUDA probe was directionally faster at batches 1 and 32, nearly unchanged at batch 8, with noisy timings; no end-to-end match-throughput gain is claimed.
+- **Checkpoint contract:** only the current v10 parameter layout is supported for `nested_cnn_v10`. Earlier V10 checkpoints are not migrated; start a fresh v10 run. v9 checkpoints continue to use their own model contract.
 
-| Domyślny profil | Parametry | MAC na pozycję |
-| --- | ---: | ---: |
-| v9 | 3 125 774 | 166,26 mln |
-| v10 | 3 201 262 | 165,35 mln |
+The gated context is part of the current v10 graph and requires fresh v10 training. It is not an Elo claim: compare against the former additive-context design with matched training and paired-opening evaluation before attributing a playing-strength gain.
 
-MAC obejmuje Conv/Linear standardowego forwardu policy+value, bez opcjonalnych wyjść. Podobna liczba MAC nie gwarantuje podobnego czasu GPU. V10 ma własny kontrakt danych i wymaga własnych wag; można natomiast rozgrywać mecze v9 przeciw v10.
+## Training and checkpoint use
 
-Profil: [`nested_cnn_v10.yaml`](../../config/models/nested_cnn_v10.yaml). Uruchamianie, nazwy checkpointów i ograniczenia: [instrukcja v10](../nested_cnn_v10.md).
+Select `nested_cnn_v10.yaml` in the IL training prompt and start with **New**. The profile uses exact repetition sidecars and rebuilds aligned PGN sidecars when needed. Checkpoints store the architecture, loss settings, input encoding and repetition contract. The current v10 parameter layout is the only supported layout; earlier v10 checkpoints require a fresh run, while v9 keeps its separate contract.
+
+`return_training_aux=True` is reserved for `model.train()` with `apply_log_softmax=False`. It exposes `main` and `bn` policy/value tuples plus `soft_policy` and `bn_soft_policy` logits. Those auxiliary projections and the BN branch are skipped by ordinary forward calls; gameplay and validation use the deployment branch. Moves-left and search-Q outputs remain optional.
+
+A bounded CPU probe found fan-out initialization gave the LayerNorm-fed value hidden layer pre-activation standard deviations of 4.48–5.32. Fan-in He reduced them to 1.26–1.49 and hidden SiLU RMS from 3.03–3.57 to 0.78–0.91. Neither variant saturated WDL probabilities, so this corrects initialization scale and early gradient size; it does not establish an Elo gain.
+
+The implementation is [`nested_cnn_v10.py`](../../src/models/architecture/nested_cnn_v10.py), and the selected profile is [`nested_cnn_v10.yaml`](../../config/models/nested_cnn_v10.yaml). The FVI beta and auxiliary-target ideas are informed by [KataGo's methods documentation](https://github.com/lightvector/KataGo/blob/master/docs/KataGoMethods.md) and [its PyTorch training implementation](https://github.com/lightvector/KataGo/blob/master/python/katago/train/model_pytorch.py). They do not prove the same choices improve chess Elo.

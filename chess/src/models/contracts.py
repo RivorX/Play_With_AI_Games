@@ -12,6 +12,7 @@ DEFAULT_POLICY_CODEC_ID = "lc0_1858_v1"
 DEFAULT_VALUE_HEAD_ID = "wdl_search_aux_v1"
 V10_ARCHITECTURE_ID = "nested_cnn_v10"
 V10_INPUT_ENCODER_ID = "planes_history_v2"
+V10_DEFAULT_REPETITION_PLANE_MODE = "unknown"
 
 SE_CNN_V9_MODEL_KEYS = (
     "version",
@@ -34,6 +35,11 @@ SE_CNN_V9_MODEL_KEYS = (
 
 NESTED_CNN_V10_MODEL_KEYS = (
     "version",
+    "normalization_mode",
+    "auxiliary_soft_policy",
+    "bn_head_loss_weight",
+    "soft_policy_temperature",
+    "soft_policy_loss_weight",
     "history_positions",
     "input_planes",
     "trunk_channels",
@@ -45,8 +51,10 @@ NESTED_CNN_V10_MODEL_KEYS = (
     "policy_head_channels",
     "value_head_filters",
     "value_hidden_dim",
+    "value_hidden_init",
     "moves_left_hidden_dim",
     "dropout",
+    "repetition_plane_mode",
 )
 
 
@@ -67,6 +75,13 @@ def model_spec_from_config(config: dict) -> dict:
             for key in NESTED_CNN_V10_MODEL_KEYS
             if key in model_cfg
         }
+        repetition_plane_mode = str(
+            model_cfg.get(
+                "repetition_plane_mode",
+                V10_DEFAULT_REPETITION_PLANE_MODE,
+            )
+        ).strip().lower()
+        kwargs["repetition_plane_mode"] = repetition_plane_mode
     else:
         raise ValueError(f"No model-spec contract registered for {architecture_id!r}")
     history_positions = int(model_cfg.get("history_positions", 0))
@@ -94,6 +109,11 @@ def model_spec_from_config(config: dict) -> dict:
             "encoder_id": encoder_id,
             "history_positions": history_positions,
             "input_planes": expected_planes,
+            **(
+                {"repetition_plane_mode": repetition_plane_mode}
+                if architecture_id == V10_ARCHITECTURE_ID
+                else {}
+            ),
         },
         "policy_spec": {
             "codec_id": str(
@@ -112,7 +132,7 @@ def model_spec_from_config(config: dict) -> dict:
 
 
 def legacy_model_spec(checkpoint: dict | None, runtime_config: dict) -> dict:
-    """Infer the current SE-CNN contract for checkpoints predating model_spec."""
+    """Infer the v9 contract for checkpoints predating model_spec."""
     config = deepcopy(runtime_config)
     checkpoint = checkpoint or {}
     legacy = checkpoint.get("model_architecture")
@@ -125,17 +145,18 @@ def legacy_model_spec(checkpoint: dict | None, runtime_config: dict) -> dict:
     # Never let a newly selected runtime profile reinterpret their state dict.
     model_cfg = config.setdefault("model", {})
     architecture_id = legacy_architecture_id or DEFAULT_ARCHITECTURE_ID
-    if architecture_id not in {DEFAULT_ARCHITECTURE_ID, V10_ARCHITECTURE_ID}:
+    if architecture_id == V10_ARCHITECTURE_ID:
+        raise ValueError(
+            "nested_cnn_v10 checkpoints require self-contained model_spec metadata. "
+            "Legacy V10 checkpoints are not migrated; start a fresh v10 run."
+        )
+    if architecture_id != DEFAULT_ARCHITECTURE_ID:
         raise ValueError(f"No legacy model-spec contract for {architecture_id!r}")
     model_cfg["architecture_id"] = architecture_id
     if isinstance(legacy, dict):
         model_cfg.update(legacy)
     model_cfg["architecture_id"] = architecture_id
-    expected_encoder = (
-        V10_INPUT_ENCODER_ID
-        if architecture_id == V10_ARCHITECTURE_ID
-        else DEFAULT_INPUT_ENCODER_ID
-    )
+    expected_encoder = DEFAULT_INPUT_ENCODER_ID
     if not isinstance(legacy, dict) or "input_encoder_id" not in legacy:
         model_cfg["input_encoder_id"] = expected_encoder
     if not isinstance(legacy, dict) or "policy_codec_id" not in legacy:
@@ -224,4 +245,28 @@ def validate_model_spec(spec: dict) -> None:
         raise ValueError(
             f"Architecture {architecture_id!r} requires encoder {expected_encoder!r}, "
             f"got {encoder_id!r}"
+        )
+    if architecture_id == V10_ARCHITECTURE_ID:
+        from src.models.data.nested_cnn_v10.encoder import (
+            normalize_repetition_plane_mode,
+        )
+
+        model_kwargs = spec.get("model_kwargs") or {}
+        if (
+            str(model_kwargs.get("version", "")) != "v10"
+            or str(model_kwargs.get("normalization_mode", ""))
+            != "fixed_variance_one_bn"
+            or not bool(model_kwargs.get("auxiliary_soft_policy", False))
+        ):
+            raise ValueError(
+                "Invalid v10 model_spec: version='v10', normalization_mode="
+                "'fixed_variance_one_bn', and auxiliary_soft_policy=true are required. "
+                "No older v10 checkpoint migration is supported."
+            )
+        input_spec = spec.get("input_spec") or {}
+        normalize_repetition_plane_mode(
+            input_spec.get(
+                "repetition_plane_mode",
+                V10_DEFAULT_REPETITION_PLANE_MODE,
+            )
         )

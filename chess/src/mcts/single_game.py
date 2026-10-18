@@ -1,5 +1,7 @@
 """Single-game API over the canonical batched MCTS engine."""
 
+import math
+
 
 class SingleGameMCTS:
     """
@@ -9,8 +11,34 @@ class SingleGameMCTS:
     multi-root search implementation with RL.
     """
 
-    def __init__(self, model, config, device):
+    def __init__(self, model, config, device, *, single_root_batch_cap=None):
         from src.mcts.search import MultiGameBatchMCTS
+
+        if single_root_batch_cap is not None:
+            if isinstance(single_root_batch_cap, bool):
+                raise ValueError("single_root_batch_cap must be a non-negative integer")
+            try:
+                numeric_cap = float(single_root_batch_cap)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "single_root_batch_cap must be a non-negative integer"
+                ) from exc
+            if (
+                not math.isfinite(numeric_cap)
+                or numeric_cap < 0
+                or not numeric_cap.is_integer()
+            ):
+                raise ValueError("single_root_batch_cap must be a non-negative integer")
+
+            # Keep this override local to the single-game wrapper. In
+            # particular, don't mutate the shared runtime config used by
+            # multi-root RL, UCI, or Elo evaluation.
+            config = dict(config)
+            reinforcement_learning = dict(
+                config.get("reinforcement_learning", {}) or {}
+            )
+            reinforcement_learning["mcts_single_root_batch_cap"] = int(numeric_cap)
+            config["reinforcement_learning"] = reinforcement_learning
 
         self._multi = MultiGameBatchMCTS(model, config, device)
         # MultiGameBatchMCTS resolves architecture and encoder settings from

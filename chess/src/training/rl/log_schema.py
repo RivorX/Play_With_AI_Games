@@ -7,7 +7,10 @@ import csv
 
 # Version 63 is already present in historical dirty RL81 CSVs with a
 # different column layout. Version 64 added independent promotion confirmation.
-RL_LOG_SCHEMA_VERSION = 68
+# Version 69 records V10's deployment/BN head losses and soft-policy signal.
+# History import maps rows by column name; these new fields stay blank for old
+# rows, while V9 batches emit zero-valued branch metrics.
+RL_LOG_SCHEMA_VERSION = 69
 
 
 # One row per training iteration. This is the promotion/strength dashboard source,
@@ -15,7 +18,11 @@ RL_LOG_SCHEMA_VERSION = 68
 RL_MAIN_COLUMNS = (
     "iteration", "schema_version",
     "avg_loss", "policy_loss", "value_loss",
-    "value_primary_loss", "value_scalar_aux_loss", "value_search_consistency_loss", "moves_left_loss",
+    "value_primary_loss", "value_scalar_aux_loss", "value_search_consistency_loss",
+    "bn_head_loss_weight", "bn_policy_loss", "bn_value_loss",
+    "soft_policy_loss", "soft_policy_deploy_loss", "soft_policy_bn_loss",
+    "soft_policy_valid_rows", "soft_policy_valid_fraction",
+    "soft_policy_loss_weight", "soft_policy_temperature", "moves_left_loss",
     "search_q_loss", "search_q_weight", "search_q_coverage", "search_q_mae",
     "learning_rate", "value_loss_weight",
     "temperature", "policy_top1_acc", "policy_top3_acc",

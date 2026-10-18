@@ -3,21 +3,21 @@
 import pygame
 
 
-BG_TOP = (14, 19, 28)
-BG_BOTTOM = (7, 10, 16)
-SURFACE = (22, 29, 40)
-SURFACE_RAISED = (28, 37, 50)
-SURFACE_SOFT = (18, 24, 33)
-BORDER = (70, 88, 116)
-BORDER_STRONG = (94, 118, 154)
-TEXT = (240, 245, 252)
-MUTED = (150, 166, 190)
-SUBTLE = (112, 128, 151)
-ACCENT = (84, 149, 235)
-ACCENT_HOVER = (105, 168, 247)
-SUCCESS = (82, 184, 135)
-WARNING = (235, 184, 92)
-DANGER = (196, 91, 98)
+BG_TOP = (16, 22, 27)
+BG_BOTTOM = (12, 17, 21)
+SURFACE = (25, 34, 40)
+SURFACE_RAISED = (31, 43, 50)
+SURFACE_SOFT = (20, 28, 33)
+BORDER = (53, 70, 76)
+BORDER_STRONG = (77, 101, 104)
+TEXT = (236, 240, 235)
+MUTED = (151, 168, 171)
+SUBTLE = (110, 128, 132)
+ACCENT = (105, 196, 171)
+ACCENT_HOVER = (135, 215, 189)
+SUCCESS = (113, 193, 148)
+WARNING = (225, 178, 104)
+DANGER = (202, 111, 104)
 
 
 def lerp_color(color_a, color_b, t):
@@ -35,20 +35,6 @@ def build_background(width, height):
         color = lerp_color(BG_TOP, BG_BOTTOM, y / max(1, height - 1))
         pygame.draw.line(surface, color, (0, y), (width, y))
 
-    glow = pygame.Surface((width, height), pygame.SRCALPHA)
-    pygame.draw.circle(
-        glow,
-        (*ACCENT, 18),
-        (int(width * 0.12), int(height * 0.06)),
-        max(180, int(min(width, height) * 0.42)),
-    )
-    pygame.draw.circle(
-        glow,
-        (66, 184, 158, 10),
-        (int(width * 0.92), int(height * 0.82)),
-        max(160, int(min(width, height) * 0.34)),
-    )
-    surface.blit(glow, (0, 0))
     return surface
 
 

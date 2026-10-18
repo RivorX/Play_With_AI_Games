@@ -2320,7 +2320,21 @@ class MultiGameBatchMCTS:
             or model_cfg.get('input_encoder_id', 'planes_history_v1')
         )
         self.input_encoder = get_input_encoder(self.input_encoder_id)
+        # V10 always has a path-sensitive 13/20-plane layout. Whether the
+        # repetition plane itself was supervised is a separate checkpoint
+        # contract: legacy V10 checkpoints were trained with it unknown (-1),
+        # even though MCTS still knows exact repetition counts for draw rules.
         self._path_dependent_repetition = self.input_encoder_id == 'planes_history_v2'
+        self.repetition_plane_mode = 'unknown'
+        if self._path_dependent_repetition:
+            self.repetition_plane_mode = self.input_encoder.resolve_repetition_plane_mode(
+                model_spec=model_spec if isinstance(model_spec, dict) else None,
+                model_config=model_cfg,
+            )
+        self._encode_exact_repetition = (
+            self._path_dependent_repetition
+            and self.repetition_plane_mode == 'exact'
+        )
         rl_cfg = config['reinforcement_learning']
         (
             self.policy_target_mode,
@@ -2385,6 +2399,15 @@ class MultiGameBatchMCTS:
             int(rl_cfg.get('eval_mcts_dynamic_budget_chunk', 16)),
         )
         self.eval_batch_size = config['reinforcement_learning'].get('mcts_batch_size', 32)
+        # SingleGameMCTS is the interactive path and has no other roots with
+        # which to fill an inference batch. A positive cap batches more of its
+        # exact per-phase simulation budget together; 0 keeps the legacy
+        # quarter-of-remaining schedule. Multi-root RL/eval scheduling is
+        # deliberately unchanged.
+        self.single_root_batch_cap = max(
+            0,
+            int(config['reinforcement_learning'].get('mcts_single_root_batch_cap', 0) or 0),
+        )
         # History configuration (POV)
         self.history_positions = int(
             input_spec.get(
@@ -2418,10 +2441,11 @@ class MultiGameBatchMCTS:
         self.cache_history_tensors = bool(
             config['reinforcement_learning'].get('mcts_cache_history_tensors', True)
         )
-        # V10's repetition feature depends on the complete path. Reusing a
-        # cached tensor by node/transposition identity alone would leak the
-        # first path's repetition count into another path.
-        if self._path_dependent_repetition:
+        # Exact v10 repetition planes depend on the complete root path, so a
+        # node-identity cache could leak one path's count into another. Legacy
+        # v10 checkpoints use an unknown (-1) repetition plane; their complete
+        # per-node encoding is path-independent and remains cacheable.
+        if self._encode_exact_repetition:
             self.cache_history_tensors = False
         # History pairs are 4 KiB each in FP16. Keeping one on every expanded
         # node made tree RAM grow with all visits, although only recent
@@ -2654,13 +2678,27 @@ class MultiGameBatchMCTS:
         sample_t0, sample_scale = self._profile_sample_begin('board_to_tensor')
         dtype = np.float32 if storage_dtype is None else storage_dtype
         if self._path_dependent_repetition:
+            repetition_count = self.input_encoder.repetition_count_for_mode(
+                self.repetition_plane_mode,
+                repetition_count,
+            )
+            direct_out = (
+                isinstance(out, np.ndarray)
+                and out.dtype == np.dtype(dtype)
+                and out.flags.writeable
+                and (out.flags.c_contiguous or out.flags.f_contiguous)
+            )
             tensor = self.input_encoder.encode(
                 board,
                 flip_perspective=flip_perspective,
                 dtype=dtype,
+                out=out if direct_out else None,
                 repetition_count=repetition_count,
             )
-            if out is not None:
+            if out is not None and not direct_out:
+                # Match the historical allocation-then-cast behavior for
+                # mismatched dtypes and layouts that the encoder cannot safely
+                # fill as a direct contiguous destination.
                 np.copyto(out, tensor)
                 tensor = out
         else:
@@ -2678,6 +2716,10 @@ class MultiGameBatchMCTS:
         storage_dtype = self.history_storage_dtype
         sample_t0, sample_scale = self._profile_sample_begin('board_to_tensor_pair')
         if self._path_dependent_repetition:
+            repetition_count = self.input_encoder.repetition_count_for_mode(
+                self.repetition_plane_mode,
+                repetition_count,
+            )
             white_tensor, black_tensor = self.input_encoder.encode_pair(
                 board,
                 dtype=storage_dtype,
@@ -2693,15 +2735,18 @@ class MultiGameBatchMCTS:
         return (white_tensor, black_tensor)
 
     def _history_tensor_pair_for_node(self, node, repetition_count=None):
-        if self._path_dependent_repetition:
-            # Repetition planes are path dependent, including unknown versus 0.
-            # Do not reuse a pair cached only by node/transposition identity.
+        if self._encode_exact_repetition:
+            # Exact repetition planes are path dependent. Do not reuse a pair
+            # cached only by node/transposition identity.
             return self._history_tensor_pair_for_board(
                 node.board,
                 repetition_count=repetition_count,
             )
         if not self.cache_history_tensors:
-            return self._history_tensor_pair_for_board(node.board)
+            return self._history_tensor_pair_for_board(
+                node.board,
+                repetition_count=repetition_count,
+            )
 
         cache_key = id(node)
         cached_entry = self._history_tensor_cache.get(cache_key)
@@ -2712,7 +2757,10 @@ class MultiGameBatchMCTS:
                 return cached
             del self._history_tensor_cache[cache_key]
 
-        cached = self._history_tensor_pair_for_board(node.board)
+        cached = self._history_tensor_pair_for_board(
+            node.board,
+            repetition_count=repetition_count,
+        )
         self._history_tensor_cache[cache_key] = (weakref.ref(node), cached)
         self._history_tensor_cache.move_to_end(cache_key)
         while len(self._history_tensor_cache) > self._history_tensor_cache_capacity:
@@ -2963,7 +3011,7 @@ class MultiGameBatchMCTS:
             for hist_entry in history_boards:
                 encoded = self._encode_history_entry(hist_entry)
                 hist_tensor = encoded[1] if use_black_pov else encoded[0]
-                history_tensors.append(hist_tensor)
+                history_tensors.append(self._history_frame_for_model(hist_tensor))
 
         pad_count = max(0, self.history_positions - len(history_tensors))
         if pad_count:
@@ -2974,13 +3022,13 @@ class MultiGameBatchMCTS:
                 current_board,
                 repetition_count=repetition_count,
             )
+        elif self._path_dependent_repetition and not self._encode_exact_repetition:
+            current_tensor = np.array(current_tensor, copy=True)
+            current_tensor[12].fill(-1.0)
         history_tensors.append(current_tensor)
 
         if self._path_dependent_repetition:
-            frames = [
-                np.asarray(item[:self._history_frame_planes])
-                for item in history_tensors[:-1]
-            ]
+            frames = [np.asarray(item) for item in history_tensors[:-1]]
             frames = [self._empty_history_tensor] * (
                 self.history_positions - len(frames)
             ) + frames
@@ -3007,7 +3055,7 @@ class MultiGameBatchMCTS:
                     f"encoder {self.input_encoder_id!r} ({self._current_planes} planes)"
                 )
             tensor = entry[1] if use_black_pov else entry[0]
-            return tensor[:13] if self._path_dependent_repetition else tensor
+            return self._history_frame_for_model(tensor)
 
         if isinstance(entry, MCTSNode):
             encoded = self._history_tensor_pair_for_node(
@@ -3015,7 +3063,7 @@ class MultiGameBatchMCTS:
                 repetition_count=repetition_count,
             )
             tensor = encoded[1] if use_black_pov else encoded[0]
-            return tensor[:13] if self._path_dependent_repetition else tensor
+            return self._history_frame_for_model(tensor)
 
         if isinstance(entry, chess.Board):
             tensor = self._board_to_tensor_profiled(
@@ -3024,14 +3072,27 @@ class MultiGameBatchMCTS:
                 storage_dtype=self.history_storage_dtype,
                 repetition_count=repetition_count,
             )
-            return tensor[:13] if self._path_dependent_repetition else tensor
+            return self._history_frame_for_model(tensor)
 
         encoded = self._encode_history_entry(
             entry,
             repetition_count=repetition_count,
         )
         tensor = encoded[1] if use_black_pov else encoded[0]
-        return tensor[:13] if self._path_dependent_repetition else tensor
+        return self._history_frame_for_model(tensor)
+
+    def _history_frame_for_model(self, tensor):
+        """Return one history frame under the checkpoint's repetition contract."""
+        if not self._path_dependent_repetition:
+            return tensor
+        frame = tensor[:self._history_frame_planes]
+        if not self._encode_exact_repetition and not np.all(frame[12] == -1.0):
+            # Encoded history can arrive from callers that know repetition
+            # counts. Do not leak that feature into checkpoints trained with
+            # unknown repetition planes, and do not mutate the caller's cache.
+            frame = np.array(frame, copy=True)
+            frame[12].fill(-1.0)
+        return frame
 
     def _collect_node_history_entries(self, node, board_history):
         """
@@ -4170,10 +4231,21 @@ class MultiGameBatchMCTS:
                 # batching even though roots receive different total budgets.
                 active_count = sum(1 for value in remaining if value > 0)
                 max_remaining_any_game = max(remaining) if remaining else 1
-                slots_per_game = max(1, min(
-                    self.eval_batch_size // max(1, active_count),
-                    max(1, max_remaining_any_game // 4),
-                ))
+                if (
+                    native_forest is not None
+                    and game_count == 1
+                    and self.single_root_batch_cap > 0
+                ):
+                    slots_per_game = min(
+                        max(1, int(self.eval_batch_size)),
+                        self.single_root_batch_cap,
+                        max(1, max_remaining_any_game),
+                    )
+                else:
+                    slots_per_game = max(1, min(
+                        self.eval_batch_size // max(1, active_count),
+                        max(1, max_remaining_any_game // 4),
+                    ))
                 batch_size = min(
                     self.eval_batch_size,
                     total_remaining,

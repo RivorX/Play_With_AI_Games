@@ -132,15 +132,15 @@ def _prefetch_piece_assets():
 
 
 def _ensure_piece_asset(symbol):
+    """Return an already available piece sprite without doing network I/O.
+
+    Remote prefetch is intentionally handled by start_piece_asset_prefetch();
+    rendering should fall back to bundled SVG assets immediately if a cache
+    miss occurs.
+    """
     cache_path = _piece_cache_path(symbol)
     if cache_path.exists():
         return cache_path
-
-    try:
-        if _download_piece_asset(symbol, cache_path):
-            return cache_path
-    except Exception:
-        pass
 
     bundled_path = _piece_asset_path(symbol)
     if bundled_path.exists():

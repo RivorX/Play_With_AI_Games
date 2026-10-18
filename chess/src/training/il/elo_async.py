@@ -2,8 +2,11 @@
 
 import copy
 import gc
+import json
 import multiprocessing as mp
 import queue
+from datetime import datetime, timezone
+from pathlib import Path
 
 import torch
 
@@ -99,7 +102,9 @@ def _async_elo_worker(
         result_queue.put(
             {
                 "epoch": int(epoch_num),
-                "error": str(exc),
+                "error": f"{type(exc).__name__}: {exc}",
+                "error_type": type(exc).__name__,
+                "device": worker_device.type,
             }
         )
     finally:
@@ -156,6 +161,66 @@ class ILEloCoordinator:
         except Exception:
             pass
 
+    def _append_async_event(self, payload, status, elo_result=None):
+        """Persist the compact result/error payload beside this run's CSV."""
+        csv_path = getattr(self.logger, "csv_path", None)
+        if csv_path is None:
+            return
+        try:
+            csv_path = Path(csv_path)
+            event_path = csv_path.with_name(f"{csv_path.stem}_elo_events.jsonl")
+            event = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "epoch": int(payload.get("epoch", -1)),
+                "status": str(status),
+                "device": payload.get("device"),
+                "error": payload.get("error"),
+                "error_type": payload.get("error_type"),
+                "result": elo_result,
+            }
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            with event_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+                handle.flush()
+        except Exception as exc:
+            print(f"     [async] Could not persist Elo event: {type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _inconclusive_detail(elo_result):
+        total = elo_result.get("total_games")
+        rating_games = elo_result.get("rating_games")
+        range_status = elo_result.get("rating_range_status")
+        stop_reason = elo_result.get("precision_stop_reason")
+        details = []
+        if total is not None:
+            details.append(f"{int(total)} valid games")
+        if rating_games is not None:
+            details.append(f"{int(rating_games)} rating games")
+        if range_status:
+            details.append(f"range={range_status}")
+        if stop_reason:
+            details.append(f"stop={stop_reason}")
+        failed_games = elo_result.get("failed_games")
+        if failed_games is not None:
+            details.append(f"failed={int(failed_games)}")
+        failure_counts = elo_result.get("game_failure_counts")
+        if isinstance(failure_counts, dict) and failure_counts:
+            counts = ", ".join(
+                f"{key}:{int(value)}"
+                for key, value in sorted(failure_counts.items())
+            )
+            details.append(f"failures=[{counts}]")
+        failure_examples = elo_result.get("game_failure_examples")
+        if isinstance(failure_examples, dict) and failure_examples:
+            details.append(f"example={next(iter(failure_examples.values()))}")
+        error_detail = elo_result.get("error_detail")
+        if error_detail:
+            details.append(str(error_detail))
+        bracket = elo_result.get("rating_bracket")
+        if isinstance(bracket, (list, tuple)) and len(bracket) == 2:
+            details.append(f"bracket={bracket[0]}-{bracket[1]}")
+        return ", ".join(details) or "the estimator returned no rating diagnostics"
+
     def print_startup_summary(self, verbose=False):
         """Print runtime Elo configuration."""
         if not self.enabled or not verbose:
@@ -189,13 +254,16 @@ class ILEloCoordinator:
             result_epoch = int(payload.get("epoch", -1))
             worker_error = payload.get("error")
             if payload.get("cancelled"):
-                pass
+                self._append_async_event(payload, "cancelled")
+                print(f"     [async] Elo cancelled for epoch {result_epoch}.")
             elif worker_error:
+                self._append_async_event(payload, "worker_error")
                 print(f"     [async] Elo failed for epoch {result_epoch}: {worker_error}")
             else:
                 elo_result = payload.get("result", {}) or {}
                 estimated_elo = elo_result.get("estimated_elo")
                 if estimated_elo is not None:
+                    self._append_async_event(payload, "estimated", elo_result)
                     self.last_estimated_elo = float(estimated_elo)
                     self.logger.record_estimated_elo(
                         result_epoch,
@@ -216,8 +284,25 @@ class ILEloCoordinator:
                         print(f"       vs SF {lvl}: {score_str} (score: {res['score']:.0%}, n={games})")
                     print(f"       time {elo_result['total_time']:.1f}s ({elo_result['total_games']} games)")
                     any_new_elo = True
-                elif "error" not in elo_result and not elo_result.get("skipped"):
-                    print(f"     [async] Epoch {result_epoch} Elo estimation: inconclusive")
+                elif elo_result.get("error"):
+                    self._append_async_event(payload, "estimator_error", elo_result)
+                    print(
+                        f"     [async] Elo failed for epoch {result_epoch}: "
+                        f"{elo_result['error']} ({self._inconclusive_detail(elo_result)})"
+                    )
+                elif elo_result.get("cancelled"):
+                    self._append_async_event(payload, "cancelled", elo_result)
+                    print(f"     [async] Elo cancelled for epoch {result_epoch}.")
+                elif elo_result.get("skipped"):
+                    self._append_async_event(payload, "skipped", elo_result)
+                    reason = elo_result.get("skip_reason") or "no reason supplied"
+                    print(f"     [async] Elo skipped for epoch {result_epoch}: {reason}")
+                else:
+                    self._append_async_event(payload, "inconclusive", elo_result)
+                    print(
+                        f"     [async] Epoch {result_epoch} Elo estimation: inconclusive "
+                        f"({self._inconclusive_detail(elo_result)})"
+                    )
 
             if self.worker_epoch == result_epoch:
                 self._clear_finished_worker()
@@ -227,6 +312,11 @@ class ILEloCoordinator:
             exitcode = getattr(self.worker_process, "exitcode", None)
             reason = f"process exited without payload (exitcode={exitcode})"
             if not self._restart_worker(reason):
+                failed_epoch = int(self.worker_epoch)
+                self._append_async_event(
+                    {"epoch": failed_epoch, "error": reason, "error_type": "worker_exit"},
+                    "worker_exit",
+                )
                 print(f"     [async] Elo worker for epoch {self.worker_epoch} finished without payload.")
                 self._clear_finished_worker()
 

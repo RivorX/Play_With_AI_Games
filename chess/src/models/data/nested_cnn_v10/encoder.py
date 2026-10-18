@@ -6,6 +6,50 @@ ENCODER_ID = "planes_history_v2"
 POLICY_CODEC_ID = "lc0_1858_v1"
 PLANES_PER_POSITION = 13
 CURRENT_METADATA_PLANES = 7
+REPETITION_PLANE_MODE_UNKNOWN = "unknown"
+REPETITION_PLANE_MODE_EXACT = "exact"
+REPETITION_PLANE_MODES = frozenset(
+    {REPETITION_PLANE_MODE_UNKNOWN, REPETITION_PLANE_MODE_EXACT}
+)
+
+
+def normalize_repetition_plane_mode(mode=None) -> str:
+    """Normalize the v10 repetition feature contract, defaulting to legacy-safe unknown."""
+    normalized = str(mode or REPETITION_PLANE_MODE_UNKNOWN).strip().lower()
+    if normalized not in REPETITION_PLANE_MODES:
+        raise ValueError(
+            "repetition_plane_mode must be 'unknown' or 'exact', "
+            f"got {mode!r}"
+        )
+    return normalized
+
+
+def resolve_repetition_plane_mode(model_spec=None, model_config=None) -> str:
+    """Resolve how a checkpoint was trained to interpret repetition planes.
+
+    A checkpoint model_spec takes precedence over the active runtime config.
+    Missing metadata in historical v10 specs means unknown, matching the old
+    compact-PGN training pipeline which did not persist repetition provenance.
+    """
+    input_spec = (
+        model_spec.get("input_spec", {})
+        if isinstance(model_spec, dict)
+        else {}
+    ) or {}
+    if isinstance(model_spec, dict) and isinstance(input_spec, dict):
+        return normalize_repetition_plane_mode(
+            input_spec.get("repetition_plane_mode", REPETITION_PLANE_MODE_UNKNOWN)
+        )
+    model_config = model_config if isinstance(model_config, dict) else {}
+    return normalize_repetition_plane_mode(
+        model_config.get("repetition_plane_mode", REPETITION_PLANE_MODE_UNKNOWN)
+    )
+
+
+def repetition_count_for_mode(mode, exact_count):
+    """Return a count only when the checkpoint was explicitly trained on it."""
+    mode = normalize_repetition_plane_mode(mode)
+    return exact_count if mode == REPETITION_PLANE_MODE_EXACT else None
 
 
 def input_planes(history_positions: int) -> int:
@@ -20,6 +64,7 @@ def encode(
     flip_perspective=None,
     dtype=None,
     *,
+    out=None,
     repetition_count=None,
 ):
     """Encode one board as 13 state planes followed by 7 current metadata planes.
@@ -33,6 +78,8 @@ def encode(
     kwargs = {"flip_perspective": flip_perspective, "repetition_count": repetition_count}
     if dtype is not None:
         kwargs["dtype"] = dtype
+    if out is not None:
+        kwargs["out"] = out
     return board_to_tensor(board, **kwargs)
 
 
@@ -76,5 +123,17 @@ def encode_history(
         history_boards=history_boards,
         history_positions=history_positions,
         **kwargs,
+    )
+
+
+def stack_history(current_tensor, history_tensors, history_positions, dtype=None):
+    """Stack POV-aligned encoded v10 frames into the 13/20-plane layout."""
+    from src.models.data.nested_cnn_v10.helpers import stack_encoded_history
+
+    return stack_encoded_history(
+        current_tensor,
+        history_tensors,
+        history_positions,
+        dtype=dtype,
     )
 

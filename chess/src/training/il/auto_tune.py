@@ -19,9 +19,14 @@ except Exception:
     DEFAULT_ACTION_SIZE = 1858
 
 from .loss import CombinedLoss
+from src.training.soft_policy import (
+    legal_masked_soft_policy_loss_from_prepared,
+    prepare_legal_masked_soft_policy_target,
+)
 
 
 AUTO_TUNE_ALGO_VERSION = 10
+V10_AUTOTUNE_CACHE_TAG = "v10-gated-pool-full-aux-v1"
 
 
 def _safe_int(value, default=0):
@@ -60,15 +65,23 @@ def _fmt_gib(num_bytes):
 def build_model_hash(config):
     """Build model hash used to cache auto-tuned IL hyperparameters."""
     model_cfg = dict(config.get("model", {}) or {})
-
+    architecture_id = str(model_cfg.get("architecture_id", "")).strip().lower()
+    is_v10 = architecture_id == "nested_cnn_v10"
     # Optional manual override from config.
     manual_hash = str(model_cfg.get("hash", "")).strip()
     if manual_hash:
+        if is_v10:
+            return f"{manual_hash}:{V10_AUTOTUNE_CACHE_TAG}"
         return manual_hash
 
     # Exclude runtime-only fields from hash.
     model_cfg.pop("print_summary", None)
     model_cfg.pop("version", None)
+    # The v10 auto-tuner must measure its training-only BN and auxiliary
+    # policy paths. The fingerprint also identifies the current gated-pooling
+    # model and avoids reusing results from the previous v10 probe/model shape.
+    if is_v10:
+        model_cfg["_auto_tune_training_probe"] = V10_AUTOTUNE_CACHE_TAG
     payload = json.dumps(model_cfg, sort_keys=True, ensure_ascii=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -414,29 +427,58 @@ def _clear_probe_state(model, device):
 
 
 def _build_adamw_optimizer(model, lr, weight_decay, fused_preferred):
+    named_parameters = list(model.named_parameters())
+    beta_parameters = [
+        parameter
+        for name, parameter in named_parameters
+        if name.endswith(".beta")
+    ]
+    if beta_parameters:
+        beta_ids = {id(parameter) for parameter in beta_parameters}
+        regular_parameters = [
+            parameter
+            for _, parameter in named_parameters
+            if id(parameter) not in beta_ids
+        ]
+        parameters = []
+        if regular_parameters:
+            parameters.append(
+                {"params": regular_parameters, "weight_decay": float(weight_decay)}
+            )
+        parameters.append({"params": beta_parameters, "weight_decay": 0.0})
+    else:
+        # Preserve the original one-group optimizer for V9; current V10 has beta parameters.
+        parameters = [parameter for _, parameter in named_parameters]
     try:
         return torch.optim.AdamW(
-            model.parameters(),
+            parameters,
             lr=lr,
             weight_decay=weight_decay,
             fused=fused_preferred,
         )
     except TypeError:
         return torch.optim.AdamW(
-            model.parameters(),
+            parameters,
             lr=lr,
             weight_decay=weight_decay,
         )
     except RuntimeError:
         return torch.optim.AdamW(
-            model.parameters(),
+            parameters,
             lr=lr,
             weight_decay=weight_decay,
             fused=False,
         )
 
 
-def _build_synthetic_batch(config, device, batch_size, input_planes, generator=None):
+def _build_synthetic_batch(
+    config,
+    device,
+    batch_size,
+    input_planes,
+    generator=None,
+    include_sparse_policy=False,
+):
     boards = torch.randn(batch_size, input_planes, 8, 8, device=device, generator=generator)
     boards = boards.to(memory_format=torch.channels_last)
 
@@ -481,7 +523,311 @@ def _build_synthetic_batch(config, device, batch_size, input_planes, generator=N
         "moves_left": moves_left,
     }
 
+    if include_sparse_policy:
+        # V10 trains its auxiliary policy objectives from empirical sparse
+        # targets. Include several supported moves so the soft-policy heads
+        # exercise their real non-degenerate loss path during tuning.
+        support = 8
+        policy_indices = torch.randint(
+            0,
+            max(2, move_space),
+            (batch_size, support),
+            device=device,
+            dtype=torch.long,
+            generator=generator,
+        )
+        policy_indices[:, 0] = moves
+        policy_values = torch.rand(
+            (batch_size, support), device=device, generator=generator
+        )
+        policy_values = policy_values / policy_values.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        targets["policy_indices"] = policy_indices
+        targets["policy_values"] = policy_values
+
     return boards, targets
+
+
+def _unwrap_probe_model(model):
+    """Return the underlying module when a compile/distribution wrapper is used."""
+    current = model
+    seen = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        wrapped = getattr(current, "_orig_mod", None)
+        if wrapped is None:
+            wrapped = getattr(current, "module", None)
+        if wrapped is None:
+            break
+        current = wrapped
+    return current
+
+
+def _supports_training_aux_probe(model):
+    return bool(getattr(_unwrap_probe_model(model), "supports_training_aux", False))
+
+
+def _v10_probe_loss(model, training_outputs, targets, criterion):
+    """Compute the same supervised and auxiliary objectives used by v10 IL."""
+    if not isinstance(training_outputs, dict):
+        raise TypeError("v10 auto-tune expects a training-aux output mapping")
+    required = {"main", "bn", "soft_policy", "bn_soft_policy"}
+    missing = sorted(required.difference(training_outputs))
+    if missing:
+        raise TypeError(f"v10 auto-tune output is missing keys: {missing}")
+
+    def predictions(branch):
+        return {
+            "policy": branch[0],
+            "value": branch[1],
+            "moves_left": branch[2],
+        }
+
+    main_loss, main_parts = criterion(
+        predictions(training_outputs["main"]), targets, include_scalar_metrics=True
+    )
+    bn_loss, bn_parts = criterion(
+        predictions(training_outputs["bn"]),
+        targets,
+        include_scalar_metrics=False,
+    )
+    base_model = _unwrap_probe_model(model)
+    model_cfg = dict(getattr(base_model, "model_config", {}) or {})
+    bn_weight = float(model_cfg.get("bn_head_loss_weight", 0.8))
+    soft_weight = float(model_cfg.get("soft_policy_loss_weight", 0.25))
+    main_weight = 1.0 - bn_weight
+    objective_loss = main_loss * main_weight + bn_loss * bn_weight
+
+    if (
+        soft_weight > 0.0
+        and targets.get("policy_indices") is not None
+        and targets.get("policy_values") is not None
+    ):
+        sparse_target = (targets["policy_indices"], targets["policy_values"])
+        row_weights = targets.get("policy_sample_weight")
+        temperature = float(model_cfg.get("soft_policy_temperature", 4.0))
+        prepared_soft_target = prepare_legal_masked_soft_policy_target(
+            training_outputs["soft_policy"],
+            sparse_target,
+            row_weights=row_weights,
+            temperature=temperature,
+        )
+        main_soft_loss, _, _ = legal_masked_soft_policy_loss_from_prepared(
+            training_outputs["soft_policy"], prepared_soft_target
+        )
+        bn_soft_loss, _, _ = legal_masked_soft_policy_loss_from_prepared(
+            training_outputs["bn_soft_policy"],
+            prepared_soft_target,
+        )
+        soft_loss = main_soft_loss * main_weight + bn_soft_loss * bn_weight
+        objective_loss = objective_loss + soft_loss * soft_weight
+
+    return objective_loss
+
+
+def _probe_training_loss(model, criterion, boards, targets, use_amp, amp_dtype):
+    """Run one deployment-compatible or full v10 training objective probe."""
+    if _supports_training_aux_probe(model):
+        outputs = model(
+            boards,
+            apply_log_softmax=False,
+            return_moves_left=True,
+            return_training_aux=True,
+        )
+        return _v10_probe_loss(model, outputs, targets, criterion)
+
+    policy_pred, value_pred, moves_left_pred = model(
+        boards,
+        apply_log_softmax=False,
+        return_moves_left=True,
+    )
+    predictions = {
+        "policy": policy_pred,
+        "value": value_pred,
+        "moves_left": moves_left_pred,
+    }
+    loss, _ = criterion(predictions, targets)
+    return loss
+
+
+def validate_v10_il_training_compile_path(
+    model,
+    config,
+    device,
+    batch_sizes,
+    use_amp,
+    use_bfloat16,
+):
+    """Exercise compiled V10 eval and the real IL auxiliary objective without an optimizer step.
+
+    The probe deliberately uses non-empty sparse policy targets and the same
+    CombinedLoss plus soft-policy objective as the IL learner. It restores the
+    full model state, per-module train/eval flags, existing gradient objects,
+    and torch RNG state so backend selection cannot alter the upcoming run.
+    """
+    base_model = _unwrap_probe_model(model)
+    if not _supports_training_aux_probe(base_model):
+        raise TypeError("V10 compile-path validation requires training auxiliaries")
+
+    normalized_batch_sizes = []
+    for batch_size in batch_sizes:
+        batch_size = int(batch_size)
+        if batch_size > 0 and batch_size not in normalized_batch_sizes:
+            normalized_batch_sizes.append(batch_size)
+    if not normalized_batch_sizes:
+        normalized_batch_sizes = [1]
+
+    state_snapshot = _snapshot_model_state_cpu(base_model)
+    module_modes = [(module, bool(module.training)) for module in base_model.modules()]
+    parameter_grads = [(parameter, parameter.grad) for parameter in base_model.parameters()]
+    cpu_rng_state = torch.get_rng_state().clone()
+    cuda_rng_states = (
+        torch.cuda.get_rng_state_all()
+        if device.type == "cuda" and torch.cuda.is_available()
+        else None
+    )
+
+    amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+    amp_enabled = bool(use_amp and device.type == "cuda")
+    criterion = CombinedLoss(config, capture_task_objectives=True)
+    probe_config = dict(config)
+    probe_il_config = dict(config.get("imitation_learning", {}) or {})
+    probe_il_config["probe_action_size"] = int(
+        getattr(base_model, "ACTION_SIZE", DEFAULT_ACTION_SIZE)
+    )
+    probe_config["imitation_learning"] = probe_il_config
+    input_planes = int(getattr(base_model, "input_planes", 16))
+    generator = torch.Generator(device=device)
+    generator.manual_seed(8162017)
+
+    try:
+        for parameter in base_model.parameters():
+            parameter.grad = None
+
+        passed = []
+        for batch_size in normalized_batch_sizes:
+            boards, targets = _build_synthetic_batch(
+                config=probe_config,
+                device=device,
+                batch_size=batch_size,
+                input_planes=input_planes,
+                generator=generator,
+                include_sparse_policy=True,
+            )
+
+            model.eval()
+            with torch.no_grad():
+                with torch.amp.autocast(
+                    "cuda", enabled=amp_enabled, dtype=amp_dtype
+                ):
+                    model(boards, apply_log_softmax=False)
+
+            for parameter in base_model.parameters():
+                parameter.grad = None
+            model.train()
+            with torch.enable_grad():
+                with torch.amp.autocast(
+                    "cuda", enabled=amp_enabled, dtype=amp_dtype
+                ):
+                    outputs = model(
+                        boards,
+                        apply_log_softmax=False,
+                        return_moves_left=True,
+                        return_training_aux=True,
+                    )
+                    loss = _v10_probe_loss(model, outputs, targets, criterion)
+
+                if not bool(torch.isfinite(loss.detach()).all().item()):
+                    raise RuntimeError(
+                        f"V10 IL compile probe produced a non-finite loss at batch {batch_size}"
+                    )
+
+                model_cfg = dict(getattr(base_model, "model_config", {}) or {})
+                bn_weight = float(model_cfg.get("bn_head_loss_weight", 0.8))
+                main_weight = 1.0 - bn_weight
+                soft_weight = float(model_cfg.get("soft_policy_loss_weight", 0.25))
+                expected_outputs = []
+                for branch_name, branch, branch_weight in (
+                    ("main", outputs["main"], main_weight),
+                    ("bn", outputs["bn"], bn_weight),
+                ):
+                    if len(branch) < 3:
+                        raise TypeError(
+                            f"V10 {branch_name} compile probe output must contain policy, value, and moves-left"
+                        )
+                    for index, label, weight in (
+                        (0, "policy", criterion.policy_weight),
+                        (
+                            1,
+                            "value",
+                            criterion.value_weight + criterion.value_scalar_aux_loss_weight,
+                        ),
+                        (2, "moves_left", criterion.moves_left_weight),
+                    ):
+                        tensor = branch[index]
+                        if not isinstance(tensor, torch.Tensor):
+                            raise TypeError(
+                                f"V10 {branch_name} {label} compile probe output is not a tensor"
+                            )
+                        if weight > 0.0 and branch_weight != 0.0:
+                            tensor.retain_grad()
+                            expected_outputs.append((f"{branch_name}.{label}", tensor))
+
+                if soft_weight > 0.0:
+                    for key, branch_weight in (
+                        ("soft_policy", main_weight),
+                        ("bn_soft_policy", bn_weight),
+                    ):
+                        tensor = outputs.get(key)
+                        if not isinstance(tensor, torch.Tensor):
+                            raise TypeError(
+                                f"V10 IL compile probe output {key!r} is missing"
+                            )
+                        if branch_weight != 0.0:
+                            tensor.retain_grad()
+                            expected_outputs.append((key, tensor))
+
+                loss.backward()
+
+            missing_gradients = [
+                label for label, tensor in expected_outputs if tensor.grad is None
+            ]
+            if missing_gradients:
+                raise RuntimeError(
+                    "V10 IL compile probe did not backpropagate through expected outputs: "
+                    + ", ".join(missing_gradients)
+                )
+            nonfinite_gradients = [
+                name
+                for name, parameter in base_model.named_parameters()
+                if parameter.grad is not None
+                and not bool(torch.isfinite(parameter.grad).all().item())
+            ]
+            if nonfinite_gradients:
+                raise RuntimeError(
+                    "V10 IL compile probe produced non-finite parameter gradients: "
+                    + ", ".join(nonfinite_gradients[:8])
+                )
+
+            passed.append(
+                {
+                    "batch_size": batch_size,
+                    "loss": float(loss.detach().float().item()),
+                    "gradient_outputs": [label for label, _ in expected_outputs],
+                }
+            )
+            del boards, targets, outputs, loss
+
+        return passed
+    finally:
+        base_model.load_state_dict(state_snapshot, strict=True)
+        for module, was_training in module_modes:
+            module.training = was_training
+        for parameter, prior_grad in parameter_grads:
+            parameter.grad = prior_grad
+        torch.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+        del state_snapshot, criterion, probe_config, probe_il_config, generator
 
 
 def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
@@ -498,7 +844,8 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
 
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
     fused_adamw = bool(device.type == "cuda" and torch.cuda.is_available())
-    criterion = CombinedLoss(config)
+    v10_training_aux = _supports_training_aux_probe(model)
+    criterion = CombinedLoss(config, capture_task_objectives=v10_training_aux)
     probe_optimizer = None
 
     boards = None
@@ -513,6 +860,7 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
     predictions = None
     targets = None
     loss = None
+    gradient_check = None
     was_training = model.training
 
     try:
@@ -527,45 +875,59 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
 
-        input_planes = int(getattr(model, "input_planes", 16))
+        input_planes = int(getattr(_unwrap_probe_model(model), "input_planes", 16))
         boards, synthetic_targets = _build_synthetic_batch(
             config=config,
             device=device,
             batch_size=batch_size,
             input_planes=input_planes,
+            include_sparse_policy=v10_training_aux,
         )
-        moves = synthetic_targets["moves"]
-        outcomes = synthetic_targets["values"]
-        move_indices = synthetic_targets["move_indices"]
-        total_moves = synthetic_targets["total_moves"]
-        moves_left = synthetic_targets["moves_left"]
+        targets = synthetic_targets
 
         torch.cuda.synchronize(device)
         step_start = time.perf_counter()
         with torch.enable_grad():
             probe_optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                policy_pred, value_pred, moves_left_pred = model(
-                    boards,
-                    apply_log_softmax=False,
-                    return_moves_left=True,
+                loss = _probe_training_loss(
+                    model, criterion, boards, targets, use_amp, amp_dtype
                 )
-
-                predictions = {
-                    "policy": policy_pred,
-                    "value": value_pred,
-                    "moves_left": moves_left_pred,
-                }
-                targets = {
-                    "moves": moves,
-                    "values": outcomes,
-                    "move_indices": move_indices,
-                    "total_moves": total_moves,
-                    "moves_left": moves_left,
-                }
-
-                loss, _ = criterion(predictions, targets)
             loss.backward()
+            gradient_check = None
+            if v10_training_aux and batch_size == 1:
+                required_prefixes = (
+                    "training_trunk_bn.",
+                    "bn_policy_conv.",
+                    "bn_policy_global_bias.",
+                    "bn_policy_logits_conv.",
+                    "bn_soft_policy_logits_conv.",
+                    "bn_value_conv.",
+                    "bn_value_norm_flat.",
+                    "bn_value_fc1.",
+                    "bn_value_fc2.",
+                    "bn_moves_left_fc1.",
+                    "bn_moves_left_norm.",
+                    "bn_moves_left_fc2.",
+                    "soft_policy_logits_conv.",
+                )
+                checked = [
+                    (name, parameter)
+                    for name, parameter in _unwrap_probe_model(model).named_parameters()
+                    if parameter.requires_grad
+                    and any(name.startswith(prefix) for prefix in required_prefixes)
+                ]
+                missing = [name for name, parameter in checked if parameter.grad is None]
+                if missing:
+                    raise RuntimeError(
+                        "v10 auto-tune did not produce gradients for training-only "
+                        f"parameters: {missing[:8]}"
+                    )
+                gradient_check = {
+                    "required_parameter_tensors": len(checked),
+                    "gradient_parameter_tensors": len(checked) - len(missing),
+                    "missing": missing,
+                }
             probe_optimizer.step()
 
         torch.cuda.synchronize(device)
@@ -579,6 +941,7 @@ def _probe_peak_bytes(model, config, device, batch_size, use_amp, use_bfloat16):
             "peak_reserved_bytes": peak_reserved_bytes,
             "elapsed_s": float(elapsed_s),
             "samples_per_second": float(batch_size) / float(elapsed_s),
+            "training_aux_gradient_check": gradient_check,
             "error": None,
         }
     except RuntimeError as exc:
@@ -939,11 +1302,13 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
     il_cfg = config.get("imitation_learning", {}) or {}
     weight_decay = _safe_float(il_cfg.get("weight_decay"), 0.0)
     fused_adamw = bool(device.type == "cuda" and torch.cuda.is_available())
-    input_planes = int(getattr(model, "input_planes", 16))
+    v10_training_aux = _supports_training_aux_probe(model)
+    base_model = _unwrap_probe_model(model)
+    input_planes = int(getattr(base_model, "input_planes", 16))
     amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
 
     baseline_state = _snapshot_model_state_cpu(model)
-    criterion = CombinedLoss(config)
+    criterion = CombinedLoss(config, capture_task_objectives=v10_training_aux)
     was_training = model.training
 
     best_entry = None
@@ -990,30 +1355,15 @@ def _select_learning_rate(model, config, configured_lr, tuned_batch, device, use
                         batch_size=tuned_batch,
                         input_planes=input_planes,
                         generator=generator,
+                        include_sparse_policy=v10_training_aux,
                     )
 
                     optimizer.zero_grad(set_to_none=True)
                     with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                        policy_pred, value_pred, moves_left_pred = model(
-                            boards,
-                            apply_log_softmax=False,
-                            return_moves_left=True,
+                        targets = synthetic_targets
+                        loss = _probe_training_loss(
+                            model, criterion, boards, targets, use_amp, amp_dtype
                         )
-
-                        predictions = {
-                            "policy": policy_pred,
-                            "value": value_pred,
-                            "moves_left": moves_left_pred,
-                        }
-                        targets = {
-                            "moves": synthetic_targets["moves"],
-                            "values": synthetic_targets["values"],
-                            "move_indices": synthetic_targets["move_indices"],
-                            "total_moves": synthetic_targets["total_moves"],
-                            "moves_left": synthetic_targets["moves_left"],
-                        }
-
-                        loss, _ = criterion(predictions, targets)
 
                     loss_value = float(loss.detach().item())
                     if not math.isfinite(loss_value):

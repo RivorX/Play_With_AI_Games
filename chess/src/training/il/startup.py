@@ -429,6 +429,7 @@ def _resume_contract_mismatch(model, checkpoint):
         ("input encoder", target_input.get("encoder_id"), source_input.get("encoder_id")),
         ("history depth", target_input.get("history_positions"), source_input.get("history_positions")),
         ("input planes", target_input.get("input_planes"), source_input.get("input_planes")),
+        ("repetition plane mode", target_input.get("repetition_plane_mode"), source_input.get("repetition_plane_mode")),
         ("policy codec", target_policy.get("codec_id"), source_policy.get("codec_id")),
     )
     mismatches = [

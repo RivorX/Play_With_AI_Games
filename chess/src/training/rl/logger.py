@@ -1561,6 +1561,18 @@ class RLLoggerMixin:
             'value_search_consistency_loss': train_metrics.get(
                 'value_search_consistency_loss', ''
             ) if train_metrics else '',
+            # `policy_loss` and `value_loss` are the production/deployment head
+            # metrics. These columns describe the training-only v10 branches.
+            'bn_head_loss_weight': train_metrics.get('bn_head_loss_weight', '') if train_metrics else '',
+            'bn_policy_loss': train_metrics.get('bn_policy_loss', '') if train_metrics else '',
+            'bn_value_loss': train_metrics.get('bn_value_loss', '') if train_metrics else '',
+            'soft_policy_loss': train_metrics.get('soft_policy_loss', '') if train_metrics else '',
+            'soft_policy_deploy_loss': train_metrics.get('soft_policy_main_loss', '') if train_metrics else '',
+            'soft_policy_bn_loss': train_metrics.get('soft_policy_bn_loss', '') if train_metrics else '',
+            'soft_policy_valid_rows': train_metrics.get('soft_policy_valid_rows', '') if train_metrics else '',
+            'soft_policy_valid_fraction': train_metrics.get('soft_policy_valid_fraction', '') if train_metrics else '',
+            'soft_policy_loss_weight': train_metrics.get('soft_policy_loss_weight', '') if train_metrics else '',
+            'soft_policy_temperature': train_metrics.get('soft_policy_temperature', '') if train_metrics else '',
             'moves_left_loss': train_metrics.get('moves_left_loss', '') if train_metrics else '',
             'search_q_loss': train_metrics.get('search_q_loss', '') if train_metrics else '',
             'search_q_weight': train_metrics.get('search_q_weight', '') if train_metrics else '',

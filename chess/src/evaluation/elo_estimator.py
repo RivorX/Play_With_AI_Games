@@ -36,11 +36,8 @@ except ImportError:
     _HAS_URLLIB = False
 
 # Imports are resolved at runtime (script_dir-based sys.path setup in train_il.py)
-from src.models.data.se_cnn_v9.helpers import (
-    board_to_tensor,
-    board_to_tensor_pair,
-    move_to_index,
-)
+from src.models.data.registry import get_input_encoder
+from src.models.data.se_cnn_v9.helpers import move_to_index
 from src.mcts.search import (
     MultiGameBatchMCTS,
     _EVAL_OPENING_LINES,
@@ -79,6 +76,21 @@ def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict
     rl_config['eval_mcts_dynamic_budget_enabled'] = False
     elo_mcts_config['reinforcement_learning'] = rl_config
     return elo_mcts_config
+
+
+def _resolve_player_input_contract(model, config: dict):
+    """Resolve the input encoder from the loaded model, not a stale run config."""
+    model_cfg = config.get("model", {}) or {}
+    model_spec = getattr(model, "model_spec", None)
+    input_spec = model_spec.get("input_spec", {}) if isinstance(model_spec, dict) else {}
+    encoder_id = str(
+        input_spec.get("encoder_id")
+        or model_cfg.get("input_encoder_id", "planes_history_v1")
+    )
+    history_positions = int(
+        input_spec.get("history_positions", model_cfg.get("history_positions", 0))
+    )
+    return get_input_encoder(encoder_id), history_positions
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +318,7 @@ class _ModelPlayer:
         self.device = device
         self.use_mcts = use_mcts
         self.simulations = simulations
-        self.history_positions = int(config.get('model', {}).get('history_positions', 0))
+        self.input_encoder, self.history_positions = _resolve_player_input_contract(model, config)
         self.use_amp = bool(
             config.get('hardware', {}).get('use_amp', True) and device.type == 'cuda'
         )
@@ -340,28 +352,25 @@ class _ModelPlayer:
             self.mcts.update_history(native_board)
         if self.history_positions <= 0:
             return
-        self.board_history.append(board_to_tensor_pair(native_board))
+        self.board_history.append(self.input_encoder.encode_pair(native_board))
         max_keep = self.history_positions
         if len(self.board_history) > max_keep:
             self.board_history = self.board_history[-max_keep:]
 
     def _build_input_tensor(self, board: native_chess.Board) -> np.ndarray:
         """Build (C, 8, 8) input tensor including history planes."""
-        tensors: list[np.ndarray] = []
         flip_history = (board.turn == native_chess.BLACK)
-
-        if self.history_positions > 0:
-            # Collect up to history_positions past boards (most recent last)
-            history = self.board_history[-(self.history_positions):]
-            for white_pov, black_pov in history:
-                tensors.append(black_pov if flip_history else white_pov)
-            # Pad with zeros if not enough history
-            while len(tensors) < self.history_positions:
-                tensors.insert(0, np.zeros((16, 8, 8), dtype=np.float32))
-
-        # Current board
-        tensors.append(board_to_tensor(board))
-        return np.concatenate(tensors, axis=0)
+        history = self.board_history[-self.history_positions:] if self.history_positions else []
+        history_tensors = [
+            black_pov if flip_history else white_pov
+            for white_pov, black_pov in history
+        ]
+        current = self.input_encoder.encode(board, flip_perspective=flip_history)
+        return self.input_encoder.stack_history(
+            current,
+            history_tensors,
+            self.history_positions,
+        )
 
     @torch.inference_mode()
     def best_move(self, board: chess.Board) -> chess.Move | None:
@@ -428,7 +437,7 @@ class _BatchedModelPlayer:
         self.device = device
         self.use_mcts = use_mcts
         self.simulations = simulations
-        self.history_positions = int(config.get('model', {}).get('history_positions', 0))
+        self.input_encoder, self.history_positions = _resolve_player_input_contract(model, config)
         self.use_amp = bool(
             config.get('hardware', {}).get('use_amp', True) and device.type == 'cuda'
         )
@@ -465,30 +474,25 @@ class _BatchedModelPlayer:
         if self.history_positions <= 0:
             return
         history = state.setdefault("board_history", [])
-        history.append(self._encode_history_entry(native_board))
+        history.append(self.input_encoder.encode_pair(native_board))
         max_keep = self.history_positions
         if len(history) > max_keep:
             state["board_history"] = history[-max_keep:]
 
-    @staticmethod
-    def _encode_history_entry(board: chess.Board):
-        return board_to_tensor_pair(board)
-
     def _build_input_tensor(self, board: chess.Board, state: dict) -> np.ndarray:
-        tensors: list[np.ndarray] = []
         use_black_pov = board.turn == native_chess.BLACK
         history = state.get("board_history", [])
-
-        if self.history_positions > 0:
-            recent_history = history[-self.history_positions:]
-            for hist_entry in recent_history:
-                hist_tensor = hist_entry[1] if use_black_pov else hist_entry[0]
-                tensors.append(hist_tensor)
-            while len(tensors) < self.history_positions:
-                tensors.insert(0, np.zeros((16, 8, 8), dtype=np.float32))
-
-        tensors.append(board_to_tensor(board))
-        return np.concatenate(tensors, axis=0)
+        recent_history = history[-self.history_positions:] if self.history_positions else []
+        history_tensors = [
+            hist_entry[1] if use_black_pov else hist_entry[0]
+            for hist_entry in recent_history
+        ]
+        current = self.input_encoder.encode(board, flip_perspective=use_black_pov)
+        return self.input_encoder.stack_history(
+            current,
+            history_tensors,
+            self.history_positions,
+        )
 
     @torch.inference_mode()
     def best_moves(self, boards: list[chess.Board], states: list[dict]) -> list[chess.Move | None]:
@@ -627,6 +631,7 @@ class EloEstimator:
         self.stockfish_path = stockfish_path
         self.stop_event = stop_event
         self._error_counters: dict[str, int] = {}
+        self._error_samples: dict[str, str] = {}
         self._thread_local = threading.local()
         self._worker_engines: list[chess.engine.SimpleEngine] = []
         self._worker_engines_lock = threading.Lock()
@@ -653,6 +658,8 @@ class EloEstimator:
 
         count = int(self._error_counters.get(key, 0)) + 1
         self._error_counters[key] = count
+        if count == 1:
+            self._error_samples[key] = str(message)
         if count <= limit:
             print(message)
             return
@@ -1862,6 +1869,35 @@ class EloEstimator:
                 "total_time": time.perf_counter() - t0,
                 "cancelled": True,
             }
+
+        if not all_scores:
+            failure_counts = {
+                key: int(count)
+                for key, count in self._error_counters.items()
+                if int(count) > 0
+            }
+            result = {
+                "estimated_elo": None,
+                "results": {},
+                "total_games": 0,
+                "rating_games": 0,
+                "total_scheduled_games": int(schedule.total_scheduled),
+                "failed_games": int(schedule.total_scheduled),
+                "total_time": time.perf_counter() - t0,
+                "error": "no_valid_games",
+                "error_detail": (
+                    "No Stockfish games produced a valid result; see game_failure_counts "
+                    "and game_failure_examples."
+                ),
+                "game_failure_counts": failure_counts,
+                "game_failure_examples": dict(self._error_samples),
+                "rating_range_status": schedule.bracket_status(),
+                "precision_stop_reason": "no_valid_games",
+                "opening_suite_id": _EVAL_OPENING_SUITE_ID,
+                "opening_suite_positions": len(_EVAL_OPENING_LINES),
+            }
+            self._print_elo_completion_summary(result)
+            return result
 
         for level in levels:
             level_scores = [score for elo, score in zip(all_opponent_elos, all_scores) if elo == level]
