@@ -130,12 +130,18 @@ Pokazuje throughput self-play, czas etapów iteracji, skład opóźnienia centra
 - **Replay i policy target shape** — czy replay pozostaje świeży i zróżnicowany, a targety MCTS zachowują sensowną ostrość.
 - **positions/s i completed MCTS visits/s** — przepustowość generowania danych; latency central inference pomaga odróżnić problem GPU, kolejkowania lub workerów.
 
+## Wyniki eksperymentów
+
+- [Wyniki potwierdzone i zachowane](docs/experiments.md)
+- [Wyniki negatywne i nierozstrzygnięte](docs/experiments_unsuccessful.md)
+
 ## Konfiguracja i katalogi
 
 ```text
 chess/
 ├── config/
-│   ├── default.yaml          # IL, RL, MCTS, hardware i central inference
+│   ├── default.yaml          # IL, hardware i central inference
+│   ├── search.yaml           # RL i MCTS
 │   ├── data.yaml             # PGN, preprocessing, cache i sampling
 │   ├── evaluation.yaml       # play, logging i Elo
 │   └── models/se_cnn_v9.yaml # profil architektury
@@ -154,7 +160,7 @@ chess/
 └── logs/                     # bieżące CSV/PNG, ignorowane przez Git
 ```
 
-`load_project_config()` scala trzy pliki konfiguracji projektu. Do pojedynczego eksperymentu można podać dodatkowy YAML jako override bez kopiowania pełnej konfiguracji.
+`load_project_config()` scala cztery pliki konfiguracji projektu. Do pojedynczego eksperymentu można podać dodatkowy YAML jako override bez kopiowania pełnej konfiguracji.
 
 ## Dane i cache
 

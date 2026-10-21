@@ -624,6 +624,106 @@ def _short_model_path(path, models_dir, max_len=66):
     return rel
 
 
+def _model_origin_label(model_path, models_dir, metadata=None):
+    """Return the checkpoint's directory origin relative to the models root.
+
+    Root-level aliases have no parent directory, so a small set of established
+    canonical names and explicit catalog metadata provide their source. Generic
+    filename fragments such as ``*_il_*`` are deliberately not treated as proof.
+    """
+    if model_path is None:
+        return None
+
+    path = Path(model_path)
+    metadata = metadata if isinstance(metadata, dict) else {}
+
+    def from_relative_path(relative_path):
+        try:
+            relative = Path(str(relative_path).replace("\\", "/"))
+            if relative.is_absolute() or ".." in relative.parts or len(relative.parts) <= 1:
+                return None
+            directories = relative.parts[:-1]
+            if directories[0].lower() in {"il", "rl"}:
+                directories = (directories[0].upper(), *directories[1:])
+            return "/".join(directories)
+        except (TypeError, ValueError, OSError):
+            return None
+
+    # The actual checkpoint location is authoritative whenever it is under the
+    # configured models root.
+    try:
+        relative = path.resolve().relative_to(Path(models_dir).resolve())
+    except (ValueError, OSError, RuntimeError):
+        relative = None
+    if relative is not None and len(relative.parts) > 1:
+        return from_relative_path(relative)
+
+    # Catalog metadata can recover the original models-relative location for
+    # callers holding a resolved alias or a path outside the configured root.
+    metadata_origin = from_relative_path(metadata.get("path_rel"))
+    if metadata_origin:
+        return metadata_origin
+
+    stage = None
+    alias_kind = str(metadata.get("alias_kind") or "").strip().casefold()
+    if alias_kind in {
+        "v10 il best",
+        "v10 il swa",
+        "legacy v10 il best",
+        "legacy v10 il swa",
+    }:
+        stage = "IL"
+    elif alias_kind in {"v10 rl best", "legacy v10 rl best"}:
+        stage = "RL"
+
+    folder = str(metadata.get("folder") or "").strip().upper()
+    if stage is None and folder in {"IL", "RL"}:
+        stage = folder
+    rl_run_version = str(metadata.get("rl_run_version") or "").strip()
+    if stage is None and rl_run_version:
+        stage = "RL"
+
+    # These exact root aliases are part of the project's model contract. Do
+    # not infer a source from arbitrary substrings in other filenames.
+    canonical_aliases = {
+        "best_model_il": "IL",
+        "best_model_il_swa": "IL",
+        "best_model_il_nested_cnn_v10": "IL",
+        "best_model_il_swa_nested_cnn_v10": "IL",
+        "best_model_v10_il": "IL",
+        "best_model_v10_il_swa": "IL",
+        "best_model_rl": "RL",
+        "best_model_rl_nested_cnn_v10": "RL",
+        "best_model_v10_rl": "RL",
+    }
+    if stage is None:
+        stage = canonical_aliases.get(path.stem.casefold())
+
+    if stage == "RL" and rl_run_version:
+        if rl_run_version.casefold() == "rl":
+            return "RL"
+        display_version = (
+            f"RL{rl_run_version[2:]}"
+            if rl_run_version.casefold().startswith("rl")
+            else rl_run_version
+        )
+        return f"RL/{display_version}"
+    return stage
+
+
+def _model_browser_label(model_path, models_dir, metadata=None):
+    """Show directory origin before a concise checkpoint name in the picker."""
+    if model_path is None:
+        return "None"
+    origin = _model_origin_label(model_path, models_dir, metadata)
+    if origin:
+        return f"{origin} · {Path(model_path).name}"
+    try:
+        return _short_model_path(Path(model_path), Path(models_dir), max_len=240)
+    except (ValueError, OSError):
+        return Path(model_path).name
+
+
 def _format_model_entry(path, models_dir, max_len=66, metadata=None):
     """Format model entry with metadata (version, top1, elo).
     
@@ -761,7 +861,9 @@ def _draw_home_player_card(
     else:
         metadata = metadata_cache.get(model_path) or {}
         model_name = metadata.get("model_name") or Path(model_path).name
-        model_meta = _format_model_entry(model_path, models_dir, max_len=256, metadata=metadata)[1]
+        origin = _model_origin_label(model_path, models_dir, metadata)
+        details = _format_model_entry(model_path, models_dir, max_len=256, metadata=metadata)[1]
+        model_meta = " | ".join(part for part in (origin, details) if part)
     name_surface = fonts["card_name"].render(
         _fit_model_identity(fonts["card_name"], model_name, text_width), True, _TEXT
     )
@@ -1226,12 +1328,12 @@ def _draw_model_info_panel(
     metadata, name, _rel, _rows, top_stats = _get_model_info_content(
         model_path, models_dir, metadata_cache
     )
-    stage = _checkpoint_stage_label(model_path)
+    origin = _model_origin_label(model_path, models_dir, metadata)
     version = str((metadata or {}).get("version") or "").strip()
     epoch = _safe_int((metadata or {}).get("epoch"))
     identity = "  ·  ".join(
         part for part in (
-            stage,
+            origin,
             f"v{version}" if version and not version.startswith("v") else version,
             f"epoch {epoch + 1}" if epoch is not None else None,
         ) if part
@@ -1458,12 +1560,7 @@ def _draw_model_browser(
     )
 
     def _display_name_for_category(path, category_key):
-        rel = _short_model_path(path, models_dir, max_len=240)
-        if category_key in ("il", "rl"):
-            prefix = f"{category_key}/"
-            if rel.lower().startswith(prefix):
-                return rel[len(prefix):]
-        return rel
+        return _model_browser_label(path, models_dir, metadata_cache.get(path))
 
     def _numeric_meta(path, field):
         meta = metadata_cache.get(path) or {}

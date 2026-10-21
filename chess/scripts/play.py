@@ -61,6 +61,17 @@ def _native_board(board):
     return native_chess.board_from_fen(board.fen())
 
 
+def _position_counts_for_history(history_boards, current_board):
+    """Return exact occurrence counts for this GUI game's known line."""
+    counts = {}
+    for board in history_boards:
+        key = _board_position_key(_native_board(board))
+        counts[key] = int(counts.get(key, 0)) + 1
+    key = _board_position_key(_native_board(current_board))
+    counts[key] = int(counts.get(key, 0)) + 1
+    return counts
+
+
 def _python_move(move):
     """Convert a native search result back to the python-chess UI board."""
     return None if move is None else chess.Move.from_uci(native_chess.move_uci(move))
@@ -483,7 +494,7 @@ class ChessGUI:
                 config,
                 device,
                 single_root_batch_cap=(config.get("play", {}) or {}).get(
-                    "single_game_mcts_batch_cap", 32
+                    "single_game_mcts_batch_cap", 0
                 ),
             )
         else:
@@ -495,7 +506,7 @@ class ChessGUI:
                 config,
                 device,
                 single_root_batch_cap=(config.get("play", {}) or {}).get(
-                    "single_game_mcts_batch_cap", 32
+                    "single_game_mcts_batch_cap", 0
                 ),
             )
         else:
@@ -613,6 +624,8 @@ class ChessGUI:
         #  v4.2: Board history for neural network input
         # Store chess.Board objects (not tensors) for history
         self.board_history = []
+        self.position_counts = _position_counts_for_history([], self.board)
+        self.position_history_complete = True
         
         # Flip board for black
         self.flipped = False
@@ -1673,6 +1686,8 @@ class ChessGUI:
         self.board = chess.Board()
         self.initial_fen = self.board.fen()
         self.board_history = []
+        self.position_counts = _position_counts_for_history([], self.board)
+        self.position_history_complete = True
         self.move_history = []
         self.move_san_history = []
         self.current_game_saved = False
@@ -4377,23 +4392,31 @@ class ChessGUI:
         """Store pre-move state for history-aware inference."""
         self.board_history.append(self.board.copy())
         current_native = _native_board(self.board)
-        repetition_count = None
-        if any(
-            mcts is not None and mcts._multi._path_dependent_repetition
-            for mcts in (self.mcts1, self.mcts2)
-        ):
-            current_key = _board_position_key(current_native)
-            repetition_count = sum(
-                _board_position_key(_native_board(history_board)) == current_key
-                for history_board in self.board_history[:-1]
-            )
-        if self.mcts1:
-            self.mcts1.update_history(current_native, repetition_count=repetition_count)
-        if self.mcts2:
-            self.mcts2.update_history(current_native, repetition_count=repetition_count)
+        current_key = _board_position_key(current_native)
+        repetition_count = max(
+            0,
+            int(self.position_counts.get(current_key, 1)) - 1,
+        )
+        for mcts in (self.mcts1, self.mcts2):
+            if mcts:
+                mcts.update_history(
+                    current_native,
+                    repetition_count=(
+                        repetition_count
+                        if mcts._multi._path_dependent_repetition
+                        else None
+                    ),
+                )
+
+    def _rebuild_position_counts(self):
+        self.position_counts = _position_counts_for_history(
+            self.board_history,
+            self.board,
+        )
 
     def _sync_mcts_histories(self):
         """Rebuild MCTS histories after undoing moves."""
+        self._rebuild_position_counts()
         for mcts in (self.mcts1, self.mcts2):
             if mcts:
                 mcts.reset_tree()
@@ -4441,6 +4464,7 @@ class ChessGUI:
 
         self.board = rebuilt_board
         self.board_history = rebuilt_history
+        self._rebuild_position_counts()
         self.move_history = rebuilt_moves
         self.move_san_history = rebuilt_san
         self._prune_mcts_snapshots_for_line(rebuilt_moves)
@@ -4552,11 +4576,22 @@ class ChessGUI:
         keep_history_preview = self._history_preview_active()
         san_move = self.board.san(move)
         self._record_pre_move_state()
-        # Move is known here, so we can advance cached MCTS roots directly.
+        self.board.push(move)
+        post_native_board = _native_board(self.board)
+        post_key = _board_position_key(post_native_board)
+        self.position_counts[post_key] = int(self.position_counts.get(post_key, 0)) + 1
+        native_move = native_chess.move_from_uci(move.uci())
+        # Reconcile each model's own tree after every real ply. The board
+        # history was appended before pushing the move, while the supplied
+        # board/counts describe the exact resulting position.
         for mcts in (self.mcts1, self.mcts2):
             if mcts:
-                mcts.advance_root(native_chess.move_from_uci(move.uci()))
-        self.board.push(move)
+                mcts.advance_root(
+                    native_move,
+                    board=post_native_board,
+                    position_counts=self.position_counts,
+                    repetition_known=self.position_history_complete,
+                )
         self.move_history.append(move)
         self.move_san_history.append(san_move)
         new_history_rows = (len(self.move_san_history) + 1) // 2
@@ -4946,6 +4981,7 @@ class ChessGUI:
 
         board_snapshot = self.board.copy(stack=True)
         history_snapshot = [board.copy(stack=True) for board in self.board_history]
+        position_counts_snapshot = dict(self.position_counts)
         current_fen = board_snapshot.fen()
         self.ai_turn_history_key = self._history_path_key(len(self.move_history))
         history_positions = self._history_positions_for_model(current_model)
@@ -4955,7 +4991,11 @@ class ChessGUI:
 
             def compute():
                 search_result = current_mcts.search(
-                    _native_board(board_snapshot), simulations, add_root_noise=False
+                    _native_board(board_snapshot),
+                    simulations,
+                    add_root_noise=False,
+                    position_counts=position_counts_snapshot,
+                    repetition_known=self.position_history_complete,
                 )
                 return {
                     "kind": "mcts",
@@ -5041,6 +5081,8 @@ class ChessGUI:
         self.move_history = []
         self.move_san_history = []
         self.board_history = []  #  Clear board history
+        self.position_counts = _position_counts_for_history([], self.board)
+        self.position_history_complete = True
         self.current_game_saved = False
         self._reset_selection_state()
         self._reset_ai_state(paused=False)
@@ -5167,6 +5209,13 @@ class ChessGUI:
         self._update_mouse_cursor(False)
         self._stop_background_match(reason=f"play screen exited: {exit_action}")
         self._invalidate_ai_turn()
+        # A cancelled search owns its SingleGame session until its worker
+        # returns. Close immediately when already drained; main() closes the
+        # remaining session after waiting for any outstanding worker.
+        if self.draining_ai_turn is None or self.draining_ai_turn.is_done:
+            for mcts in (self.mcts1, self.mcts2):
+                if mcts is not None:
+                    mcts.close()
         return exit_action
 
 
@@ -5253,6 +5302,9 @@ def main():
         if previous_gui is not None:
             # Drop the old GUI's search trees and model references only after
             # its evaluator has drained, before the next checkpoint is loaded.
+            for mcts in (previous_gui.mcts1, previous_gui.mcts2):
+                if mcts is not None:
+                    mcts.close()
             previous_gui.mcts1 = None
             previous_gui.mcts2 = None
             previous_gui.model1 = None

@@ -157,11 +157,9 @@ _CENTRAL_INFERENCE_DEFAULTS = {
     'stall_warning_s': 15,
     'load_timeout_s': 300,
     'use_compile': True,
-    # Fixed compile buckets make cuDNN autotuning stable.  On the RTX 5060 Ti
-    # paired 192-simulation self-play improved played positions/s by ~1.4%
-    # and reduced descriptor queue wait by ~9.5%; the one-time warmup is
-    # amortized by the persistent inference server.
-    'cudnn_benchmark': True,
+    # Central batch sizes vary, so autotuning's new-shape cost outweighs
+    # steady-state gains by default. Users may explicitly enable it.
+    'cudnn_benchmark': False,
     'sync_timing': False,
 }
 
@@ -320,9 +318,13 @@ _RL_DEFAULTS = {
     'self_play_device': 'cuda', 'self_play_worker_auto_multiplier': 0.75,
     'max_batch_games_per_worker': 48,
     'self_play_randomize_learner_color': True, 'self_play_store_frozen_best_positions': False,
+    'mcts_algorithm': 'gumbel',
+    'mcts_gumbel_root_schedule': 'standard',
+    'mcts_gumbel_reuse_q_scale': 'fresh',
     'mcts_gumbel_c_scale': 0.10, 'mcts_gumbel_q_range_floor': 0.25,
     'mcts_gumbel_target_temperature': 0.95,
     'mcts_single_root_batch_cap': 0,
+    'mcts_local_cuda_graph_forward': None,
     'mcts_reuse_tree': True, 'mcts_tree_reuse_visit_credit_enabled': True,
     'mcts_cache_history_tensors': True,
     'mcts_temperature': 0.0, 'mcts_temperature_threshold': 0,
@@ -447,6 +449,14 @@ def normalize_rl_config(config):
 
     has_grouped_rl = any(section in rl_cfg for section in _RL_SECTION_PREFIXES)
     if not has_grouped_rl:
+        rl_cfg.setdefault('mcts_algorithm', 'gumbel')
+        _validate_mcts_algorithm(rl_cfg['mcts_algorithm'])
+        rl_cfg.setdefault('mcts_gumbel_root_schedule', 'standard')
+        _validate_gumbel_root_schedule(rl_cfg['mcts_gumbel_root_schedule'])
+        rl_cfg.setdefault('mcts_local_cuda_graph_forward', None)
+        _validate_local_cuda_graph_forward(rl_cfg['mcts_local_cuda_graph_forward'])
+        rl_cfg.setdefault('mcts_gumbel_reuse_q_scale', 'fresh')
+        _validate_gumbel_reuse_q_scale(rl_cfg['mcts_gumbel_reuse_q_scale'])
         rl_cfg['search_control_effective_archive_capacity'] = (
             _effective_search_control_archive_capacity(rl_cfg)
         )
@@ -473,12 +483,51 @@ def normalize_rl_config(config):
         normalized['stockfish_elo'] = stockfish_cfg
 
     normalized['mcts_batch_size'] = int(normalized.get('mcts_simulations', 192))
+    _validate_mcts_algorithm(normalized['mcts_algorithm'])
+    _validate_gumbel_root_schedule(normalized['mcts_gumbel_root_schedule'])
+    _validate_local_cuda_graph_forward(normalized['mcts_local_cuda_graph_forward'])
+    _validate_gumbel_reuse_q_scale(normalized['mcts_gumbel_reuse_q_scale'])
     normalized['search_control_effective_archive_capacity'] = (
         _effective_search_control_archive_capacity(normalized)
     )
     config['reinforcement_learning'] = normalized
     _preflight_configured_opening_pool(config, normalized)
     return config
+
+
+def _validate_local_cuda_graph_forward(value):
+    if value is not None and type(value) is not bool:
+        raise ValueError(
+            'reinforcement_learning.search.local_cuda_graph_forward must be '
+            f'null, false, or true; got {value!r}'
+        )
+
+
+def _validate_gumbel_root_schedule(value):
+    """Reject unknown Gumbel root scheduler names before runtime setup."""
+    if not isinstance(value, str) or value not in {'standard', 'revisiting'}:
+        raise ValueError(
+            "reinforcement_learning.search.gumbel_root_schedule must be "
+            f"'standard' or 'revisiting'; got {value!r}"
+        )
+
+
+def _validate_gumbel_reuse_q_scale(value):
+    """Select the visit count used to scale retained root completed-Q values."""
+    if not isinstance(value, str) or value not in {'fresh', 'total'}:
+        raise ValueError(
+            "reinforcement_learning.search.gumbel_reuse_q_scale must be "
+            f"'fresh' or 'total'; got {value!r}"
+        )
+
+
+def _validate_mcts_algorithm(value):
+    """Reject unknown MCTS algorithms before search/runtime setup."""
+    if not isinstance(value, str) or value != 'gumbel':
+        raise ValueError(
+            "reinforcement_learning.search.algorithm must be 'gumbel'; "
+            f"got unsupported value {value!r}"
+        )
 
 
 def _preflight_configured_opening_pool(config, rl_cfg):

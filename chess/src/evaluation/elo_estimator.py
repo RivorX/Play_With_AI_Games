@@ -38,12 +38,15 @@ except ImportError:
 # Imports are resolved at runtime (script_dir-based sys.path setup in train_il.py)
 from src.models.data.registry import get_input_encoder
 from src.models.data.se_cnn_v9.helpers import move_to_index
+from src.inference.prediction import predict_raw
 from src.mcts.search import (
     MultiGameBatchMCTS,
     _EVAL_OPENING_LINES,
     _EVAL_OPENING_SUITE_ID,
+    _board_position_key,
 )
 from src.mcts.single_game import SingleGameMCTS
+from src.mcts.session import SearchSession
 from src.game import backend as native_chess
 from src.evaluation.central_inference import CentralInferenceSession, snapshot_model_state_cpu
 from src.evaluation.elo_rating import (
@@ -331,6 +334,7 @@ class _ModelPlayer:
         # Stockfish boundary and each past board is encoded exactly once.
         self.board_history: list[tuple[np.ndarray, np.ndarray]] = []
         self._current_native_board = None
+        self._position_counts: dict[bytes, int] = {}
         # MCTS instance (lazy init)
         self.mcts = None
         if use_mcts:
@@ -339,8 +343,22 @@ class _ModelPlayer:
     def reset(self):
         self.board_history = []
         self._current_native_board = None
+        self._position_counts = {}
         if self.mcts is not None:
             self.mcts.reset_tree()
+
+    def close(self):
+        if self.mcts is not None:
+            self.mcts.close()
+        self.board_history = []
+        self._current_native_board = None
+        self._position_counts = {}
+
+    def _ensure_current_position_count(self, native_board):
+        key = _board_position_key(native_board)
+        if not self._position_counts:
+            self._position_counts[key] = 1
+        return max(0, int(self._position_counts.get(key, 0)) - 1)
 
     def record_state(self, board: chess.Board):
         """Call BEFORE making a move to keep board history."""
@@ -348,8 +366,12 @@ class _ModelPlayer:
         if native_board is None:
             native_board = _native_board(board)
             self._current_native_board = native_board
+        repetition_count = self._ensure_current_position_count(native_board)
         if self.mcts is not None:
-            self.mcts.update_history(native_board)
+            self.mcts.update_history(
+                native_board,
+                repetition_count=repetition_count,
+            )
         if self.history_positions <= 0:
             return
         self.board_history.append(self.input_encoder.encode_pair(native_board))
@@ -392,11 +414,13 @@ class _ModelPlayer:
             .unsqueeze(0)
             .to(self.device, memory_format=torch.channels_last)
         )
-        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
-            policy_logits, _ = self.model(
-                t,
-                apply_log_softmax=False,
-            )
+        policy_logits, _ = predict_raw(
+            self.model,
+            t,
+            use_amp=self.use_amp,
+            amp_dtype=self.amp_dtype,
+            model_kwargs={'apply_log_softmax': False},
+        )
 
         policy = policy_logits.squeeze(0).float().cpu().numpy()
         best_move = None
@@ -414,7 +438,13 @@ class _ModelPlayer:
         if native_board is None:
             native_board = _native_board(board)
             self._current_native_board = native_board
-        search_result = self.mcts.search(native_board, self.simulations)
+        self._ensure_current_position_count(native_board)
+        search_result = self.mcts.search(
+            native_board,
+            self.simulations,
+            position_counts=self._position_counts,
+            repetition_known=True,
+        )
         if not search_result:
             return self._best_move_raw(board)  # Fallback
         return _python_move(search_result.selected_move)
@@ -422,10 +452,17 @@ class _ModelPlayer:
     def on_move_played(self, move: chess.Move):
         """Keep MCTS tree synchronized with the actual played move."""
         native_move = native_chess.move_from_uci(move.uci())
-        if self.mcts is not None:
-            self.mcts.advance_root(native_move)
         if self._current_native_board is not None:
             native_chess.apply_move(self._current_native_board, native_move)
+            key = _board_position_key(self._current_native_board)
+            self._position_counts[key] = int(self._position_counts.get(key, 0)) + 1
+            if self.mcts is not None:
+                self.mcts.advance_root(
+                    native_move,
+                    board=self._current_native_board,
+                    position_counts=self._position_counts,
+                    repetition_known=True,
+                )
 
 
 class _BatchedModelPlayer:
@@ -452,25 +489,45 @@ class _BatchedModelPlayer:
         return {
             "board_history": [],
             "native_board": None,
-            "root": None,
-            "_root_synced": False,
-            "_native_tree_key": object(),
+            "position_counts": {},
+            "search_session": (
+                SearchSession(self.multi_mcts, tree_key=object())
+                if self.multi_mcts is not None
+                else None
+            ),
         }
 
     def reset_state(self, state: dict):
-        if self.multi_mcts is not None:
-            self.multi_mcts.release_native_tree(state.get("_native_tree_key"))
+        session = state.get("search_session")
+        if session is not None:
+            session.clear()
         state["board_history"] = []
         state["native_board"] = None
-        state["root"] = None
-        state["_root_synced"] = False
-        state["_native_tree_key"] = object()
+        state["position_counts"] = {}
+
+    @staticmethod
+    def close_state(state: dict):
+        session = state.get("search_session")
+        if session is not None:
+            try:
+                session.close()
+            finally:
+                state["search_session"] = None
+
+    @staticmethod
+    def _ensure_current_position_count(state, native_board):
+        counts = state.setdefault("position_counts", {})
+        key = _board_position_key(native_board)
+        if not counts:
+            counts[key] = 1
+        return max(0, int(counts.get(key, 0)) - 1)
 
     def record_state(self, state: dict, board: chess.Board):
         native_board = state.get("native_board")
         if native_board is None:
             native_board = _native_board(board)
             state["native_board"] = native_board
+        self._ensure_current_position_count(state, native_board)
         if self.history_positions <= 0:
             return
         history = state.setdefault("board_history", [])
@@ -504,6 +561,7 @@ class _BatchedModelPlayer:
             if native_board is None:
                 native_board = _native_board(board)
                 state["native_board"] = native_board
+            self._ensure_current_position_count(state, native_board)
             native_boards.append(native_board)
         if self.use_mcts and self.multi_mcts is not None:
             moves = self._best_moves_mcts(native_boards, states)
@@ -521,11 +579,13 @@ class _BatchedModelPlayer:
             memory_format=torch.channels_last,
             non_blocking=True,
         )
-        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
-            policy_logits, _ = self.model(
-                tensors,
-                apply_log_softmax=False,
-            )
+        policy_logits, _ = predict_raw(
+            self.model,
+            tensors,
+            use_amp=self.use_amp,
+            amp_dtype=self.amp_dtype,
+            model_kwargs={'apply_log_softmax': False},
+        )
 
         policy_batch = policy_logits.float().cpu().numpy()
         moves: list[chess.Move | None] = []
@@ -544,15 +604,16 @@ class _BatchedModelPlayer:
     def _best_moves_mcts(self, boards: list[chess.Board], states: list[dict]) -> list[chess.Move | None]:
         game_states = []
         for board, state in zip(boards, states):
-            game_states.append(
-                {
-                    "board": board,
-                    "root": state.get("root"),
-                    "_root_synced": bool(state.get("_root_synced", False)),
-                    "board_history": state.get("board_history", []),
-                    "_native_tree_key": state.setdefault("_native_tree_key", object()),
-                }
-            )
+            session = state.get("search_session")
+            if session is None:
+                raise RuntimeError("MCTS-enabled Elo game is missing its search session")
+            repetition_known = True
+            game_states.append(session.make_state(
+                board,
+                board_history=state.get("board_history", []),
+                position_counts=state.get("position_counts"),
+                repetition_known=repetition_known,
+            ))
 
         search_results = self.multi_mcts.search_results_many(
             game_states,
@@ -565,8 +626,7 @@ class _BatchedModelPlayer:
         for idx, search_result in enumerate(search_results):
             state = states[idx]
             gs = game_states[idx]
-            state["root"] = gs.get("root")
-            state["_root_synced"] = bool(gs.get("_root_synced", False))
+            state["search_session"].commit(gs)
             if search_result:
                 moves.append(search_result.selected_move)
             else:
@@ -588,19 +648,21 @@ class _BatchedModelPlayer:
         native_board = state.get("native_board")
         if native_board is not None:
             native_chess.apply_move(native_board, native_move)
+            key = _board_position_key(native_board)
+            counts = state.setdefault("position_counts", {})
+            counts[key] = int(counts.get(key, 0)) + 1
         if self.multi_mcts is None:
             return
-        root = state.get("root")
-        if root is None:
+        session = state.get("search_session")
+        if session is None or native_board is None:
             return
-        child = root.get_child_for_move(native_move)
-        if child is None:
-            state["root"] = None
-            state["_root_synced"] = False
-            return
-        _ = child.board
-        state["root"] = child.detach_as_root()
-        state["_root_synced"] = True
+        session.advance(
+            native_move,
+            board=native_board,
+            board_history=state.get("board_history", []),
+            position_counts=state.get("position_counts"),
+            repetition_known=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1123,6 +1185,10 @@ class EloEstimator:
             engine = worker.get("engine")
             if engine is not None:
                 engines = list(engines) + [engine]
+            player = worker.get("player")
+            if player is not None:
+                with contextlib.suppress(Exception):
+                    player.close()
         seen = set()
         for engine in engines:
             engine_id = id(engine)
@@ -1150,6 +1216,10 @@ class EloEstimator:
             )
             if same_cfg:
                 return worker["engine"], worker["player"]
+            player = worker.get("player")
+            if player is not None:
+                with contextlib.suppress(Exception):
+                    player.close()
             self._force_close_engine(worker.get("engine"))
 
         engine = self._open_stockfish_engine(stockfish_path)
@@ -2115,6 +2185,7 @@ class EloEstimator:
                 all_opponent_elos.append(float(game["level"]))
                 all_scores.append(float(score))
                 all_game_indices.append(int(game["game_idx"]))
+            batched_player.close_state(game["state"])
             worker_slot = int(game.get("worker_slot", -1))
             if 0 <= worker_slot < len(worker_game_counts):
                 worker_game_counts[worker_slot] += 1
@@ -2276,6 +2347,8 @@ class EloEstimator:
                     worker_slot, engine = idle_engines.pop()
                     launch_next_game(worker_slot, engine)
         finally:
+            for game in active_games:
+                batched_player.close_state(game["state"])
             if self._is_cancelled():
                 executor.shutdown(wait=False, cancel_futures=True)
             else:

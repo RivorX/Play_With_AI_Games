@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.inference.prediction import predict_single_position
 from src.models.data.se_cnn_v9.policy import policy_index_maps
 from src.models.data.nested_cnn_v10.encoder import (
     input_planes as encoder_input_planes,
@@ -957,20 +958,5 @@ class NestedCNNV10(nn.Module):
         return policy, value, moves_left
 
     def predict(self, board_tensor):
-        was_training = self.training
-        if was_training:
-            self.eval()
-        try:
-            with torch.inference_mode():
-                if board_tensor.ndim == 3:
-                    board_tensor = board_tensor.unsqueeze(0)
-                policy_logits, value_logits = self.forward(
-                    board_tensor, apply_log_softmax=False
-                )
-                wdl_probs = F.softmax(value_logits, dim=1)
-                value_scalar = wdl_probs[0, 0] - wdl_probs[0, 2]
-                policy_probs = F.softmax(policy_logits, dim=1)
-                return policy_probs.float().cpu().numpy()[0], value_scalar.item()
-        finally:
-            if was_training:
-                self.train()
+        """Return single-position policy probabilities and WDL value scalar."""
+        return predict_single_position(self, board_tensor)

@@ -14,9 +14,10 @@
 #define MCTS_API extern "C" __attribute__((visibility("default")))
 #endif
 
+
 namespace {
 
-constexpr std::int32_t kApiVersion = 7;
+constexpr std::int32_t kApiVersion = 16;
 
 inline bool valid_size(std::int32_t size) noexcept {
     return size > 0;
@@ -326,6 +327,7 @@ struct NativeNode {
     std::int32_t edge_begin = -1;
     std::int32_t edge_count = 0;
     double raw_value = std::numeric_limits<double>::quiet_NaN();
+    std::uint64_t tree_id = 0;
     std::int32_t root_visits = 0;
     double root_value_sum = 0.0;
     std::int32_t root_virtual_loss = 0;
@@ -334,11 +336,13 @@ struct NativeNode {
 
 struct RootSelectionState {
     std::vector<double> initial_visits;
+    std::vector<double> pass_initial_visits;
     // Per-search normalized log-prior + sampled Gumbel, rebuilt from current
     // priors/noise in configure_root and reused across root selections.
     std::vector<double> root_base_scores;
     std::vector<std::int32_t> sequence;
-    double initial_total = 0.0;
+    double pass_initial_total = 0.0;
+    bool q_scale_total_visits = false;
     bool configured = false;
 };
 
@@ -595,7 +599,7 @@ inline std::int32_t select_root(
     }
     const auto simulation_index = std::max<std::int64_t>(
         0,
-        static_cast<std::int64_t>(std::llround(total_count_sum - state.initial_total))
+        static_cast<std::int64_t>(std::llround(total_count_sum - state.pass_initial_total))
     );
     const double considered_visit = state.sequence.empty()
         ? 0.0
@@ -605,33 +609,48 @@ inline std::int32_t select_root(
         )]);
 
     double max_fresh = 0.0;
-    double min_fresh = std::numeric_limits<double>::infinity();
+    double max_q_scale_visits = 0.0;
+    double min_pass_fresh = std::numeric_limits<double>::infinity();
     bool has_considered = false;
     for (std::int32_t index = 0; index < count; ++index) {
         const double initial = index < static_cast<std::int32_t>(state.initial_visits.size())
             ? state.initial_visits[static_cast<std::size_t>(index)]
             : 0.0;
-        const double fresh = std::max(
+        const double pass_initial = index < static_cast<std::int32_t>(state.pass_initial_visits.size())
+            ? state.pass_initial_visits[static_cast<std::size_t>(index)]
+            : initial;
+        const double cumulative_fresh = std::max(
             0.0,
             static_cast<double>(edges[index].visits + edges[index].virtual_loss) - initial
         );
-        max_fresh = std::max(max_fresh, fresh);
-        min_fresh = std::min(min_fresh, fresh);
-        has_considered = has_considered || fresh == considered_visit;
+        const double pass_fresh = std::max(
+            0.0,
+            static_cast<double>(edges[index].visits + edges[index].virtual_loss) - pass_initial
+        );
+        max_fresh = std::max(max_fresh, cumulative_fresh);
+        const double q_scale_visits = state.q_scale_total_visits
+            ? static_cast<double>(edges[index].visits + edges[index].virtual_loss)
+            : cumulative_fresh;
+        max_q_scale_visits = std::max(max_q_scale_visits, q_scale_visits);
+        min_pass_fresh = std::min(min_pass_fresh, pass_fresh);
+        has_considered = has_considered || pass_fresh == considered_visit;
     }
-    const double eligible_visit = has_considered ? considered_visit : min_fresh;
-    const double scale = (forest.c_visit + max_fresh) * forest.c_scale;
+    const double eligible_visit = has_considered ? considered_visit : min_pass_fresh;
+    const double scale = (forest.c_visit + max_q_scale_visits) * forest.c_scale;
     std::int32_t selected = 0;
     double best_score = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < count; ++index) {
         const double initial = index < static_cast<std::int32_t>(state.initial_visits.size())
             ? state.initial_visits[static_cast<std::size_t>(index)]
             : 0.0;
-        const double fresh = std::max(
+        const double pass_initial = index < static_cast<std::int32_t>(state.pass_initial_visits.size())
+            ? state.pass_initial_visits[static_cast<std::size_t>(index)]
+            : initial;
+        const double pass_fresh = std::max(
             0.0,
-            static_cast<double>(edges[index].visits + edges[index].virtual_loss) - initial
+            static_cast<double>(edges[index].visits + edges[index].virtual_loss) - pass_initial
         );
-        if (fresh != eligible_visit) {
+        if (pass_fresh != eligible_visit) {
             continue;
         }
         const float q_score = static_cast<float>(
@@ -657,35 +676,44 @@ inline std::int32_t ensure_child(
     if (!valid_node(forest, parent_id)) {
         return -1;
     }
-    auto& parent = forest.nodes[static_cast<std::size_t>(parent_id)];
-    if (
-        !valid_edge_span(forest, parent) ||
-        local_edge < 0 || local_edge >= parent.edge_count
-    ) {
-        return -1;
-    }
-    const auto edge_index = static_cast<std::size_t>(parent.edge_begin + local_edge);
-    auto& edge = forest.edges[edge_index];
-    if (edge.child >= 0) {
-        if (valid_node(forest, edge.child)) {
-            return edge.child;
+    std::size_t edge_index = 0;
+    std::uint64_t tree_id = 0;
+    {
+        const auto& parent = forest.nodes[static_cast<std::size_t>(parent_id)];
+        if (
+            !valid_edge_span(forest, parent) ||
+            local_edge < 0 || local_edge >= parent.edge_count
+        ) {
+            return -1;
         }
-        // A stale child id must never become an unchecked vector index. Repair
-        // the edge in place and rematerialize the child below.
-        edge.child = -1;
+        edge_index = static_cast<std::size_t>(parent.edge_begin + local_edge);
+        tree_id = parent.tree_id;
+        const auto child_id = forest.edges[edge_index].child;
+        if (child_id >= 0) {
+            if (valid_node(forest, child_id)) {
+                return child_id;
+            }
+            // A stale child id must never become an unchecked vector index.
+            // Keep only the edge index across the node-vector reservations.
+            forest.edges[edge_index].child = -1;
+        }
     }
     // Reserve both parallel node arrays only when a child really needs to be
     // materialized. Allocation happens before changing either vector's size,
     // so a failure leaves the forest valid without taxing the common hit path.
+    // These reservations may move the parent node and root-state vectors, so
+    // no references into either vector survive beyond this point.
     reserve_geometric(forest.nodes, 1U);
     reserve_geometric(forest.root_states, 1U);
     NativeNode child;
     child.parent = parent_id;
     child.parent_edge = local_edge;
+    child.tree_id = tree_id;
     forest.nodes.push_back(child);
     forest.root_states.emplace_back();
-    edge.child = static_cast<std::int32_t>(forest.nodes.size() - 1);
-    return edge.child;
+    const auto child_id = static_cast<std::int32_t>(forest.nodes.size() - 1);
+    forest.edges[edge_index].child = child_id;
+    return child_id;
 }
 
 }  // namespace
@@ -902,19 +930,85 @@ MCTS_API std::int32_t mcts_forest_set_edges(
     }
 }
 
+MCTS_API std::int32_t mcts_forest_bind_tree(
+    void* context,
+    const std::int32_t root_id,
+    const std::uint64_t tree_id
+) noexcept {
+    auto* forest = static_cast<NativeForest*>(context);
+    if (forest == nullptr || !valid_node(*forest, root_id) || tree_id == 0) {
+        return -1;
+    }
+    if (forest->nodes[static_cast<std::size_t>(root_id)].tree_id == tree_id) {
+        // Every descendant inherits its tree id when materialized, and a
+        // first bind walks the complete imported subtree. Repeated searches
+        // therefore need only check the already-bound root.
+        return 0;
+    }
+    if (forest->nodes[static_cast<std::size_t>(root_id)].tree_id != 0) return -3;
+    try {
+        std::vector<std::int32_t> pending{root_id};
+        std::vector<std::int32_t> tree_nodes;
+        std::vector<std::uint8_t> visited(forest->nodes.size(), 0);
+        while (!pending.empty()) {
+            const auto node_id = pending.back();
+            pending.pop_back();
+            if (!valid_node(*forest, node_id)) return -2;
+            const auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
+            auto& seen = visited[static_cast<std::size_t>(node_id)];
+            if (seen != 0) continue;
+            seen = 1;
+            if (node.tree_id != 0 && node.tree_id != tree_id) return -3;
+            tree_nodes.push_back(node_id);
+            if (!valid_edge_span(*forest, node)) return -4;
+            for (std::int32_t edge_index = 0; edge_index < node.edge_count; ++edge_index) {
+                const auto child_id = forest->edges[
+                    static_cast<std::size_t>(node.edge_begin + edge_index)
+                ].child;
+                if (child_id >= 0) pending.push_back(child_id);
+            }
+        }
+        for (const auto node_id : tree_nodes) {
+            auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
+            node.tree_id = tree_id;
+        }
+        return 0;
+    } catch (...) {
+        return -5;
+    }
+}
+
+MCTS_API std::int32_t mcts_forest_release_tree(
+    void* context,
+    const std::uint64_t tree_id
+) noexcept {
+    auto* forest = static_cast<NativeForest*>(context);
+    if (forest == nullptr || tree_id == 0) return -1;
+    for (auto& node : forest->nodes) {
+        if (node.tree_id != tree_id) continue;
+        node.tree_id = 0;
+    }
+    return 0;
+}
+
 MCTS_API std::int32_t mcts_forest_configure_root(
     void* context,
     const std::int32_t node_id,
     const std::int32_t* initial_visits,
+    const std::int32_t* pass_initial_visits,
     const double* gumbel,
     const std::int32_t count,
     const std::int32_t* sequence,
-    const std::int32_t sequence_count
+    const std::int32_t sequence_count,
+    const std::int32_t q_scale_total_visits
 ) noexcept {
     auto* forest = static_cast<NativeForest*>(context);
     if (
         forest == nullptr || !valid_node(*forest, node_id) || count < 0 ||
-        sequence_count < 0 || (count > 0 && (initial_visits == nullptr || gumbel == nullptr)) ||
+        sequence_count < 0 || (q_scale_total_visits != 0 && q_scale_total_visits != 1) ||
+        (count > 0 && (
+            initial_visits == nullptr || pass_initial_visits == nullptr || gumbel == nullptr
+        )) ||
         (sequence_count > 0 && sequence == nullptr)
     ) {
         return -1;
@@ -924,7 +1018,9 @@ MCTS_API std::int32_t mcts_forest_configure_root(
     }
     try {
         auto& state = forest->root_states[static_cast<std::size_t>(node_id)];
+        state.q_scale_total_visits = q_scale_total_visits != 0;
         state.initial_visits.resize(static_cast<std::size_t>(count));
+        state.pass_initial_visits.resize(static_cast<std::size_t>(count));
         state.root_base_scores.clear();
         state.sequence.clear();
         if (count > 0) {
@@ -933,11 +1029,13 @@ MCTS_API std::int32_t mcts_forest_configure_root(
         if (sequence_count > 0) {
             state.sequence.assign(sequence, sequence + sequence_count);
         }
-        state.initial_total = 0.0;
+        state.pass_initial_total = 0.0;
         for (std::int32_t index = 0; index < count; ++index) {
             state.initial_visits[static_cast<std::size_t>(index)] =
                 static_cast<double>(initial_visits[index]);
-            state.initial_total += static_cast<double>(initial_visits[index]);
+            state.pass_initial_visits[static_cast<std::size_t>(index)] =
+                static_cast<double>(pass_initial_visits[index]);
+            state.pass_initial_total += static_cast<double>(pass_initial_visits[index]);
         }
         if (count > 0) {
             const auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
@@ -963,6 +1061,54 @@ MCTS_API std::int32_t mcts_forest_configure_root(
         return 0;
     } catch (...) {
         return -3;
+    }
+}
+
+// Update only the pass-local selection state for an already configured root.
+// Rebuilding root_base_scores here would repeat one log-prior reduction and
+// addition per legal action at every revisiting pass; priors, Gumbel noise,
+// initial visit counts and Q scaling are invariant for the whole search.
+MCTS_API std::int32_t mcts_forest_configure_root_pass(
+    void* context,
+    const std::int32_t node_id,
+    const std::int32_t* pass_initial_visits,
+    const std::int32_t count,
+    const std::int32_t* sequence,
+    const std::int32_t sequence_count
+) noexcept {
+    auto* forest = static_cast<NativeForest*>(context);
+    if (
+        forest == nullptr || !valid_node(*forest, node_id) || count < 0 ||
+        sequence_count < 0 ||
+        (count > 0 && pass_initial_visits == nullptr) ||
+        (sequence_count > 0 && sequence == nullptr)
+    ) {
+        return -1;
+    }
+    auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
+    if (node.edge_count != count) {
+        return -2;
+    }
+    auto& state = forest->root_states[static_cast<std::size_t>(node_id)];
+    if (!state.configured || state.initial_visits.size() != static_cast<std::size_t>(count) ||
+        state.root_base_scores.size() != static_cast<std::size_t>(count)) {
+        return -3;
+    }
+    try {
+        state.pass_initial_visits.resize(static_cast<std::size_t>(count));
+        state.sequence.resize(static_cast<std::size_t>(sequence_count));
+        state.pass_initial_total = 0.0;
+        for (std::int32_t index = 0; index < count; ++index) {
+            const double visits = static_cast<double>(pass_initial_visits[index]);
+            state.pass_initial_visits[static_cast<std::size_t>(index)] = visits;
+            state.pass_initial_total += visits;
+        }
+        for (std::int32_t index = 0; index < sequence_count; ++index) {
+            state.sequence[static_cast<std::size_t>(index)] = sequence[index];
+        }
+        return 0;
+    } catch (...) {
+        return -4;
     }
 }
 
@@ -1023,26 +1169,41 @@ MCTS_API std::int32_t mcts_forest_select_batch(
             forest->selection_paths.push_back(root_id);
             forest->nodes[static_cast<std::size_t>(root_id)].root_virtual_loss += 1;
             auto node_id = root_id;
-            while (valid_node(*forest, node_id) && forest->nodes[static_cast<std::size_t>(node_id)].expanded) {
-                const auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
-                if (node.edge_count <= 0 || !valid_edge_span(*forest, node)) {
+            while (
+                valid_node(*forest, node_id) &&
+                forest->nodes[static_cast<std::size_t>(node_id)].expanded
+            ) {
+                std::int32_t selected = -1;
+                std::int32_t edge_count = 0;
+                std::size_t edge_index = 0;
+                {
+                    const auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
+                    if (node.edge_count <= 0 || !valid_edge_span(*forest, node)) {
+                        break;
+                    }
+                    edge_count = node.edge_count;
+                    const auto& root_state = forest->root_states[
+                        static_cast<std::size_t>(root_id)
+                    ];
+                    selected = (
+                        node_id == root_id && root_state.configured
+                    ) ? select_root(*forest, node_id, root_state)
+                      : select_interior(*forest, node_id);
+                    if (selected >= 0 && selected < edge_count) {
+                        edge_index = static_cast<std::size_t>(node.edge_begin + selected);
+                    }
+                }
+                if (selected < 0 || selected >= edge_count) {
                     break;
                 }
-                const auto& root_state = forest->root_states[static_cast<std::size_t>(root_id)];
-                const auto selected = (
-                    node_id == root_id && root_state.configured
-                ) ? select_root(*forest, node_id, root_state)
-                  : select_interior(*forest, node_id);
-                if (selected < 0 || selected >= node.edge_count) {
-                    break;
-                }
-                auto& edge = forest->edges[
-                    static_cast<std::size_t>(node.edge_begin + selected)
-                ];
-                edge.virtual_loss = static_cast<std::int16_t>(edge.virtual_loss + 1);
+                forest->edges[edge_index].virtual_loss = static_cast<std::int16_t>(
+                    forest->edges[edge_index].virtual_loss + 1
+                );
                 const auto child_id = ensure_child(*forest, node_id, selected);
                 if (!valid_node(*forest, child_id)) {
-                    edge.virtual_loss = static_cast<std::int16_t>(edge.virtual_loss - 1);
+                    forest->edges[edge_index].virtual_loss = static_cast<std::int16_t>(
+                        forest->edges[edge_index].virtual_loss - 1
+                    );
                     return -4;
                 }
                 forest->selection_paths.push_back(child_id);
@@ -1544,7 +1705,6 @@ MCTS_API std::int32_t mcts_completed_q(
         priors == nullptr || output == nullptr) {
         return -1;
     }
-
     raw_value = std::clamp(raw_value, -1.0, 1.0);
     double visit_sum = 0.0;
     double visited_prior_sum = 0.0;
@@ -1559,7 +1719,8 @@ MCTS_API std::int32_t mcts_completed_q(
             const double q = -static_cast<double>(value_sums[index]) /
                              static_cast<double>(visits);
             output[index] = q;
-            visit_sum += static_cast<double>(visits);
+            const double total_visits = static_cast<double>(visits);
+            visit_sum += total_visits;
             const double safe_prior = std::max(static_cast<double>(priors[index]), tiny);
             visited_prior_sum += safe_prior;
             weighted_q_sum += safe_prior * q;
@@ -1661,6 +1822,7 @@ MCTS_API std::int32_t mcts_select_root(
     const double* gumbel,
     const double* completed_q,
     const double* initial_visits,
+    const double* pass_initial_visits,
     std::int32_t* visit_counts,
     float* total_counts,
     std::int16_t* virtual_losses,
@@ -1668,39 +1830,51 @@ MCTS_API std::int32_t mcts_select_root(
     const double considered_visit,
     const double c_visit,
     const double c_scale,
-    const std::int32_t apply_virtual_loss
+    const std::int32_t apply_virtual_loss,
+    const std::int32_t q_scale_total_visits
 ) noexcept {
     if (!valid_size(size) || log_priors == nullptr || gumbel == nullptr ||
-        completed_q == nullptr || initial_visits == nullptr || visit_counts == nullptr ||
-        total_counts == nullptr || virtual_losses == nullptr) {
+        completed_q == nullptr || initial_visits == nullptr ||
+        pass_initial_visits == nullptr || visit_counts == nullptr ||
+        total_counts == nullptr || virtual_losses == nullptr ||
+        (q_scale_total_visits != 0 && q_scale_total_visits != 1)) {
         return -1;
     }
 
     double maximum_log_prior = -std::numeric_limits<double>::infinity();
-    double max_fresh = 0.0;
-    double min_fresh = std::numeric_limits<double>::infinity();
+    double max_q_scale_visits = 0.0;
+    double min_pass_fresh = std::numeric_limits<double>::infinity();
     bool has_eligible = false;
     for (std::int32_t index = 0; index < size; ++index) {
         maximum_log_prior = std::max(maximum_log_prior, log_priors[index]);
-        const double fresh = std::max(
+        const double cumulative_fresh = std::max(
             0.0,
             static_cast<double>(total_counts[index]) - initial_visits[index]
         );
-        max_fresh = std::max(max_fresh, fresh);
-        min_fresh = std::min(min_fresh, fresh);
-        has_eligible = has_eligible || (fresh == considered_visit);
+        const double pass_fresh = std::max(
+            0.0,
+            static_cast<double>(total_counts[index]) - pass_initial_visits[index]
+        );
+        max_q_scale_visits = std::max(
+            max_q_scale_visits,
+            q_scale_total_visits != 0
+                ? static_cast<double>(total_counts[index])
+                : cumulative_fresh
+        );
+        min_pass_fresh = std::min(min_pass_fresh, pass_fresh);
+        has_eligible = has_eligible || (pass_fresh == considered_visit);
     }
 
-    const double eligible_visit = has_eligible ? considered_visit : min_fresh;
-    const double scale = (c_visit + max_fresh) * c_scale;
+    const double eligible_visit = has_eligible ? considered_visit : min_pass_fresh;
+    const double scale = (c_visit + max_q_scale_visits) * c_scale;
     std::int32_t selected = 0;
     double best_score = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < size; ++index) {
-        const double fresh = std::max(
+        const double pass_fresh = std::max(
             0.0,
-            static_cast<double>(total_counts[index]) - initial_visits[index]
+            static_cast<double>(total_counts[index]) - pass_initial_visits[index]
         );
-        if (fresh != eligible_visit) {
+        if (pass_fresh != eligible_visit) {
             continue;
         }
         const float q_score = static_cast<float>(completed_q[index] * scale);
@@ -1725,24 +1899,33 @@ MCTS_API std::int32_t mcts_final_action(
     const std::int32_t* visit_counts,
     const std::int32_t size,
     const double c_visit,
-    const double c_scale
+    const double c_scale,
+    const std::int32_t q_scale_total_visits
 ) noexcept {
     if (!valid_size(size) || log_priors == nullptr || gumbel == nullptr ||
-        completed_q == nullptr || initial_visits == nullptr || visit_counts == nullptr) {
+        completed_q == nullptr || initial_visits == nullptr || visit_counts == nullptr ||
+        (q_scale_total_visits != 0 && q_scale_total_visits != 1)) {
         return -1;
     }
 
     double maximum_log_prior = -std::numeric_limits<double>::infinity();
     double most_visited = 0.0;
+    double max_q_scale_visits = 0.0;
     for (std::int32_t index = 0; index < size; ++index) {
         maximum_log_prior = std::max(maximum_log_prior, log_priors[index]);
         most_visited = std::max(
             most_visited,
             std::max(0.0, static_cast<double>(visit_counts[index]) - initial_visits[index])
         );
+        max_q_scale_visits = std::max(
+            max_q_scale_visits,
+            q_scale_total_visits != 0
+                ? static_cast<double>(visit_counts[index])
+                : std::max(0.0, static_cast<double>(visit_counts[index]) - initial_visits[index])
+        );
     }
 
-    const double scale = (c_visit + most_visited) * c_scale;
+    const double scale = (c_visit + max_q_scale_visits) * c_scale;
     std::int32_t selected = 0;
     double best_score = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < size; ++index) {
@@ -1751,6 +1934,73 @@ MCTS_API std::int32_t mcts_final_action(
             static_cast<double>(visit_counts[index]) - initial_visits[index]
         );
         if (fresh != most_visited) {
+            continue;
+        }
+        const float q_score = static_cast<float>(completed_q[index] * scale);
+        const double score = (log_priors[index] - maximum_log_prior) + gumbel[index] +
+                             static_cast<double>(q_score);
+        if (score > best_score) {
+            best_score = score;
+            selected = index;
+        }
+    }
+    return selected;
+}
+
+MCTS_API std::int32_t mcts_final_action_eligible(
+    const double* log_priors,
+    const double* gumbel,
+    const double* completed_q,
+    const double* initial_visits,
+    const double* pass_initial_visits,
+    const std::int32_t* visit_counts,
+    const std::int32_t size,
+    const double final_visit_threshold,
+    const double c_visit,
+    const double c_scale,
+    const std::int32_t q_scale_total_visits
+) noexcept {
+    if (!valid_size(size) || log_priors == nullptr || gumbel == nullptr ||
+        completed_q == nullptr || initial_visits == nullptr ||
+        pass_initial_visits == nullptr || visit_counts == nullptr ||
+        (q_scale_total_visits != 0 && q_scale_total_visits != 1)) {
+        return -1;
+    }
+
+    double maximum_log_prior = -std::numeric_limits<double>::infinity();
+    double max_q_scale_visits = 0.0;
+    double min_pass_fresh = std::numeric_limits<double>::infinity();
+    bool has_finalist = false;
+    for (std::int32_t index = 0; index < size; ++index) {
+        maximum_log_prior = std::max(maximum_log_prior, log_priors[index]);
+        const double cumulative_fresh = std::max(
+            0.0,
+            static_cast<double>(visit_counts[index]) - initial_visits[index]
+        );
+        const double pass_fresh = std::max(
+            0.0,
+            static_cast<double>(visit_counts[index]) - pass_initial_visits[index]
+        );
+        max_q_scale_visits = std::max(
+            max_q_scale_visits,
+            q_scale_total_visits != 0
+                ? static_cast<double>(visit_counts[index])
+                : cumulative_fresh
+        );
+        min_pass_fresh = std::min(min_pass_fresh, pass_fresh);
+        has_finalist = has_finalist || pass_fresh == final_visit_threshold;
+    }
+
+    const double eligible_visit = has_finalist ? final_visit_threshold : min_pass_fresh;
+    const double scale = (c_visit + max_q_scale_visits) * c_scale;
+    std::int32_t selected = 0;
+    double best_score = -std::numeric_limits<double>::infinity();
+    for (std::int32_t index = 0; index < size; ++index) {
+        const double pass_fresh = std::max(
+            0.0,
+            static_cast<double>(visit_counts[index]) - pass_initial_visits[index]
+        );
+        if (pass_fresh != eligible_visit) {
             continue;
         }
         const float q_score = static_cast<float>(completed_q[index] * scale);

@@ -31,6 +31,7 @@ from src.mcts.search import (
     _search_correction_metadata,
     _select_move_from_visits_safe,
 )
+from src.mcts.session import SearchSession
 from src.models.data.se_cnn_v9.helpers import move_to_index
 from src.training.rl.search_control import suffix_regret_targets
 from src.selfplay.opening_pool import load_opening_pool
@@ -1231,30 +1232,40 @@ class SelfPlayEngine:
         return None
 
     def _clear_game_search_state(self, gs):
-        tree_key = gs.get('_native_tree_key', id(gs.get('board')))
-        self.mcts.release_native_tree(tree_key)
-        opponent_mcts = gs.get('opponent_mcts')
-        if opponent_mcts is not None:
-            opponent_mcts.release_native_tree(tree_key)
-        gs['root'] = None
-        gs['opponent_root'] = None
-        gs['_root_synced'] = False
-        gs['_opponent_root_synced'] = False
+        for session_key in ('_search_session', '_opponent_search_session'):
+            session = gs.get(session_key)
+            if session is not None:
+                session.clear()
 
     @staticmethod
-    def _advance_search_root(root, move):
-        if root is None:
-            return None, False
-        edge_idx = root.edges._get_move_index(move) if root.edges is not None else None
-        child = (
-            root.edges.nodes[int(edge_idx)]
-            if edge_idx is not None and int(edge_idx) < len(root.edges.nodes)
-            else None
-        )
-        if child is None:
-            return None, False
-        _ = child.board
-        return child.detach_as_root(), True
+    def _close_game_search_sessions(gs):
+        for session_key in ('_search_session', '_opponent_search_session'):
+            session = gs.get(session_key)
+            if session is not None:
+                session.close()
+                gs[session_key] = None
+
+    @staticmethod
+    def _advance_game_search_sessions(gs, move):
+        board = gs['board']
+        known = bool(gs.get('position_history_complete', True))
+        for session_key, history_key in (
+            ('_search_session', 'board_history'),
+            (
+                '_opponent_search_session',
+                'opponent_board_history',
+            ),
+        ):
+            session = gs.get(session_key)
+            if session is None:
+                continue
+            session.advance(
+                move,
+                board=board,
+                board_history=gs[history_key],
+                position_counts=gs.get('position_counts'),
+                repetition_known=known,
+            )
 
     def _maybe_finish_with_syzygy(self, gs, board):
         if self.syzygy is None or chess.is_game_over(board, claim_draw=False):
@@ -2211,6 +2222,12 @@ class SelfPlayEngine:
                 if opponent_mcts is not None
                 else []
             )
+            learner_session = SearchSession(self.mcts, tree_key=object())
+            opponent_session = (
+                SearchSession(opponent_mcts, tree_key=object())
+                if opponent_mcts is not None
+                else None
+            )
             fen_parts = chess.board_fen(initial_board).split()
             try:
                 fullmove = max(1, int(fen_parts[5]))
@@ -2225,10 +2242,8 @@ class SelfPlayEngine:
                 'repetition_history': hard_history_repetition_counts[-self.history_positions:] if self.history_positions > 0 else [],
                 'position_counts': position_counts,
                 'position_history_complete': position_history_complete,
-                'root': None,
-                '_root_synced': False,
-                'opponent_root': None,
-                '_opponent_root_synced': False,
+                '_search_session': learner_session,
+                '_opponent_search_session': opponent_session,
                 'game_history': [],
                 'move_count': initial_ply,
                 'done': False,
@@ -2256,7 +2271,6 @@ class SelfPlayEngine:
                 '_opening_prefix_sampled': False,
                 '_opening_prefix_plies': 0,
                 '_archive_id': int((hard_start or {}).get('archive_id', -1)),
-                '_native_tree_key': id(initial_board),
                 '_stream_job_id': game_spec.get('job_id'),
                 # The global dispatcher id is stable across workers for this
                 # iteration. Replay combines it with insertion iteration, so
@@ -2302,6 +2316,7 @@ class SelfPlayEngine:
                     if not gs.get('_finalized_for_batch', False):
                         gs['_finalized_for_batch'] = True
                         completed_game_states.append(gs)
+                        self._close_game_search_sessions(gs)
                         _flush_completed_games()
                 else:
                     active.append(gs)
@@ -2526,23 +2541,27 @@ class SelfPlayEngine:
 
             visit_counts_by_index = {}
 
-            def _run_search_for_indices(indices, mcts_ref, root_key, synced_key, history_key):
+            def _run_search_for_indices(indices, mcts_ref, history_key, session_key):
                 if not indices:
                     return
                 group_states = []
                 for i in indices:
                     gs = game_states[i]
-                    group_states.append([
+                    session = gs.get(session_key)
+                    if session is None:
+                        raise RuntimeError(
+                            f"Missing search session {session_key!r} for active self-play game"
+                        )
+                    repetition_known = bool(
+                        gs.get('position_history_complete', True)
+                    )
+                    group_states.append(session.make_state(
                         gs['board'],
-                        gs.get(root_key),
-                        bool(gs.get(synced_key, False)),
-                        gs[history_key],
-                        int(gs.get('move_count', 0) or 0),
-                        gs.get('position_counts'),
-                        None,
-                        gs['_native_tree_key'],
-                        bool(gs.get('position_history_complete', True)),
-                    ])
+                        board_history=gs[history_key],
+                        position_counts=gs.get('position_counts'),
+                        repetition_known=repetition_known,
+                        simulation_budget_override=None,
+                    ))
                 visit_counts_list_group, search_metadata_group = mcts_ref.search_many(
                     group_states,
                     num_simulations=self.num_simulations,
@@ -2556,8 +2575,8 @@ class SelfPlayEngine:
                     search_metadata_group,
                 ):
                     gs = game_states[gs_idx]
-                    gs[root_key] = local_state[1]
-                    gs[synced_key] = bool(local_state[2])
+                    session = gs[session_key]
+                    session.commit(local_state)
                     visit_counts_by_index[gs_idx] = (visit_counts, search_metadata)
                     used = int(search_metadata.get('simulations_used', 0)) if isinstance(search_metadata, dict) else 0
                     search_stats['sim_used'] += used
@@ -2634,17 +2653,15 @@ class SelfPlayEngine:
                 _run_search_for_indices(
                     active_indices,
                     self.mcts,
-                    'root',
-                    '_root_synced',
                     'board_history',
+                    '_search_session',
                 )
             else:
                 _run_search_for_indices(
                     learner_indices,
                     self.mcts,
-                    'root',
-                    '_root_synced',
                     'board_history',
+                    '_search_session',
                 )
                 for label, indices in grouped_opponent_indices.items():
                     opponent_mcts = self.opponent_mcts_by_label.get(label)
@@ -2653,9 +2670,8 @@ class SelfPlayEngine:
                     _run_search_for_indices(
                         indices,
                         opponent_mcts,
-                        'opponent_root',
-                        '_opponent_root_synced',
                         'opponent_board_history',
+                        '_opponent_search_session',
                     )
             for idx in active_indices:
                 gs = game_states[idx]
@@ -2671,9 +2687,13 @@ class SelfPlayEngine:
                     temperature = 0.0
                 learner_turn = bool(gs.get('_learner_turn_cache', True))
                 game_opponent_mcts = gs.get('opponent_mcts')
-                root_key = 'root' if learner_turn or game_opponent_mcts is None else 'opponent_root'
-                synced_key = '_root_synced' if learner_turn or game_opponent_mcts is None else '_opponent_root_synced'
-                root = gs.get(root_key)
+                session_key = (
+                    '_search_session'
+                    if learner_turn or game_opponent_mcts is None
+                    else '_opponent_search_session'
+                )
+                search_session = gs.get(session_key)
+                root = search_session.root if search_session is not None else None
                 adjudication_t0 = time.perf_counter() if self.profile_enabled else None
                 adjudicated_result = self._maybe_adjudicate_game(gs, root, board)
                 if self.profile_enabled:
@@ -2893,28 +2913,17 @@ class SelfPlayEngine:
                 ):
                     gs['_opening_sequence'].append(move.uci())
 
-                # Keep both side-specific MCTS trees synchronized with the
-                # actual game line. Mixed-opponent self-play otherwise starts
-                # every move from a fresh root and produces noisier targets.
-                if self.share_trees or gs['has_frozen_opponent']:
-                    root_keys = [('root', '_root_synced')]
-                    if gs['has_frozen_opponent']:
-                        # Different networks must retain independent trees: their
-                        # priors and Q values are not interchangeable.
-                        root_keys.append(('opponent_root', '_opponent_root_synced'))
-                    for candidate_root_key, candidate_synced_key in root_keys:
-                        next_root, next_synced = self._advance_search_root(
-                            gs.get(candidate_root_key),
-                            move,
-                        )
-                        gs[candidate_root_key] = next_root
-                        gs[candidate_synced_key] = next_synced
-                else:
+                # Preserve the explicit no-sharing mode. Frozen opponents have
+                # separate model sessions and both must observe every actual ply.
+                keep_model_trees = self.share_trees or gs['has_frozen_opponent']
+                if not keep_model_trees:
                     self._clear_game_search_state(gs)
 
                 chess.apply_move(board, move)
                 gs['move_count'] += 1
                 _record_position_count(gs['position_counts'], board)
+                if keep_model_trees:
+                    self._advance_game_search_sessions(gs, move)
 
                 forced_game_over = chess.is_game_over(board, claim_draw=False)
                 auto_claim_draw = self._should_auto_claim_draw(board, gs['move_count'])

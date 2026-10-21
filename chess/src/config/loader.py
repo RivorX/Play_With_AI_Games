@@ -18,6 +18,7 @@ DEFAULT_ARCHITECTURE_ID = "se_cnn_v9"
 PROJECT_CONFIG_FILES = (
     CONFIG_DIR / "data.yaml",
     CONFIG_DIR / "evaluation.yaml",
+    CONFIG_DIR / "search.yaml",
     CONFIG_DIR / "default.yaml",
 )
 
@@ -33,6 +34,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _read_yaml(path: Path) -> dict:
+    if not path.is_file():
+        raise FileNotFoundError(f"Configuration file not found: {path}")
     with path.open("r", encoding="utf-8") as stream:
         value = yaml.safe_load(stream) or {}
     if not isinstance(value, dict):
@@ -41,7 +44,12 @@ def _read_yaml(path: Path) -> dict:
 
 
 def _load_project_parts(config_path: str | Path | None) -> dict:
-    """Merge standard project parts and an optional external override."""
+    """Merge standard project parts and an optional external override.
+
+    Keep ``search.yaml`` before ``default.yaml`` so any future RL settings in
+    the main config retain their historical precedence. Explicit external
+    configs are merged last and continue to override every standard part.
+    """
     runtime: dict = {}
     for path in PROJECT_CONFIG_FILES:
         runtime = _deep_merge(runtime, _read_yaml(path))

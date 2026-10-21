@@ -83,41 +83,6 @@ reinforcement_learning:
     syzygy_paths:
       - "data/syzygy"
 
-  # Full Gumbel AlphaZero search with Sequential Halving at the root and
-  # completed-Q policy improvement below it.
-  search:
-    simulations: 192
-    # Interactive one-root searches otherwise shrink each batch to a quarter
-    # of the remaining budget, creating many tiny GPU calls. 0 preserves that
-    # legacy schedule; positive caps apply only to one root.
-    single_root_batch_cap: 0
-    # Assign the complete budget before Sequential Halving. `simulations` is
-    # the exact group average. Difficulty combines prior ambiguity/entropy,
-    # branching and value uncertainty on a smooth 16-sim grid in the strict
-    # 64-320 range. Every root produces a complete policy target.
-    dynamic_budget_enabled: true
-    dynamic_budget_min: 64
-    dynamic_budget_max_multiplier: 1.6666667
-    # Root-width cap. The search keeps 16 when the fresh action budget can fund
-    # two initial visits per candidate, and narrows to 8 in the low-budget band.
-    gumbel_max_considered_actions: 16
-    gumbel_scale: 1.0              # self-play exploration
-    gumbel_eval_scale: 0.0         # deterministic perfect-information eval
-    # Earlier Q influence is valuable with the compensated dynamic budget:
-    # paired ablations beat c_visit=50 at 64/192 sims and tied it at 320 sims.
-    gumbel_c_visit: 100.0
-    gumbel_c_scale: 0.10
-    # Do not stretch tiny, noisy sibling-Q differences to the full [0, 1]
-    # interval. The current value head is strongly under-dispersed in openings.
-    gumbel_q_range_floor: 0.25
-    gumbel_use_mixed_value: true
-    # The completed-Q policy is already soft. Do not flatten it a second time:
-    # the last run's target top-1 fell from 65.7% to 53.7%, while useful
-    # correction top-1 stayed near 10%.
-    # A small sharpening step makes the completed-Q teacher more separable while
-    # preserving its full distribution. It never changes MCTS action selection.
-    gumbel_target_temperature: 0.95
-
   # Optimizer and the few regularizers worth tuning between runs.
   training:
     # Four-generation rolling replay. Rows are interleaved by complete game so
@@ -246,16 +211,19 @@ hardware:
 central_inference:
   max_batch_size: 384            # Production 192-sim throughput optimum.
   flush_ms: 0.5                  # Coalesce concurrent MCTS requests.
+  # Batch sizes vary; autotuning adds multi-second latency on each new shape.
+  # Set true explicitly to trade first-use latency for tuned steady-state speed.
+  cudnn_benchmark: false
 
 
 # ------------------------------------------------------------------------------
 # PLAY UI
 # ------------------------------------------------------------------------------
 play:
-  # Batch up to 32 leaves for the visible one-game UI search. Set to 0 to
-  # restore the legacy shrinking-batch schedule. This does not affect RL,
-  # UCI/Elo, or background multi-game matches.
-  single_game_mcts_batch_cap: 32
+  # Preserve the canonical shrinking-batch schedule. Positive overrides change
+  # search feedback timing; caps 16/32 reduced revisiting quality in testing.
+  # This UI-only override does not affect RL, UCI/Elo, or background matches.
+  single_game_mcts_batch_cap: 0
   # Minimum on-screen time before a fast AI move is applied; background games
   # and evaluation workers are unaffected. Set 0 to disable presentation pacing.
   min_visible_move_seconds: 1.0

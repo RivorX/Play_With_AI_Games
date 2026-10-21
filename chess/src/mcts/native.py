@@ -21,8 +21,7 @@ from pathlib import Path
 import numpy as np
 from filelock import FileLock
 
-
-_API_VERSION = 7
+_API_VERSION = 16
 _INSTANCE = None
 _LOAD_ATTEMPTED = False
 _INSTANCE_LOCK = threading.Lock()
@@ -174,7 +173,8 @@ class NativeMCTSKernels:
 
         lib.mcts_completed_q.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
-            ctypes.c_double, ctypes.c_int32, ctypes.c_double, ctypes.c_void_p,
+            ctypes.c_double, ctypes.c_int32, ctypes.c_double,
+            ctypes.c_void_p,
         ]
         lib.mcts_completed_q.restype = ctypes.c_int32
         lib.mcts_improved_policy.argtypes = [
@@ -184,15 +184,23 @@ class NativeMCTSKernels:
         lib.mcts_improved_policy.restype = ctypes.c_int32
         lib.mcts_select_root.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
-            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_int32,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int32, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            ctypes.c_int32, ctypes.c_int32,
         ]
         lib.mcts_select_root.restype = ctypes.c_int32
         lib.mcts_final_action.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_int32, ctypes.c_double, ctypes.c_double,
+            ctypes.c_int32,
         ]
         lib.mcts_final_action.restype = ctypes.c_int32
+        lib.mcts_final_action_eligible.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32, ctypes.c_double,
+            ctypes.c_double, ctypes.c_double, ctypes.c_int32,
+        ]
+        lib.mcts_final_action_eligible.restype = ctypes.c_int32
         lib.mcts_soften_policy.argtypes = [
             ctypes.c_void_p, ctypes.c_int32, ctypes.c_double, ctypes.c_void_p,
         ]
@@ -215,14 +223,24 @@ class NativeMCTSKernels:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
         ]
         lib.mcts_forest_set_edges.restype = ctypes.c_int32
+        lib.mcts_forest_bind_tree.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_uint64]
+        lib.mcts_forest_bind_tree.restype = ctypes.c_int32
+        lib.mcts_forest_release_tree.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        lib.mcts_forest_release_tree.restype = ctypes.c_int32
         lib.mcts_forest_configure_root.argtypes = [
             ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int32, ctypes.c_void_p, ctypes.c_int32,
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_int32,
+            ctypes.c_int32,
         ]
         lib.mcts_forest_configure_root.restype = ctypes.c_int32
+        lib.mcts_forest_configure_root_pass.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_int32,
+            ctypes.c_void_p, ctypes.c_int32,
+        ]
+        lib.mcts_forest_configure_root_pass.restype = ctypes.c_int32
         lib.mcts_forest_reroot.argtypes = [
-            ctypes.c_void_p, ctypes.c_int32, ctypes.c_double, ctypes.c_int32,
-            ctypes.c_double, ctypes.c_int32,
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_double,
+            ctypes.c_int32, ctypes.c_double, ctypes.c_int32,
         ]
         lib.mcts_forest_reroot.restype = ctypes.c_int32
         lib.mcts_forest_select_batch.argtypes = [
@@ -404,7 +422,8 @@ class NativeMCTSKernels:
     ) -> None:
         status = self._library.mcts_completed_q(
             _pointer(visits), _pointer(value_sums), _pointer(priors), visits.size,
-            raw_value, int(use_mixed_value), q_range_floor, _pointer(output),
+            raw_value, int(use_mixed_value), q_range_floor,
+            _pointer(output),
         )
         if status != 0:
             raise RuntimeError(f"mcts_completed_q failed with status {status}")
@@ -432,6 +451,7 @@ class NativeMCTSKernels:
         gumbel: np.ndarray,
         completed_q: np.ndarray,
         initial_visits: np.ndarray,
+        pass_initial_visits: np.ndarray,
         visits: np.ndarray,
         total_counts: np.ndarray,
         virtual_losses: np.ndarray,
@@ -439,12 +459,34 @@ class NativeMCTSKernels:
         c_visit: float,
         c_scale: float,
         apply_virtual_loss: bool,
+        q_scale_total_visits: bool = False,
     ) -> int:
         return int(self._library.mcts_select_root(
             _pointer(log_priors), _pointer(gumbel), _pointer(completed_q),
-            _pointer(initial_visits), _pointer(visits), _pointer(total_counts),
-            _pointer(virtual_losses), log_priors.size, considered_visit,
-            c_visit, c_scale, int(apply_virtual_loss),
+            _pointer(initial_visits), _pointer(pass_initial_visits),
+            _pointer(visits), _pointer(total_counts), _pointer(virtual_losses),
+            log_priors.size, considered_visit,
+            c_visit, c_scale, int(apply_virtual_loss), int(q_scale_total_visits),
+        ))
+
+    def final_action_eligible(
+        self,
+        log_priors: np.ndarray,
+        gumbel: np.ndarray,
+        completed_q: np.ndarray,
+        initial_visits: np.ndarray,
+        pass_initial_visits: np.ndarray,
+        visits: np.ndarray,
+        final_visit_threshold: float,
+        c_visit: float,
+        c_scale: float,
+        q_scale_total_visits: bool = False,
+    ) -> int:
+        return int(self._library.mcts_final_action_eligible(
+            _pointer(log_priors), _pointer(gumbel), _pointer(completed_q),
+            _pointer(initial_visits), _pointer(pass_initial_visits),
+            _pointer(visits), log_priors.size, float(final_visit_threshold),
+            c_visit, c_scale, int(q_scale_total_visits),
         ))
 
     def final_action(
@@ -456,11 +498,12 @@ class NativeMCTSKernels:
         visits: np.ndarray,
         c_visit: float,
         c_scale: float,
+        q_scale_total_visits: bool = False,
     ) -> int:
         return int(self._library.mcts_final_action(
             _pointer(log_priors), _pointer(gumbel), _pointer(completed_q),
             _pointer(initial_visits), _pointer(visits), log_priors.size,
-            c_visit, c_scale,
+            c_visit, c_scale, int(q_scale_total_visits),
         ))
 
     def soften_policy(
@@ -493,7 +536,6 @@ class NativeMCTSKernels:
             use_mixed_value=use_mixed_value,
         )
 
-
 class NativeMCTSForest:
     """Persistent native tree for traversal, virtual visits and backup."""
 
@@ -519,11 +561,14 @@ class NativeMCTSForest:
         )
         if not self._context:
             raise RuntimeError("mcts_forest_create failed")
+        self._poisoned = False
         self.nodes = []
         self._node_ids = {}
         self._native_expanded = set()
         self.root_ids = []
         self._active_roots = {}
+        self._tree_ids = {}
+        self._next_tree_id = 1
         self._prepare_calls = 0
         self._released_since_compact = 0
         try:
@@ -534,7 +579,7 @@ class NativeMCTSForest:
 
     @property
     def active(self) -> bool:
-        return bool(self._context)
+        return bool(self._context) and not self._poisoned
 
     @property
     def node_count(self) -> int:
@@ -547,8 +592,37 @@ class NativeMCTSForest:
     def close(self) -> None:
         context = self._context
         if context:
+            # Clear the handle first so a failed destroy is never retried by
+            # close(), __del__(), or a later SearchSession cleanup.
             self._context = None
             self._lib.mcts_forest_destroy(context)
+
+    def _poison_and_discard(self, cause: BaseException) -> None:
+        """Invalidate a forest after a native failure without inspecting it.
+
+        Once a native operation reports corruption (or raises an access
+        violation), no release/compaction call may safely traverse its arrays.
+        Destroying the opaque context is the only permitted cleanup. Preserve
+        the triggering exception if even that cleanup fails.
+        """
+        self._poisoned = True
+        context = self._context
+        self._context = None
+        if context:
+            try:
+                self._lib.mcts_forest_destroy(context)
+            except Exception as cleanup_error:
+                try:
+                    cause.add_note(
+                        f"native forest destroy also failed after poisoning: {cleanup_error}"
+                    )
+                except Exception:
+                    pass
+
+    def _raise_native_failure(self, message: str, status: int):
+        error = RuntimeError(f"{message} failed with status {status}")
+        self._poison_and_discard(error)
+        raise error
 
     def __del__(self):
         try:
@@ -560,6 +634,16 @@ class NativeMCTSForest:
     def _raw_value(node) -> float:
         value = getattr(node, "raw_value", None)
         return float("nan") if value is None else float(value)
+
+    def _tree_id(self, tree_key) -> int:
+        tree_id = self._tree_ids.get(tree_key)
+        if tree_id is None:
+            tree_id = self._next_tree_id
+            self._next_tree_id += 1
+            if tree_id <= 0 or tree_id >= (1 << 64):
+                raise RuntimeError("native MCTS tree scope identifiers were exhausted")
+            self._tree_ids[tree_key] = tree_id
+        return int(tree_id)
 
     def _add_python_node(self, node, parent_id: int, parent_edge: int) -> int:
         existing = self._node_ids.get(id(node))
@@ -637,6 +721,7 @@ class NativeMCTSForest:
 
         prepared_ids = []
         for root, tree_key in zip(roots, tree_keys):
+            tree_id = self._tree_id(tree_key)
             previous = self._active_roots.get(tree_key)
             node_id = self._node_ids.get(id(root))
             if node_id is None:
@@ -664,6 +749,14 @@ class NativeMCTSForest:
                 # tree-reuse telemetry read its counters.
                 self.sync_node(root)
 
+            status = int(self._lib.mcts_forest_bind_tree(
+                self._context,
+                int(node_id),
+                tree_id,
+            ))
+            if status != 0:
+                raise RuntimeError(f"mcts_forest_bind_tree failed with status {status}")
+
             self._active_roots[tree_key] = (root, int(node_id))
             prepared_ids.append(int(node_id))
 
@@ -680,6 +773,24 @@ class NativeMCTSForest:
             ]
 
     def release_tree(self, tree_key) -> None:
+        if not self.active:
+            # A poisoned forest has already discarded its opaque context.
+            # Python-side cleanup can proceed without touching native arrays.
+            self._tree_ids.pop(tree_key, None)
+            self._active_roots.pop(tree_key, None)
+            return
+        tree_id = self._tree_ids.pop(tree_key, None)
+        if tree_id is not None:
+            try:
+                status = int(self._lib.mcts_forest_release_tree(
+                    self._context,
+                    int(tree_id),
+                ))
+            except OSError as error:
+                self._poison_and_discard(error)
+                raise
+            if status != 0:
+                self._raise_native_failure("mcts_forest_release_tree", status)
         if self._active_roots.pop(tree_key, None) is not None:
             self._released_since_compact += 1
         if not self._active_roots and self.node_count:
@@ -687,6 +798,8 @@ class NativeMCTSForest:
 
     def compact(self) -> None:
         """Drop nodes unreachable from registered game roots entirely in C++."""
+        if not self.active:
+            return
         old_count = self.node_count
         if old_count <= 0:
             self.root_ids = []
@@ -699,15 +812,19 @@ class NativeMCTSForest:
             dtype=np.int32,
         )
         old_to_new = np.empty(old_count, dtype=np.int32)
-        status = self._lib.mcts_forest_compact(
-            self._context,
-            _pointer(active_ids),
-            int(active_ids.size),
-            _pointer(old_to_new),
-            int(old_to_new.size),
-        )
+        try:
+            status = self._lib.mcts_forest_compact(
+                self._context,
+                _pointer(active_ids),
+                int(active_ids.size),
+                _pointer(old_to_new),
+                int(old_to_new.size),
+            )
+        except OSError as error:
+            self._poison_and_discard(error)
+            raise
         if status < 0:
-            raise RuntimeError(f"mcts_forest_compact failed with status {status}")
+            self._raise_native_failure("mcts_forest_compact", status)
 
         new_count = int(status)
         new_nodes = [None] * new_count
@@ -715,7 +832,9 @@ class NativeMCTSForest:
             if int(new_id) >= 0:
                 new_nodes[int(new_id)] = self.nodes[old_id]
         if any(node is None for node in new_nodes):
-            raise RuntimeError("native compaction returned a sparse node mapping")
+            error = RuntimeError("native compaction returned a sparse node mapping")
+            self._poison_and_discard(error)
+            raise error
 
         self.nodes = new_nodes
         self._node_ids = {id(node): node_id for node_id, node in enumerate(new_nodes)}
@@ -741,9 +860,13 @@ class NativeMCTSForest:
             if not state:
                 continue
             initial = np.ascontiguousarray(state["initial_visits"], dtype=np.int32)
+            pass_initial = np.ascontiguousarray(
+                state.get("pass_initial_visits", state["initial_visits"]),
+                dtype=np.int32,
+            )
             gumbel = np.ascontiguousarray(state["gumbel"], dtype=np.float64)
             sequence = np.ascontiguousarray(state.get("sequence", ()), dtype=np.int32)
-            if initial.size != gumbel.size:
+            if initial.size != gumbel.size or initial.size != pass_initial.size:
                 raise ValueError("native root state size mismatch")
             root = self.nodes[root_id]
             if initial.size != len(root.edges.moves):
@@ -754,14 +877,45 @@ class NativeMCTSForest:
                 self._context,
                 int(root_id),
                 _pointer(initial),
+                _pointer(pass_initial),
                 _pointer(gumbel),
                 int(initial.size),
+                _pointer(sequence),
+                int(sequence.size),
+                int(bool(state.get("q_scale_total_visits", False))),
+            )
+            if status != 0:
+                raise RuntimeError(
+                    f"mcts_forest_configure_root failed with status {status}"
+                )
+
+    def configure_root_pass(self, states) -> None:
+        """Update only pass-local data for roots configured earlier in a search."""
+        for root_id, state in zip(self.root_ids, states):
+            if not state:
+                continue
+            pass_initial = np.ascontiguousarray(
+                state.get("pass_initial_visits", state["initial_visits"]),
+                dtype=np.int32,
+            )
+            sequence = np.ascontiguousarray(state.get("sequence", ()), dtype=np.int32)
+            root = self.nodes[root_id]
+            if pass_initial.size != len(root.edges.moves):
+                raise ValueError(
+                    "native root pass state does not match the current root edges"
+                )
+            status = self._lib.mcts_forest_configure_root_pass(
+                self._context,
+                int(root_id),
+                _pointer(pass_initial),
+                int(pass_initial.size),
                 _pointer(sequence),
                 int(sequence.size),
             )
             if status != 0:
                 raise RuntimeError(
-                    f"mcts_forest_configure_root failed with status {status}"
+                    "mcts_forest_configure_root_pass failed with status "
+                    f"{status}"
                 )
 
     def _ensure_python_leaf(
@@ -799,22 +953,33 @@ class NativeMCTSForest:
         parent_ids = np.empty(count, dtype=np.int32)
         parent_edges = np.empty(count, dtype=np.int32)
         depths = np.empty(count, dtype=np.int32)
-        status = self._lib.mcts_forest_select_batch(
-            self._context,
-            _pointer(root_ids),
-            count,
-            _pointer(selection_ids),
-            _pointer(leaf_ids),
-            _pointer(parent_ids),
-            _pointer(parent_edges),
-            _pointer(depths),
-        )
+        try:
+            status = self._lib.mcts_forest_select_batch(
+                self._context,
+                _pointer(root_ids),
+                count,
+                _pointer(selection_ids),
+                _pointer(leaf_ids),
+                _pointer(parent_ids),
+                _pointer(parent_edges),
+                _pointer(depths),
+            )
+        except OSError as error:
+            self._poison_and_discard(error)
+            raise
         if status != 0:
-            raise RuntimeError(f"mcts_forest_select_batch failed with status {status}")
-        leaves = [
-            self._ensure_python_leaf(int(leaf), int(parent), int(edge))
-            for leaf, parent, edge in zip(leaf_ids, parent_ids, parent_edges)
-        ]
+            self._raise_native_failure("mcts_forest_select_batch", status)
+        try:
+            leaves = [
+                self._ensure_python_leaf(int(leaf), int(parent), int(edge))
+                for leaf, parent, edge in zip(leaf_ids, parent_ids, parent_edges)
+            ]
+        except Exception as error:
+            # Native selection has already mutated visit/virtual-loss state.
+            # A Python/native mapping mismatch cannot be repaired by traversing
+            # or compacting this context.
+            self._poison_and_discard(error)
+            raise
         return leaves, selection_ids, depths
 
     def sync_expansions(self, nodes) -> None:

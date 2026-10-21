@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.inference.prediction import predict_single_position
 from src.models.data.se_cnn_v9.helpers import (
     ACTION_PLANES,
     ACTION_SIZE,
@@ -529,28 +530,5 @@ class SECNNV9(nn.Module):
         return policy, value, moves_left
 
     def predict(self, board_tensor):
-        """
-        Predict for a single position (used in MCTS)
-        đź†• Handles WDL output and converts to scalar
-        """
-        was_training = self.training
-        if was_training:
-            self.eval()
-        try:
-            with torch.inference_mode():
-                if len(board_tensor.shape) == 3:
-                    board_tensor = board_tensor.unsqueeze(0)
-                policy_logits, value_logits = self.forward(
-                    board_tensor,
-                    apply_log_softmax=False,
-                )
-                
-                # value_logits: (1, 3) -> [Win, Draw, Loss]
-                wdl_probs = F.softmax(value_logits, dim=1)
-                # Scalar: W*1.0 + D*0.0 + L*(-1.0) = W - L
-                value_scalar = wdl_probs[0, 0] - wdl_probs[0, 2]
-                policy_probs = F.softmax(policy_logits, dim=1)
-                return policy_probs.float().cpu().numpy()[0], value_scalar.item()
-        finally:
-            if was_training:
-                self.train()
+        """Return single-position policy probabilities and WDL value scalar."""
+        return predict_single_position(self, board_tensor)

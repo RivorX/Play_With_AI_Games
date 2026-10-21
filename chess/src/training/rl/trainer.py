@@ -30,6 +30,7 @@ from src.mcts.search import (
     _position_counts_from_board,
     _record_position_count,
 )
+from src.mcts.session import SearchSession
 from src.inference.central import RemoteInferenceClient, central_inference_server
 from src.game import backend as chess
 from src.model import config_for_model_spec, create_model, model_spec_from_config
@@ -281,12 +282,19 @@ def _task_gradient_probe(policy_objective, value_objective, model):
 
 
 def _snapshot_state_dict_cpu_shared(model):
-    snapshot = {}
-    for key, tensor in model.state_dict().items():
-        cpu_tensor = tensor.detach().to(device="cpu", copy=True).contiguous()
-        cpu_tensor.share_memory_()
-        snapshot[key] = cpu_tensor
-    return snapshot
+    from src.inference.cuda_graph_forward import cuda_model_setup_lock
+
+    try:
+        model_device = next(model.parameters()).device
+    except (AttributeError, StopIteration, TypeError):
+        model_device = torch.device("cpu")
+    with cuda_model_setup_lock(model_device):
+        snapshot = {}
+        for key, tensor in model.state_dict().items():
+            cpu_tensor = tensor.detach().to(device="cpu", copy=True).contiguous()
+            cpu_tensor.share_memory_()
+            snapshot[key] = cpu_tensor
+        return snapshot
 
 
 def _eval_uses_central_inference(config, device):
@@ -1050,16 +1058,6 @@ def _evaluate_single_game_no_mcts(
     return result, (result == "*")
 
 
-def _advance_eval_root(root, move):
-    if root is None:
-        return None, False
-    child = root.get_child_for_move(move)
-    if child is None:
-        return None, False
-    _ = child.board
-    return child.detach_as_root(), True
-
-
 def _evaluate_games_batched(
     model1,
     model2,
@@ -1215,10 +1213,12 @@ def _evaluate_games_batched(
             "position_history_complete": True,
             "move_count": int(move_count),
             "model1_as_white": bool(int(game_idx) % 2 == 0),
-            "model1_root": None,
-            "model1_synced": False,
-            "model2_root": None,
-            "model2_synced": False,
+            "model1_session": (
+                SearchSession(mcts1, tree_key=object()) if mcts1 is not None else None
+            ),
+            "model2_session": (
+                SearchSession(mcts2, tree_key=object()) if mcts2 is not None else None
+            ),
             "done": bool(
                 _eval_game_is_over(board, config)
                 or _eval_ply_cap_reached(move_count, max_moves)
@@ -1234,10 +1234,11 @@ def _evaluate_games_batched(
 
     def _finish_game(gs):
         nonlocal wins, draws, losses, unresolved, completed
-        native_tree_key = gs.get("_native_tree_key", id(gs["board"]))
-        for mcts in (mcts1, mcts2):
-            if mcts is not None:
-                mcts.release_native_tree(native_tree_key)
+        for key in ("model1_session", "model2_session"):
+            session = gs.get(key)
+            if session is not None:
+                session.close()
+                gs[key] = None
         board = gs["board"]
         if bool(gs.get("auto_claim_draw", False)):
             result = "1/2-1/2"
@@ -1324,33 +1325,42 @@ def _evaluate_games_batched(
 
         moves_by_index = {}
 
-        def _run_group(indices, model, search_config, mcts, sims, root_key, synced_key, history_key, profile_prefix):
+        def _run_group(
+            indices, model, search_config, mcts, sims, session_key, history_key,
+            profile_prefix,
+        ):
             nonlocal runtime_nn_batches, runtime_search_batches
             if not indices:
                 return
             group_states = []
             for idx in indices:
                 gs = active_games[idx]
-                # Use the named search-state contract. The former positional
-                # list had accumulated two obsolete fields before the native
-                # tree key, while MCTS still read that key at index 7. Every
-                # game consequently appeared under the key ``False`` and the
-                # persistent forest mixed roots from independent games.
-                group_states.append({
-                    "board": gs["board"],
-                    "root": gs.get(root_key),
-                    "_root_synced": bool(gs.get(synced_key, False)),
-                    "board_history": gs[history_key],
-                    "position_counts": gs.get("position_counts"),
-                    "position_history_complete": gs.get(
-                        "position_history_complete", True
-                    ),
-                    "simulation_budget_override": None,
-                    "_native_tree_key": gs.setdefault(
-                        "_native_tree_key",
-                        id(gs["board"]),
-                    ),
-                })
+                board_history = gs[history_key]
+                position_counts = gs.get("position_counts")
+                repetition_known = bool(
+                    gs.get("position_history_complete", True)
+                )
+                if mcts is not None:
+                    session = gs.get(session_key)
+                    if session is None:
+                        raise RuntimeError(
+                            f"Missing search session {session_key!r} for active evaluation game"
+                        )
+                    state = session.make_state(
+                        gs["board"],
+                        board_history=board_history,
+                        position_counts=position_counts,
+                        repetition_known=repetition_known,
+                        simulation_budget_override=None,
+                    )
+                else:
+                    state = {
+                        "board": gs["board"],
+                        "board_history": board_history,
+                        "position_counts": position_counts,
+                        "position_history_complete": repetition_known,
+                    }
+                group_states.append(state)
             _emit_runtime_progress(
                 force=(runtime_nn_batches + runtime_search_batches == 0),
                 activity="mcts_search" if mcts is not None else "nn_forward",
@@ -1389,19 +1399,19 @@ def _evaluate_games_batched(
 
             for idx, local_state, move in zip(indices, group_states, moves):
                 gs = active_games[idx]
-                gs[root_key] = local_state.get("root")
-                gs[synced_key] = bool(local_state.get("_root_synced", False))
+                if mcts is not None:
+                    gs[session_key].commit(local_state)
                 moves_by_index[idx] = move
 
         _run_group(
             model1_indices, model1, model1_search_config, mcts1, sims1,
-            "model1_root", "model1_synced", "model1_board_history", "model1",
+            "model1_session", "model1_board_history", "model1",
         )
         if _eval_stop_requested(stop_event):
             break
         _run_group(
             model2_indices, model2, model2_search_config, mcts2, sims2,
-            "model2_root", "model2_synced", "model2_board_history", "model2",
+            "model2_session", "model2_board_history", "model2",
         )
         if _eval_stop_requested(stop_event):
             break
@@ -1434,12 +1444,24 @@ def _evaluate_games_batched(
                     repetition_count=repetition_count,
                     max_history_positions=max_history_positions,
                 )
-            gs["model1_root"], gs["model1_synced"] = _advance_eval_root(gs.get("model1_root"), move)
-            gs["model2_root"], gs["model2_synced"] = _advance_eval_root(gs.get("model2_root"), move)
             chess.apply_move(board, move)
             gs["move_count"] += 1
             runtime_plies_processed += 1
             _record_position_count(gs["position_counts"], board)
+            repetition_known = bool(gs.get("position_history_complete", True))
+            for session_key, history_key in (
+                ("model1_session", "model1_board_history"),
+                ("model2_session", "model2_board_history"),
+            ):
+                session = gs.get(session_key)
+                if session is not None:
+                    session.advance(
+                        move,
+                        board=board,
+                        board_history=gs[history_key],
+                        position_counts=gs["position_counts"],
+                        repetition_known=repetition_known,
+                    )
 
             if (
                 _eval_game_is_over(board, config)
@@ -1457,6 +1479,13 @@ def _evaluate_games_batched(
         active_games = next_active
         _fill_active()
         _emit_runtime_progress()
+
+    for gs in active_games:
+        for session_key in ("model1_session", "model2_session"):
+            session = gs.get(session_key)
+            if session is not None:
+                session.close()
+                gs[session_key] = None
 
     stats = _build_eval_stats(wins, draws, losses, unresolved, len(game_indices))
     stats["completed"] = int(completed)
@@ -2618,7 +2647,8 @@ def _evaluate_models_with_central_inference(
         if owns_runtime:
             _close_eval_central_runtime(runtime)
             if (
-                (
+                isinstance(runtime, dict)
+                and (
                     bool(runtime.get("profile_forward_shapes", False))
                     or bool(runtime.get("profile_cuda_graphs", False))
                 )

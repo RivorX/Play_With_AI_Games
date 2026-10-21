@@ -20,6 +20,31 @@ from typing import Any, Iterable
 
 import torch
 
+from src.inference.prediction import predict_raw
+
+
+_DEVICE_SETUP_LOCKS_GUARD = threading.Lock()
+_DEVICE_SETUP_LOCKS: dict[tuple[str, int | None], threading.RLock] = {}
+
+
+def cuda_model_setup_lock(device: torch.device | str):
+    """Return a process-local lock for CUDA model snapshot/capture setup.
+
+    CUDA graph capture and copying live model weights to CPU both enqueue work
+    against the same model/device. Serializing those setup operations prevents
+    an otherwise unrelated state-dict snapshot from invalidating a concurrent
+    graph capture. Ordinary graph replays do not take this lock.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return nullcontext()
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device() if torch.cuda.is_available() else 0
+    key = (device.type, int(index))
+    with _DEVICE_SETUP_LOCKS_GUARD:
+        return _DEVICE_SETUP_LOCKS.setdefault(key, threading.RLock())
+
 
 @dataclass
 class _GraphEntry:
@@ -177,7 +202,8 @@ class CUDAGraphForwardRunner:
                         inputs,
                         self._stats["last_fallback_reason"] or "memory_guard",
                     )
-                entry = self._capture_entry(key, actual_batch, inputs)
+                with cuda_model_setup_lock(self.device):
+                    entry = self._capture_entry(key, actual_batch, inputs)
                 if entry is None:
                     return self._fallback(inputs, self._stats["last_fallback_reason"] or "capture_failed")
                 self._entries[key] = entry
@@ -217,28 +243,14 @@ class CUDAGraphForwardRunner:
             return "model_not_on_runner_device"
         return None
 
-    def _autocast(self, device_type: str):
-        if self.use_amp and device_type == "cuda":
-            dtype = self.amp_dtype or torch.float16
-            return torch.autocast(
-                device_type="cuda",
-                dtype=dtype,
-                enabled=True,
-                cache_enabled=False,
-            )
-        return nullcontext()
-
     def _forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        with torch.inference_mode(), self._autocast(inputs.device.type):
-            outputs = self.model(inputs, apply_log_softmax=False)
-        if not isinstance(outputs, (tuple, list)) or len(outputs) < 2:
-            raise TypeError("model forward must return at least (policy_logits, value_logits)")
-        policy, value = outputs[0], outputs[1]
-        if not isinstance(policy, torch.Tensor) or not isinstance(value, torch.Tensor):
-            raise TypeError("model forward policy and value outputs must be tensors")
-        if policy.shape[0] != inputs.shape[0] or value.shape[0] != inputs.shape[0]:
-            raise ValueError("model forward output batch does not match input batch")
-        return policy, value
+        return predict_raw(
+            self.model,
+            inputs,
+            use_amp=self.use_amp,
+            amp_dtype=self.amp_dtype,
+            amp_cache_enabled=False,
+        )
 
     def _fallback(self, inputs: torch.Tensor, reason: str) -> tuple[torch.Tensor, torch.Tensor]:
         self._stats["eager_fallbacks"] += 1
@@ -310,11 +322,13 @@ class CUDAGraphForwardRunner:
             free_before, _ = torch.cuda.mem_get_info(self.device)
 
             with torch.cuda.graph(graph, stream=replay_stream):
-                with torch.inference_mode(), self._autocast("cuda"):
-                    static_policy, static_value = self.model(
-                        static_input,
-                        apply_log_softmax=False,
-                    )
+                static_policy, static_value = predict_raw(
+                    self.model,
+                    static_input,
+                    use_amp=self.use_amp,
+                    amp_dtype=self.amp_dtype,
+                    amp_cache_enabled=False,
+                )
                 if not isinstance(static_policy, torch.Tensor) or not isinstance(static_value, torch.Tensor):
                     raise TypeError("model graph forward must return policy and value tensors")
                 if static_policy.shape[0] != batch_size or static_value.shape[0] != batch_size:

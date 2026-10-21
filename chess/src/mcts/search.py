@@ -5,15 +5,19 @@ used below the root and for replay targets.
 """
 
 import errno
+import hashlib
 import logging
 import math
 import os
 import shutil
 import struct
 import tempfile
+import threading
 import time
 import weakref
+import zlib
 from collections import OrderedDict
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -21,6 +25,11 @@ import numpy as np
 import torch
 
 from src.common.syzygy import resolve_syzygy_paths, syzygy_piece_counts
+from src.inference.prediction import (
+    copy_compact_policy_value_to_cpu,
+    predict_raw,
+    value_logits_to_scalar,
+)
 from src.game import backend as chess
 from src.common.torch_cache import configure_torch_compile_cache, torch_compile_cache_paths
 from src.models.data.se_cnn_v9.helpers import (
@@ -738,6 +747,69 @@ def _gumbel_initial_round_visits(considered_actions, num_simulations):
     return max(1, simulations // max(1, rounds * considered))
 
 
+def _gumbel_revisiting_pass_budgets(action_budget, considered_actions, max_passes=3):
+    """Split a Gumbel root budget into bounded, complete re-ranking passes.
+
+    Each pass gets enough selections to complete one visit-count layer for
+    every Sequential-Halving stage at the resolved width. The candidate width
+    is resolved once from the full action budget; revisits do not silently
+    shrink the root shortlist. Any remainder is distributed across the first
+    passes, and the returned budgets sum exactly to ``action_budget``.
+    """
+    budget = max(0, int(action_budget))
+    width = max(1, int(considered_actions))
+    if budget <= 0:
+        return ()
+    if width <= 1:
+        return (budget,)
+
+    halving_stages = max(1, int(math.ceil(math.log2(width))))
+    minimum_pass_budget = max(1, width * halving_stages)
+    pass_count = min(
+        max(1, int(max_passes)),
+        max(1, budget // minimum_pass_budget),
+    )
+    base, remainder = divmod(budget, pass_count)
+    return tuple(
+        int(base + (1 if pass_index < remainder else 0))
+        for pass_index in range(pass_count)
+    )
+
+
+def _gumbel_revisiting_feedback_boundaries(considered_actions, num_simulations):
+    """Return visit offsets where Sequential Halving actually removes actions.
+
+    Batches may cross repeated visit-count layers while the candidate width is
+    fixed. They must end at each real width reduction so the next stage sees
+    the completed evidence. Once the schedule reaches two actions, it no
+    longer halves; the remaining pass can run in ordinary batches.
+    """
+    action_count = max(1, int(considered_actions))
+    simulation_count = max(0, int(num_simulations))
+    if action_count <= 2 or simulation_count <= 0:
+        return ()
+
+    log2_actions = int(math.ceil(math.log2(action_count)))
+    considered = action_count
+    scheduled = 0
+    boundaries = []
+    while scheduled < simulation_count:
+        extra_visits = max(
+            1,
+            int(simulation_count / (log2_actions * considered)),
+        )
+        stage_end = min(
+            simulation_count,
+            scheduled + extra_visits * considered,
+        )
+        next_considered = max(2, considered // 2)
+        if next_considered < considered and stage_end < simulation_count:
+            boundaries.append(int(stage_end))
+        scheduled = stage_end
+        considered = next_considered
+    return tuple(boundaries)
+
+
 def _replay_source_code(learner_turn, game_opponent_mcts, opponent_label):
     if learner_turn or game_opponent_mcts is None:
         return _REPLAY_SOURCE_LEARNER
@@ -1420,6 +1492,151 @@ def _board_tree_reuse_key(board):
     return chess.position_key(board)
 
 
+def _board_tree_reuse_identity(board):
+    """Return exact board/rule identity for reuse validation, not a hash alone."""
+    return (
+        _board_position_key(board),
+        int(board.halfmove_clock),
+        int(board.fullmove_number),
+    )
+
+
+def _canonical_context_value(value):
+    """Freeze plain model/input metadata into deterministic comparable tuples."""
+    if value is None or isinstance(value, (str, int, bool, bytes)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, dict):
+        try:
+            return tuple(sorted(
+                (
+                    _canonical_context_value(key),
+                    _canonical_context_value(item),
+                )
+                for key, item in value.items()
+            ))
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, (list, tuple)):
+        return tuple(_canonical_context_value(item) for item in value)
+    return (type(value).__module__, type(value).__qualname__, repr(value))
+
+
+def _canonical_position_counts(position_counts):
+    """Canonicalize exact repetition provenance for a single live root."""
+    if not isinstance(position_counts, dict):
+        return None
+    if len(position_counts) > 0xFFFFFFFF:
+        return None
+    items = []
+    for key, count in position_counts.items():
+        # Position keys are fixed-width exact encodings from
+        # ``_board_position_key``. Do not call ``bytes(int)`` here: Python
+        # interprets an integer as a requested allocation length, and native
+        # board hashes may be large enough to raise MemoryError.
+        if (
+            not isinstance(key, (bytes, bytearray, memoryview))
+            or isinstance(count, (bool, np.bool_))
+            or not isinstance(count, (int, np.integer))
+        ):
+            return None
+        try:
+            key_bytes = bytes(key)
+            count_value = int(count)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not key_bytes or count_value <= 0 or count_value > 0xFFFFFFFF:
+            return None
+        items.append((key_bytes, count_value))
+    items.sort(key=lambda item: item[0])
+    return tuple(items)
+
+
+def _history_tensor_context_digest(tensor):
+    """Digest an exact encoded history frame including shape and dtype."""
+    array = np.ascontiguousarray(np.asarray(tensor))
+    digest = hashlib.blake2b(digest_size=32)
+    digest.update(array.dtype.str.encode('ascii'))
+    digest.update(struct.pack('<I', array.ndim))
+    for dimension in array.shape:
+        digest.update(struct.pack('<Q', int(dimension)))
+    digest.update(array.tobytes(order='C'))
+    return digest.digest()
+
+
+@dataclass(frozen=True)
+class _RootReuseContext:
+    """Immutable provenance for one root's NN inputs and chess rule context.
+
+    ``history_frames`` stores both POVs for the exact encoded frames used by
+    the root.  It is one bounded root-level tuple, not a per-node history map.
+    ``current_frame`` lets a selected child derive its expected next-root
+    history before ``detach_as_root`` drops the parent link.  A derived child
+    leaves that field unset until its observed input context is validated.
+    """
+
+    board_identity: tuple
+    history_frames: tuple
+    current_frame: tuple | None
+    history_positions: int
+    position_counts: tuple
+    repetition_known: bool
+    input_contract: tuple
+    evaluation_generation: tuple
+
+    def matches(self, observed):
+        if not isinstance(observed, _RootReuseContext):
+            return False
+        if (
+            self.board_identity != observed.board_identity
+            or self.history_frames != observed.history_frames
+            or self.history_positions != observed.history_positions
+            or self.position_counts != observed.position_counts
+            or self.repetition_known != observed.repetition_known
+            or self.input_contract != observed.input_contract
+            or self.evaluation_generation != observed.evaluation_generation
+        ):
+            return False
+        # A just-promoted child has all of its expected input provenance, but
+        # its own frame is filled only after the caller-provided context agrees.
+        return self.current_frame is None or self.current_frame == observed.current_frame
+
+    def with_observed_frame(self, observed):
+        if not self.matches(observed):
+            return None
+        return observed
+
+    def advance_to_child(self, child_board):
+        """Derive the exact expected context after one actual tree edge."""
+        if (
+            not self.repetition_known
+            or not self.position_counts
+            or (self.history_positions > 0 and self.current_frame is None)
+        ):
+            return None
+
+        counts = dict(self.position_counts)
+        child_position_key = _board_position_key(child_board)
+        counts[child_position_key] = int(counts.get(child_position_key, 0)) + 1
+        next_history = self.history_frames
+        if self.history_positions:
+            next_history = (next_history + (self.current_frame,))[-self.history_positions:]
+            padding = self.history_positions - len(next_history)
+            if padding:
+                # The leading entries are already represented by the exact
+                # padding-frame digest stored in the prior root anchor.
+                next_history = self.history_frames[:padding] + next_history
+
+        return replace(
+            self,
+            board_identity=_board_tree_reuse_identity(child_board),
+            history_frames=next_history,
+            current_frame=None,
+            position_counts=tuple(sorted(counts.items(), key=lambda item: item[0])),
+        )
+
+
 def _position_counts_from_board(board):
     """Rebuild repetition counts when a caller supplies a board with a stack."""
     moves = list(chess.move_history(board))
@@ -1814,6 +2031,7 @@ class MCTSNode:
         "_legal_indices",
         "terminal_value",
         "raw_value",
+        "_reuse_context_anchor",
         "__weakref__",
     )
 
@@ -1839,6 +2057,7 @@ class MCTSNode:
         self._legal_indices = None
         self.terminal_value = None
         self.raw_value = None
+        self._reuse_context_anchor = None
 
     @property
     def parent(self):
@@ -1867,8 +2086,15 @@ class MCTSNode:
         if self._board is None and self.parent is not None:
             _ = self.board
         if self._has_parent_edge():
+            parent = self.parent
+            parent_context = getattr(parent, "_reuse_context_anchor", None)
+            self._reuse_context_anchor = (
+                parent_context.advance_to_child(self.board)
+                if isinstance(parent_context, _RootReuseContext)
+                else None
+            )
             idx = int(self.parent_edge_index)
-            edges = self.parent.edges
+            edges = parent.edges
             self._root_visit_count = int(edges.visit_counts[idx])
             self._root_value_sum = float(edges.value_sums[idx])
             self._root_virtual_loss = 0
@@ -2296,8 +2522,17 @@ class MultiGameBatchMCTS:
     leaf evaluations across all games for higher GPU utilization.
     """
 
-    def __init__(self, model, config, device):
+    def __init__(
+        self,
+        model,
+        config,
+        device,
+        *,
+        local_cuda_graph_forward=None,
+        local_cuda_graph_exact_batch_sizes=(1, 2, 3, 4, 5, 6, 8, 16),
+    ):
         self.model = model
+        self._search_context_invalidation_epoch = 0
         model_spec = getattr(model, 'model_spec', None)
         if isinstance(model_spec, dict):
             # Search inputs are part of the checkpoint contract. In matches
@@ -2308,6 +2543,26 @@ class MultiGameBatchMCTS:
             config = config_for_model_spec(config, model_spec)
         self.config = config
         self.device = device
+        if local_cuda_graph_forward is None:
+            local_cuda_graph_forward = (config.get('reinforcement_learning', {}) or {}).get(
+                'mcts_local_cuda_graph_forward'
+            )
+        if local_cuda_graph_forward is not None and type(local_cuda_graph_forward) is not bool:
+            raise ValueError('local_cuda_graph_forward must be null, false, or true')
+        # Auto changes only the forward execution of the measured one-root B
+        # path. False is a shared config opt-out; True keeps explicit opt-in
+        # available for other local models and search modes.
+        self._local_cuda_graph_forward_configured = local_cuda_graph_forward
+        self._local_cuda_graph_forward_enabled = local_cuda_graph_forward is not False
+        self._local_cuda_graph_exact_batch_sizes = tuple(sorted({
+            int(size)
+            for size in local_cuda_graph_exact_batch_sizes
+            if int(size) > 0
+        }))
+        self._local_cuda_graph_forward_runner = None
+        self._local_cuda_graph_forward_generation = None
+        self._local_cuda_graph_forward_lock = threading.Lock()
+        self._local_cuda_graph_forward_context = threading.local()
         model_cfg = config.get('model', {}) or {}
         input_spec = (
             (model_spec or {}).get('input_spec', {})
@@ -2318,6 +2573,16 @@ class MultiGameBatchMCTS:
             input_spec.get('encoder_id')
             or getattr(model, 'input_encoder_id', None)
             or model_cfg.get('input_encoder_id', 'planes_history_v1')
+        )
+        policy_spec = (
+            (model_spec or {}).get('policy_spec', {})
+            if isinstance(model_spec, dict)
+            else {}
+        ) or {}
+        self.policy_codec_id = str(
+            policy_spec.get('codec_id')
+            or getattr(model, 'policy_codec_id', None)
+            or model_cfg.get('policy_codec_id', 'lc0_1858_v1')
         )
         self.input_encoder = get_input_encoder(self.input_encoder_id)
         # V10 always has a path-sensitive 13/20-plane layout. Whether the
@@ -2336,6 +2601,12 @@ class MultiGameBatchMCTS:
             and self.repetition_plane_mode == 'exact'
         )
         rl_cfg = config['reinforcement_learning']
+        algorithm = str(rl_cfg.get('mcts_algorithm', 'gumbel')).strip().lower()
+        if algorithm != 'gumbel':
+            raise ValueError(
+                "reinforcement_learning.search.algorithm must be 'gumbel'"
+            )
+        self.mcts_algorithm = 'gumbel'
         (
             self.policy_target_mode,
             self.challenge_delta_prior_fraction,
@@ -2345,6 +2616,22 @@ class MultiGameBatchMCTS:
             1,
             int(rl_cfg.get('mcts_gumbel_max_considered_actions', 16)),
         )
+        self.gumbel_root_schedule = str(
+            rl_cfg.get('mcts_gumbel_root_schedule', 'standard')
+        ).strip().lower()
+        if self.gumbel_root_schedule not in {'standard', 'revisiting'}:
+            raise ValueError(
+                "reinforcement_learning.mcts_gumbel_root_schedule must be "
+                "'standard' or 'revisiting'"
+            )
+        self.gumbel_reuse_q_scale = str(
+            rl_cfg.get('mcts_gumbel_reuse_q_scale', 'fresh')
+        ).strip().lower()
+        if self.gumbel_reuse_q_scale not in {'fresh', 'total'}:
+            raise ValueError(
+                "reinforcement_learning.search.gumbel_reuse_q_scale must be "
+                "'fresh' or 'total'"
+            )
         self.gumbel_scale = max(0.0, float(rl_cfg.get('mcts_gumbel_scale', 1.0)))
         self.gumbel_eval_scale = max(0.0, float(rl_cfg.get('mcts_gumbel_eval_scale', 0.0)))
         self.gumbel_c_visit = max(0.0, float(rl_cfg.get('mcts_gumbel_c_visit', 100.0)))
@@ -2360,7 +2647,6 @@ class MultiGameBatchMCTS:
         self.gumbel_use_mixed_value = bool(
             rl_cfg.get('mcts_gumbel_use_mixed_value', True)
         )
-
         self.dynamic_budget_enabled = bool(
             config['reinforcement_learning'].get('mcts_dynamic_budget_enabled', False)
         )
@@ -2635,6 +2921,444 @@ class MultiGameBatchMCTS:
             'central_inference_server_output_pipeline_requests': 0,
             'central_inference_server_auto_calibrated_requests': 0,
         }
+
+    def _evaluation_generation_token(self):
+        """Return a stable evaluator generation token for this search call.
+
+        Remote inference exposes a server epoch so a long-lived proxy notices
+        model reloads without a per-leaf RPC. Local eager modules use tensor
+        identity/version counters. Unknown local callables can still search,
+        but cannot safely reuse a root.
+        """
+        model = self.model
+        invalidation_epoch = int(
+            getattr(self, '_search_context_invalidation_epoch', 0)
+        )
+        getter = getattr(model, 'get_evaluation_generation', None)
+        if callable(getter):
+            try:
+                generation = getter()
+            except Exception:
+                return None
+            frozen = _canonical_context_value(generation)
+            if generation is None or frozen is None:
+                return None
+            return ('remote', invalidation_epoch, frozen)
+
+        if bool(getattr(model, 'supports_remote_legal_gather', False)):
+            return None
+        if not isinstance(model, torch.nn.Module):
+            return None
+        try:
+            # Training mode disables tree reuse below, but remains observable
+            # so a local search can reject a train/eval transition that occurs
+            # while its batched evaluations are in flight.
+            training_modes = tuple(
+                (str(name), bool(module.training))
+                for name, module in model.named_modules()
+            )
+            tensors = []
+            for kind, named_tensors in (
+                ('p', model.named_parameters()),
+                ('b', model.named_buffers()),
+            ):
+                for name, tensor in named_tensors:
+                    version = getattr(tensor, '_version', None)
+                    if version is None:
+                        return None
+                    tensors.append((
+                        kind,
+                        str(name),
+                        id(tensor),
+                        int(tensor.data_ptr()),
+                        int(version),
+                        tuple(int(dim) for dim in tensor.shape),
+                        str(tensor.dtype),
+                        str(tensor.device),
+                    ))
+            if not tensors:
+                return None
+            return (
+                'local',
+                invalidation_epoch,
+                id(model),
+                type(model).__module__,
+                type(model).__qualname__,
+                _canonical_context_value(getattr(model, 'model_spec', None)),
+                training_modes,
+                tuple(tensors),
+            )
+        except Exception:
+            return None
+
+    def _local_cuda_graph_auto_eligible(self, original_game_count, native_forest):
+        """Limit automatic graphs to the verified native one-root B contract."""
+        if (
+            original_game_count != 1
+            or self.gumbel_root_schedule != 'revisiting'
+            or native_forest is None
+            or not native_forest.active
+        ):
+            return False
+        from src.models.architecture.se_cnn_v9 import SECNNV9
+        from src.models.architecture.nested_cnn_v10 import NestedCNNV10
+
+        # Unknown wrappers/subclasses may change forward semantics. They can
+        # still opt in explicitly, but never enter automatic graph capture.
+        return type(self.model) in (SECNNV9, NestedCNNV10)
+
+    def _prepare_local_cuda_graph_forward(self, evaluation_generation, *, auto_eligible=False):
+        """Select a stable local forward runner once per search, never per leaf.
+
+        Graphs are only considered for an eval-mode local ``nn.Module`` with
+        a stable generation token. Remote, training, and unknown evaluators
+        stay on their existing eager/transport path.
+        """
+        context = self._local_cuda_graph_forward_context
+        context.runner = None
+        eligible = not (
+            not self._local_cuda_graph_forward_enabled
+            or (self._local_cuda_graph_forward_configured is None and not auto_eligible)
+            or self.device.type != 'cuda'
+            or not torch.cuda.is_available()
+            or evaluation_generation is None
+            or not isinstance(self.model, torch.nn.Module)
+            or bool(getattr(self.model, 'supports_remote_legal_gather', False))
+            or any(bool(module.training) for module in self.model.modules())
+        )
+        if not eligible:
+            # A prior stable eval generation must not retain graph pools after
+            # the model becomes mutable, remote, or otherwise ineligible.
+            with self._local_cuda_graph_forward_lock:
+                old_runner = self._local_cuda_graph_forward_runner
+                if old_runner is not None:
+                    old_runner.clear()
+                self._local_cuda_graph_forward_runner = None
+                self._local_cuda_graph_forward_generation = None
+            return
+
+        with self._local_cuda_graph_forward_lock:
+            if self._local_cuda_graph_forward_generation != evaluation_generation:
+                old_runner = self._local_cuda_graph_forward_runner
+                if old_runner is not None:
+                    old_runner.clear()
+                self._local_cuda_graph_forward_runner = None
+                self._local_cuda_graph_forward_generation = evaluation_generation
+                try:
+                    from src.inference.cuda_graph_forward import CUDAGraphForwardRunner
+
+                    self._local_cuda_graph_forward_runner = CUDAGraphForwardRunner(
+                        self.model,
+                        self.device,
+                        use_amp=self.use_amp,
+                        amp_dtype=self.amp_dtype,
+                        exact_batch_sizes=self._local_cuda_graph_exact_batch_sizes,
+                        min_capture_observations=2,
+                        max_entries=len(self._local_cuda_graph_exact_batch_sizes),
+                        max_graph_memory_fraction=0.04,
+                        min_free_memory_bytes=512 * 1024 * 1024,
+                        warmup_iterations=3,
+                    )
+                except Exception:
+                    # Optional acceleration must never prevent ordinary search.
+                    self._local_cuda_graph_forward_runner = None
+            context.runner = self._local_cuda_graph_forward_runner
+
+    def _local_model_forward(self, inputs, model_kwargs):
+        """Run the unchanged raw model contract, optionally through local graphs.
+
+        Returns ``(policy, value, used_runner)``. The third value lets callers
+        avoid reading a stale compact-policy flag after a graph replay.
+        """
+        context = getattr(self, '_local_cuda_graph_forward_context', None)
+        runner = getattr(context, 'runner', None) if context is not None else None
+        raw_graph_call = model_kwargs == {'apply_log_softmax': False}
+        policy, value = predict_raw(
+            self.model,
+            inputs,
+            use_amp=self.use_amp,
+            amp_dtype=self.amp_dtype,
+            graph_runner=runner if raw_graph_call else None,
+            model_kwargs=model_kwargs,
+        )
+        return policy, value, bool(runner is not None and raw_graph_call)
+
+    def _local_cuda_readback_buffers(self, batch_size, legal_width, device):
+        """Return thread-local pinned outputs and one reusable transfer event."""
+        device = torch.device(device)
+        device_key = str(device)
+        batch_size = int(batch_size)
+        legal_width = int(legal_width)
+        policy_elements = batch_size * legal_width
+        context = self._local_cuda_graph_forward_context
+        scratch = getattr(context, 'mcts_readback_scratch', None)
+        if (
+            scratch is not None
+            and scratch['device'] == device_key
+            and scratch['policy_capacity_elements'] >= policy_elements
+            and scratch['value_capacity'] >= batch_size
+        ):
+            return (
+                scratch['policy_storage'][:policy_elements].view(
+                    batch_size,
+                    legal_width,
+                ),
+                scratch['values_storage'][:batch_size],
+                scratch['event'],
+            )
+
+        previous = scratch if scratch is not None and scratch['device'] == device_key else None
+        graph_batch_capacity = max(
+            self._local_cuda_graph_exact_batch_sizes,
+            default=1,
+        )
+        policy_capacity_elements = max(
+            policy_elements,
+            graph_batch_capacity * int(MAX_LEGAL_MOVES),
+            int(previous['policy_capacity_elements']) if previous is not None else 0,
+        )
+        value_capacity = max(
+            batch_size,
+            graph_batch_capacity,
+            int(previous['value_capacity']) if previous is not None else 0,
+        )
+        with torch.cuda.device(device):
+            if (
+                previous is not None
+                and previous['policy_capacity_elements'] >= policy_capacity_elements
+            ):
+                policy_storage = previous['policy_storage']
+            else:
+                policy_storage = torch.empty(
+                    (policy_capacity_elements,),
+                    dtype=torch.float16,
+                    pin_memory=True,
+                )
+            if previous is not None and previous['value_capacity'] >= value_capacity:
+                values_storage = previous['values_storage']
+            else:
+                values_storage = torch.empty(
+                    (value_capacity,),
+                    dtype=torch.float32,
+                    pin_memory=True,
+                )
+            transfer_event = (
+                previous['event']
+                if previous is not None
+                else torch.cuda.Event(blocking=False)
+            )
+        context.mcts_readback_scratch = {
+            'device': device_key,
+            'policy_capacity_elements': policy_capacity_elements,
+            'value_capacity': value_capacity,
+            'policy_storage': policy_storage,
+            'values_storage': values_storage,
+            'event': transfer_event,
+        }
+        return (
+            policy_storage[:policy_elements].view(batch_size, legal_width),
+            values_storage[:batch_size],
+            transfer_event,
+        )
+
+    @property
+    def local_cuda_graph_forward_stats(self):
+        """Expose bounded runner counters for opt-in profiling harnesses."""
+        runner = self._local_cuda_graph_forward_runner
+        if runner is None:
+            return {
+                'enabled': self._local_cuda_graph_forward_enabled,
+                'configured': self._local_cuda_graph_forward_configured,
+                'active': False,
+                'entries': 0,
+                'captures': 0,
+                'replays': 0,
+                'eager_fallbacks': 0,
+                'last_fallback_reason': 'not_initialized',
+            }
+        return {
+            'enabled': True,
+            'configured': self._local_cuda_graph_forward_configured,
+            'active': getattr(self._local_cuda_graph_forward_context, 'runner', None) is runner,
+            **runner.stats,
+        }
+
+    def clear_local_cuda_graph_forward(self):
+        """Release captured graphs before unloading or replacing a local model."""
+        with self._local_cuda_graph_forward_lock:
+            runner = self._local_cuda_graph_forward_runner
+            if runner is not None:
+                runner.clear()
+            self._local_cuda_graph_forward_runner = None
+            self._local_cuda_graph_forward_generation = None
+            self._local_cuda_graph_forward_context.runner = None
+            self._local_cuda_graph_forward_context.mcts_readback_scratch = None
+
+    def invalidate_search_context(self):
+        """Invalidate root reuse after custom or opaque weight mutation.
+
+        Standard local ``load_state_dict``/``copy_`` and optimizer updates are
+        detected by tensor versions; call this after writes such as
+        ``parameter.data.copy_(...)`` that bypass those counters.
+        """
+        self._search_context_invalidation_epoch = int(
+            getattr(self, '_search_context_invalidation_epoch', 0)
+        ) + 1
+        if hasattr(self, '_local_cuda_graph_forward_lock'):
+            self.clear_local_cuda_graph_forward()
+
+    def _root_reuse_input_contract(self):
+        return (
+            self.input_encoder_id,
+            self.policy_codec_id,
+            int(self.history_positions),
+            int(self._input_planes),
+            int(self._current_planes),
+            int(self._history_frame_planes),
+            str(np.dtype(self.input_storage_dtype)),
+            str(np.dtype(self.history_storage_dtype)),
+            bool(self._path_dependent_repetition),
+            bool(self._encode_exact_repetition),
+            str(self.repetition_plane_mode),
+            bool(self.use_amp),
+            str(self.amp_dtype),
+            str(self.device),
+            _canonical_context_value(getattr(self.model, 'model_spec', None)),
+            bool(self.tactical_priors_enabled),
+            float(self.tactical_capture_bonus),
+            float(self.tactical_winning_capture_bonus),
+            float(self.tactical_check_bonus),
+            float(self.tactical_promotion_bonus),
+            float(self.tactical_recapture_bonus),
+        )
+
+    def _history_pair_context_digest(self, entry, *, repetition_count=None):
+        encoded = self._encode_history_entry(
+            entry,
+            repetition_count=repetition_count,
+        )
+        return (
+            self._history_context_frame_digest(encoded[0]),
+            self._history_context_frame_digest(encoded[1]),
+        )
+
+    def _history_context_frame_digest(self, tensor):
+        """Hash a history frame after the same cast used for model input."""
+        # Provenance must describe the values that actually reach the model,
+        # not the caller's temporary storage dtype. Elo may retain FP32
+        # history pairs while GPU/central search transports them as FP16; the
+        # batch builder casts both representations to input_storage_dtype.
+        # Hashing before that cast falsely rejects otherwise identical roots.
+        frame = self._history_frame_for_model(tensor)
+        frame = np.asarray(frame, dtype=np.dtype(self.input_storage_dtype))
+        return _history_tensor_context_digest(frame)
+
+    def _model_is_training_for_reuse(self):
+        """Return whether evaluator training mode makes root reuse unsafe.
+
+        Local ``nn.Module`` trees need every submodule checked because a child
+        can remain in training mode even when its parent flag is false. Remote
+        inference proxies are intentionally not modules; their explicit
+        ``training`` property is the mode contract. Unknown evaluators fail
+        closed for reuse without affecting whether they can run a search.
+        """
+        model = self.model
+        if isinstance(model, torch.nn.Module):
+            return any(module.training for module in model.modules())
+        training = getattr(model, 'training', None)
+        return True if training is None else bool(training)
+
+    def _build_root_reuse_context(
+        self,
+        board,
+        board_history,
+        position_counts,
+        repetition_known,
+        evaluation_generation,
+        *,
+        evaluation_generation_is_canonical=False,
+    ):
+        """Build exact bounded NN-history and rule provenance for a root."""
+        if (
+            evaluation_generation is None
+            or not bool(repetition_known)
+            or self._model_is_training_for_reuse()
+        ):
+            return None
+        canonical_counts = _canonical_position_counts(position_counts)
+        if canonical_counts is None:
+            return None
+        counts_map = dict(canonical_counts)
+        position_key = _board_position_key(board)
+        if int(counts_map.get(position_key, 0)) <= 0:
+            return None
+
+        history_positions = max(0, int(self.history_positions))
+        entries = (
+            list(board_history[-history_positions:])
+            if history_positions and board_history else []
+        )
+        history_frames = [
+            self._history_pair_context_digest(entry)
+            for entry in entries
+        ]
+        if history_positions:
+            empty_frame = self._history_frame_for_model(self._empty_history_tensor)
+            empty_digest = self._history_context_frame_digest(empty_frame)
+            padding = max(0, history_positions - len(history_frames))
+            history_frames = [(empty_digest, empty_digest)] * padding + history_frames
+
+        current_repetition_count = (
+            max(0, int(counts_map.get(position_key, 0)) - 1)
+            if self._encode_exact_repetition else None
+        )
+        current_frame = (
+            self._history_pair_context_digest(
+                board,
+                repetition_count=current_repetition_count,
+            )
+            if history_positions else None
+        )
+        return _RootReuseContext(
+            board_identity=_board_tree_reuse_identity(board),
+            history_frames=tuple(history_frames),
+            current_frame=current_frame,
+            history_positions=history_positions,
+            position_counts=canonical_counts,
+            repetition_known=True,
+            input_contract=self._root_reuse_input_contract(),
+            evaluation_generation=(
+                evaluation_generation
+                if evaluation_generation_is_canonical
+                else _canonical_context_value(evaluation_generation)
+            ),
+        )
+
+    def _verify_search_generation(self, start_generation, roots, game_states, mapping_states):
+        """Reject mixed-generation results and invalidate their reusable roots."""
+        remote = bool(getattr(self.model, 'supports_remote_legal_gather', False))
+        if start_generation is None and not remote:
+            return
+        end_generation = self._evaluation_generation_token()
+        if end_generation is not None and end_generation == start_generation:
+            return
+
+        for idx, root in enumerate(roots):
+            if root is not None:
+                root._reuse_context_anchor = None
+            state = game_states[idx]
+            if mapping_states[idx]:
+                state['root'] = None
+                state['_root_synced'] = False
+            else:
+                if len(state) > 1:
+                    state[1] = None
+                if len(state) > 2:
+                    state[2] = False
+        raise RuntimeError(
+            'MCTS evaluator generation changed or became unavailable during search; '
+            'discarded the search result and invalidated its reusable roots.'
+        )
 
     def _profile_add(self, key, value):
         self._profile_stats[key] = float(self._profile_stats.get(key, 0.0)) + float(value)
@@ -3617,6 +4341,28 @@ class MultiGameBatchMCTS:
             return edges.improved_policy_cache
         return probs
 
+    def _gumbel_root_q_scale_visit_counts(self, node, state, *, include_virtual=False):
+        """Return root Q-scale counts, leaving fresh search accounting intact.
+
+        ``fresh`` preserves the existing root behavior. ``total`` lets valid
+        inherited edge evidence set Q confidence while Sequential Halving and
+        visit credit continue to use only fresh visits.
+        """
+        edges = node.edges
+        edges.ensure_gumbel_workspace()
+        if self.gumbel_reuse_q_scale == 'total':
+            return edges.total_counts if include_virtual else edges.visit_counts
+
+        source = edges.total_counts if include_virtual else edges.visit_counts
+        initial = state.get('_initial_visits_f64')
+        if initial is None:
+            initial = np.asarray(state['initial_visits'], dtype=np.float64)
+            state['_initial_visits_f64'] = initial
+        scratch = edges.fresh_count_scratch
+        np.subtract(source, initial, out=scratch)
+        np.maximum(scratch, 0.0, out=scratch)
+        return scratch
+
     def _gumbel_policy_target(self, improved_policy):
         """Temperature-scale only the training target, not action selection."""
         probs = np.asarray(improved_policy)
@@ -3704,9 +4450,18 @@ class MultiGameBatchMCTS:
         if initial is None:
             initial = np.asarray(state['initial_visits'], dtype=np.float64)
             state['_initial_visits_f64'] = initial
-            state['_initial_total'] = float(initial.sum())
+        pass_initial = state.get('_pass_initial_visits_f64')
+        if pass_initial is None:
+            pass_initial = np.asarray(
+                state.get('pass_initial_visits', state['initial_visits']),
+                dtype=np.float64,
+            )
+            state['_pass_initial_visits_f64'] = pass_initial
+            state['_pass_initial_total'] = float(pass_initial.sum())
         sequence = state['sequence']
-        simulation_index = int(round(edges.total_count_sum - state['_initial_total']))
+        simulation_index = int(
+            round(edges.total_count_sum - state['_pass_initial_total'])
+        )
         considered_visit = sequence[min(simulation_index, len(sequence) - 1)] if sequence else 0
 
         native = self._native_mcts
@@ -3720,6 +4475,7 @@ class MultiGameBatchMCTS:
                 gumbel,
                 self._gumbel_normalized_completed_qvalues(node),
                 initial,
+                pass_initial,
                 edges.visit_counts,
                 edges.total_counts,
                 edges.virtual_losses,
@@ -3727,6 +4483,7 @@ class MultiGameBatchMCTS:
                 self.gumbel_c_visit,
                 self.gumbel_c_scale,
                 apply_virtual_loss,
+                self.gumbel_reuse_q_scale == 'total',
             )
             if apply_virtual_loss:
                 edges.total_count_sum += 1.0
@@ -3743,9 +4500,15 @@ class MultiGameBatchMCTS:
                 edges.nodes[selected_idx] = child
             return child
 
-        fresh_counts = edges.fresh_count_scratch
-        np.subtract(edges.total_counts, initial, out=fresh_counts)
-        np.maximum(fresh_counts, 0.0, out=fresh_counts)
+        cumulative_fresh = edges.fresh_count_scratch
+        np.subtract(edges.total_counts, initial, out=cumulative_fresh)
+        np.maximum(cumulative_fresh, 0.0, out=cumulative_fresh)
+        pass_fresh = state.get('_pass_fresh_scratch')
+        if pass_fresh is None or pass_fresh.size != len(edges.moves):
+            pass_fresh = np.empty(len(edges.moves), dtype=np.float64)
+            state['_pass_fresh_scratch'] = pass_fresh
+        np.subtract(edges.total_counts, pass_initial, out=pass_fresh)
+        np.maximum(pass_fresh, 0.0, out=pass_fresh)
         scores = edges.selection_score_scratch
         gumbel = state.get('_gumbel_f64')
         if gumbel is None:
@@ -3758,26 +4521,33 @@ class MultiGameBatchMCTS:
             base_scores += gumbel
             state['_base_scores'] = base_scores
         np.copyto(scores, base_scores)
-        max_fresh = float(np.max(fresh_counts)) if fresh_counts.size else 0.0
+        q_scale_counts = (
+            edges.total_counts
+            if self.gumbel_reuse_q_scale == 'total'
+            else cumulative_fresh
+        )
+        max_q_scale_visits = (
+            float(np.max(q_scale_counts)) if q_scale_counts.size else 0.0
+        )
         if (
             state.get('_q_score_version') != edges.stats_version
-            or state.get('_q_score_max_visit') != max_fresh
+            or state.get('_q_score_max_visit') != max_q_scale_visits
         ):
-            scale = (self.gumbel_c_visit + max_fresh) * self.gumbel_c_scale
+            scale = (self.gumbel_c_visit + max_q_scale_visits) * self.gumbel_c_scale
             np.multiply(
                 self._gumbel_normalized_completed_qvalues(node),
                 scale,
                 out=edges.q_score_scratch,
             )
             state['_q_score_version'] = edges.stats_version
-            state['_q_score_max_visit'] = max_fresh
+            state['_q_score_max_visit'] = max_q_scale_visits
         np.add(scores, edges.q_score_scratch, out=scores)
         eligible = edges.eligibility_scratch
-        np.equal(fresh_counts, float(considered_visit), out=eligible)
+        np.equal(pass_fresh, float(considered_visit), out=eligible)
         if not eligible.any():
             # Defensive fallback for externally supplied/reused roots with
             # inconsistent counters. Prefer the least freshly visited actions.
-            np.equal(fresh_counts, float(np.min(fresh_counts)), out=eligible)
+            np.equal(pass_fresh, float(np.min(pass_fresh)), out=eligible)
         scores[~eligible] = -np.inf
         selected_idx = int(np.argmax(scores))
         self._python_root_selection_calls += 1
@@ -3801,6 +4571,67 @@ class MultiGameBatchMCTS:
             return None
         edges.ensure_gumbel_workspace()
         initial = np.asarray(state['initial_visits'], dtype=np.float64)
+        if (
+            state.get('root_schedule') == 'revisiting'
+            and state.get('sequence')
+        ):
+            pass_initial = np.asarray(
+                state.get('pass_initial_visits', state['initial_visits']),
+                dtype=np.float64,
+            )
+            pass_fresh = np.maximum(
+                0.0,
+                edges.visit_counts.astype(np.float64) - pass_initial,
+            )
+            final_visit_threshold = (
+                float(np.max(pass_fresh)) if pass_fresh.size else 0.0
+            )
+            native = self._native_mcts
+            if native is not None:
+                gumbel = state.get('_gumbel_f64')
+                if gumbel is None:
+                    gumbel = np.asarray(state['gumbel'], dtype=np.float64)
+                    state['_gumbel_f64'] = gumbel
+                return native.final_action_eligible(
+                    edges.log_base_priors,
+                    gumbel,
+                    self._gumbel_normalized_completed_qvalues(node),
+                    initial,
+                    pass_initial,
+                    edges.visit_counts,
+                    final_visit_threshold,
+                    self.gumbel_c_visit,
+                    self.gumbel_c_scale,
+                    self.gumbel_reuse_q_scale == 'total',
+                )
+
+            cumulative_fresh = np.maximum(
+                0.0,
+                edges.visit_counts.astype(np.float64) - initial,
+            )
+            scores = edges.selection_score_scratch
+            np.copyto(scores, edges.log_base_priors)
+            scores -= float(np.max(scores))
+            np.add(scores, np.asarray(state['gumbel'], dtype=np.float64), out=scores)
+            np.add(
+                scores,
+                self._gumbel_completed_qvalues(
+                    node,
+                    scale_visit_counts=(
+                        edges.visit_counts
+                        if self.gumbel_reuse_q_scale == 'total'
+                        else cumulative_fresh
+                    ),
+                ),
+                out=scores,
+            )
+            eligible = edges.eligibility_scratch
+            np.equal(pass_fresh, final_visit_threshold, out=eligible)
+            if not eligible.any():
+                np.equal(pass_fresh, float(np.min(pass_fresh)), out=eligible)
+            scores[~eligible] = -np.inf
+            return int(np.argmax(scores))
+
         native = self._native_mcts
         if native is not None:
             gumbel = state.get('_gumbel_f64')
@@ -3815,6 +4646,7 @@ class MultiGameBatchMCTS:
                 edges.visit_counts,
                 self.gumbel_c_visit,
                 self.gumbel_c_scale,
+                self.gumbel_reuse_q_scale == 'total',
             )
         fresh = edges.fresh_count_scratch
         np.subtract(edges.visit_counts, initial, out=fresh)
@@ -3826,7 +4658,14 @@ class MultiGameBatchMCTS:
         np.add(scores, np.asarray(state['gumbel'], dtype=np.float64), out=scores)
         np.add(
             scores,
-            self._gumbel_completed_qvalues(node, scale_visit_counts=fresh),
+            self._gumbel_completed_qvalues(
+                node,
+                scale_visit_counts=(
+                    edges.visit_counts
+                    if self.gumbel_reuse_q_scale == 'total'
+                    else fresh
+                ),
+            ),
             out=scores,
         )
         eligible = edges.eligibility_scratch
@@ -4035,7 +4874,18 @@ class MultiGameBatchMCTS:
         profile_detail = self.profile_detail_enabled
         profile_timing = self.profile_enabled
         search_t0 = perf_counter()
-
+        evaluation_generation = self._evaluation_generation_token()
+        if bool(getattr(self.model, 'supports_remote_legal_gather', False)):
+            if not callable(getattr(self.model, 'get_evaluation_generation', None)):
+                raise RuntimeError(
+                    'Remote MCTS inference requires get_evaluation_generation() '
+                    'to guard tree reuse and prevent mixed-model search results.'
+                )
+            if evaluation_generation is None:
+                raise RuntimeError(
+                    'Remote MCTS inference generation is unavailable or changing; '
+                    'wait for model loading to finish before searching.'
+                )
         game_count = len(game_states)
         boards = [None] * game_count
         roots = [None] * game_count
@@ -4111,26 +4961,64 @@ class MultiGameBatchMCTS:
             )
             native_tree_keys[idx] = native_tree_key
 
+            observed_context = None
+            observed_context = self._build_root_reuse_context(
+                board,
+                board_history,
+                root_position_counts[idx],
+                root_repetition_known[idx],
+                evaluation_generation,
+            )
             if self.reuse_tree and root is not None:
-                if root_synced:
-                    root_synced = False
+                anchor = getattr(root, '_reuse_context_anchor', None)
+                if (
+                    isinstance(anchor, _RootReuseContext)
+                    and observed_context is not None
+                    and anchor.matches(observed_context)
+                ):
+                    root._reuse_context_anchor = anchor.with_observed_frame(
+                        observed_context
+                    )
                     root_reused_flags[idx] = True
-                else:
+                    root_synced = False
+                elif not root_synced:
+                    target_identity = _board_tree_reuse_identity(board)
                     target_key = _board_tree_reuse_key(board)
-                    if root.get_tree_reuse_key() == target_key:
-                        root_reused_flags[idx] = True
-                    else:
+                    matched_child = None
+                    if (
+                        isinstance(anchor, _RootReuseContext)
+                        and observed_context is not None
+                    ):
                         for move in root.edges.moves:
                             child = root.get_child_for_move(move)
-                            if child is not None and child.get_tree_reuse_key() == target_key:
-                                _ = child.board  # Ensure board is instantiated
-                                root = child.detach_as_root()
-                                root_reused_flags[idx] = True
+                            if child is None:
+                                continue
+                            if child.get_tree_reuse_key() != target_key:
+                                continue
+                            _ = child.board  # Ensure board is instantiated.
+                            if _board_tree_reuse_identity(child.board) != target_identity:
+                                continue
+                            expected_child = anchor.advance_to_child(child.board)
+                            if (
+                                expected_child is not None
+                                and expected_child.matches(observed_context)
+                            ):
+                                matched_child = child
                                 break
-                        else:
-                            root = MCTSNode(board)
+                    if matched_child is not None:
+                        root = matched_child.detach_as_root()
+                        root._reuse_context_anchor = observed_context
+                        root_reused_flags[idx] = True
+                    else:
+                        root = MCTSNode(board)
+                        root._reuse_context_anchor = observed_context
+                else:
+                    root = MCTSNode(board)
+                    root._reuse_context_anchor = observed_context
+                    root_synced = False
             else:
                 root = MCTSNode(board)
+                root._reuse_context_anchor = observed_context
                 root_synced = False
 
             roots[idx] = root
@@ -4174,6 +5062,11 @@ class MultiGameBatchMCTS:
                         'native_tree_import_time',
                         perf_counter() - native_import_t0,
                     )
+        if self._local_cuda_graph_forward_enabled or self._local_cuda_graph_forward_runner is not None:
+            self._prepare_local_cuda_graph_forward(
+                evaluation_generation,
+                auto_eligible=self._local_cuda_graph_auto_eligible(game_count, native_forest),
+            )
 
         for idx, root in enumerate(roots):
             initial_root_visits[idx] = (
@@ -4221,10 +5114,14 @@ class MultiGameBatchMCTS:
             remaining,
             root_selection_states=None,
             post_batch_callback=None,
+            native_root_pass_update=None,
         ):
             nonlocal game_ptr
             if native_forest is not None and root_selection_states is not None:
-                native_forest.configure_root_states(root_selection_states)
+                if native_root_pass_update is None:
+                    native_forest.configure_root_states(root_selection_states)
+                else:
+                    native_forest.configure_root_pass(native_root_pass_update)
             total_remaining = int(sum(remaining))
             while total_remaining > 0:
                 # Keep decisions in coarse batches. This preserves central GPU
@@ -4257,12 +5154,47 @@ class MultiGameBatchMCTS:
                 leaf_game_indices = []
                 scheduled_game_indices = []
                 selected_this_batch = [0] * game_count
+                feedback_windows = [0] * game_count
+                if root_selection_states is not None:
+                    for state_idx, root_state in enumerate(root_selection_states):
+                        if (
+                            not root_state
+                            or root_state.get('root_schedule') != 'revisiting'
+                        ):
+                            continue
+                        sequence = root_state.get('sequence', ())
+                        progress = max(0, int(root_state.get('_pass_scheduled', 0)))
+                        if not sequence or progress >= len(sequence):
+                            continue
+                        boundaries = root_state.get('_feedback_boundaries', ())
+                        boundary_index = max(
+                            0,
+                            int(root_state.get('_feedback_boundary_index', 0)),
+                        )
+                        while (
+                            boundary_index < len(boundaries)
+                            and int(boundaries[boundary_index]) <= progress
+                        ):
+                            boundary_index += 1
+                        root_state['_feedback_boundary_index'] = boundary_index
+                        if boundary_index < len(boundaries):
+                            feedback_windows[state_idx] = max(
+                                1,
+                                int(boundaries[boundary_index]) - progress,
+                            )
                 selection_node_traversals_this_batch = 0
 
                 selection_t0 = perf_counter() if profile_timing else None
                 for _ in range(batch_size):
                     found = False
                     for _ in range(game_count):
+                        if (
+                            feedback_windows[game_ptr] > 0
+                            and selected_this_batch[game_ptr]
+                            >= feedback_windows[game_ptr]
+                        ):
+                            game_ptr = (game_ptr + 1) % game_count
+                            continue
                         current_root = roots[game_ptr]
                         if (
                             remaining[game_ptr] > 0
@@ -4363,7 +5295,10 @@ class MultiGameBatchMCTS:
                             perf_counter() - expand_sync_t0,
                         )
                     backup_t0 = perf_counter() if profile_timing else None
-                    native_forest.backup_batch(selection_ids, values)
+                    native_forest.backup_batch(
+                        selection_ids,
+                        values,
+                    )
                     if profile_timing:
                         self._profile_add(
                             'native_tree_backup_time',
@@ -4379,6 +5314,13 @@ class MultiGameBatchMCTS:
                         'search_backprop_time',
                         perf_counter() - backprop_t0,
                     )
+                if root_selection_states is not None:
+                    for state_idx, count in enumerate(selected_this_batch):
+                        root_state = root_selection_states[state_idx]
+                        if root_state and root_state.get('root_schedule') == 'revisiting':
+                            root_state['_pass_scheduled'] = int(
+                                root_state.get('_pass_scheduled', 0)
+                            ) + int(count)
                 if post_batch_callback is not None:
                     _sync_native_roots()
                     removed = max(
@@ -4491,7 +5433,11 @@ class MultiGameBatchMCTS:
                     ),
                 )
         inherited_visit_credits = [0] * game_count
-        if add_root_noise and self.reuse_tree and self.tree_reuse_visit_credit_enabled:
+        if (
+            add_root_noise
+            and self.reuse_tree
+            and self.tree_reuse_visit_credit_enabled
+        ):
             for idx, budget in enumerate(simulation_budgets):
                 if not root_reused_flags[idx]:
                     continue
@@ -4513,6 +5459,7 @@ class MultiGameBatchMCTS:
         # in place. Preserve the assigned budget for post-search telemetry and
         # Sequential Halving diagnostics before that mutation starts.
         gumbel_action_budgets = tuple(action_budgets)
+
         pre_scout_winners = [None] * game_count
         pre_scout_policies = [None] * game_count
         tree_reuse_scout_results = [
@@ -4546,17 +5493,41 @@ class MultiGameBatchMCTS:
                 len(root.edges.moves),
                 action_budgets[idx],
             )
-            gumbel_root_states[idx] = {
-                'initial_visits': np.asarray(initial, dtype=np.int32),
-                'gumbel': root_gumbel_noises[idx],
-                'considered_actions': int(considered),
-                'sequence': _gumbel_considered_visit_sequence(
+            pass_budgets = (
+                _gumbel_revisiting_pass_budgets(
+                    action_budgets[idx],
+                    considered,
+                )
+                if self.gumbel_root_schedule == 'revisiting'
+                else ((int(action_budgets[idx]),) if action_budgets[idx] > 0 else ())
+            )
+            root_sequence = (
+                _gumbel_considered_visit_sequence(considered, pass_budgets[0])
+                if self.gumbel_root_schedule == 'revisiting' and pass_budgets
+                else _gumbel_considered_visit_sequence(
                     considered,
                     action_budgets[idx],
-                ),
+                )
+            )
+            initial_copy = np.asarray(initial, dtype=np.int32).copy()
+            gumbel_root_states[idx] = {
+                'initial_visits': initial_copy,
+                'pass_initial_visits': initial_copy.copy(),
+                'gumbel': root_gumbel_noises[idx],
+                'considered_actions': int(considered),
+                'sequence': root_sequence,
+                'root_schedule': self.gumbel_root_schedule,
+                'q_scale_total_visits': self.gumbel_reuse_q_scale == 'total',
+                'pass_budgets': tuple(int(value) for value in pass_budgets),
+                'pass_index': 0,
+                '_pass_scheduled': 0,
+                '_initial_visits_f64': np.asarray(initial_copy, dtype=np.float64),
+                '_pass_initial_visits_f64': np.asarray(initial_copy, dtype=np.float64),
+                '_pass_initial_total': float(initial_copy.sum()),
             }
             if (
-                add_root_noise
+                self.gumbel_root_schedule == 'standard'
+                and add_root_noise
                 and root_reused_flags[idx]
                 and action_budgets[idx] > _TREE_REUSE_SCOUT_SIMULATIONS
                 and tree_reuse_quality[idx]['quality'] >= _TREE_REUSE_SCOUT_MIN_TREE_QUALITY
@@ -4569,7 +5540,10 @@ class MultiGameBatchMCTS:
                 )
                 pre_scout_policies[idx] = self._gumbel_improved_policy(
                     root,
-                    scale_visit_counts=np.zeros(len(root.edges.moves), dtype=np.float64),
+                    scale_visit_counts=self._gumbel_root_q_scale_visit_counts(
+                        root,
+                        gumbel_root_states[idx],
+                    ),
                 ).copy()
 
         def _apply_ready_tree_reuse_scouts(remaining, selected_this_batch):
@@ -4601,7 +5575,10 @@ class MultiGameBatchMCTS:
                 post_winner = self._gumbel_final_action_index(root, state)
                 post_policy = self._gumbel_improved_policy(
                     root,
-                    scale_visit_counts=fresh_counts,
+                    scale_visit_counts=self._gumbel_root_q_scale_visit_counts(
+                        root,
+                        state,
+                    ),
                 ).copy()
                 policy_js = _policy_jensen_shannon_divergence(pre_policy, post_policy)
                 winner_stable = pre_scout_winners[idx] == post_winner
@@ -4633,15 +5610,97 @@ class MultiGameBatchMCTS:
                 }
             return removed_total
 
-        _run_simulation_phase(
-            action_budgets,
-            gumbel_root_states,
-            post_batch_callback=(
-                _apply_ready_tree_reuse_scouts
-                if any(policy is not None for policy in pre_scout_policies)
-                else None
-            ),
+        reuse_scout_callback = (
+            _apply_ready_tree_reuse_scouts
+            if (
+                self.gumbel_root_schedule == 'standard'
+                and any(policy is not None for policy in pre_scout_policies)
+            )
+            else None
         )
+        if self.gumbel_root_schedule == 'revisiting':
+            max_pass_count = max(
+                (len(state['pass_budgets']) for state in gumbel_root_states if state),
+                default=0,
+            )
+            for pass_index in range(max_pass_count):
+                pass_remaining = [0] * game_count
+                for idx, (root, state) in enumerate(zip(roots, gumbel_root_states)):
+                    if state is None or pass_index >= len(state['pass_budgets']):
+                        continue
+                    pass_budget = int(state['pass_budgets'][pass_index])
+                    pass_remaining[idx] = pass_budget
+                    if pass_index > 0:
+                        pass_initial = np.asarray(
+                            root.edges.visit_counts,
+                            dtype=np.int32,
+                        ).copy()
+                        state['pass_initial_visits'] = pass_initial
+                        state['_pass_initial_visits_f64'] = np.asarray(
+                            pass_initial,
+                            dtype=np.float64,
+                        )
+                        state['_pass_initial_total'] = float(pass_initial.sum())
+                    state['pass_index'] = int(pass_index)
+                    state['_pass_scheduled'] = 0
+                    state['sequence'] = _gumbel_considered_visit_sequence(
+                        state['considered_actions'],
+                        pass_budget,
+                    )
+                    state['_feedback_boundaries'] = (
+                        _gumbel_revisiting_feedback_boundaries(
+                            state['considered_actions'],
+                            pass_budget,
+                        )
+                    )
+                    state['_feedback_boundary_index'] = 0
+
+                _run_simulation_phase(
+                    pass_remaining,
+                    gumbel_root_states,
+                    post_batch_callback=reuse_scout_callback,
+                    native_root_pass_update=(
+                        [
+                            state if (
+                                state is not None
+                                and int(state.get('pass_index', 0)) == pass_index
+                                and pass_index > 0
+                            ) else None
+                            for state in gumbel_root_states
+                        ]
+                        if pass_index > 0 else None
+                    ),
+                )
+                for state in gumbel_root_states:
+                    if (
+                        state is not None
+                        and state.get('root_schedule') == 'revisiting'
+                        and state.get('pass_index') == pass_index
+                    ):
+                        actual = max(0, int(state.get('_pass_scheduled', 0)))
+                        state.setdefault('pass_actual_visits', []).append(actual)
+                        if actual < len(state['sequence']):
+                            state['sequence'] = state['sequence'][:actual]
+        else:
+            _run_simulation_phase(
+                action_budgets,
+                gumbel_root_states,
+                post_batch_callback=reuse_scout_callback,
+            )
+            for idx, state in enumerate(gumbel_root_states):
+                if state is None:
+                    continue
+                root = roots[idx]
+                if root is None:
+                    actual = 0
+                else:
+                    fresh = np.maximum(
+                        0.0,
+                        root.edges.visit_counts.astype(np.float64)
+                        - np.asarray(state['initial_visits'], dtype=np.float64),
+                    )
+                    actual = int(round(float(fresh.sum())))
+                state['pass_actual_visits'] = [actual]
 
         if native_forest is not None:
             native_sync_t0 = perf_counter() if profile_timing else None
@@ -4674,6 +5733,7 @@ class MultiGameBatchMCTS:
                 initial_child_visits=initial_child_visits[idx],
                 inherited_visit_credit=inherited_visit_credits[idx],
             )
+            metadata['mcts_algorithm'] = self.mcts_algorithm
             metadata['dynamic_budget_enabled'] = bool(dynamic_budget_active)
             metadata['eval_easy_cut_enabled'] = bool(eval_easy_cut_active)
             metadata['eval_easy_cut_reduced'] = bool(
@@ -4689,6 +5749,12 @@ class MultiGameBatchMCTS:
             metadata['tree_inherited_visits'] = (
                 int(initial_root_visits[idx]) if root_reused_flags[idx] else 0
             )
+            metadata['root_outgoing_inherited_visits'] = (
+                int(np.asarray(initial_child_visits[idx], dtype=np.int64).sum())
+                if root_reused_flags[idx] and initial_child_visits[idx] is not None
+                else 0
+            )
+            metadata['mcts_gumbel_reuse_q_scale'] = self.gumbel_reuse_q_scale
             reuse_quality = tree_reuse_quality[idx]
             metadata['tree_reuse_quality'] = float(reuse_quality['quality'])
             metadata['tree_reuse_candidate_coverage'] = float(
@@ -4740,7 +5806,10 @@ class MultiGameBatchMCTS:
                 )
                 improved = self._gumbel_improved_policy(
                     root,
-                    scale_visit_counts=fresh_count_vector,
+                    scale_visit_counts=self._gumbel_root_q_scale_visit_counts(
+                        root,
+                        gumbel_state,
+                    ),
                 )
                 policy_target_probs = self._gumbel_policy_target(improved)
                 selected_idx = self._gumbel_final_action_index(root, gumbel_state)
@@ -4751,10 +5820,36 @@ class MultiGameBatchMCTS:
                 selection_scores -= float(np.max(selection_scores))
                 selection_scores += np.asarray(gumbel_state['gumbel'], dtype=np.float64)
                 selection_scores += normalized_completed_q * (
-                    (self.gumbel_c_visit + float(np.max(fresh_count_vector)))
+                    (
+                        self.gumbel_c_visit
+                        + float(np.max(self._gumbel_root_q_scale_visit_counts(root, gumbel_state)))
+                    )
                     * self.gumbel_c_scale
                 )
-                eligible = fresh_count_vector == float(np.max(fresh_count_vector))
+                if (
+                    gumbel_state.get('root_schedule') == 'revisiting'
+                    and gumbel_state.get('sequence')
+                ):
+                    final_pass_initial = np.asarray(
+                        gumbel_state.get(
+                            'pass_initial_visits',
+                            gumbel_state['initial_visits'],
+                        ),
+                        dtype=np.float64,
+                    )
+                    final_pass_visits = np.maximum(
+                        0.0,
+                        root.edges.visit_counts.astype(np.float64) - final_pass_initial,
+                    )
+                    final_threshold = (
+                        float(np.max(final_pass_visits))
+                        if final_pass_visits.size else 0.0
+                    )
+                    eligible = final_pass_visits == final_threshold
+                    if not eligible.any():
+                        eligible = final_pass_visits == float(np.min(final_pass_visits))
+                else:
+                    eligible = fresh_count_vector == float(np.max(fresh_count_vector))
                 selection_scores[~eligible] = -np.inf
                 policy_target = {
                     move: float(probability)
@@ -4768,10 +5863,48 @@ class MultiGameBatchMCTS:
                     gumbel_state.get('considered_actions', 0) or 0
                 )
                 metadata['gumbel_action_budget'] = int(gumbel_action_budgets[idx])
+                metadata['gumbel_root_schedule'] = str(
+                    gumbel_state.get('root_schedule', 'standard')
+                )
+                if gumbel_state.get('root_schedule') == 'revisiting':
+                    metadata['tree_reuse_post_scout_credit_disabled'] = True
+                    metadata['tree_reuse_post_scout_credit_disabled_reason'] = (
+                        'fixed_revisiting_pass_budget'
+                    )
+                metadata['gumbel_pass_count'] = int(
+                    len(gumbel_state.get('pass_budgets', ()))
+                )
+                metadata['gumbel_pass_budgets'] = [
+                    int(value)
+                    for value in gumbel_state.get('pass_budgets', ())
+                ]
+                metadata['gumbel_pass_actual_visits'] = [
+                    int(value)
+                    for value in gumbel_state.get('pass_actual_visits', ())
+                ]
+                metadata['gumbel_pass_initial_round_visits'] = [
+                    int(
+                        _gumbel_initial_round_visits(
+                            gumbel_state.get('considered_actions', 0),
+                            pass_budget,
+                        )
+                    )
+                    for pass_budget in gumbel_state.get('pass_budgets', ())
+                ]
+                metadata['gumbel_final_pass_index'] = int(
+                    gumbel_state.get('pass_index', 0)
+                )
                 metadata['gumbel_initial_round_visits'] = int(
-                    _gumbel_initial_round_visits(
-                        gumbel_state.get('considered_actions', 0),
-                        gumbel_action_budgets[idx],
+                    (
+                        metadata['gumbel_pass_initial_round_visits'][0]
+                        if (
+                            gumbel_state.get('root_schedule') == 'revisiting'
+                            and metadata['gumbel_pass_initial_round_visits']
+                        )
+                        else _gumbel_initial_round_visits(
+                            gumbel_state.get('considered_actions', 0),
+                            gumbel_action_budgets[idx],
+                        )
                     )
                 )
                 metadata['gumbel_width_adapted'] = bool(
@@ -4886,6 +6019,12 @@ class MultiGameBatchMCTS:
             search_metadata.append(metadata)
         if profile_timing:
             self._profile_add('search_metadata_time', perf_counter() - metadata_t0)
+        self._verify_search_generation(
+            evaluation_generation,
+            roots,
+            game_states,
+            is_mapping_state,
+        )
         self._profile_add('search_many_time', perf_counter() - search_t0)
         self._profile_inc('search_many_calls', 1)
         if return_search_metadata:
@@ -4909,6 +6048,29 @@ class MultiGameBatchMCTS:
         forest = self._native_forest
         if forest is not None and forest.active:
             forest.release_tree(tree_key)
+
+    def _sync_native_node_for_promotion(self, node, tree_key) -> None:
+        """Refresh one retained descendant before it is promoted without search.
+
+        Native backups update every traversed edge, while Python edge arrays are
+        eagerly synchronized only for active roots. A game can make multiple
+        actual moves between searches, so the parent of a later promoted child
+        may still be a stale Python descendant. Read that node's edge arrays
+        from the retained forest before detach copies the incoming edge into
+        the new root. Do not replace the node's own root totals: those are
+        distinct from its parent-edge statistics.
+        """
+        forest = self._native_forest
+        if forest is None or not forest.active:
+            return
+        node_id = forest._node_ids.get(id(node))
+        active_root = forest._active_roots.get(tree_key)
+        if node_id is None or active_root is None:
+            return
+        if int(active_root[1]) == int(node_id):
+            # The just-searched active root was already exported at search end.
+            return
+        forest.sync_node(node, sync_root_stats=False)
 
     def _batch_expand_and_evaluate(
         self,
@@ -5061,6 +6223,7 @@ class MultiGameBatchMCTS:
             if profile_timing:
                 self._profile_add('batch_expand_tensor_pack_time', perf_counter() - tensor_pack_t0)
 
+            remote_legal_gather = bool(getattr(self.model, 'supports_remote_legal_gather', False))
             use_cuda_stage_timing = (
                 self.cuda_stage_profile_enabled
                 and self.device.type == 'cuda'
@@ -5072,7 +6235,6 @@ class MultiGameBatchMCTS:
                     return None
                 return torch.cuda.Event(enable_timing=True)
 
-            remote_legal_gather = bool(getattr(self.model, 'supports_remote_legal_gather', False))
             h2d_start = _cuda_event()
             h2d_end = _cuda_event()
             if remote_legal_gather:
@@ -5123,37 +6285,32 @@ class MultiGameBatchMCTS:
                 model_kwargs['legal_index_matrix'] = legal_index_matrix
                 model_kwargs['legal_counts'] = np.asarray(legal_counts, dtype=np.int16)
             with torch.inference_mode():
-                if self.use_amp:
-                    with torch.autocast(device_type='cuda', dtype=self.amp_dtype):
-                        policy_logits_batch, values_batch = self.model(
-                            board_tensors,
-                            **model_kwargs,
-                        )
-                else:
-                    policy_logits_batch, values_batch = self.model(
-                        board_tensors,
-                        **model_kwargs,
-                    )
+                policy_logits_batch, values_batch, used_local_forward_runner = (
+                    self._local_model_forward(board_tensors, model_kwargs)
+                )
                 if forward_end is not None:
                     forward_end.record()
-                compact_policy_response = bool(getattr(self.model, 'last_response_compact_policy', False))
+                compact_policy_response = (
+                    False
+                    if used_local_forward_runner
+                    else bool(getattr(self.model, 'last_response_compact_policy', False))
+                )
                 
-                if values_batch.dim() == 2 and values_batch.shape[1] == 3:
+                if values_batch.ndim == 2 and values_batch.shape[1] == 3:
                     wdl_start = _cuda_event()
                     wdl_end = _cuda_event()
                     if wdl_start is not None:
                         wdl_start.record()
-                    wdl_probs = torch.softmax(values_batch, dim=1)
-                    values_batch = (wdl_probs[:, 0] - wdl_probs[:, 2])
+                    values_batch = value_logits_to_scalar(values_batch)
                     if wdl_end is not None:
                         wdl_end.record()
+                else:
+                    values_batch = value_logits_to_scalar(values_batch)
 
                 # Gather only legal move logits on GPU before transferring to CPU.
                 if max_legal_count > 0:
                     if compact_policy_response:
                         legal_logits_batch = policy_logits_batch.to(dtype=torch.float16).cpu().numpy()
-                        d2h_legal_start = None
-                        d2h_legal_end = None
                     else:
                         h2d_legal_start = _cuda_event()
                         h2d_legal_end = _cuda_event()
@@ -5172,24 +6329,60 @@ class MultiGameBatchMCTS:
                         legal_logits_batch = torch.gather(policy_logits_batch, 1, legal_index_tensor)
                         if gather_end is not None:
                             gather_end.record()
+                else:
+                    legal_logits_batch = None
+
+                d2h_legal_start = None
+                d2h_legal_end = None
+                d2h_values_start = None
+                d2h_values_end = None
+                if (
+                    isinstance(legal_logits_batch, torch.Tensor)
+                    and isinstance(values_batch, torch.Tensor)
+                    and legal_logits_batch.device.type == 'cuda'
+                    and values_batch.device == legal_logits_batch.device
+                    and not remote_legal_gather
+                    and not compact_policy_response
+                ):
+                    d2h_legal_start = _cuda_event()
+                    d2h_legal_end = _cuda_event()
+                    if d2h_legal_start is not None:
+                        d2h_legal_start.record()
+                    pinned_policy, pinned_values, transfer_event = (
+                        self._local_cuda_readback_buffers(
+                            int(legal_logits_batch.shape[0]),
+                            int(legal_logits_batch.shape[1]),
+                            legal_logits_batch.device,
+                        )
+                    )
+                    legal_logits_batch, values_batch = copy_compact_policy_value_to_cpu(
+                        legal_logits_batch,
+                        values_batch,
+                        pinned_policy=pinned_policy,
+                        pinned_values=pinned_values,
+                        transfer_event=transfer_event,
+                    )
+                    if d2h_legal_end is not None:
+                        d2h_legal_end.record()
+                else:
+                    if isinstance(legal_logits_batch, torch.Tensor):
                         d2h_legal_start = _cuda_event()
                         d2h_legal_end = _cuda_event()
                         if d2h_legal_start is not None:
                             d2h_legal_start.record()
-                        legal_logits_batch = legal_logits_batch.to(dtype=torch.float16).cpu().numpy()
+                        legal_logits_batch = legal_logits_batch.to(
+                            dtype=torch.float16
+                        ).cpu().numpy()
                         if d2h_legal_end is not None:
                             d2h_legal_end.record()
-                else:
-                    legal_logits_batch = None
-                    d2h_legal_start = None
-                    d2h_legal_end = None
-                d2h_values_start = _cuda_event()
-                d2h_values_end = _cuda_event()
-                if d2h_values_start is not None:
-                    d2h_values_start.record()
-                values_batch = values_batch.float().cpu().numpy()
-                if d2h_values_end is not None:
-                    d2h_values_end.record()
+                    if isinstance(values_batch, torch.Tensor):
+                        d2h_values_start = _cuda_event()
+                        d2h_values_end = _cuda_event()
+                        if d2h_values_start is not None:
+                            d2h_values_start.record()
+                        values_batch = values_batch.float().cpu().numpy()
+                        if d2h_values_end is not None:
+                            d2h_values_end.record()
             self._profile_inc('nn_inference_calls', 1)
             self._profile_inc('nn_inference_batch_items', batch_n)
             self._profile_inc('nn_legal_move_items', sum(legal_counts))

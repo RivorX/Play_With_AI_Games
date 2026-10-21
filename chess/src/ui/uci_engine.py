@@ -27,7 +27,8 @@ from src.config import default_config_path, load_project_config
 from src.model import load_model
 from src.models.registry import MODEL_REGISTRY
 from src.models.data.registry import get_input_encoder
-from src.mcts.search import _board_position_key
+from src.inference.prediction import predict_raw
+from src.mcts.search import _board_position_key, _position_counts_from_board
 from src.models.data.se_cnn_v9.helpers import board_to_tensor, move_to_index
 from src.common.runtime import legacy_architecture_scoped_file, model_alias_file
 
@@ -44,6 +45,9 @@ class UCIChessEngine:
         self.board = chess.new_board()
         self.board_history = []
         self._repetition_history_known = True
+        self._position_base = ("startpos",)
+        self._position_moves = ()
+        self.position_counts = {_board_position_key(self.board): 1}
         self.stop_requested = False
 
         self.use_mcts = bool(use_mcts)
@@ -89,6 +93,22 @@ class UCIChessEngine:
     def _ensure_mcts(self):
         if self.use_mcts and self.mcts is None:
             self.mcts = SingleGameMCTS(self.model, self.config, self.device)
+            for history_board in self.board_history:
+                key = _board_position_key(history_board)
+                historical_counts = (
+                    _position_counts_from_board(history_board)
+                    if self._repetition_history_known
+                    else None
+                )
+                self.mcts.update_history(
+                    history_board,
+                    repetition_count=(
+                        max(0, int((historical_counts or {}).get(key, 1)) - 1)
+                        if self._repetition_history_known
+                        and self.mcts._multi._path_dependent_repetition
+                        else None
+                    ),
+                )
 
     def _record_pre_move_state(self):
         self.board_history.append(chess.copy_board(self.board))
@@ -97,12 +117,24 @@ class UCIChessEngine:
             if len(self.board_history) > max_history:
                 self.board_history = self.board_history[-max_history:]
         if self.mcts:
-            self.mcts.update_history(self.board)
+            key = _board_position_key(self.board)
+            self.mcts.update_history(
+                self.board,
+                repetition_count=(
+                    max(0, int(self.position_counts.get(key, 1)) - 1)
+                    if self._repetition_history_known
+                    and self.mcts._multi._path_dependent_repetition
+                    else None
+                ),
+            )
 
     def _new_game(self):
         self.board = chess.new_board()
         self.board_history = []
         self._repetition_history_known = True
+        self._position_base = ("startpos",)
+        self._position_moves = ()
+        self.position_counts = {_board_position_key(self.board): 1}
         self.stop_requested = False
         if self.mcts:
             self.mcts.reset_tree()
@@ -160,13 +192,13 @@ class UCIChessEngine:
             .unsqueeze(0)
             .to(self.device, memory_format=torch.channels_last)
         )
-        with torch.inference_mode():
-            with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                policy_logits, _ = self.model(
-                    board_tensor,
-                    apply_log_softmax=False,
-                )
-            policy = policy_logits.float().cpu().numpy()[0]
+        policy_logits, _ = predict_raw(
+            self.model,
+            board_tensor,
+            use_amp=self.use_amp,
+            amp_dtype=self.amp_dtype,
+        )
+        policy = policy_logits.float().cpu().numpy()[0]
 
         best_move = None
         best_score = -float("inf")
@@ -224,7 +256,12 @@ class UCIChessEngine:
         self._ensure_mcts()
         sims = self._compute_simulations(go_args)
         self._send(f"info string mcts simulations {sims}")
-        search_result = self.mcts.search(self.board, sims)
+        search_result = self.mcts.search(
+            self.board,
+            sims,
+            position_counts=self.position_counts,
+            repetition_known=self._repetition_history_known,
+        )
         if not search_result:
             return None
         return search_result.selected_move
@@ -232,16 +269,11 @@ class UCIChessEngine:
     def _set_position(self, args):
         if not args:
             return
-
-        self.board_history = []
-        self._repetition_history_known = False
-        if self.mcts:
-            self.mcts.reset_tree()
-
         idx = 0
         if args[0] == "startpos":
-            self.board = chess.new_board()
-            self._repetition_history_known = True
+            base_board = chess.new_board()
+            base_key = ("startpos",)
+            repetition_history_known = True
             idx = 1
         elif args[0] == "fen":
             if len(args) < 7:
@@ -249,29 +281,81 @@ class UCIChessEngine:
                 return
             fen = " ".join(args[1:7])
             try:
-                self.board = chess.board_from_fen(fen)
-                self._repetition_history_known = False
+                base_board = chess.board_from_fen(fen)
+                base_key = ("fen", fen)
+                repetition_history_known = False
             except ValueError:
                 self._send("info string invalid fen")
-                self.board = chess.new_board()
                 return
             idx = 7
         else:
             self._send("info string unsupported position command")
             return
 
-        if idx < len(args) and args[idx] == "moves":
-            for move_uci in args[idx + 1 :]:
-                try:
-                    move = chess.move_from_uci(move_uci)
-                except ValueError:
-                    self._send(f"info string invalid move format: {move_uci}")
-                    break
-                if move is None or move not in chess.legal_moves(self.board):
-                    self._send(f"info string illegal move in position: {move_uci}")
-                    break
+        move_tokens = []
+        if idx < len(args):
+            if args[idx] != "moves":
+                self._send("info string invalid position command")
+                return
+            move_tokens = list(args[idx + 1 :])
+
+        # Validate the complete supplied line before changing live state.
+        probe = chess.copy_board(base_board)
+        for move_uci in move_tokens:
+            try:
+                move = chess.move_from_uci(move_uci)
+            except ValueError:
+                self._send(f"info string invalid move format: {move_uci}")
+                return
+            if move is None or move not in chess.legal_moves(probe):
+                self._send(f"info string illegal move in position: {move_uci}")
+                return
+            chess.apply_move(probe, move)
+
+        requested_moves = tuple(move_tokens)
+        can_extend_known_startpos = bool(
+            repetition_history_known
+            and base_key == ("startpos",)
+            and self._repetition_history_known
+            and self._position_base == base_key
+            and len(requested_moves) >= len(self._position_moves)
+            and requested_moves[: len(self._position_moves)] == self._position_moves
+        )
+
+        if can_extend_known_startpos:
+            suffix = requested_moves[len(self._position_moves) :]
+            for move_uci in suffix:
+                move = chess.move_from_uci(move_uci)
                 self._record_pre_move_state()
                 chess.apply_move(self.board, move)
+                key = _board_position_key(self.board)
+                self.position_counts[key] = int(self.position_counts.get(key, 0)) + 1
+                if self.mcts is not None and self.mcts.root is not None:
+                    self.mcts.advance_root(
+                        move,
+                        board=self.board,
+                        position_counts=self.position_counts,
+                        repetition_known=True,
+                    )
+        else:
+            # FEN positions do not provide complete repetition provenance, so
+            # they always start a fresh search session. A changed/branched
+            # startpos line also discards the old root.
+            if self.mcts:
+                self.mcts.reset_tree()
+            self.board = base_board
+            self.board_history = []
+            self._repetition_history_known = repetition_history_known
+            self.position_counts = {_board_position_key(self.board): 1}
+            for move_uci in requested_moves:
+                move = chess.move_from_uci(move_uci)
+                self._record_pre_move_state()
+                chess.apply_move(self.board, move)
+                key = _board_position_key(self.board)
+                self.position_counts[key] = int(self.position_counts.get(key, 0)) + 1
+
+        self._position_base = base_key
+        self._position_moves = requested_moves
 
     def _set_option(self, args):
         name = ""
@@ -364,6 +448,9 @@ class UCIChessEngine:
                 self._send(f"info string fen {self.board.fen()}")
             elif cmd == "quit":
                 break
+
+        if self.mcts is not None:
+            self.mcts.close()
 
 
 def load_config(config_path):

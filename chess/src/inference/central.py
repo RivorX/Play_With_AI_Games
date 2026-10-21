@@ -6,6 +6,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -13,7 +14,13 @@ import numpy as np
 import torch
 
 from src.inference.fused_output import packed_output_views, packed_output_width_bytes
-from src.inference.shared_memory import shared_inference_array
+from src.inference.prediction import predict_raw
+from src.inference.shared_memory import (
+    SharedInferenceGenerationPublisher,
+    read_shared_evaluation_generation,
+    shared_inference_array,
+    shared_inference_generation_arrays,
+)
 from src.mcts.native import get_native_mcts
 from src.models.data.registry import get_input_encoder
 from src.mcts.search import (
@@ -167,6 +174,45 @@ def _validate_central_model_input_contract(
     return checkpoint_spec
 
 
+def _central_eval_cache_key(
+    model_label,
+    board_row,
+    legal_row,
+    legal_count,
+    native_hash_pair=None,
+):
+    """Build a compact cache key with a second independent input fingerprint.
+
+    The native 128-bit hash is the fast primary index when available. A
+    second 128 bits of an independent BLAKE2b-256 fingerprint make a native
+    hash collision a cache miss; without the native backend, the same digest
+    supplies both key halves. This remains probabilistic, but avoids storing a
+    full 10 KiB V9 input tensor per LRU entry.
+    """
+    board = np.asarray(board_row)
+    legal_count = int(legal_count)
+    legal = np.asarray(legal_row, dtype=np.int16).reshape(-1)[:legal_count]
+    fingerprint = hashlib.blake2b(digest_size=32, person=b'chess-nn-cache2')
+    fingerprint.update(board.dtype.str.encode('ascii'))
+    fingerprint.update(np.asarray(board.shape, dtype=np.int32).tobytes())
+    fingerprint.update(memoryview(board).cast('B'))
+    fingerprint.update(legal_count.to_bytes(2, 'little', signed=False))
+    if legal_count > 0:
+        fingerprint.update(memoryview(legal).cast('B'))
+    fingerprint = fingerprint.digest()
+    if native_hash_pair is not None:
+        primary = (
+            str(model_label),
+            int(native_hash_pair[0]),
+            int(native_hash_pair[1]),
+        )
+        verifier = fingerprint[16:]
+    else:
+        primary = (str(model_label), fingerprint[:16])
+        verifier = fingerprint[16:]
+    return primary, verifier
+
+
 class RemoteInferenceClient:
     """Small model-like proxy used by MCTS workers with central GPU inference."""
 
@@ -251,6 +297,7 @@ class RemoteInferenceClient:
         self._transport_np_dtype = np.float32 if self.transport_dtype == "float32" else np.float16
         self.shared_buffer = shared_buffer
         self._shared_arrays = None
+        self._evaluation_generation_views = shared_inference_generation_arrays(shared_buffer)
         self._shared_call_lock = shared_call_lock or threading.Lock()
         # A CentralInferenceSession may expose several label-specific proxies
         # over the same response queue. Serialize those proxies even when the
@@ -270,6 +317,20 @@ class RemoteInferenceClient:
     @property
     def training(self):
         return self._training
+
+    def get_evaluation_generation(self):
+        """Return a stable ``(server UUID, model label, epoch)`` or ``None``.
+
+        Persistent NN-result/tree reuse must fail closed when the server is
+        loading weights, the shared descriptor is old, or generation metadata
+        is otherwise unavailable. This is a local shared-memory read, never an
+        inference RPC.
+        """
+        return read_shared_evaluation_generation(
+            self.shared_buffer,
+            self.model_label,
+            views=self._evaluation_generation_views,
+        )
 
     def eval(self):
         self._training = False
@@ -531,6 +592,17 @@ class RemoteInferenceClient:
 def _central_inference_option(config, key, default=None):
     shared_cfg = (config or {}).get('central_inference', {}) or {}
     return shared_cfg.get(key, default)
+
+
+def _resolve_inference_cache_settings(config):
+    """Resolve the shared inference cache's generic enable and capacity settings."""
+    return (
+        bool(_central_inference_option(config, 'cache_enabled', True)),
+        max(
+            0,
+            int(_central_inference_option(config, 'cache_max_entries', 50000) or 0),
+        ),
+    )
 
 
 class _AdaptiveInferenceCacheGate:
@@ -840,6 +912,11 @@ def central_inference_server(
         }
         for rank, spec in shared_buffers.items()
     }
+    evaluation_generation_publisher = SharedInferenceGenerationPublisher(
+        shared_buffers.values()
+    )
+    server_incarnation = uuid.uuid4().hex
+    evaluation_generation_publisher.initialize(server_incarnation)
     batch_controller = _AdaptiveBatchController(
         max_batch=max_batch,
         compile_buckets=_central_compile_batch_buckets(max_batch),
@@ -849,11 +926,7 @@ def central_inference_server(
         ),
         enabled=auto_batch_enabled,
     )
-    cache_enabled = bool(_central_inference_option(config, 'cache_enabled', True))
-    cache_max_entries = max(
-        0,
-        int(_central_inference_option(config, 'cache_max_entries', 50000) or 0),
-    )
+    cache_enabled, cache_max_entries = _resolve_inference_cache_settings(config)
     cache = OrderedDict()
     native_server_kernels = get_native_mcts()
     native_hash_scratch = np.empty((max_batch, 2), dtype=np.uint64)
@@ -1031,10 +1104,12 @@ def central_inference_server(
                         device=device,
                         dtype=dummy_dtype,
                     ).to(memory_format=torch.channels_last)
-                    with torch.autocast(device_type='cuda', enabled=use_amp, dtype=central_amp_dtype):
-                        policy_logits, value_logits = model(
-                            dummy_input, apply_log_softmax=False
-                        )
+                    policy_logits, value_logits = predict_raw(
+                        model,
+                        dummy_input,
+                        use_amp=use_amp,
+                        amp_dtype=central_amp_dtype,
+                    )
                     if fused_legal_output is not None and not fused_warmup_done:
                         # Warm any actual model output dtype before serving.
                         # Width/strides stay runtime scalars in the Triton
@@ -1807,19 +1882,16 @@ def central_inference_server(
                     )
                 for idx in range(total_n):
                     legal_count = int(legal_counts[idx])
+                    native_hash_pair = None
                     if native_hashes is not None and not path_dependent_input:
-                        key = (
-                            model_label,
-                            int(native_hashes[idx, 0]),
-                            int(native_hashes[idx, 1]),
-                        )
-                    else:
-                        digest = hashlib.blake2b(digest_size=16, person=b'chess-nn-cache')
-                        digest.update(memoryview(boards[idx]).cast('B'))
-                        digest.update(legal_count.to_bytes(2, 'little', signed=False))
-                        if legal_count > 0:
-                            digest.update(memoryview(legal_indices[idx, :legal_count]).cast('B'))
-                        key = (model_label, digest.digest())
+                        native_hash_pair = native_hashes[idx]
+                    key = _central_eval_cache_key(
+                        model_label,
+                        boards[idx],
+                        legal_indices[idx],
+                        legal_count,
+                        native_hash_pair=native_hash_pair,
+                    )
                     cache_keys[idx] = key
                     cached = cache.get(key)
                     if cached is not None:
@@ -1937,17 +2009,13 @@ def central_inference_server(
                             if actual_batch_size in _graph_forward_hot_sizes(model_label)
                             else None
                         )
-                        if graph_runner is not None:
-                            policy_logits, value_logits = graph_runner.run_forward(tensor)
-                        elif use_amp and device.type == 'cuda':
-                            with torch.autocast(device_type='cuda', dtype=central_amp_dtype):
-                                policy_logits, value_logits = model(
-                                    tensor, apply_log_softmax=False
-                                )
-                        else:
-                            policy_logits, value_logits = model(
-                                tensor, apply_log_softmax=False
-                            )
+                        policy_logits, value_logits = predict_raw(
+                            model,
+                            tensor,
+                            use_amp=use_amp,
+                            amp_dtype=central_amp_dtype,
+                            graph_runner=graph_runner,
+                        )
                     except Exception as exc:
                         eager_model = compiled_base_models.get(model_label)
                         if eager_model is None or eager_model is model:
@@ -1968,15 +2036,12 @@ def central_inference_server(
                         central_use_compile = False
                         eager_model.eval()
                         model = eager_model
-                        if use_amp and device.type == 'cuda':
-                            with torch.autocast(device_type='cuda', dtype=central_amp_dtype):
-                                policy_logits, value_logits = eager_model(
-                                    tensor, apply_log_softmax=False
-                                )
-                        else:
-                            policy_logits, value_logits = eager_model(
-                                tensor, apply_log_softmax=False
-                            )
+                        policy_logits, value_logits = predict_raw(
+                            eager_model,
+                            tensor,
+                            use_amp=use_amp,
+                            amp_dtype=central_amp_dtype,
+                        )
                     if int(policy_logits.shape[0]) != actual_batch_size:
                         policy_logits = policy_logits[:actual_batch_size]
                         value_logits = value_logits[:actual_batch_size]
@@ -2212,6 +2277,11 @@ def central_inference_server(
             if cmd == "load_models":
                 task_id = item.get("task_id")
                 load_t0 = time.perf_counter()
+                # Invalidate every label before preflight/loading. A failed or
+                # partial transaction remains odd, so persistent reuse and
+                # inference both fail closed until a later successful model
+                # set is committed.
+                evaluation_generation_publisher.begin_update()
                 prepared_models = []
                 try:
                     # Preflight every selected checkpoint before clearing or
@@ -2266,11 +2336,11 @@ def central_inference_server(
                         })
                         return "control"
                     raise
-                if loaded_models:
-                    # A label may have received new weights. Never reuse outputs
-                    # computed by a previous model generation.
-                    cache.clear()
-                    cache_gate.reset()
+                # The cache is part of the model generation. Clear it after
+                # every successful load transaction, including a clear-only
+                # transaction, before publishing the next stable epoch.
+                cache.clear()
+                cache_gate.reset()
                 if loaded_models:
                     def _format_loaded_model(info):
                         label = str(info.get("label", "model"))
@@ -2299,6 +2369,7 @@ def central_inference_server(
                             f"{model_summary} ({time.perf_counter() - load_t0:.2f}s).",
                             flush=True,
                         )
+                committed_generation = evaluation_generation_publisher.commit()
                 if control_queue is not None:
                     control_queue.put({
                         "type": "models_loaded",
@@ -2321,10 +2392,21 @@ def central_inference_server(
                         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark) if device.type == 'cuda' else None,
                         "model_summary": model_summary if loaded_models else "",
                         "load_s": float(time.perf_counter() - load_t0),
+                        "evaluation_generation": int(committed_generation),
+                        "server_incarnation": server_incarnation,
                     })
                 return "control"
             if cmd == "infer":
                 item["server_dequeued_at_perf"] = time.perf_counter()
+                if not evaluation_generation_publisher.stable:
+                    _put_response(item, {
+                        "ok": False,
+                        "error": (
+                            "Central inference model generation is invalid after an "
+                            "incomplete or failed model-load transaction."
+                        ),
+                    })
+                    return "ignored"
                 try:
                     _validate_infer_request(item)
                 except Exception as exc:
@@ -2347,6 +2429,13 @@ def central_inference_server(
                             ),
                         })
                         return "ignored"
+                # Tag requests when accepted so a queue item that was waiting
+                # across a later model reload cannot be evaluated by the new
+                # weights under the old caller's transaction.
+                item["_central_evaluation_generation"] = int(
+                    evaluation_generation_publisher.epoch
+                )
+                item["_central_server_incarnation"] = server_incarnation
                 if pending_started_at is None:
                     pending_started_at = time.perf_counter()
                 item_positions = _request_positions(item)
@@ -2448,6 +2537,40 @@ def central_inference_server(
                 )
             )
             if not should_flush:
+                continue
+
+            # A load command can be processed while requests are already
+            # pending but have not reached a batch boundary. Reject those
+            # stale requests instead of silently scoring them with new weights.
+            current_generation = int(evaluation_generation_publisher.epoch)
+            current_incarnation = server_incarnation
+            current_pending = []
+            for req in pending:
+                if (
+                    not evaluation_generation_publisher.stable
+                    or int(req.get("_central_evaluation_generation", -1)) != current_generation
+                    or req.get("_central_server_incarnation") != current_incarnation
+                ):
+                    _put_response(req, {
+                        "ok": False,
+                        "error": (
+                            "Central inference request crossed a model-generation "
+                            "reload; retry the search under the current weights."
+                        ),
+                    })
+                else:
+                    current_pending.append(req)
+            pending = current_pending
+            pending_positions = sum(_request_positions(req) for req in pending)
+            pending_positions_by_model.clear()
+            for req in pending:
+                model_label = str(req.get("model_label", "learner"))
+                pending_positions_by_model[model_label] = (
+                    int(pending_positions_by_model.get(model_label, 0))
+                    + _request_positions(req)
+                )
+            if not pending:
+                pending_started_at = None
                 continue
 
             grouped = {}
