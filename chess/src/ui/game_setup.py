@@ -818,6 +818,8 @@ def _draw_home_player_card(
     side_color,
     use_mcts=None,
     simulations=None,
+    budget_mode="simulations",
+    move_time_seconds=1.0,
     mcts_rect=None,
     budget_minus_rect=None,
     budget_value_rect=None,
@@ -911,13 +913,19 @@ def _draw_home_player_card(
             active=enabled,
         )
         if budget_minus_rect and budget_value_rect and budget_plus_rect:
-            _draw_button(screen, budget_minus_rect, "−", fonts["h2"], hovered=bool(mouse_pos and budget_minus_rect.collidepoint(mouse_pos)), disabled=not enabled)
-            budget_text = f"{int(simulations or 0)} sims per move" if enabled else "MCTS budget inactive"
+            fixed_budget = str(budget_mode).strip().lower() != "time"
+            _draw_button(screen, budget_minus_rect, "−", fonts["h2"], hovered=bool(mouse_pos and budget_minus_rect.collidepoint(mouse_pos)), disabled=not enabled or not fixed_budget)
+            budget_text = (
+                f"{float(move_time_seconds):g}s per move"
+                if enabled and not fixed_budget
+                else f"{int(simulations or 0)} sims per move" if enabled
+                else "MCTS budget inactive"
+            )
             budget_surface = fonts["small"].render(_fit_text(fonts["small"], budget_text, budget_value_rect.width - px(14)), True, _TEXT if enabled else _SUBTLE)
             pygame.draw.rect(screen, (18, 26, 30), budget_value_rect, border_radius=px(9))
             pygame.draw.rect(screen, (54, 72, 76) if enabled else (39, 51, 55), budget_value_rect, width=max(1, px(1)), border_radius=px(9))
             screen.blit(budget_surface, budget_surface.get_rect(center=budget_value_rect.center))
-            _draw_button(screen, budget_plus_rect, "+", fonts["h2"], hovered=bool(mouse_pos and budget_plus_rect.collidepoint(mouse_pos)), disabled=not enabled)
+            _draw_button(screen, budget_plus_rect, "+", fonts["h2"], hovered=bool(mouse_pos and budget_plus_rect.collidepoint(mouse_pos)), disabled=not enabled or not fixed_budget)
 
     return {
         "model": model_rect,
@@ -2080,6 +2088,14 @@ def select_models(
     mcts_simulations_white = max(16, min(2000, int(mcts_simulations_white)))
     mcts_simulations_black = max(16, min(2000, int(mcts_simulations_black)))
     mcts_step = 16
+    rl_search_cfg = (config or {}).get("reinforcement_learning", {}) or {}
+    mcts_budget_mode = str(rl_search_cfg.get("mcts_budget_mode", "simulations")).strip().lower()
+    if mcts_budget_mode not in {"simulations", "time"}:
+        mcts_budget_mode = "simulations"
+    try:
+        mcts_move_time_seconds = max(0.001, float(rl_search_cfg.get("mcts_move_time_seconds", 1.0)))
+    except (TypeError, ValueError, OverflowError):
+        mcts_move_time_seconds = 1.0
     match_games = _safe_int(saved_preferences.get("match_games"), default=1)
     match_games = max(1, min(500, int(match_games or 1)))
     match_games_step = 2
@@ -2232,6 +2248,8 @@ def select_models(
             canvas, layout.white_card, layout.white_model_button, "White", white_model, models_dir, metadata_cache,
             fonts, scale, chess.WHITE, use_mcts=use_mcts_white and not white_human,
             simulations=mcts_simulations_white,
+            budget_mode=mcts_budget_mode,
+            move_time_seconds=mcts_move_time_seconds,
             mcts_rect=white_controls["mcts"] if white_controls else None,
             budget_minus_rect=white_controls["minus"] if white_controls else None,
             budget_value_rect=white_controls["value"] if white_controls else None,
@@ -2242,6 +2260,8 @@ def select_models(
             canvas, layout.black_card, layout.black_model_button, "Black", black_model, models_dir, metadata_cache,
             fonts, scale, chess.BLACK, use_mcts=use_mcts_black and not black_human,
             simulations=mcts_simulations_black,
+            budget_mode=mcts_budget_mode,
+            move_time_seconds=mcts_move_time_seconds,
             mcts_rect=black_controls["mcts"] if black_controls else None,
             budget_minus_rect=black_controls["minus"] if black_controls else None,
             budget_value_rect=black_controls["value"] if black_controls else None,
@@ -2337,7 +2357,7 @@ def select_models(
                 rect = pygame.Rect(settings_panel.left + px(28) + index * (col_w + gap), y, col_w, px(44))
                 settings_paces.append((value, rect))
                 _draw_button(canvas, rect, label, fonts["small"], hovered=pace_enabled and mouse_inside and rect.collidepoint(mouse_pos), active=abs(min_visible_move_seconds - value) < 0.01, disabled=not pace_enabled)
-            if pace_enabled:
+            if pace_enabled and mcts_budget_mode != "time":
                 y += px(82)
                 canvas.blit(fonts["card_label"].render("SEARCH BUDGET PRESETS", True, _ACCENT), (settings_panel.left + px(28), y))
                 y += px(34)
@@ -2431,7 +2451,7 @@ def select_models(
                             if rect.collidepoint(click):
                                 min_visible_move_seconds, changed = _visible_move_delay(value), True
                                 break
-                    if not changed:
+                    if not changed and mcts_budget_mode != "time":
                         for value, rect in settings_budgets:
                             if rect.collidepoint(click):
                                 mcts_simulations = mcts_simulations_white = mcts_simulations_black = value
@@ -2506,8 +2526,8 @@ def select_models(
                         continue
                 if white_controls:
                     if white_controls["mcts"].collidepoint(click): use_mcts_white = not use_mcts_white
-                    elif white_controls["minus"].collidepoint(click) and use_mcts_white: mcts_simulations_white = max(16, mcts_simulations_white - mcts_step)
-                    elif white_controls["plus"].collidepoint(click) and use_mcts_white: mcts_simulations_white = min(2000, mcts_simulations_white + mcts_step)
+                    elif white_controls["minus"].collidepoint(click) and use_mcts_white and mcts_budget_mode != "time": mcts_simulations_white = max(16, mcts_simulations_white - mcts_step)
+                    elif white_controls["plus"].collidepoint(click) and use_mcts_white and mcts_budget_mode != "time": mcts_simulations_white = min(2000, mcts_simulations_white + mcts_step)
                     else: white_controls = None
                     if white_controls:
                         use_mcts = bool(use_mcts_black if game_mode == "human_vs_ai" and human_color == chess.WHITE else use_mcts_white if game_mode == "human_vs_ai" else use_mcts_white and use_mcts_black)
@@ -2515,8 +2535,8 @@ def select_models(
                         continue
                 if black_controls:
                     if black_controls["mcts"].collidepoint(click): use_mcts_black = not use_mcts_black
-                    elif black_controls["minus"].collidepoint(click) and use_mcts_black: mcts_simulations_black = max(16, mcts_simulations_black - mcts_step)
-                    elif black_controls["plus"].collidepoint(click) and use_mcts_black: mcts_simulations_black = min(2000, mcts_simulations_black + mcts_step)
+                    elif black_controls["minus"].collidepoint(click) and use_mcts_black and mcts_budget_mode != "time": mcts_simulations_black = max(16, mcts_simulations_black - mcts_step)
+                    elif black_controls["plus"].collidepoint(click) and use_mcts_black and mcts_budget_mode != "time": mcts_simulations_black = min(2000, mcts_simulations_black + mcts_step)
                     else: black_controls = None
                     if black_controls:
                         use_mcts = bool(use_mcts_black if game_mode == "human_vs_ai" and human_color == chess.WHITE else use_mcts_white if game_mode == "human_vs_ai" else use_mcts_white and use_mcts_black)

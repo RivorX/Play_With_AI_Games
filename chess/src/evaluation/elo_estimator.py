@@ -75,6 +75,15 @@ def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict
     """Build deterministic MCTS settings for Stockfish Elo checks."""
     elo_mcts_config = dict(config or {})
     rl_config = dict(elo_mcts_config.get('reinforcement_learning', {}) or {})
+    elo_config = dict(elo_config or {})
+    if 'mcts_budget_mode' in elo_config:
+        rl_config['mcts_budget_mode'] = elo_config['mcts_budget_mode']
+    if 'mcts_move_time_seconds' in elo_config:
+        rl_config['mcts_move_time_seconds'] = elo_config['mcts_move_time_seconds']
+    if 'mcts_gumbel_root_schedule' in elo_config:
+        rl_config['mcts_gumbel_root_schedule'] = elo_config[
+            'mcts_gumbel_root_schedule'
+        ]
     rl_config['mcts_dynamic_budget_enabled'] = False
     rl_config['eval_mcts_dynamic_budget_enabled'] = False
     elo_mcts_config['reinforcement_learning'] = rl_config
@@ -444,6 +453,7 @@ class _ModelPlayer:
             self.simulations,
             position_counts=self._position_counts,
             repetition_known=True,
+            include_diagnostics=False,
         )
         if not search_result:
             return self._best_move_raw(board)  # Fallback
@@ -619,6 +629,7 @@ class _BatchedModelPlayer:
             game_states,
             num_simulations=self.simulations,
             add_root_noise=False,
+            include_diagnostics=False,
         )
 
         moves: list[chess.Move | None] = []
@@ -689,6 +700,14 @@ class EloEstimator:
         self.model = model
         self.elo_config = dict(elo_config or {})
         self.config = _build_elo_mcts_config(config, self.elo_config)
+        self.elo_config.setdefault(
+            "mcts_gumbel_root_schedule",
+            str(
+                (self.config.get("reinforcement_learning", {}) or {}).get(
+                    "mcts_gumbel_root_schedule", "standard"
+                )
+            ),
+        )
         self.device = device
         self.stockfish_path = stockfish_path
         self.stop_event = stop_event
@@ -1522,6 +1541,13 @@ class EloEstimator:
         self._local_cancel_event.clear()
         self._printed_central_mcts_clients = False
         self.model.eval()
+        budget_mode = str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower()
+        if use_mcts and budget_mode == "time":
+            # A per-move time budget is only comparable when concurrent searches
+            # do not contend for the same model/device. Keep timed Elo serial.
+            workers = 1
+            self.elo_config["workers"] = 1
+            self.elo_config["batch_model_moves"] = False
         if self._is_cancelled():
             return {
                 "estimated_elo": None,
@@ -1690,6 +1716,15 @@ class EloEstimator:
             f"probe={probe_games_cfg}, "
             f"focus>={focus_games_cfg}/selected level, then precision rounds"
         )
+        if use_mcts:
+            budget_mode = str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower()
+            if budget_mode == "time":
+                print(
+                    "  Info: MCTS budget: "
+                    f"{float(self.elo_config.get('mcts_move_time_seconds', 1.0)):.3g}s per move"
+                )
+            else:
+                print(f"  Info: MCTS budget: {int(simulations)} simulations per move")
         if bool(self.elo_config.get("elo_verbose_adaptive", False)):
             print(f"  Info: Elo candidate levels: {levels}")
         if bool(self.elo_config.get("paired_openings_enabled", True)):
@@ -2006,6 +2041,17 @@ class EloEstimator:
 
         result = {
             "estimated_elo": round(estimated_elo) if estimated_elo is not None else None,
+            "mcts_budget_mode": str(self.elo_config.get("mcts_budget_mode", "simulations")) if use_mcts else "raw_nn",
+            "mcts_move_time_seconds": float(self.elo_config.get("mcts_move_time_seconds", 1.0)) if use_mcts else None,
+            "mcts_simulations": int(simulations) if use_mcts and str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower() != "time" else 0,
+            "mcts_time_search_workers": int(workers) if use_mcts and budget_mode == "time" else None,
+            "mcts_root_schedule": (
+                "revisiting"
+                if use_mcts and budget_mode == "time"
+                else str(self.elo_config.get("mcts_gumbel_root_schedule", "standard"))
+                if use_mcts
+                else None
+            ),
             "results": results_per_level,
             "total_games": len(all_scores),
             "total_time": elapsed,

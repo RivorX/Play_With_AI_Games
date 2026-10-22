@@ -5,7 +5,7 @@ Implements a minimal-but-practical UCI command set:
 - uci / isready / ucinewgame / quit / stop
 - position startpos [moves ...]
 - position fen <fen> [moves ...]
-- go [movetime|wtime btime winc binc movestogo]
+- go [movetime|nodes|wtime btime winc binc movestogo]
 - setoption name UseMCTS|Simulations|MoveOverhead
 """
 
@@ -56,6 +56,7 @@ class UCIChessEngine:
             if simulations is not None
             else self.config.get("reinforcement_learning", {}).get("mcts_simulations", 200)
         )
+        self._simulations_explicit = simulations is not None
         self.move_overhead_ms = 50
 
         self.use_amp = bool(
@@ -218,6 +219,7 @@ class UCIChessEngine:
             "binc": 0,
             "movestogo": None,
             "movetime": None,
+            "nodes": None,
             "depth": None,
         }
         i = 0
@@ -233,34 +235,66 @@ class UCIChessEngine:
             i += 1
         return parsed
 
-    def _compute_simulations(self, go_args):
-        sims = max(1, int(self.simulations))
-        target_ms = None
+    def _compute_search_budget(self, go_args):
+        if go_args.get("nodes") is not None:
+            return {
+                "budget_mode": "simulations",
+                "num_simulations": max(1, min(5000, int(go_args["nodes"]))),
+                "time_limit_seconds": None,
+            }
 
-        if go_args["movetime"] is not None:
-            target_ms = max(50, go_args["movetime"] - self.move_overhead_ms)
-        elif go_args["wtime"] is not None and go_args["btime"] is not None:
+        target_ms = None
+        if go_args.get("movetime") is not None:
+            target_ms = max(1, int(go_args["movetime"]) - self.move_overhead_ms)
+        elif go_args.get("wtime") is not None and go_args.get("btime") is not None:
             remaining = go_args["wtime"] if self.board.turn == chess.WHITE else go_args["btime"]
             increment = go_args["winc"] if self.board.turn == chess.WHITE else go_args["binc"]
             moves_to_go = go_args["movestogo"] or 30
             alloc = remaining / max(1, moves_to_go) + 0.5 * increment
-            target_ms = max(50, int(alloc) - self.move_overhead_ms)
+            target_ms = max(1, int(alloc) - self.move_overhead_ms)
 
         if target_ms is not None:
-            # Scale around a 1-second baseline.
-            sims = int(round(self.simulations * (target_ms / 1000.0)))
-
-        return max(8, min(5000, sims))
+            return {
+                "budget_mode": "time",
+                "num_simulations": max(1, int(self.simulations)),
+                "time_limit_seconds": float(target_ms) / 1000.0,
+            }
+        if self._simulations_explicit:
+            return {
+                "budget_mode": "simulations",
+                "num_simulations": max(1, min(5000, int(self.simulations))),
+                "time_limit_seconds": None,
+            }
+        return {
+            "budget_mode": None,
+            "num_simulations": max(1, int(self.simulations)),
+            "time_limit_seconds": None,
+        }
 
     def _best_mcts_move(self, go_args):
         self._ensure_mcts()
-        sims = self._compute_simulations(go_args)
-        self._send(f"info string mcts simulations {sims}")
+        budget = self._compute_search_budget(go_args)
+        if budget["budget_mode"] == "time":
+            self._send(f"info string mcts time {budget['time_limit_seconds']:.3f}s")
+        elif budget["budget_mode"] == "simulations":
+            self._send(f"info string mcts simulations {budget['num_simulations']}")
+        else:
+            rl_cfg = self.config.get("reinforcement_learning", {}) or {}
+            if str(rl_cfg.get("mcts_budget_mode", "simulations")).strip().lower() == "time":
+                self._send(
+                    "info string mcts time "
+                    f"{float(rl_cfg.get('mcts_move_time_seconds', 1.0)):.3f}s"
+                )
+            else:
+                self._send(f"info string mcts simulations {budget['num_simulations']}")
         search_result = self.mcts.search(
             self.board,
-            sims,
+            budget["num_simulations"],
             position_counts=self.position_counts,
             repetition_known=self._repetition_history_known,
+            budget_mode=budget["budget_mode"],
+            time_limit_seconds=budget["time_limit_seconds"],
+            include_diagnostics=False,
         )
         if not search_result:
             return None
@@ -384,6 +418,7 @@ class UCIChessEngine:
         elif key == "simulations":
             try:
                 self.simulations = max(1, int(value))
+                self._simulations_explicit = True
                 self._send(f"info string Simulations set to {self.simulations}")
             except ValueError:
                 self._send("info string invalid Simulations value")
@@ -498,7 +533,7 @@ def main():
         "--simulations",
         type=int,
         default=None,
-        help="Override MCTS simulations per move.",
+        help="Use a fixed MCTS simulation budget unless UCI go supplies movetime/nodes.",
     )
     args = parser.parse_args()
 

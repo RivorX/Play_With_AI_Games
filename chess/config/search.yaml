@@ -11,6 +11,10 @@ reinforcement_learning:
     # `total` is the current default; Sequential-Halving quotas stay fresh.
     gumbel_reuse_q_scale: total
     simulations: 192
+    # Fixed simulations preserve existing behavior; time mode searches for the
+    # configured wall-clock budget and repeatedly revisits root actions. 
+    budget_mode: simulation             #simulation | time
+    move_time_seconds: 0.2
     # Interactive one-root searches otherwise shrink each batch to a quarter
     # of the remaining budget, creating many tiny GPU calls. 0 preserves that
     # legacy schedule; positive caps apply only to one root.

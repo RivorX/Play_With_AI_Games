@@ -10,6 +10,7 @@ Provides consistent table formatting for model checkpoints across:
 
 from datetime import datetime
 from pathlib import Path
+import math
 import re
 import torch
 
@@ -89,7 +90,44 @@ def _normalize_mcts_elo_by_sims(raw_value):
     return normalized
 
 
+def _normalize_mcts_elo_by_time(raw_value):
+    if not isinstance(raw_value, dict):
+        return {}
+    normalized = {}
+    for key, item in raw_value.items():
+        seconds = _safe_float(key)
+        if seconds is None and isinstance(item, dict):
+            seconds = _safe_float(item.get("time_limit_seconds"))
+        if seconds is None or not math.isfinite(seconds) or seconds <= 0:
+            continue
+        elo = _safe_float(item.get("elo", item.get("estimated_elo"))) if isinstance(item, dict) else _safe_float(item)
+        if elo is None:
+            continue
+        normalized_entry = {
+            "elo": float(elo),
+            "time_limit_seconds": float(seconds),
+            "timestamp": item.get("timestamp") if isinstance(item, dict) else None,
+        }
+        if isinstance(item, dict):
+            if item.get("source") is not None:
+                normalized_entry["source"] = str(item.get("source"))
+            if isinstance(item.get("settings"), dict):
+                normalized_entry["settings"] = dict(item["settings"])
+            standard_error = _safe_float(item.get("se"))
+            if standard_error is not None:
+                normalized_entry["se"] = float(standard_error)
+            ci95 = item.get("ci95")
+            if isinstance(ci95, (list, tuple)) and len(ci95) == 2:
+                ci_low = _safe_float(ci95[0])
+                ci_high = _safe_float(ci95[1])
+                if ci_low is not None and ci_high is not None:
+                    normalized_entry["ci95"] = [float(ci_low), float(ci_high)]
+        normalized[format(float(seconds), ".9g")] = normalized_entry
+    return normalized
+
+
 def _format_mcts_elo_summary(entry, max_items=3):
+    parts = []
     by_sims = entry.get("elo_mcts_by_simulations") or {}
     if by_sims:
         items = sorted(by_sims.items(), key=lambda kv: int(kv[0]), reverse=True)
@@ -100,8 +138,22 @@ def _format_mcts_elo_summary(entry, max_items=3):
         ]
         if len(items) > max_items:
             parts.append("...")
-        if parts:
-            return ",".join(parts)
+    if len(parts) < max_items:
+        by_time = entry.get("elo_mcts_by_time") or {}
+        time_items = sorted(
+            by_time.items(),
+            key=lambda item: str((item[1] or {}).get("timestamp") or ""),
+            reverse=True,
+        ) if isinstance(by_time, dict) else []
+        for seconds, info in time_items:
+            if len(parts) >= max_items or not isinstance(info, dict) or info.get("elo") is None:
+                continue
+            try:
+                parts.append(f"{int(round(float(info['elo'])))} | {float(seconds):g}s")
+            except (TypeError, ValueError, OverflowError):
+                continue
+    if parts:
+        return ",".join(parts)
     elo_mcts = entry.get("elo_mcts")
     if elo_mcts is None:
         return "n/a"
@@ -130,6 +182,22 @@ def _best_mcts_elo_with_sims(entry):
     if elo_mcts is not None:
         return elo_mcts, sims
     return None, None
+
+
+def _latest_mcts_elo_by_time(entry):
+    by_time = entry.get("elo_mcts_by_time") or {}
+    if not isinstance(by_time, dict):
+        return None, None
+    candidates = [
+        (str(info.get("timestamp") or ""), _safe_float(info.get("time_limit_seconds", seconds)), _safe_float(info.get("elo")))
+        for seconds, info in by_time.items()
+        if isinstance(info, dict)
+    ]
+    candidates = [item for item in candidates if item[1] is not None and item[2] is not None]
+    if not candidates:
+        return None, None
+    _, seconds, elo = max(candidates, key=lambda item: item[0])
+    return elo, seconds
 
 
 def _set_legacy_nn_elo(checkpoint, elo_value, *, std_error=None, ci_low=None, ci_high=None, epoch=None, source=None, timestamp=None, settings=None):
@@ -200,6 +268,10 @@ def format_elo_summary(entry, *, legacy_label=True):
             parts.append(f"MCTS {mcts_text} | {int(sims)}")
         else:
             parts.append(f"MCTS {mcts_text}")
+    timed_elo, seconds = _latest_mcts_elo_by_time(entry)
+    timed_text = _format_elo_number(timed_elo)
+    if timed_text is not None:
+        parts.append(f"MCTS {timed_text} | {float(seconds):g}s")
 
     if parts:
         return " | ".join(parts)
@@ -225,6 +297,10 @@ def format_elo_stat_parts(entry):
     if mcts_text is not None:
         value = f"{mcts_text} | {int(sims)}" if sims is not None else mcts_text
         parts.append(("MCTS", value))
+    timed_elo, seconds = _latest_mcts_elo_by_time(entry)
+    timed_text = _format_elo_number(timed_elo)
+    if timed_text is not None:
+        parts.append(("MCTS", f"{timed_text} | {float(seconds):g}s"))
 
     if parts:
         return parts
@@ -242,6 +318,8 @@ def persist_checkpoint_elo_metadata(
     use_mcts,
     simulations,
     sf_time,
+    budget_mode="simulations",
+    time_limit_seconds=None,
     source="eval_elo_manual",
     elo_result=None,
 ):
@@ -260,6 +338,14 @@ def persist_checkpoint_elo_metadata(
         return False, "Checkpoint has no model_state_dict"
 
     mode = "mcts" if bool(use_mcts) else "nn"
+    timed_mcts = bool(mode == "mcts" and str(budget_mode).strip().lower() == "time")
+    if timed_mcts:
+        try:
+            time_limit_seconds = float(time_limit_seconds)
+        except (TypeError, ValueError, OverflowError):
+            return False, "Timed MCTS Elo requires a positive time_limit_seconds"
+        if not math.isfinite(time_limit_seconds) or time_limit_seconds <= 0.0:
+            return False, "Timed MCTS Elo requires a positive time_limit_seconds"
     mode_prefix = "estimated_elo_mcts" if mode == "mcts" else "estimated_elo_nn"
     # A checkpoint represents one unchanged network. Keep one current NN Elo
     # and one current MCTS Elo per simulation budget, never estimator history.
@@ -272,7 +358,9 @@ def persist_checkpoint_elo_metadata(
         "levels": [int(x) for x in levels],
         "games_per_level": int(games_per_level),
         "use_mcts": bool(use_mcts),
-        "simulations": int(simulations) if bool(use_mcts) else 0,
+        "budget_mode": str(budget_mode).strip().lower() if bool(use_mcts) else "raw_nn",
+        "simulations": int(simulations) if bool(use_mcts) and not timed_mcts else 0,
+        "time_limit_seconds": float(time_limit_seconds) if timed_mcts else None,
         "stockfish_time_limit": float(sf_time),
     }
     if isinstance(elo_result, dict):
@@ -290,6 +378,7 @@ def persist_checkpoint_elo_metadata(
             "rating_bracketed", "rating_bracket", "rating_range_status",
             "rating_censored", "elo_lower_bound", "elo_upper_bound",
             "rating_levels", "rating_games", "probe_only_games",
+            "mcts_root_schedule", "mcts_time_search_workers",
         ):
             if elo_result.get(key) is not None:
                 settings[key] = elo_result.get(key)
@@ -298,18 +387,35 @@ def persist_checkpoint_elo_metadata(
     ci_low = _safe_float(elo_ci95[0]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
     ci_high = _safe_float(elo_ci95[1]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
 
-    checkpoint[mode_prefix] = float(elo_value)
-    checkpoint[f"last_{mode_prefix}"] = float(elo_value)
-    checkpoint[f"{mode_prefix}_timestamp"] = now
-    checkpoint[f"{mode_prefix}_settings"] = settings
-    checkpoint[f"{mode_prefix}_source"] = str(source)
-    if elo_std_error is not None:
-        checkpoint[f"{mode_prefix}_se"] = float(elo_std_error)
-    if ci_low is not None:
-        checkpoint[f"{mode_prefix}_ci95_low"] = float(ci_low)
-    if ci_high is not None:
-        checkpoint[f"{mode_prefix}_ci95_high"] = float(ci_high)
-    if mode == "mcts":
+    if not timed_mcts:
+        checkpoint[mode_prefix] = float(elo_value)
+        checkpoint[f"last_{mode_prefix}"] = float(elo_value)
+        checkpoint[f"{mode_prefix}_timestamp"] = now
+        checkpoint[f"{mode_prefix}_settings"] = settings
+        checkpoint[f"{mode_prefix}_source"] = str(source)
+        if elo_std_error is not None:
+            checkpoint[f"{mode_prefix}_se"] = float(elo_std_error)
+        if ci_low is not None:
+            checkpoint[f"{mode_prefix}_ci95_low"] = float(ci_low)
+        if ci_high is not None:
+            checkpoint[f"{mode_prefix}_ci95_high"] = float(ci_high)
+    if mode == "mcts" and timed_mcts:
+        budget_key = format(float(time_limit_seconds), ".9g")
+        by_time = _normalize_mcts_elo_by_time(checkpoint.get("estimated_elo_mcts_by_time"))
+        time_entry = {
+            "elo": float(elo_value),
+            "time_limit_seconds": float(time_limit_seconds),
+            "timestamp": now,
+            "source": str(source),
+            "settings": settings,
+        }
+        if elo_std_error is not None:
+            time_entry["se"] = float(elo_std_error)
+        if ci_low is not None and ci_high is not None:
+            time_entry["ci95"] = [float(ci_low), float(ci_high)]
+        by_time[budget_key] = time_entry
+        checkpoint["estimated_elo_mcts_by_time"] = by_time
+    elif mode == "mcts":
         checkpoint["estimated_elo_mcts_simulations"] = int(simulations)
         by_sims = _normalize_mcts_elo_by_sims(checkpoint.get("estimated_elo_mcts_by_simulations"))
         sim_entry = {
@@ -330,7 +436,7 @@ def persist_checkpoint_elo_metadata(
 
     epoch_raw = checkpoint.get("epoch")
     epoch_idx = _safe_int(epoch_raw)
-    if epoch_idx is not None:
+    if epoch_idx is not None and not timed_mcts:
         checkpoint[f"{mode_prefix}_epoch"] = epoch_idx + 1
     mode_epoch = _safe_int(checkpoint.get(f"{mode_prefix}_epoch"))
 
@@ -346,7 +452,7 @@ def persist_checkpoint_elo_metadata(
             timestamp=now,
             settings=settings,
         )
-    else:
+    elif not timed_mcts:
         _sync_legacy_elo_from_nn(checkpoint)
 
     try:
@@ -408,6 +514,7 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
         "elo_nn_source": None,
         "elo_mcts": None,
         "elo_mcts_simulations": None,
+        "elo_mcts_by_time": {},
         "score_rate": None,
         "eval_true_win_rate": None,
         "swa": False,
@@ -466,6 +573,9 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
     entry["elo_mcts_simulations"] = _safe_int(checkpoint.get("estimated_elo_mcts_simulations"))
     entry["elo_mcts_by_simulations"] = _normalize_mcts_elo_by_sims(
         checkpoint.get("estimated_elo_mcts_by_simulations")
+    )
+    entry["elo_mcts_by_time"] = _normalize_mcts_elo_by_time(
+        checkpoint.get("estimated_elo_mcts_by_time")
     )
     if legacy_elo is not None:
         mode = _checkpoint_elo_mode(checkpoint)

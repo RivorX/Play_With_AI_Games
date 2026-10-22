@@ -440,6 +440,10 @@ def choose_eval_settings(elo_cfg):
     default_games = int(elo_cfg.get("adaptive_focus_games_per_level", 20))
     default_use_mcts = False
     default_sims = int(elo_cfg.get("mcts_eval_simulations", 100))
+    default_budget_mode = str(elo_cfg.get("mcts_budget_mode", "simulations")).strip().lower()
+    if default_budget_mode not in {"simulations", "time"}:
+        default_budget_mode = "simulations"
+    default_move_time = float(elo_cfg.get("mcts_move_time_seconds", 1.0))
     default_sf_time = float(elo_cfg.get("stockfish_time_limit", 0.05))
     default_max_moves = int(elo_cfg.get("max_moves", 150))
     default_sf_path = str(elo_cfg.get("stockfish_path", "stockfish"))
@@ -469,8 +473,22 @@ def choose_eval_settings(elo_cfg):
         eval_modes = ["mcts"] if default_use_mcts else ["nn"]
 
     simulations = default_sims
+    budget_mode = default_budget_mode
+    move_time_seconds = default_move_time
     if "mcts" in eval_modes:
-        simulations = _prompt_int("MCTS simulations per move", default_sims, min_value=1)
+        if _is_tty():
+            budget_choice = _prompt_menu(
+                "MCTS move budget:",
+                ["Fixed simulations", "Wall-clock time"],
+                default_idx=1 if default_budget_mode == "time" else 0,
+            )
+            budget_mode = "time" if budget_choice == 1 else "simulations"
+        if budget_mode == "time":
+            move_time_seconds = _prompt_float(
+                "MCTS time per move (seconds)", default_move_time, min_value=0.001
+            )
+        else:
+            simulations = _prompt_int("MCTS simulations per move", default_sims, min_value=1)
 
     sf_time = _prompt_float("Stockfish time per move (seconds)", default_sf_time, min_value=0.0)
     max_moves = _prompt_int("Max moves per game", default_max_moves, min_value=1)
@@ -483,6 +501,8 @@ def choose_eval_settings(elo_cfg):
         "use_mcts": "mcts" in eval_modes and len(eval_modes) == 1,
         "eval_modes": eval_modes,
         "simulations": simulations,
+        "budget_mode": budget_mode,
+        "move_time_seconds": move_time_seconds,
         "sf_time": sf_time,
         "max_moves": max_moves,
         "sf_path": sf_path,
@@ -722,13 +742,19 @@ def main():
         device = torch.device(cfg_device)
     print(f"Using device from config: {device}")
 
-    elo_cfg = config.get("elo_estimation", {})
+    elo_cfg = dict(config.get("elo_estimation", {}) or {})
+    rl_cfg = config.get("reinforcement_learning", {}) or {}
+    elo_cfg.setdefault("mcts_budget_mode", rl_cfg.get("mcts_budget_mode", "simulations"))
+    elo_cfg.setdefault("mcts_move_time_seconds", rl_cfg.get("mcts_move_time_seconds", 1.0))
+    elo_cfg.setdefault("mcts_gumbel_root_schedule", rl_cfg.get("mcts_gumbel_root_schedule", "standard"))
     settings = choose_eval_settings(elo_cfg)
     levels = settings["levels"]
     games_per_level = settings["games_per_level"]
     workers = settings["workers"]
     eval_modes = list(settings.get("eval_modes") or (["mcts"] if settings.get("use_mcts") else ["nn"]))
     simulations = settings["simulations"]
+    budget_mode = settings["budget_mode"]
+    move_time_seconds = settings["move_time_seconds"]
     sf_time = settings["sf_time"]
     max_moves = settings["max_moves"]
     sf_path = settings["sf_path"]
@@ -776,6 +802,8 @@ def main():
             games_per_level=games_per_level,
             use_mcts=mode_use_mcts,
             simulations=simulations,
+            budget_mode=budget_mode,
+            time_limit_seconds=move_time_seconds,
             sf_time=sf_time,
             max_moves=max_moves,
             sf_path=sf_path,
@@ -801,12 +829,22 @@ def main():
     if "nn" in eval_modes:
         mode_labels.append("Raw NN")
     if "mcts" in eval_modes:
-        mode_labels.append(f"MCTS ({simulations} sims)")
+        mode_labels.append(
+            f"MCTS ({move_time_seconds:g}s/move)"
+            if budget_mode == "time"
+            else f"MCTS ({simulations} sims)"
+        )
     mode_str = " + ".join(mode_labels)
     if workers > 0:
         workers_str = f"{workers} workers" if workers > 1 else "sequential"
     else:
         workers_str = "auto"
+    if budget_mode == "time" and "mcts" in eval_modes:
+        workers_str = (
+            "Raw NN auto; timed MCTS sequential"
+            if "nn" in eval_modes
+            else "1 worker (timed MCTS)"
+        )
 
     _print_block("Elo Estimation Plan")
     print(f"Models:         {len(selected_paths)}")
@@ -814,7 +852,10 @@ def main():
     print(f"Total games:    <= {total_games} hard safety cap (usually stops earlier)")
     print(f"Mode:           {mode_str}")
     if "mcts" in eval_modes:
-        print(f"MCTS sims:      {simulations}")
+        if budget_mode == "time":
+            print(f"MCTS time:      {move_time_seconds:g}s/move")
+        else:
+            print(f"MCTS sims:      {simulations}")
     for mode_name in eval_modes:
         runtime_cfg = mode_runtime_configs[mode_name]
         label = "MCTS adaptive" if mode_name == "mcts" else "NN adaptive"
@@ -869,18 +910,34 @@ def main():
 
         for eval_mode in eval_modes:
             mode_use_mcts = eval_mode == "mcts"
-            mode_label_text = mode_label(mode_use_mcts, simulations)
+            mode_label_text = mode_label(
+                mode_use_mcts,
+                simulations,
+                budget_mode=budget_mode,
+                time_limit_seconds=move_time_seconds,
+            )
             print(f"  Mode: {mode_label_text}")
 
             mode_workers = resolve_eval_workers(workers, mode_use_mcts, elo_cfg)
+            if mode_use_mcts and budget_mode == "time":
+                mode_workers = 1
             mode_elo_cfg = dict(mode_runtime_configs[eval_mode])
             mode_elo_cfg["workers"] = int(mode_workers)
-            initial_elo = entry.get("elo_mcts" if mode_use_mcts else "elo_nn")
+            initial_elo = (
+                None if mode_use_mcts and budget_mode == "time"
+                else entry.get("elo_mcts" if mode_use_mcts else "elo_nn")
+            )
             if mode_use_mcts:
-                by_sims = dict(entry.get("elo_mcts_by_simulations") or {})
-                sims_entry = by_sims.get(int(simulations)) or by_sims.get(str(int(simulations)))
-                if isinstance(sims_entry, dict) and _safe_float(sims_entry.get("elo")) is not None:
-                    initial_elo = _safe_float(sims_entry.get("elo"))
+                if budget_mode == "time":
+                    by_time = dict(entry.get("elo_mcts_by_time") or {})
+                    time_entry = by_time.get(format(float(move_time_seconds), ".9g"))
+                    if isinstance(time_entry, dict) and _safe_float(time_entry.get("elo")) is not None:
+                        initial_elo = _safe_float(time_entry.get("elo"))
+                else:
+                    by_sims = dict(entry.get("elo_mcts_by_simulations") or {})
+                    sims_entry = by_sims.get(int(simulations)) or by_sims.get(str(int(simulations)))
+                    if isinstance(sims_entry, dict) and _safe_float(sims_entry.get("elo")) is not None:
+                        initial_elo = _safe_float(sims_entry.get("elo"))
             if _safe_float(initial_elo) is not None:
                 mode_elo_cfg["adaptive_initial_elo"] = float(initial_elo)
                 mode_elo_cfg["adaptive_initial_elo_source"] = (
@@ -902,7 +959,9 @@ def main():
             result["model_path"] = str(model_path)
             result["mode"] = "mcts" if mode_use_mcts else "nn"
             result["mode_label"] = mode_label_text
-            result["mcts_simulations"] = int(simulations) if mode_use_mcts else 0
+            result["mcts_simulations"] = int(simulations) if mode_use_mcts and budget_mode == "simulations" else 0
+            result["mcts_budget_mode"] = budget_mode if mode_use_mcts else "raw_nn"
+            result["mcts_move_time_seconds"] = move_time_seconds if mode_use_mcts else None
             all_results.append(result)
 
             elo = result.get("estimated_elo")
@@ -915,6 +974,8 @@ def main():
                 games_per_level=int(result.get("games_per_level_requested", 0) or 0),
                 use_mcts=mode_use_mcts,
                 simulations=simulations,
+                budget_mode=budget_mode,
+                time_limit_seconds=move_time_seconds,
                 sf_time=sf_time,
                 source="eval_elo_manual",
                 elo_result=result,

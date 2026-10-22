@@ -629,6 +629,8 @@ def _run_il_final_elo(
     if estimated_elo is not None:
         use_mcts = bool(elo_config.get("use_mcts", False))
         simulations = int(elo_config.get("mcts_simulations", 0) or 0)
+        if use_mcts and str(elo_config.get("mcts_budget_mode", "simulations")).strip().lower() == "time":
+            simulations = 0
         mode_key = "mcts" if use_mcts else "nn"
         logger.record_il_mode_elo(
             epoch_num,
@@ -640,7 +642,11 @@ def _run_il_final_elo(
             std_error=elo_result.get("elo_std_error"),
             ci95=elo_result.get("elo_ci95"),
         )
-        mode_label = f"MCTS {simulations} sims" if use_mcts else "raw NN"
+        mode_label = (
+            f"MCTS {float(elo_config.get('mcts_move_time_seconds', 1.0)):g}s/move"
+            if use_mcts and str(elo_config.get("mcts_budget_mode", "simulations")).strip().lower() == "time"
+            else f"MCTS {simulations} sims" if use_mcts else "raw NN"
+        )
         print(f"Final IL Estimated Elo ({model_label}, {mode_label}): {int(round(float(estimated_elo)))}")
         if elo_result.get("local_rating_level") is not None:
             print(
@@ -2061,7 +2067,11 @@ def main(argv=None):
                 "Transfer warmup requested but no changed trainable tensors were detected; "
                 "running without freeze."
             )
-    elo_config = config.get("elo_estimation", {})
+    elo_config = dict(config.get("elo_estimation", {}) or {})
+    rl_elo_budget = config.get("reinforcement_learning", {}) or {}
+    elo_config.setdefault("mcts_budget_mode", rl_elo_budget.get("mcts_budget_mode", "simulations"))
+    elo_config.setdefault("mcts_move_time_seconds", rl_elo_budget.get("mcts_move_time_seconds", 1.0))
+    elo_config.setdefault("mcts_gumbel_root_schedule", rl_elo_budget.get("mcts_gumbel_root_schedule", "standard"))
     elo_config_il = build_il_periodic_elo_config(elo_config)
     if elo_config_il.get("use_mcts", False):
         print("Note: IL forces elo_estimation.use_mcts=False for speed.")
@@ -2086,7 +2096,11 @@ def main(argv=None):
             f"time={float(final_elo_config_il_mcts.get('stockfish_time_limit', 0.0)):.2f}s, "
             "mcts_profile="
             + "/".join(
-                str(int(cfg.get("mcts_simulations", 0) or 0))
+                (
+                    f"{float(cfg.get('mcts_move_time_seconds', 1.0)):g}s/move"
+                    if str(cfg.get("mcts_budget_mode", "simulations")).strip().lower() == "time"
+                    else f"{int(cfg.get('mcts_simulations', 0) or 0)} sims"
+                )
                 for cfg in final_elo_config_il_mcts_profile
             )
         )
@@ -2917,7 +2931,11 @@ def main(argv=None):
             print(
                 "Fresh evaluation: Raw NN, then final-only MCTS profile "
                 + "/".join(
-                    str(int(cfg.get("mcts_simulations", 0) or 0))
+                    (
+                        f"{float(cfg.get('mcts_move_time_seconds', 1.0)):g}s/move"
+                        if str(cfg.get("mcts_budget_mode", "simulations")).strip().lower() == "time"
+                        else f"{int(cfg.get('mcts_simulations', 0) or 0)} sims"
+                    )
                     for cfg in final_elo_config_il_mcts_profile
                 )
             )
@@ -2927,7 +2945,11 @@ def main(argv=None):
             final_best_mode_plan.extend(
                 (
                     mode_cfg,
-                    f"MCTS @{int(mode_cfg.get('mcts_simulations', 0) or 0)}",
+                    (
+                        f"MCTS @{float(mode_cfg.get('mcts_move_time_seconds', 1.0)):g}s/move"
+                        if str(mode_cfg.get("mcts_budget_mode", "simulations")).strip().lower() == "time"
+                        else f"MCTS @{int(mode_cfg.get('mcts_simulations', 0) or 0)}"
+                    ),
                 )
                 for mode_cfg in final_elo_config_il_mcts_profile
             )

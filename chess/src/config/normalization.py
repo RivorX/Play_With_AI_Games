@@ -274,6 +274,7 @@ _RL_SECTION_PREFIXES = {
 _RL_KEY_ALIASES = {
     'self_play.max_batch_games_per_worker': 'max_batch_games_per_worker',
     'self_play.syzygy_paths': 'syzygy_paths',
+    'self_play.syzygy_auto_download_enabled': 'syzygy_auto_download_enabled',
     'losses.policy': 'policy_loss_weight',
     'losses.value': 'value_loss_weight',
     'losses.value_scalar_aux': 'value_scalar_aux_loss_weight',
@@ -293,7 +294,7 @@ _RL_DEFAULTS = {
     'self_play_compile_lock_timeout_s': 900, 'self_play_save_every_games': 1,
     'self_play_auto_claim_draw': True, 'self_play_claim_repetition_after_moves': 64,
     'self_play_claim_draw_after_moves': 120, 'syzygy_enabled': True,
-    'syzygy_auto_download_enabled': True, 'self_play_progress_interval_games': 5,
+    'syzygy_auto_download_enabled': False, 'self_play_progress_interval_games': 5,
     'self_play_opening_diversity_enabled': True,
     'self_play_opening_pool_path': None, 'self_play_opening_pool_sha256': None,
     # A bounded archive-start share improves value-target independence without
@@ -312,6 +313,9 @@ _RL_DEFAULTS = {
     'replay_reanalyse_min_age': 2, 'replay_reanalyse_min_staleness': 2,
     'replay_reanalyse_max_refreshes': 2, 'replay_reanalyse_simulations': 192,
     'replay_reanalyse_batch_positions': 16,
+    # Search budgets remain simulation-based unless a run explicitly selects
+    # the wall-clock mode. The seconds value is the per-root target in that mode.
+    'mcts_budget_mode': 'simulations', 'mcts_move_time_seconds': 1.0,
     # Importing PyTorch commits about 1 GiB per Windows process even when the
     # central-inference worker holds no model. Nine workers still provide broad
     # 48-game request batches while avoiding the 18-process RAM cliff on 32 GiB.
@@ -451,6 +455,10 @@ def normalize_rl_config(config):
     if not has_grouped_rl:
         rl_cfg.setdefault('mcts_algorithm', 'gumbel')
         _validate_mcts_algorithm(rl_cfg['mcts_algorithm'])
+        rl_cfg.setdefault('syzygy_auto_download_enabled', False)
+        rl_cfg.setdefault('mcts_budget_mode', 'simulations')
+        rl_cfg.setdefault('mcts_move_time_seconds', 1.0)
+        _validate_mcts_budget(rl_cfg)
         rl_cfg.setdefault('mcts_gumbel_root_schedule', 'standard')
         _validate_gumbel_root_schedule(rl_cfg['mcts_gumbel_root_schedule'])
         rl_cfg.setdefault('mcts_local_cuda_graph_forward', None)
@@ -487,6 +495,7 @@ def normalize_rl_config(config):
     _validate_gumbel_root_schedule(normalized['mcts_gumbel_root_schedule'])
     _validate_local_cuda_graph_forward(normalized['mcts_local_cuda_graph_forward'])
     _validate_gumbel_reuse_q_scale(normalized['mcts_gumbel_reuse_q_scale'])
+    _validate_mcts_budget(normalized)
     normalized['search_control_effective_archive_capacity'] = (
         _effective_search_control_archive_capacity(normalized)
     )
@@ -528,6 +537,32 @@ def _validate_mcts_algorithm(value):
             "reinforcement_learning.search.algorithm must be 'gumbel'; "
             f"got unsupported value {value!r}"
         )
+
+
+def _validate_mcts_budget(rl_cfg):
+    mode = rl_cfg.get('mcts_budget_mode', 'simulations')
+    if not isinstance(mode, str) or mode.strip().lower() not in {'simulations', 'time'}:
+        raise ValueError(
+            "reinforcement_learning.search.budget_mode must be 'simulations' or 'time'; "
+            f'got {mode!r}'
+        )
+    rl_cfg['mcts_budget_mode'] = mode.strip().lower()
+    raw_seconds = rl_cfg.get('mcts_move_time_seconds', 1.0)
+    if isinstance(raw_seconds, bool):
+        raise ValueError(
+            'reinforcement_learning.search.move_time_seconds must be a finite positive number'
+        )
+    try:
+        seconds = float(raw_seconds)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            'reinforcement_learning.search.move_time_seconds must be a finite positive number'
+        ) from exc
+    if not math.isfinite(seconds) or seconds <= 0.0:
+        raise ValueError(
+            'reinforcement_learning.search.move_time_seconds must be a finite positive number'
+        )
+    rl_cfg['mcts_move_time_seconds'] = seconds
 
 
 def _preflight_configured_opening_pool(config, rl_cfg):

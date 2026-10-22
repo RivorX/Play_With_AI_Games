@@ -970,6 +970,17 @@ class _SyzygyOracle:
         except Exception:
             return None
 
+    def probe_dtz(self, board):
+        """Return a local DTZ value when both WDL and DTZ tables cover it."""
+        if not self.can_probe(board):
+            return None
+        if chess.piece_count(board) not in self.dtz_piece_counts:
+            return None
+        try:
+            return self._probe_dtz_fen(chess.board_fen(board))
+        except Exception:
+            return None
+
     def probe_value(self, board):
         """Return an exact side-to-move value, or None when WDL is insufficient."""
         wdl = self.probe_wdl(board)
@@ -4842,7 +4853,176 @@ class MultiGameBatchMCTS:
                 ))
         return summary
 
-    def search_many(self, game_states, num_simulations, add_root_noise=False, return_search_metadata=False):
+    def _syzygy_root_result(self, root, board, position_counts, repetition_known):
+        """Return a safe root move when forced or locally provable by Syzygy.
+
+        Tablebase values are side-to-move values. Root history matters because
+        the tablebase does not know whether a child move itself claims a
+        threefold draw, so WDL shortcuts require complete history and no
+        already-repeated root. Uncovered choices fall back to ordinary MCTS,
+        except that one proven winning child is sufficient to prove a win.
+        """
+        legal_moves = (
+            tuple(root.edges.moves)
+            if root.expanded and root.edges is not None
+            else root.get_legal_moves()
+        )
+        if not legal_moves:
+            return None
+        root_key = _board_position_key(board)
+        root_occurrences = int((position_counts or {}).get(root_key, 0))
+        # The caller owns claimable/forced root draws. Do not disguise one as
+        # a forced move or tablebase result in this lightweight path.
+        if (
+            int(board.halfmove_clock) >= 100
+            or chess.is_insufficient_material(board)
+            or (repetition_known and root_occurrences >= 3)
+        ):
+            return None
+        if len(legal_moves) == 1:
+            return {
+                'selected_move': legal_moves[0],
+                'legal_moves': legal_moves,
+                'root_values': None,
+                'best_value': None,
+                'stop_reason': 'forced_move',
+            }
+        if self.syzygy is None or not self.syzygy.enabled or not repetition_known:
+            return None
+        if any(int(count) > 1 for count in (position_counts or {}).values()):
+            return None
+
+        values = []
+        proven_zeroing_wins = []
+        immediate_mates = []
+        uncovered_child = False
+        for move in legal_moves:
+            child_board = _copy_board_fast(board)
+            chess.apply_move(child_board, move)
+            child_key = _board_position_key(child_board)
+            child_clock = int(child_board.halfmove_clock)
+            child_repetitions = int((position_counts or {}).get(child_key, 0))
+
+            # Checkmate takes precedence over both the 50-move claim and a
+            # third-occurrence draw (the normal leaf evaluator does the same).
+            if chess.is_check(child_board) and not chess.legal_moves(child_board):
+                immediate_mates.append(move)
+                values.append(1.0)
+                continue
+
+            if (
+                child_clock >= 100
+                or child_repetitions >= 2
+                or chess.is_insufficient_material(child_board)
+            ):
+                # Search treats a claimable fifty-move/threefold descendant as
+                # a draw before consulting Syzygy (unless it is checkmate).
+                child_value = 0.0
+            else:
+                child_value = self.syzygy.probe_value(child_board)
+            if child_value is None:
+                uncovered_child = True
+                values.append(None)
+                continue
+            if child_value == -1.0 and child_clock == 0 and child_repetitions < 2:
+                # WDL is exact immediately after a zeroing move.  A single
+                # such losing child proves this root has a winning action even
+                # when quiet alternatives fall outside the local TB coverage.
+                proven_zeroing_wins.append((move, self.syzygy.probe_dtz(child_board)))
+            values.append(-float(child_value))
+
+        if immediate_mates:
+            return {
+                'selected_move': immediate_mates[0],
+                'legal_moves': legal_moves,
+                'root_values': None,
+                'best_value': 1.0,
+                'stop_reason': 'checkmate_in_one',
+            }
+        if proven_zeroing_wins:
+            if len(proven_zeroing_wins) == 1:
+                selected_move = proven_zeroing_wins[0][0]
+            elif all(dtz is not None and dtz < 0 for _, dtz in proven_zeroing_wins):
+                # A losing child has negative DTZ. The shortest safe zeroing
+                # line is the closest-to-zero losing DTZ among winning moves.
+                selected_move = min(
+                    proven_zeroing_wins,
+                    key=lambda item: abs(int(item[1])),
+                )[0]
+            else:
+                # Several exact winning moves but incomplete DTZ coverage: let
+                # normal Gumbel search compare them instead of cycling through
+                # an arbitrary legal-order tie.
+                return None
+            return {
+                'selected_move': selected_move,
+                'legal_moves': legal_moves,
+                'root_values': None,
+                'best_value': 1.0,
+                'stop_reason': 'syzygy_proven_root_win',
+            }
+        if uncovered_child:
+            return None
+
+        best_value = max(values)
+        best_indices = [
+            index for index, value in enumerate(values) if value == best_value
+        ]
+        if best_value > 0.0 and len(best_indices) > 1:
+            # Root-winning actions lead to losing (negative-DTZ) child
+            # positions. A safe DTZ ordering avoids repeatedly choosing an
+            # arbitrary WDL-equivalent line.
+            # Re-probe only tied winners. Their WDL probes were exact above;
+            # use each child's signed DTZ (rather than the root-side sign).
+            tied_dtz = []
+            for index in best_indices:
+                child_board = _copy_board_fast(board)
+                chess.apply_move(child_board, legal_moves[index])
+                tied_dtz.append(self.syzygy.probe_dtz(child_board))
+            if not all(value is not None and value < 0 for value in tied_dtz):
+                return None
+            selected_offset = min(
+                range(len(best_indices)),
+                key=lambda offset: abs(int(tied_dtz[offset])),
+            )
+            best_index = best_indices[selected_offset]
+        elif best_value < 0.0 and len(best_indices) > 1:
+            # In a forced loss, prefer delaying the opponent's winning
+            # zeroing progress; child DTZ is positive because the opponent is
+            # the winning side to move.
+            tied_dtz = []
+            for index in best_indices:
+                child_board = _copy_board_fast(board)
+                chess.apply_move(child_board, legal_moves[index])
+                tied_dtz.append(self.syzygy.probe_dtz(child_board))
+            if not all(value is not None and value > 0 for value in tied_dtz):
+                return None
+            selected_offset = max(
+                range(len(best_indices)),
+                key=lambda offset: int(tied_dtz[offset]),
+            )
+            best_index = best_indices[selected_offset]
+        else:
+            best_index = best_indices[0]
+        return {
+            'selected_move': legal_moves[best_index],
+            'legal_moves': legal_moves,
+            'root_values': tuple(values),
+            'best_value': float(best_value),
+            'stop_reason': 'syzygy_exact_root',
+        }
+
+    def search_many(
+        self,
+        game_states,
+        num_simulations,
+        add_root_noise=False,
+        return_search_metadata=False,
+        *,
+        time_limit_seconds=None,
+        budget_mode=None,
+        include_diagnostics=True,
+    ):
         """
         Run MCTS for multiple games and batch leaf evaluations across games.
 
@@ -4852,6 +5032,35 @@ class MultiGameBatchMCTS:
         Returns:
             List[Dict[chess.Move, float]] search weights for each game in order
         """
+        rl_cfg = self.config.get('reinforcement_learning', {}) or {}
+        if budget_mode is None:
+            if time_limit_seconds is not None:
+                effective_budget_mode = 'time'
+            else:
+                effective_budget_mode = str(
+                    rl_cfg.get('mcts_budget_mode', 'simulations')
+                ).strip().lower()
+        else:
+            effective_budget_mode = str(budget_mode).strip().lower()
+        if effective_budget_mode not in {'simulations', 'time'}:
+            raise ValueError("budget_mode must be 'simulations' or 'time'")
+        requested_time_limit = None
+        if effective_budget_mode == 'time':
+            raw_time_limit = (
+                time_limit_seconds
+                if time_limit_seconds is not None
+                else rl_cfg.get('mcts_move_time_seconds', 1.0)
+            )
+            if isinstance(raw_time_limit, (bool, np.bool_)):
+                raise ValueError('time_limit_seconds must be a finite positive number')
+            try:
+                requested_time_limit = float(raw_time_limit)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    'time_limit_seconds must be a finite positive number'
+                ) from exc
+            if not math.isfinite(requested_time_limit) or requested_time_limit <= 0.0:
+                raise ValueError('time_limit_seconds must be a finite positive number')
         if not game_states:
             if return_search_metadata:
                 return [], []
@@ -4860,6 +5069,12 @@ class MultiGameBatchMCTS:
         profile_detail = self.profile_detail_enabled
         profile_timing = self.profile_enabled
         search_t0 = perf_counter()
+        time_deadline = (
+            search_t0 + requested_time_limit
+            if requested_time_limit is not None
+            else None
+        )
+        budget_stop_reason = 'simulations_complete'
         evaluation_generation = self._evaluation_generation_token()
         if bool(getattr(self.model, 'supports_remote_legal_gather', False)):
             if not callable(getattr(self.model, 'get_evaluation_generation', None)):
@@ -5012,6 +5227,30 @@ class MultiGameBatchMCTS:
         if profile_timing:
             self._profile_add('search_root_setup_time', perf_counter() - root_setup_t0)
 
+        # Exact tablebase ranking may replace the final move in deterministic
+        # play. Lightweight callers can skip the search entirely; diagnostic
+        # callers still run it and retain their policy/value targets. Self-play
+        # noise always follows the ordinary Gumbel path.
+        root_shortcuts = [None] * game_count
+        root_proofs = [None] * game_count
+        if not add_root_noise and return_search_metadata:
+            for idx, board in enumerate(boards):
+                root_result = self._syzygy_root_result(
+                    roots[idx],
+                    board,
+                    root_position_counts[idx],
+                    root_repetition_known[idx],
+                )
+                if root_result is None:
+                    continue
+                if root_result['stop_reason'] == 'forced_move':
+                    if not include_diagnostics:
+                        root_shortcuts[idx] = root_result
+                else:
+                    root_proofs[idx] = root_result
+                    if not include_diagnostics:
+                        root_shortcuts[idx] = root_result
+
         native_forest = self._native_forest
         if self._native_tree_enabled:
             native_import_t0 = perf_counter() if profile_timing else None
@@ -5074,13 +5313,19 @@ class MultiGameBatchMCTS:
                     perf_counter() - sync_t0,
                 )
 
+        time_budget_active = effective_budget_mode == 'time'
+        effective_root_schedule = (
+            'revisiting' if time_budget_active else self.gumbel_root_schedule
+        )
         dynamic_budget_active = bool(
-            self.dynamic_budget_enabled
+            not time_budget_active
+            and self.dynamic_budget_enabled
             and game_count > 1
             and any(value is None for value in budget_overrides)
         )
         eval_easy_cut_active = bool(
-            self.eval_easy_cut_enabled
+            not time_budget_active
+            and self.eval_easy_cut_enabled
             and not add_root_noise
             and game_count > 1
             and all(value is None for value in budget_overrides)
@@ -5100,7 +5345,9 @@ class MultiGameBatchMCTS:
             remaining,
             root_selection_states=None,
             post_batch_callback=None,
+            post_feedback_callback=None,
             native_root_pass_update=None,
+            deadline=None,
         ):
             nonlocal game_ptr
             if native_forest is not None and root_selection_states is not None:
@@ -5110,6 +5357,11 @@ class MultiGameBatchMCTS:
                     native_forest.configure_root_pass(native_root_pass_update)
             total_remaining = int(sum(remaining))
             while total_remaining > 0:
+                # A selected batch is always fully evaluated and backed up.
+                # The soft deadline is observed before starting the next batch,
+                # so neither native nor Python virtual losses can be stranded.
+                if deadline is not None and perf_counter() >= deadline:
+                    break
                 # Keep decisions in coarse batches. This preserves central GPU
                 # batching even though roots receive different total budgets.
                 active_count = sum(1 for value in remaining if value > 0)
@@ -5304,21 +5556,39 @@ class MultiGameBatchMCTS:
                             root_state['_pass_scheduled'] = int(
                                 root_state.get('_pass_scheduled', 0)
                             ) + int(count)
-                if post_batch_callback is not None:
+                feedback_checkpoint_indices = []
+                if post_feedback_callback is not None and root_selection_states is not None:
+                    for state_idx, count in enumerate(selected_this_batch):
+                        root_state = root_selection_states[state_idx]
+                        if count <= 0 or not root_state:
+                            continue
+                        progress = int(root_state.get('_pass_scheduled', 0))
+                        if progress in root_state.get('_feedback_boundaries', ()):
+                            feedback_checkpoint_indices.append(state_idx)
+                if post_batch_callback is not None or feedback_checkpoint_indices:
                     _sync_native_roots()
+                if post_batch_callback is not None:
                     removed = max(
                         0,
                         int(post_batch_callback(remaining, selected_this_batch) or 0),
                     )
                     total_remaining = max(0, total_remaining - removed)
+                if feedback_checkpoint_indices:
+                    post_feedback_callback(feedback_checkpoint_indices)
             _sync_native_roots()
 
         scout_difficulties = [0.0] * game_count
         # Evaluate every unexpanded root exactly once so priors/raw values exist
         # before assigning the complete Sequential-Halving budget.
         root_setup = [
-            1 if root is not None and not root.expanded else 0
-            for root in roots
+            1
+            if (
+                root is not None
+                and not root.expanded
+                and root_shortcuts[idx] is None
+            )
+            else 0
+            for idx, root in enumerate(roots)
         ]
         if any(root_setup):
             _run_simulation_phase(root_setup)
@@ -5430,7 +5700,13 @@ class MultiGameBatchMCTS:
                     quality=tree_reuse_quality[idx]['quality'],
                 )
         action_budgets = [
-            max(
+            (
+                0
+                if root_shortcuts[idx] is not None
+                else max(1, int(simulation_budgets[idx]))
+            )
+            if time_budget_active
+            else max(
                 0,
                 int(simulation_budgets[idx])
                 - int(setup_visits[idx])
@@ -5477,16 +5753,20 @@ class MultiGameBatchMCTS:
                 action_budgets[idx],
             )
             pass_budgets = (
-                _gumbel_revisiting_pass_budgets(
-                    action_budgets[idx],
-                    considered,
+                (
+                    (int(action_budgets[idx]),)
+                    if time_budget_active and action_budgets[idx] > 0
+                    else _gumbel_revisiting_pass_budgets(
+                        action_budgets[idx],
+                        considered,
+                    )
                 )
-                if self.gumbel_root_schedule == 'revisiting'
+                if effective_root_schedule == 'revisiting'
                 else ((int(action_budgets[idx]),) if action_budgets[idx] > 0 else ())
             )
             root_sequence = (
                 _gumbel_considered_visit_sequence(considered, pass_budgets[0])
-                if self.gumbel_root_schedule == 'revisiting' and pass_budgets
+                if effective_root_schedule == 'revisiting' and pass_budgets
                 else _gumbel_considered_visit_sequence(
                     considered,
                     action_budgets[idx],
@@ -5499,9 +5779,13 @@ class MultiGameBatchMCTS:
                 'gumbel': root_gumbel_noises[idx],
                 'considered_actions': int(considered),
                 'sequence': root_sequence,
-                'root_schedule': self.gumbel_root_schedule,
+                'root_schedule': effective_root_schedule,
                 'q_scale_total_visits': self.gumbel_reuse_q_scale == 'total',
-                'pass_budgets': tuple(int(value) for value in pass_budgets),
+                'pass_budgets': (
+                    [int(value) for value in pass_budgets]
+                    if time_budget_active
+                    else tuple(int(value) for value in pass_budgets)
+                ),
                 'pass_index': 0,
                 '_pass_scheduled': 0,
                 '_feedback_boundaries': (
@@ -5509,7 +5793,7 @@ class MultiGameBatchMCTS:
                         considered,
                         action_budgets[idx],
                     )
-                    if self.gumbel_root_schedule == 'standard'
+                    if effective_root_schedule == 'standard'
                     else ()
                 ),
                 '_feedback_boundary_index': 0,
@@ -5517,8 +5801,16 @@ class MultiGameBatchMCTS:
                 '_pass_initial_visits_f64': np.asarray(initial_copy, dtype=np.float64),
                 '_pass_initial_total': float(initial_copy.sum()),
             }
+            if time_budget_active:
+                state = gumbel_root_states[idx]
+                state['_stable_selected_idx'] = self._gumbel_final_action_index(
+                    root,
+                    state,
+                )
+                state['_stable_checkpoint_pass'] = -1
+                state['_stable_checkpoint_visit'] = 0
             if (
-                self.gumbel_root_schedule == 'standard'
+                effective_root_schedule == 'standard'
                 and add_root_noise
                 and root_reused_flags[idx]
                 and action_budgets[idx] > _TREE_REUSE_SCOUT_SIMULATIONS
@@ -5605,12 +5897,120 @@ class MultiGameBatchMCTS:
         reuse_scout_callback = (
             _apply_ready_tree_reuse_scouts
             if (
-                self.gumbel_root_schedule == 'standard'
+                effective_root_schedule == 'standard'
                 and any(policy is not None for policy in pre_scout_policies)
             )
             else None
         )
-        if self.gumbel_root_schedule == 'revisiting':
+        if time_budget_active:
+            def _record_stable_gumbel_choices(root_indices):
+                for idx in root_indices:
+                    root = roots[idx]
+                    state = gumbel_root_states[idx]
+                    if root is None or state is None or not root.edges.moves:
+                        continue
+                    selected_idx = self._gumbel_final_action_index(root, state)
+                    if selected_idx is not None:
+                        state['_stable_selected_idx'] = int(selected_idx)
+                        state['_stable_checkpoint_pass'] = int(
+                            state.get('pass_index', 0)
+                        )
+                        state['_stable_checkpoint_visit'] = int(
+                            state.get('_pass_scheduled', 0)
+                        )
+
+            time_pass_index = 0
+            while True:
+                if perf_counter() >= time_deadline:
+                    budget_stop_reason = (
+                        'deadline_after_root_setup'
+                        if time_pass_index == 0
+                        else 'deadline'
+                    )
+                    break
+
+                pass_remaining = [0] * game_count
+                pass_budgets = [0] * game_count
+                for idx, (root, state) in enumerate(zip(roots, gumbel_root_states)):
+                    if (
+                        state is None
+                        or root is None
+                        or root_shortcuts[idx] is not None
+                        or not root.edges.moves
+                    ):
+                        continue
+                    pass_budget = max(1, int(gumbel_action_budgets[idx]))
+                    pass_budgets[idx] = pass_budget
+                    pass_remaining[idx] = pass_budget
+                    if time_pass_index > 0:
+                        pass_initial = np.asarray(
+                            root.edges.visit_counts,
+                            dtype=np.int32,
+                        ).copy()
+                        state['pass_initial_visits'] = pass_initial
+                        state['_pass_initial_visits_f64'] = np.asarray(
+                            pass_initial,
+                            dtype=np.float64,
+                        )
+                        state['_pass_initial_total'] = float(pass_initial.sum())
+                        state['pass_budgets'].append(pass_budget)
+                    state['pass_index'] = int(time_pass_index)
+                    state['_pass_scheduled'] = 0
+                    state['sequence'] = _gumbel_considered_visit_sequence(
+                        state['considered_actions'],
+                        pass_budget,
+                    )
+                    state['_feedback_boundaries'] = (
+                        _gumbel_revisiting_feedback_boundaries(
+                            state['considered_actions'],
+                            pass_budget,
+                        )
+                    )
+                    state['_feedback_boundary_index'] = 0
+
+                if not any(pass_remaining):
+                    budget_stop_reason = 'no_searchable_root'
+                    break
+                _run_simulation_phase(
+                    pass_remaining,
+                    gumbel_root_states,
+                    post_feedback_callback=_record_stable_gumbel_choices,
+                    native_root_pass_update=(
+                        [
+                            state if (
+                                state is not None
+                                and int(state.get('pass_index', 0)) == time_pass_index
+                                and time_pass_index > 0
+                            ) else None
+                            for state in gumbel_root_states
+                        ]
+                        if time_pass_index > 0 else None
+                    ),
+                    deadline=time_deadline,
+                )
+                completed_any = False
+                incomplete = False
+                for idx, state in enumerate(gumbel_root_states):
+                    if state is None or pass_budgets[idx] <= 0:
+                        continue
+                    actual = max(0, int(state.get('_pass_scheduled', 0)))
+                    state.setdefault('pass_actual_visits', []).append(actual)
+                    if actual >= pass_budgets[idx]:
+                        completed_any = True
+                        _record_stable_gumbel_choices((idx,))
+                    else:
+                        incomplete = True
+                        state['sequence'] = state['sequence'][:actual]
+                if incomplete:
+                    budget_stop_reason = (
+                        'deadline' if perf_counter() >= time_deadline else 'no_search_progress'
+                    )
+                    break
+                if not completed_any:
+                    budget_stop_reason = 'no_search_progress'
+                    break
+                time_pass_index += 1
+        elif effective_root_schedule == 'revisiting':
             max_pass_count = max(
                 (len(state['pass_budgets']) for state in gumbel_root_states if state),
                 default=0,
@@ -5718,13 +6118,114 @@ class MultiGameBatchMCTS:
         search_metadata = []
         metadata_t0 = perf_counter() if profile_timing else None
         for idx, root in enumerate(roots):
+            fresh_used = max(
+                0,
+                int(getattr(root, 'visit_count', 0) or 0)
+                - int(initial_root_visits[idx]),
+            ) if root is not None else 0
+            basic_metadata = {
+                'mcts_algorithm': self.mcts_algorithm,
+                'simulations_used': int(fresh_used + inherited_visit_credits[idx]),
+                'fresh_simulations_used': int(fresh_used),
+                'actual_fresh_simulations': int(fresh_used),
+                'simulation_budget': int(simulation_budgets[idx]),
+                'simulation_planning_quantum': (
+                    int(fixed_simulation_budget) if time_budget_active else None
+                ),
+                'budget_mode': effective_budget_mode,
+                'requested_time_limit_seconds': requested_time_limit,
+                'elapsed_time_seconds': float(perf_counter() - search_t0),
+                'budget_stop_reason': budget_stop_reason,
+                'search_diagnostics_included': bool(include_diagnostics),
+                'gumbel_configured_root_schedule': self.gumbel_root_schedule,
+                'gumbel_effective_root_schedule': effective_root_schedule,
+            }
+            shortcut = root_shortcuts[idx]
+            if shortcut is not None:
+                selected_move = shortcut['selected_move']
+                if root is not None and root.expanded and root.edges is not None:
+                    root_result = self._fresh_child_visit_dict(
+                        root,
+                        initial_child_visits[idx],
+                    )
+                else:
+                    root_result = {move: 0.0 for move in shortcut['legal_moves']}
+                if not root_result:
+                    root_result = {move: 0.0 for move in shortcut['legal_moves']}
+                basic_metadata['selected_move_override'] = selected_move
+                basic_metadata['budget_stop_reason'] = shortcut['stop_reason']
+                basic_metadata['root_shortcut'] = shortcut['stop_reason']
+                basic_metadata['selected_move_decision_source'] = (
+                    'syzygy_root' if shortcut['best_value'] is not None else 'forced_move'
+                )
+                if shortcut['best_value'] is not None:
+                    basic_metadata['syzygy_root_value'] = shortcut['best_value']
+                result.append(root_result)
+                search_metadata.append(basic_metadata)
+                continue
+
+            if not include_diagnostics:
+                root_result = self._fresh_child_visit_dict(
+                    root,
+                    initial_child_visits[idx],
+                )
+                if not root_result and root is not None and root.expanded:
+                    root_result = {move: 0.0 for move in root.edges.moves}
+                selected_move = None
+                state = gumbel_root_states[idx]
+                if root is not None and state is not None and root.edges.moves:
+                    stable_idx = state.get('_stable_selected_idx')
+                    use_stable = bool(
+                        time_budget_active
+                        and budget_stop_reason.startswith('deadline')
+                        and stable_idx is not None
+                    )
+                    selected_idx = (
+                        int(stable_idx)
+                        if use_stable
+                        else self._gumbel_final_action_index(root, state)
+                    )
+                    if selected_idx is not None:
+                        selected_move = root.edges.moves[selected_idx]
+                        basic_metadata['selected_move_override'] = selected_move
+                    if use_stable:
+                        basic_metadata['budget_decision_source'] = (
+                            'last_completed_feedback_checkpoint'
+                        )
+                        basic_metadata['budget_decision_checkpoint_pass'] = int(
+                            state.get('_stable_checkpoint_pass', -1)
+                        )
+                        basic_metadata['budget_decision_checkpoint_visit'] = int(
+                            state.get('_stable_checkpoint_visit', 0)
+                        )
+                if state is not None:
+                    basic_metadata['gumbel_root_schedule'] = str(
+                        state.get('root_schedule', effective_root_schedule)
+                    )
+                    basic_metadata['gumbel_action_budget'] = int(
+                        gumbel_action_budgets[idx]
+                    )
+                    basic_metadata['gumbel_pass_count'] = len(
+                        state.get('pass_actual_visits', ())
+                    )
+                    basic_metadata['gumbel_pass_budgets'] = [
+                        int(value) for value in state.get('pass_budgets', ())
+                    ]
+                    basic_metadata['gumbel_pass_actual_visits'] = [
+                        int(value) for value in state.get('pass_actual_visits', ())
+                    ]
+                result.append(root_result)
+                search_metadata.append(basic_metadata)
+                continue
+
             metadata = self._summarize_root_search(
                 root,
-                simulation_budgets[idx],
+                max(int(simulation_budgets[idx]), int(fresh_used)),
                 initial_root_visits=initial_root_visits[idx],
                 initial_child_visits=initial_child_visits[idx],
                 inherited_visit_credit=inherited_visit_credits[idx],
             )
+            metadata.update(basic_metadata)
             metadata['mcts_algorithm'] = self.mcts_algorithm
             metadata['dynamic_budget_enabled'] = bool(dynamic_budget_active)
             metadata['eval_easy_cut_enabled'] = bool(eval_easy_cut_active)
@@ -5804,8 +6305,31 @@ class MultiGameBatchMCTS:
                     ),
                 )
                 policy_target_probs = self._gumbel_policy_target(improved)
-                selected_idx = self._gumbel_final_action_index(root, gumbel_state)
+                stable_idx = gumbel_state.get('_stable_selected_idx')
+                use_stable = bool(
+                    time_budget_active
+                    and budget_stop_reason.startswith('deadline')
+                    and stable_idx is not None
+                )
+                selected_idx = (
+                    int(stable_idx)
+                    if use_stable
+                    else self._gumbel_final_action_index(root, gumbel_state)
+                )
                 selected_move = root.edges.moves[selected_idx] if selected_idx is not None else None
+                if use_stable:
+                    metadata['budget_decision_source'] = (
+                        'last_completed_feedback_checkpoint'
+                    )
+                    metadata['budget_decision_checkpoint_pass'] = int(
+                        gumbel_state.get('_stable_checkpoint_pass', -1)
+                    )
+                    metadata['budget_decision_checkpoint_visit'] = int(
+                        gumbel_state.get('_stable_checkpoint_visit', 0)
+                    )
+                    metadata['budget_decision_score_source'] = (
+                        'checkpoint_statistics; per_move_scores_are_final_statistics'
+                    )
                 completed_q = self._gumbel_raw_completed_qvalues(root)
                 normalized_completed_q = self._gumbel_normalized_completed_qvalues(root)
                 selection_scores = root.edges.log_base_priors.astype(np.float64, copy=True)
@@ -5900,6 +6424,7 @@ class MultiGameBatchMCTS:
                     move: float(value)
                     for move, value in zip(root.edges.moves, selection_scores)
                 }
+                metadata['selection_score_by_move_source'] = 'final_search_statistics'
 
                 # Full Gumbel trains against the temperature-scaled completed-Q
                 # target; target telemetry and Q labels must use that exact map.
@@ -5985,6 +6510,16 @@ class MultiGameBatchMCTS:
                 }
             elif fresh_visits:
                 metadata['policy_visit_counts_override'] = fresh_visits
+            proof = root_proofs[idx]
+            if proof is not None:
+                metadata['mcts_selected_move'] = metadata.get(
+                    'selected_move_override'
+                )
+                metadata['selected_move_override'] = proof['selected_move']
+                metadata['selected_move_decision_source'] = 'syzygy_root'
+                metadata['selection_score_applies_to_selected_move'] = False
+                metadata['syzygy_root_value'] = proof['best_value']
+                metadata['syzygy_root_decision_reason'] = proof['stop_reason']
             result.append(root_result)
             search_metadata.append(metadata)
         if profile_timing:
@@ -5995,19 +6530,34 @@ class MultiGameBatchMCTS:
             game_states,
             is_mapping_state,
         )
+        elapsed_time_seconds = float(perf_counter() - search_t0)
+        for metadata in search_metadata:
+            metadata['elapsed_time_seconds'] = elapsed_time_seconds
         self._profile_add('search_many_time', perf_counter() - search_t0)
         self._profile_inc('search_many_calls', 1)
         if return_search_metadata:
             return result, search_metadata
         return result
 
-    def search_results_many(self, game_states, num_simulations, add_root_noise=False):
+    def search_results_many(
+        self,
+        game_states,
+        num_simulations,
+        add_root_noise=False,
+        *,
+        time_limit_seconds=None,
+        budget_mode=None,
+        include_diagnostics=True,
+    ):
         """Return complete root-search decisions for public MCTS consumers."""
         visits, metadata = self.search_many(
             game_states,
             num_simulations=num_simulations,
             add_root_noise=add_root_noise,
             return_search_metadata=True,
+            time_limit_seconds=time_limit_seconds,
+            budget_mode=budget_mode,
+            include_diagnostics=include_diagnostics,
         )
         return [
             SearchResult.from_legacy_result(root_visits, root_metadata)

@@ -332,8 +332,13 @@ struct NativeNode {
     double root_value_sum = 0.0;
     std::int32_t root_virtual_loss = 0;
     std::vector<double> completed_q_cache;
+    // Normalized float32-rounded improved policy for interior selection.
+    // It depends on the same backed-up statistics as completed_q_cache, but
+    // not on virtual visits, which only affect the final count-share term.
+    std::vector<double> improved_policy_cache;
     bool expanded = false;
     bool completed_q_cache_valid = false;
+    bool improved_policy_cache_valid = false;
 };
 
 struct RootSelectionState {
@@ -522,7 +527,7 @@ inline std::int32_t select_interior(
     NativeForest& forest,
     const std::int32_t node_id
 ) {
-    const auto& node = forest.nodes[static_cast<std::size_t>(node_id)];
+    auto& node = forest.nodes[static_cast<std::size_t>(node_id)];
     auto* edges = node_edges(forest, node);
     const auto count = node.edge_count;
     if (edges == nullptr || count <= 0) {
@@ -532,32 +537,46 @@ inline std::int32_t select_interior(
         return 0;
     }
     const auto& completed_q = compute_completed_q(forest, node_id);
-    std::int32_t max_visits = 0;
-    for (std::int32_t index = 0; index < count; ++index) {
-        max_visits = std::max(max_visits, edges[index].visits);
+    auto& improved_policy = node.improved_policy_cache;
+    if (!node.improved_policy_cache_valid ||
+        improved_policy.size() != static_cast<std::size_t>(count)) {
+        std::int32_t max_visits = 0;
+        for (std::int32_t index = 0; index < count; ++index) {
+            max_visits = std::max(max_visits, edges[index].visits);
+        }
+        const double scale = (forest.c_visit + static_cast<double>(max_visits)) * forest.c_scale;
+        double maximum = -std::numeric_limits<double>::infinity();
+        improved_policy.assign(static_cast<std::size_t>(count), 0.0);
+        for (std::int32_t index = 0; index < count; ++index) {
+            const float q_score = static_cast<float>(
+                completed_q[static_cast<std::size_t>(index)] * scale
+            );
+            const double logit = std::log(std::max(
+                static_cast<double>(edges[index].prior),
+                std::numeric_limits<double>::min()
+            )) + static_cast<double>(q_score);
+            improved_policy[static_cast<std::size_t>(index)] = logit;
+            maximum = std::max(maximum, logit);
+        }
+        double probability_total = 0.0;
+        for (std::int32_t index = 0; index < count; ++index) {
+            const double probability = std::exp(
+                improved_policy[static_cast<std::size_t>(index)] - maximum
+            );
+            improved_policy[static_cast<std::size_t>(index)] = probability;
+            probability_total += probability;
+        }
+        for (std::int32_t index = 0; index < count; ++index) {
+            auto& probability = improved_policy[static_cast<std::size_t>(index)];
+            // Cache the exact float32-rounded value used by the old selector.
+            probability = probability_total > 0.0
+                ? static_cast<double>(static_cast<float>(probability / probability_total))
+                : static_cast<double>(edges[index].prior);
+        }
+        node.improved_policy_cache_valid = true;
     }
-    const double scale = (forest.c_visit + static_cast<double>(max_visits)) * forest.c_scale;
-    double maximum = -std::numeric_limits<double>::infinity();
-    forest.improved_policy.assign(static_cast<std::size_t>(count), 0.0);
-    for (std::int32_t index = 0; index < count; ++index) {
-        const float q_score = static_cast<float>(
-            completed_q[static_cast<std::size_t>(index)] * scale
-        );
-        const double logit = std::log(std::max(
-            static_cast<double>(edges[index].prior),
-            std::numeric_limits<double>::min()
-        )) + static_cast<double>(q_score);
-        forest.improved_policy[static_cast<std::size_t>(index)] = logit;
-        maximum = std::max(maximum, logit);
-    }
-    double probability_total = 0.0;
     double total_count_sum = 0.0;
     for (std::int32_t index = 0; index < count; ++index) {
-        const double probability = std::exp(
-            forest.improved_policy[static_cast<std::size_t>(index)] - maximum
-        );
-        forest.improved_policy[static_cast<std::size_t>(index)] = probability;
-        probability_total += probability;
         total_count_sum += static_cast<double>(
             edges[index].visits + edges[index].virtual_loss
         );
@@ -565,14 +584,7 @@ inline std::int32_t select_interior(
     std::int32_t selected = 0;
     double best_score = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < count; ++index) {
-        // Python's improved-policy cache is float32. Preserve its rounding
-        // before the visit-share subtraction so native traversal makes the
-        // same tie decisions as the existing search.
-        const double probability = probability_total > 0.0
-            ? static_cast<double>(static_cast<float>(
-                forest.improved_policy[static_cast<std::size_t>(index)] / probability_total
-            ))
-            : static_cast<double>(edges[index].prior);
+        const double probability = improved_policy[static_cast<std::size_t>(index)];
         const double count_share = static_cast<double>(
             edges[index].visits + edges[index].virtual_loss
         ) / (1.0 + total_count_sum);
@@ -925,6 +937,7 @@ MCTS_API std::int32_t mcts_forest_set_edges(
         node.edge_count = count;
         node.expanded = true;
         node.completed_q_cache_valid = false;
+        node.improved_policy_cache_valid = false;
         for (std::int32_t index = 0; index < count; ++index) {
             NativeEdge edge;
             edge.prior = priors[index];
@@ -1142,6 +1155,7 @@ MCTS_API std::int32_t mcts_forest_reroot(
     node.root_value_sum = root_value_sum;
     node.root_virtual_loss = root_virtual_loss;
     node.completed_q_cache_valid = false;
+    node.improved_policy_cache_valid = false;
     forest->root_states[static_cast<std::size_t>(node_id)] = RootSelectionState{};
     return 0;
 }
@@ -1264,6 +1278,7 @@ MCTS_API std::int32_t mcts_forest_expand(
         node.raw_value = raw_value;
         node.expanded = true;
         node.completed_q_cache_valid = false;
+        node.improved_policy_cache_valid = false;
         node.edge_begin = static_cast<std::int32_t>(forest->edges.size());
         node.edge_count = count;
         for (std::int32_t index = 0; index < count; ++index) {
@@ -1325,6 +1340,7 @@ MCTS_API std::int32_t mcts_forest_expand_batch(
             node.raw_value = raw_values[slot];
             node.expanded = true;
             node.completed_q_cache_valid = false;
+            node.improved_policy_cache_valid = false;
             node.edge_begin = static_cast<std::int32_t>(forest->edges.size());
             node.edge_count = end - begin;
             for (auto index = begin; index < end; ++index) {
@@ -1395,9 +1411,11 @@ MCTS_API std::int32_t mcts_forest_backup_batch(
             ];
             auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
             node.completed_q_cache_valid = false;
+            node.improved_policy_cache_valid = false;
             if (node.parent >= 0) {
                 auto& parent = forest->nodes[static_cast<std::size_t>(node.parent)];
                 parent.completed_q_cache_valid = false;
+                parent.improved_policy_cache_valid = false;
                 auto& edge = forest->edges[
                     static_cast<std::size_t>(parent.edge_begin + node.parent_edge)
                 ];

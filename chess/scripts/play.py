@@ -405,6 +405,14 @@ class ChessGUI:
         self.model2_checkpoint_path = model2_checkpoint_path
         self.console_verbose = bool(console_verbose)
         default_mcts_sims = int(config.get("reinforcement_learning", {}).get("mcts_simulations", 100))
+        rl_search_config = config.get("reinforcement_learning", {}) or {}
+        self.mcts_budget_mode = str(rl_search_config.get("mcts_budget_mode", "simulations")).strip().lower()
+        if self.mcts_budget_mode not in {"simulations", "time"}:
+            self.mcts_budget_mode = "simulations"
+        try:
+            self.mcts_move_time_seconds = float(rl_search_config.get("mcts_move_time_seconds", 1.0))
+        except (TypeError, ValueError, OverflowError):
+            self.mcts_move_time_seconds = 1.0
         try:
             self.mcts_simulations_white = max(1, int(mcts_simulations_white if mcts_simulations_white is not None else default_mcts_sims))
         except (TypeError, ValueError):
@@ -2503,6 +2511,9 @@ class ChessGUI:
         rl_config = dict(config.get("reinforcement_learning", {}) or {})
         runtime_keys = (
             "simulation_budget", "simulations_used", "fresh_simulations_used",
+            "budget_mode", "requested_time_limit_seconds", "elapsed_time_seconds",
+            "actual_fresh_simulations", "budget_stop_reason",
+            "gumbel_configured_root_schedule", "gumbel_effective_root_schedule",
             "inherited_visit_credit", "dynamic_budget_enabled",
             "tree_reuse_attempted", "tree_reused", "tree_inherited_visits",
             "tree_reuse_quality", "eval_easy_cut_enabled", "eval_easy_cut_reduced",
@@ -2511,6 +2522,9 @@ class ChessGUI:
             "gumbel_q_range_floor", "gumbel_target_temperature",
         )
         runtime = {key: _json_safe(metadata.get(key)) for key in runtime_keys if key in metadata}
+        budget_mode = str(rl_config.get("mcts_budget_mode", "simulations")).strip().lower()
+        if budget_mode not in {"simulations", "time"}:
+            budget_mode = "simulations"
         return {
             "ply": len(self.move_history),
             "root_fen": expected_fen,
@@ -2523,7 +2537,17 @@ class ChessGUI:
             "selected_move_override_uci": override_uci,
             "selected_score": selected_row.get("selection_score"),
             "root_noise": False,
-            "requested_simulations": max(1, int(result.get("requested_simulations", 1) or 1)),
+            "requested_simulations": (
+                max(1, int(result.get("requested_simulations", 1) or 1))
+                if budget_mode == "simulations"
+                else 0
+            ),
+            "budget_mode": budget_mode,
+            "time_limit_seconds": (
+                float(rl_config.get("mcts_move_time_seconds", 1.0))
+                if budget_mode == "time"
+                else None
+            ),
             "single_root_batch_cap": _json_safe(rl_config.get("mcts_single_root_batch_cap")),
             "runtime": runtime,
             "actions": actions,
@@ -2794,7 +2818,11 @@ class ChessGUI:
             "name": Path(str(model_name or "model.pt")).stem,
             "version": self._format_version(model_meta),
             "elo": format_elo_summary(model_meta),
-            "search_mode": f"MCTS · {simulations} sims" if uses_mcts else "NN only",
+            "search_mode": (
+                f"MCTS · {self.mcts_move_time_seconds:g}s/move"
+                if uses_mcts and self.mcts_budget_mode == "time"
+                else f"MCTS · {simulations} sims" if uses_mcts else "NN only"
+            ),
         }
 
     def _draw_card(self, rect, fill=(40, 49, 63), border=(88, 105, 132)):

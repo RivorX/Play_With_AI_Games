@@ -45,8 +45,17 @@ def mode_key(use_mcts: bool) -> str:
     return "mcts" if use_mcts else "nn"
 
 
-def mode_label(use_mcts: bool, simulations: int | None = None) -> str:
+def mode_label(
+    use_mcts: bool,
+    simulations: int | None = None,
+    *,
+    budget_mode: str = "simulations",
+    time_limit_seconds: float | None = None,
+) -> str:
     if use_mcts:
+        if str(budget_mode or "simulations").strip().lower() == "time":
+            seconds = safe_float(time_limit_seconds)
+            return f"MCTS ({seconds:g}s/move)" if seconds is not None else "MCTS (timed)"
         sims = safe_int(simulations) or 0
         return f"MCTS ({sims} sims)" if sims > 0 else "MCTS"
     return "Raw NN"
@@ -57,13 +66,21 @@ def elo_protocol_settings(
     *,
     use_mcts: bool,
     simulations: int = 0,
+    budget_mode: str = "simulations",
+    time_limit_seconds: float | None = None,
 ) -> dict:
     """Return the strength-defining part of an Elo evaluation protocol."""
     runtime_cfg = dict(runtime_cfg or {})
     paired_openings = bool(runtime_cfg.get("paired_openings_enabled", True))
+    budget_mode = str(budget_mode or "simulations").strip().lower()
+    timed = bool(use_mcts and budget_mode == "time")
     return {
         "use_mcts": bool(use_mcts),
-        "simulations": max(0, int(simulations or 0)) if use_mcts else 0,
+        "budget_mode": budget_mode if use_mcts else "raw_nn",
+        "simulations": max(0, int(simulations or 0)) if use_mcts and not timed else 0,
+        "time_limit_seconds": (
+            float(time_limit_seconds) if timed and time_limit_seconds is not None else None
+        ),
         "stockfish_time_limit": float(
             runtime_cfg.get("stockfish_time_limit", 0.0) or 0.0
         ),
@@ -82,8 +99,22 @@ def elo_protocol_settings(
         "rating_method": "nearest_50pct_stockfish_level",
         # MCTS Elo is comparable only at an exact per-root simulation budget.
         # The estimator disables both regular redistribution and eval easy cuts.
-        "mcts_simulation_budget_strict": bool(use_mcts),
+        "mcts_simulation_budget_strict": bool(use_mcts and not timed),
+        **(
+            {
+                "mcts_root_schedule": "revisiting"
+                if timed
+                else str(runtime_cfg.get("mcts_gumbel_root_schedule", "standard"))
+            }
+            if use_mcts
+            else {}
+        ),
         "pair_aware_standard_error": paired_openings,
+        **(
+            {"time_search_workers": max(1, int(runtime_cfg.get("workers", 1) or 1))}
+            if timed
+            else {}
+        ),
     }
 
 
@@ -93,6 +124,8 @@ def elo_protocol_matches_settings(
     *,
     use_mcts: bool,
     simulations: int = 0,
+    budget_mode: str = "simulations",
+    time_limit_seconds: float | None = None,
 ) -> bool:
     """Whether a stored rating used the same strength-defining protocol."""
     if not isinstance(settings, dict):
@@ -101,6 +134,8 @@ def elo_protocol_matches_settings(
         runtime_cfg,
         use_mcts=use_mcts,
         simulations=simulations,
+        budget_mode=budget_mode,
+        time_limit_seconds=time_limit_seconds,
     )
     for key, active_value in expected.items():
         if key not in settings:
@@ -124,6 +159,8 @@ def checkpoint_elo_seed(
     *,
     use_mcts: bool,
     simulations: int = 0,
+    budget_mode: str = "simulations",
+    time_limit_seconds: float | None = None,
 ) -> tuple[float | None, str | None]:
     """Read an unbiased scheduling seed from checkpoint Elo metadata.
 
@@ -147,6 +184,26 @@ def checkpoint_elo_seed(
             elo = safe_float(checkpoint.get(key))
             if elo is not None and math.isfinite(elo):
                 return float(elo), f"{checkpoint_path.name} previous raw NN Elo"
+        return None, None
+
+    budget_mode = str(budget_mode or "simulations").strip().lower()
+    if budget_mode == "time":
+        requested_seconds = safe_float(time_limit_seconds)
+        by_time = checkpoint.get("estimated_elo_mcts_by_time")
+        if requested_seconds is None or not math.isfinite(requested_seconds) or not isinstance(by_time, dict):
+            return None, None
+        target_key = _time_budget_key(requested_seconds)
+        for raw_seconds, raw_entry in by_time.items():
+            entry_seconds = safe_float(raw_seconds)
+            if entry_seconds is None and isinstance(raw_entry, dict):
+                entry_seconds = safe_float(raw_entry.get("time_limit_seconds"))
+            if entry_seconds is None or not math.isclose(
+                entry_seconds, requested_seconds, rel_tol=0.0, abs_tol=1e-9
+            ):
+                continue
+            elo = safe_float(raw_entry.get("elo")) if isinstance(raw_entry, dict) else safe_float(raw_entry)
+            if elo is not None and math.isfinite(elo):
+                return float(elo), f"{checkpoint_path.name} previous timed MCTS Elo @{_time_budget_key(entry_seconds)}s"
         return None, None
 
     requested_sims = max(0, int(simulations or 0))
@@ -187,6 +244,8 @@ def apply_checkpoint_elo_seed(
     *,
     use_mcts: bool,
     simulations: int = 0,
+    budget_mode: str = "simulations",
+    time_limit_seconds: float | None = None,
 ) -> float | None:
     """Attach checkpoint Elo as an opponent-selection seed when none is set."""
     existing = safe_float((runtime_cfg or {}).get("adaptive_initial_elo"))
@@ -196,6 +255,8 @@ def apply_checkpoint_elo_seed(
         checkpoint_path,
         use_mcts=use_mcts,
         simulations=simulations,
+        budget_mode=budget_mode,
+        time_limit_seconds=time_limit_seconds,
     )
     if elo is None:
         return None
@@ -232,6 +293,8 @@ def build_eval_elo_config(
     games_per_level=None,
     use_mcts: bool,
     simulations=None,
+    budget_mode=None,
+    time_limit_seconds=None,
     sf_time=None,
     max_moves=None,
     sf_path=None,
@@ -265,11 +328,40 @@ def build_eval_elo_config(
         simulations = source.get("mcts_simulations", 0)
 
     runtime_cfg["use_mcts"] = bool(use_mcts)
-    runtime_cfg["mcts_simulations"] = int(simulations or 0)
+    if budget_mode is None:
+        budget_mode = source.get("mcts_budget_mode", "simulations")
+    budget_mode = str(budget_mode or "simulations").strip().lower()
+    if budget_mode not in {"simulations", "time"}:
+        raise ValueError("mcts_budget_mode must be 'simulations' or 'time'")
+    if time_limit_seconds is None:
+        time_limit_seconds = source.get("mcts_move_time_seconds", 1.0)
+    if isinstance(time_limit_seconds, bool):
+        raise ValueError("mcts_move_time_seconds must be a finite positive number")
+    time_limit_seconds = safe_float(time_limit_seconds)
+    if time_limit_seconds is None or not math.isfinite(time_limit_seconds) or time_limit_seconds <= 0:
+        raise ValueError("mcts_move_time_seconds must be a finite positive number")
+    runtime_cfg["mcts_budget_mode"] = budget_mode if use_mcts else "raw_nn"
+    runtime_cfg["mcts_move_time_seconds"] = float(time_limit_seconds)
+    if "mcts_gumbel_root_schedule" in source:
+        runtime_cfg["mcts_gumbel_root_schedule"] = str(
+            source["mcts_gumbel_root_schedule"]
+        )
+    else:
+        # Let run_elo_check/estimator inherit the actual normalized RL search
+        # schedule instead of silently replacing it with this helper's default.
+        runtime_cfg.pop("mcts_gumbel_root_schedule", None)
+    # Keep a positive compatibility value for callers that still pass a
+    # simulation-count positional argument; timed search ignores it.
+    runtime_cfg["mcts_simulations"] = max(1, int(simulations or 1))
     runtime_cfg["workers"] = int(resolve_eval_workers(workers, use_mcts, source))
     runtime_cfg["batch_model_moves"] = bool(source.get("batch_model_moves", True))
     runtime_cfg["batch_raw_model_moves"] = bool(source.get("batch_raw_model_moves", False))
     runtime_cfg["stockfish_hide_window"] = bool(source.get("stockfish_hide_window", True))
+    if use_mcts and budget_mode == "time":
+        # Each move gets its own wall-clock budget; batching several roots into
+        # one search would instead share one deadline across the whole batch.
+        runtime_cfg["batch_model_moves"] = False
+        runtime_cfg["workers"] = 1
 
     if standalone:
         runtime_cfg["stockfish_priority"] = str(source.get("eval_elo_stockfish_priority", "normal"))
@@ -317,6 +409,9 @@ def build_final_elo_config(elo_cfg: dict, *, use_mcts: bool = True) -> dict:
 def build_final_mcts_elo_configs(elo_cfg: dict) -> list[dict]:
     """Build final-only MCTS budgets as multiples of the standard Elo budget."""
     source = dict(elo_cfg or {})
+    if str(source.get("mcts_budget_mode", "simulations")).strip().lower() == "time":
+        resolved = build_final_elo_config(source, use_mcts=True)
+        return [resolved]
     default_simulations = max(
         1,
         int(source.get("mcts_eval_simulations", source.get("mcts_simulations", 1)) or 1),
@@ -361,7 +456,20 @@ def build_il_final_elo_configs(elo_cfg: dict) -> tuple[dict, dict]:
 
 
 def run_elo_check(model, config: dict, device, elo_config: dict, *, stop_event=None) -> dict:
-    return estimate_model_elo(model, config, device, elo_config, stop_event=stop_event)
+    resolved = dict(elo_config or {})
+    rl_cfg = dict((config or {}).get("reinforcement_learning", {}) or {})
+    search_cfg = dict(rl_cfg.get("search", {}) or {})
+    configured_schedule = rl_cfg.get(
+        "mcts_gumbel_root_schedule",
+        search_cfg.get("gumbel_root_schedule", "standard"),
+    )
+    for key, fallback in (
+        ("mcts_budget_mode", "simulations"),
+        ("mcts_move_time_seconds", 1.0),
+        ("mcts_gumbel_root_schedule", configured_schedule),
+    ):
+        resolved.setdefault(key, rl_cfg.get(key, fallback))
+    return estimate_model_elo(model, config, device, resolved, stop_event=stop_event)
 
 
 def persist_estimated_elo(
@@ -372,6 +480,8 @@ def persist_estimated_elo(
     games_per_level: int,
     use_mcts: bool,
     simulations: int,
+    budget_mode: str | None = None,
+    time_limit_seconds: float | None = None,
     sf_time: float,
     source: str,
     elo_result: dict | None = None,
@@ -394,8 +504,17 @@ def persist_estimated_elo(
     if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
         return
 
-    existing_key = "estimated_elo_mcts" if use_mcts else "estimated_elo_nn"
-    existing_elo = safe_float(checkpoint.get(existing_key))
+    if budget_mode is None:
+        budget_mode = (elo_result or {}).get("mcts_budget_mode", "simulations")
+    if time_limit_seconds is None:
+        time_limit_seconds = (elo_result or {}).get("mcts_move_time_seconds")
+    timed_mcts = bool(use_mcts and str(budget_mode).strip().lower() == "time")
+    existing_key = (
+        "estimated_elo_nn" if not use_mcts else
+        "estimated_elo_mcts" if not timed_mcts else
+        None
+    )
+    existing_elo = safe_float(checkpoint.get(existing_key)) if existing_key else None
     ok, error = persist_checkpoint_elo_metadata(
         checkpoint_path,
         elo_value,
@@ -403,15 +522,25 @@ def persist_estimated_elo(
         games_per_level=games_per_level,
         use_mcts=use_mcts,
         simulations=simulations,
+        budget_mode=budget_mode,
+        time_limit_seconds=time_limit_seconds,
         sf_time=sf_time,
         source=source,
         elo_result=elo_result,
     )
     if ok and announce_success:
-        label = "MCTS Elo" if use_mcts else "NN Elo"
+        label = (
+            f"MCTS Elo @{float(time_limit_seconds):g}s/move"
+            if timed_mcts and time_limit_seconds is not None
+            else "MCTS Elo" if use_mcts else "NN Elo"
+        )
         if existing_elo is not None:
             print(f"{print_prefix}✓ Updated {label}: {int(round(existing_elo))} -> {int(round(elo_value))}")
         else:
             print(f"{print_prefix}✓ Saved {label} into checkpoint metadata: {int(round(elo_value))}")
     elif error:
         print(f"{print_prefix}! {error}")
+
+
+def _time_budget_key(seconds):
+    return format(float(seconds), ".9g")

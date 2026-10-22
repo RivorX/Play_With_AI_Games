@@ -91,12 +91,21 @@ class SingleGameMCTS:
     def search(
         self,
         board,
-        num_simulations,
+        num_simulations=None,
         add_root_noise=False,
         *,
         position_counts=None,
         repetition_known=None,
+        budget_mode=None,
+        time_limit_seconds=None,
+        include_diagnostics=True,
     ):
+        if num_simulations is None:
+            num_simulations = int(
+                (self.config.get("reinforcement_learning", {}) or {}).get(
+                    "mcts_simulations", 192
+                )
+            )
         position_counts, repetition_known = self._board_repetition_context(
             board,
             position_counts,
@@ -113,6 +122,9 @@ class SingleGameMCTS:
                 [game_state],
                 num_simulations=num_simulations,
                 add_root_noise=add_root_noise,
+                budget_mode=budget_mode,
+                time_limit_seconds=time_limit_seconds,
+                include_diagnostics=include_diagnostics,
             )
         except BaseException:
             # search_many deliberately clears roots if model generation changes

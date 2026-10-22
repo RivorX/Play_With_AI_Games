@@ -82,6 +82,9 @@ reinforcement_learning:
 
     syzygy_paths:
       - "data/syzygy"
+    # Startup and training must use existing local tables only. Downloads are
+    # available through the explicit Syzygy download tool.
+    syzygy_auto_download_enabled: false
 
   # Optimizer and the few regularizers worth tuning between runs.
   training:
