@@ -747,6 +747,34 @@ def _gumbel_initial_round_visits(considered_actions, num_simulations):
     return max(1, simulations // max(1, rounds * considered))
 
 
+def _gumbel_final_action_eligibility(visit_counts):
+    """Return the MCTX final-action mask and its maximum-visit cutoff."""
+    visits = np.asarray(visit_counts, dtype=np.float64)
+    if visits.size == 0:
+        return np.zeros(0, dtype=np.bool_), 0.0
+    threshold = float(np.max(visits))
+    return visits == threshold, threshold
+
+
+def _gumbel_final_visit_counts(node, state):
+    """Return fresh counts in the active root schedule's visit scope."""
+    edges = node.edges
+    initial = np.asarray(state['initial_visits'], dtype=np.float64)
+    if state.get('root_schedule') == 'revisiting':
+        pass_initial = np.asarray(
+            state.get('pass_initial_visits', state['initial_visits']),
+            dtype=np.float64,
+        )
+        return np.maximum(
+            0.0,
+            edges.visit_counts.astype(np.float64) - pass_initial,
+        )
+    fresh = edges.fresh_count_scratch
+    np.subtract(edges.visit_counts, initial, out=fresh)
+    np.maximum(fresh, 0.0, out=fresh)
+    return fresh
+
+
 def _gumbel_revisiting_pass_budgets(action_budget, considered_actions, max_passes=3):
     """Split a Gumbel root budget into bounded, complete re-ranking passes.
 
@@ -4571,31 +4599,27 @@ class MultiGameBatchMCTS:
             return None
         edges.ensure_gumbel_workspace()
         initial = np.asarray(state['initial_visits'], dtype=np.float64)
-        if (
-            state.get('root_schedule') == 'revisiting'
-            and state.get('sequence')
-        ):
-            pass_initial = np.asarray(
-                state.get('pass_initial_visits', state['initial_visits']),
-                dtype=np.float64,
-            )
-            pass_fresh = np.maximum(
-                0.0,
-                edges.visit_counts.astype(np.float64) - pass_initial,
-            )
-            final_visit_threshold = (
-                float(np.max(pass_fresh)) if pass_fresh.size else 0.0
-            )
-            native = self._native_mcts
-            if native is not None:
-                gumbel = state.get('_gumbel_f64')
-                if gumbel is None:
-                    gumbel = np.asarray(state['gumbel'], dtype=np.float64)
-                    state['_gumbel_f64'] = gumbel
+        pass_initial = np.asarray(
+            state.get('pass_initial_visits', state['initial_visits']),
+            dtype=np.float64,
+        )
+        revisiting = state.get('root_schedule') == 'revisiting'
+        native = self._native_mcts
+        if native is not None:
+            gumbel = state.get('_gumbel_f64')
+            if gumbel is None:
+                gumbel = np.asarray(state['gumbel'], dtype=np.float64)
+                state['_gumbel_f64'] = gumbel
+            completed_q = self._gumbel_normalized_completed_qvalues(node)
+            if revisiting:
+                final_visit_counts = _gumbel_final_visit_counts(node, state)
+                _, final_visit_threshold = _gumbel_final_action_eligibility(
+                    final_visit_counts
+                )
                 return native.final_action_eligible(
                     edges.log_base_priors,
                     gumbel,
-                    self._gumbel_normalized_completed_qvalues(node),
+                    completed_q,
                     initial,
                     pass_initial,
                     edges.visit_counts,
@@ -4604,54 +4628,19 @@ class MultiGameBatchMCTS:
                     self.gumbel_c_scale,
                     self.gumbel_reuse_q_scale == 'total',
                 )
-
-            cumulative_fresh = np.maximum(
-                0.0,
-                edges.visit_counts.astype(np.float64) - initial,
-            )
-            scores = edges.selection_score_scratch
-            np.copyto(scores, edges.log_base_priors)
-            scores -= float(np.max(scores))
-            np.add(scores, np.asarray(state['gumbel'], dtype=np.float64), out=scores)
-            np.add(
-                scores,
-                self._gumbel_completed_qvalues(
-                    node,
-                    scale_visit_counts=(
-                        edges.visit_counts
-                        if self.gumbel_reuse_q_scale == 'total'
-                        else cumulative_fresh
-                    ),
-                ),
-                out=scores,
-            )
-            eligible = edges.eligibility_scratch
-            np.equal(pass_fresh, final_visit_threshold, out=eligible)
-            if not eligible.any():
-                np.equal(pass_fresh, float(np.min(pass_fresh)), out=eligible)
-            scores[~eligible] = -np.inf
-            return int(np.argmax(scores))
-
-        native = self._native_mcts
-        if native is not None:
-            gumbel = state.get('_gumbel_f64')
-            if gumbel is None:
-                gumbel = np.asarray(state['gumbel'], dtype=np.float64)
-                state['_gumbel_f64'] = gumbel
             return native.final_action(
                 edges.log_base_priors,
                 gumbel,
-                self._gumbel_normalized_completed_qvalues(node),
+                completed_q,
                 initial,
                 edges.visit_counts,
                 self.gumbel_c_visit,
                 self.gumbel_c_scale,
                 self.gumbel_reuse_q_scale == 'total',
             )
-        fresh = edges.fresh_count_scratch
-        np.subtract(edges.visit_counts, initial, out=fresh)
-        np.maximum(fresh, 0.0, out=fresh)
-        most_visited = float(np.max(fresh)) if fresh.size else 0.0
+
+        final_visit_counts = _gumbel_final_visit_counts(node, state)
+        eligible, _ = _gumbel_final_action_eligibility(final_visit_counts)
         scores = edges.selection_score_scratch
         np.copyto(scores, edges.log_base_priors)
         scores -= float(np.max(scores))
@@ -4660,16 +4649,13 @@ class MultiGameBatchMCTS:
             scores,
             self._gumbel_completed_qvalues(
                 node,
-                scale_visit_counts=(
-                    edges.visit_counts
-                    if self.gumbel_reuse_q_scale == 'total'
-                    else fresh
+                scale_visit_counts=self._gumbel_root_q_scale_visit_counts(
+                    node,
+                    state,
                 ),
             ),
             out=scores,
         )
-        eligible = edges.eligibility_scratch
-        np.equal(fresh, most_visited, out=eligible)
         scores[~eligible] = -np.inf
         return int(np.argmax(scores))
 
@@ -5157,10 +5143,7 @@ class MultiGameBatchMCTS:
                 feedback_windows = [0] * game_count
                 if root_selection_states is not None:
                     for state_idx, root_state in enumerate(root_selection_states):
-                        if (
-                            not root_state
-                            or root_state.get('root_schedule') != 'revisiting'
-                        ):
+                        if not root_state:
                             continue
                         sequence = root_state.get('sequence', ())
                         progress = max(0, int(root_state.get('_pass_scheduled', 0)))
@@ -5317,7 +5300,7 @@ class MultiGameBatchMCTS:
                 if root_selection_states is not None:
                     for state_idx, count in enumerate(selected_this_batch):
                         root_state = root_selection_states[state_idx]
-                        if root_state and root_state.get('root_schedule') == 'revisiting':
+                        if root_state:
                             root_state['_pass_scheduled'] = int(
                                 root_state.get('_pass_scheduled', 0)
                             ) + int(count)
@@ -5521,6 +5504,15 @@ class MultiGameBatchMCTS:
                 'pass_budgets': tuple(int(value) for value in pass_budgets),
                 'pass_index': 0,
                 '_pass_scheduled': 0,
+                '_feedback_boundaries': (
+                    _gumbel_revisiting_feedback_boundaries(
+                        considered,
+                        action_budgets[idx],
+                    )
+                    if self.gumbel_root_schedule == 'standard'
+                    else ()
+                ),
+                '_feedback_boundary_index': 0,
                 '_initial_visits_f64': np.asarray(initial_copy, dtype=np.float64),
                 '_pass_initial_visits_f64': np.asarray(initial_copy, dtype=np.float64),
                 '_pass_initial_total': float(initial_copy.sum()),
@@ -5826,30 +5818,8 @@ class MultiGameBatchMCTS:
                     )
                     * self.gumbel_c_scale
                 )
-                if (
-                    gumbel_state.get('root_schedule') == 'revisiting'
-                    and gumbel_state.get('sequence')
-                ):
-                    final_pass_initial = np.asarray(
-                        gumbel_state.get(
-                            'pass_initial_visits',
-                            gumbel_state['initial_visits'],
-                        ),
-                        dtype=np.float64,
-                    )
-                    final_pass_visits = np.maximum(
-                        0.0,
-                        root.edges.visit_counts.astype(np.float64) - final_pass_initial,
-                    )
-                    final_threshold = (
-                        float(np.max(final_pass_visits))
-                        if final_pass_visits.size else 0.0
-                    )
-                    eligible = final_pass_visits == final_threshold
-                    if not eligible.any():
-                        eligible = final_pass_visits == float(np.min(final_pass_visits))
-                else:
-                    eligible = fresh_count_vector == float(np.max(fresh_count_vector))
+                final_visit_counts = _gumbel_final_visit_counts(root, gumbel_state)
+                eligible, _ = _gumbel_final_action_eligibility(final_visit_counts)
                 selection_scores[~eligible] = -np.inf
                 policy_target = {
                     move: float(probability)

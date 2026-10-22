@@ -331,7 +331,9 @@ struct NativeNode {
     std::int32_t root_visits = 0;
     double root_value_sum = 0.0;
     std::int32_t root_virtual_loss = 0;
+    std::vector<double> completed_q_cache;
     bool expanded = false;
+    bool completed_q_cache_valid = false;
 };
 
 struct RootSelectionState {
@@ -362,7 +364,6 @@ struct NativeForest {
     std::vector<RootSelectionState> root_states;
     std::vector<PendingSelection> selections;
     std::vector<std::int32_t> selection_paths;
-    std::vector<double> completed_q;
     std::vector<double> improved_policy;
 };
 
@@ -445,16 +446,22 @@ inline std::int32_t node_visits(
     return node.root_visits;
 }
 
-inline void compute_completed_q(
+inline const std::vector<double>& compute_completed_q(
     NativeForest& forest,
     const std::int32_t node_id
 ) {
-    const auto& node = forest.nodes[static_cast<std::size_t>(node_id)];
+    auto& node = forest.nodes[static_cast<std::size_t>(node_id)];
     const auto* edges = node_edges(forest, node);
     const auto count = node.edge_count;
-    forest.completed_q.assign(static_cast<std::size_t>(count), 0.0);
+    auto& completed_q = node.completed_q_cache;
+    if (node.completed_q_cache_valid &&
+        completed_q.size() == static_cast<std::size_t>(count)) {
+        return completed_q;
+    }
+    completed_q.assign(static_cast<std::size_t>(count), 0.0);
     if (edges == nullptr || count <= 0) {
-        return;
+        node.completed_q_cache_valid = true;
+        return completed_q;
     }
 
     double raw_value = node.raw_value;
@@ -475,7 +482,7 @@ inline void compute_completed_q(
             any_visited = true;
             const double q = -static_cast<double>(edges[index].value_sum) /
                              static_cast<double>(visits);
-            forest.completed_q[static_cast<std::size_t>(index)] = q;
+            completed_q[static_cast<std::size_t>(index)] = q;
             visit_sum += static_cast<double>(visits);
             const double prior = std::max(static_cast<double>(edges[index].prior), tiny);
             visited_prior_sum += prior;
@@ -491,7 +498,7 @@ inline void compute_completed_q(
     double q_min = std::numeric_limits<double>::infinity();
     double q_max = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < count; ++index) {
-        auto& q = forest.completed_q[static_cast<std::size_t>(index)];
+        auto& q = completed_q[static_cast<std::size_t>(index)];
         if (edges[index].visits <= 0) {
             q = completion;
         }
@@ -501,12 +508,14 @@ inline void compute_completed_q(
     const double range = q_max - q_min;
     if (range > 1.0e-8) {
         const double denominator = std::max(range, forest.q_range_floor);
-        for (auto& q : forest.completed_q) {
+        for (auto& q : completed_q) {
             q = (q - q_min) / denominator;
         }
     } else {
-        std::fill(forest.completed_q.begin(), forest.completed_q.end(), 0.0);
+        std::fill(completed_q.begin(), completed_q.end(), 0.0);
     }
+    node.completed_q_cache_valid = true;
+    return completed_q;
 }
 
 inline std::int32_t select_interior(
@@ -522,7 +531,7 @@ inline std::int32_t select_interior(
     if (count == 1) {
         return 0;
     }
-    compute_completed_q(forest, node_id);
+    const auto& completed_q = compute_completed_q(forest, node_id);
     std::int32_t max_visits = 0;
     for (std::int32_t index = 0; index < count; ++index) {
         max_visits = std::max(max_visits, edges[index].visits);
@@ -532,7 +541,7 @@ inline std::int32_t select_interior(
     forest.improved_policy.assign(static_cast<std::size_t>(count), 0.0);
     for (std::int32_t index = 0; index < count; ++index) {
         const float q_score = static_cast<float>(
-            forest.completed_q[static_cast<std::size_t>(index)] * scale
+            completed_q[static_cast<std::size_t>(index)] * scale
         );
         const double logit = std::log(std::max(
             static_cast<double>(edges[index].prior),
@@ -590,7 +599,7 @@ inline std::int32_t select_root(
     if (count == 1) {
         return 0;
     }
-    compute_completed_q(forest, node_id);
+    const auto& completed_q = compute_completed_q(forest, node_id);
     double total_count_sum = 0.0;
     for (std::int32_t index = 0; index < count; ++index) {
         total_count_sum += static_cast<double>(
@@ -654,7 +663,7 @@ inline std::int32_t select_root(
             continue;
         }
         const float q_score = static_cast<float>(
-            forest.completed_q[static_cast<std::size_t>(index)] * scale
+            completed_q[static_cast<std::size_t>(index)] * scale
         );
         const double base_score = index < static_cast<std::int32_t>(state.root_base_scores.size())
             ? state.root_base_scores[static_cast<std::size_t>(index)]
@@ -915,6 +924,7 @@ MCTS_API std::int32_t mcts_forest_set_edges(
         node.edge_begin = static_cast<std::int32_t>(forest->edges.size());
         node.edge_count = count;
         node.expanded = true;
+        node.completed_q_cache_valid = false;
         for (std::int32_t index = 0; index < count; ++index) {
             NativeEdge edge;
             edge.prior = priors[index];
@@ -1131,6 +1141,7 @@ MCTS_API std::int32_t mcts_forest_reroot(
     node.root_visits = root_visits;
     node.root_value_sum = root_value_sum;
     node.root_virtual_loss = root_virtual_loss;
+    node.completed_q_cache_valid = false;
     forest->root_states[static_cast<std::size_t>(node_id)] = RootSelectionState{};
     return 0;
 }
@@ -1252,6 +1263,7 @@ MCTS_API std::int32_t mcts_forest_expand(
         }
         node.raw_value = raw_value;
         node.expanded = true;
+        node.completed_q_cache_valid = false;
         node.edge_begin = static_cast<std::int32_t>(forest->edges.size());
         node.edge_count = count;
         for (std::int32_t index = 0; index < count; ++index) {
@@ -1312,6 +1324,7 @@ MCTS_API std::int32_t mcts_forest_expand_batch(
             const auto end = prior_offsets[slot + 1];
             node.raw_value = raw_values[slot];
             node.expanded = true;
+            node.completed_q_cache_valid = false;
             node.edge_begin = static_cast<std::int32_t>(forest->edges.size());
             node.edge_count = end - begin;
             for (auto index = begin; index < end; ++index) {
@@ -1381,8 +1394,10 @@ MCTS_API std::int32_t mcts_forest_backup_batch(
                 static_cast<std::size_t>(selection.path_begin + offset)
             ];
             auto& node = forest->nodes[static_cast<std::size_t>(node_id)];
+            node.completed_q_cache_valid = false;
             if (node.parent >= 0) {
                 auto& parent = forest->nodes[static_cast<std::size_t>(node.parent)];
+                parent.completed_q_cache_valid = false;
                 auto& edge = forest->edges[
                     static_cast<std::size_t>(parent.edge_begin + node.parent_edge)
                 ];
