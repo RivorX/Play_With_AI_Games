@@ -405,14 +405,14 @@ class ChessGUI:
         self.model2_checkpoint_path = model2_checkpoint_path
         self.console_verbose = bool(console_verbose)
         default_mcts_sims = int(config.get("reinforcement_learning", {}).get("mcts_simulations", 100))
-        rl_search_config = config.get("reinforcement_learning", {}) or {}
-        self.mcts_budget_mode = str(rl_search_config.get("mcts_budget_mode", "simulations")).strip().lower()
+        inference_config = config.get("inference", {}) or {}
+        self.mcts_budget_mode = str(inference_config.get("budget_mode", "simulations")).strip().lower()
         if self.mcts_budget_mode not in {"simulations", "time"}:
             self.mcts_budget_mode = "simulations"
         try:
-            self.mcts_move_time_seconds = float(rl_search_config.get("mcts_move_time_seconds", 1.0))
+            self.mcts_move_time_seconds = float(inference_config.get("move_time_seconds", 0.2))
         except (TypeError, ValueError, OverflowError):
-            self.mcts_move_time_seconds = 1.0
+            self.mcts_move_time_seconds = 0.2
         try:
             self.mcts_simulations_white = max(1, int(mcts_simulations_white if mcts_simulations_white is not None else default_mcts_sims))
         except (TypeError, ValueError):
@@ -2508,7 +2508,7 @@ class ChessGUI:
             override_uci = str(override) if override is not None else None
         selected_row = next((row for row in actions if row["uci"] == selected_uci), {})
         config = getattr(mcts, "config", {}) or {}
-        rl_config = dict(config.get("reinforcement_learning", {}) or {})
+        inference_config = dict(config.get("inference", {}) or {})
         runtime_keys = (
             "simulation_budget", "simulations_used", "fresh_simulations_used",
             "budget_mode", "requested_time_limit_seconds", "elapsed_time_seconds",
@@ -2522,7 +2522,7 @@ class ChessGUI:
             "gumbel_q_range_floor", "gumbel_target_temperature",
         )
         runtime = {key: _json_safe(metadata.get(key)) for key in runtime_keys if key in metadata}
-        budget_mode = str(rl_config.get("mcts_budget_mode", "simulations")).strip().lower()
+        budget_mode = str(inference_config.get("budget_mode", "simulations")).strip().lower()
         if budget_mode not in {"simulations", "time"}:
             budget_mode = "simulations"
         return {
@@ -2544,7 +2544,7 @@ class ChessGUI:
             ),
             "budget_mode": budget_mode,
             "time_limit_seconds": (
-                float(rl_config.get("mcts_move_time_seconds", 1.0))
+                float(inference_config.get("move_time_seconds", 0.2))
                 if budget_mode == "time"
                 else None
             ),

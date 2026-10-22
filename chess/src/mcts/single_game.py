@@ -106,6 +106,14 @@ class SingleGameMCTS:
                     "mcts_simulations", 192
                 )
             )
+        if budget_mode is None and time_limit_seconds is None:
+            # SingleGameMCTS is the inference/play wrapper. Keep timed mode
+            # opt-in here, while MultiGameBatchMCTS remains simulation-only
+            # unless its caller explicitly supplies a budget mode.
+            inference_cfg = self.config.get("inference", {}) or {}
+            budget_mode = inference_cfg.get("budget_mode", "simulations")
+            if str(budget_mode).strip().lower() == "time":
+                time_limit_seconds = inference_cfg.get("move_time_seconds", 0.2)
         position_counts, repetition_known = self._board_repetition_context(
             board,
             position_counts,

@@ -76,10 +76,8 @@ def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict
     elo_mcts_config = dict(config or {})
     rl_config = dict(elo_mcts_config.get('reinforcement_learning', {}) or {})
     elo_config = dict(elo_config or {})
-    if 'mcts_budget_mode' in elo_config:
-        rl_config['mcts_budget_mode'] = elo_config['mcts_budget_mode']
-    if 'mcts_move_time_seconds' in elo_config:
-        rl_config['mcts_move_time_seconds'] = elo_config['mcts_move_time_seconds']
+    rl_config.pop('mcts_budget_mode', None)
+    rl_config.pop('mcts_move_time_seconds', None)
     if 'mcts_gumbel_root_schedule' in elo_config:
         rl_config['mcts_gumbel_root_schedule'] = elo_config[
             'mcts_gumbel_root_schedule'
@@ -87,6 +85,21 @@ def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict
     rl_config['mcts_dynamic_budget_enabled'] = False
     rl_config['eval_mcts_dynamic_budget_enabled'] = False
     elo_mcts_config['reinforcement_learning'] = rl_config
+    inference_config = dict(elo_mcts_config.get('inference', {}) or {})
+    budget_mode = str(elo_config.get('mcts_budget_mode', 'simulations')).strip().lower()
+    if budget_mode not in {'simulations', 'time'}:
+        budget_mode = 'simulations'
+    inference_config['budget_mode'] = budget_mode
+    if budget_mode == 'time':
+        inference_config['move_time_seconds'] = float(
+            elo_config.get(
+                'mcts_move_time_seconds',
+                inference_config.get('move_time_seconds', 0.2),
+            )
+        )
+    else:
+        inference_config.pop('move_time_seconds', None)
+    elo_mcts_config['inference'] = inference_config
     return elo_mcts_config
 
 
@@ -484,6 +497,15 @@ class _BatchedModelPlayer:
         self.device = device
         self.use_mcts = use_mcts
         self.simulations = simulations
+        inference_config = config.get("inference", {}) or {}
+        self.mcts_budget_mode = str(
+            inference_config.get("budget_mode", "simulations")
+        ).strip().lower()
+        self.mcts_time_limit_seconds = (
+            float(inference_config.get("move_time_seconds", 0.2))
+            if self.mcts_budget_mode == "time"
+            else None
+        )
         self.input_encoder, self.history_positions = _resolve_player_input_contract(model, config)
         self.use_amp = bool(
             config.get('hardware', {}).get('use_amp', True) and device.type == 'cuda'
@@ -500,6 +522,8 @@ class _BatchedModelPlayer:
             "board_history": [],
             "native_board": None,
             "position_counts": {},
+            "mcts_search_calls": 0,
+            "mcts_fresh_simulations": 0,
             "search_session": (
                 SearchSession(self.multi_mcts, tree_key=object())
                 if self.multi_mcts is not None
@@ -514,6 +538,8 @@ class _BatchedModelPlayer:
         state["board_history"] = []
         state["native_board"] = None
         state["position_counts"] = {}
+        state["mcts_search_calls"] = 0
+        state["mcts_fresh_simulations"] = 0
 
     @staticmethod
     def close_state(state: dict):
@@ -630,6 +656,8 @@ class _BatchedModelPlayer:
             num_simulations=self.simulations,
             add_root_noise=False,
             include_diagnostics=False,
+            budget_mode=self.mcts_budget_mode,
+            time_limit_seconds=self.mcts_time_limit_seconds,
         )
 
         moves: list[chess.Move | None] = []
@@ -640,6 +668,21 @@ class _BatchedModelPlayer:
             state["search_session"].commit(gs)
             if search_result:
                 moves.append(search_result.selected_move)
+                state["mcts_search_calls"] = int(
+                    state.get("mcts_search_calls", 0) or 0
+                ) + 1
+                metadata = getattr(search_result, "metadata", {}) or {}
+                fresh_simulations = metadata.get(
+                    "actual_fresh_simulations",
+                    metadata.get("fresh_simulations_used", 0),
+                )
+                try:
+                    fresh_simulations = max(0, int(fresh_simulations or 0))
+                except (TypeError, ValueError, OverflowError):
+                    fresh_simulations = 0
+                state["mcts_fresh_simulations"] = int(
+                    state.get("mcts_fresh_simulations", 0) or 0
+                ) + fresh_simulations
             else:
                 moves.append(None)
                 raw_fallback_indices.append(idx)
@@ -968,6 +1011,9 @@ class EloEstimator:
             "stockfish_move_time_s": 0.0,
             "mcts_nn_inference_calls": 0,
             "mcts_nn_inference_batch_items": 0,
+            "mcts_search_calls": 0,
+            "mcts_fresh_simulations": 0,
+            "mcts_avg_simulations_per_move": 0.0,
             "central_inference_requests": 0,
             "central_inference_server_batch_items": 0,
             "central_inference_remote_wait_time": 0.0,
@@ -986,6 +1032,8 @@ class EloEstimator:
             merged["stockfish_move_time_s"] += float(stats.get("stockfish_move_time_s", 0.0) or 0.0)
             merged["mcts_nn_inference_calls"] += int(stats.get("mcts_nn_inference_calls", 0) or 0)
             merged["mcts_nn_inference_batch_items"] += int(stats.get("mcts_nn_inference_batch_items", 0) or 0)
+            merged["mcts_search_calls"] += int(stats.get("mcts_search_calls", 0) or 0)
+            merged["mcts_fresh_simulations"] += int(stats.get("mcts_fresh_simulations", 0) or 0)
             merged["central_inference_requests"] += int(stats.get("central_inference_requests", 0) or 0)
             merged["central_inference_server_batch_items"] += int(stats.get("central_inference_server_batch_items", 0) or 0)
             merged["central_inference_remote_wait_time"] += float(stats.get("central_inference_remote_wait_time", 0.0) or 0.0)
@@ -996,6 +1044,11 @@ class EloEstimator:
             merged["central_inference_server_h2d_time"] += float(stats.get("central_inference_server_h2d_time", 0.0) or 0.0)
             merged["central_inference_server_d2h_time"] += float(stats.get("central_inference_server_d2h_time", 0.0) or 0.0)
             merged["worker_game_counts"].extend(list(stats.get("worker_game_counts", []) or []))
+        if merged["mcts_search_calls"] > 0:
+            merged["mcts_avg_simulations_per_move"] = (
+                float(merged["mcts_fresh_simulations"])
+                / float(merged["mcts_search_calls"])
+            )
         return merged
 
     def _estimate_central_batched_groups(
@@ -1335,6 +1388,11 @@ class EloEstimator:
         all_scores: list[float] = []
         all_game_indices: list[int] = []
         interrupted_by_user = False
+        timed_mcts = bool(
+            use_mcts
+            and str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower()
+            == "time"
+        )
 
         if not tasks:
             return all_opponent_elos, all_scores, all_game_indices, interrupted_by_user
@@ -1354,7 +1412,7 @@ class EloEstimator:
                 interrupted_by_user = True
                 self._request_cancel()
                 print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
-        elif batch_model_moves and workers > 1:
+        elif batch_model_moves and (workers > 1 or timed_mcts):
             try:
                 all_opponent_elos, all_scores, all_game_indices = self._estimate_batched_games(
                     tasks=tasks,
@@ -1541,13 +1599,10 @@ class EloEstimator:
         self._local_cancel_event.clear()
         self._printed_central_mcts_clients = False
         self.model.eval()
-        budget_mode = str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower()
-        if use_mcts and budget_mode == "time":
-            # A per-move time budget is only comparable when concurrent searches
-            # do not contend for the same model/device. Keep timed Elo serial.
-            workers = 1
-            self.elo_config["workers"] = 1
-            self.elo_config["batch_model_moves"] = False
+        self._last_elo_batch_stats = None
+        budget_mode = str(
+            self.elo_config.get("mcts_budget_mode", "simulations")
+        ).strip().lower()
         if self._is_cancelled():
             return {
                 "estimated_elo": None,
@@ -1691,6 +1746,10 @@ class EloEstimator:
             # Raw NN inference is usually much cheaper than the Stockfish move.
             # Running full games per worker avoids the per-ply batch barrier.
             batch_model_moves = bool(self.elo_config.get("batch_raw_model_moves", batch_model_moves))
+        elif budget_mode == "time":
+            # Timed roots share one native batched search/deadline per model
+            # turn. This also lets the result report per-root actual work.
+            batch_model_moves = True
         central_inference_enabled = bool(
             use_mcts
             and workers > 1
@@ -1717,11 +1776,10 @@ class EloEstimator:
             f"focus>={focus_games_cfg}/selected level, then precision rounds"
         )
         if use_mcts:
-            budget_mode = str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower()
             if budget_mode == "time":
                 print(
                     "  Info: MCTS budget: "
-                    f"{float(self.elo_config.get('mcts_move_time_seconds', 1.0)):.3g}s per move"
+                    f"{float(self.elo_config.get('mcts_move_time_seconds', 0.2)):.3g}s per move"
                 )
             else:
                 print(f"  Info: MCTS budget: {int(simulations)} simulations per move")
@@ -2039,12 +2097,49 @@ class EloEstimator:
         if estimated_elo is not None and elo_se is not None:
             elo_ci95 = [round(estimated_elo - 1.96 * elo_se), round(estimated_elo + 1.96 * elo_se)]
 
+        mcts_stats = self._last_elo_batch_stats or {}
+        mcts_stats_available = "mcts_search_calls" in mcts_stats
+        mcts_search_calls = (
+            int(mcts_stats.get("mcts_search_calls", 0) or 0)
+            if mcts_stats_available
+            else None
+        )
+        mcts_fresh_simulations = (
+            int(mcts_stats.get("mcts_fresh_simulations", 0) or 0)
+            if mcts_stats_available
+            else None
+        )
+        mcts_avg_simulations_per_move = (
+            float(mcts_fresh_simulations) / float(mcts_search_calls)
+            if mcts_stats_available and mcts_search_calls > 0
+            else 0.0 if mcts_stats_available else None
+        )
+
         result = {
             "estimated_elo": round(estimated_elo) if estimated_elo is not None else None,
             "mcts_budget_mode": str(self.elo_config.get("mcts_budget_mode", "simulations")) if use_mcts else "raw_nn",
-            "mcts_move_time_seconds": float(self.elo_config.get("mcts_move_time_seconds", 1.0)) if use_mcts else None,
+            "mcts_move_time_seconds": (
+                float(self.elo_config.get("mcts_move_time_seconds", 0.2))
+                if use_mcts and budget_mode == "time"
+                else None
+            ),
             "mcts_simulations": int(simulations) if use_mcts and str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower() != "time" else 0,
             "mcts_time_search_workers": int(workers) if use_mcts and budget_mode == "time" else None,
+            "mcts_time_search_batch_model_moves": (
+                bool(batch_model_moves or central_inference_enabled)
+                if use_mcts and budget_mode == "time"
+                else None
+            ),
+            "mcts_time_search_central_inference": (
+                bool(central_inference_enabled)
+                if use_mcts and budget_mode == "time"
+                else None
+            ),
+            "mcts_search_calls": mcts_search_calls if use_mcts else None,
+            "mcts_fresh_simulations": mcts_fresh_simulations if use_mcts else None,
+            "mcts_avg_simulations_per_move": (
+                mcts_avg_simulations_per_move if use_mcts else None
+            ),
             "mcts_root_schedule": (
                 "revisiting"
                 if use_mcts and budget_mode == "time"
@@ -2210,6 +2305,8 @@ class EloEstimator:
         model_move_positions = 0
         model_move_time_s = 0.0
         stockfish_move_time_s = 0.0
+        mcts_search_calls = 0
+        mcts_fresh_simulations = 0
 
         def refill_pending_tasks(group_worker_count: int | None = None) -> bool:
             nonlocal dynamic_tasks_exhausted
@@ -2224,6 +2321,7 @@ class EloEstimator:
             return False
 
         def finalize_game(game: dict, score: float | None = None):
+            nonlocal mcts_search_calls, mcts_fresh_simulations
             valid_result = not bool(game.get("invalid", False))
             if score is None and valid_result:
                 score = self._score_game_result(game["board"], bool(game["model_is_white"]))
@@ -2231,6 +2329,14 @@ class EloEstimator:
                 all_opponent_elos.append(float(game["level"]))
                 all_scores.append(float(score))
                 all_game_indices.append(int(game["game_idx"]))
+                if use_mcts:
+                    game_state = game["state"]
+                    mcts_search_calls += int(
+                        game_state.get("mcts_search_calls", 0) or 0
+                    )
+                    mcts_fresh_simulations += int(
+                        game_state.get("mcts_fresh_simulations", 0) or 0
+                    )
             batched_player.close_state(game["state"])
             worker_slot = int(game.get("worker_slot", -1))
             if 0 <= worker_slot < len(worker_game_counts):
@@ -2414,6 +2520,14 @@ class EloEstimator:
             stats_out["model_move_time_s"] = float(model_move_time_s)
             stats_out["stockfish_move_time_s"] = float(stockfish_move_time_s)
             stats_out["worker_game_counts"] = list(worker_game_counts)
+            if use_mcts:
+                stats_out["mcts_search_calls"] = int(mcts_search_calls)
+                stats_out["mcts_fresh_simulations"] = int(mcts_fresh_simulations)
+                stats_out["mcts_avg_simulations_per_move"] = (
+                    float(mcts_fresh_simulations) / float(mcts_search_calls)
+                    if mcts_search_calls > 0
+                    else 0.0
+                )
             if use_mcts and batched_player.multi_mcts is not None:
                 mcts_profile = batched_player.multi_mcts.get_profile_stats()
                 stats_out["mcts_nn_inference_calls"] = int(
@@ -2446,6 +2560,18 @@ class EloEstimator:
                 "stockfish_move_time_s": float(stockfish_move_time_s),
                 "worker_game_counts": list(worker_game_counts),
             }
+            if use_mcts:
+                self._last_elo_batch_stats.update(
+                    {
+                        "mcts_search_calls": int(mcts_search_calls),
+                        "mcts_fresh_simulations": int(mcts_fresh_simulations),
+                        "mcts_avg_simulations_per_move": (
+                            float(mcts_fresh_simulations) / float(mcts_search_calls)
+                            if mcts_search_calls > 0
+                            else 0.0
+                        ),
+                    }
+                )
             if use_mcts and batched_player.multi_mcts is not None:
                 mcts_profile = batched_player.multi_mcts.get_profile_stats()
                 self._last_elo_batch_stats.update(

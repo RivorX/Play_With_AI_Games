@@ -1,5 +1,11 @@
-# Reinforcement-learning search settings.
+# Inference/search settings.
 # Keep these grouped values aligned with config normalization.
+inference:
+  # Simulations remain the default. Select time for play, UCI and standalone
+  # Stockfish inference evaluation; training always uses simulation budgets.
+  budget_mode: simulations       # simulations | time
+  move_time_seconds: 0.2
+
 reinforcement_learning:
   search:
     # The current supported root search algorithm.
@@ -11,10 +17,6 @@ reinforcement_learning:
     # `total` is the current default; Sequential-Halving quotas stay fresh.
     gumbel_reuse_q_scale: total
     simulations: 192
-    # Fixed simulations preserve existing behavior; time mode searches for the
-    # configured wall-clock budget and repeatedly revisits root actions. 
-    budget_mode: simulation             #simulation | time
-    move_time_seconds: 0.2
     # Interactive one-root searches otherwise shrink each batch to a quarter
     # of the remaining budget, creating many tiny GPU calls. 0 preserves that
     # legacy schedule; positive caps apply only to one root.

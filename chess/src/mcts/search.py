@@ -5032,14 +5032,16 @@ class MultiGameBatchMCTS:
         Returns:
             List[Dict[chess.Move, float]] search weights for each game in order
         """
-        rl_cfg = self.config.get('reinforcement_learning', {}) or {}
+        inference_cfg = self.config.get('inference', {}) or {}
         if budget_mode is None:
             if time_limit_seconds is not None:
                 effective_budget_mode = 'time'
             else:
-                effective_budget_mode = str(
-                    rl_cfg.get('mcts_budget_mode', 'simulations')
-                ).strip().lower()
+                # The shared core also serves self-play, reanalysis, and Elo.
+                # None of those paths may inherit an interactive wall-clock
+                # setting from global config; only an explicit API request
+                # opts into timed search.
+                effective_budget_mode = 'simulations'
         else:
             effective_budget_mode = str(budget_mode).strip().lower()
         if effective_budget_mode not in {'simulations', 'time'}:
@@ -5049,7 +5051,7 @@ class MultiGameBatchMCTS:
             raw_time_limit = (
                 time_limit_seconds
                 if time_limit_seconds is not None
-                else rl_cfg.get('mcts_move_time_seconds', 1.0)
+                else inference_cfg.get('move_time_seconds', 0.2)
             )
             if isinstance(raw_time_limit, (bool, np.bool_)):
                 raise ValueError('time_limit_seconds must be a finite positive number')

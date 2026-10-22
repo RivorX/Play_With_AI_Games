@@ -32,7 +32,9 @@ from src.model import (
 )
 from src.evaluation.elo_estimator import ensure_stockfish
 from src.evaluation.elo_runner import (
+    apply_checkpoint_elo_seed,
     build_eval_elo_config,
+    elo_protocol_settings,
     mode_label,
     persist_estimated_elo,
     resolve_eval_workers,
@@ -436,14 +438,15 @@ def choose_model_entries(catalog, best_path):
         print("All selected IDs were invalid. Try again.")
 
 
-def choose_eval_settings(elo_cfg):
+def choose_eval_settings(elo_cfg, inference_cfg=None):
     default_games = int(elo_cfg.get("adaptive_focus_games_per_level", 20))
     default_use_mcts = False
     default_sims = int(elo_cfg.get("mcts_eval_simulations", 100))
-    default_budget_mode = str(elo_cfg.get("mcts_budget_mode", "simulations")).strip().lower()
+    inference_cfg = dict(inference_cfg or {})
+    default_budget_mode = str(inference_cfg.get("budget_mode", "simulations")).strip().lower()
     if default_budget_mode not in {"simulations", "time"}:
         default_budget_mode = "simulations"
-    default_move_time = float(elo_cfg.get("mcts_move_time_seconds", 1.0))
+    default_move_time = float(inference_cfg.get("move_time_seconds", 0.2))
     default_sf_time = float(elo_cfg.get("stockfish_time_limit", 0.05))
     default_max_moves = int(elo_cfg.get("max_moves", 150))
     default_sf_path = str(elo_cfg.get("stockfish_path", "stockfish"))
@@ -463,8 +466,8 @@ def choose_eval_settings(elo_cfg):
             "Inference mode:",
             [
                 "Raw NN only",
-                "MCTS only (choose simulations)",
-                "Raw NN + MCTS (choose simulations)",
+                "MCTS only (choose budget)",
+                "Raw NN + MCTS (choose budget)",
             ],
             default_idx=mcts_default_idx,
         )
@@ -636,6 +639,9 @@ def format_results_table(all_results: list[dict]) -> str:
         elo_str = str(elo) if elo is not None else "N/A"
         lines.append(f"- {name} [{mode_label}]")
         lines.append(f"  Estimated Elo: {elo_str}")
+        timed_summary = _timed_mcts_work_summary(result)
+        if timed_summary:
+            lines.append(f"  {timed_summary}")
         rating_bracket = result.get("rating_bracket")
         if result.get("rating_bracketed") and isinstance(rating_bracket, list):
             lines.append(
@@ -721,6 +727,31 @@ def format_results_table(all_results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _timed_mcts_work_summary(result: dict) -> str | None:
+    if result.get("mode") != "mcts" or result.get("mcts_budget_mode") != "time":
+        return None
+    seconds = _safe_float(result.get("mcts_move_time_seconds"))
+    workers = _safe_int(result.get("mcts_time_search_workers"))
+    calls = _safe_int(result.get("mcts_search_calls"))
+    fresh = _safe_int(result.get("mcts_fresh_simulations"))
+    average = _safe_float(result.get("mcts_avg_simulations_per_move"))
+    if average is None and calls and fresh is not None:
+        average = float(fresh) / max(1, calls)
+    budget = f"{seconds:g}s/move" if seconds is not None else "timed/move"
+    if workers is None:
+        worker_text = "parallelism unavailable"
+    else:
+        worker_text = f"{workers} game worker" if workers == 1 else f"{workers} game workers"
+    if average is None:
+        work_text = "actual simulations/move unavailable"
+    else:
+        detail = f" ({fresh} fresh / {calls} search calls)" if fresh is not None and calls is not None else ""
+        work_text = f"{average:.1f} average fresh simulations/move{detail}"
+    style = result.get("mcts_time_search_style")
+    style_text = f", path={style}" if style else ""
+    return f"Timed search: {budget}, {worker_text}{style_text}; {work_text}."
+
+
 def main():
     parser = argparse.ArgumentParser(description="Estimate NN/MCTS Elo against Stockfish")
     parser.add_argument("--model", action="append", default=[], help="checkpoint path to preselect")
@@ -743,11 +774,7 @@ def main():
     print(f"Using device from config: {device}")
 
     elo_cfg = dict(config.get("elo_estimation", {}) or {})
-    rl_cfg = config.get("reinforcement_learning", {}) or {}
-    elo_cfg.setdefault("mcts_budget_mode", rl_cfg.get("mcts_budget_mode", "simulations"))
-    elo_cfg.setdefault("mcts_move_time_seconds", rl_cfg.get("mcts_move_time_seconds", 1.0))
-    elo_cfg.setdefault("mcts_gumbel_root_schedule", rl_cfg.get("mcts_gumbel_root_schedule", "standard"))
-    settings = choose_eval_settings(elo_cfg)
+    settings = choose_eval_settings(elo_cfg, config.get("inference", {}))
     levels = settings["levels"]
     games_per_level = settings["games_per_level"]
     workers = settings["workers"]
@@ -796,7 +823,7 @@ def main():
 
     def _resolved_mode_config(mode_name):
         mode_use_mcts = mode_name == "mcts"
-        return build_eval_elo_config(
+        runtime_cfg = build_eval_elo_config(
             elo_cfg,
             levels=levels,
             games_per_level=games_per_level,
@@ -810,6 +837,19 @@ def main():
             workers=resolve_eval_workers(workers, mode_use_mcts, elo_cfg),
             standalone=True,
         )
+        if mode_use_mcts and budget_mode == "time":
+            central = bool(
+                device.type == "cuda"
+                and int(runtime_cfg.get("workers", 1) or 1) > 1
+                and runtime_cfg.get("eval_elo_central_inference_enabled", False)
+            )
+            batched_roots = bool(runtime_cfg.get("batch_model_moves", True))
+            runtime_cfg["mcts_time_search_central_inference"] = central
+            runtime_cfg["mcts_time_search_batch_model_moves"] = batched_roots
+            runtime_cfg["mcts_time_search_style"] = (
+                "central_inference" if central else "batched_roots" if batched_roots else "independent_roots"
+            )
+        return runtime_cfg
 
     mode_runtime_configs = {
         mode_name: _resolved_mode_config(mode_name)
@@ -840,11 +880,13 @@ def main():
     else:
         workers_str = "auto"
     if budget_mode == "time" and "mcts" in eval_modes:
-        workers_str = (
-            "Raw NN auto; timed MCTS sequential"
-            if "nn" in eval_modes
-            else "1 worker (timed MCTS)"
-        )
+        timed_workers = int(mode_runtime_configs["mcts"].get("workers", 1) or 1)
+        timed_worker_text = f"timed MCTS {timed_workers} game workers"
+        if "nn" in eval_modes:
+            nn_workers = int(mode_runtime_configs["nn"].get("workers", 1) or 1)
+            workers_str = f"Raw NN {nn_workers} workers; {timed_worker_text}"
+        else:
+            workers_str = timed_worker_text
 
     _print_block("Elo Estimation Plan")
     print(f"Models:         {len(selected_paths)}")
@@ -871,19 +913,42 @@ def main():
         raw_workers = resolve_eval_workers(workers, False, elo_cfg)
         if raw_workers > 0:
             print(f"Raw NN workers: {raw_workers}")
-    if workers <= 0 and "mcts" in eval_modes:
-        mcts_workers = resolve_eval_workers(workers, True, elo_cfg)
+    if "mcts" in eval_modes and budget_mode == "time":
+        timed_cfg = mode_runtime_configs["mcts"]
+        mcts_workers = int(timed_cfg.get("workers", 1) or 1)
+        requested_timed_workers = int(
+            timed_cfg.get("mcts_timed_parallel_games_requested_workers", mcts_workers) or mcts_workers
+        )
+        cap = int(elo_cfg.get("mcts_timed_parallel_games", 4) or 4)
+        clamp_note = (
+            f", requested {requested_timed_workers} capped at {mcts_workers}"
+            if requested_timed_workers > mcts_workers
+            else ""
+        )
+        print(f"MCTS workers:   {mcts_workers} (timed cap {cap}{clamp_note})")
+    elif workers <= 0 and "mcts" in eval_modes:
+        mcts_workers = int(mode_runtime_configs["mcts"].get("workers", 0) or 0)
         if mcts_workers > 0:
             print(f"MCTS workers:   {mcts_workers}")
         else:
             print("MCTS workers:   auto -> full CPU budget")
     if "mcts" in eval_modes:
-        central_enabled = bool(elo_cfg.get("eval_elo_central_inference_enabled", False))
+        central_enabled = bool(
+            mode_runtime_configs["mcts"].get(
+                "mcts_time_search_central_inference",
+                elo_cfg.get("eval_elo_central_inference_enabled", False),
+            )
+        )
         if central_enabled:
             servers = elo_cfg.get("eval_elo_central_inference_servers", "auto")
             print(f"MCTS central:   enabled (servers={servers})")
         else:
             print("MCTS central:   disabled")
+        if budget_mode == "time":
+            print(
+                "Timed path:     "
+                f"{mode_runtime_configs['mcts'].get('mcts_time_search_style', 'unknown')}"
+            )
     print(f"SF time/move:   {sf_time}s")
     print(f"Max moves:      {max_moves}")
     if bool(elo_cfg.get("paired_openings_enabled", True)):
@@ -918,31 +983,21 @@ def main():
             )
             print(f"  Mode: {mode_label_text}")
 
-            mode_workers = resolve_eval_workers(workers, mode_use_mcts, elo_cfg)
-            if mode_use_mcts and budget_mode == "time":
-                mode_workers = 1
             mode_elo_cfg = dict(mode_runtime_configs[eval_mode])
-            mode_elo_cfg["workers"] = int(mode_workers)
-            initial_elo = (
-                None if mode_use_mcts and budget_mode == "time"
-                else entry.get("elo_mcts" if mode_use_mcts else "elo_nn")
+            initial_elo = apply_checkpoint_elo_seed(
+                mode_elo_cfg,
+                model_path,
+                use_mcts=mode_use_mcts,
+                simulations=simulations,
+                budget_mode=budget_mode,
+                time_limit_seconds=move_time_seconds,
             )
-            if mode_use_mcts:
-                if budget_mode == "time":
-                    by_time = dict(entry.get("elo_mcts_by_time") or {})
-                    time_entry = by_time.get(format(float(move_time_seconds), ".9g"))
-                    if isinstance(time_entry, dict) and _safe_float(time_entry.get("elo")) is not None:
-                        initial_elo = _safe_float(time_entry.get("elo"))
-                else:
-                    by_sims = dict(entry.get("elo_mcts_by_simulations") or {})
-                    sims_entry = by_sims.get(int(simulations)) or by_sims.get(str(int(simulations)))
-                    if isinstance(sims_entry, dict) and _safe_float(sims_entry.get("elo")) is not None:
-                        initial_elo = _safe_float(sims_entry.get("elo"))
-            if _safe_float(initial_elo) is not None:
-                mode_elo_cfg["adaptive_initial_elo"] = float(initial_elo)
-                mode_elo_cfg["adaptive_initial_elo_source"] = (
-                    f"{model_path.name} stored {mode_label_text}"
+            if initial_elo is not None:
+                seed_source = mode_elo_cfg.get(
+                    "adaptive_initial_elo_source",
+                    "explicit adaptive_initial_elo",
                 )
+                print(f"  Scheduling seed: {initial_elo:.0f} Elo ({seed_source})")
 
             result = run_elo_check(model, config, device, mode_elo_cfg)
             if result.get("cancelled"):
@@ -962,10 +1017,42 @@ def main():
             result["mcts_simulations"] = int(simulations) if mode_use_mcts and budget_mode == "simulations" else 0
             result["mcts_budget_mode"] = budget_mode if mode_use_mcts else "raw_nn"
             result["mcts_move_time_seconds"] = move_time_seconds if mode_use_mcts else None
+            if mode_use_mcts and budget_mode == "time":
+                for result_key, config_key in (
+                    ("mcts_time_search_protocol", "mcts_time_search_protocol"),
+                    ("mcts_time_search_workers", "workers"),
+                    ("mcts_time_search_batch_model_moves", "mcts_time_search_batch_model_moves"),
+                    ("mcts_time_search_central_inference", "mcts_time_search_central_inference"),
+                    ("mcts_time_search_style", "mcts_time_search_style"),
+                    ("mcts_timed_parallel_games", "mcts_timed_parallel_games"),
+                ):
+                    if result.get(result_key) is None:
+                        result[result_key] = mode_elo_cfg.get(config_key)
+                protocol_runtime_cfg = dict(mode_elo_cfg)
+                for result_key, protocol_key in (
+                    ("mcts_time_search_workers", "workers"),
+                    ("mcts_time_search_batch_model_moves", "mcts_time_search_batch_model_moves"),
+                    ("mcts_time_search_central_inference", "mcts_time_search_central_inference"),
+                    ("mcts_time_search_style", "mcts_time_search_style"),
+                ):
+                    if result.get(result_key) is not None:
+                        protocol_runtime_cfg[protocol_key] = result[result_key]
+            else:
+                protocol_runtime_cfg = mode_elo_cfg
+            result["elo_protocol_settings"] = elo_protocol_settings(
+                protocol_runtime_cfg,
+                use_mcts=mode_use_mcts,
+                simulations=simulations,
+                budget_mode=budget_mode,
+                time_limit_seconds=move_time_seconds,
+            )
             all_results.append(result)
 
             elo = result.get("estimated_elo")
             print(f"  Estimated {mode_label_text} Elo: {elo if elo is not None else 'N/A'}")
+            timed_summary = _timed_mcts_work_summary(result)
+            if timed_summary:
+                print(f"  {timed_summary}")
 
             persist_estimated_elo(
                 model_path,

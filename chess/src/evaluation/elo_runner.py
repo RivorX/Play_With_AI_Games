@@ -8,6 +8,7 @@ import torch
 from src.evaluation.elo_estimator import (
     _EVAL_OPENING_LINES,
     _EVAL_OPENING_SUITE_ID,
+    _available_cpu_count,
     estimate_model_elo,
 )
 from src.models.catalog import persist_checkpoint_elo_metadata
@@ -115,6 +116,29 @@ def elo_protocol_settings(
             if timed
             else {}
         ),
+        **(_timed_search_protocol(runtime_cfg) if timed else {}),
+    }
+
+
+def _timed_search_protocol(runtime_cfg: dict) -> dict:
+    """Describe the effective path so sequential and parallel Elo stay distinct."""
+    central = bool(runtime_cfg.get("mcts_time_search_central_inference", False))
+    batched_roots = bool(
+        runtime_cfg.get(
+            "mcts_time_search_batch_model_moves",
+            runtime_cfg.get("batch_model_moves", True),
+        )
+    )
+    return {
+        "time_search_protocol": "mcts-deadline-v1",
+        "time_search_batch_model_moves": batched_roots,
+        "time_search_central_inference": central,
+        "time_search_style": str(
+            runtime_cfg.get(
+                "mcts_time_search_style",
+                "central_inference" if central else "batched_roots" if batched_roots else "independent_roots",
+            )
+        ),
     }
 
 
@@ -161,6 +185,7 @@ def checkpoint_elo_seed(
     simulations: int = 0,
     budget_mode: str = "simulations",
     time_limit_seconds: float | None = None,
+    runtime_cfg: dict | None = None,
 ) -> tuple[float | None, str | None]:
     """Read an unbiased scheduling seed from checkpoint Elo metadata.
 
@@ -190,22 +215,64 @@ def checkpoint_elo_seed(
     if budget_mode == "time":
         requested_seconds = safe_float(time_limit_seconds)
         by_time = checkpoint.get("estimated_elo_mcts_by_time")
-        if requested_seconds is None or not math.isfinite(requested_seconds) or not isinstance(by_time, dict):
-            return None, None
-        target_key = _time_budget_key(requested_seconds)
-        for raw_seconds, raw_entry in by_time.items():
-            entry_seconds = safe_float(raw_seconds)
-            if entry_seconds is None and isinstance(raw_entry, dict):
-                entry_seconds = safe_float(raw_entry.get("time_limit_seconds"))
-            if entry_seconds is None or not math.isclose(
-                entry_seconds, requested_seconds, rel_tol=0.0, abs_tol=1e-9
-            ):
-                continue
-            elo = safe_float(raw_entry.get("elo")) if isinstance(raw_entry, dict) else safe_float(raw_entry)
-            if elo is not None and math.isfinite(elo):
-                return float(elo), f"{checkpoint_path.name} previous timed MCTS Elo @{_time_budget_key(entry_seconds)}s"
-        return None, None
+        if requested_seconds is None or not math.isfinite(requested_seconds) or requested_seconds <= 0:
+            return _checkpoint_simulation_seed(checkpoint, checkpoint_path, simulations, approximate=True)
+        time_candidates: list[tuple[float, float, dict | None]] = []
+        if isinstance(by_time, dict):
+            for raw_seconds, raw_entry in by_time.items():
+                entry_seconds = safe_float(raw_seconds)
+                if entry_seconds is None and isinstance(raw_entry, dict):
+                    entry_seconds = safe_float(raw_entry.get("time_limit_seconds"))
+                elo = safe_float(raw_entry.get("elo")) if isinstance(raw_entry, dict) else safe_float(raw_entry)
+                if (
+                    entry_seconds is not None
+                    and math.isfinite(entry_seconds)
+                    and entry_seconds > 0
+                    and elo is not None
+                    and math.isfinite(elo)
+                ):
+                    settings = raw_entry.get("settings") if isinstance(raw_entry, dict) else None
+                    time_candidates.append((float(entry_seconds), float(elo), settings if isinstance(settings, dict) else None))
 
+        same_budget = [
+            item for item in time_candidates
+            if math.isclose(item[0], requested_seconds, rel_tol=0.0, abs_tol=1e-9)
+        ]
+        for entry_seconds, elo, settings in same_budget:
+            if elo_protocol_matches_settings(
+                settings,
+                runtime_cfg or {},
+                use_mcts=True,
+                simulations=simulations,
+                budget_mode="time",
+                time_limit_seconds=requested_seconds,
+            ):
+                return elo, (
+                    f"{checkpoint_path.name} previous timed MCTS Elo "
+                    f"@{_time_budget_key(entry_seconds)}s (matching protocol)"
+                )
+        if same_budget:
+            entry_seconds, elo, _settings = same_budget[-1]
+            return elo, (
+                f"{checkpoint_path.name} approximate timed MCTS scheduling prior "
+                f"@{_time_budget_key(entry_seconds)}s (protocol differs or is legacy)"
+            )
+        if time_candidates:
+            entry_seconds, elo, _settings = min(
+                time_candidates,
+                key=lambda item: abs(math.log(item[0] / requested_seconds)),
+            )
+            return elo, (
+                f"{checkpoint_path.name} approximate timed MCTS scheduling prior "
+                f"@{_time_budget_key(entry_seconds)}s (nearest time budget)"
+            )
+        return _checkpoint_simulation_seed(checkpoint, checkpoint_path, simulations, approximate=True)
+
+    return _checkpoint_simulation_seed(checkpoint, checkpoint_path, simulations)
+
+
+def _checkpoint_simulation_seed(checkpoint, checkpoint_path, simulations, *, approximate=False):
+    """Use the nearest same-checkpoint fixed-simulation MCTS rating as a prior."""
     requested_sims = max(0, int(simulations or 0))
     candidates: list[tuple[int, float]] = []
     by_simulations = checkpoint.get("estimated_elo_mcts_by_simulations")
@@ -219,8 +286,7 @@ def checkpoint_elo_seed(
                 candidates.append((max(0, int(sims)), float(elo)))
 
     if candidates:
-        exact = next((item for item in candidates if item[0] == requested_sims), None)
-        chosen = exact
+        chosen = next((item for item in candidates if item[0] == requested_sims), None)
         if chosen is None:
             chosen = min(
                 candidates,
@@ -228,12 +294,16 @@ def checkpoint_elo_seed(
             )
         sims, elo = chosen
         relation = "same" if sims == requested_sims else "nearest"
+        if approximate:
+            return elo, f"{checkpoint_path.name} approximate MCTS scheduling prior @{sims} ({relation} simulation budget)"
         return elo, f"{checkpoint_path.name} previous MCTS Elo @{sims} ({relation} budget)"
 
     elo = safe_float(checkpoint.get("estimated_elo_mcts", checkpoint.get("last_estimated_elo_mcts")))
     if elo is not None and math.isfinite(elo):
         stored_sims = safe_int(checkpoint.get("estimated_elo_mcts_simulations"))
         suffix = f" @{stored_sims}" if stored_sims is not None else ""
+        if approximate:
+            return float(elo), f"{checkpoint_path.name} approximate previous MCTS scheduling prior{suffix}"
         return float(elo), f"{checkpoint_path.name} previous MCTS Elo{suffix}"
     return None, None
 
@@ -257,6 +327,7 @@ def apply_checkpoint_elo_seed(
         simulations=simulations,
         budget_mode=budget_mode,
         time_limit_seconds=time_limit_seconds,
+        runtime_cfg=runtime_cfg,
     )
     if elo is None:
         return None
@@ -329,26 +400,34 @@ def build_eval_elo_config(
 
     runtime_cfg["use_mcts"] = bool(use_mcts)
     if budget_mode is None:
-        budget_mode = source.get("mcts_budget_mode", "simulations")
+        inference_cfg = source.get("inference", {}) or {}
+        budget_mode = (
+            inference_cfg.get("budget_mode", "simulations")
+            if standalone
+            else "simulations"
+        )
     budget_mode = str(budget_mode or "simulations").strip().lower()
     if budget_mode not in {"simulations", "time"}:
         raise ValueError("mcts_budget_mode must be 'simulations' or 'time'")
-    if time_limit_seconds is None:
-        time_limit_seconds = source.get("mcts_move_time_seconds", 1.0)
-    if isinstance(time_limit_seconds, bool):
-        raise ValueError("mcts_move_time_seconds must be a finite positive number")
-    time_limit_seconds = safe_float(time_limit_seconds)
-    if time_limit_seconds is None or not math.isfinite(time_limit_seconds) or time_limit_seconds <= 0:
-        raise ValueError("mcts_move_time_seconds must be a finite positive number")
     runtime_cfg["mcts_budget_mode"] = budget_mode if use_mcts else "raw_nn"
-    runtime_cfg["mcts_move_time_seconds"] = float(time_limit_seconds)
+    if use_mcts and budget_mode == "time":
+        if time_limit_seconds is None:
+            inference_cfg = source.get("inference", {}) or {}
+            time_limit_seconds = inference_cfg.get("move_time_seconds", 0.2)
+        if isinstance(time_limit_seconds, bool):
+            raise ValueError("inference.move_time_seconds must be a finite positive number")
+        time_limit_seconds = safe_float(time_limit_seconds)
+        if time_limit_seconds is None or not math.isfinite(time_limit_seconds) or time_limit_seconds <= 0:
+            raise ValueError("inference.move_time_seconds must be a finite positive number")
+        runtime_cfg["mcts_move_time_seconds"] = float(time_limit_seconds)
+    else:
+        runtime_cfg.pop("mcts_move_time_seconds", None)
     if "mcts_gumbel_root_schedule" in source:
         runtime_cfg["mcts_gumbel_root_schedule"] = str(
             source["mcts_gumbel_root_schedule"]
         )
     else:
-        # Let run_elo_check/estimator inherit the actual normalized RL search
-        # schedule instead of silently replacing it with this helper's default.
+        # Let run_elo_check/estimator inherit the configured RL root schedule.
         runtime_cfg.pop("mcts_gumbel_root_schedule", None)
     # Keep a positive compatibility value for callers that still pass a
     # simulation-count positional argument; timed search ignores it.
@@ -358,10 +437,17 @@ def build_eval_elo_config(
     runtime_cfg["batch_raw_model_moves"] = bool(source.get("batch_raw_model_moves", False))
     runtime_cfg["stockfish_hide_window"] = bool(source.get("stockfish_hide_window", True))
     if use_mcts and budget_mode == "time":
-        # Each move gets its own wall-clock budget; batching several roots into
-        # one search would instead share one deadline across the whole batch.
-        runtime_cfg["batch_model_moves"] = False
-        runtime_cfg["workers"] = 1
+        cap = source.get("mcts_timed_parallel_games", 4)
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise ValueError("elo_estimation.mcts_timed_parallel_games must be a positive integer")
+        requested = int(runtime_cfg["workers"])
+        if requested <= 0:
+            requested = cap
+        runtime_cfg["mcts_timed_parallel_games_requested_workers"] = int(requested)
+        runtime_cfg["workers"] = max(1, min(requested, cap, _available_cpu_count()))
+        runtime_cfg["mcts_timed_parallel_games"] = int(cap)
+        runtime_cfg["mcts_time_search_protocol"] = "mcts-deadline-v1"
+        runtime_cfg["batch_model_moves"] = True
 
     if standalone:
         runtime_cfg["stockfish_priority"] = str(source.get("eval_elo_stockfish_priority", "normal"))
@@ -380,6 +466,7 @@ def build_il_periodic_elo_config(elo_cfg: dict) -> dict:
         elo_cfg or {},
         use_mcts=False,
         simulations=(elo_cfg or {}).get("mcts_simulations", 0),
+        budget_mode="simulations",
         workers=(elo_cfg or {}).get("nn_eval_workers"),
         standalone=False,
     )
@@ -399,6 +486,7 @@ def build_final_elo_config(elo_cfg: dict, *, use_mcts: bool = True) -> dict:
         source,
         use_mcts=use_mcts,
         simulations=simulations,
+        budget_mode="simulations",
         workers=workers,
         standalone=True,
     )
@@ -409,9 +497,6 @@ def build_final_elo_config(elo_cfg: dict, *, use_mcts: bool = True) -> dict:
 def build_final_mcts_elo_configs(elo_cfg: dict) -> list[dict]:
     """Build final-only MCTS budgets as multiples of the standard Elo budget."""
     source = dict(elo_cfg or {})
-    if str(source.get("mcts_budget_mode", "simulations")).strip().lower() == "time":
-        resolved = build_final_elo_config(source, use_mcts=True)
-        return [resolved]
     default_simulations = max(
         1,
         int(source.get("mcts_eval_simulations", source.get("mcts_simulations", 1)) or 1),
@@ -465,10 +550,17 @@ def run_elo_check(model, config: dict, device, elo_config: dict, *, stop_event=N
     )
     for key, fallback in (
         ("mcts_budget_mode", "simulations"),
-        ("mcts_move_time_seconds", 1.0),
         ("mcts_gumbel_root_schedule", configured_schedule),
     ):
-        resolved.setdefault(key, rl_cfg.get(key, fallback))
+        resolved.setdefault(key, fallback)
+    if str(resolved.get("mcts_budget_mode", "simulations")).strip().lower() == "time":
+        inference_cfg = dict((config or {}).get("inference", {}) or {})
+        resolved.setdefault(
+            "mcts_move_time_seconds",
+            inference_cfg.get("move_time_seconds", 0.2),
+        )
+    else:
+        resolved.pop("mcts_move_time_seconds", None)
     return estimate_model_elo(model, config, device, resolved, stop_event=stop_event)
 
 

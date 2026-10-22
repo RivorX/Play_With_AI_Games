@@ -364,6 +364,9 @@ def persist_checkpoint_elo_metadata(
         "stockfish_time_limit": float(sf_time),
     }
     if isinstance(elo_result, dict):
+        protocol_settings = elo_result.get("elo_protocol_settings")
+        if isinstance(protocol_settings, dict):
+            settings.update(protocol_settings)
         settings["adaptive"] = bool(elo_result.get("adaptive", False))
         actual_games = elo_result.get("actual_games_per_level")
         if isinstance(actual_games, dict):
@@ -379,6 +382,14 @@ def persist_checkpoint_elo_metadata(
             "rating_censored", "elo_lower_bound", "elo_upper_bound",
             "rating_levels", "rating_games", "probe_only_games",
             "mcts_root_schedule", "mcts_time_search_workers",
+            "mcts_time_search_protocol",
+            "mcts_time_search_batch_model_moves",
+            "mcts_time_search_central_inference",
+            "mcts_time_search_style",
+            "mcts_timed_parallel_games",
+            "mcts_search_calls",
+            "mcts_fresh_simulations",
+            "mcts_avg_simulations_per_move",
         ):
             if elo_result.get(key) is not None:
                 settings[key] = elo_result.get(key)

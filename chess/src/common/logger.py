@@ -576,8 +576,6 @@ class TrainingLogger(RLLoggerMixin, ILLoggerMixin):
         *,
         mode="nn",
         simulations=0,
-        budget_mode="simulations",
-        time_limit_seconds=None,
         update_csv=True,
         std_error=None,
         ci95=None,
@@ -591,14 +589,6 @@ class TrainingLogger(RLLoggerMixin, ILLoggerMixin):
         except (TypeError, ValueError):
                 return
         mode = "mcts" if str(mode).lower() == "mcts" else "nn"
-        timed_mcts = (
-            mode == "mcts"
-            and str(budget_mode or "simulations").strip().lower() == "time"
-        )
-        if timed_mcts:
-            # These legacy columns describe a fixed simulation budget. Timed
-            # Elo is persisted by the timed checkpoint/event metadata instead.
-            return
         std_error = _clean_optional_float(std_error)
         ci_low, ci_high = _clean_elo_ci95(ci95)
         prefix = 'estimated_elo_mcts' if mode == "mcts" else 'estimated_elo_nn'
@@ -628,17 +618,14 @@ class TrainingLogger(RLLoggerMixin, ILLoggerMixin):
                 if not rows:
                     return
                 header = list(rows[0])
-                columns = [
+                for col in (
                     'estimated_elo_nn', 'estimated_elo_nn_se',
                     'estimated_elo_nn_ci95_low', 'estimated_elo_nn_ci95_high',
                     'estimated_elo_mcts', 'estimated_elo_mcts_se',
                     'estimated_elo_mcts_ci95_low', 'estimated_elo_mcts_ci95_high',
-                ]
-                columns.extend((
                     'estimated_elo_mcts_simulations',
                     'estimated_elo_mcts_by_simulations',
-                ))
-                for col in columns:
+                ):
                     if col not in header:
                         header.append(col)
                         for row in rows[1:]:
@@ -648,9 +635,8 @@ class TrainingLogger(RLLoggerMixin, ILLoggerMixin):
                 se_idx = header.index(f'{prefix}_se')
                 ci_low_idx = header.index(f'{prefix}_ci95_low')
                 ci_high_idx = header.index(f'{prefix}_ci95_high')
-                if mode == "mcts":
-                    sims_idx = header.index('estimated_elo_mcts_simulations')
-                    by_sims_idx = header.index('estimated_elo_mcts_by_simulations')
+                sims_idx = header.index('estimated_elo_mcts_simulations')
+                by_sims_idx = header.index('estimated_elo_mcts_by_simulations')
                 iter_col = 'iteration' if 'iteration' in header else 'epoch'
                 iter_idx = header.index(iter_col)
                 updated_existing_row = False

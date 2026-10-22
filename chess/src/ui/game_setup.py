@@ -819,7 +819,7 @@ def _draw_home_player_card(
     use_mcts=None,
     simulations=None,
     budget_mode="simulations",
-    move_time_seconds=1.0,
+    move_time_seconds=0.2,
     mcts_rect=None,
     budget_minus_rect=None,
     budget_value_rect=None,
@@ -2088,14 +2088,14 @@ def select_models(
     mcts_simulations_white = max(16, min(2000, int(mcts_simulations_white)))
     mcts_simulations_black = max(16, min(2000, int(mcts_simulations_black)))
     mcts_step = 16
-    rl_search_cfg = (config or {}).get("reinforcement_learning", {}) or {}
-    mcts_budget_mode = str(rl_search_cfg.get("mcts_budget_mode", "simulations")).strip().lower()
+    inference_cfg = (config or {}).get("inference", {}) or {}
+    mcts_budget_mode = str(inference_cfg.get("budget_mode", "simulations")).strip().lower()
     if mcts_budget_mode not in {"simulations", "time"}:
         mcts_budget_mode = "simulations"
     try:
-        mcts_move_time_seconds = max(0.001, float(rl_search_cfg.get("mcts_move_time_seconds", 1.0)))
+        mcts_move_time_seconds = max(0.001, float(inference_cfg.get("move_time_seconds", 0.2)))
     except (TypeError, ValueError, OverflowError):
-        mcts_move_time_seconds = 1.0
+        mcts_move_time_seconds = 0.2
     match_games = _safe_int(saved_preferences.get("match_games"), default=1)
     match_games = max(1, min(500, int(match_games or 1)))
     match_games_step = 2

@@ -279,11 +279,11 @@ class UCIChessEngine:
         elif budget["budget_mode"] == "simulations":
             self._send(f"info string mcts simulations {budget['num_simulations']}")
         else:
-            rl_cfg = self.config.get("reinforcement_learning", {}) or {}
-            if str(rl_cfg.get("mcts_budget_mode", "simulations")).strip().lower() == "time":
+            inference_cfg = self.config.get("inference", {}) or {}
+            if str(inference_cfg.get("budget_mode", "simulations")).strip().lower() == "time":
                 self._send(
                     "info string mcts time "
-                    f"{float(rl_cfg.get('mcts_move_time_seconds', 1.0)):.3f}s"
+                    f"{float(inference_cfg.get('move_time_seconds', 0.2)):.3f}s"
                 )
             else:
                 self._send(f"info string mcts simulations {budget['num_simulations']}")

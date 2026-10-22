@@ -12,5 +12,7 @@ elo_estimation:
   # and chooses opponents around the checkpoint's previous rating.
   stockfish_time_limit: 0.10
   mcts_eval_simulations: 192
+  # Concurrent timed-MCTS game roots; each run is capped by this count.
+  mcts_timed_parallel_games: 4
   final_mcts_profile_multipliers: [0.5, 1.0, 2.0]
   il_eval_every: 2

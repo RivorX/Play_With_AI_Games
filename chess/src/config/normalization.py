@@ -233,6 +233,7 @@ _ELO_DEFAULTS = {
     'nn_eval_adaptive_target_standard_error': 30.0,
     'nn_eval_adaptive_min_games_for_se_stop': 128,
     'mcts_eval_workers': 0,
+    'mcts_timed_parallel_games': 4,
     'mcts_eval_simulations': 192,
     'final_mcts_profile_multipliers': [0.5, 1.0, 2.0],
     'il_eval_every': 2,
@@ -313,9 +314,6 @@ _RL_DEFAULTS = {
     'replay_reanalyse_min_age': 2, 'replay_reanalyse_min_staleness': 2,
     'replay_reanalyse_max_refreshes': 2, 'replay_reanalyse_simulations': 192,
     'replay_reanalyse_batch_positions': 16,
-    # Search budgets remain simulation-based unless a run explicitly selects
-    # the wall-clock mode. The seconds value is the per-root target in that mode.
-    'mcts_budget_mode': 'simulations', 'mcts_move_time_seconds': 1.0,
     # Importing PyTorch commits about 1 GiB per Windows process even when the
     # central-inference worker holds no model. Nine workers still provide broad
     # 48-game request batches while avoiding the 18-process RAM cliff on 32 GiB.
@@ -456,9 +454,8 @@ def normalize_rl_config(config):
         rl_cfg.setdefault('mcts_algorithm', 'gumbel')
         _validate_mcts_algorithm(rl_cfg['mcts_algorithm'])
         rl_cfg.setdefault('syzygy_auto_download_enabled', False)
-        rl_cfg.setdefault('mcts_budget_mode', 'simulations')
-        rl_cfg.setdefault('mcts_move_time_seconds', 1.0)
-        _validate_mcts_budget(rl_cfg)
+        rl_cfg.pop('mcts_budget_mode', None)
+        rl_cfg.pop('mcts_move_time_seconds', None)
         rl_cfg.setdefault('mcts_gumbel_root_schedule', 'standard')
         _validate_gumbel_root_schedule(rl_cfg['mcts_gumbel_root_schedule'])
         rl_cfg.setdefault('mcts_local_cuda_graph_forward', None)
@@ -495,7 +492,8 @@ def normalize_rl_config(config):
     _validate_gumbel_root_schedule(normalized['mcts_gumbel_root_schedule'])
     _validate_local_cuda_graph_forward(normalized['mcts_local_cuda_graph_forward'])
     _validate_gumbel_reuse_q_scale(normalized['mcts_gumbel_reuse_q_scale'])
-    _validate_mcts_budget(normalized)
+    normalized.pop('mcts_budget_mode', None)
+    normalized.pop('mcts_move_time_seconds', None)
     normalized['search_control_effective_archive_capacity'] = (
         _effective_search_control_archive_capacity(normalized)
     )
@@ -539,30 +537,37 @@ def _validate_mcts_algorithm(value):
         )
 
 
-def _validate_mcts_budget(rl_cfg):
-    mode = rl_cfg.get('mcts_budget_mode', 'simulations')
-    if not isinstance(mode, str) or mode.strip().lower() not in {'simulations', 'time'}:
-        raise ValueError(
-            "reinforcement_learning.search.budget_mode must be 'simulations' or 'time'; "
-            f'got {mode!r}'
-        )
-    rl_cfg['mcts_budget_mode'] = mode.strip().lower()
-    raw_seconds = rl_cfg.get('mcts_move_time_seconds', 1.0)
+def _normalize_inference_config(config):
+    raw_inference_cfg = config.get('inference', {}) or {}
+    if not isinstance(raw_inference_cfg, dict):
+        raise ValueError('inference must be a mapping')
+    inference_cfg = dict(raw_inference_cfg)
+    mode = inference_cfg.get('budget_mode', 'simulations')
+    if not isinstance(mode, str):
+        raise ValueError("inference.budget_mode must be 'simulations' or 'time'")
+    mode = mode.strip().lower()
+    if mode == 'simulation':
+        mode = 'simulations'
+    if mode not in {'simulations', 'time'}:
+        raise ValueError("inference.budget_mode must be 'simulations' or 'time'")
+    inference_cfg['budget_mode'] = mode
+    raw_seconds = inference_cfg.get('move_time_seconds', 0.2)
     if isinstance(raw_seconds, bool):
         raise ValueError(
-            'reinforcement_learning.search.move_time_seconds must be a finite positive number'
+            'inference.move_time_seconds must be a finite positive number'
         )
     try:
         seconds = float(raw_seconds)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(
-            'reinforcement_learning.search.move_time_seconds must be a finite positive number'
+            'inference.move_time_seconds must be a finite positive number'
         ) from exc
     if not math.isfinite(seconds) or seconds <= 0.0:
         raise ValueError(
-            'reinforcement_learning.search.move_time_seconds must be a finite positive number'
+            'inference.move_time_seconds must be a finite positive number'
         )
-    rl_cfg['mcts_move_time_seconds'] = seconds
+    inference_cfg['move_time_seconds'] = seconds
+    config['inference'] = inference_cfg
 
 
 def _preflight_configured_opening_pool(config, rl_cfg):
@@ -631,5 +636,11 @@ def normalize_config(config):
         _ELO_DEFAULTS,
         config.get('elo_estimation', {}),
     )
+    timed_parallel_games = config['elo_estimation'].get('mcts_timed_parallel_games', 4)
+    if isinstance(timed_parallel_games, bool) or not isinstance(timed_parallel_games, int):
+        raise ValueError('elo_estimation.mcts_timed_parallel_games must be a positive integer')
+    if timed_parallel_games < 1:
+        raise ValueError('elo_estimation.mcts_timed_parallel_games must be a positive integer')
     config['debug'] = _with_defaults(_DEBUG_DEFAULTS, config.get('debug', {}))
+    _normalize_inference_config(config)
     return config

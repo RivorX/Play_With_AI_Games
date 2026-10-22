@@ -244,6 +244,12 @@ class AdaptiveEloSchedule:
         if not unplayed:
             return []
         count = min(self.probe_levels_per_wave, len(unplayed))
+        if self.initial_elo is not None:
+            # A prior is a scheduling hint, so begin with the nearest opponent
+            # and at most one adjacent level. Keep later waves local too: the
+            # observed outcomes choose expansion direction, rather than
+            # opening several distant opponents just to fill a batch.
+            count = min(count, 2)
         if not played:
             return self.probe_order[:count]
 

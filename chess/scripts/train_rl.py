@@ -1729,11 +1729,7 @@ def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", e
         return {}
 
     use_mcts = bool((elo_config or {}).get("use_mcts", False))
-    budget_mode = str((elo_config or {}).get("mcts_budget_mode", "simulations")).strip().lower()
-    timed_mcts = bool(use_mcts and budget_mode == "time")
     simulations = int((elo_config or {}).get("mcts_simulations", 0) or 0) if use_mcts else 0
-    if timed_mcts:
-        simulations = 0
     mode_prefix = "estimated_elo_mcts" if use_mcts else "estimated_elo_nn"
     timestamp = datetime.now().isoformat(timespec="seconds")
     settings = {
@@ -1741,8 +1737,6 @@ def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", e
             elo_config,
             use_mcts=use_mcts,
             simulations=simulations,
-            budget_mode=budget_mode,
-            time_limit_seconds=(elo_config or {}).get("mcts_move_time_seconds"),
         ),
         "levels": [int(x) for x in list((elo_config or {}).get("levels", []) or [])],
         "games_per_level": int((elo_config or {}).get("games_per_level", 0) or 0),
@@ -1766,7 +1760,7 @@ def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", e
             "rating_censored", "elo_lower_bound", "elo_upper_bound",
             "rating_levels", "rating_games", "probe_only_games",
             "local_rating_level", "local_rating_games", "local_rating_clusters",
-            "standard_error_method", "mcts_root_schedule", "mcts_time_search_workers",
+            "standard_error_method",
         ):
             if elo_result.get(key) is not None:
                 settings[key] = elo_result.get(key)
@@ -1774,22 +1768,6 @@ def _build_elo_checkpoint_metadata(estimated_elo, elo_config, source="rl_elo", e
     elo_ci95 = settings.get("elo_ci95")
     ci_low = _safe_float(elo_ci95[0]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
     ci_high = _safe_float(elo_ci95[1]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
-    if timed_mcts:
-        seconds = float((elo_config or {}).get("mcts_move_time_seconds", 1.0))
-        time_key = format(seconds, ".9g")
-        time_entry = {
-            "elo": elo_value,
-            "time_limit_seconds": seconds,
-            "timestamp": timestamp,
-            "source": str(source),
-            "settings": settings,
-        }
-        if elo_std_error is not None:
-            time_entry["se"] = float(elo_std_error)
-        if ci_low is not None and ci_high is not None:
-            time_entry["ci95"] = [float(ci_low), float(ci_high)]
-        return {"estimated_elo_mcts_by_time": {time_key: time_entry}}
-
     metadata = {
         mode_prefix: elo_value,
         f"last_{mode_prefix}": elo_value,
@@ -1842,7 +1820,6 @@ def _merge_elo_checkpoint_metadata(target, incoming):
     """Merge mode metadata while retaining every distinct MCTS budget."""
     incoming = dict(incoming or {})
     incoming_by_sims = dict(incoming.pop("estimated_elo_mcts_by_simulations", {}) or {})
-    incoming_by_time = dict(incoming.pop("estimated_elo_mcts_by_time", {}) or {})
     target.update(incoming)
     if incoming_by_sims:
         merged = dict(target.get("estimated_elo_mcts_by_simulations", {}) or {})
@@ -1851,10 +1828,6 @@ def _merge_elo_checkpoint_metadata(target, incoming):
             str(int(key)): value
             for key, value in sorted(merged.items(), key=lambda item: int(item[0]))
         }
-    if incoming_by_time:
-        merged = dict(target.get("estimated_elo_mcts_by_time", {}) or {})
-        merged.update(incoming_by_time)
-        target["estimated_elo_mcts_by_time"] = merged
 
 
 def _best_mcts_elo_from_metadata(entry):
@@ -1935,11 +1908,8 @@ class RLEloCoordinator:
         self.config = config
         self.device = device
         self.logger = logger
-        rl_cfg = config.get("reinforcement_learning", {}) or {}
         self.elo_config = dict(config.get("elo_estimation", {}) or {})
-        self.elo_config.setdefault("mcts_budget_mode", rl_cfg.get("mcts_budget_mode", "simulations"))
-        self.elo_config.setdefault("mcts_move_time_seconds", rl_cfg.get("mcts_move_time_seconds", 1.0))
-        self.elo_config.setdefault("mcts_gumbel_root_schedule", rl_cfg.get("mcts_gumbel_root_schedule", "standard"))
+        rl_cfg = config.get("reinforcement_learning", {}) or {}
         self.rl_elo_config = dict(rl_cfg.get("stockfish_elo", {}) or {})
         self.checkpoint_targets = [Path(p) for p in list(checkpoint_targets or []) if p is not None]
         self._elo_priors = {}
@@ -1970,8 +1940,6 @@ class RLEloCoordinator:
         self.last_promoted_raw_elo = None
         self.last_promoted_mcts_elo = None
         self.last_promoted_mcts_simulations = None
-        self.last_promoted_mcts_budget_mode = None
-        self.last_promoted_mcts_move_time_seconds = None
         self.last_mcts_eval_iteration = None
         self.pending_mcts_best_iteration = None
         self.elo_events_path = Path(self.logger.csv_path).with_name(
@@ -1991,8 +1959,6 @@ class RLEloCoordinator:
             "last_promoted_raw_elo": self.last_promoted_raw_elo,
             "last_promoted_mcts_elo": self.last_promoted_mcts_elo,
             "last_promoted_mcts_simulations": self.last_promoted_mcts_simulations,
-            "last_promoted_mcts_budget_mode": self.last_promoted_mcts_budget_mode,
-            "last_promoted_mcts_move_time_seconds": self.last_promoted_mcts_move_time_seconds,
             "last_mcts_eval_iteration": self.last_mcts_eval_iteration,
             "pending_mcts_best_iteration": self.pending_mcts_best_iteration,
         }
@@ -2013,7 +1979,6 @@ class RLEloCoordinator:
             "best_il_anchor_true_win_rate",
             "last_promoted_raw_elo",
             "last_promoted_mcts_elo",
-            "last_promoted_mcts_move_time_seconds",
         )
         for key in optional_ints:
             value = state.get(key)
@@ -2021,10 +1986,6 @@ class RLEloCoordinator:
         for key in optional_floats:
             value = state.get(key)
             setattr(self, key, None if value is None else float(value))
-        budget_mode = state.get("last_promoted_mcts_budget_mode")
-        self.last_promoted_mcts_budget_mode = (
-            None if budget_mode is None else str(budget_mode).strip().lower()
-        )
         self.last_elo_metadata = dict(state.get("last_elo_metadata") or {})
         self.il_anchor_surpassed = bool(state.get("il_anchor_surpassed", False))
         self.promoted_evaluations = max(
@@ -2045,11 +2006,7 @@ class RLEloCoordinator:
         elo_result,
     ):
         """Persist the ladder result with execution and model iterations separated."""
-        budget_mode = str(elo_config.get("mcts_budget_mode", "simulations"))
-        move_time_seconds = elo_config.get("mcts_move_time_seconds", 1.0)
-        prior_key = self._elo_prior_key(
-            bool(use_mcts), int(simulations or 0), elo_config=elo_config
-        )
+        prior_key = self._elo_prior_key(bool(use_mcts), int(simulations or 0))
         prior_settings = self._elo_prior_settings.get(prior_key)
         model_iteration_num = (
             int(iteration_num)
@@ -2064,17 +2021,11 @@ class RLEloCoordinator:
             "reason": str(reason_label),
             "source": str(source),
             "mode": "mcts" if use_mcts else "nn",
-            "simulations": (
-                int(simulations or 0)
-                if use_mcts and budget_mode.strip().lower() != "time"
-                else 0
-            ),
+            "simulations": int(simulations or 0) if use_mcts else 0,
             "protocol": elo_protocol_settings(
                 elo_config,
                 use_mcts=bool(use_mcts),
                 simulations=int(simulations or 0),
-                budget_mode=budget_mode,
-                time_limit_seconds=move_time_seconds,
             ),
             "seed_elo": elo_config.get("adaptive_initial_elo"),
             "seed_source": elo_config.get("adaptive_initial_elo_source"),
@@ -2084,8 +2035,6 @@ class RLEloCoordinator:
                     elo_config,
                     use_mcts=bool(use_mcts),
                     simulations=int(simulations or 0),
-                    budget_mode=budget_mode,
-                    time_limit_seconds=move_time_seconds,
                 )
             ),
             "result": dict(elo_result or {}),
@@ -2098,54 +2047,31 @@ class RLEloCoordinator:
         except Exception as exc:
             print(f"  Elo event log failed (result retained): {exc}")
 
-    def _elo_prior_key(self, use_mcts, simulations=0, *, elo_config=None):
-        resolved = dict(elo_config or self.elo_config or {})
-        budget_mode = str(resolved.get("mcts_budget_mode", "simulations")).strip().lower()
-        if use_mcts and budget_mode == "time":
-            try:
-                seconds = float(resolved.get("mcts_move_time_seconds", 1.0))
-            except (TypeError, ValueError, OverflowError):
-                seconds = 1.0
-            return ("mcts-time", format(seconds, ".9g"))
+    @staticmethod
+    def _elo_prior_key(use_mcts, simulations=0):
         return ("mcts", max(0, int(simulations or 0))) if use_mcts else ("nn", 0)
 
     def _load_checkpoint_elo_priors(self):
-        modes = [(False, 0, "raw_nn", None)]
+        modes = [(False, 0)]
         modes.extend(
-            (
-                True,
-                int(cfg.get("mcts_simulations", 0) or 0),
-                str(cfg.get("mcts_budget_mode", "simulations")),
-                cfg.get("mcts_move_time_seconds"),
-            )
+            (True, int(cfg.get("mcts_simulations", 0) or 0))
             for cfg in build_final_mcts_elo_configs(self.elo_config)
         )
-        for use_mcts, simulations, budget_mode, move_time_seconds in modes:
-            profile_config = dict(self.elo_config)
-            profile_config["mcts_budget_mode"] = budget_mode
-            if move_time_seconds is not None:
-                profile_config["mcts_move_time_seconds"] = move_time_seconds
-            key = self._elo_prior_key(use_mcts, simulations, elo_config=profile_config)
+        for use_mcts, simulations in modes:
+            key = self._elo_prior_key(use_mcts, simulations)
             for checkpoint_path in self.checkpoint_targets:
                 elo, source = checkpoint_elo_seed(
                     checkpoint_path,
                     use_mcts=bool(use_mcts),
                     simulations=int(simulations),
-                    budget_mode=budget_mode,
-                    time_limit_seconds=move_time_seconds,
                 )
                 if elo is not None:
                     self._elo_priors[key] = (float(elo), str(source or "previous checkpoint Elo"))
                     entry = load_checkpoint_metadata(checkpoint_path)
                     if use_mcts:
-                        if budget_mode == "time":
-                            profile = dict(entry.get("elo_mcts_by_time") or {}).get(
-                                format(float(move_time_seconds), ".9g")
-                            )
-                        else:
-                            profile = dict(entry.get("elo_mcts_by_simulations") or {}).get(
-                                int(simulations)
-                            )
+                        profile = dict(entry.get("elo_mcts_by_simulations") or {}).get(
+                            int(simulations)
+                        )
                         settings = (
                             profile.get("settings")
                             if isinstance(profile, dict)
@@ -2159,16 +2085,12 @@ class RLEloCoordinator:
 
     def _startup_measurement_matches_protocol(self, *, use_mcts, simulations, elo_config):
         """Reuse unchanged weights only when their benchmark protocol matches."""
-        key = self._elo_prior_key(use_mcts, simulations, elo_config=elo_config)
-        budget_mode = str(elo_config.get("mcts_budget_mode", "simulations"))
-        move_time_seconds = elo_config.get("mcts_move_time_seconds", 1.0)
+        key = self._elo_prior_key(use_mcts, simulations)
         return elo_protocol_matches_settings(
             self._elo_prior_settings.get(key),
             elo_config,
             use_mcts=bool(use_mcts),
             simulations=int(simulations or 0),
-            budget_mode=budget_mode,
-            time_limit_seconds=move_time_seconds,
         )
 
     def _resolve_elo_prior(self, use_mcts, simulations=0):
@@ -2176,8 +2098,6 @@ class RLEloCoordinator:
         exact = self._elo_priors.get(key)
         if exact is not None or not use_mcts:
             return exact
-        if str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower() == "time":
-            return None
         target = max(0, int(simulations or 0))
         candidates = [
             (candidate_key[1], value)
@@ -2233,11 +2153,7 @@ class RLEloCoordinator:
         final_mcts_text = "off"
         if final_use_mcts:
             final_mcts_text = "/".join(
-                (
-                    f"{float(cfg.get('mcts_move_time_seconds', 1.0)):g}s/move"
-                    if str(cfg.get("mcts_budget_mode", "simulations")).strip().lower() == "time"
-                    else f"{int(cfg.get('mcts_simulations', 0) or 0)} sims"
-                )
+                str(int(cfg.get("mcts_simulations", 0) or 0))
                 for cfg in build_final_mcts_elo_configs(self.elo_config)
             )
         print(
@@ -2325,8 +2241,6 @@ class RLEloCoordinator:
         self.last_promoted_raw_elo = None
         self.last_promoted_mcts_elo = None
         self.last_promoted_mcts_simulations = None
-        self.last_promoted_mcts_budget_mode = None
-        self.last_promoted_mcts_move_time_seconds = None
         run_mcts = self._should_run_promoted_mcts(iteration_num)
         self.pending_mcts_best_iteration = None if run_mcts else int(iteration_num)
         mode_label = "raw NN and scheduled MCTS" if run_mcts else "raw NN"
@@ -2357,18 +2271,7 @@ class RLEloCoordinator:
             results.append(mcts_result)
             if mcts_result is not None:
                 self.last_promoted_mcts_elo = float(mcts_result)
-                budget_mode = str(
-                    self.elo_config.get("mcts_budget_mode", "simulations")
-                ).strip().lower()
-                self.last_promoted_mcts_budget_mode = budget_mode
-                self.last_promoted_mcts_simulations = (
-                    None if budget_mode == "time" else int(mcts_simulations)
-                )
-                self.last_promoted_mcts_move_time_seconds = (
-                    float(self.elo_config.get("mcts_move_time_seconds", 1.0))
-                    if budget_mode == "time"
-                    else None
-                )
+                self.last_promoted_mcts_simulations = int(mcts_simulations)
                 self.last_mcts_eval_iteration = int(iteration_num)
                 self.pending_mcts_best_iteration = None
         return next((r for r in reversed(results) if r is not None), None)
@@ -2400,45 +2303,11 @@ class RLEloCoordinator:
             self.model = old_model
         if result is not None:
             simulations = self._resolve_eval_mcts_simulations()
-            budget_mode = str(
-                self.elo_config.get("mcts_budget_mode", "simulations")
-            ).strip().lower()
             self.last_promoted_mcts_elo = float(result)
-            self.last_promoted_mcts_budget_mode = budget_mode
-            self.last_promoted_mcts_simulations = (
-                None if budget_mode == "time" else int(simulations)
-            )
-            self.last_promoted_mcts_move_time_seconds = (
-                float(self.elo_config.get("mcts_move_time_seconds", 1.0))
-                if budget_mode == "time"
-                else None
-            )
+            self.last_promoted_mcts_simulations = int(simulations)
             self.last_mcts_eval_iteration = int(iteration_num)
             self.pending_mcts_best_iteration = None
         return result
-
-    def _last_promoted_mcts_budget(self):
-        mode = self.last_promoted_mcts_budget_mode
-        seconds = self.last_promoted_mcts_move_time_seconds
-        if mode is None:
-            # Recover fixed-simulation identity from older coordinator states
-            # when available. Never infer it from the compatibility count alone:
-            # older timed measurements also carried that count.
-            settings = (self.last_elo_metadata or {}).get(
-                "estimated_elo_mcts_settings"
-            )
-            if isinstance(settings, dict):
-                mode = settings.get("budget_mode")
-                if mode == "time":
-                    seconds = settings.get("time_limit_seconds")
-        normalized_mode = (
-            None if mode is None else str(mode).strip().lower()
-        )
-        try:
-            normalized_seconds = None if seconds is None else float(seconds)
-        except (TypeError, ValueError, OverflowError):
-            normalized_seconds = None
-        return normalized_mode, normalized_seconds
 
     def evaluate_final_best(self, iteration_num, model_override=None):
         if not self.enabled or not bool(self.rl_elo_config.get("final_enabled", True)):
@@ -2459,11 +2328,7 @@ class RLEloCoordinator:
             else []
         )
         profile_text = "/".join(
-            (
-                f"{float(cfg.get('mcts_move_time_seconds', 1.0)):g}s/move"
-                if str(cfg.get("mcts_budget_mode", "simulations")).strip().lower() == "time"
-                else str(int(cfg.get("mcts_simulations", 0) or 0))
-            )
+            str(int(cfg.get("mcts_simulations", 0) or 0))
             for cfg in final_mcts_configs
         )
         mode_label = f"raw NN and MCTS profile {profile_text}" if final_use_mcts else "raw NN"
@@ -2518,66 +2383,30 @@ class RLEloCoordinator:
                 return next((r for r in reversed(results) if r is not None), None)
             if final_use_mcts:
                 for final_mcts_config in final_mcts_configs:
-                    final_budget_mode = str(
-                        final_mcts_config.get("mcts_budget_mode", "simulations")
-                    ).strip().lower()
                     final_mcts_simulations = int(
                         final_mcts_config.get("mcts_simulations", 0) or 0
                     )
-                    final_time_seconds = float(
-                        final_mcts_config.get("mcts_move_time_seconds", 1.0)
-                    )
-                    if final_budget_mode != "time" and final_mcts_simulations <= 0:
+                    if final_mcts_simulations <= 0:
                         continue
-                    if final_budget_mode == "time":
-                        promoted_mode, promoted_seconds = (
-                            self._last_promoted_mcts_budget()
-                        )
-                        same_promoted_budget = bool(
-                            promoted_mode == "time"
-                            and promoted_seconds is not None
-                            and math.isclose(
-                                promoted_seconds,
-                                final_time_seconds,
-                                rel_tol=0.0,
-                                abs_tol=1e-9,
-                            )
-                        )
-                    else:
-                        promoted_mode, _ = self._last_promoted_mcts_budget()
-                        same_promoted_budget = bool(
-                            promoted_mode == "simulations"
-                            and int(self.last_promoted_mcts_simulations or 0)
-                            == int(final_mcts_simulations)
-                        )
                     can_reuse_mcts = bool(
                         same_promoted_weights
                         and self.last_promoted_mcts_elo is not None
-                        and same_promoted_budget
+                        and int(self.last_promoted_mcts_simulations or 0)
+                        == int(final_mcts_simulations)
                     )
                     if can_reuse_mcts:
                         mcts_result = self.last_promoted_mcts_elo
-                        budget_label = (
-                            f"{final_time_seconds:g}s/move"
-                            if final_budget_mode == "time"
-                            else f"{final_mcts_simulations} simulations"
-                        )
                         print(
                             "Final MCTS Elo reused from promotion "
                             f"{int(self.last_promoted_iteration)} "
-                            f"(same weights, {budget_label})."
+                            f"(same weights, {final_mcts_simulations} simulations)."
                         )
                     else:
-                        budget_label = (
-                            f"@{final_time_seconds:g}s/move"
-                            if final_budget_mode == "time"
-                            else f"@{final_mcts_simulations}"
-                        )
                         mcts_result = self._run_estimate(
                             iteration_num,
                             reason_label=(
                                 f"final best MCTS {iteration_num} "
-                                f"{budget_label}"
+                                f"@{final_mcts_simulations}"
                             ),
                             use_mcts=True,
                             persist_checkpoints=True,
@@ -2684,12 +2513,7 @@ class RLEloCoordinator:
             prior_key = self._elo_prior_key(bool(use_mcts), active_simulations)
             self._elo_priors[prior_key] = (
                 float(estimated_elo),
-                (
-                    f"latest measured MCTS @{float(elo_config.get('mcts_move_time_seconds', 1.0)):g}s/move Elo"
-                    if use_mcts and str(elo_config.get("mcts_budget_mode", "simulations")).strip().lower() == "time"
-                    else f"latest measured MCTS @{active_simulations} Elo" if use_mcts
-                    else "latest measured raw NN Elo"
-                ),
+                f"latest measured {'MCTS @' + str(active_simulations) if use_mcts else 'raw NN'} Elo",
             )
             self.last_elo_iteration = int(iteration_num)
             source = str(source)
@@ -2710,14 +2534,7 @@ class RLEloCoordinator:
                     model_iteration_num,
                     estimated_elo,
                     mode="mcts" if bool(elo_config.get("use_mcts", False)) else "nn",
-                    simulations=(
-                        0
-                        if bool(elo_config.get("use_mcts", False))
-                        and str(elo_config.get("mcts_budget_mode", "simulations")).strip().lower() == "time"
-                        else int(elo_config.get("mcts_simulations", 0) or 0)
-                    ),
-                    budget_mode=str(elo_config.get("mcts_budget_mode", "simulations")),
-                    time_limit_seconds=elo_config.get("mcts_move_time_seconds"),
+                    simulations=int(elo_config.get("mcts_simulations", 0) or 0),
                     update_csv=True,
                     std_error=elo_result.get("elo_std_error"),
                     ci95=elo_result.get("elo_ci95"),
@@ -2759,8 +2576,6 @@ class RLEloCoordinator:
                         games_per_level=int(elo_config.get("games_per_level", 0) or 0),
                         use_mcts=bool(elo_config.get("use_mcts", False)),
                         simulations=int(elo_config.get("mcts_simulations", 0) or 0),
-                        budget_mode=str(elo_config.get("mcts_budget_mode", "simulations")),
-                        time_limit_seconds=elo_config.get("mcts_move_time_seconds"),
                         sf_time=float(elo_config.get("stockfish_time_limit", 0.0) or 0.0),
                         source=source,
                         elo_result=elo_result,
