@@ -8,12 +8,69 @@ dispatch target; graph capture and lifetime remain its owner's responsibility.
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from contextlib import nullcontext
 from typing import Any, Mapping
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+_PREDICTION_PROVENANCE_SCHEMA_VERSION = 1
+_PREDICTION_ROW_SOURCES = frozenset(
+    {"fresh_nn", "cache_hit", "deduplicated", "unknown"}
+)
+
+
+def _prediction_provenance_for_sources(
+    row_sources: Any, batch_size: int | None = None
+) -> dict[str, Any]:
+    """Build the versioned row-attribution contract used by local and remote inference."""
+    if not isinstance(row_sources, (list, tuple)):
+        sources = []
+    else:
+        sources = [
+            source
+            if isinstance(source, str) and source in _PREDICTION_ROW_SOURCES
+            else "unknown"
+            for source in row_sources
+        ]
+    aligned = True
+    if batch_size is not None:
+        expected = max(0, int(batch_size))
+        aligned = len(sources) == expected
+        if not aligned:
+            sources = ["unknown"] * expected
+    complete = aligned and all(source != "unknown" for source in sources)
+    counts = {"fresh_nn": 0, "cache_hit": 0, "deduplicated": 0}
+    for source in sources:
+        if source in counts:
+            counts[source] += 1
+    return {
+        "schema_version": _PREDICTION_PROVENANCE_SCHEMA_VERSION,
+        "row_sources": sources,
+        "nn_evaluated_positions": counts["fresh_nn"] if complete else None,
+        "cache_hits": counts["cache_hit"] if complete else None,
+        "dedup_hits": counts["deduplicated"] if complete else None,
+        "provenance_complete": complete,
+    }
+
+
+def _copy_prediction_provenance(
+    target: MutableMapping[str, Any], value: Any, batch_size: int
+) -> None:
+    """Copy a producer's row attribution, failing closed for absent/legacy data."""
+    if (
+        isinstance(value, Mapping)
+        and type(value.get("schema_version")) is int
+        and value.get("schema_version") == _PREDICTION_PROVENANCE_SCHEMA_VERSION
+    ):
+        result = _prediction_provenance_for_sources(value.get("row_sources"), batch_size)
+    else:
+        result = _prediction_provenance_for_sources(None, batch_size)
+    target.clear()
+    target.update(result)
 
 
 def _raw_output_pair(outputs: Any, inputs: Any) -> tuple[torch.Tensor, torch.Tensor]:
@@ -83,6 +140,7 @@ def predict_raw(
     amp_cache_enabled: bool = True,
     graph_runner: Any = None,
     model_kwargs: Mapping[str, Any] | None = None,
+    provenance: MutableMapping[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one raw policy/value prediction and preserve producer-owned outputs.
 
@@ -100,14 +158,30 @@ def predict_raw(
     remain the runner's responsibility. Policy logits must be ``(B, width)``;
     the width is intentionally unrestricted for compact remote policies.
     Values may be scalar ``(B,)``/``(B, 1)`` or W/D/L logits ``(B, 3)``.
+
+    When ``provenance`` is supplied, it is replaced with versioned per-row
+    attribution. Local module and graph rows are ``fresh_nn``; remote rows use
+    server attribution, with missing legacy metadata reported as ``unknown``.
     """
+    if provenance is not None and not isinstance(provenance, MutableMapping):
+        raise TypeError("provenance must be a mutable mapping when provided")
+
     kwargs = dict(model_kwargs or {})
     kwargs.setdefault("apply_log_softmax", False)
     if kwargs.get("apply_log_softmax") is not False:
         raise ValueError("predict_raw only supports raw policy logits")
 
     if graph_runner is not None and kwargs == {"apply_log_softmax": False}:
-        return _raw_output_pair(graph_runner.run_forward(inputs), inputs)
+        outputs = _raw_output_pair(graph_runner.run_forward(inputs), inputs)
+        if provenance is not None:
+            _copy_prediction_provenance(
+                provenance,
+                _prediction_provenance_for_sources(
+                    ["fresh_nn"] * int(outputs[0].shape[0])
+                ),
+                int(outputs[0].shape[0]),
+            )
+        return outputs
 
     amp_context = nullcontext()
     if (
@@ -124,7 +198,24 @@ def predict_raw(
 
     with torch.inference_mode(), amp_context:
         outputs = model(inputs, **kwargs)
-    return _raw_output_pair(outputs, inputs)
+    outputs = _raw_output_pair(outputs, inputs)
+    if provenance is not None:
+        batch_size = int(outputs[0].shape[0])
+        if isinstance(model, torch.nn.Module):
+            source_info = _prediction_provenance_for_sources(["fresh_nn"] * batch_size)
+        elif bool(getattr(model, "_is_remote_inference_client", False)):
+            _copy_prediction_provenance(
+                provenance,
+                getattr(model, "last_prediction_provenance", None),
+                batch_size,
+            )
+            return outputs
+        else:
+            source_info = _prediction_provenance_for_sources(
+                ["unknown"] * batch_size
+            )
+        _copy_prediction_provenance(provenance, source_info, batch_size)
+    return outputs
 
 
 def copy_compact_policy_value_to_cpu(

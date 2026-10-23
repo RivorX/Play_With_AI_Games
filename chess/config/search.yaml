@@ -12,6 +12,8 @@ reinforcement_learning:
     algorithm: gumbel
     # `revisiting` gives eliminated root actions another chance in later
     # passes. Select `standard` to use a single Sequential Halving schedule.
+    # Adaptive fixed-simulation searches use revisiting passes for feedback
+    # checkpoints and budget transfers, regardless of this fixed-search setting.
     gumbel_root_schedule: revisiting
     # Scale reused edge Q values by fresh visits or all retained edge visits.
     # `total` is the current default; Sequential-Halving quotas stay fresh.
@@ -21,13 +23,18 @@ reinforcement_learning:
     # of the remaining budget, creating many tiny GPU calls. 0 preserves that
     # legacy schedule; positive caps apply only to one root.
     single_root_batch_cap: 0
-    # null automatically accelerates only native one-root revisiting on a
-    # supported local eval-mode CUDA model. false disables graphs; true opts
-    # other local search/model combinations in explicitly.
+    # null auto-enables native revisiting for supported one-root eval models
+    # and SECNNV9 feedback batches when every root is adaptive. false disables
+    # graphs; true opts other local search/model combinations in explicitly.
     local_cuda_graph_forward: null
-    # Assign the full budget before Sequential Halving. Difficulty adjusts
-    # each root on a 16-simulation grid within the configured range.
+    # `feedback` freezes completed Q/prior checkpoints and spends the shared
+    # simulation pool on roots with the greatest current uncertainty. It
+    # transfers saved quotas between roots and carries earned credit only
+    # within a bounded search session. A session may underspend when roots are
+    # already clear or another complete pass does not fit the remaining pool.
     dynamic_budget_enabled: true
+    # New configs use feedback. Set `prior` explicitly for the previous allocator.
+    dynamic_budget_strategy: feedback  # feedback | prior
     dynamic_budget_min: 64
     dynamic_budget_max_multiplier: 1.6666667
     # Root-width cap. The search keeps 16 when the fresh action budget can fund

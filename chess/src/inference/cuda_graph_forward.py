@@ -142,6 +142,7 @@ class CUDAGraphForwardRunner:
             "last_capture_seconds": 0.0,
         }
         self._shape_observations: dict[tuple[Any, ...], int] = {}
+        self._fallback_batch_histogram: dict[tuple[str, int], dict[str, int]] = {}
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -155,6 +156,10 @@ class CUDAGraphForwardRunner:
             result["shape_observations"] = {
                 f"{key[0]}|{key[1]}|{key[2]}|N={key[3]}": int(count)
                 for key, count in self._shape_observations.items()
+            }
+            result["fallback_batch_histogram"] = {
+                f"{reason}|N={batch}": dict(counts)
+                for (reason, batch), counts in self._fallback_batch_histogram.items()
             }
             return result
 
@@ -253,6 +258,13 @@ class CUDAGraphForwardRunner:
         )
 
     def _fallback(self, inputs: torch.Tensor, reason: str) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(inputs.shape[0]) if inputs.ndim else 0
+        key = (str(reason), batch_size)
+        counts = self._fallback_batch_histogram.setdefault(
+            key, {"calls": 0, "rows": 0}
+        )
+        counts["calls"] += 1
+        counts["rows"] += batch_size
         self._stats["eager_fallbacks"] += 1
         self._stats["last_fallback_reason"] = str(reason)
         # Eager outputs are newly allocated model results and do not alias any

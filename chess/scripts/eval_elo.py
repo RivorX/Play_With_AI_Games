@@ -642,6 +642,9 @@ def format_results_table(all_results: list[dict]) -> str:
         timed_summary = _timed_mcts_work_summary(result)
         if timed_summary:
             lines.append(f"  {timed_summary}")
+        adaptive_summary = _adaptive_mcts_work_summary(result)
+        if adaptive_summary:
+            lines.append(f"  {adaptive_summary}")
         rating_bracket = result.get("rating_bracket")
         if result.get("rating_bracketed") and isinstance(rating_bracket, list):
             lines.append(
@@ -752,6 +755,43 @@ def _timed_mcts_work_summary(result: dict) -> str | None:
     return f"Timed search: {budget}, {worker_text}{style_text}; {work_text}."
 
 
+def _adaptive_mcts_work_summary(result: dict) -> str | None:
+    if result.get("mode") != "mcts" or not result.get("mcts_dynamic_budget_enabled"):
+        return None
+    target = _safe_int(result.get("mcts_dynamic_budget_target_simulations"))
+    calls = _safe_int(result.get("mcts_search_calls"))
+    fresh = _safe_int(result.get("mcts_fresh_simulations"))
+    average = _safe_float(result.get("mcts_avg_simulations_per_move"))
+    if average is None and calls is not None and calls > 0 and fresh is not None:
+        average = float(fresh) / calls
+    # Missing strategy in a stored result is legacy prior-v1, not today's default.
+    strategy = str(result.get("mcts_dynamic_budget_strategy", "prior"))
+    inference = result.get("mcts_dynamic_budget_inference")
+    inference_text = f", {inference} inference" if inference else ""
+    light = result.get("mcts_light_metadata")
+    work_text = ""
+    if isinstance(light, dict):
+        fresh_nn = light.get("nn_fresh_evaluations")
+        saved = light.get("dynamic_budget_saved_simulations")
+        stopped = light.get("dynamic_budget_early_stopped")
+        details = []
+        if fresh_nn is not None:
+            details.append(f"{fresh_nn} fresh NN rows")
+        if saved is not None:
+            details.append(f"{saved} saved sims")
+        if stopped is not None:
+            details.append(f"{stopped} early stops")
+        if details:
+            work_text = "; " + ", ".join(details)
+    if target is None or average is None:
+        return f"Adaptive {strategy} search{inference_text}: actual average unavailable{work_text}."
+    detail = f" ({fresh} fresh / {calls} searches)" if fresh is not None and calls is not None else ""
+    return (
+        f"Adaptive {strategy} search{inference_text}: target {target} average simulations/move; "
+        f"actual {average:.1f} average{detail}{work_text}."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Estimate NN/MCTS Elo against Stockfish")
     parser.add_argument("--model", action="append", default=[], help="checkpoint path to preselect")
@@ -837,6 +877,41 @@ def main():
             workers=resolve_eval_workers(workers, mode_use_mcts, elo_cfg),
             standalone=True,
         )
+        rl_config = config.get("reinforcement_learning", {}) or {}
+        search_config = rl_config.get("search", {}) or {}
+        runtime_cfg["mcts_gumbel_root_schedule"] = str(
+            rl_config.get(
+                "mcts_gumbel_root_schedule",
+                search_config.get("gumbel_root_schedule", "standard"),
+            )
+        )
+        if mode_use_mcts and budget_mode == "simulations":
+            rl_search = rl_config
+            runtime_cfg["mcts_dynamic_budget_enabled"] = bool(
+                rl_search.get("mcts_dynamic_budget_enabled", False)
+            )
+            runtime_cfg["mcts_dynamic_budget_strategy"] = str(
+                rl_search.get("mcts_dynamic_budget_strategy", "feedback") or "feedback"
+            ).strip().lower()
+            runtime_cfg["mcts_dynamic_budget_min"] = int(
+                rl_search.get("mcts_dynamic_budget_min", 64)
+            )
+            runtime_cfg["mcts_dynamic_budget_max_multiplier"] = float(
+                rl_search.get("mcts_dynamic_budget_max_multiplier", 5.0 / 3.0)
+            )
+            runtime_cfg["eval_elo_central_inference_enabled"] = bool(
+                rl_search.get("eval_elo_central_inference_enabled", True)
+            )
+            central_dynamic = bool(
+                runtime_cfg["mcts_dynamic_budget_enabled"]
+                and runtime_cfg["mcts_dynamic_budget_strategy"] == "feedback"
+                and device.type == "cuda"
+                and int(runtime_cfg.get("workers", 1) or 1) > 1
+                and runtime_cfg["eval_elo_central_inference_enabled"]
+            )
+            runtime_cfg["mcts_dynamic_budget_inference"] = (
+                "central" if central_dynamic else "local"
+            )
         if mode_use_mcts and budget_mode == "time":
             central = bool(
                 device.type == "cuda"
@@ -872,7 +947,12 @@ def main():
         mode_labels.append(
             f"MCTS ({move_time_seconds:g}s/move)"
             if budget_mode == "time"
-            else f"MCTS ({simulations} sims)"
+            else (
+                f"MCTS {mode_runtime_configs['mcts'].get('mcts_dynamic_budget_strategy', 'feedback')} "
+                f"(~{simulations} target avg sims)"
+                if mode_runtime_configs["mcts"].get("mcts_dynamic_budget_enabled", False)
+                else f"MCTS ({simulations} sims)"
+            )
         )
     mode_str = " + ".join(mode_labels)
     if workers > 0:
@@ -897,7 +977,16 @@ def main():
         if budget_mode == "time":
             print(f"MCTS time:      {move_time_seconds:g}s/move")
         else:
-            print(f"MCTS sims:      {simulations}")
+            if mode_runtime_configs["mcts"].get("mcts_dynamic_budget_enabled", False):
+                dynamic_cfg = mode_runtime_configs["mcts"]
+                print(
+                    f"MCTS {dynamic_cfg.get('mcts_dynamic_budget_strategy', 'feedback')}: "
+                    f"{simulations} target average sims/move "
+                    f"(minimum {dynamic_cfg['mcts_dynamic_budget_min']}, "
+                    f"maximum multiplier {dynamic_cfg['mcts_dynamic_budget_max_multiplier']:g}×)"
+                )
+            else:
+                print(f"MCTS sims:      {simulations}")
     for mode_name in eval_modes:
         runtime_cfg = mode_runtime_configs[mode_name]
         label = "MCTS adaptive" if mode_name == "mcts" else "NN adaptive"
@@ -935,8 +1024,11 @@ def main():
     if "mcts" in eval_modes:
         central_enabled = bool(
             mode_runtime_configs["mcts"].get(
-                "mcts_time_search_central_inference",
-                elo_cfg.get("eval_elo_central_inference_enabled", False),
+                "mcts_dynamic_budget_inference",
+                mode_runtime_configs["mcts"].get(
+                    "mcts_time_search_central_inference",
+                    elo_cfg.get("eval_elo_central_inference_enabled", False),
+                ),
             )
         )
         if central_enabled:
@@ -980,6 +1072,13 @@ def main():
                 simulations,
                 budget_mode=budget_mode,
                 time_limit_seconds=move_time_seconds,
+                adaptive_budget=bool(
+                    mode_runtime_configs.get("mcts", {}).get("mcts_dynamic_budget_enabled", False)
+                    and budget_mode == "simulations"
+                ),
+                adaptive_strategy=str(
+                    mode_runtime_configs.get("mcts", {}).get("mcts_dynamic_budget_strategy", "feedback")
+                ),
             )
             print(f"  Mode: {mode_label_text}")
 
@@ -1017,6 +1116,27 @@ def main():
             result["mcts_simulations"] = int(simulations) if mode_use_mcts and budget_mode == "simulations" else 0
             result["mcts_budget_mode"] = budget_mode if mode_use_mcts else "raw_nn"
             result["mcts_move_time_seconds"] = move_time_seconds if mode_use_mcts else None
+            result["mcts_dynamic_budget_enabled"] = bool(
+                mode_elo_cfg.get("mcts_dynamic_budget_enabled", False)
+                and mode_use_mcts
+                and budget_mode == "simulations"
+            )
+            if result["mcts_dynamic_budget_enabled"]:
+                result["mcts_dynamic_budget_target_simulations"] = int(simulations)
+                result["mcts_dynamic_budget_min"] = int(
+                    mode_elo_cfg["mcts_dynamic_budget_min"]
+                )
+                result["mcts_dynamic_budget_max_multiplier"] = float(
+                    mode_elo_cfg["mcts_dynamic_budget_max_multiplier"]
+                )
+                result["mcts_dynamic_budget_strategy"] = str(
+                    mode_elo_cfg.get("mcts_dynamic_budget_strategy", "feedback")
+                )
+                result["mcts_dynamic_budget_protocol"] = (
+                    "search-feedback-v2"
+                    if result["mcts_dynamic_budget_strategy"] == "feedback"
+                    else "prior-v1"
+                )
             if mode_use_mcts and budget_mode == "time":
                 for result_key, config_key in (
                     ("mcts_time_search_protocol", "mcts_time_search_protocol"),
@@ -1053,6 +1173,9 @@ def main():
             timed_summary = _timed_mcts_work_summary(result)
             if timed_summary:
                 print(f"  {timed_summary}")
+            adaptive_summary = _adaptive_mcts_work_summary(result)
+            if adaptive_summary:
+                print(f"  {adaptive_summary}")
 
             persist_estimated_elo(
                 model_path,

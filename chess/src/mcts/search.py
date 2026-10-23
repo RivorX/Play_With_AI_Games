@@ -78,6 +78,8 @@ _DEFAULT_REPLAY_MAX_POLICY_TARGETS = 256
 _REPLAY_SOURCE_UNKNOWN = 0
 _REPLAY_SOURCE_LEARNER = 1
 _REPLAY_SOURCE_FROZEN_BEST = 2
+_DEFAULT_LOCAL_CUDA_GRAPH_BATCH_SIZES = (1, 2, 3, 4, 5, 6, 8, 16)
+_FEEDBACK_MULTIROOT_LOCAL_CUDA_GRAPH_BATCH_SIZES = (1, 2, 4, 6, 8, 12, 14, 16)
 
 # Gumbel search is the policy-improvement operator. Target confidence controls
 # the regular policy CE weight, while useful top-move changes are handled by the
@@ -86,6 +88,10 @@ _REPLAY_SOURCE_FROZEN_BEST = 2
 # most of the policy gradient.
 _DYNAMIC_BUDGET_MARGINAL_PENALTY = 0.35
 _DYNAMIC_BUDGET_TARGET_CHUNKS = 12
+_DYNAMIC_BUDGET_MIN_FRESH_LEAVES_PER_FINALIST = 2
+_DYNAMIC_BUDGET_EARLY_STOP_Q_GAP = 0.12
+_DYNAMIC_BUDGET_REUSE_FRESH_FLOOR_BONUS = 32
+_DYNAMIC_BUDGET_CREDIT_KEYS = 4096
 _TREE_REUSE_MIN_FRESH_SIMULATIONS = 64
 _TREE_REUSE_CONSERVATIVE_FRESH_FRACTION = 0.50
 _TREE_REUSE_HIGH_QUALITY_FRESH_FRACTION = 1.0 / 3.0
@@ -754,6 +760,60 @@ def _gumbel_final_action_eligibility(visit_counts):
         return np.zeros(0, dtype=np.bool_), 0.0
     threshold = float(np.max(visits))
     return visits == threshold, threshold
+
+
+def _adaptive_challenger_index(scores, winner):
+    """Return the best-scoring legal challenger, independent of edge order."""
+    values = np.asarray(scores, dtype=np.float64)
+    winner = int(winner)
+    if values.size < 2 or not 0 <= winner < values.size:
+        return None
+    challenger_scores = values.copy()
+    challenger_scores[winner] = -np.inf
+    challenger = int(np.argmax(challenger_scores))
+    return challenger if np.isfinite(challenger_scores[challenger]) else None
+
+
+def _dynamic_budget_uncertainty_score(
+    score_gap,
+    q_gap,
+    winner_switches,
+    finalist_support,
+    stable_checkpoints,
+    tree_reuse_quality,
+):
+    """Combine current decision margin, evidence, stability and retained quality."""
+    def margin_uncertainty(value, scale):
+        if value is None:
+            return 1.0
+        value = float(value)
+        if not math.isfinite(value):
+            return 1.0
+        return 1.0 - min(1.0, max(0.0, value) / scale)
+
+    quality = float(tree_reuse_quality)
+    if not math.isfinite(quality):
+        quality = 0.0
+    quality = min(1.0, max(0.0, quality))
+    signals = (
+        margin_uncertainty(score_gap, 0.5),
+        margin_uncertainty(
+            q_gap,
+            max(0.36, 3.0 * _DYNAMIC_BUDGET_EARLY_STOP_Q_GAP),
+        ),
+        min(1.0, max(0, int(winner_switches)) / 2.0),
+        1.0 - min(1.0, max(0, int(finalist_support)) / 4.0),
+        1.0 - min(1.0, max(0, int(stable_checkpoints) - 1) / 3.0),
+        1.0 - quality,
+    )
+    return float(sum(signals) / len(signals))
+
+
+def _provenance_count_or_none(stats, key):
+    """Return an aggregate only when every inference row was attributed."""
+    if stats is None or not bool(stats.get('nn_provenance_complete', False)):
+        return None
+    return int(stats[key])
 
 
 def _gumbel_final_visit_counts(node, state):
@@ -2568,7 +2628,7 @@ class MultiGameBatchMCTS:
         device,
         *,
         local_cuda_graph_forward=None,
-        local_cuda_graph_exact_batch_sizes=(1, 2, 3, 4, 5, 6, 8, 16),
+        local_cuda_graph_exact_batch_sizes=None,
     ):
         self.model = model
         self._search_context_invalidation_epoch = 0
@@ -2588,11 +2648,16 @@ class MultiGameBatchMCTS:
             )
         if local_cuda_graph_forward is not None and type(local_cuda_graph_forward) is not bool:
             raise ValueError('local_cuda_graph_forward must be null, false, or true')
-        # Auto changes only the forward execution of the measured one-root B
-        # path. False is a shared config opt-out; True keeps explicit opt-in
+        # Auto changes only forward execution on benchmarked local paths.
+        # False is a shared config opt-out; True keeps explicit opt-in
         # available for other local models and search modes.
         self._local_cuda_graph_forward_configured = local_cuda_graph_forward
         self._local_cuda_graph_forward_enabled = local_cuda_graph_forward is not False
+        self._local_cuda_graph_exact_batch_sizes_custom = (
+            local_cuda_graph_exact_batch_sizes is not None
+        )
+        if local_cuda_graph_exact_batch_sizes is None:
+            local_cuda_graph_exact_batch_sizes = _DEFAULT_LOCAL_CUDA_GRAPH_BATCH_SIZES
         self._local_cuda_graph_exact_batch_sizes = tuple(sorted({
             int(size)
             for size in local_cuda_graph_exact_batch_sizes
@@ -2600,6 +2665,7 @@ class MultiGameBatchMCTS:
         }))
         self._local_cuda_graph_forward_runner = None
         self._local_cuda_graph_forward_generation = None
+        self._local_cuda_graph_forward_runner_key = None
         self._local_cuda_graph_forward_lock = threading.Lock()
         self._local_cuda_graph_forward_context = threading.local()
         model_cfg = config.get('model', {}) or {}
@@ -2689,6 +2755,14 @@ class MultiGameBatchMCTS:
         self.dynamic_budget_enabled = bool(
             config['reinforcement_learning'].get('mcts_dynamic_budget_enabled', False)
         )
+        self.dynamic_budget_strategy = str(
+            rl_cfg.get('mcts_dynamic_budget_strategy', 'feedback')
+        ).strip().lower()
+        if self.dynamic_budget_strategy not in {'prior', 'feedback'}:
+            raise ValueError(
+                "reinforcement_learning.search.mcts_dynamic_budget_strategy must be "
+                "'prior' or 'feedback'"
+            )
         self.dynamic_budget_minimum = max(
             1,
             int(config['reinforcement_learning'].get('mcts_dynamic_budget_min', 64)),
@@ -2702,6 +2776,11 @@ class MultiGameBatchMCTS:
                 )
             ),
         )
+        # Single-game sessions may carry only earned, bounded budget savings
+        # between successive positions. Explicit tree keys are required so
+        # temporary board identities and unrelated games never share credit.
+        self._dynamic_budget_credits = OrderedDict()
+        self._dynamic_budget_credit_generation = None
         self.eval_easy_cut_enabled = bool(
             rl_cfg.get('eval_mcts_dynamic_budget_enabled', False)
         )
@@ -3030,10 +3109,17 @@ class MultiGameBatchMCTS:
         except Exception:
             return None
 
-    def _local_cuda_graph_auto_eligible(self, original_game_count, native_forest):
-        """Limit automatic graphs to the verified native one-root B contract."""
+    def _local_cuda_graph_auto_eligible(
+        self,
+        original_game_count,
+        native_forest,
+        *,
+        feedback_active=False,
+        all_roots_adaptive=False,
+    ):
+        """Limit automatic graphs to measured native revisiting contracts."""
         if (
-            original_game_count != 1
+            original_game_count < 1
             or self.gumbel_root_schedule != 'revisiting'
             or native_forest is None
             or not native_forest.active
@@ -3044,9 +3130,32 @@ class MultiGameBatchMCTS:
 
         # Unknown wrappers/subclasses may change forward semantics. They can
         # still opt in explicitly, but never enter automatic graph capture.
-        return type(self.model) in (SECNNV9, NestedCNNV10)
+        if original_game_count == 1:
+            return type(self.model) in (SECNNV9, NestedCNNV10)
+        return bool(
+            original_game_count > 1
+            and feedback_active
+            and all_roots_adaptive
+            and type(self.model) is SECNNV9
+        )
 
-    def _prepare_local_cuda_graph_forward(self, evaluation_generation, *, auto_eligible=False):
+    def _local_cuda_graph_batch_sizes_for_call(self, *, auto_eligible, game_count):
+        if (
+            auto_eligible
+            and game_count > 1
+            and self._local_cuda_graph_forward_configured is None
+            and not self._local_cuda_graph_exact_batch_sizes_custom
+        ):
+            return _FEEDBACK_MULTIROOT_LOCAL_CUDA_GRAPH_BATCH_SIZES
+        return self._local_cuda_graph_exact_batch_sizes
+
+    def _prepare_local_cuda_graph_forward(
+        self,
+        evaluation_generation,
+        *,
+        auto_eligible=False,
+        exact_batch_sizes=None,
+    ):
         """Select a stable local forward runner once per search, never per leaf.
 
         Graphs are only considered for an eval-mode local ``nn.Module`` with
@@ -3055,6 +3164,13 @@ class MultiGameBatchMCTS:
         """
         context = self._local_cuda_graph_forward_context
         context.runner = None
+        if exact_batch_sizes is None:
+            exact_batch_sizes = self._local_cuda_graph_exact_batch_sizes
+        else:
+            exact_batch_sizes = tuple(
+                sorted({int(size) for size in exact_batch_sizes if int(size) > 0})
+            )
+        runner_key = (evaluation_generation, exact_batch_sizes)
         eligible = not (
             not self._local_cuda_graph_forward_enabled
             or (self._local_cuda_graph_forward_configured is None and not auto_eligible)
@@ -3074,15 +3190,17 @@ class MultiGameBatchMCTS:
                     old_runner.clear()
                 self._local_cuda_graph_forward_runner = None
                 self._local_cuda_graph_forward_generation = None
+                self._local_cuda_graph_forward_runner_key = None
             return
 
         with self._local_cuda_graph_forward_lock:
-            if self._local_cuda_graph_forward_generation != evaluation_generation:
+            if self._local_cuda_graph_forward_runner_key != runner_key:
                 old_runner = self._local_cuda_graph_forward_runner
                 if old_runner is not None:
                     old_runner.clear()
                 self._local_cuda_graph_forward_runner = None
                 self._local_cuda_graph_forward_generation = evaluation_generation
+                self._local_cuda_graph_forward_runner_key = runner_key
                 try:
                     from src.inference.cuda_graph_forward import CUDAGraphForwardRunner
 
@@ -3091,9 +3209,9 @@ class MultiGameBatchMCTS:
                         self.device,
                         use_amp=self.use_amp,
                         amp_dtype=self.amp_dtype,
-                        exact_batch_sizes=self._local_cuda_graph_exact_batch_sizes,
+                        exact_batch_sizes=exact_batch_sizes,
                         min_capture_observations=2,
-                        max_entries=len(self._local_cuda_graph_exact_batch_sizes),
+                        max_entries=len(exact_batch_sizes),
                         max_graph_memory_fraction=0.04,
                         min_free_memory_bytes=512 * 1024 * 1024,
                         warmup_iterations=3,
@@ -3103,7 +3221,7 @@ class MultiGameBatchMCTS:
                     self._local_cuda_graph_forward_runner = None
             context.runner = self._local_cuda_graph_forward_runner
 
-    def _local_model_forward(self, inputs, model_kwargs):
+    def _local_model_forward(self, inputs, model_kwargs, provenance=None):
         """Run the unchanged raw model contract, optionally through local graphs.
 
         Returns ``(policy, value, used_runner)``. The third value lets callers
@@ -3119,6 +3237,7 @@ class MultiGameBatchMCTS:
             amp_dtype=self.amp_dtype,
             graph_runner=runner if raw_graph_call else None,
             model_kwargs=model_kwargs,
+            provenance=provenance,
         )
         return policy, value, bool(runner is not None and raw_graph_call)
 
@@ -3230,6 +3349,7 @@ class MultiGameBatchMCTS:
                 runner.clear()
             self._local_cuda_graph_forward_runner = None
             self._local_cuda_graph_forward_generation = None
+            self._local_cuda_graph_forward_runner_key = None
             self._local_cuda_graph_forward_context.runner = None
             self._local_cuda_graph_forward_context.mcts_readback_scratch = None
 
@@ -3243,6 +3363,8 @@ class MultiGameBatchMCTS:
         self._search_context_invalidation_epoch = int(
             getattr(self, '_search_context_invalidation_epoch', 0)
         ) + 1
+        self._dynamic_budget_credits.clear()
+        self._dynamic_budget_credit_generation = None
         if hasattr(self, '_local_cuda_graph_forward_lock'):
             self.clear_local_cuda_graph_forward()
 
@@ -5078,6 +5200,9 @@ class MultiGameBatchMCTS:
         )
         budget_stop_reason = 'simulations_complete'
         evaluation_generation = self._evaluation_generation_token()
+        if evaluation_generation != self._dynamic_budget_credit_generation:
+            self._dynamic_budget_credits.clear()
+            self._dynamic_budget_credit_generation = evaluation_generation
         if bool(getattr(self.model, 'supports_remote_legal_gather', False)):
             if not callable(getattr(self.model, 'get_evaluation_generation', None)):
                 raise RuntimeError(
@@ -5094,6 +5219,7 @@ class MultiGameBatchMCTS:
         roots = [None] * game_count
         initial_root_visits = [0] * game_count
         initial_child_visits = [None] * game_count
+        initial_child_value_sums = [None] * game_count
         incoming_root_present = [False] * game_count
         root_reused_flags = [False] * game_count
         root_synced_flags = [False] * game_count
@@ -5102,6 +5228,7 @@ class MultiGameBatchMCTS:
         root_repetition_known = [False] * game_count
         budget_overrides = [None] * game_count
         native_tree_keys = [None] * game_count
+        explicit_native_tree_keys = [False] * game_count
         is_mapping_state = [False] * game_count
 
         # Initialize / reuse roots per game.
@@ -5121,6 +5248,7 @@ class MultiGameBatchMCTS:
                 position_history_complete = gs.get('position_history_complete')
                 budget_override = gs.get('simulation_budget_override')
                 native_tree_key = gs.get('_native_tree_key', id(board))
+                explicit_native_tree_keys[idx] = '_native_tree_key' in gs
             else:
                 if len(gs) > 9:
                     raise ValueError(
@@ -5134,6 +5262,7 @@ class MultiGameBatchMCTS:
                 position_counts = gs[5] if len(gs) > 5 else None
                 budget_override = gs[6] if len(gs) > 6 else None
                 native_tree_key = gs[7] if len(gs) > 7 else id(board)
+                explicit_native_tree_keys[idx] = len(gs) > 7
                 position_history_complete = gs[8] if len(gs) > 8 else None
 
             boards[idx] = board
@@ -5253,6 +5382,33 @@ class MultiGameBatchMCTS:
                     if not include_diagnostics:
                         root_shortcuts[idx] = root_result
 
+        time_budget_active = effective_budget_mode == 'time'
+        dynamic_budget_requested = bool(
+            not time_budget_active
+            and self.dynamic_budget_enabled
+            and any(value is None for value in budget_overrides)
+        )
+        dynamic_budget_feedback_active = bool(
+            dynamic_budget_requested
+            and self.dynamic_budget_strategy == 'feedback'
+        )
+        # Determine the effective controller before graph selection so the
+        # multi-root auto route cannot accidentally include fixed-budget or
+        # time-mode batches. Explicit graph=True remains an override.
+        dynamic_budget_active = bool(
+            dynamic_budget_feedback_active
+            or (
+                dynamic_budget_requested
+                and self.dynamic_budget_strategy == 'prior'
+                and game_count > 1
+            )
+        )
+        effective_root_schedule = (
+            'revisiting'
+            if time_budget_active or dynamic_budget_feedback_active
+            else self.gumbel_root_schedule
+        )
+
         native_forest = self._native_forest
         if self._native_tree_enabled:
             native_import_t0 = perf_counter() if profile_timing else None
@@ -5290,10 +5446,38 @@ class MultiGameBatchMCTS:
                         perf_counter() - native_import_t0,
                     )
         if self._local_cuda_graph_forward_enabled or self._local_cuda_graph_forward_runner is not None:
+            graph_auto_eligible = self._local_cuda_graph_auto_eligible(
+                game_count,
+                native_forest,
+                feedback_active=dynamic_budget_feedback_active,
+                all_roots_adaptive=all(value is None for value in budget_overrides),
+            )
             self._prepare_local_cuda_graph_forward(
                 evaluation_generation,
-                auto_eligible=self._local_cuda_graph_auto_eligible(game_count, native_forest),
+                auto_eligible=graph_auto_eligible,
+                exact_batch_sizes=self._local_cuda_graph_batch_sizes_for_call(
+                    auto_eligible=graph_auto_eligible,
+                    game_count=game_count,
+                ),
             )
+        feedback_eval_stats = (
+            [
+                {
+                    'nn_fresh_evaluations': 0,
+                    'nn_cache_hits': 0,
+                    'nn_deduplicated_evaluations': 0,
+                    'nn_unknown_rows': 0,
+                    'nn_provenance_complete': True,
+                    'mcts_duplicate_leaf_selections': 0,
+                    'inherited_leaf_evaluations': 0,
+                    'exact_leaf_evaluations': 0,
+                }
+                if budget_overrides[idx] is None else None
+                for idx in range(game_count)
+            ]
+            if dynamic_budget_feedback_active
+            else None
+        )
 
         for idx, root in enumerate(roots):
             initial_root_visits[idx] = (
@@ -5301,32 +5485,40 @@ class MultiGameBatchMCTS:
             )
             if root is not None and root.expanded and root.edges is not None:
                 initial_child_visits[idx] = root.edges.visit_counts.copy()
+                if dynamic_budget_feedback_active:
+                    initial_child_value_sums[idx] = root.edges.value_sums.copy()
 
         fixed_simulation_budget = max(1, int(num_simulations))
+        native_dirty_root_indices = set()
 
-        def _sync_native_roots():
+        def _sync_native_roots(root_indices=None):
             if native_forest is None:
                 return
             sync_t0 = perf_counter() if profile_timing else None
-            native_forest.sync_roots()
+            if root_indices is None:
+                native_forest.sync_roots()
+                native_dirty_root_indices.clear()
+            else:
+                # A completed feedback checkpoint reads only these roots. The
+                # other roots retain their last exported snapshot and need not
+                # cross the native/Python boundary again yet.
+                for root_idx in root_indices:
+                    root_idx = int(root_idx)
+                    if root_idx < 0 or root_idx >= game_count:
+                        continue
+                    root = roots[root_idx]
+                    if root is not None and root.edges is not None:
+                        native_forest.sync_node(root)
+                        native_dirty_root_indices.discard(root_idx)
             if profile_timing:
                 self._profile_add(
                     'native_tree_sync_time',
                     perf_counter() - sync_t0,
                 )
 
-        time_budget_active = effective_budget_mode == 'time'
-        effective_root_schedule = (
-            'revisiting' if time_budget_active else self.gumbel_root_schedule
-        )
-        dynamic_budget_active = bool(
-            not time_budget_active
-            and self.dynamic_budget_enabled
-            and game_count > 1
-            and any(value is None for value in budget_overrides)
-        )
         eval_easy_cut_active = bool(
             not time_budget_active
+            and not dynamic_budget_feedback_active
             and self.eval_easy_cut_enabled
             and not add_root_noise
             and game_count > 1
@@ -5460,6 +5652,7 @@ class MultiGameBatchMCTS:
                     leaf_nodes, selection_ids, depths = native_forest.select_batch(
                         scheduled_game_indices
                     )
+                    native_dirty_root_indices.update(scheduled_game_indices)
                     leaf_game_indices.extend(scheduled_game_indices)
                     selection_node_traversals_this_batch = int(
                         depths.sum(dtype=np.int64)
@@ -5514,13 +5707,85 @@ class MultiGameBatchMCTS:
                 if not leaf_nodes:
                     break
 
+                adaptive_leaf_candidates = []
+                if dynamic_budget_feedback_active and root_selection_states is not None:
+                    seen_adaptive_candidates = set()
+                    for node, gs_idx in zip(leaf_nodes, leaf_game_indices):
+                        node_id = id(node)
+                        if (
+                            node_id not in seen_adaptive_candidates
+                            and node is not roots[gs_idx]
+                            and node.raw_value is None
+                            and not node.expanded
+                        ):
+                            seen_adaptive_candidates.add(node_id)
+                            adaptive_leaf_candidates.append((node, gs_idx))
+                evaluation_trace = {} if dynamic_budget_feedback_active else None
                 values = self._batch_expand_and_evaluate(
                     leaf_nodes,
                     leaf_game_indices,
                     board_histories,
                     root_position_counts,
                     root_repetition_known,
+                    adaptive_stats=feedback_eval_stats,
+                    evaluation_trace=evaluation_trace,
                 )
+                if adaptive_leaf_candidates:
+                    # Count one new-leaf identity per attributed NN/cache row;
+                    # MCTS duplicates and inference-level dedup rows add none.
+                    sources_by_node = (
+                        evaluation_trace.get('row_sources_by_node', {})
+                        if isinstance(evaluation_trace, dict)
+                        else {}
+                    )
+                    for node, gs_idx in adaptive_leaf_candidates:
+                        source = sources_by_node.get(id(node))
+                        if source not in {'fresh_nn', 'cache_hit', 'exact_terminal'}:
+                            continue
+                        root = roots[gs_idx]
+                        if root is None:
+                            continue
+                        state = root_selection_states[gs_idx]
+                        edge_cache = state.setdefault(
+                            '_adaptive_root_edge_index_cache', {}
+                        ) if state is not None else None
+                        edge_index = None
+                        if edge_cache is not None:
+                            path_ids = []
+                            current = node
+                            while current is not None and current is not root:
+                                cached_edge = edge_cache.get(id(current))
+                                if cached_edge is not None:
+                                    edge_index = int(cached_edge)
+                                    break
+                                path_ids.append(id(current))
+                                parent = current.parent
+                                if parent is root:
+                                    edge_index = int(current.parent_edge_index)
+                                    break
+                                current = parent
+                            if edge_index is None:
+                                continue
+                            for path_id in path_ids:
+                                edge_cache[path_id] = edge_index
+                        else:
+                            root_edge = node
+                            while root_edge.parent is not None and root_edge.parent is not root:
+                                root_edge = root_edge.parent
+                            if root_edge.parent is not root:
+                                continue
+                            edge_index = int(root_edge.parent_edge_index)
+                        if state is not None and 0 <= edge_index < len(root.edges.moves):
+                            if source in {'fresh_nn', 'cache_hit'}:
+                                state.setdefault(
+                                    '_adaptive_fresh_leaf_ids_by_edge',
+                                    [set() for _ in root.edges.moves],
+                                )[edge_index].add(id(node))
+                            else:
+                                state.setdefault(
+                                    '_adaptive_exact_leaf_ids_by_edge',
+                                    [set() for _ in root.edges.moves],
+                                )[edge_index].add(id(node))
 
                 backprop_t0 = perf_counter() if profile_timing else None
                 if native_forest is not None:
@@ -5567,8 +5832,10 @@ class MultiGameBatchMCTS:
                         progress = int(root_state.get('_pass_scheduled', 0))
                         if progress in root_state.get('_feedback_boundaries', ()):
                             feedback_checkpoint_indices.append(state_idx)
-                if post_batch_callback is not None or feedback_checkpoint_indices:
+                if post_batch_callback is not None:
                     _sync_native_roots()
+                elif feedback_checkpoint_indices:
+                    _sync_native_roots(feedback_checkpoint_indices)
                 if post_batch_callback is not None:
                     removed = max(
                         0,
@@ -5576,8 +5843,13 @@ class MultiGameBatchMCTS:
                     )
                     total_remaining = max(0, total_remaining - removed)
                 if feedback_checkpoint_indices:
-                    post_feedback_callback(feedback_checkpoint_indices)
-            _sync_native_roots()
+                    removed = max(
+                        0,
+                        int(post_feedback_callback(feedback_checkpoint_indices, remaining) or 0),
+                    )
+                    total_remaining = max(0, total_remaining - removed)
+            if native_dirty_root_indices:
+                _sync_native_roots(tuple(native_dirty_root_indices))
 
         scout_difficulties = [0.0] * game_count
         # Evaluate every unexpanded root exactly once so priors/raw values exist
@@ -5594,21 +5866,39 @@ class MultiGameBatchMCTS:
         ]
         if any(root_setup):
             _run_simulation_phase(root_setup)
+        for idx, root in enumerate(roots):
+            if (
+                root is not None
+                and root.expanded
+                and root.edges is not None
+                and initial_child_visits[idx] is None
+            ):
+                # Root expansion is setup, not root-action evidence. Snapshot
+                # zero edge statistics now so both adaptive Q and its evidence
+                # floor count only simulations spent choosing legal moves.
+                initial_child_visits[idx] = root.edges.visit_counts.copy()
+                if dynamic_budget_feedback_active:
+                    initial_child_value_sums[idx] = root.edges.value_sums.copy()
 
         if dynamic_budget_active or eval_easy_cut_active:
             scout_difficulties = [_gumbel_prior_difficulty(root) for root in roots]
-        overridden_total = sum(
-            int(value) for value in budget_overrides if value is not None
-        )
         adaptive_indices = [
             idx for idx, value in enumerate(budget_overrides) if value is None
         ]
         if adaptive_indices:
-            requested_total = fixed_simulation_budget * game_count
-            adaptive_total = max(
-                len(adaptive_indices),
-                requested_total - overridden_total,
-            )
+            if dynamic_budget_feedback_active:
+                # Feedback begins with a shared scout pass; the immutable
+                # target-sized pool is released only after that evidence exists.
+                adaptive_total = fixed_simulation_budget * len(adaptive_indices)
+            else:
+                # Preserve the HEAD prior allocator's mixed-override total.
+                overridden_total = sum(
+                    int(value) for value in budget_overrides if value is not None
+                )
+                adaptive_total = max(
+                    len(adaptive_indices),
+                    fixed_simulation_budget * game_count - overridden_total,
+                )
             adaptive_target = float(adaptive_total) / float(len(adaptive_indices))
             if eval_easy_cut_active:
                 adaptive_budgets = _allocate_eval_easy_cut_simulation_budgets(
@@ -5618,6 +5908,15 @@ class MultiGameBatchMCTS:
                     difficulty_threshold=self.eval_easy_cut_difficulty_threshold,
                     chunk=self.eval_easy_cut_chunk,
                 )
+            elif dynamic_budget_feedback_active:
+                scout_budget = min(
+                    int(dynamic_maximum),
+                    max(
+                        int(dynamic_minimum),
+                        (int(fixed_simulation_budget) + 1) // 2,
+                    ),
+                )
+                adaptive_budgets = [scout_budget] * len(adaptive_indices)
             elif dynamic_budget_active:
                 adaptive_budgets = _allocate_dynamic_simulation_budgets(
                     [scout_difficulties[idx] for idx in adaptive_indices],
@@ -5642,6 +5941,31 @@ class MultiGameBatchMCTS:
         for idx, budget_override in enumerate(budget_overrides):
             if budget_override is not None:
                 simulation_budgets[idx] = int(budget_override)
+        prior_dynamic_credit = 0
+        if (
+            dynamic_budget_feedback_active
+            and game_count == 1
+            and explicit_native_tree_keys[0]
+        ):
+            tree_key = native_tree_keys[0]
+            try:
+                prior_dynamic_credit = int(self._dynamic_budget_credits.get(tree_key, 0))
+            except (TypeError, ValueError):
+                prior_dynamic_credit = 0
+            prior_dynamic_credit = max(
+                0,
+                min(dynamic_maximum - dynamic_target, prior_dynamic_credit),
+            )
+            simulation_budgets[0] = min(
+                dynamic_maximum,
+                int(simulation_budgets[0]) + prior_dynamic_credit,
+            )
+        dynamic_budget_initial_budgets = list(simulation_budgets)
+        dynamic_budget_pool_total = (
+            int(fixed_simulation_budget) * len(adaptive_indices)
+            + int(prior_dynamic_credit)
+            if dynamic_budget_feedback_active else 0
+        )
 
         setup_visits = [
             max(0, int(getattr(root, 'visit_count', 0) or 0) - initial_root_visits[idx])
@@ -5692,6 +6016,7 @@ class MultiGameBatchMCTS:
             add_root_noise
             and self.reuse_tree
             and self.tree_reuse_visit_credit_enabled
+            and not dynamic_budget_feedback_active
         ):
             for idx, budget in enumerate(simulation_budgets):
                 if not root_reused_flags[idx]:
@@ -5719,7 +6044,7 @@ class MultiGameBatchMCTS:
         # ``_run_simulation_phase`` consumes its mutable remaining-budget list
         # in place. Preserve the assigned budget for post-search telemetry and
         # Sequential Halving diagnostics before that mutation starts.
-        gumbel_action_budgets = tuple(action_budgets)
+        gumbel_action_budgets = list(action_budgets)
 
         pre_scout_winners = [None] * game_count
         pre_scout_policies = [None] * game_count
@@ -5749,10 +6074,19 @@ class MultiGameBatchMCTS:
             initial = initial_child_visits[idx]
             if initial is None or len(initial) != len(root.edges.moves):
                 initial = np.zeros(len(root.edges.moves), dtype=np.int32)
+            # Feedback starts with a reduced scout quota, but its later
+            # transfers can fund the ordinary target-sized search. Resolve
+            # shortlist width from that nominal target so the scout does not
+            # permanently halve the candidate set before extra work arrives.
+            width_budget = (
+                int(fixed_simulation_budget)
+                if dynamic_budget_feedback_active and budget_overrides[idx] is None
+                else action_budgets[idx]
+            )
             considered = _resolve_gumbel_considered_actions(
                 self.gumbel_max_considered_actions,
                 len(root.edges.moves),
-                action_budgets[idx],
+                width_budget,
             )
             pass_budgets = (
                 (
@@ -5775,6 +6109,19 @@ class MultiGameBatchMCTS:
                 )
             )
             initial_copy = np.asarray(initial, dtype=np.int32).copy()
+            feedback_boundaries = (
+                _gumbel_revisiting_feedback_boundaries(
+                    considered,
+                    action_budgets[idx],
+                )
+                if effective_root_schedule == 'standard'
+                else ()
+            )
+            if dynamic_budget_feedback_active and action_budgets[idx] > 0:
+                # A completed pass is also a valid stability checkpoint once
+                # the halving schedule has reached its final two candidates.
+                if not feedback_boundaries or feedback_boundaries[-1] != int(action_budgets[idx]):
+                    feedback_boundaries = tuple(feedback_boundaries) + (int(action_budgets[idx]),)
             gumbel_root_states[idx] = {
                 'initial_visits': initial_copy,
                 'pass_initial_visits': initial_copy.copy(),
@@ -5783,26 +6130,48 @@ class MultiGameBatchMCTS:
                 'sequence': root_sequence,
                 'root_schedule': effective_root_schedule,
                 'q_scale_total_visits': self.gumbel_reuse_q_scale == 'total',
-                'pass_budgets': (
-                    [int(value) for value in pass_budgets]
-                    if time_budget_active
-                    else tuple(int(value) for value in pass_budgets)
-                ),
+                'pass_budgets': [int(value) for value in pass_budgets],
+                'pass_considered_actions': [int(considered)] * len(pass_budgets),
                 'pass_index': 0,
                 '_pass_scheduled': 0,
-                '_feedback_boundaries': (
-                    _gumbel_revisiting_feedback_boundaries(
-                        considered,
-                        action_budgets[idx],
-                    )
-                    if effective_root_schedule == 'standard'
-                    else ()
-                ),
+                '_feedback_boundaries': feedback_boundaries,
                 '_feedback_boundary_index': 0,
                 '_initial_visits_f64': np.asarray(initial_copy, dtype=np.float64),
                 '_pass_initial_visits_f64': np.asarray(initial_copy, dtype=np.float64),
                 '_pass_initial_total': float(initial_copy.sum()),
+                '_adaptive_fresh_leaf_ids_by_edge': (
+                    [set() for _ in root.edges.moves]
+                    if dynamic_budget_feedback_active
+                    and root is not None and root.edges is not None
+                    else []
+                ),
+                '_adaptive_exact_leaf_ids_by_edge': (
+                    [set() for _ in root.edges.moves]
+                    if dynamic_budget_feedback_active
+                    and root is not None and root.edges is not None
+                    else []
+                ),
+                '_adaptive_last_winner': None,
+                '_adaptive_stable_checkpoints': 0,
+                '_adaptive_q_gap': 0.0,
+                '_adaptive_score_gap': None,
+                '_adaptive_challenger': None,
+                '_adaptive_uncertainty_score': 0.0,
+                '_adaptive_uncertainty_rank': 0.0,
+                '_adaptive_transferred_in': 0,
+                '_adaptive_winner_switches': 0,
+                '_adaptive_fresh_floor': int(dynamic_minimum),
+                '_adaptive_early_stopped': False,
+                '_adaptive_stop_reason': 'budget_exhausted',
             }
+            if dynamic_budget_feedback_active:
+                state = gumbel_root_states[idx]
+                state['initial_value_sums'] = np.asarray(
+                    initial_child_value_sums[idx]
+                    if initial_child_value_sums[idx] is not None
+                    else np.zeros_like(initial_copy, dtype=np.float32),
+                    dtype=np.float32,
+                ).copy()
             if time_budget_active:
                 state = gumbel_root_states[idx]
                 state['_stable_selected_idx'] = self._gumbel_final_action_index(
@@ -5899,13 +6268,15 @@ class MultiGameBatchMCTS:
         reuse_scout_callback = (
             _apply_ready_tree_reuse_scouts
             if (
+                not dynamic_budget_feedback_active
+                and
                 effective_root_schedule == 'standard'
                 and any(policy is not None for policy in pre_scout_policies)
             )
             else None
         )
         if time_budget_active:
-            def _record_stable_gumbel_choices(root_indices):
+            def _record_stable_gumbel_choices(root_indices, _remaining=None):
                 for idx in root_indices:
                     root = roots[idx]
                     state = gumbel_root_states[idx]
@@ -5921,6 +6292,329 @@ class MultiGameBatchMCTS:
                             state.get('_pass_scheduled', 0)
                         )
 
+        def _adaptive_uncertainty_score(root_idx):
+            """One bounded urgency score shared by funding and metadata."""
+            state = gumbel_root_states[root_idx]
+            if state is None:
+                return 0.0
+            leaf_counts = state.get('_adaptive_fresh_leaf_ids_by_edge', ())
+            support = min(
+                (
+                    len(leaf_counts[int(edge)])
+                    for edge in (
+                        state.get('_adaptive_last_winner'),
+                        state.get('_adaptive_challenger'),
+                    )
+                    if edge is not None and int(edge) < len(leaf_counts)
+                ),
+                default=0,
+            )
+            return _dynamic_budget_uncertainty_score(
+                state.get('_adaptive_score_gap'),
+                state.get('_adaptive_q_gap'),
+                state.get('_adaptive_winner_switches', 0),
+                support,
+                state.get('_adaptive_stable_checkpoints', 0),
+                tree_reuse_quality[root_idx]['quality'],
+            )
+
+        def _adaptive_feedback_callback(root_indices, remaining):
+            """Stop only after completed SH feedback with fresh evidence."""
+            removed_total = 0
+            for idx in root_indices:
+                if (
+                    not dynamic_budget_feedback_active
+                    or budget_overrides[idx] is not None
+                    or idx >= len(remaining)
+                ):
+                    continue
+                root = roots[idx]
+                state = gumbel_root_states[idx]
+                if (
+                    root is None
+                    or state is None
+                    or not root.edges.moves
+                    or state.get('_adaptive_early_stopped', False)
+                ):
+                    continue
+
+                final_counts = _gumbel_final_visit_counts(root, state)
+                eligible, _ = _gumbel_final_action_eligibility(final_counts)
+                if int(eligible.sum()) < 2:
+                    winner = self._gumbel_final_action_index(root, state)
+                    if winner is None:
+                        continue
+                    state['_adaptive_last_winner'] = int(winner)
+                    state['_adaptive_stable_checkpoints'] = 1
+                    continue
+
+                # Final action follows canonical max-visit selection. The
+                # challenger guard inspects every legal edge because the
+                # Gumbel shortlist is rank-based, not a prefix of edge order.
+                # Reuse this completed-Q score vector for both decisions rather
+                # than asking the native final-action kernel to build it first.
+                scale_counts = self._gumbel_root_q_scale_visit_counts(root, state)
+                scores = root.edges.log_base_priors.astype(np.float64, copy=True)
+                scores -= float(np.max(scores))
+                scores += np.asarray(state['gumbel'], dtype=np.float64)
+                scores += self._gumbel_completed_qvalues(
+                    root,
+                    scale_visit_counts=scale_counts,
+                )
+                winner = int(np.argmax(np.where(eligible, scores, -np.inf)))
+                challenger = _adaptive_challenger_index(scores, winner)
+                if challenger is None:
+                    continue
+                score_gap = float(scores[int(winner)] - scores[int(challenger)])
+                state['_adaptive_score_gap'] = score_gap
+                state['_adaptive_challenger'] = int(challenger)
+
+                previous_winner = state.get('_adaptive_last_winner')
+                if previous_winner is not None and previous_winner != int(winner):
+                    state['_adaptive_winner_switches'] = int(
+                        state.get('_adaptive_winner_switches', 0)
+                    ) + 1
+                stable_checkpoints = (
+                    int(state.get('_adaptive_stable_checkpoints', 0)) + 1
+                    if previous_winner == int(winner)
+                    else 1
+                )
+                state['_adaptive_last_winner'] = int(winner)
+                state['_adaptive_stable_checkpoints'] = stable_checkpoints
+
+                initial_visits = np.asarray(state['initial_visits'], dtype=np.float64)
+                fresh_visits = np.maximum(
+                    0.0,
+                    root.edges.visit_counts.astype(np.float64) - initial_visits,
+                )
+                initial_sums = np.asarray(
+                    state.get('initial_value_sums', np.zeros_like(fresh_visits)),
+                    dtype=np.float64,
+                )
+                fresh_sums = (
+                    root.edges.value_sums.astype(np.float64) - initial_sums
+                )
+                fresh_q = np.zeros(fresh_visits.size, dtype=np.float64)
+                visited = fresh_visits > 0.0
+                fresh_q[visited] = -fresh_sums[visited] / fresh_visits[visited]
+                q_gap = float(fresh_q[int(winner)] - fresh_q[challenger])
+                state['_adaptive_q_gap'] = q_gap
+                leaf_ids = state.get('_adaptive_fresh_leaf_ids_by_edge', ())
+                winner_leaf_count = (
+                    len(leaf_ids[int(winner)]) if int(winner) < len(leaf_ids) else 0
+                )
+                challenger_leaf_count = (
+                    len(leaf_ids[challenger]) if challenger < len(leaf_ids) else 0
+                )
+                exact_leaf_ids = state.get('_adaptive_exact_leaf_ids_by_edge', ())
+                winner_exact_count = (
+                    len(exact_leaf_ids[int(winner)])
+                    if int(winner) < len(exact_leaf_ids) else 0
+                )
+                challenger_exact_count = (
+                    len(exact_leaf_ids[challenger])
+                    if challenger < len(exact_leaf_ids) else 0
+                )
+                state['_adaptive_winner_fresh_leaf_count'] = int(winner_leaf_count)
+                state['_adaptive_challenger_fresh_leaf_count'] = int(challenger_leaf_count)
+                state['_adaptive_winner_exact_leaf_count'] = int(winner_exact_count)
+                state['_adaptive_challenger_exact_leaf_count'] = int(challenger_exact_count)
+                state['_adaptive_uncertainty_score'] = _adaptive_uncertainty_score(idx)
+                quality = float(tree_reuse_quality[idx]['quality'])
+                base_floor = min(
+                    dynamic_target,
+                    dynamic_minimum
+                    + int(round(
+                        (1.0 - quality)
+                        * min(
+                            _DYNAMIC_BUDGET_REUSE_FRESH_FLOOR_BONUS,
+                            max(0, dynamic_target - dynamic_minimum),
+                        )
+                    )) if root_reused_flags[idx] else dynamic_minimum,
+                )
+                state['_adaptive_fresh_floor'] = int(base_floor)
+                action_visits = int(round(float(fresh_visits.sum())))
+                if (
+                    action_visits >= int(base_floor)
+                    and stable_checkpoints >= 2
+                    and score_gap >= 0.0
+                    and q_gap >= _DYNAMIC_BUDGET_EARLY_STOP_Q_GAP
+                    and (
+                        winner_leaf_count >= _DYNAMIC_BUDGET_MIN_FRESH_LEAVES_PER_FINALIST
+                        or winner_exact_count > 0
+                    )
+                    and (
+                        challenger_leaf_count >= _DYNAMIC_BUDGET_MIN_FRESH_LEAVES_PER_FINALIST
+                        or challenger_exact_count > 0
+                    )
+                ):
+                    state['_adaptive_early_stopped'] = True
+                    state['_adaptive_stop_reason'] = 'stable_gumbel_winner_q_gap'
+                    removed = max(0, int(remaining[idx]))
+                    remaining[idx] = 0
+                    removed_total += removed
+            return removed_total
+
+        def _run_adaptive_extension_passes():
+            """Spend the fixed feedback pool in uncertainty-ranked SH passes."""
+            if not dynamic_budget_feedback_active or time_budget_active:
+                return
+
+            def _actual_fresh(root_idx):
+                root = roots[root_idx]
+                if root is None:
+                    return 0
+                return max(
+                    0,
+                    int(getattr(root, 'visit_count', 0) or 0)
+                    - int(initial_root_visits[root_idx]),
+                )
+
+            # This is a hard ledger: root setup and all later passes consume
+            # the same per-call target pool. A donor's unused allocation can
+            # therefore be transferred only once.
+            original_pool = int(dynamic_budget_pool_total)
+            minimum_pass = min(
+                (
+                    max(
+                        1,
+                        int(state.get('considered_actions', 1))
+                        * int(math.ceil(math.log2(max(2, int(state.get('considered_actions', 1)))))),
+                    )
+                    for idx in adaptive_indices
+                    if (state := gumbel_root_states[idx]) is not None
+                ),
+                default=1,
+            )
+            max_extension_rounds = max(1, original_pool // minimum_pass + 1)
+            for _ in range(max_extension_rounds):
+                pool = max(
+                    0,
+                    int(original_pool)
+                    - sum(
+                        _actual_fresh(idx)
+                        for idx in adaptive_indices
+                    ),
+                )
+                if pool <= 0:
+                    break
+                candidates = [
+                    idx for idx in adaptive_indices
+                    if (
+                        gumbel_root_states[idx] is not None
+                        and root_shortcuts[idx] is None
+                        and roots[idx] is not None
+                        and roots[idx].edges is not None
+                        and roots[idx].edges.moves
+                        and len(roots[idx].edges.moves) > 1
+                        and not gumbel_root_states[idx].get('_adaptive_early_stopped', False)
+                        and simulation_budgets[idx] < dynamic_maximum
+                    )
+                ]
+                if not candidates:
+                    break
+
+                for idx in candidates:
+                    gumbel_root_states[idx]['_adaptive_uncertainty_score'] = (
+                        _adaptive_uncertainty_score(idx)
+                    )
+                # Every observed signal contributes to the same bounded
+                # priority. Prior difficulty only breaks exact score ties.
+                candidates.sort(
+                    key=lambda idx: (
+                        -float(gumbel_root_states[idx]['_adaptive_uncertainty_score']),
+                        -float(scout_difficulties[idx]),
+                        idx,
+                    )
+                )
+                for rank, idx in enumerate(candidates):
+                    gumbel_root_states[idx]['_adaptive_uncertainty_rank'] = (
+                        float(len(candidates) - rank) / float(len(candidates))
+                    )
+                grants = {}
+                available = int(pool)
+                for idx in candidates:
+                    state = gumbel_root_states[idx]
+                    considered = max(1, int(state.get('considered_actions', 1)))
+                    pass_cost = max(
+                        1,
+                        considered * int(math.ceil(math.log2(considered)))
+                        if considered > 1 else 1,
+                    )
+                    capacity = max(
+                        0,
+                        int(dynamic_maximum) - int(simulation_budgets[idx]),
+                    )
+                    if available < pass_cost or capacity < pass_cost:
+                        continue
+                    grants[idx] = pass_cost
+                    available -= pass_cost
+                if not grants:
+                    break
+
+                pass_remaining = [0] * game_count
+                for idx, grant in grants.items():
+                    root = roots[idx]
+                    state = gumbel_root_states[idx]
+                    # Preserve the original considered shortlist across passes;
+                    # each grant is a complete balanced SH pass for this width.
+                    considered = max(1, int(state['considered_actions']))
+                    pass_initial = np.asarray(
+                        root.edges.visit_counts,
+                        dtype=np.int32,
+                    ).copy()
+                    state['pass_initial_visits'] = pass_initial
+                    state['_pass_initial_visits_f64'] = np.asarray(
+                        pass_initial,
+                        dtype=np.float64,
+                    )
+                    state['_pass_initial_total'] = float(pass_initial.sum())
+                    state['considered_actions'] = int(considered)
+                    state.setdefault('pass_considered_actions', []).append(int(considered))
+                    state['pass_budgets'].append(int(grant))
+                    state['pass_index'] = len(state['pass_budgets']) - 1
+                    state['_pass_scheduled'] = 0
+                    state['sequence'] = _gumbel_considered_visit_sequence(
+                        considered,
+                        grant,
+                    )
+                    boundaries = _gumbel_revisiting_feedback_boundaries(
+                        considered,
+                        grant,
+                    )
+                    if not boundaries or boundaries[-1] != grant:
+                        boundaries = tuple(boundaries) + (grant,)
+                    state['_feedback_boundaries'] = boundaries
+                    state['_feedback_boundary_index'] = 0
+                    simulation_budgets[idx] += int(grant)
+                    gumbel_action_budgets[idx] += int(grant)
+                    state['_adaptive_transferred_in'] = int(
+                        state.get('_adaptive_transferred_in', 0)
+                    ) + int(grant)
+                    pass_remaining[idx] = int(grant)
+
+                _run_simulation_phase(
+                    pass_remaining,
+                    gumbel_root_states,
+                    post_feedback_callback=_adaptive_feedback_callback,
+                    native_root_pass_update=[
+                        gumbel_root_states[idx]
+                        if idx in grants else None
+                        for idx in range(game_count)
+                    ],
+                )
+                progressed = 0
+                for idx, grant in grants.items():
+                    state = gumbel_root_states[idx]
+                    actual = max(0, int(state.get('_pass_scheduled', 0)))
+                    state.setdefault('pass_actual_visits', []).append(actual)
+                    if actual < len(state['sequence']):
+                        state['sequence'] = state['sequence'][:actual]
+                    progressed += actual
+                if progressed <= 0:
+                    break
+
+        if time_budget_active:
             time_pass_index = 0
             while True:
                 if perf_counter() >= time_deadline:
@@ -5956,6 +6650,9 @@ class MultiGameBatchMCTS:
                         )
                         state['_pass_initial_total'] = float(pass_initial.sum())
                         state['pass_budgets'].append(pass_budget)
+                        state.setdefault('pass_considered_actions', []).append(
+                            int(state['considered_actions'])
+                        )
                     state['pass_index'] = int(time_pass_index)
                     state['_pass_scheduled'] = 0
                     state['sequence'] = _gumbel_considered_visit_sequence(
@@ -6020,7 +6717,11 @@ class MultiGameBatchMCTS:
             for pass_index in range(max_pass_count):
                 pass_remaining = [0] * game_count
                 for idx, (root, state) in enumerate(zip(roots, gumbel_root_states)):
-                    if state is None or pass_index >= len(state['pass_budgets']):
+                    if (
+                        state is None
+                        or state.get('_adaptive_early_stopped', False)
+                        or pass_index >= len(state['pass_budgets'])
+                    ):
                         continue
                     pass_budget = int(state['pass_budgets'][pass_index])
                     pass_remaining[idx] = pass_budget
@@ -6047,12 +6748,23 @@ class MultiGameBatchMCTS:
                             pass_budget,
                         )
                     )
+                    if dynamic_budget_feedback_active and (
+                        not state['_feedback_boundaries']
+                        or state['_feedback_boundaries'][-1] != pass_budget
+                    ):
+                        state['_feedback_boundaries'] = tuple(
+                            state['_feedback_boundaries']
+                        ) + (pass_budget,)
                     state['_feedback_boundary_index'] = 0
 
                 _run_simulation_phase(
                     pass_remaining,
                     gumbel_root_states,
                     post_batch_callback=reuse_scout_callback,
+                    post_feedback_callback=(
+                        _adaptive_feedback_callback
+                        if dynamic_budget_feedback_active else None
+                    ),
                     native_root_pass_update=(
                         [
                             state if (
@@ -6075,11 +6787,16 @@ class MultiGameBatchMCTS:
                         state.setdefault('pass_actual_visits', []).append(actual)
                         if actual < len(state['sequence']):
                             state['sequence'] = state['sequence'][:actual]
+            _run_adaptive_extension_passes()
         else:
             _run_simulation_phase(
                 action_budgets,
                 gumbel_root_states,
                 post_batch_callback=reuse_scout_callback,
+                post_feedback_callback=(
+                    _adaptive_feedback_callback
+                    if dynamic_budget_feedback_active else None
+                ),
             )
             for idx, state in enumerate(gumbel_root_states):
                 if state is None:
@@ -6095,6 +6812,17 @@ class MultiGameBatchMCTS:
                     )
                     actual = int(round(float(fresh.sum())))
                 state['pass_actual_visits'] = [actual]
+            _run_adaptive_extension_passes()
+
+        if dynamic_budget_feedback_active:
+            for state in gumbel_root_states:
+                if state is None:
+                    continue
+                completed_passes = len(state.get('pass_actual_visits', ()))
+                state['pass_budgets'] = state.get('pass_budgets', [])[:completed_passes]
+                state['pass_considered_actions'] = state.get(
+                    'pass_considered_actions', []
+                )[:completed_passes]
 
         if native_forest is not None:
             native_sync_t0 = perf_counter() if profile_timing else None
@@ -6104,6 +6832,39 @@ class MultiGameBatchMCTS:
                     'native_tree_sync_time',
                     perf_counter() - native_sync_t0,
                 )
+
+        if (
+            dynamic_budget_feedback_active
+            and game_count == 1
+            and explicit_native_tree_keys[0]
+            and evaluation_generation is not None
+            and gumbel_root_states[0] is not None
+        ):
+            tree_key = native_tree_keys[0]
+            root = roots[0]
+            fresh_used = max(
+                0,
+                int(getattr(root, 'visit_count', 0) or 0)
+                - int(initial_root_visits[0]),
+            ) if root is not None else 0
+            earned = 0
+            if gumbel_root_states[0].get('_adaptive_early_stopped', False):
+                earned = min(
+                    max(0, dynamic_maximum - dynamic_target),
+                    max(
+                        0,
+                        int(dynamic_target)
+                        + int(prior_dynamic_credit)
+                        - int(fresh_used),
+                    ),
+                )
+            if earned > 0:
+                self._dynamic_budget_credits[tree_key] = int(earned)
+                self._dynamic_budget_credits.move_to_end(tree_key)
+                while len(self._dynamic_budget_credits) > _DYNAMIC_BUDGET_CREDIT_KEYS:
+                    self._dynamic_budget_credits.popitem(last=False)
+            else:
+                self._dynamic_budget_credits.pop(tree_key, None)
 
         # Sync roots back to caller-provided state containers.
         for idx, gs in enumerate(game_states):
@@ -6116,6 +6877,23 @@ class MultiGameBatchMCTS:
                 if len(gs) > 2:
                     gs[2] = bool(root_synced_flags[idx])
 
+        dynamic_budget_pool_used = (
+            sum(
+                max(
+                    0,
+                    int(getattr(roots[idx], 'visit_count', 0) or 0)
+                    - int(initial_root_visits[idx]),
+                )
+                for idx in adaptive_indices
+                if roots[idx] is not None
+            )
+            if dynamic_budget_feedback_active else 0
+        )
+        dynamic_budget_pool_unused = max(
+            0,
+            int(dynamic_budget_pool_total) - int(dynamic_budget_pool_used),
+        )
+
         result = []
         search_metadata = []
         metadata_t0 = perf_counter() if profile_timing else None
@@ -6125,6 +6903,13 @@ class MultiGameBatchMCTS:
                 int(getattr(root, 'visit_count', 0) or 0)
                 - int(initial_root_visits[idx]),
             ) if root is not None else 0
+            feedback_stats = (
+                feedback_eval_stats[idx]
+                if feedback_eval_stats is not None
+                and idx < len(feedback_eval_stats)
+                else None
+            )
+            feedback_state = gumbel_root_states[idx]
             basic_metadata = {
                 'mcts_algorithm': self.mcts_algorithm,
                 'simulations_used': int(fresh_used + inherited_visit_credits[idx]),
@@ -6141,6 +6926,176 @@ class MultiGameBatchMCTS:
                 'search_diagnostics_included': bool(include_diagnostics),
                 'gumbel_configured_root_schedule': self.gumbel_root_schedule,
                 'gumbel_effective_root_schedule': effective_root_schedule,
+                'dynamic_budget_enabled': bool(
+                    dynamic_budget_active and budget_overrides[idx] is None
+                ),
+                'dynamic_budget_strategy': self.dynamic_budget_strategy,
+                'dynamic_budget_initial_budget': (
+                    int(dynamic_budget_initial_budgets[idx])
+                    if dynamic_budget_feedback_active
+                    and budget_overrides[idx] is None else None
+                ),
+                'dynamic_budget_transferred_in': (
+                    int(feedback_state.get('_adaptive_transferred_in', 0))
+                    if dynamic_budget_feedback_active and feedback_state is not None
+                    else 0
+                ),
+                'dynamic_budget_extra_simulations_used': (
+                    max(
+                        0,
+                        int(fresh_used)
+                        - int(dynamic_budget_initial_budgets[idx]),
+                    )
+                    if dynamic_budget_feedback_active
+                    and budget_overrides[idx] is None else 0
+                ),
+                'dynamic_budget_saved_simulations': (
+                    max(0, int(simulation_budgets[idx]) - int(fresh_used))
+                    if dynamic_budget_feedback_active
+                    and budget_overrides[idx] is None else 0
+                ),
+                'dynamic_budget_pool_total': (
+                    int(dynamic_budget_pool_total)
+                    if dynamic_budget_feedback_active
+                    and budget_overrides[idx] is None else 0
+                ),
+                'dynamic_budget_pool_used': (
+                    int(dynamic_budget_pool_used)
+                    if dynamic_budget_feedback_active
+                    and budget_overrides[idx] is None else 0
+                ),
+                'dynamic_budget_pool_unused': (
+                    int(dynamic_budget_pool_unused)
+                    if dynamic_budget_feedback_active
+                    and budget_overrides[idx] is None else 0
+                ),
+                'dynamic_budget_pool_overrun': (
+                    max(
+                        0,
+                        int(dynamic_budget_pool_used)
+                        - int(dynamic_budget_pool_total),
+                    )
+                    if dynamic_budget_feedback_active
+                    and budget_overrides[idx] is None else 0
+                ),
+                'dynamic_budget_spent_credit': (
+                    min(
+                        int(prior_dynamic_credit),
+                        max(0, int(fresh_used) - int(fixed_simulation_budget)),
+                    )
+                    if dynamic_budget_feedback_active
+                    and game_count == 1
+                    and explicit_native_tree_keys[idx] else 0
+                ),
+                'nn_fresh_evaluations': (
+                    _provenance_count_or_none(
+                        feedback_stats,
+                        'nn_fresh_evaluations',
+                    )
+                ),
+                'nn_cache_hits': (
+                    _provenance_count_or_none(feedback_stats, 'nn_cache_hits')
+                ),
+                'nn_deduplicated_evaluations': (
+                    _provenance_count_or_none(
+                        feedback_stats,
+                        'nn_deduplicated_evaluations',
+                    )
+                ),
+                'nn_unknown_rows': (
+                    int(feedback_stats['nn_unknown_rows'])
+                    if feedback_stats is not None else None
+                ),
+                'nn_provenance_complete': (
+                    bool(feedback_stats['nn_provenance_complete'])
+                    if feedback_stats is not None else False
+                ),
+                'mcts_duplicate_leaf_selections': (
+                    int(feedback_stats['mcts_duplicate_leaf_selections'])
+                    if feedback_stats is not None else None
+                ),
+                'inherited_leaf_evaluations': (
+                    int(feedback_stats['inherited_leaf_evaluations'])
+                    if feedback_stats is not None else None
+                ),
+                'exact_leaf_evaluations': (
+                    int(feedback_stats['exact_leaf_evaluations'])
+                    if feedback_stats is not None else None
+                ),
+                'dynamic_budget_uncertainty_score': (
+                    float(feedback_state.get('_adaptive_uncertainty_score', 0.0))
+                    if dynamic_budget_feedback_active and feedback_state is not None
+                    else None
+                ),
+                'dynamic_budget_uncertainty_rank': (
+                    float(feedback_state.get('_adaptive_uncertainty_rank', 0.0))
+                    if dynamic_budget_feedback_active and feedback_state is not None
+                    else None
+                ),
+                'dynamic_budget_minimum': (
+                    int(dynamic_minimum) if dynamic_budget_active else None
+                ),
+                'dynamic_budget_target': (
+                    int(dynamic_target) if dynamic_budget_active else None
+                ),
+                'dynamic_budget_maximum': (
+                    int(dynamic_maximum) if dynamic_budget_active else None
+                ),
+                'dynamic_budget_early_stopped': bool(
+                    gumbel_root_states[idx].get('_adaptive_early_stopped', False)
+                    if gumbel_root_states[idx] is not None else False
+                ),
+                'dynamic_budget_stop_reason': (
+                    gumbel_root_states[idx].get('_adaptive_stop_reason', 'budget_exhausted')
+                    if dynamic_budget_feedback_active and gumbel_root_states[idx] is not None
+                    else 'fixed_override'
+                    if budget_overrides[idx] is not None
+                    else 'prior_allocation_complete'
+                    if dynamic_budget_active
+                    else 'disabled'
+                ),
+                'dynamic_budget_q_gap': (
+                    float(gumbel_root_states[idx].get('_adaptive_q_gap', 0.0))
+                    if dynamic_budget_feedback_active
+                    and gumbel_root_states[idx] is not None else None
+                ),
+                'dynamic_budget_score_gap': (
+                    gumbel_root_states[idx].get('_adaptive_score_gap')
+                    if dynamic_budget_feedback_active
+                    and gumbel_root_states[idx] is not None else None
+                ),
+                'dynamic_budget_stable_checkpoints': (
+                    int(gumbel_root_states[idx].get('_adaptive_stable_checkpoints', 0))
+                    if dynamic_budget_feedback_active
+                    and gumbel_root_states[idx] is not None else None
+                ),
+                'dynamic_budget_fresh_floor': (
+                    int(gumbel_root_states[idx].get('_adaptive_fresh_floor', dynamic_minimum))
+                    if dynamic_budget_feedback_active and gumbel_root_states[idx] is not None
+                    else None
+                ),
+                'dynamic_budget_distinct_new_leaf_evaluations': (
+                    sum(
+                        len(edge_leaf_ids)
+                        for edge_leaf_ids in gumbel_root_states[idx].get(
+                            '_adaptive_fresh_leaf_ids_by_edge', ()
+                        )
+                    )
+                    if dynamic_budget_feedback_active and gumbel_root_states[idx] is not None
+                    else None
+                ),
+                'dynamic_budget_actual_fresh_simulations': (
+                    int(fresh_used) if dynamic_budget_active else None
+                ),
+                'dynamic_budget_earned_credit': (
+                    int(self._dynamic_budget_credits.get(native_tree_keys[idx], 0))
+                    if (
+                        dynamic_budget_active
+                        and game_count == 1
+                        and explicit_native_tree_keys[idx]
+                    )
+                    else 0
+                ),
             }
             shortcut = root_shortcuts[idx]
             if shortcut is not None:
@@ -6229,7 +7184,9 @@ class MultiGameBatchMCTS:
             )
             metadata.update(basic_metadata)
             metadata['mcts_algorithm'] = self.mcts_algorithm
-            metadata['dynamic_budget_enabled'] = bool(dynamic_budget_active)
+            metadata['dynamic_budget_enabled'] = bool(
+                dynamic_budget_active and budget_overrides[idx] is None
+            )
             metadata['eval_easy_cut_enabled'] = bool(eval_easy_cut_active)
             metadata['eval_easy_cut_reduced'] = bool(
                 eval_easy_cut_active
@@ -6373,6 +7330,10 @@ class MultiGameBatchMCTS:
                 metadata['gumbel_pass_budgets'] = [
                     int(value)
                     for value in gumbel_state.get('pass_budgets', ())
+                ]
+                metadata['gumbel_pass_considered_actions'] = [
+                    int(value)
+                    for value in gumbel_state.get('pass_considered_actions', ())
                 ]
                 metadata['gumbel_pass_actual_visits'] = [
                     int(value)
@@ -6567,6 +7528,15 @@ class MultiGameBatchMCTS:
         ]
 
     def release_native_tree(self, tree_key) -> None:
+        self._release_native_tree(tree_key, preserve_budget_credit=False)
+
+    def release_native_tree_preserving_budget_credit(self, tree_key) -> None:
+        """Drop a tree after an unsearched move without losing game credit."""
+        self._release_native_tree(tree_key, preserve_budget_credit=True)
+
+    def _release_native_tree(self, tree_key, *, preserve_budget_credit):
+        if not preserve_budget_credit:
+            self._dynamic_budget_credits.pop(tree_key, None)
         forest = self._native_forest
         if forest is not None and forest.active:
             forest.release_tree(tree_key)
@@ -6601,6 +7571,8 @@ class MultiGameBatchMCTS:
         board_histories,
         root_position_counts,
         root_repetition_known,
+        adaptive_stats=None,
+        evaluation_trace=None,
     ):
         """
         Batch expansion + evaluation for leaf nodes across games.
@@ -6621,6 +7593,18 @@ class MultiGameBatchMCTS:
                 unique_entries.append((node, game_indices[idx]))
             else:
                 node_occurrences[node_id].append(idx)
+        if adaptive_stats is not None:
+            seen_root_nodes = set()
+            for node, gi in zip(nodes, game_indices):
+                key = (int(gi), id(node))
+                if key in seen_root_nodes:
+                    stats = adaptive_stats[int(gi)]
+                    if stats is not None:
+                        stats['mcts_duplicate_leaf_selections'] += 1
+                else:
+                    seen_root_nodes.add(key)
+        node_sources = {} if evaluation_trace is not None else None
+        inherited_node_ids = set()
         if profile_timing:
             self._profile_add('batch_expand_dedup_terminal_time', perf_counter() - dedup_t0)
 
@@ -6632,6 +7616,8 @@ class MultiGameBatchMCTS:
         legal_counts = []
         max_legal_count = 0
         for node, gi in unique_entries:
+            if node.raw_value is not None or node.expanded:
+                inherited_node_ids.add(id(node))
             # A promoted root still needs children/visits so callers can choose
             # a move. Reuse exact terminal values only while the node is a
             # simulated descendant.
@@ -6707,6 +7693,22 @@ class MultiGameBatchMCTS:
                     perf_counter() - index_t0,
                 )
         values_by_node_id = {}
+
+        if adaptive_stats is not None:
+            for node, gi in unique_entries:
+                stats = adaptive_stats[int(gi)]
+                if stats is not None and id(node) in inherited_node_ids:
+                    stats['inherited_leaf_evaluations'] += 1
+                    if node_sources is not None:
+                        node_sources[id(node)] = 'inherited'
+            for node, gi in unique_entries:
+                node_id = id(node)
+                if node_id in terminal_values:
+                    stats = adaptive_stats[int(gi)]
+                    if stats is not None:
+                        stats['exact_leaf_evaluations'] += 1
+                    if node_sources is not None:
+                        node_sources[node_id] = 'exact_terminal'
 
         if non_terminal_nodes:
             batch_n = len(non_terminal_nodes)
@@ -6800,6 +7802,7 @@ class MultiGameBatchMCTS:
             if forward_start is not None:
                 forward_start.record()
             model_kwargs = {'apply_log_softmax': False}
+            prediction_provenance = {} if adaptive_stats is not None else None
             if (
                 legal_index_matrix is not None
                 and remote_legal_gather
@@ -6808,7 +7811,11 @@ class MultiGameBatchMCTS:
                 model_kwargs['legal_counts'] = np.asarray(legal_counts, dtype=np.int16)
             with torch.inference_mode():
                 policy_logits_batch, values_batch, used_local_forward_runner = (
-                    self._local_model_forward(board_tensors, model_kwargs)
+                    self._local_model_forward(
+                        board_tensors,
+                        model_kwargs,
+                        provenance=prediction_provenance,
+                    )
                 )
                 if forward_end is not None:
                     forward_end.record()
@@ -6909,6 +7916,35 @@ class MultiGameBatchMCTS:
             self._profile_inc('nn_inference_batch_items', batch_n)
             self._profile_inc('nn_legal_move_items', sum(legal_counts))
             self._profile_add('nn_inference_time', perf_counter() - inference_t0)
+            if adaptive_stats is not None:
+                row_sources = (
+                    prediction_provenance.get('row_sources', ())
+                    if isinstance(prediction_provenance, dict)
+                    else ()
+                )
+                for row_idx, (node, gi) in enumerate(
+                    zip(non_terminal_nodes, non_terminal_game_indices)
+                ):
+                    stats = adaptive_stats[int(gi)]
+                    source = (
+                        str(row_sources[row_idx]).strip().lower()
+                        if row_idx < len(row_sources)
+                        else 'unknown'
+                    )
+                    if source not in {'fresh_nn', 'cache_hit', 'deduplicated'}:
+                        source = 'unknown'
+                    if stats is not None:
+                        if source == 'fresh_nn':
+                            stats['nn_fresh_evaluations'] += 1
+                        elif source == 'cache_hit':
+                            stats['nn_cache_hits'] += 1
+                        elif source == 'deduplicated':
+                            stats['nn_deduplicated_evaluations'] += 1
+                        else:
+                            stats['nn_unknown_rows'] += 1
+                            stats['nn_provenance_complete'] = False
+                    if node_sources is not None:
+                        node_sources[id(node)] = source
             server_batch_size = int(getattr(self.model, 'last_server_batch_size', 0) or 0)
             remote_request_seen = bool(
                 server_batch_size > 0
@@ -7123,4 +8159,6 @@ class MultiGameBatchMCTS:
         if profile_timing:
             self._profile_add('batch_expand_eval_time', perf_counter() - eval_t0)
             self._profile_inc('batch_expand_eval_calls', 1)
+        if node_sources is not None:
+            evaluation_trace['row_sources_by_node'] = node_sources
         return all_values

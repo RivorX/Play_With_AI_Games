@@ -58,6 +58,214 @@ from src.evaluation.elo_rating import (
 from src.evaluation.elo_schedule import AdaptiveEloSchedule, build_stockfish_elo_levels
 
 
+_MCTS_LIGHT_COUNT_FIELDS = (
+    "nn_fresh_evaluations",
+    "nn_cache_hits",
+    "nn_deduplicated_evaluations",
+    "nn_unknown_rows",
+    "mcts_duplicate_leaf_selections",
+    "inherited_leaf_evaluations",
+    "exact_leaf_evaluations",
+    "dynamic_budget_initial_budget",
+    "dynamic_budget_transferred_in",
+    "dynamic_budget_extra_simulations_used",
+    "dynamic_budget_saved_simulations",
+    "dynamic_budget_earned_credit",
+    "dynamic_budget_spent_credit",
+    "dynamic_budget_stable_checkpoints",
+    "dynamic_budget_fresh_floor",
+    "dynamic_budget_distinct_new_leaf_evaluations",
+    "actual_fresh_simulations",
+)
+_MCTS_LIGHT_FLOAT_FIELDS = (
+    "dynamic_budget_uncertainty_score",
+    "dynamic_budget_uncertainty_rank",
+    "dynamic_budget_q_gap",
+    "dynamic_budget_score_gap",
+)
+_MCTS_LIGHT_BATCH_COUNT_FIELDS = (
+    "dynamic_budget_pool_total",
+    "dynamic_budget_pool_used",
+    "dynamic_budget_pool_unused",
+    "dynamic_budget_pool_overrun",
+)
+
+
+def _accumulate_mcts_light_metadata(state: dict, metadata: dict):
+    """Aggregate cheap per-root work counters without enabling diagnostics."""
+    aggregate = state.setdefault("mcts_light_metadata", {
+        "searches": 0,
+        "counts": {},
+        "count_coverage": {},
+        "floats": {},
+        "float_coverage": {},
+        "early_stopped": 0,
+        "early_stop_coverage": 0,
+        "stop_reasons": {},
+        "provenance_complete": None,
+        "provenance_coverage": 0,
+        "batches": 0,
+        "batch_counts": {},
+        "batch_count_coverage": {},
+    })
+    aggregate["searches"] += 1
+    for key in _MCTS_LIGHT_COUNT_FIELDS:
+        value = metadata.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        aggregate["counts"][key] = aggregate["counts"].get(key, 0) + number
+        aggregate["count_coverage"][key] = aggregate["count_coverage"].get(key, 0) + 1
+    row_sources = metadata.get("row_sources")
+    if isinstance(row_sources, (list, tuple)):
+        source_fields = {
+            "fresh_nn": "nn_fresh_evaluations",
+            "cache_hit": "nn_cache_hits",
+            "deduplicated": "nn_deduplicated_evaluations",
+            "unknown": "nn_unknown_rows",
+        }
+        for source, field in source_fields.items():
+            if metadata.get(field) is None:
+                if source == "unknown":
+                    rows = sum(
+                        str(value).strip().lower() not in {"fresh_nn", "cache_hit", "deduplicated"}
+                        for value in row_sources
+                    )
+                else:
+                    rows = sum(str(value).strip().lower() == source for value in row_sources)
+                aggregate["counts"][field] = aggregate["counts"].get(field, 0) + rows
+                aggregate["count_coverage"][field] = aggregate["count_coverage"].get(field, 0) + 1
+    for key in _MCTS_LIGHT_FLOAT_FIELDS:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(number):
+            aggregate["floats"][key] = aggregate["floats"].get(key, 0.0) + number
+            aggregate["float_coverage"][key] = aggregate["float_coverage"].get(key, 0) + 1
+    early = metadata.get("dynamic_budget_early_stopped")
+    if isinstance(early, bool):
+        aggregate["early_stopped"] += int(early)
+        aggregate["early_stop_coverage"] += 1
+    reason = metadata.get("dynamic_budget_stop_reason")
+    if reason is not None:
+        reason = str(reason)
+        aggregate["stop_reasons"][reason] = aggregate["stop_reasons"].get(reason, 0) + 1
+    complete = metadata.get("nn_provenance_complete")
+    if isinstance(complete, bool):
+        aggregate["provenance_coverage"] += 1
+        aggregate["provenance_complete"] = (
+            complete if aggregate["provenance_complete"] is None
+            else aggregate["provenance_complete"] and complete
+        )
+
+
+def _accumulate_mcts_batch_metadata(state: dict, metadata: dict):
+    """Record batch-scoped ledger values once, not once per returned root."""
+    aggregate = state.setdefault("mcts_light_metadata", {
+        "searches": 0, "counts": {}, "count_coverage": {}, "floats": {},
+        "float_coverage": {}, "early_stopped": 0, "early_stop_coverage": 0,
+        "stop_reasons": {}, "provenance_complete": None, "provenance_coverage": 0,
+        "batches": 0, "batch_counts": {}, "batch_count_coverage": {},
+    })
+    aggregate["batches"] += 1
+    for key in _MCTS_LIGHT_BATCH_COUNT_FIELDS:
+        value = metadata.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        aggregate["batch_counts"][key] = aggregate["batch_counts"].get(key, 0) + number
+        aggregate["batch_count_coverage"][key] = aggregate["batch_count_coverage"].get(key, 0) + 1
+
+
+def _merge_mcts_light_metadata(total: dict, game_metadata: dict | None):
+    if not isinstance(game_metadata, dict):
+        return
+    total["searches"] = total.get("searches", 0) + int(game_metadata.get("searches", 0) or 0)
+    total.setdefault("counts", {})
+    total.setdefault("count_coverage", {})
+    total.setdefault("floats", {})
+    total.setdefault("float_coverage", {})
+    for key, value in (game_metadata.get("counts") or {}).items():
+        total["counts"][key] = total["counts"].get(key, 0) + int(value)
+    for key, value in (game_metadata.get("count_coverage") or {}).items():
+        total["count_coverage"][key] = total["count_coverage"].get(key, 0) + int(value)
+    for key, value in (game_metadata.get("floats") or {}).items():
+        total["floats"][key] = total["floats"].get(key, 0.0) + float(value)
+    for key, value in (game_metadata.get("float_coverage") or {}).items():
+        total["float_coverage"][key] = total["float_coverage"].get(key, 0) + int(value)
+    total["batches"] = total.get("batches", 0) + int(game_metadata.get("batches", 0) or 0)
+    total.setdefault("batch_counts", {})
+    total.setdefault("batch_count_coverage", {})
+    for key, value in (game_metadata.get("batch_counts") or {}).items():
+        total["batch_counts"][key] = total["batch_counts"].get(key, 0) + int(value)
+    for key, value in (game_metadata.get("batch_count_coverage") or {}).items():
+        total["batch_count_coverage"][key] = total["batch_count_coverage"].get(key, 0) + int(value)
+    total["early_stopped"] = total.get("early_stopped", 0) + int(game_metadata.get("early_stopped", 0) or 0)
+    total["early_stop_coverage"] = total.get("early_stop_coverage", 0) + int(game_metadata.get("early_stop_coverage", 0) or 0)
+    total["provenance_coverage"] = total.get("provenance_coverage", 0) + int(game_metadata.get("provenance_coverage", 0) or 0)
+    if game_metadata.get("provenance_complete") is False:
+        total["provenance_complete"] = False
+    elif game_metadata.get("provenance_complete") is True and total.get("provenance_complete") is None:
+        total["provenance_complete"] = True
+    for key, value in (game_metadata.get("stop_reasons") or {}).items():
+        reasons = total.setdefault("stop_reasons", {})
+        reasons[key] = reasons.get(key, 0) + int(value)
+
+
+def _finalize_mcts_light_metadata(aggregate: dict, search_count: int) -> dict:
+    """Return exact totals only when every root reported that field."""
+    output = {"searches": int(search_count)}
+    counts = aggregate.get("counts", {})
+    coverage = aggregate.get("count_coverage", {})
+    for key in _MCTS_LIGHT_COUNT_FIELDS:
+        output[key] = counts.get(key) if coverage.get(key, 0) == search_count and search_count else None
+    floats = aggregate.get("floats", {})
+    float_coverage = aggregate.get("float_coverage", {})
+    for key in _MCTS_LIGHT_FLOAT_FIELDS:
+        output[key] = (
+            floats[key] / search_count
+            if float_coverage.get(key, 0) == search_count and search_count
+            else None
+        )
+    output["dynamic_budget_early_stopped"] = (
+        aggregate.get("early_stopped", 0)
+        if aggregate.get("early_stop_coverage", 0) == search_count and search_count
+        else None
+    )
+    output["dynamic_budget_stop_reasons"] = (
+        dict(aggregate.get("stop_reasons", {}))
+        if len(aggregate.get("stop_reasons", {})) > 0 else None
+    )
+    output["nn_provenance_complete"] = (
+        aggregate.get("provenance_complete")
+        if aggregate.get("provenance_coverage", 0) == search_count and search_count
+        else None
+    )
+    batch_counts = aggregate.get("batch_counts", {})
+    batch_coverage = aggregate.get("batch_count_coverage", {})
+    covered_batches = [batch_coverage.get(key, 0) for key in _MCTS_LIGHT_BATCH_COUNT_FIELDS]
+    ledger_batches = min(covered_batches) if covered_batches and min(covered_batches) > 0 else None
+    output["dynamic_budget_pool_ledger_batches"] = ledger_batches
+    output["mcts_search_batch_count"] = int(aggregate.get("batches", 0) or 0)
+    output["dynamic_budget_pool_scope"] = "per_search_batch_sum"
+    for key in _MCTS_LIGHT_BATCH_COUNT_FIELDS:
+        output[key] = (
+            batch_counts.get(key)
+            if ledger_batches is not None and batch_coverage.get(key, 0) == ledger_batches else None
+        )
+    return output
+
+
 def _native_board(board):
     """Explicit Stockfish/python-chess -> native model boundary."""
     if isinstance(board, native_chess.Board):
@@ -76,19 +284,31 @@ def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict
     elo_mcts_config = dict(config or {})
     rl_config = dict(elo_mcts_config.get('reinforcement_learning', {}) or {})
     elo_config = dict(elo_config or {})
+    budget_mode = str(elo_config.get('mcts_budget_mode', 'simulations')).strip().lower()
+    if budget_mode not in {'simulations', 'time'}:
+        budget_mode = 'simulations'
     rl_config.pop('mcts_budget_mode', None)
     rl_config.pop('mcts_move_time_seconds', None)
     if 'mcts_gumbel_root_schedule' in elo_config:
         rl_config['mcts_gumbel_root_schedule'] = elo_config[
             'mcts_gumbel_root_schedule'
         ]
-    rl_config['mcts_dynamic_budget_enabled'] = False
+    # Standalone manual evaluation may opt into the configured per-root
+    # adaptive budget. Training/final Elo builders omit this key and therefore
+    # retain strict fixed-simulation comparisons by default.
+    dynamic_budget_enabled = bool(
+        elo_config.get('mcts_dynamic_budget_enabled', False)
+    ) and budget_mode == 'simulations'
+    rl_config['mcts_dynamic_budget_enabled'] = dynamic_budget_enabled
+    rl_config['mcts_dynamic_budget_strategy'] = str(
+        elo_config.get(
+            'mcts_dynamic_budget_strategy',
+            rl_config.get('mcts_dynamic_budget_strategy', 'feedback'),
+        ) or 'feedback'
+    ).strip().lower()
     rl_config['eval_mcts_dynamic_budget_enabled'] = False
     elo_mcts_config['reinforcement_learning'] = rl_config
     inference_config = dict(elo_mcts_config.get('inference', {}) or {})
-    budget_mode = str(elo_config.get('mcts_budget_mode', 'simulations')).strip().lower()
-    if budget_mode not in {'simulations', 'time'}:
-        budget_mode = 'simulations'
     inference_config['budget_mode'] = budget_mode
     if budget_mode == 'time':
         inference_config['move_time_seconds'] = float(
@@ -659,6 +879,16 @@ class _BatchedModelPlayer:
             budget_mode=self.mcts_budget_mode,
             time_limit_seconds=self.mcts_time_limit_seconds,
         )
+        if states and search_results:
+            batch_metadata = next(
+                (
+                    getattr(item, "metadata", {}) or {}
+                    for item in search_results
+                    if isinstance(getattr(item, "metadata", None), dict)
+                ),
+                {},
+            )
+            _accumulate_mcts_batch_metadata(states[0], batch_metadata)
 
         moves: list[chess.Move | None] = []
         raw_fallback_indices: list[int] = []
@@ -672,6 +902,7 @@ class _BatchedModelPlayer:
                     state.get("mcts_search_calls", 0) or 0
                 ) + 1
                 metadata = getattr(search_result, "metadata", {}) or {}
+                _accumulate_mcts_light_metadata(state, metadata)
                 fresh_simulations = metadata.get(
                     "actual_fresh_simulations",
                     metadata.get("fresh_simulations_used", 0),
@@ -1014,6 +1245,7 @@ class EloEstimator:
             "mcts_search_calls": 0,
             "mcts_fresh_simulations": 0,
             "mcts_avg_simulations_per_move": 0.0,
+            "mcts_light_metadata": {},
             "central_inference_requests": 0,
             "central_inference_server_batch_items": 0,
             "central_inference_remote_wait_time": 0.0,
@@ -1034,6 +1266,9 @@ class EloEstimator:
             merged["mcts_nn_inference_batch_items"] += int(stats.get("mcts_nn_inference_batch_items", 0) or 0)
             merged["mcts_search_calls"] += int(stats.get("mcts_search_calls", 0) or 0)
             merged["mcts_fresh_simulations"] += int(stats.get("mcts_fresh_simulations", 0) or 0)
+            _merge_mcts_light_metadata(
+                merged["mcts_light_metadata"], stats.get("mcts_light_metadata")
+            )
             merged["central_inference_requests"] += int(stats.get("central_inference_requests", 0) or 0)
             merged["central_inference_server_batch_items"] += int(stats.get("central_inference_server_batch_items", 0) or 0)
             merged["central_inference_remote_wait_time"] += float(stats.get("central_inference_remote_wait_time", 0.0) or 0.0)
@@ -1393,6 +1628,11 @@ class EloEstimator:
             and str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower()
             == "time"
         )
+        adaptive_mcts = bool(
+            use_mcts
+            and not timed_mcts
+            and self.elo_config.get("mcts_dynamic_budget_enabled", False)
+        )
 
         if not tasks:
             return all_opponent_elos, all_scores, all_game_indices, interrupted_by_user
@@ -1412,7 +1652,7 @@ class EloEstimator:
                 interrupted_by_user = True
                 self._request_cancel()
                 print("\nCtrl+C detected during Elo estimation. Cancelling remaining games...")
-        elif batch_model_moves and (workers > 1 or timed_mcts):
+        elif batch_model_moves and (workers > 1 or timed_mcts or adaptive_mcts):
             try:
                 all_opponent_elos, all_scores, all_game_indices = self._estimate_batched_games(
                     tasks=tasks,
@@ -1750,8 +1990,17 @@ class EloEstimator:
             # Timed roots share one native batched search/deadline per model
             # turn. This also lets the result report per-root actual work.
             batch_model_moves = True
+        elif use_mcts and self.elo_config.get("mcts_dynamic_budget_enabled", False):
+            # Adaptive fixed-target searches need the batched player even for
+            # one game worker so the search session and actual work counters
+            # are retained for every move.
+            batch_model_moves = True
         central_inference_enabled = bool(
             use_mcts
+            and (
+                not self.elo_config.get("mcts_dynamic_budget_enabled", False)
+                or str(self.elo_config.get("mcts_dynamic_budget_strategy", "feedback")) == "feedback"
+            )
             and workers > 1
             and self.device.type == "cuda"
             and self.elo_config.get("eval_elo_central_inference_enabled", False)
@@ -1782,7 +2031,13 @@ class EloEstimator:
                     f"{float(self.elo_config.get('mcts_move_time_seconds', 0.2)):.3g}s per move"
                 )
             else:
-                print(f"  Info: MCTS budget: {int(simulations)} simulations per move")
+                if self.elo_config.get("mcts_dynamic_budget_enabled", False):
+                    print(
+                        "  Info: MCTS adaptive per-root budget: "
+                        f"target average {int(simulations)} simulations per move"
+                    )
+                else:
+                    print(f"  Info: MCTS budget: {int(simulations)} simulations per move")
         if bool(self.elo_config.get("elo_verbose_adaptive", False)):
             print(f"  Info: Elo candidate levels: {levels}")
         if bool(self.elo_config.get("paired_openings_enabled", True)):
@@ -2114,6 +2369,11 @@ class EloEstimator:
             if mcts_stats_available and mcts_search_calls > 0
             else 0.0 if mcts_stats_available else None
         )
+        dynamic_budget_enabled = bool(
+            use_mcts
+            and str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower() == "simulations"
+            and self.elo_config.get("mcts_dynamic_budget_enabled", False)
+        )
 
         result = {
             "estimated_elo": round(estimated_elo) if estimated_elo is not None else None,
@@ -2137,12 +2397,17 @@ class EloEstimator:
             ),
             "mcts_search_calls": mcts_search_calls if use_mcts else None,
             "mcts_fresh_simulations": mcts_fresh_simulations if use_mcts else None,
+            "mcts_light_metadata": (
+                mcts_stats.get("mcts_light_metadata") if use_mcts else None
+            ),
             "mcts_avg_simulations_per_move": (
                 mcts_avg_simulations_per_move if use_mcts else None
             ),
             "mcts_root_schedule": (
                 "revisiting"
-                if use_mcts and budget_mode == "time"
+                if use_mcts and (
+                    budget_mode == "time" or dynamic_budget_enabled
+                )
                 else str(self.elo_config.get("mcts_gumbel_root_schedule", "standard"))
                 if use_mcts
                 else None
@@ -2169,7 +2434,41 @@ class EloEstimator:
             "calibration_warning": bool(fit_diagnostics.get("calibration_warning", False)),
             "rating_method": "nearest_50pct_stockfish_level",
             "pair_aware_standard_error": bool(self.elo_config.get("paired_openings_enabled", True)),
-            "mcts_simulation_budget_strict": bool(use_mcts),
+            "mcts_simulation_budget_strict": bool(
+                use_mcts
+                and str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower() != "time"
+                and not dynamic_budget_enabled
+            ),
+            "mcts_dynamic_budget_enabled": dynamic_budget_enabled,
+            "mcts_dynamic_budget_protocol": (
+                (
+                    "search-feedback-v2"
+                    if str(self.elo_config.get("mcts_dynamic_budget_strategy", "feedback")) == "feedback"
+                    else "prior-v1"
+                )
+                if dynamic_budget_enabled else None
+            ),
+            "mcts_dynamic_budget_strategy": (
+                str(self.elo_config.get("mcts_dynamic_budget_strategy", "feedback"))
+                if dynamic_budget_enabled else None
+            ),
+            "mcts_dynamic_budget_inference": (
+                ("central" if central_inference_enabled else "local")
+                if dynamic_budget_enabled else None
+            ),
+            "mcts_dynamic_budget_target_simulations": (
+                int(simulations) if dynamic_budget_enabled else None
+            ),
+            "mcts_dynamic_budget_min": (
+                int(self.elo_config.get("mcts_dynamic_budget_min", 64))
+                if dynamic_budget_enabled
+                else None
+            ),
+            "mcts_dynamic_budget_max_multiplier": (
+                float(self.elo_config.get("mcts_dynamic_budget_max_multiplier", 5.0 / 3.0))
+                if dynamic_budget_enabled
+                else None
+            ),
             "local_rating_level": local_level,
             "local_rating_games": local_games,
             "local_rating_clusters": schedule.independent_cluster_count(),
@@ -2307,6 +2606,7 @@ class EloEstimator:
         stockfish_move_time_s = 0.0
         mcts_search_calls = 0
         mcts_fresh_simulations = 0
+        mcts_light_metadata = {}
 
         def refill_pending_tasks(group_worker_count: int | None = None) -> bool:
             nonlocal dynamic_tasks_exhausted
@@ -2336,6 +2636,9 @@ class EloEstimator:
                     )
                     mcts_fresh_simulations += int(
                         game_state.get("mcts_fresh_simulations", 0) or 0
+                    )
+                    _merge_mcts_light_metadata(
+                        mcts_light_metadata, game_state.get("mcts_light_metadata")
                     )
             batched_player.close_state(game["state"])
             worker_slot = int(game.get("worker_slot", -1))
@@ -2523,6 +2826,9 @@ class EloEstimator:
             if use_mcts:
                 stats_out["mcts_search_calls"] = int(mcts_search_calls)
                 stats_out["mcts_fresh_simulations"] = int(mcts_fresh_simulations)
+                stats_out["mcts_light_metadata"] = _finalize_mcts_light_metadata(
+                    mcts_light_metadata, mcts_search_calls
+                )
                 stats_out["mcts_avg_simulations_per_move"] = (
                     float(mcts_fresh_simulations) / float(mcts_search_calls)
                     if mcts_search_calls > 0
@@ -2565,6 +2871,9 @@ class EloEstimator:
                     {
                         "mcts_search_calls": int(mcts_search_calls),
                         "mcts_fresh_simulations": int(mcts_fresh_simulations),
+                        "mcts_light_metadata": _finalize_mcts_light_metadata(
+                            mcts_light_metadata, mcts_search_calls
+                        ),
                         "mcts_avg_simulations_per_move": (
                             float(mcts_fresh_simulations) / float(mcts_search_calls)
                             if mcts_search_calls > 0

@@ -52,12 +52,17 @@ def mode_label(
     *,
     budget_mode: str = "simulations",
     time_limit_seconds: float | None = None,
+    adaptive_budget: bool = False,
+    adaptive_strategy: str = "prior",
 ) -> str:
     if use_mcts:
         if str(budget_mode or "simulations").strip().lower() == "time":
             seconds = safe_float(time_limit_seconds)
             return f"MCTS ({seconds:g}s/move)" if seconds is not None else "MCTS (timed)"
         sims = safe_int(simulations) or 0
+        if adaptive_budget and sims > 0:
+            strategy = str(adaptive_strategy or "prior").strip().lower()
+            return f"MCTS {strategy} (~{sims} avg sims)"
         return f"MCTS ({sims} sims)" if sims > 0 else "MCTS"
     return "Raw NN"
 
@@ -75,7 +80,17 @@ def elo_protocol_settings(
     paired_openings = bool(runtime_cfg.get("paired_openings_enabled", True))
     budget_mode = str(budget_mode or "simulations").strip().lower()
     timed = bool(use_mcts and budget_mode == "time")
-    return {
+    dynamic_budget = bool(
+        use_mcts
+        and not timed
+        and runtime_cfg.get("mcts_dynamic_budget_enabled", False)
+    )
+    dynamic_strategy = str(
+        runtime_cfg.get("mcts_dynamic_budget_strategy", "feedback") or "feedback"
+    ).strip().lower()
+    if dynamic_strategy not in {"prior", "feedback"}:
+        raise ValueError("mcts_dynamic_budget_strategy must be 'prior' or 'feedback'")
+    settings = {
         "use_mcts": bool(use_mcts),
         "budget_mode": budget_mode if use_mcts else "raw_nn",
         "simulations": max(0, int(simulations or 0)) if use_mcts and not timed else 0,
@@ -98,13 +113,13 @@ def elo_protocol_settings(
         "opening_suite_positions": len(_EVAL_OPENING_LINES) if paired_openings else 0,
         "claim_draw": True,
         "rating_method": "nearest_50pct_stockfish_level",
-        # MCTS Elo is comparable only at an exact per-root simulation budget.
-        # The estimator disables both regular redistribution and eval easy cuts.
-        "mcts_simulation_budget_strict": bool(use_mcts and not timed),
+        # Strict MCTS Elo requires an exact per-root budget. Adaptive budgets
+        # are kept in a separately versioned protocol below.
+        "mcts_simulation_budget_strict": bool(use_mcts and not timed and not dynamic_budget),
         **(
             {
                 "mcts_root_schedule": "revisiting"
-                if timed
+                if timed or dynamic_budget
                 else str(runtime_cfg.get("mcts_gumbel_root_schedule", "standard"))
             }
             if use_mcts
@@ -118,6 +133,37 @@ def elo_protocol_settings(
         ),
         **(_timed_search_protocol(runtime_cfg) if timed else {}),
     }
+    if dynamic_budget:
+        settings.update({
+            "mcts_dynamic_budget_enabled": True,
+            "mcts_dynamic_budget_strategy": dynamic_strategy,
+            "mcts_dynamic_budget_protocol": (
+                "search-feedback-v2" if dynamic_strategy == "feedback" else "prior-v1"
+            ),
+            "mcts_dynamic_budget_target_simulations": max(0, int(simulations or 0)),
+            "mcts_dynamic_budget_min": max(
+                1, int(runtime_cfg.get("mcts_dynamic_budget_min", 64))
+            ),
+            "mcts_dynamic_budget_max_multiplier": float(
+                runtime_cfg.get("mcts_dynamic_budget_max_multiplier", 5.0 / 3.0)
+            ),
+        })
+        if dynamic_strategy == "feedback":
+            inference_path = str(
+                runtime_cfg.get("mcts_dynamic_budget_inference", "") or ""
+            ).strip().lower()
+            if inference_path not in {"local", "central"}:
+                inference_path = (
+                    "central" if runtime_cfg.get("eval_elo_central_inference_enabled", False)
+                    and int(runtime_cfg.get("workers", 1) or 1) > 1 else "local"
+                )
+            settings.update({
+                "mcts_dynamic_budget_inference": inference_path,
+                "mcts_dynamic_budget_pool_scope": (
+                    "central_client_group" if inference_path == "central" else "per_search_batch"
+                ),
+            })
+    return settings
 
 
 def _timed_search_protocol(runtime_cfg: dict) -> dict:
@@ -268,7 +314,66 @@ def checkpoint_elo_seed(
             )
         return _checkpoint_simulation_seed(checkpoint, checkpoint_path, simulations, approximate=True)
 
+    if bool((runtime_cfg or {}).get("mcts_dynamic_budget_enabled", False)):
+        adaptive_entries = _adaptive_simulation_entries(checkpoint)
+        requested_sims = max(0, int(simulations or 0))
+        same_target = [item for item in adaptive_entries if item[0] == requested_sims]
+        for entry_sims, elo, settings in same_target:
+            if elo_protocol_matches_settings(
+                settings,
+                runtime_cfg or {},
+                use_mcts=True,
+                simulations=entry_sims,
+                budget_mode="simulations",
+            ):
+                return elo, (
+                    f"{checkpoint_path.name} previous adaptive MCTS Elo "
+                    f"@{entry_sims} target average (matching protocol)"
+                )
+        compatible = []
+        for entry_sims, elo, settings in adaptive_entries:
+            candidate_runtime = dict(runtime_cfg or {})
+            candidate_runtime["mcts_dynamic_budget_enabled"] = True
+            if elo_protocol_matches_settings(
+                settings,
+                candidate_runtime,
+                use_mcts=True,
+                simulations=entry_sims,
+                budget_mode="simulations",
+            ):
+                compatible.append((entry_sims, elo))
+        if compatible:
+            entry_sims, elo = min(
+                compatible,
+                key=lambda item: abs(math.log2((item[0] + 1.0) / (requested_sims + 1.0))),
+            )
+            return elo, (
+                f"{checkpoint_path.name} approximate adaptive MCTS scheduling prior "
+                f"@{entry_sims} target average (same protocol)"
+            )
+        # Fixed-budget results are useful only to place the initial ladder;
+        # adaptive ratings from a different strategy are not interchangeable.
+        return _checkpoint_simulation_seed(checkpoint, checkpoint_path, simulations, approximate=True)
+
     return _checkpoint_simulation_seed(checkpoint, checkpoint_path, simulations)
+
+
+def _adaptive_simulation_entries(checkpoint):
+    raw_entries = checkpoint.get("estimated_elo_mcts_adaptive_by_simulations")
+    candidates = []
+    if not isinstance(raw_entries, dict):
+        return candidates
+    for raw_sims, raw_entry in raw_entries.items():
+        entry = raw_entry if isinstance(raw_entry, dict) else {}
+        sims = safe_int(raw_sims)
+        if sims is None:
+            sims = safe_int(entry.get("simulations"))
+        elo = safe_float(entry.get("elo")) if entry else safe_float(raw_entry)
+        if sims is None or elo is None or not math.isfinite(elo):
+            continue
+        settings = entry.get("settings") if isinstance(entry.get("settings"), dict) else None
+        candidates.append((max(0, int(sims)), float(elo), settings))
+    return candidates
 
 
 def _checkpoint_simulation_seed(checkpoint, checkpoint_path, simulations, *, approximate=False):
@@ -551,6 +656,10 @@ def run_elo_check(model, config: dict, device, elo_config: dict, *, stop_event=N
     for key, fallback in (
         ("mcts_budget_mode", "simulations"),
         ("mcts_gumbel_root_schedule", configured_schedule),
+        ("mcts_dynamic_budget_strategy", rl_cfg.get(
+            "mcts_dynamic_budget_strategy",
+            search_cfg.get("dynamic_budget_strategy", "feedback"),
+        )),
     ):
         resolved.setdefault(key, fallback)
     if str(resolved.get("mcts_budget_mode", "simulations")).strip().lower() == "time":
@@ -601,9 +710,15 @@ def persist_estimated_elo(
     if time_limit_seconds is None:
         time_limit_seconds = (elo_result or {}).get("mcts_move_time_seconds")
     timed_mcts = bool(use_mcts and str(budget_mode).strip().lower() == "time")
+    adaptive_mcts = bool(
+        use_mcts
+        and not timed_mcts
+        and isinstance(elo_result, dict)
+        and elo_result.get("mcts_dynamic_budget_enabled", False)
+    )
     existing_key = (
         "estimated_elo_nn" if not use_mcts else
-        "estimated_elo_mcts" if not timed_mcts else
+        "estimated_elo_mcts" if not timed_mcts and not adaptive_mcts else
         None
     )
     existing_elo = safe_float(checkpoint.get(existing_key)) if existing_key else None
@@ -624,6 +739,8 @@ def persist_estimated_elo(
         label = (
             f"MCTS Elo @{float(time_limit_seconds):g}s/move"
             if timed_mcts and time_limit_seconds is not None
+            else f"Adaptive MCTS Elo (~{int(simulations)} target avg sims)"
+            if adaptive_mcts
             else "MCTS Elo" if use_mcts else "NN Elo"
         )
         if existing_elo is not None:

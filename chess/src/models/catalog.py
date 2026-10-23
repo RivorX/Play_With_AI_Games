@@ -90,6 +90,43 @@ def _normalize_mcts_elo_by_sims(raw_value):
     return normalized
 
 
+def _normalize_mcts_elo_adaptive_by_sims(raw_value):
+    """Keep separate adaptive protocol results at the same target budget."""
+    if not isinstance(raw_value, dict):
+        return {}
+    normalized = {}
+    for raw_key, item in raw_value.items():
+        item_dict = item if isinstance(item, dict) else {}
+        sims = _safe_int(item_dict.get("simulations", raw_key))
+        elo = _safe_float(
+            item_dict.get("elo", item_dict.get("estimated_elo"))
+            if item_dict else item
+        )
+        if sims is None or elo is None:
+            continue
+        settings = item_dict.get("settings") if isinstance(item_dict.get("settings"), dict) else {}
+        protocol = str(settings.get("mcts_dynamic_budget_protocol", "legacy"))
+        key = f"{int(sims)}:{protocol}"
+        entry = {
+            "elo": float(elo),
+            "simulations": int(sims),
+            "timestamp": item_dict.get("timestamp"),
+            "settings": dict(settings),
+        }
+        if item_dict.get("source") is not None:
+            entry["source"] = str(item_dict["source"])
+        se = _safe_float(item_dict.get("se"))
+        if se is not None:
+            entry["se"] = float(se)
+        ci95 = item_dict.get("ci95")
+        if isinstance(ci95, (list, tuple)) and len(ci95) == 2:
+            low, high = _safe_float(ci95[0]), _safe_float(ci95[1])
+            if low is not None and high is not None:
+                entry["ci95"] = [low, high]
+        normalized[key] = entry
+    return normalized
+
+
 def _normalize_mcts_elo_by_time(raw_value):
     if not isinstance(raw_value, dict):
         return {}
@@ -339,6 +376,12 @@ def persist_checkpoint_elo_metadata(
 
     mode = "mcts" if bool(use_mcts) else "nn"
     timed_mcts = bool(mode == "mcts" and str(budget_mode).strip().lower() == "time")
+    adaptive_mcts = bool(
+        mode == "mcts"
+        and not timed_mcts
+        and isinstance(elo_result, dict)
+        and elo_result.get("mcts_dynamic_budget_enabled", False)
+    )
     if timed_mcts:
         try:
             time_limit_seconds = float(time_limit_seconds)
@@ -390,6 +433,14 @@ def persist_checkpoint_elo_metadata(
             "mcts_search_calls",
             "mcts_fresh_simulations",
             "mcts_avg_simulations_per_move",
+            "mcts_dynamic_budget_enabled",
+            "mcts_dynamic_budget_strategy",
+            "mcts_dynamic_budget_protocol",
+            "mcts_dynamic_budget_inference",
+            "mcts_dynamic_budget_target_simulations",
+            "mcts_dynamic_budget_min",
+            "mcts_dynamic_budget_max_multiplier",
+            "mcts_light_metadata",
         ):
             if elo_result.get(key) is not None:
                 settings[key] = elo_result.get(key)
@@ -398,7 +449,7 @@ def persist_checkpoint_elo_metadata(
     ci_low = _safe_float(elo_ci95[0]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
     ci_high = _safe_float(elo_ci95[1]) if isinstance(elo_ci95, (list, tuple)) and len(elo_ci95) == 2 else None
 
-    if not timed_mcts:
+    if not timed_mcts and not adaptive_mcts:
         checkpoint[mode_prefix] = float(elo_value)
         checkpoint[f"last_{mode_prefix}"] = float(elo_value)
         checkpoint[f"{mode_prefix}_timestamp"] = now
@@ -426,6 +477,25 @@ def persist_checkpoint_elo_metadata(
             time_entry["ci95"] = [float(ci_low), float(ci_high)]
         by_time[budget_key] = time_entry
         checkpoint["estimated_elo_mcts_by_time"] = by_time
+    elif mode == "mcts" and adaptive_mcts:
+        budget_key = str(max(0, int(simulations)))
+        by_adaptive_sims = _normalize_mcts_elo_adaptive_by_sims(
+            checkpoint.get("estimated_elo_mcts_adaptive_by_simulations")
+        )
+        adaptive_entry = {
+            "elo": float(elo_value),
+            "simulations": int(simulations),
+            "timestamp": now,
+            "source": str(source),
+            "settings": settings,
+        }
+        if elo_std_error is not None:
+            adaptive_entry["se"] = float(elo_std_error)
+        if ci_low is not None and ci_high is not None:
+            adaptive_entry["ci95"] = [float(ci_low), float(ci_high)]
+        protocol = str(settings.get("mcts_dynamic_budget_protocol", "legacy")) if isinstance(settings, dict) else "legacy"
+        by_adaptive_sims[f"{int(simulations)}:{protocol}"] = adaptive_entry
+        checkpoint["estimated_elo_mcts_adaptive_by_simulations"] = by_adaptive_sims
     elif mode == "mcts":
         checkpoint["estimated_elo_mcts_simulations"] = int(simulations)
         by_sims = _normalize_mcts_elo_by_sims(checkpoint.get("estimated_elo_mcts_by_simulations"))
@@ -447,7 +517,7 @@ def persist_checkpoint_elo_metadata(
 
     epoch_raw = checkpoint.get("epoch")
     epoch_idx = _safe_int(epoch_raw)
-    if epoch_idx is not None and not timed_mcts:
+    if epoch_idx is not None and not timed_mcts and not adaptive_mcts:
         checkpoint[f"{mode_prefix}_epoch"] = epoch_idx + 1
     mode_epoch = _safe_int(checkpoint.get(f"{mode_prefix}_epoch"))
 
@@ -463,7 +533,7 @@ def persist_checkpoint_elo_metadata(
             timestamp=now,
             settings=settings,
         )
-    elif not timed_mcts:
+    elif not timed_mcts and not adaptive_mcts:
         _sync_legacy_elo_from_nn(checkpoint)
 
     try:
@@ -584,6 +654,9 @@ def load_checkpoint_metadata(checkpoint_path, base_dir=None):
     entry["elo_mcts_simulations"] = _safe_int(checkpoint.get("estimated_elo_mcts_simulations"))
     entry["elo_mcts_by_simulations"] = _normalize_mcts_elo_by_sims(
         checkpoint.get("estimated_elo_mcts_by_simulations")
+    )
+    entry["elo_mcts_adaptive_by_simulations"] = _normalize_mcts_elo_adaptive_by_sims(
+        checkpoint.get("estimated_elo_mcts_adaptive_by_simulations")
     )
     entry["elo_mcts_by_time"] = _normalize_mcts_elo_by_time(
         checkpoint.get("estimated_elo_mcts_by_time")

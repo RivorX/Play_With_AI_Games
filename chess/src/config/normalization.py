@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import math
+from numbers import Real
 
 
 def _with_defaults(defaults, values):
@@ -321,6 +322,7 @@ _RL_DEFAULTS = {
     'max_batch_games_per_worker': 48,
     'self_play_randomize_learner_color': True, 'self_play_store_frozen_best_positions': False,
     'mcts_algorithm': 'gumbel',
+    'mcts_dynamic_budget_strategy': 'feedback',
     'mcts_gumbel_root_schedule': 'standard',
     'mcts_gumbel_reuse_q_scale': 'fresh',
     'mcts_gumbel_c_scale': 0.10, 'mcts_gumbel_q_range_floor': 0.25,
@@ -453,6 +455,9 @@ def normalize_rl_config(config):
     if not has_grouped_rl:
         rl_cfg.setdefault('mcts_algorithm', 'gumbel')
         _validate_mcts_algorithm(rl_cfg['mcts_algorithm'])
+        rl_cfg.setdefault('mcts_dynamic_budget_strategy', 'feedback')
+        _validate_dynamic_budget_strategy(rl_cfg['mcts_dynamic_budget_strategy'])
+        _validate_dynamic_budget_config(rl_cfg)
         rl_cfg.setdefault('syzygy_auto_download_enabled', False)
         rl_cfg.pop('mcts_budget_mode', None)
         rl_cfg.pop('mcts_move_time_seconds', None)
@@ -489,6 +494,8 @@ def normalize_rl_config(config):
 
     normalized['mcts_batch_size'] = int(normalized.get('mcts_simulations', 192))
     _validate_mcts_algorithm(normalized['mcts_algorithm'])
+    _validate_dynamic_budget_strategy(normalized['mcts_dynamic_budget_strategy'])
+    _validate_dynamic_budget_config(normalized)
     _validate_gumbel_root_schedule(normalized['mcts_gumbel_root_schedule'])
     _validate_local_cuda_graph_forward(normalized['mcts_local_cuda_graph_forward'])
     _validate_gumbel_reuse_q_scale(normalized['mcts_gumbel_reuse_q_scale'])
@@ -507,6 +514,50 @@ def _validate_local_cuda_graph_forward(value):
         raise ValueError(
             'reinforcement_learning.search.local_cuda_graph_forward must be '
             f'null, false, or true; got {value!r}'
+        )
+
+
+def _validate_dynamic_budget_config(rl_cfg):
+    """Validate the public per-root adaptive simulation-budget bounds."""
+    enabled_key = 'mcts_dynamic_budget_enabled'
+    if enabled_key in rl_cfg and type(rl_cfg[enabled_key]) is not bool:
+        raise ValueError(
+            'reinforcement_learning.search.dynamic_budget_enabled must be true or false'
+        )
+
+    minimum_key = 'mcts_dynamic_budget_min'
+    if minimum_key in rl_cfg:
+        minimum = rl_cfg[minimum_key]
+        if type(minimum) is not int or minimum < 16:
+            raise ValueError(
+                'reinforcement_learning.search.dynamic_budget_min must be an '
+                'integer of at least 16'
+            )
+
+    multiplier_key = 'mcts_dynamic_budget_max_multiplier'
+    if multiplier_key in rl_cfg:
+        multiplier = rl_cfg[multiplier_key]
+        try:
+            multiplier_value = float(multiplier)
+        except (TypeError, ValueError, OverflowError):
+            multiplier_value = math.nan
+        if (
+            isinstance(multiplier, bool)
+            or not isinstance(multiplier, Real)
+            or not math.isfinite(multiplier_value)
+            or multiplier_value < 1.0
+        ):
+            raise ValueError(
+                'reinforcement_learning.search.dynamic_budget_max_multiplier '
+                'must be a finite number greater than or equal to 1'
+            )
+
+
+def _validate_dynamic_budget_strategy(value):
+    if not isinstance(value, str) or value not in {'prior', 'feedback'}:
+        raise ValueError(
+            'reinforcement_learning.search.dynamic_budget_strategy must be '
+            f"'prior' or 'feedback'; got {value!r}"
         )
 
 

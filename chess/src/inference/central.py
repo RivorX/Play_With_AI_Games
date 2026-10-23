@@ -14,7 +14,11 @@ import numpy as np
 import torch
 
 from src.inference.fused_output import packed_output_views, packed_output_width_bytes
-from src.inference.prediction import predict_raw
+from src.inference.prediction import (
+    _PREDICTION_PROVENANCE_SCHEMA_VERSION,
+    _prediction_provenance_for_sources,
+    predict_raw,
+)
 from src.inference.shared_memory import (
     SharedInferenceGenerationPublisher,
     read_shared_evaluation_generation,
@@ -288,6 +292,7 @@ class RemoteInferenceClient:
         self.last_cache_suspensions = 0
         self.last_cache_reactivations = 0
         self.last_nn_evaluated_positions = 0
+        self._prediction_provenance_state = threading.local()
         self.last_server_cache_lookup_s = 0.0
         self.last_server_staging_copy_s = 0.0
         self.last_gpu_batch_fill = 0.0
@@ -313,6 +318,19 @@ class RemoteInferenceClient:
                     "request_tokens", "response_tokens",
                 )
             }
+
+    @property
+    def _is_remote_inference_client(self):
+        return True
+
+    @property
+    def last_prediction_provenance(self):
+        """Per-calling-thread attribution for the most recent remote request."""
+        return getattr(self._prediction_provenance_state, "value", None)
+
+    @last_prediction_provenance.setter
+    def last_prediction_provenance(self, value):
+        self._prediction_provenance_state.value = value
 
     @property
     def training(self):
@@ -508,6 +526,19 @@ class RemoteInferenceClient:
                 )
             if not response.get("ok", False):
                 raise RuntimeError(response.get("error", "central inference failed"))
+            response_provenance = response.get("prediction_provenance")
+            if (
+                isinstance(response_provenance, dict)
+                and type(response_provenance.get("schema_version")) is int
+                and response_provenance.get("schema_version")
+                == _PREDICTION_PROVENANCE_SCHEMA_VERSION
+            ):
+                row_sources = response_provenance.get("row_sources")
+            else:
+                row_sources = None
+            self.last_prediction_provenance = _prediction_provenance_for_sources(
+                row_sources, batch_size
+            )
             self.last_remote_wait_s = time.perf_counter() - request_started_perf
             self.last_server_batch_size = int(response.get("server_batch_size", 0) or 0)
             self.last_server_batch_target = int(response.get("server_batch_target", 0) or 0)
@@ -1684,8 +1715,17 @@ def central_inference_server(
                 if group_cache_active:
                     cache_hits = int(np.count_nonzero(ctx['cache_hit_flags'][cursor:req_end]))
                     dedup_hits = int(np.count_nonzero(ctx['dedup_hit_flags'][cursor:req_end]))
+                    row_sources = [
+                        "cache_hit"
+                        if ctx['cache_hit_flags'][row_idx]
+                        else "deduplicated"
+                        if ctx['dedup_hit_flags'][row_idx]
+                        else "fresh_nn"
+                        for row_idx in range(cursor, req_end)
+                    ]
                 else:
                     cache_hits = dedup_hits = 0
+                    row_sources = ["fresh_nn"] * batch_size
                 nn_evaluated = (
                     max(0, cache_queries - cache_hits - dedup_hits)
                     if cache_queries else batch_size
@@ -1723,6 +1763,9 @@ def central_inference_server(
                     'cache_hits': int(cache_hits),
                     'dedup_hits': int(dedup_hits),
                     'nn_evaluated_positions': int(nn_evaluated),
+                    'prediction_provenance': _prediction_provenance_for_sources(
+                        row_sources
+                    ),
                     'cache_entries': int(len(cache)),
                     'cache_active': bool(cache_gate.active),
                     'cache_suspensions': int(cache_suspended and req_idx == 0),

@@ -177,7 +177,14 @@ class SearchSession:
     def _drop(self):
         self._root = None
         self._root_synced = False
-        self._engine.release_native_tree(self._tree_key)
+        # A missed child is still the same game. Discard its tree, but keep
+        # bounded earned simulation savings on the stable per-game key.
+        release_tree = getattr(
+            self._engine,
+            'release_native_tree_preserving_budget_credit',
+            self._engine.release_native_tree,
+        )
+        release_tree(self._tree_key)
         return False
 
     def clear(self):
