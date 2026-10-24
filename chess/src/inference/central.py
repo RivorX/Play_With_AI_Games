@@ -38,8 +38,6 @@ def _configure_selfplay_worker_runtime(config, device_id):
     rl_cfg = config.get('reinforcement_learning', {})
     self_play_threads = rl_cfg.get('self_play_torch_threads', None)
 
-    _configure_inductor_for_selfplay(config)
-
     if self_play_threads is not None:
         try:
             self_play_threads = int(self_play_threads)
@@ -57,6 +55,10 @@ def _configure_selfplay_worker_runtime(config, device_id):
     else:
         device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
         if device.type == 'cuda':
+            # CPU-only clients used with central inference never compile a
+            # local model. Avoid importing torch._inductor in every spawned
+            # worker; it materially increases each process's committed RAM.
+            _configure_inductor_for_selfplay(config)
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True

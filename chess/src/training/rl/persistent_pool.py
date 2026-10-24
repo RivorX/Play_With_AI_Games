@@ -6,6 +6,7 @@ import os
 import queue
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -18,6 +19,12 @@ from src.models.data.se_cnn_v9.helpers import MAX_LEGAL_MOVES
 from src.inference.shared_memory import (
     create_shared_inference_buffer,
     shared_inference_bytes,
+)
+from src.selfplay.cpu_bootstrap import (
+    bootstrap_cpu_torch_worker,
+    cpu_worker_torch_supported,
+    ensure_cpu_worker_torch_overlay,
+    resolve_cpu_worker_torch_mode,
 )
 
 WORKER_INTERRUPT_EXIT_CODE = 130
@@ -219,6 +226,49 @@ class _PersistentSelfPlayPool:
             self.worker_specs,
             device_type,
         )
+        central_cfg = config.get('central_inference', {}) or {}
+        runtime_mode = central_cfg.get('cpu_worker_torch_enabled', 'auto')
+        self.cpu_worker_torch_overlay = None
+        self.cpu_worker_torch_version = None
+        project_root = Path(__file__).resolve().parents[3]
+        cpu_worker_requested, auto_mode = resolve_cpu_worker_torch_mode(
+            runtime_mode,
+        )
+        self.cpu_worker_torch_enabled = False
+        if cpu_worker_requested and not self.central_inference_enabled:
+            if not auto_mode:
+                raise ValueError(
+                    "central_inference.cpu_worker_torch_enabled requires "
+                    "central self-play inference on CUDA."
+                )
+        elif cpu_worker_requested and self.central_inference_enabled:
+            if not cpu_worker_torch_supported():
+                if not auto_mode:
+                    raise RuntimeError(
+                        "The isolated CPU worker torch runtime is supported only on Windows x64."
+                    )
+                print(
+                    "Central-inference self-play is using the existing Python "
+                    "runtime because the isolated CPU torch worker package is "
+                    "supported only on Windows x64."
+                )
+            else:
+                self.cpu_worker_torch_overlay = ensure_cpu_worker_torch_overlay(
+                    project_root,
+                    str(torch.__version__),
+                    overlay_override=central_cfg.get('cpu_worker_torch_overlay'),
+                    python_executable=sys.executable,
+                )
+                self.cpu_worker_torch_version = (
+                    f"{str(torch.__version__).split('+', 1)[0]}+cpu"
+                )
+                self.cpu_worker_torch_enabled = True
+                print(
+                    "Central-inference self-play CPU workers use isolated torch "
+                    f"{self.cpu_worker_torch_version} from "
+                    f"{self.cpu_worker_torch_overlay} "
+                    f"({len(self.worker_specs)} worker processes)."
+                )
         self.inference_request_queues = [
             self.mp_ctx.Queue() for _ in range(self.central_inference_server_count)
         ]
@@ -288,20 +338,33 @@ class _PersistentSelfPlayPool:
         if task_queue is None:
             task_queue = self.mp_ctx.Queue()
         device_id, inference_request_queue, inference_response_queue, shared_buffer = self._worker_runtime_args(rank)
-        process = self.mp_ctx.Process(
-            target=persistent_selfplay_worker,
-            args=(
-                rank,
-                self.config,
-                device_id,
-                task_queue,
-                self.result_queue,
-                self.game_queue,
-                inference_request_queue,
-                inference_response_queue,
-                shared_buffer,
-            ),
+        worker_args = (
+            rank,
+            self.config,
+            device_id,
+            task_queue,
+            self.result_queue,
+            self.game_queue,
+            inference_request_queue,
+            inference_response_queue,
+            shared_buffer,
         )
+        if self.cpu_worker_torch_enabled:
+            process = self.mp_ctx.Process(
+                target=bootstrap_cpu_torch_worker,
+                args=(
+                    str(self.cpu_worker_torch_overlay),
+                    self.cpu_worker_torch_version,
+                    'src.selfplay.workers',
+                    'persistent_selfplay_worker',
+                    worker_args,
+                ),
+            )
+        else:
+            process = self.mp_ctx.Process(
+                target=persistent_selfplay_worker,
+                args=worker_args,
+            )
         process.daemon = True
         process.start()
         self.task_queues[rank] = task_queue

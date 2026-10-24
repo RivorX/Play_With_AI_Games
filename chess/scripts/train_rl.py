@@ -30,12 +30,10 @@ except Exception:
 # Windows multiprocessing ("spawn") starts worker processes by re-running this script as __mp_main__.
 # Ignore Ctrl+C inside spawned children to avoid noisy KeyboardInterrupt tracebacks during heavy imports.
 def _is_spawned_worker_process():
-    if __name__ != "__mp_main__":
-        return False
-    try:
-        return _stdlib_mp.parent_process() is not None
-    except Exception:
-        return True
+    # multiprocessing.spawn executes the main script with runpy under
+    # "__mp_main__" before installing the child-side parent_process object.
+    # Checking parent_process() here misses the spawn preparation phase.
+    return __name__ == "__mp_main__"
 
 
 if _is_spawned_worker_process():
@@ -67,12 +65,7 @@ if _is_spawned_worker_process():
     except Exception:
         pass
 
-import torch
-import torch.optim as optim
-import torch.multiprocessing as mp
 from pathlib import Path
-import numpy as np
-from tqdm import tqdm
 import gc
 import copy
 import time
@@ -86,143 +79,154 @@ from datetime import datetime
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir.parent))
 
-from src.config import default_config_path, load_project_config
-from src.mcts.q_delta import (
-    Q_DELTA_HIST_BINS as _Q_DELTA_HIST_BINS,
-    USEFUL_SEARCH_Q_DELTA_MIN,
-    q_delta_histogram as _q_delta_histogram,
-    q_delta_percentile_from_histogram as _q_delta_percentile_from_histogram,
-)
+if not _is_spawned_worker_process():
+    # Spawned worker targets live in src.* modules and import their own
+    # dependencies. Skip the training coordinator, replay, evaluation, and
+    # plotting import graph in every spawned worker process.
+    import torch
+    import torch.optim as optim
+    import torch.multiprocessing as mp
+    import numpy as np
+    from tqdm import tqdm
 
-from src.model import (
-    MODEL_REGISTRY,
-    create_model,
-    load_checkpoint_file,
-    normalize_state_dict_keys,
-    save_checkpoint,
-)
-from src.models.checkpoints import restore_rng_state
-from src.game import backend as chess
-from src.mcts.native import get_native_mcts
-
-from src.mcts.search import (
-    MultiGameBatchMCTS,
-    _build_sparse_policy_target_from_visits,
-    _resolve_dynamic_simulation_budget,
-    _resolve_replay_max_policy_targets,
-    _search_correction_metadata,
-)
-from src.selfplay.workers import run_selfplay_worker
-
-# Import training modules
-from src.common.logger import TrainingLogger
-from src.common.torch_cache import configure_torch_compile_cache
-from src.evaluation.elo_runner import (
-    build_final_elo_config,
-    build_final_mcts_elo_configs,
-    checkpoint_elo_seed,
-    elo_protocol_matches_settings,
-    elo_protocol_settings,
-    run_elo_check,
-    safe_float as _safe_float,
-)
-from src.models.catalog import load_checkpoint_metadata, persist_checkpoint_elo_metadata
-from src.training.rl.replay import (
-    REPLAY_SOURCE_CHAMPION,
-    REPLAY_SOURCE_LEARNER,
-    ReplayBuffer,
-)
-from src.training.rl.search_control import RegretOpeningArchive
-from src.training.rl.correction_audit import (
-    CORRECTION_AUDIT_MAX_ROWS,
-    correction_audit_metrics,
-    evaluate_correction_cohort,
-    freeze_replay_batch,
-    holdout_metrics,
-)
-from src.training.rl.trainer import (
-    close_eval_central_runtime,
-    evaluate_models,
-    evaluate_models_no_mcts,
-    is_transient_cuda_error,
-    prepare_eval_central_runtime,
-    _resolve_eval_opening_lines,
-    train_on_batch_rl,
-)
-from src.training.rl.startup import (
-    apply_rl_startup_plan,
-    plan_rl_startup,
-    select_best_il_checkpoint,
-)
-from src.training.rl.console import compact_path, dominant_stage, format_duration, print_panel
-from src.training.rl.profiler import print_selfplay_profiler
-from src.training.rl.persistent_pool import (
-    _resolve_central_inference_server_count,
-    borrow_selfplay_central_runtime,
-    get_or_create_selfplay_pool,
-    _shutdown_selfplay_pool,
-    _terminate_workers,
-    _is_interrupt_exit_code,
-)
-from src.training.il.auto_tune import resolve_rl_hyperparameters
-from src.common.metrics import MetricsCalculator
-from src.common.runtime import (
-    build_rl_experiment_name,
-    build_model_file_tag,
-    build_model_architecture_metadata,
-    architecture_scoped_directory,
-    legacy_architecture_scoped_file,
-    model_alias_file,
-    cleanup_interrupted_log_csv,
-)
-from src.common.syzygy import ensure_syzygy_tables, describe_syzygy_status
-from src.evaluation.rl_promotion import (
-    anchor_candidate_needs_more_games as _anchor_candidate_needs_more_games,
-    attach_paired_score_stats as _attach_paired_score_stats,
-    combine_eval_stats as _combine_eval_stats,
-    empty_eval_stats as _empty_eval_stats,
-    eval_mcts_move_metrics as _eval_mcts_move_metrics,
-    paired_score_standard_error as _paired_score_standard_error,
-    promotion_anchor_safety_decision as _promotion_anchor_safety_decision,
-    promotion_confirmation_decision as _promotion_confirmation_decision,
-    promotion_eval_has_full_evidence as _promotion_eval_has_full_evidence,
-    promotion_raw_nn_decision as _promotion_nn_safety_decision,
-    next_raw_candidate_retest_target as _next_raw_candidate_retest_target,
-    safe_score_rate as _safe_score_rate,
-    score_rate_lower_bound as _score_rate_lower_bound,
-    score_rate_standard_error as _score_rate_standard_error,
-    score_rate_upper_bound as _score_rate_upper_bound,
-    evaluate_mcts_selector_funnel as _run_cumulative_promotion_funnel,
-)
-from src.evaluation.rl_candidate_archive import (
-    MctsCandidateArchive,
-    model_state_sha256 as _model_state_sha256,
-    json_sha256 as _json_sha256,
-    restore_candidate_archive_identity as _restore_candidate_archive_identity,
-    sha256_file as _sha256_file,
-)
-
-try:
-    from src.evaluation.promotion_holdout import (
-        promotion_holdout_suite_capacity,
-        promotion_holdout_ledger_status,
-        reserve_promotion_holdout_suites,
-        finish_promotion_holdout_reservation,
-        validate_promotion_holdout_bank,
+    from src.config import default_config_path, load_project_config
+    from src.mcts.q_delta import (
+        Q_DELTA_HIST_BINS as _Q_DELTA_HIST_BINS,
+        USEFUL_SEARCH_Q_DELTA_MIN,
+        q_delta_histogram as _q_delta_histogram,
+        q_delta_percentile_from_histogram as _q_delta_percentile_from_histogram,
     )
-    _PROMOTION_HOLDOUT_IMPORT_ERROR = None
-except Exception as _promotion_holdout_import_exc:
-    # Keep diagnostics importable if the bank package is missing; promotion
-    # remains fail-closed when a candidate reaches independent confirmation.
-    promotion_holdout_suite_capacity = None
-    promotion_holdout_ledger_status = None
-    reserve_promotion_holdout_suites = None
-    finish_promotion_holdout_reservation = None
-    validate_promotion_holdout_bank = None
-    _PROMOTION_HOLDOUT_IMPORT_ERROR = (
-        f"{type(_promotion_holdout_import_exc).__name__}: "
-        f"{_promotion_holdout_import_exc}"
+
+    from src.model import (
+        MODEL_REGISTRY,
+        create_model,
+        load_checkpoint_file,
+        normalize_state_dict_keys,
+        save_checkpoint,
     )
+    from src.models.checkpoints import restore_rng_state
+    from src.game import backend as chess
+    from src.mcts.native import get_native_mcts
+
+    from src.mcts.search import (
+        MultiGameBatchMCTS,
+        _build_sparse_policy_target_from_visits,
+        _resolve_dynamic_simulation_budget,
+        _resolve_replay_max_policy_targets,
+        _search_correction_metadata,
+    )
+    from src.selfplay.workers import run_selfplay_worker
+
+    # Import training modules
+    from src.common.logger import TrainingLogger
+    from src.common.torch_cache import configure_torch_compile_cache
+    from src.evaluation.elo_runner import (
+        build_final_elo_config,
+        build_final_mcts_elo_configs,
+        checkpoint_elo_seed,
+        elo_protocol_matches_settings,
+        elo_protocol_settings,
+        run_elo_check,
+        safe_float as _safe_float,
+    )
+    from src.models.catalog import load_checkpoint_metadata, persist_checkpoint_elo_metadata
+    from src.training.rl.replay import (
+        REPLAY_SOURCE_CHAMPION,
+        REPLAY_SOURCE_LEARNER,
+        ReplayBuffer,
+    )
+    from src.training.rl.search_control import RegretOpeningArchive
+    from src.training.rl.correction_audit import (
+        CORRECTION_AUDIT_MAX_ROWS,
+        correction_audit_metrics,
+        evaluate_correction_cohort,
+        freeze_replay_batch,
+        holdout_metrics,
+    )
+    from src.training.rl.trainer import (
+        close_eval_central_runtime,
+        evaluate_models,
+        evaluate_models_no_mcts,
+        is_transient_cuda_error,
+        prepare_eval_central_runtime,
+        _resolve_eval_opening_lines,
+        train_on_batch_rl,
+    )
+    from src.training.rl.startup import (
+        apply_rl_startup_plan,
+        plan_rl_startup,
+        select_best_il_checkpoint,
+    )
+    from src.training.rl.console import compact_path, dominant_stage, format_duration, print_panel
+    from src.training.rl.profiler import print_selfplay_profiler
+    from src.training.rl.persistent_pool import (
+        _resolve_central_inference_server_count,
+        borrow_selfplay_central_runtime,
+        get_or_create_selfplay_pool,
+        _shutdown_selfplay_pool,
+        _terminate_workers,
+        _is_interrupt_exit_code,
+    )
+    from src.training.il.auto_tune import resolve_rl_hyperparameters
+    from src.common.metrics import MetricsCalculator
+    from src.common.runtime import (
+        build_rl_experiment_name,
+        build_model_file_tag,
+        build_model_architecture_metadata,
+        architecture_scoped_directory,
+        legacy_architecture_scoped_file,
+        model_alias_file,
+        cleanup_interrupted_log_csv,
+    )
+    from src.common.syzygy import ensure_syzygy_tables, describe_syzygy_status
+    from src.evaluation.rl_promotion import (
+        anchor_candidate_needs_more_games as _anchor_candidate_needs_more_games,
+        attach_paired_score_stats as _attach_paired_score_stats,
+        combine_eval_stats as _combine_eval_stats,
+        empty_eval_stats as _empty_eval_stats,
+        eval_mcts_move_metrics as _eval_mcts_move_metrics,
+        paired_score_standard_error as _paired_score_standard_error,
+        promotion_anchor_safety_decision as _promotion_anchor_safety_decision,
+        promotion_confirmation_decision as _promotion_confirmation_decision,
+        promotion_eval_has_full_evidence as _promotion_eval_has_full_evidence,
+        promotion_raw_nn_decision as _promotion_nn_safety_decision,
+        next_raw_candidate_retest_target as _next_raw_candidate_retest_target,
+        safe_score_rate as _safe_score_rate,
+        score_rate_lower_bound as _score_rate_lower_bound,
+        score_rate_standard_error as _score_rate_standard_error,
+        score_rate_upper_bound as _score_rate_upper_bound,
+        evaluate_mcts_selector_funnel as _run_cumulative_promotion_funnel,
+    )
+    from src.evaluation.rl_candidate_archive import (
+        MctsCandidateArchive,
+        model_state_sha256 as _model_state_sha256,
+        json_sha256 as _json_sha256,
+        restore_candidate_archive_identity as _restore_candidate_archive_identity,
+        sha256_file as _sha256_file,
+    )
+
+    try:
+        from src.evaluation.promotion_holdout import (
+            promotion_holdout_suite_capacity,
+            promotion_holdout_ledger_status,
+            reserve_promotion_holdout_suites,
+            finish_promotion_holdout_reservation,
+            validate_promotion_holdout_bank,
+        )
+        _PROMOTION_HOLDOUT_IMPORT_ERROR = None
+    except Exception as _promotion_holdout_import_exc:
+        # Keep diagnostics importable if the bank package is missing; promotion
+        # remains fail-closed when a candidate reaches independent confirmation.
+        promotion_holdout_suite_capacity = None
+        promotion_holdout_ledger_status = None
+        reserve_promotion_holdout_suites = None
+        finish_promotion_holdout_reservation = None
+        validate_promotion_holdout_bank = None
+        _PROMOTION_HOLDOUT_IMPORT_ERROR = (
+            f"{type(_promotion_holdout_import_exc).__name__}: "
+            f"{_promotion_holdout_import_exc}"
+        )
+
 
 
 _LAST_RUN_LOG_CSV = None

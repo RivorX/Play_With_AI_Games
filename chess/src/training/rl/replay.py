@@ -1546,6 +1546,12 @@ class ReplayBuffer:
             self._scratch = {}
             return True
 
+        # Sample batches are disposable views into this buffer's reusable
+        # scratch storage. Drop cached shapes before allocating replacement
+        # replay tensors, so a resize does not retain old training batches for
+        # the duration of the copy.
+        self._scratch = {}
+
         old_size = int(self.size)
         keep_size = min(old_size, new_max_size)
         self.total_resize_dropped_positions += max(0, old_size - keep_size)
@@ -1648,40 +1654,52 @@ class ReplayBuffer:
 
         if keep_size > 0:
             idx = torch.as_tensor(keep_indices, dtype=torch.long)
-            self._boards[:keep_size].copy_(old_boards[idx])
-            self._values[:keep_size].copy_(old_values[idx])
-            self._policy_indices[:keep_size].copy_(old_policy_indices[idx])
-            self._policy_values[:keep_size].copy_(old_policy_values[idx])
-            self._policy_lengths[:keep_size].copy_(old_policy_lengths[idx])
-            self._legal_indices[:keep_size].copy_(old_legal_indices[idx])
-            self._legal_lengths[:keep_size].copy_(old_legal_lengths[idx])
-            self._importance[:keep_size].copy_(old_importance[idx])
-            self._policy_sample_weights[:keep_size].copy_(old_policy_sample_weights[idx])
-            self._value_sample_weights[:keep_size].copy_(old_value_sample_weights[idx])
-            self._moves_left[:keep_size].copy_(old_moves_left[idx])
-            self._insertion_iterations[:keep_size].copy_(old_insertion_iterations[idx])
-            self._source_codes[:keep_size].copy_(old_source_codes[idx])
-            self._root_q_targets[:keep_size].copy_(old_root_q_targets[idx])
-            self._search_changed_top[:keep_size].copy_(old_search_changed_top[idx])
-            self._search_q_deltas[:keep_size].copy_(old_search_q_deltas[idx])
-            self._best_q_targets[:keep_size].copy_(old_best_q_targets[idx])
-            self._played_q_targets[:keep_size].copy_(old_played_q_targets[idx])
-            self._orig_q_targets[:keep_size].copy_(old_orig_q_targets[idx])
-            self._policy_kld_targets[:keep_size].copy_(old_policy_kld_targets[idx])
-            self._search_visits[:keep_size].copy_(old_search_visits[idx])
-            self._search_budget_assigned[:keep_size].copy_(old_search_budget_assigned[idx])
-            self._search_simulations_effective[:keep_size].copy_(old_search_simulations_effective[idx])
-            self._search_simulations_fresh[:keep_size].copy_(old_search_simulations_fresh[idx])
-            self._search_visits_inherited_credit[:keep_size].copy_(old_search_visits_inherited_credit[idx])
-            self._game_ids[:keep_size].copy_(old_game_ids[idx])
-            self._game_ply_indices[:keep_size].copy_(old_game_ply_indices[idx])
-            self._regret_targets[:keep_size].copy_(old_regret_targets[idx])
-            self._archive_ids[:keep_size].copy_(old_archive_ids[idx])
-            self._policy_target_iterations[:keep_size].copy_(old_policy_target_iterations[idx])
-            self._last_reanalysis_iterations[:keep_size].copy_(old_last_reanalysis_iterations[idx])
-            self._reanalysis_counts[:keep_size].copy_(old_reanalysis_counts[idx])
+
+            def gather_into(destination, source):
+                # Advanced indexing (`source[idx]`) allocates another full
+                # selected tensor. Write the gather straight into the new
+                # storage instead to avoid that resize-time memory spike.
+                torch.index_select(
+                    source,
+                    0,
+                    idx,
+                    out=destination[:keep_size],
+                )
+
+            gather_into(self._boards, old_boards)
+            gather_into(self._values, old_values)
+            gather_into(self._policy_indices, old_policy_indices)
+            gather_into(self._policy_values, old_policy_values)
+            gather_into(self._policy_lengths, old_policy_lengths)
+            gather_into(self._legal_indices, old_legal_indices)
+            gather_into(self._legal_lengths, old_legal_lengths)
+            gather_into(self._importance, old_importance)
+            gather_into(self._policy_sample_weights, old_policy_sample_weights)
+            gather_into(self._value_sample_weights, old_value_sample_weights)
+            gather_into(self._moves_left, old_moves_left)
+            gather_into(self._insertion_iterations, old_insertion_iterations)
+            gather_into(self._source_codes, old_source_codes)
+            gather_into(self._root_q_targets, old_root_q_targets)
+            gather_into(self._search_changed_top, old_search_changed_top)
+            gather_into(self._search_q_deltas, old_search_q_deltas)
+            gather_into(self._best_q_targets, old_best_q_targets)
+            gather_into(self._played_q_targets, old_played_q_targets)
+            gather_into(self._orig_q_targets, old_orig_q_targets)
+            gather_into(self._policy_kld_targets, old_policy_kld_targets)
+            gather_into(self._search_visits, old_search_visits)
+            gather_into(self._search_budget_assigned, old_search_budget_assigned)
+            gather_into(self._search_simulations_effective, old_search_simulations_effective)
+            gather_into(self._search_simulations_fresh, old_search_simulations_fresh)
+            gather_into(self._search_visits_inherited_credit, old_search_visits_inherited_credit)
+            gather_into(self._game_ids, old_game_ids)
+            gather_into(self._game_ply_indices, old_game_ply_indices)
+            gather_into(self._regret_targets, old_regret_targets)
+            gather_into(self._archive_ids, old_archive_ids)
+            gather_into(self._policy_target_iterations, old_policy_target_iterations)
+            gather_into(self._last_reanalysis_iterations, old_last_reanalysis_iterations)
+            gather_into(self._reanalysis_counts, old_reanalysis_counts)
             if self.store_hard_positions:
-                for dst_idx, src_idx in enumerate(keep_indices.tolist()):
+                for dst_idx, src_idx in enumerate(keep_indices):
                     self._fens[dst_idx] = old_fens[int(src_idx)]
                     self._history_fens[dst_idx] = old_history_fens[int(src_idx)]
 
