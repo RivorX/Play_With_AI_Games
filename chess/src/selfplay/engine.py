@@ -398,7 +398,9 @@ class SelfPlayEngine:
             int(rl_cfg.get('value_phase_endgame_min_fullmove', 40)),
         )
 
-        self.mcts = MultiGameBatchMCTS(model, config, device)
+        self.mcts = MultiGameBatchMCTS(
+            model, config, device, search_context='self_play'
+        )
         self.opponent_models_by_label = {}
         if isinstance(opponent_models_by_label, dict):
             for label, opp_model in opponent_models_by_label.items():
@@ -407,7 +409,9 @@ class SelfPlayEngine:
         elif opponent_model is not None:
             self.opponent_models_by_label[self.opponent_source_label] = opponent_model
         self.opponent_mcts_by_label = {
-            str(label): MultiGameBatchMCTS(opp_model, config, device)
+            str(label): MultiGameBatchMCTS(
+                opp_model, config, device, search_context='self_play'
+            )
             for label, opp_model in self.opponent_models_by_label.items()
             if opp_model is not None
         }

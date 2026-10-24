@@ -90,6 +90,15 @@ def elo_protocol_settings(
     ).strip().lower()
     if dynamic_strategy not in {"prior", "feedback"}:
         raise ValueError("mcts_dynamic_budget_strategy must be 'prior' or 'feedback'")
+    efficiency_feedback = bool(
+        use_mcts
+        and dynamic_strategy == "feedback"
+        and (
+            dynamic_budget
+            or (timed and runtime_cfg.get("mcts_dynamic_budget_enabled", False))
+        )
+        and runtime_cfg.get("search_efficiency_feedback_enabled", False)
+    )
     settings = {
         "use_mcts": bool(use_mcts),
         "budget_mode": budget_mode if use_mcts else "raw_nn",
@@ -138,7 +147,12 @@ def elo_protocol_settings(
             "mcts_dynamic_budget_enabled": True,
             "mcts_dynamic_budget_strategy": dynamic_strategy,
             "mcts_dynamic_budget_protocol": (
-                "search-feedback-v2" if dynamic_strategy == "feedback" else "prior-v1"
+                (
+                    "search-feedback-e1"
+                    if efficiency_feedback
+                    else "search-feedback-v2"
+                )
+                if dynamic_strategy == "feedback" else "prior-v1"
             ),
             "mcts_dynamic_budget_target_simulations": max(0, int(simulations or 0)),
             "mcts_dynamic_budget_min": max(
@@ -148,21 +162,26 @@ def elo_protocol_settings(
                 runtime_cfg.get("mcts_dynamic_budget_max_multiplier", 5.0 / 3.0)
             ),
         })
-        if dynamic_strategy == "feedback":
-            inference_path = str(
-                runtime_cfg.get("mcts_dynamic_budget_inference", "") or ""
-            ).strip().lower()
-            if inference_path not in {"local", "central"}:
-                inference_path = (
-                    "central" if runtime_cfg.get("eval_elo_central_inference_enabled", False)
-                    and int(runtime_cfg.get("workers", 1) or 1) > 1 else "local"
-                )
-            settings.update({
-                "mcts_dynamic_budget_inference": inference_path,
-                "mcts_dynamic_budget_pool_scope": (
-                    "central_client_group" if inference_path == "central" else "per_search_batch"
-                ),
-            })
+    if efficiency_feedback:
+        settings.update({
+            "mcts_search_efficiency_feedback_enabled": True,
+            "mcts_search_efficiency_feedback_protocol": "weighted-sh-pass-v1",
+        })
+    if dynamic_budget and dynamic_strategy == "feedback":
+        inference_path = str(
+            runtime_cfg.get("mcts_dynamic_budget_inference", "") or ""
+        ).strip().lower()
+        if inference_path not in {"local", "central"}:
+            inference_path = (
+                "central" if runtime_cfg.get("eval_elo_central_inference_enabled", False)
+                and int(runtime_cfg.get("workers", 1) or 1) > 1 else "local"
+            )
+        settings.update({
+            "mcts_dynamic_budget_inference": inference_path,
+            "mcts_dynamic_budget_pool_scope": (
+                "central_client_group" if inference_path == "central" else "per_search_batch"
+            ),
+        })
     return settings
 
 
@@ -207,6 +226,10 @@ def elo_protocol_matches_settings(
         budget_mode=budget_mode,
         time_limit_seconds=time_limit_seconds,
     )
+    if bool(expected.get("mcts_search_efficiency_feedback_enabled", False)) != bool(
+        settings.get("mcts_search_efficiency_feedback_enabled", False)
+    ):
+        return False
     for key, active_value in expected.items():
         if key not in settings:
             return False

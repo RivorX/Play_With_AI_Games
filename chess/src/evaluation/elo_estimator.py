@@ -293,22 +293,45 @@ def _build_elo_mcts_config(config: dict, elo_config: dict | None = None) -> dict
         rl_config['mcts_gumbel_root_schedule'] = elo_config[
             'mcts_gumbel_root_schedule'
         ]
-    # Standalone manual evaluation may opt into the configured per-root
-    # adaptive budget. Training/final Elo builders omit this key and therefore
-    # retain strict fixed-simulation comparisons by default.
-    dynamic_budget_enabled = bool(
-        elo_config.get('mcts_dynamic_budget_enabled', False)
-    ) and budget_mode == 'simulations'
-    rl_config['mcts_dynamic_budget_enabled'] = dynamic_budget_enabled
-    rl_config['mcts_dynamic_budget_strategy'] = str(
+    inference_config = dict(elo_mcts_config.get('inference', {}) or {})
+    efficiency_feedback_enabled = elo_config.get(
+        'search_efficiency_feedback_enabled',
+        inference_config.get('search_efficiency_feedback_enabled', False),
+    )
+    if type(efficiency_feedback_enabled) is not bool:
+        raise ValueError('inference.search_efficiency_feedback_enabled must be true or false')
+    inference_config['search_efficiency_feedback_enabled'] = efficiency_feedback_enabled
+    dynamic_strategy = str(
         elo_config.get(
             'mcts_dynamic_budget_strategy',
             rl_config.get('mcts_dynamic_budget_strategy', 'feedback'),
         ) or 'feedback'
     ).strip().lower()
+    # Standalone manual evaluation may opt into the configured per-root
+    # adaptive budget. Training/final Elo builders omit this key and therefore
+    # retain strict fixed-simulation comparisons by default. An inference E
+    # opt-in may activate feedback only when no explicit Elo override exists.
+    if budget_mode == 'simulations':
+        dynamic_budget_enabled = bool(
+            elo_config.get('mcts_dynamic_budget_enabled', False)
+            or (
+                efficiency_feedback_enabled
+                and 'mcts_dynamic_budget_enabled' not in elo_config
+                and dynamic_strategy == 'feedback'
+            )
+        )
+    else:
+        # Time-mode MCTS keeps the legacy fixed timed path unless E was
+        # explicitly opted in and no explicit dynamic-budget disable exists.
+        dynamic_budget_enabled = bool(
+            efficiency_feedback_enabled
+            and dynamic_strategy == 'feedback'
+            and elo_config.get('mcts_dynamic_budget_enabled', True)
+        )
+    rl_config['mcts_dynamic_budget_enabled'] = dynamic_budget_enabled
+    rl_config['mcts_dynamic_budget_strategy'] = dynamic_strategy
     rl_config['eval_mcts_dynamic_budget_enabled'] = False
     elo_mcts_config['reinforcement_learning'] = rl_config
-    inference_config = dict(elo_mcts_config.get('inference', {}) or {})
     inference_config['budget_mode'] = budget_mode
     if budget_mode == 'time':
         inference_config['move_time_seconds'] = float(
@@ -974,6 +997,22 @@ class EloEstimator:
         self.model = model
         self.elo_config = dict(elo_config or {})
         self.config = _build_elo_mcts_config(config, self.elo_config)
+        self.elo_config.setdefault(
+            'search_efficiency_feedback_enabled',
+            bool(
+                (self.config.get('inference', {}) or {}).get(
+                    'search_efficiency_feedback_enabled', False
+                )
+            ),
+        )
+        self.elo_config.setdefault(
+            'mcts_dynamic_budget_enabled',
+            bool(
+                (self.config.get('reinforcement_learning', {}) or {}).get(
+                    'mcts_dynamic_budget_enabled', False
+                )
+            ),
+        )
         self.elo_config.setdefault(
             "mcts_gumbel_root_schedule",
             str(
@@ -2374,6 +2413,12 @@ class EloEstimator:
             and str(self.elo_config.get("mcts_budget_mode", "simulations")).strip().lower() == "simulations"
             and self.elo_config.get("mcts_dynamic_budget_enabled", False)
         )
+        search_efficiency_feedback_enabled = bool(
+            self.elo_config.get("mcts_dynamic_budget_enabled", False)
+            and str(self.elo_config.get("mcts_dynamic_budget_strategy", "feedback"))
+            == "feedback"
+            and self.elo_config.get("search_efficiency_feedback_enabled", False)
+        )
 
         result = {
             "estimated_elo": round(estimated_elo) if estimated_elo is not None else None,
@@ -2442,11 +2487,24 @@ class EloEstimator:
             "mcts_dynamic_budget_enabled": dynamic_budget_enabled,
             "mcts_dynamic_budget_protocol": (
                 (
-                    "search-feedback-v2"
-                    if str(self.elo_config.get("mcts_dynamic_budget_strategy", "feedback")) == "feedback"
-                    else "prior-v1"
+                    "search-feedback-e1"
+                    if search_efficiency_feedback_enabled
+                    else "search-feedback-v2"
                 )
-                if dynamic_budget_enabled else None
+                if dynamic_budget_enabled
+                and str(self.elo_config.get("mcts_dynamic_budget_strategy", "feedback"))
+                == "feedback"
+                else (
+                    "prior-v1"
+                    if dynamic_budget_enabled else None
+                )
+            ),
+            "mcts_search_efficiency_feedback_enabled": (
+                search_efficiency_feedback_enabled if use_mcts else False
+            ),
+            "mcts_search_efficiency_feedback_protocol": (
+                "weighted-sh-pass-v1"
+                if search_efficiency_feedback_enabled else None
             ),
             "mcts_dynamic_budget_strategy": (
                 str(self.elo_config.get("mcts_dynamic_budget_strategy", "feedback"))

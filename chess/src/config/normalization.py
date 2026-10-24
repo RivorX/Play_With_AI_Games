@@ -275,6 +275,7 @@ _RL_SECTION_PREFIXES = {
 
 _RL_KEY_ALIASES = {
     'self_play.max_batch_games_per_worker': 'max_batch_games_per_worker',
+    'search.search_efficiency_feedback_enabled': 'mcts_search_efficiency_feedback_enabled',
     'self_play.syzygy_paths': 'syzygy_paths',
     'self_play.syzygy_auto_download_enabled': 'syzygy_auto_download_enabled',
     'losses.policy': 'policy_loss_weight',
@@ -323,6 +324,7 @@ _RL_DEFAULTS = {
     'self_play_randomize_learner_color': True, 'self_play_store_frozen_best_positions': False,
     'mcts_algorithm': 'gumbel',
     'mcts_dynamic_budget_strategy': 'feedback',
+    'mcts_search_efficiency_feedback_enabled': True,
     'mcts_gumbel_root_schedule': 'standard',
     'mcts_gumbel_reuse_q_scale': 'fresh',
     'mcts_gumbel_c_scale': 0.10, 'mcts_gumbel_q_range_floor': 0.25,
@@ -457,6 +459,10 @@ def normalize_rl_config(config):
         _validate_mcts_algorithm(rl_cfg['mcts_algorithm'])
         rl_cfg.setdefault('mcts_dynamic_budget_strategy', 'feedback')
         _validate_dynamic_budget_strategy(rl_cfg['mcts_dynamic_budget_strategy'])
+        rl_cfg.setdefault('mcts_search_efficiency_feedback_enabled', True)
+        _validate_search_efficiency_feedback_enabled(
+            rl_cfg['mcts_search_efficiency_feedback_enabled']
+        )
         _validate_dynamic_budget_config(rl_cfg)
         rl_cfg.setdefault('syzygy_auto_download_enabled', False)
         rl_cfg.pop('mcts_budget_mode', None)
@@ -495,6 +501,9 @@ def normalize_rl_config(config):
     normalized['mcts_batch_size'] = int(normalized.get('mcts_simulations', 192))
     _validate_mcts_algorithm(normalized['mcts_algorithm'])
     _validate_dynamic_budget_strategy(normalized['mcts_dynamic_budget_strategy'])
+    _validate_search_efficiency_feedback_enabled(
+        normalized['mcts_search_efficiency_feedback_enabled']
+    )
     _validate_dynamic_budget_config(normalized)
     _validate_gumbel_root_schedule(normalized['mcts_gumbel_root_schedule'])
     _validate_local_cuda_graph_forward(normalized['mcts_local_cuda_graph_forward'])
@@ -514,6 +523,14 @@ def _validate_local_cuda_graph_forward(value):
         raise ValueError(
             'reinforcement_learning.search.local_cuda_graph_forward must be '
             f'null, false, or true; got {value!r}'
+        )
+
+
+def _validate_search_efficiency_feedback_enabled(value):
+    if type(value) is not bool:
+        raise ValueError(
+            'reinforcement_learning.search.search_efficiency_feedback_enabled '
+            'must be true or false'
         )
 
 
@@ -593,6 +610,9 @@ def _normalize_inference_config(config):
     if not isinstance(raw_inference_cfg, dict):
         raise ValueError('inference must be a mapping')
     inference_cfg = dict(raw_inference_cfg)
+    inference_cfg.setdefault('search_efficiency_feedback_enabled', False)
+    if type(inference_cfg['search_efficiency_feedback_enabled']) is not bool:
+        raise ValueError('inference.search_efficiency_feedback_enabled must be true or false')
     mode = inference_cfg.get('budget_mode', 'simulations')
     if not isinstance(mode, str):
         raise ValueError("inference.budget_mode must be 'simulations' or 'time'")

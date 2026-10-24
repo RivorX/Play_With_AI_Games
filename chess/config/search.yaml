@@ -5,6 +5,7 @@ inference:
   # Stockfish inference evaluation; training always uses simulation budgets.
   budget_mode: simulations       # simulations | time
   move_time_seconds: 0.2
+  search_efficiency_feedback_enabled: false
 
 reinforcement_learning:
   search:
@@ -19,6 +20,9 @@ reinforcement_learning:
     # `total` is the current default; Sequential-Halving quotas stay fresh.
     gumbel_reuse_q_scale: total
     simulations: 192
+    # Search Efficiency Feedback reallocates whole Sequential Halving passes
+    # by newly evaluated finalist leaves during RL/self-play search.
+    search_efficiency_feedback_enabled: true
     # Interactive one-root searches otherwise shrink each batch to a quarter
     # of the remaining budget, creating many tiny GPU calls. 0 preserves that
     # legacy schedule; positive caps apply only to one root.

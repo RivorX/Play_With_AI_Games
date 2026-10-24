@@ -885,6 +885,11 @@ def main():
                 search_config.get("gumbel_root_schedule", "standard"),
             )
         )
+        runtime_cfg["search_efficiency_feedback_enabled"] = bool(
+            (config.get("inference", {}) or {}).get(
+                "search_efficiency_feedback_enabled", False
+            )
+        )
         if mode_use_mcts and budget_mode == "simulations":
             rl_search = rl_config
             runtime_cfg["mcts_dynamic_budget_enabled"] = bool(
@@ -912,6 +917,16 @@ def main():
             runtime_cfg["mcts_dynamic_budget_inference"] = (
                 "central" if central_dynamic else "local"
             )
+        elif mode_use_mcts and budget_mode == "time" and runtime_cfg[
+            "search_efficiency_feedback_enabled"
+        ]:
+            rl_search = rl_config
+            runtime_cfg["mcts_dynamic_budget_enabled"] = bool(
+                rl_search.get("mcts_dynamic_budget_enabled", False)
+            )
+            runtime_cfg["mcts_dynamic_budget_strategy"] = str(
+                rl_search.get("mcts_dynamic_budget_strategy", "feedback") or "feedback"
+            ).strip().lower()
         if mode_use_mcts and budget_mode == "time":
             central = bool(
                 device.type == "cuda"
