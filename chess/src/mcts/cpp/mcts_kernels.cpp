@@ -17,7 +17,7 @@
 
 namespace {
 
-constexpr std::int32_t kApiVersion = 16;
+constexpr std::int32_t kApiVersion = 17;
 
 inline bool valid_size(std::int32_t size) noexcept {
     return size > 0;
@@ -362,6 +362,8 @@ struct PendingSelection {
 struct NativeForest {
     double c_visit = 100.0;
     double c_scale = 0.10;
+    double q_scale_visit_knee = 256.0;
+    double q_scale_visit_exponent = 1.0;
     double q_range_floor = 0.25;
     bool use_mixed_value = true;
     std::vector<NativeNode> nodes;
@@ -371,6 +373,31 @@ struct NativeForest {
     std::vector<std::int32_t> selection_paths;
     std::vector<double> improved_policy;
 };
+
+inline double gumbel_q_scale(
+    const double c_visit,
+    const double c_scale,
+    const double max_visits,
+    const double visit_knee,
+    const double visit_exponent
+) noexcept {
+    const double visits = std::max(0.0, max_visits);
+    double effective_visits = visits;
+    if (visits > visit_knee && visit_exponent < 1.0) {
+        effective_visits = visit_knee * std::pow(visits / visit_knee, visit_exponent);
+    }
+    return (c_visit + effective_visits) * c_scale;
+}
+
+inline double gumbel_q_scale(const NativeForest& forest, const double max_visits) noexcept {
+    return gumbel_q_scale(
+        forest.c_visit,
+        forest.c_scale,
+        max_visits,
+        forest.q_scale_visit_knee,
+        forest.q_scale_visit_exponent
+    );
+}
 
 inline bool valid_node(const NativeForest& forest, const std::int32_t node_id) noexcept {
     return node_id >= 0 && static_cast<std::size_t>(node_id) < forest.nodes.size();
@@ -544,7 +571,7 @@ inline std::int32_t select_interior(
         for (std::int32_t index = 0; index < count; ++index) {
             max_visits = std::max(max_visits, edges[index].visits);
         }
-        const double scale = (forest.c_visit + static_cast<double>(max_visits)) * forest.c_scale;
+        const double scale = gumbel_q_scale(forest, static_cast<double>(max_visits));
         double maximum = -std::numeric_limits<double>::infinity();
         improved_policy.assign(static_cast<std::size_t>(count), 0.0);
         for (std::int32_t index = 0; index < count; ++index) {
@@ -657,7 +684,7 @@ inline std::int32_t select_root(
         has_considered = has_considered || pass_fresh == considered_visit;
     }
     const double eligible_visit = has_considered ? considered_visit : min_pass_fresh;
-    const double scale = (forest.c_visit + max_q_scale_visits) * forest.c_scale;
+    const double scale = gumbel_q_scale(forest, max_q_scale_visits);
     std::int32_t selected = 0;
     double best_score = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < count; ++index) {
@@ -846,6 +873,8 @@ MCTS_API std::int32_t mcts_encode_move_hashes(
 MCTS_API void* mcts_forest_create(
     const double c_visit,
     const double c_scale,
+    const double q_scale_visit_knee,
+    const double q_scale_visit_exponent,
     const double q_range_floor,
     const std::int32_t use_mixed_value,
     const std::int32_t reserve_nodes,
@@ -855,6 +884,8 @@ MCTS_API void* mcts_forest_create(
         auto* forest = new NativeForest();
         forest->c_visit = std::max(0.0, c_visit);
         forest->c_scale = std::max(0.0, c_scale);
+        forest->q_scale_visit_knee = std::max(1.0e-8, q_scale_visit_knee);
+        forest->q_scale_visit_exponent = std::clamp(q_scale_visit_exponent, 0.0, 1.0);
         forest->q_range_floor = std::max(1.0e-8, q_range_floor);
         forest->use_mixed_value = use_mixed_value != 0;
         if (reserve_nodes > 0) {
@@ -1798,6 +1829,8 @@ MCTS_API std::int32_t mcts_improved_policy(
     const double max_visit,
     const double c_visit,
     const double c_scale,
+    const double q_scale_visit_knee,
+    const double q_scale_visit_exponent,
     float* output
 ) noexcept {
     if (!valid_size(size) || log_priors == nullptr || priors == nullptr ||
@@ -1805,7 +1838,9 @@ MCTS_API std::int32_t mcts_improved_policy(
         return -1;
     }
 
-    const double scale = (c_visit + max_visit) * c_scale;
+    const double scale = gumbel_q_scale(
+        c_visit, c_scale, max_visit, q_scale_visit_knee, q_scale_visit_exponent
+    );
     double maximum = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < size; ++index) {
         // q_score_scratch is float32 in the Python implementation. Preserve
@@ -1863,6 +1898,8 @@ MCTS_API std::int32_t mcts_select_root(
     const double considered_visit,
     const double c_visit,
     const double c_scale,
+    const double q_scale_visit_knee,
+    const double q_scale_visit_exponent,
     const std::int32_t apply_virtual_loss,
     const std::int32_t q_scale_total_visits
 ) noexcept {
@@ -1899,7 +1936,10 @@ MCTS_API std::int32_t mcts_select_root(
     }
 
     const double eligible_visit = has_eligible ? considered_visit : min_pass_fresh;
-    const double scale = (c_visit + max_q_scale_visits) * c_scale;
+    const double scale = gumbel_q_scale(
+        c_visit, c_scale, max_q_scale_visits,
+        q_scale_visit_knee, q_scale_visit_exponent
+    );
     std::int32_t selected = 0;
     double best_score = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < size; ++index) {
@@ -1933,6 +1973,8 @@ MCTS_API std::int32_t mcts_final_action(
     const std::int32_t size,
     const double c_visit,
     const double c_scale,
+    const double q_scale_visit_knee,
+    const double q_scale_visit_exponent,
     const std::int32_t q_scale_total_visits
 ) noexcept {
     if (!valid_size(size) || log_priors == nullptr || gumbel == nullptr ||
@@ -1958,7 +2000,10 @@ MCTS_API std::int32_t mcts_final_action(
         );
     }
 
-    const double scale = (c_visit + max_q_scale_visits) * c_scale;
+    const double scale = gumbel_q_scale(
+        c_visit, c_scale, max_q_scale_visits,
+        q_scale_visit_knee, q_scale_visit_exponent
+    );
     std::int32_t selected = 0;
     double best_score = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < size; ++index) {
@@ -1991,6 +2036,8 @@ MCTS_API std::int32_t mcts_final_action_eligible(
     const double final_visit_threshold,
     const double c_visit,
     const double c_scale,
+    const double q_scale_visit_knee,
+    const double q_scale_visit_exponent,
     const std::int32_t q_scale_total_visits
 ) noexcept {
     if (!valid_size(size) || log_priors == nullptr || gumbel == nullptr ||
@@ -2025,7 +2072,10 @@ MCTS_API std::int32_t mcts_final_action_eligible(
     }
 
     const double eligible_visit = has_finalist ? final_visit_threshold : min_pass_fresh;
-    const double scale = (c_visit + max_q_scale_visits) * c_scale;
+    const double scale = gumbel_q_scale(
+        c_visit, c_scale, max_q_scale_visits,
+        q_scale_visit_knee, q_scale_visit_exponent
+    );
     std::int32_t selected = 0;
     double best_score = -std::numeric_limits<double>::infinity();
     for (std::int32_t index = 0; index < size; ++index) {

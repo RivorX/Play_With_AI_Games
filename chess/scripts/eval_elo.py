@@ -33,7 +33,7 @@ from src.model import (
 from src.evaluation.elo_estimator import ensure_stockfish
 from src.evaluation.elo_runner import (
     apply_checkpoint_elo_seed,
-    build_eval_elo_config,
+    build_eval_elo_runtime_config,
     elo_protocol_settings,
     mode_label,
     persist_estimated_elo,
@@ -863,82 +863,21 @@ def main():
 
     def _resolved_mode_config(mode_name):
         mode_use_mcts = mode_name == "mcts"
-        runtime_cfg = build_eval_elo_config(
+        runtime_cfg = build_eval_elo_runtime_config(
+            config,
             elo_cfg,
-            levels=levels,
-            games_per_level=games_per_level,
+            device=device,
             use_mcts=mode_use_mcts,
             simulations=simulations,
             budget_mode=budget_mode,
             time_limit_seconds=move_time_seconds,
+            workers=workers,
+            levels=levels,
+            games_per_level=games_per_level,
             sf_time=sf_time,
             max_moves=max_moves,
             sf_path=sf_path,
-            workers=resolve_eval_workers(workers, mode_use_mcts, elo_cfg),
-            standalone=True,
         )
-        rl_config = config.get("reinforcement_learning", {}) or {}
-        search_config = rl_config.get("search", {}) or {}
-        runtime_cfg["mcts_gumbel_root_schedule"] = str(
-            rl_config.get(
-                "mcts_gumbel_root_schedule",
-                search_config.get("gumbel_root_schedule", "standard"),
-            )
-        )
-        runtime_cfg["search_efficiency_feedback_enabled"] = bool(
-            (config.get("inference", {}) or {}).get(
-                "search_efficiency_feedback_enabled", False
-            )
-        )
-        if mode_use_mcts and budget_mode == "simulations":
-            rl_search = rl_config
-            runtime_cfg["mcts_dynamic_budget_enabled"] = bool(
-                rl_search.get("mcts_dynamic_budget_enabled", False)
-            )
-            runtime_cfg["mcts_dynamic_budget_strategy"] = str(
-                rl_search.get("mcts_dynamic_budget_strategy", "feedback") or "feedback"
-            ).strip().lower()
-            runtime_cfg["mcts_dynamic_budget_min"] = int(
-                rl_search.get("mcts_dynamic_budget_min", 64)
-            )
-            runtime_cfg["mcts_dynamic_budget_max_multiplier"] = float(
-                rl_search.get("mcts_dynamic_budget_max_multiplier", 5.0 / 3.0)
-            )
-            runtime_cfg["eval_elo_central_inference_enabled"] = bool(
-                rl_search.get("eval_elo_central_inference_enabled", True)
-            )
-            central_dynamic = bool(
-                runtime_cfg["mcts_dynamic_budget_enabled"]
-                and runtime_cfg["mcts_dynamic_budget_strategy"] == "feedback"
-                and device.type == "cuda"
-                and int(runtime_cfg.get("workers", 1) or 1) > 1
-                and runtime_cfg["eval_elo_central_inference_enabled"]
-            )
-            runtime_cfg["mcts_dynamic_budget_inference"] = (
-                "central" if central_dynamic else "local"
-            )
-        elif mode_use_mcts and budget_mode == "time" and runtime_cfg[
-            "search_efficiency_feedback_enabled"
-        ]:
-            rl_search = rl_config
-            runtime_cfg["mcts_dynamic_budget_enabled"] = bool(
-                rl_search.get("mcts_dynamic_budget_enabled", False)
-            )
-            runtime_cfg["mcts_dynamic_budget_strategy"] = str(
-                rl_search.get("mcts_dynamic_budget_strategy", "feedback") or "feedback"
-            ).strip().lower()
-        if mode_use_mcts and budget_mode == "time":
-            central = bool(
-                device.type == "cuda"
-                and int(runtime_cfg.get("workers", 1) or 1) > 1
-                and runtime_cfg.get("eval_elo_central_inference_enabled", False)
-            )
-            batched_roots = bool(runtime_cfg.get("batch_model_moves", True))
-            runtime_cfg["mcts_time_search_central_inference"] = central
-            runtime_cfg["mcts_time_search_batch_model_moves"] = batched_roots
-            runtime_cfg["mcts_time_search_style"] = (
-                "central_inference" if central else "batched_roots" if batched_roots else "independent_roots"
-            )
         return runtime_cfg
 
     mode_runtime_configs = {

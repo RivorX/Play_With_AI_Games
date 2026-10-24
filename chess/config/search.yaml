@@ -49,6 +49,10 @@ reinforcement_learning:
     # Controls the influence of completed child Q values on root ranking.
     gumbel_c_visit: 100.0
     gumbel_c_scale: 0.10
+    # Legacy-compatible at exponent 1; values below 1 soften visit growth
+    # only beyond the knee. Scale is applied uniformly across Python/native paths.
+    gumbel_q_scale_visit_knee: 256.0
+    gumbel_q_scale_visit_exponent: 1.0
     # Minimum range used when scaling sibling completed-Q differences.
     gumbel_q_range_floor: 0.25
     gumbel_use_mixed_value: true

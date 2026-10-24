@@ -328,6 +328,10 @@ _RL_DEFAULTS = {
     'mcts_gumbel_root_schedule': 'standard',
     'mcts_gumbel_reuse_q_scale': 'fresh',
     'mcts_gumbel_c_scale': 0.10, 'mcts_gumbel_q_range_floor': 0.25,
+    # Exponent 1 preserves the historical linear Q-growth exactly. Values
+    # below 1 soften only the visit-driven growth after the knee.
+    'mcts_gumbel_q_scale_visit_knee': 256.0,
+    'mcts_gumbel_q_scale_visit_exponent': 1.0,
     'mcts_gumbel_target_temperature': 0.95,
     'mcts_single_root_batch_cap': 0,
     'mcts_local_cuda_graph_forward': None,
@@ -473,6 +477,12 @@ def normalize_rl_config(config):
         _validate_local_cuda_graph_forward(rl_cfg['mcts_local_cuda_graph_forward'])
         rl_cfg.setdefault('mcts_gumbel_reuse_q_scale', 'fresh')
         _validate_gumbel_reuse_q_scale(rl_cfg['mcts_gumbel_reuse_q_scale'])
+        rl_cfg.setdefault('mcts_gumbel_q_scale_visit_knee', 256.0)
+        rl_cfg.setdefault('mcts_gumbel_q_scale_visit_exponent', 1.0)
+        _validate_gumbel_q_scale_visit_curve(
+            rl_cfg['mcts_gumbel_q_scale_visit_knee'],
+            rl_cfg['mcts_gumbel_q_scale_visit_exponent'],
+        )
         rl_cfg['search_control_effective_archive_capacity'] = (
             _effective_search_control_archive_capacity(rl_cfg)
         )
@@ -508,6 +518,10 @@ def normalize_rl_config(config):
     _validate_gumbel_root_schedule(normalized['mcts_gumbel_root_schedule'])
     _validate_local_cuda_graph_forward(normalized['mcts_local_cuda_graph_forward'])
     _validate_gumbel_reuse_q_scale(normalized['mcts_gumbel_reuse_q_scale'])
+    _validate_gumbel_q_scale_visit_curve(
+        normalized['mcts_gumbel_q_scale_visit_knee'],
+        normalized['mcts_gumbel_q_scale_visit_exponent'],
+    )
     normalized.pop('mcts_budget_mode', None)
     normalized.pop('mcts_move_time_seconds', None)
     normalized['search_control_effective_archive_capacity'] = (
@@ -593,6 +607,25 @@ def _validate_gumbel_reuse_q_scale(value):
         raise ValueError(
             "reinforcement_learning.search.gumbel_reuse_q_scale must be "
             f"'fresh' or 'total'; got {value!r}"
+        )
+
+
+def _validate_gumbel_q_scale_visit_curve(knee, exponent):
+    try:
+        knee = float(knee)
+        exponent = float(exponent)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            'reinforcement_learning.search.gumbel_q_scale_visit_knee and '
+            'gumbel_q_scale_visit_exponent must be numeric'
+        ) from exc
+    if not math.isfinite(knee) or knee <= 0.0:
+        raise ValueError(
+            'reinforcement_learning.search.gumbel_q_scale_visit_knee must be finite and > 0'
+        )
+    if not math.isfinite(exponent) or exponent < 0.0 or exponent > 1.0:
+        raise ValueError(
+            'reinforcement_learning.search.gumbel_q_scale_visit_exponent must be in [0, 1]'
         )
 
 

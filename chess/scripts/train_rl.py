@@ -1273,6 +1273,8 @@ def _print_rl_startup_plan(
         f"Gumbel · adaptive top <= {int(rl_cfg.get('mcts_gumbel_max_considered_actions', 16))} "
         f"· c=({float(rl_cfg.get('mcts_gumbel_c_visit', 100.0)):.0f},"
         f"{float(rl_cfg.get('mcts_gumbel_c_scale', 0.10)):.2f}) "
+        f"· Q-visit={float(rl_cfg.get('mcts_gumbel_q_scale_visit_knee', 256.0)):.0f}"
+        f"^{float(rl_cfg.get('mcts_gumbel_q_scale_visit_exponent', 1.0)):.2f} "
         f"· Q-floor={float(rl_cfg.get('mcts_gumbel_q_range_floor', 0.25)):.2f} "
         f"· target-T={float(rl_cfg.get('mcts_gumbel_target_temperature', 0.95)):.2f}"
     )

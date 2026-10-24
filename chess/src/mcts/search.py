@@ -43,6 +43,7 @@ from src.models.data.se_cnn_v9.helpers import (
 from src.models.data.registry import get_input_encoder
 from src.mcts.native import get_native_mcts
 from src.mcts.result import SearchResult
+from src.mcts.gumbel_scaling import gumbel_q_scale
 from src.mcts.q_delta import USEFUL_SEARCH_Q_DELTA_MIN
 
 
@@ -772,6 +773,124 @@ def _adaptive_challenger_index(scores, winner):
     challenger_scores[winner] = -np.inf
     challenger = int(np.argmax(challenger_scores))
     return challenger if np.isfinite(challenger_scores[challenger]) else None
+
+
+def _adaptive_gumbel_stop_decision(evidence, state, *, mode='current'):
+    """Evaluate one dynamic Gumbel early-stop rule from fresh evidence.
+
+    ``current`` preserves the existing stable-winner/Q-gap rule exactly;
+    ``disabled`` vetoes only that rule; ``cautious`` retains the legacy gates
+    and Q gap but also requires target-proportional fresh work, fresh coverage
+    of every monitored finalist, and repeated checkpoints with new evidence.
+    This pure helper is intentionally private so diagnostics can compare modes
+    without adding a user-facing configuration switch.
+    """
+    if mode == 'disabled':
+        return False
+    if not evidence.get('legacy_ready', False):
+        return False
+    if not (
+        float(evidence.get('q_gap', -math.inf))
+        >= _DYNAMIC_BUDGET_EARLY_STOP_Q_GAP
+    ):
+        return False
+    if mode == 'current':
+        return True
+    if mode != 'cautious':
+        raise ValueError(f"unknown adaptive Gumbel stop mode: {mode!r}")
+
+    target_budget = max(1, int(evidence['target_budget']))
+    fresh_visits = np.asarray(evidence['fresh_visits'], dtype=np.float64)
+    finalists = tuple(int(index) for index in evidence['monitor_indices'])
+    minimum_work = max(
+        int(evidence['legacy_fresh_floor']),
+        int(math.ceil(target_budget * 0.50)),
+    )
+    minimum_finalist_visits = max(4, int(math.ceil(target_budget * 0.025)))
+    if int(round(float(fresh_visits.sum()))) < minimum_work or not finalists:
+        return False
+    if any(
+        index < 0
+        or index >= fresh_visits.size
+        or fresh_visits[index] < minimum_finalist_visits
+        for index in finalists
+    ):
+        return False
+    return bool(
+        evidence.get('new_fresh_finalist_evidence', False)
+        and int(state.get('_adaptive_stop_evidence_checkpoints', 0)) >= 3
+    )
+
+
+def _adaptive_stop_monitor_indices(scores, final_counts, winner, challenger, limit=4):
+    """Monitor the winner, its score challenger, and active fresh finalists."""
+    scores = np.asarray(scores, dtype=np.float64)
+    counts = np.asarray(final_counts, dtype=np.float64)
+    if scores.size == 0 or counts.size != scores.size:
+        return ()
+    indices = []
+    for value in (winner, challenger):
+        if value is not None and 0 <= int(value) < scores.size and int(value) not in indices:
+            indices.append(int(value))
+    # Add the most visited finalists in the active SH pass, resolving visit
+    # ties by score. Low-scoring legal actions outside this bounded set do not
+    # block an early stop, while the best score challenger above always does.
+    order = np.lexsort((-scores, -counts))
+    for value in order:
+        value = int(value)
+        if counts[value] <= 0.0 or value in indices:
+            continue
+        indices.append(value)
+        if len(indices) >= max(1, int(limit)):
+            break
+    return tuple(indices[:max(1, int(limit))])
+
+
+def _adaptive_stop_checkpoint_evidence(
+    fresh_visits,
+    monitor_indices,
+    winner,
+    challenger,
+    state,
+):
+    """Summarize one checkpoint using only new visits to monitored finalists."""
+    fresh_visits = np.asarray(fresh_visits, dtype=np.float64)
+    monitor_indices = tuple(int(index) for index in monitor_indices)
+    previous_visits = state.get('_adaptive_stop_checkpoint_fresh_visits')
+    if previous_visits is None:
+        deltas = fresh_visits.copy()
+    else:
+        deltas = np.maximum(
+            0.0,
+            fresh_visits - np.asarray(previous_visits, dtype=np.float64),
+        )
+    signature = (
+        int(winner),
+        int(challenger),
+        tuple(sorted(monitor_indices)),
+    )
+    has_new_evidence = bool(monitor_indices) and all(
+        index >= 0
+        and index < deltas.size
+        and deltas[index] >= 1.0
+        for index in monitor_indices
+    )
+    previous_signature = state.get('_adaptive_stop_finalist_signature')
+    if has_new_evidence:
+        checkpoints = (
+            int(state.get('_adaptive_stop_evidence_checkpoints', 0)) + 1
+            if signature == previous_signature
+            else 1
+        )
+    else:
+        checkpoints = 0
+    return {
+        'fresh_visits_snapshot': fresh_visits.copy(),
+        'checkpoint_deltas': deltas.copy(),
+        'finalist_signature': signature,
+        'has_new_evidence': has_new_evidence,
+        'stable_checkpoints': checkpoints,
+    }
 
 
 def _dynamic_budget_uncertainty_score(
@@ -2893,6 +3012,14 @@ class MultiGameBatchMCTS:
         self.gumbel_eval_scale = max(0.0, float(rl_cfg.get('mcts_gumbel_eval_scale', 0.0)))
         self.gumbel_c_visit = max(0.0, float(rl_cfg.get('mcts_gumbel_c_visit', 100.0)))
         self.gumbel_c_scale = max(0.0, float(rl_cfg.get('mcts_gumbel_c_scale', 0.10)))
+        self.gumbel_q_scale_visit_knee = max(
+            1e-8,
+            float(rl_cfg.get('mcts_gumbel_q_scale_visit_knee', 256.0)),
+        )
+        self.gumbel_q_scale_visit_exponent = min(
+            1.0,
+            max(0.0, float(rl_cfg.get('mcts_gumbel_q_scale_visit_exponent', 1.0))),
+        )
         self.gumbel_q_range_floor = max(
             1e-8,
             float(rl_cfg.get('mcts_gumbel_q_range_floor', 0.25)),
@@ -4600,10 +4727,25 @@ class MultiGameBatchMCTS:
             else np.asarray(scale_visit_counts, dtype=np.float64)
         )
         max_visit = float(np.max(scale_visits)) if scale_visits.size else 0.0
-        scale = (self.gumbel_c_visit + max_visit) * self.gumbel_c_scale
+        scale = self._gumbel_q_visit_scale(max_visit)
         scaled = edges.q_score_scratch
         np.multiply(completed, scale, out=scaled)
         return scaled
+
+    def _gumbel_q_visit_scale(self, max_visits):
+        """Return the Q multiplier for a node's maximum scaling visit count.
+
+        Exponent 1 exactly reproduces the historical linear ``c_visit + N``
+        schedule. Lower exponents preserve the linear schedule through the
+        knee, then make additional visits increase Q confidence more slowly.
+        """
+        return gumbel_q_scale(
+            self.gumbel_c_visit,
+            self.gumbel_c_scale,
+            max_visits,
+            self.gumbel_q_scale_visit_knee,
+            self.gumbel_q_scale_visit_exponent,
+        )
 
     def _gumbel_improved_policy(self, node, scale_visit_counts=None):
         """Policy target softmax(log prior + completed Q), without root Gumbel."""
@@ -4639,6 +4781,8 @@ class MultiGameBatchMCTS:
                 max_visit,
                 self.gumbel_c_visit,
                 self.gumbel_c_scale,
+                self.gumbel_q_scale_visit_knee,
+                self.gumbel_q_scale_visit_exponent,
                 probs,
             )
             if use_cache:
@@ -4690,6 +4834,10 @@ class MultiGameBatchMCTS:
         np.subtract(source, initial, out=scratch)
         np.maximum(scratch, 0.0, out=scratch)
         return scratch
+
+    def _adaptive_stop_decision(self, evidence, state):
+        """Use cautious fresh-evidence guard; diagnostic runs may override per engine."""
+        return _adaptive_gumbel_stop_decision(evidence, state, mode='cautious')
 
     def _gumbel_policy_target(self, improved_policy):
         """Temperature-scale only the training target, not action selection."""
@@ -4810,6 +4958,8 @@ class MultiGameBatchMCTS:
                 considered_visit,
                 self.gumbel_c_visit,
                 self.gumbel_c_scale,
+                self.gumbel_q_scale_visit_knee,
+                self.gumbel_q_scale_visit_exponent,
                 apply_virtual_loss,
                 self.gumbel_reuse_q_scale == 'total',
             )
@@ -4861,7 +5011,7 @@ class MultiGameBatchMCTS:
             state.get('_q_score_version') != edges.stats_version
             or state.get('_q_score_max_visit') != max_q_scale_visits
         ):
-            scale = (self.gumbel_c_visit + max_q_scale_visits) * self.gumbel_c_scale
+            scale = self._gumbel_q_visit_scale(max_q_scale_visits)
             np.multiply(
                 self._gumbel_normalized_completed_qvalues(node),
                 scale,
@@ -4926,6 +5076,8 @@ class MultiGameBatchMCTS:
                     final_visit_threshold,
                     self.gumbel_c_visit,
                     self.gumbel_c_scale,
+                    self.gumbel_q_scale_visit_knee,
+                    self.gumbel_q_scale_visit_exponent,
                     self.gumbel_reuse_q_scale == 'total',
                 )
             return native.final_action(
@@ -4936,6 +5088,8 @@ class MultiGameBatchMCTS:
                 edges.visit_counts,
                 self.gumbel_c_visit,
                 self.gumbel_c_scale,
+                self.gumbel_q_scale_visit_knee,
+                self.gumbel_q_scale_visit_exponent,
                 self.gumbel_reuse_q_scale == 'total',
             )
 
@@ -5610,6 +5764,8 @@ class MultiGameBatchMCTS:
                         [],
                         c_visit=self.gumbel_c_visit,
                         c_scale=self.gumbel_c_scale,
+                        q_scale_visit_knee=self.gumbel_q_scale_visit_knee,
+                        q_scale_visit_exponent=self.gumbel_q_scale_visit_exponent,
                         q_range_floor=self.gumbel_q_range_floor,
                         use_mixed_value=self.gumbel_use_mixed_value,
                     )
@@ -6370,6 +6526,11 @@ class MultiGameBatchMCTS:
                 '_adaptive_q_gap': 0.0,
                 '_adaptive_score_gap': None,
                 '_adaptive_challenger': None,
+                '_adaptive_stop_evidence_checkpoints': 0,
+                '_adaptive_stop_monitor_indices': (),
+                '_adaptive_stop_monitor_visits': (),
+                '_adaptive_stop_checkpoint_deltas': (),
+                '_adaptive_stop_finalist_signature': (),
                 '_adaptive_uncertainty_score': 0.0,
                 '_adaptive_uncertainty_rank': 0.0,
                 '_adaptive_transferred_in': 0,
@@ -6728,13 +6889,11 @@ class MultiGameBatchMCTS:
                 )
                 state['_adaptive_fresh_floor'] = int(base_floor)
                 action_visits = int(round(float(fresh_visits.sum())))
-                if (
+                legacy_ready = bool(
                     dynamic_budget_feedback_active
-                    and
-                    action_visits >= int(base_floor)
+                    and action_visits >= int(base_floor)
                     and stable_checkpoints >= 2
                     and score_gap >= 0.0
-                    and q_gap >= _DYNAMIC_BUDGET_EARLY_STOP_Q_GAP
                     and (
                         winner_leaf_count >= _DYNAMIC_BUDGET_MIN_FRESH_LEAVES_PER_FINALIST
                         or winner_exact_count > 0
@@ -6743,9 +6902,58 @@ class MultiGameBatchMCTS:
                         challenger_leaf_count >= _DYNAMIC_BUDGET_MIN_FRESH_LEAVES_PER_FINALIST
                         or challenger_exact_count > 0
                     )
-                ):
+                )
+
+                monitor_indices = _adaptive_stop_monitor_indices(
+                    scores,
+                    final_counts,
+                    winner,
+                    challenger,
+                )
+                checkpoint = _adaptive_stop_checkpoint_evidence(
+                    fresh_visits,
+                    monitor_indices,
+                    winner,
+                    challenger,
+                    state,
+                )
+                checkpoint_deltas = checkpoint['checkpoint_deltas']
+                finalist_signature = checkpoint['finalist_signature']
+                new_finalist_evidence = checkpoint['has_new_evidence']
+                state['_adaptive_stop_evidence_checkpoints'] = checkpoint[
+                    'stable_checkpoints'
+                ]
+                state['_adaptive_stop_checkpoint_fresh_visits'] = checkpoint[
+                    'fresh_visits_snapshot'
+                ]
+                state['_adaptive_stop_finalist_signature'] = finalist_signature
+                state['_adaptive_stop_monitor_indices'] = tuple(
+                    int(value) for value in monitor_indices
+                )
+                state['_adaptive_stop_monitor_visits'] = tuple(
+                    int(round(float(fresh_visits[index])))
+                    for index in monitor_indices
+                )
+                state['_adaptive_stop_checkpoint_deltas'] = tuple(
+                    int(round(float(checkpoint_deltas[index])))
+                    for index in monitor_indices
+                )
+
+                stop_evidence = {
+                    'legacy_ready': legacy_ready,
+                    'q_gap': q_gap,
+                    'target_budget': max(1, int(math.ceil(float(dynamic_target)))),
+                    'legacy_fresh_floor': int(base_floor),
+                    'fresh_visits': fresh_visits,
+                    'monitor_indices': monitor_indices,
+                    'new_fresh_finalist_evidence': new_finalist_evidence,
+                }
+                if self._adaptive_stop_decision(stop_evidence, state):
                     state['_adaptive_early_stopped'] = True
-                    state['_adaptive_stop_reason'] = 'stable_gumbel_winner_q_gap'
+                    state['_adaptive_stop_reason'] = state.get(
+                        '_adaptive_stop_decision_reason',
+                        'stable_gumbel_winner_q_gap',
+                    )
                     removed = max(0, int(remaining[idx]))
                     remaining[idx] = 0
                     removed_total += removed
@@ -7571,6 +7779,41 @@ class MultiGameBatchMCTS:
                     if dynamic_budget_feedback_active
                     and gumbel_root_states[idx] is not None else None
                 ),
+                'dynamic_budget_stop_evidence_checkpoints': (
+                    int(gumbel_root_states[idx].get(
+                        '_adaptive_stop_evidence_checkpoints', 0
+                    ))
+                    if dynamic_budget_feedback_active
+                    and gumbel_root_states[idx] is not None else None
+                ),
+                'dynamic_budget_stop_monitor_indices': (
+                    list(gumbel_root_states[idx].get(
+                        '_adaptive_stop_monitor_indices', ()
+                    ))
+                    if dynamic_budget_feedback_active
+                    and gumbel_root_states[idx] is not None else None
+                ),
+                'dynamic_budget_stop_monitor_fresh_visits': (
+                    list(gumbel_root_states[idx].get(
+                        '_adaptive_stop_monitor_visits', ()
+                    ))
+                    if dynamic_budget_feedback_active
+                    and gumbel_root_states[idx] is not None else None
+                ),
+                'dynamic_budget_stop_checkpoint_fresh_deltas': (
+                    list(gumbel_root_states[idx].get(
+                        '_adaptive_stop_checkpoint_deltas', ()
+                    ))
+                    if dynamic_budget_feedback_active
+                    and gumbel_root_states[idx] is not None else None
+                ),
+                'dynamic_budget_stop_finalist_signature': (
+                    gumbel_root_states[idx].get(
+                        '_adaptive_stop_finalist_signature'
+                    )
+                    if dynamic_budget_feedback_active
+                    and gumbel_root_states[idx] is not None else None
+                ),
                 'dynamic_budget_fresh_floor': (
                     int(gumbel_root_states[idx].get('_adaptive_fresh_floor', dynamic_minimum))
                     if dynamic_budget_feedback_active and gumbel_root_states[idx] is not None
@@ -7709,6 +7952,12 @@ class MultiGameBatchMCTS:
                 else 0
             )
             metadata['mcts_gumbel_reuse_q_scale'] = self.gumbel_reuse_q_scale
+            metadata['mcts_gumbel_q_scale_visit_knee'] = float(
+                self.gumbel_q_scale_visit_knee
+            )
+            metadata['mcts_gumbel_q_scale_visit_exponent'] = float(
+                self.gumbel_q_scale_visit_exponent
+            )
             reuse_quality = tree_reuse_quality[idx]
             metadata['tree_reuse_quality'] = float(reuse_quality['quality'])
             metadata['tree_reuse_candidate_coverage'] = float(
@@ -7796,12 +8045,12 @@ class MultiGameBatchMCTS:
                 selection_scores = root.edges.log_base_priors.astype(np.float64, copy=True)
                 selection_scores -= float(np.max(selection_scores))
                 selection_scores += np.asarray(gumbel_state['gumbel'], dtype=np.float64)
-                selection_scores += normalized_completed_q * (
-                    (
-                        self.gumbel_c_visit
-                        + float(np.max(self._gumbel_root_q_scale_visit_counts(root, gumbel_state)))
-                    )
-                    * self.gumbel_c_scale
+                q_scale_visits = self._gumbel_root_q_scale_visit_counts(
+                    root,
+                    gumbel_state,
+                )
+                selection_scores += normalized_completed_q * self._gumbel_q_visit_scale(
+                    float(np.max(q_scale_visits)) if q_scale_visits.size else 0.0
                 )
                 final_visit_counts = _gumbel_final_visit_counts(root, gumbel_state)
                 eligible, _ = _gumbel_final_action_eligibility(final_visit_counts)
@@ -7874,6 +8123,12 @@ class MultiGameBatchMCTS:
                     self.gumbel_scale if add_root_noise else self.gumbel_eval_scale
                 )
                 metadata['gumbel_q_range_floor'] = float(self.gumbel_q_range_floor)
+                metadata['gumbel_q_scale_visit_knee'] = float(
+                    self.gumbel_q_scale_visit_knee
+                )
+                metadata['gumbel_q_scale_visit_exponent'] = float(
+                    self.gumbel_q_scale_visit_exponent
+                )
                 metadata['gumbel_target_temperature'] = float(self.gumbel_target_temperature)
                 if selected_move is not None:
                     metadata['selected_move_override'] = selected_move

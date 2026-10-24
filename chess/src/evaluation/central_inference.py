@@ -108,6 +108,7 @@ class CentralInferenceSession:
         self.rank_base = int(rank_base)
 
         self._session = None
+        self._last_diagnostic_messages: list[dict[str, Any]] = []
         self._rank_lock = threading.Lock()
         self._thread_ranks: dict[int, int] = {}
         self._next_rank = 0
@@ -408,6 +409,20 @@ class CentralInferenceSession:
                         process.join(timeout=0.5)
             with contextlib.suppress(Exception):
                 process.close()
+
+        diagnostic_messages = []
+        for control_queue in session.get("control_queues", []) or []:
+            while True:
+                try:
+                    message = control_queue.get_nowait()
+                except queue.Empty:
+                    break
+                except (EOFError, OSError, ValueError):
+                    break
+                if isinstance(message, dict):
+                    diagnostic_messages.append(dict(message))
+        session["diagnostic_messages"] = diagnostic_messages
+        self._last_diagnostic_messages = diagnostic_messages
 
         for queue_obj in list(session.get("request_queues", []) or []) + list(session.get("control_queues", []) or []):
             with contextlib.suppress(Exception):

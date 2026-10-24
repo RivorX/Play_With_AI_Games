@@ -1,0 +1,36 @@
+# Full-game paired Gumbel budget comparison. This file configures the
+# benchmark only; Elo/search behavior comes from the normal project config.
+runtime_config: null
+
+benchmark:
+  checkpoint: models/RL/v9.9b_latest.pt
+  baseline_simulations: 192
+  simulations: [384, 768, 1536]
+  games_per_profile: 20
+  opening_suite: elo_first_10
+  # Parallel Elo clients; override with --workers auto to use Elo's auto mode.
+  workers: 4
+  search_overrides: {}
+  # Benchmark-only override: use the Elo central model with validated v9 hot
+  # batch shapes. The shared runner disables central compile when graph capture
+  # is enabled; ordinary Elo defaults remain unchanged.
+  central_inference_overrides:
+    cuda_graph_forward_enabled: true
+    cuda_graph_forward_min_observations: 4
+    cuda_graph_forward_hot_shapes:
+      se_cnn_v9: [2, 5, 6, 8, 11, 14, 17, 18]
+    profile_cuda_graphs: true
+  # Optional experiments can override search settings per profile. Leave this
+  # commented to compare simulation budgets only.
+  # variants:
+  #   - name: 384-soft-q
+  #     simulations: 384
+  #     config_overrides:
+  #       reinforcement_learning:
+  #         search:
+  #           gumbel_q_scale_visit_exponent: 0.5
+  #   - name: 768-linear-q
+  #     simulations: 768
+  #     config_overrides: {}
+  output_dir: logs/benchmark/gumbel_scaling_20games_20261024
+  resume: false

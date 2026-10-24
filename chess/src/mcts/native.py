@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 from filelock import FileLock
 
-_API_VERSION = 16
+_API_VERSION = 17
 _INSTANCE = None
 _LOAD_ATTEMPTED = False
 _INSTANCE_LOCK = threading.Lock()
@@ -179,26 +179,29 @@ class NativeMCTSKernels:
         lib.mcts_completed_q.restype = ctypes.c_int32
         lib.mcts_improved_policy.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
-            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_void_p,
+            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            ctypes.c_double, ctypes.c_void_p,
         ]
         lib.mcts_improved_policy.restype = ctypes.c_int32
         lib.mcts_select_root.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int32, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            ctypes.c_double, ctypes.c_double,
             ctypes.c_int32, ctypes.c_int32,
         ]
         lib.mcts_select_root.restype = ctypes.c_int32
         lib.mcts_final_action.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_int32, ctypes.c_double, ctypes.c_double,
-            ctypes.c_int32,
+            ctypes.c_double, ctypes.c_double, ctypes.c_int32,
         ]
         lib.mcts_final_action.restype = ctypes.c_int32
         lib.mcts_final_action_eligible.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32, ctypes.c_double,
-            ctypes.c_double, ctypes.c_double, ctypes.c_int32,
+            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            ctypes.c_int32,
         ]
         lib.mcts_final_action_eligible.restype = ctypes.c_int32
         lib.mcts_soften_policy.argtypes = [
@@ -207,7 +210,8 @@ class NativeMCTSKernels:
         lib.mcts_soften_policy.restype = ctypes.c_int32
 
         lib.mcts_forest_create.argtypes = [
-            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_int32,
+            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            ctypes.c_double, ctypes.c_int32,
             ctypes.c_int32, ctypes.c_int32,
         ]
         lib.mcts_forest_create.restype = ctypes.c_void_p
@@ -436,11 +440,14 @@ class NativeMCTSKernels:
         max_visit: float,
         c_visit: float,
         c_scale: float,
+        q_scale_visit_knee: float,
+        q_scale_visit_exponent: float,
         output: np.ndarray,
     ) -> None:
         status = self._library.mcts_improved_policy(
             _pointer(log_priors), _pointer(priors), _pointer(completed_q),
-            log_priors.size, max_visit, c_visit, c_scale, _pointer(output),
+            log_priors.size, max_visit, c_visit, c_scale,
+            q_scale_visit_knee, q_scale_visit_exponent, _pointer(output),
         )
         if status != 0:
             raise RuntimeError(f"mcts_improved_policy failed with status {status}")
@@ -458,6 +465,8 @@ class NativeMCTSKernels:
         considered_visit: float,
         c_visit: float,
         c_scale: float,
+        q_scale_visit_knee: float,
+        q_scale_visit_exponent: float,
         apply_virtual_loss: bool,
         q_scale_total_visits: bool = False,
     ) -> int:
@@ -466,7 +475,8 @@ class NativeMCTSKernels:
             _pointer(initial_visits), _pointer(pass_initial_visits),
             _pointer(visits), _pointer(total_counts), _pointer(virtual_losses),
             log_priors.size, considered_visit,
-            c_visit, c_scale, int(apply_virtual_loss), int(q_scale_total_visits),
+            c_visit, c_scale, q_scale_visit_knee, q_scale_visit_exponent,
+            int(apply_virtual_loss), int(q_scale_total_visits),
         ))
 
     def final_action_eligible(
@@ -480,13 +490,16 @@ class NativeMCTSKernels:
         final_visit_threshold: float,
         c_visit: float,
         c_scale: float,
+        q_scale_visit_knee: float,
+        q_scale_visit_exponent: float,
         q_scale_total_visits: bool = False,
     ) -> int:
         return int(self._library.mcts_final_action_eligible(
             _pointer(log_priors), _pointer(gumbel), _pointer(completed_q),
             _pointer(initial_visits), _pointer(pass_initial_visits),
             _pointer(visits), log_priors.size, float(final_visit_threshold),
-            c_visit, c_scale, int(q_scale_total_visits),
+            c_visit, c_scale, q_scale_visit_knee, q_scale_visit_exponent,
+            int(q_scale_total_visits),
         ))
 
     def final_action(
@@ -498,12 +511,15 @@ class NativeMCTSKernels:
         visits: np.ndarray,
         c_visit: float,
         c_scale: float,
+        q_scale_visit_knee: float,
+        q_scale_visit_exponent: float,
         q_scale_total_visits: bool = False,
     ) -> int:
         return int(self._library.mcts_final_action(
             _pointer(log_priors), _pointer(gumbel), _pointer(completed_q),
             _pointer(initial_visits), _pointer(visits), log_priors.size,
-            c_visit, c_scale, int(q_scale_total_visits),
+            c_visit, c_scale, q_scale_visit_knee, q_scale_visit_exponent,
+            int(q_scale_total_visits),
         ))
 
     def soften_policy(
@@ -524,6 +540,8 @@ class NativeMCTSKernels:
         *,
         c_visit: float,
         c_scale: float,
+        q_scale_visit_knee: float,
+        q_scale_visit_exponent: float,
         q_range_floor: float,
         use_mixed_value: bool,
     ):
@@ -532,6 +550,8 @@ class NativeMCTSKernels:
             roots,
             c_visit=c_visit,
             c_scale=c_scale,
+            q_scale_visit_knee=q_scale_visit_knee,
+            q_scale_visit_exponent=q_scale_visit_exponent,
             q_range_floor=q_range_floor,
             use_mixed_value=use_mixed_value,
         )
@@ -546,6 +566,8 @@ class NativeMCTSForest:
         *,
         c_visit: float,
         c_scale: float,
+        q_scale_visit_knee: float,
+        q_scale_visit_exponent: float,
         q_range_floor: float,
         use_mixed_value: bool,
     ):
@@ -554,6 +576,8 @@ class NativeMCTSForest:
         self._context = self._lib.mcts_forest_create(
             float(c_visit),
             float(c_scale),
+            float(q_scale_visit_knee),
+            float(q_scale_visit_exponent),
             float(q_range_floor),
             int(bool(use_mixed_value)),
             4096,

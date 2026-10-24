@@ -9,7 +9,6 @@ from src.evaluation.elo_estimator import (
     _EVAL_OPENING_LINES,
     _EVAL_OPENING_SUITE_ID,
     _available_cpu_count,
-    estimate_model_elo,
 )
 from src.models.catalog import persist_checkpoint_elo_metadata
 
@@ -588,6 +587,130 @@ def build_eval_elo_config(
     return runtime_cfg
 
 
+def build_eval_elo_runtime_config(
+    config: dict,
+    elo_cfg: dict,
+    *,
+    device,
+    use_mcts: bool,
+    simulations: int,
+    workers=None,
+    budget_mode: str = "simulations",
+    time_limit_seconds=None,
+    levels=None,
+    games_per_level=None,
+    sf_time=None,
+    max_moves=None,
+    sf_path=None,
+) -> dict:
+    """Build the exact mode-specific runtime policy used by ``eval_elo``.
+
+    Keep search schedule, adaptive-budget routing, worker resolution and the
+    central-inference decision in one place so reusable evaluation tools can
+    share the same contract instead of recreating a subtly different path.
+    """
+    elo_cfg = dict(elo_cfg or {})
+    runtime_cfg = build_eval_elo_config(
+        elo_cfg,
+        levels=levels,
+        games_per_level=games_per_level,
+        use_mcts=use_mcts,
+        simulations=simulations,
+        budget_mode=budget_mode,
+        time_limit_seconds=time_limit_seconds,
+        sf_time=sf_time,
+        max_moves=max_moves,
+        sf_path=sf_path,
+        workers=resolve_eval_workers(workers, use_mcts, elo_cfg),
+        standalone=True,
+    )
+
+    rl_config = (config or {}).get("reinforcement_learning", {}) or {}
+    search_config = rl_config.get("search", {}) or {}
+    runtime_cfg["mcts_gumbel_root_schedule"] = str(
+        rl_config.get(
+            "mcts_gumbel_root_schedule",
+            search_config.get("gumbel_root_schedule", "standard"),
+        )
+    )
+    runtime_cfg["search_efficiency_feedback_enabled"] = bool(
+        ((config or {}).get("inference", {}) or {}).get(
+            "search_efficiency_feedback_enabled", False
+        )
+    )
+
+    budget_mode = str(budget_mode or "simulations").strip().lower()
+    if use_mcts and budget_mode == "simulations":
+        runtime_cfg["mcts_dynamic_budget_enabled"] = bool(
+            rl_config.get("mcts_dynamic_budget_enabled", False)
+        )
+        runtime_cfg["mcts_dynamic_budget_strategy"] = str(
+            rl_config.get("mcts_dynamic_budget_strategy", "feedback") or "feedback"
+        ).strip().lower()
+        runtime_cfg["mcts_dynamic_budget_min"] = int(
+            rl_config.get("mcts_dynamic_budget_min", 64)
+        )
+        runtime_cfg["mcts_dynamic_budget_max_multiplier"] = float(
+            rl_config.get("mcts_dynamic_budget_max_multiplier", 5.0 / 3.0)
+        )
+        runtime_cfg["eval_elo_central_inference_enabled"] = bool(
+            rl_config.get("eval_elo_central_inference_enabled", True)
+        )
+        central_dynamic = bool(
+            runtime_cfg["mcts_dynamic_budget_enabled"]
+            and runtime_cfg["mcts_dynamic_budget_strategy"] == "feedback"
+            and getattr(device, "type", None) == "cuda"
+            and int(runtime_cfg.get("workers", 1) or 1) > 1
+            and runtime_cfg["eval_elo_central_inference_enabled"]
+        )
+        runtime_cfg["mcts_dynamic_budget_inference"] = (
+            "central" if central_dynamic else "local"
+        )
+    elif use_mcts and budget_mode == "time" and runtime_cfg[
+        "search_efficiency_feedback_enabled"
+    ]:
+        runtime_cfg["mcts_dynamic_budget_enabled"] = bool(
+            rl_config.get("mcts_dynamic_budget_enabled", False)
+        )
+        runtime_cfg["mcts_dynamic_budget_strategy"] = str(
+            rl_config.get("mcts_dynamic_budget_strategy", "feedback") or "feedback"
+        ).strip().lower()
+
+    if use_mcts and budget_mode == "time":
+        central = bool(
+            getattr(device, "type", None) == "cuda"
+            and int(runtime_cfg.get("workers", 1) or 1) > 1
+            and runtime_cfg.get("eval_elo_central_inference_enabled", False)
+        )
+        batched_roots = bool(runtime_cfg.get("batch_model_moves", True))
+        runtime_cfg["mcts_time_search_central_inference"] = central
+        runtime_cfg["mcts_time_search_batch_model_moves"] = batched_roots
+        runtime_cfg["mcts_time_search_style"] = (
+            "central_inference"
+            if central
+            else "batched_roots"
+            if batched_roots
+            else "independent_roots"
+        )
+    return runtime_cfg
+
+
+def create_elo_estimator(model, config: dict, device, elo_config: dict, *, stop_event=None):
+    """Create the shared Elo runtime used by the CLI and benchmark module."""
+    # Import locally to keep the runner's helper imports acyclic.
+    from src.evaluation.elo_estimator import EloEstimator
+
+    resolved = dict(elo_config or {})
+    return EloEstimator(
+        model,
+        config,
+        device,
+        resolved.get("stockfish_path", "stockfish"),
+        stop_event=stop_event,
+        elo_config=resolved,
+    )
+
+
 def build_il_periodic_elo_config(elo_cfg: dict) -> dict:
     """IL epoch checks use Raw NN settings and keep training-friendly CPU limits."""
     resolved = build_eval_elo_config(
@@ -693,7 +816,22 @@ def run_elo_check(model, config: dict, device, elo_config: dict, *, stop_event=N
         )
     else:
         resolved.pop("mcts_move_time_seconds", None)
-    return estimate_model_elo(model, config, device, resolved, stop_event=stop_event)
+    estimator = create_elo_estimator(
+        model,
+        config,
+        device,
+        resolved,
+        stop_event=stop_event,
+    )
+    return estimator.estimate(
+        levels=None,
+        games_per_level=resolved.get("games_per_level"),
+        stockfish_time_limit=resolved.get("stockfish_time_limit", 0.05),
+        max_moves=resolved.get("max_moves", 150),
+        use_mcts=resolved.get("use_mcts", False),
+        simulations=resolved.get("mcts_simulations", 100),
+        workers=resolved.get("workers", 0),
+    )
 
 
 def persist_estimated_elo(

@@ -1842,6 +1842,8 @@ class ChessGUI:
             engine_fields = {
                 "mcts_gumbel_c_visit": "gumbel_c_visit",
                 "mcts_gumbel_c_scale": "gumbel_c_scale",
+                "mcts_gumbel_q_scale_visit_knee": "gumbel_q_scale_visit_knee",
+                "mcts_gumbel_q_scale_visit_exponent": "gumbel_q_scale_visit_exponent",
                 "mcts_gumbel_max_considered_actions": "gumbel_max_considered_actions",
                 "mcts_gumbel_scale": "gumbel_scale",
                 "mcts_gumbel_eval_scale": "gumbel_eval_scale",
