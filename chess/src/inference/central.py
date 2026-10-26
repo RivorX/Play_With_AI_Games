@@ -627,6 +627,167 @@ def _central_inference_option(config, key, default=None):
     return shared_cfg.get(key, default)
 
 
+def _central_pinned_staging_active(config_enabled, device_type):
+    """Pinned input staging is a CUDA-only optimization."""
+    return bool(config_enabled and str(device_type) == 'cuda')
+
+
+class _DeferredCentralOutput:
+    """Own one async D2H result until its response is safely published."""
+
+    def __init__(self, record_stage_stats):
+        self._record_stage_stats = record_stage_stats
+        self._stage = None
+        self._next_slot = 0
+
+    @property
+    def pending(self):
+        return self._stage is not None
+
+    @property
+    def stage(self):
+        return self._stage
+
+    def next_slot(self):
+        slot = self._next_slot
+        self._next_slot ^= 1
+        return slot
+
+    def finalize(self):
+        if self._stage is None:
+            return None
+        stage = self._stage
+        try:
+            stats = stage['finalize']()
+            self._record_stage_stats(
+                stats,
+                time.perf_counter() - stage['started_at'],
+            )
+            return stats
+        finally:
+            self._stage = None
+
+    def take_queued_request(self, request_queue):
+        """Use existing queue work to hide output latency; never block for it."""
+        if self._stage is None:
+            return False, None
+        if not self._stage.get('early_publish_safe', False):
+            self.finalize()
+            return False, None
+        try:
+            return True, request_queue.get_nowait()
+        except queue.Empty:
+            self.finalize()
+            return False, None
+
+    def finish_before_request(self, request):
+        """Enforce output ownership and model control barriers."""
+        if self._stage is not None and (
+            not self._stage.get('early_publish_safe', False)
+            or str(request.get('cmd', '')) != 'infer'
+        ):
+            self.finalize()
+
+    def finalize_if_ready(self):
+        """Publish an already-completed event without stalling the GPU stream."""
+        if self._stage is None or not self._stage.get('early_publish_safe', False):
+            return False
+        try:
+            ready = bool(self._stage['ready']())
+        except Exception:
+            # Retain the synchronize-and-publish fallback when event query is
+            # unavailable on a CUDA runtime.
+            ready = False
+        self._stage['mark_ready'](ready)
+        if ready:
+            self.finalize()
+        return ready
+
+    def complete_launch(self, launched, started_at):
+        """Release the prior slot after launch, then retain the new output."""
+        if self._stage is not None:
+            self.finalize()
+        finalize = launched.get('deferred_finalize')
+        if finalize is None:
+            self._record_stage_stats(
+                launched,
+                time.perf_counter() - started_at,
+            )
+            return
+        self._stage = {
+            'finalize': finalize,
+            'ready': launched['deferred_ready'],
+            'mark_ready': launched['mark_deferred_ready'],
+            'early_publish_safe': bool(launched.get('early_publish_safe', False)),
+            'started_at': started_at,
+        }
+
+
+class _PinnedInputTransferLease:
+    """Keep pinned host inputs alive and immutable until their H2D copy ends."""
+
+    @staticmethod
+    def _storage_key(tensor):
+        if tensor is None or not bool(getattr(tensor, 'is_pinned', lambda: False)()):
+            return None
+        try:
+            return int(tensor.untyped_storage().data_ptr())
+        except Exception:
+            return int(tensor.data_ptr())
+
+    def __init__(self):
+        self._events = {}
+
+    def wait_before_overwrite(self, tensor):
+        key = self._storage_key(tensor)
+        if key is None:
+            return False
+        event = self._events.get(key)
+        if event is None:
+            return False
+        event.synchronize()
+        return True
+
+    def release(self, tensor):
+        key = self._storage_key(tensor)
+        if key is None:
+            return False
+        event = self._events.pop(key, None)
+        if event is None:
+            return False
+        event.synchronize()
+        return True
+
+    def record_transfer(self, tensor, stream, event_factory):
+        key = self._storage_key(tensor)
+        if key is None:
+            return False
+        event = self._events.get(key)
+        if event is None:
+            event = event_factory()
+        try:
+            event.record(stream)
+        except Exception:
+            # If the completion fence cannot be recorded, wait on the stream
+            # before allowing the caller to reuse the pinned allocation.
+            stream.synchronize()
+            raise
+        self._events[key] = event
+        return True
+
+    def synchronize_all(self):
+        events, self._events = self._events, {}
+        first_error = None
+        for event in events.values():
+            try:
+                event.synchronize()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+
 def _resolve_inference_cache_settings(config):
     """Resolve the shared inference cache's generic enable and capacity settings."""
     return (
@@ -718,12 +879,7 @@ def _prioritize_central_inference_process():
 
 
 def _central_compile_batch_buckets(max_batch):
-    """Return a small fixed shape set for compiled central inference.
-
-    CUDAGraph records one graph per observed batch shape. Keeping at most eight
-    shapes avoids graph proliferation while retaining dense buckets around the
-    measured self-play operating range (roughly 250-320 positions).
-    """
+    """Return the production fixed shape set for compiled central inference."""
     max_batch = max(1, int(max_batch))
     if max_batch <= 64:
         # Elo/eval servers run much smaller groups; retaining 1/8/16 avoids
@@ -881,6 +1037,8 @@ def central_inference_server(
     control_queue=None,
     server_rank=None,
     shared_buffers=None,
+    *,
+    _compile_batch_buckets_override=None,
 ):
     """Own GPU inference and batch requests coming from self-play workers."""
     rl_cfg = config.get('reinforcement_learning', {})
@@ -899,11 +1057,24 @@ def central_inference_server(
     )
     quiet_startup = True
     central_use_compile = bool(_central_inference_option(config, 'use_compile', False))
-    compile_batch_buckets = (
-        _central_compile_batch_buckets(max_batch)
-        if central_use_compile
-        else ()
-    )
+    if central_use_compile:
+        if _compile_batch_buckets_override is None:
+            compile_batch_buckets = _central_compile_batch_buckets(max_batch)
+        else:
+            compile_batch_buckets = tuple(sorted({
+                int(batch_size)
+                for batch_size in _compile_batch_buckets_override
+            }))
+            if not compile_batch_buckets or any(
+                batch_size < 1 or batch_size > max_batch
+                for batch_size in compile_batch_buckets
+            ):
+                raise ValueError(
+                    "Central inference compile bucket override must contain sizes "
+                    f"between 1 and max_batch_size={max_batch}."
+                )
+    else:
+        compile_batch_buckets = ()
     auto_batch_enabled = bool(
         _central_inference_option(config, 'auto_batch_size', True)
     )
@@ -952,7 +1123,7 @@ def central_inference_server(
     evaluation_generation_publisher.initialize(server_incarnation)
     batch_controller = _AdaptiveBatchController(
         max_batch=max_batch,
-        compile_buckets=_central_compile_batch_buckets(max_batch),
+        compile_buckets=compile_batch_buckets,
         worker_count=(
             len(shared_arrays_by_rank)
             or (len(response_queues) if response_queues is not None else 1)
@@ -979,10 +1150,12 @@ def central_inference_server(
         min_saved_rate=cache_min_saved_rate,
         cooldown_positions=cache_reprobe_cooldown_positions,
     )
-    pinned_staging_enabled = bool(
+    pinned_staging_requested = bool(
         _central_inference_option(config, 'pinned_staging_enabled', False)
     )
+    pinned_staging_enabled = False
     pinned_staging = {}
+    pinned_input_lease = _PinnedInputTransferLease()
     gpu_input_buffers = {}
     prepare_executor = None
     central_use_bfloat16 = bool(_central_inference_option(
@@ -991,10 +1164,15 @@ def central_inference_server(
         config.get('hardware', {}).get('use_bfloat16', False),
     ))
     central_amp_dtype = torch.bfloat16 if central_use_bfloat16 else torch.float16
+    deferred_output = None
 
     try:
         _prioritize_central_inference_process()
         device = _configure_selfplay_worker_runtime(config, device_id)
+        pinned_staging_enabled = _central_pinned_staging_active(
+            pinned_staging_requested,
+            device.type,
+        )
         cuda_graph_forward_enabled = (
             cuda_graph_forward_enabled and device.type == 'cuda'
         )
@@ -1468,6 +1646,11 @@ def central_inference_server(
             torch_dtype = torch.float16 if np_dtype == np.float16 else torch.float32
             key = (str(name), np_dtype.str, tuple(trailing_shape))
             tensor = pinned_staging.get(key)
+            if tensor is not None:
+                if int(tensor.shape[0]) < int(rows):
+                    pinned_input_lease.release(tensor)
+                else:
+                    pinned_input_lease.wait_before_overwrite(tensor)
             if tensor is None or int(tensor.shape[0]) < int(rows):
                 capacity = max(max_batch, int(rows))
                 try:
@@ -1480,6 +1663,20 @@ def central_inference_server(
                     return None
                 pinned_staging[key] = tensor
             return tensor
+
+        def _record_pinned_input_transfer(source_tensor):
+            if not (pinned_staging_enabled and device.type == 'cuda'):
+                return
+            if getattr(source_tensor, 'device', None) is None:
+                return
+            if source_tensor.device.type != 'cpu' or not source_tensor.is_pinned():
+                return
+            stream = torch.cuda.current_stream(device)
+            pinned_input_lease.record_transfer(
+                source_tensor,
+                stream,
+                torch.cuda.Event,
+            )
 
         def _prepare_group_inputs(requests, compute_hashes=False):
             """Assemble one server batch without touching the model or cache."""
@@ -2032,12 +2229,16 @@ def central_inference_server(
                         source_tensor,
                         non_blocking=True,
                     )
+                    if pinned_staging_enabled:
+                        _record_pinned_input_transfer(source_tensor)
                 else:
                     tensor = source_tensor.to(
                         device,
                         memory_format=torch.channels_last,
                         non_blocking=True,
                     )
+                    if pinned_staging_enabled:
+                        _record_pinned_input_transfer(source_tensor)
                 legal_index_tensor = None
                 if compact_policy:
                     legal_index_tensor = torch.from_numpy(
@@ -2517,20 +2718,33 @@ def central_inference_server(
                 last_batch_positions,
             )
 
+        deferred_output = _DeferredCentralOutput(_record_stage_stats)
+
         while True:
+            # A completed shared/Pipe response may still be waiting for its
+            # CUDA D2H event. Reuse otherwise idle server time only when a
+            # descriptor is already queued; never wait for future work here.
+            # Queue-backed NumPy results are finalized before their reusable
+            # pinned buffers can outlive the response serialization.
+            got_deferred_request, deferred_request = deferred_output.take_queued_request(
+                request_queue
+            )
+            item = deferred_request if got_deferred_request else None
+
             get_t0 = time.perf_counter()
-            if pending_started_at is None:
-                item = request_queue.get()
-            else:
-                elapsed_s = time.perf_counter() - pending_started_at
-                remaining_s = (flush_ms / 1000.0) - elapsed_s
-                if remaining_s <= 0.0:
-                    item = None
+            if item is None:
+                if pending_started_at is None:
+                    item = request_queue.get()
                 else:
-                    try:
-                        item = request_queue.get(timeout=remaining_s)
-                    except queue.Empty:
+                    elapsed_s = time.perf_counter() - pending_started_at
+                    remaining_s = (flush_ms / 1000.0) - elapsed_s
+                    if remaining_s <= 0.0:
                         item = None
+                    else:
+                        try:
+                            item = request_queue.get(timeout=remaining_s)
+                        except queue.Empty:
+                            item = None
             get_wait_s = time.perf_counter() - get_t0
             if pending_started_at is None:
                 interval_idle_wait_time += get_wait_s
@@ -2538,6 +2752,7 @@ def central_inference_server(
                 interval_batch_wait_time += get_wait_s
 
             if item is not None:
+                deferred_output.finish_before_request(item)
                 item_status = _handle_request_item(item)
                 if item_status == "stop":
                     break
@@ -2561,6 +2776,7 @@ def central_inference_server(
                     drained_item = request_queue.get_nowait()
                 except queue.Empty:
                     break
+                deferred_output.finish_before_request(drained_item)
                 item_status = _handle_request_item(drained_item)
                 if item_status == "stop":
                     return
@@ -2582,6 +2798,10 @@ def central_inference_server(
                 )
             )
             if not should_flush:
+                # Do not hold a response while entering the timed coalescing
+                # wait at the top of the next request-collection pass.
+                if deferred_output.pending:
+                    deferred_output.finalize()
                 continue
 
             # A load command can be processed while requests are already
@@ -2659,10 +2879,21 @@ def central_inference_server(
                     bool(cache_gate.active),
                 )
 
-            deferred_stage = None
+            singleton_shared_pipe_output = bool(
+                len(inference_tasks) == 1
+                and all(
+                    _shared_request_arrays(req) is not None
+                    and hasattr(_response_queue_for(req), 'send')
+                    for req in inference_tasks[0][1]
+                )
+            )
             pipeline_outputs = bool(
                 output_pipeline_enabled and output_copy_stream is not None
-                and len(inference_tasks) > 1
+                and inference_tasks
+                and (
+                    len(inference_tasks) > 1
+                    or singleton_shared_pipe_output
+                )
                 and not cache_gate.active
             )
             for task_idx, (model_label, request_batch) in enumerate(inference_tasks):
@@ -2688,83 +2919,38 @@ def central_inference_server(
                     # launch-then-finalize overlap.  Restrict the optimization
                     # to shared outputs with synchronous Pipe metadata sends;
                     # Queue-backed NumPy response ownership remains unchanged.
-                    if (
-                        deferred_stage is not None
-                        and deferred_stage.get('early_publish_safe', False)
-                    ):
-                        try:
-                            output_ready = bool(deferred_stage['ready']())
-                        except Exception:
-                            # Preserve the existing synchronize-and-publish
-                            # path if a nonblocking event query is unavailable.
-                            output_ready = False
-                        deferred_stage['mark_ready'](output_ready)
-                        if output_ready:
-                            previous_stats = deferred_stage['finalize']()
-                            _record_stage_stats(
-                                previous_stats,
-                                time.perf_counter() - deferred_stage['started_at'],
-                            )
-                            deferred_stage = None
+                    deferred_output.finalize_if_ready()
                     try:
                         infer_t0 = time.perf_counter()
+                        output_slot = deferred_output.next_slot()
                         launched = _infer_group(
                             model_label,
                             request_batch,
                             prepared=prepared_inputs,
                             defer_output=pipeline_outputs,
-                            output_slot=task_idx & 1,
+                            output_slot=output_slot,
                             batch_target=batch_target,
                         )
-                        # Launch batch N first, then wait for and publish N-1.
-                        # Its D2H/output copy therefore overlaps this forward.
-                        if deferred_stage is not None:
-                            previous_stats = deferred_stage['finalize']()
-                            _record_stage_stats(
-                                previous_stats,
-                                time.perf_counter() - deferred_stage['started_at'],
-                            )
-                            deferred_stage = None
-                        finalize = launched.get('deferred_finalize')
-                        if finalize is not None:
-                            deferred_stage = {
-                                'finalize': finalize,
-                                'ready': launched['deferred_ready'],
-                                'mark_ready': launched['mark_deferred_ready'],
-                                'early_publish_safe': bool(
-                                    launched.get('early_publish_safe', False)
-                                ),
-                                'started_at': infer_t0,
-                            }
-                        else:
-                            _record_stage_stats(
-                                launched,
-                                time.perf_counter() - infer_t0,
-                            )
+                        # Launch batch N first, then publish the previous
+                        # result. Alternating slots keep both pinned buffers
+                        # distinct until the previous event has been finalized.
+                        deferred_output.complete_launch(launched, infer_t0)
                     finally:
                         prepared_future = next_future
                 except Exception as exc:
                     prepared_future = next_future
-                    if deferred_stage is not None:
-                        try:
-                            previous_stats = deferred_stage['finalize']()
-                            _record_stage_stats(
-                                previous_stats,
-                                time.perf_counter() - deferred_stage['started_at'],
-                            )
-                        finally:
-                            deferred_stage = None
+                    if deferred_output.pending:
+                        deferred_output.finalize()
                     for req in request_batch:
                         _put_response(req, {
                             "ok": False,
                             "error": str(exc),
                         })
-            if deferred_stage is not None:
-                final_stats = deferred_stage['finalize']()
-                _record_stage_stats(
-                    final_stats,
-                    time.perf_counter() - deferred_stage['started_at'],
-                )
+            if (
+                deferred_output.pending
+                and not deferred_output.stage.get('early_publish_safe', False)
+            ):
+                deferred_output.finalize()
             if debug_enabled and (time.perf_counter() - last_debug_print) >= 5.0:
                 interval_s = max(1e-9, time.perf_counter() - last_debug_print)
                 last_debug_print = time.perf_counter()
@@ -2802,6 +2988,30 @@ def central_inference_server(
         import traceback
         traceback.print_exc()
     finally:
+        if deferred_output is not None and deferred_output.pending:
+            try:
+                deferred_output.finalize()
+            except Exception as deferred_error:
+                # Preserve the original server failure while making a final
+                # best effort to release worker requests before GPU teardown.
+                print(
+                    "Central inference could not finalize a deferred output "
+                    f"during shutdown: {deferred_error}"
+                )
+        try:
+            pinned_input_lease.synchronize_all()
+        except Exception as pinned_error:
+            # Fall back to a device-wide drain before releasing pinned memory,
+            # while preserving any earlier inference failure.
+            try:
+                if 'device' not in locals() or device.type != 'cuda':
+                    raise pinned_error
+                torch.cuda.synchronize(device)
+            except Exception as sync_error:
+                print(
+                    "Central inference could not drain pinned input DMA: "
+                    f"{pinned_error}; device fallback: {sync_error}"
+                )
         graph_stats = {
             label: runner.stats
             for label, runner in sorted(forward_graph_runners.items())

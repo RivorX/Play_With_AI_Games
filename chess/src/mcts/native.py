@@ -595,6 +595,10 @@ class NativeMCTSForest:
         self._next_tree_id = 1
         self._prepare_calls = 0
         self._released_since_compact = 0
+        # Compaction only removes nodes made unreachable by changing or
+        # releasing roots. Searches that keep the same roots can grow their
+        # reachable trees, but a periodic compaction cannot reclaim anything.
+        self._roots_changed_since_compact = False
         try:
             self.root_ids = self._import_roots(list(roots))
         except Exception:
@@ -744,13 +748,16 @@ class NativeMCTSForest:
             raise ValueError("native root/key size mismatch")
 
         prepared_ids = []
+        roots_changed = False
         for root, tree_key in zip(roots, tree_keys):
             tree_id = self._tree_id(tree_key)
             previous = self._active_roots.get(tree_key)
             node_id = self._node_ids.get(id(root))
             if node_id is None:
                 node_id = self._import_roots([root])[0]
+                roots_changed = True
             elif previous is None or int(previous[1]) != int(node_id):
+                roots_changed = True
                 root_visits = int(getattr(root, "visit_count", 0) or 0)
                 root_value_sum = float(getattr(root, "value_sum", 0.0) or 0.0)
                 root_virtual_loss = int(getattr(root, "virtual_loss", 0) or 0)
@@ -785,10 +792,16 @@ class NativeMCTSForest:
             prepared_ids.append(int(node_id))
 
         self.root_ids = prepared_ids
+        self._roots_changed_since_compact = (
+            self._roots_changed_since_compact or roots_changed
+        )
         self._prepare_calls += 1
         if (
-            self._released_since_compact >= 8
-            or self._prepare_calls % 16 == 0
+            self._roots_changed_since_compact
+            and (
+                self._released_since_compact >= 8
+                or self._prepare_calls % 16 == 0
+            )
         ):
             self.compact()
             self.root_ids = [
@@ -817,6 +830,7 @@ class NativeMCTSForest:
                 self._raise_native_failure("mcts_forest_release_tree", status)
         if self._active_roots.pop(tree_key, None) is not None:
             self._released_since_compact += 1
+            self._roots_changed_since_compact = True
         if not self._active_roots and self.node_count:
             self.compact()
 
@@ -828,6 +842,7 @@ class NativeMCTSForest:
         if old_count <= 0:
             self.root_ids = []
             self._released_since_compact = 0
+            self._roots_changed_since_compact = False
             return
 
         active_items = list(self._active_roots.items())
@@ -851,10 +866,14 @@ class NativeMCTSForest:
             self._raise_native_failure("mcts_forest_compact", status)
 
         new_count = int(status)
+        # Read the native int32 buffer directly so each loop gets a Python int
+        # without allocating a NumPy scalar or a second Python list the size of
+        # the whole forest. Compaction runs at a fixed cadence in self-play.
+        old_to_new_ids = memoryview(old_to_new).cast("B").cast("i")
         new_nodes = [None] * new_count
-        for old_id, new_id in enumerate(old_to_new):
-            if int(new_id) >= 0:
-                new_nodes[int(new_id)] = self.nodes[old_id]
+        for old_id, new_id in enumerate(old_to_new_ids):
+            if new_id >= 0:
+                new_nodes[new_id] = self.nodes[old_id]
         if any(node is None for node in new_nodes):
             error = RuntimeError("native compaction returned a sparse node mapping")
             self._poison_and_discard(error)
@@ -863,21 +882,22 @@ class NativeMCTSForest:
         self.nodes = new_nodes
         self._node_ids = {id(node): node_id for node_id, node in enumerate(new_nodes)}
         self._native_expanded = {
-            int(old_to_new[old_id])
+            old_to_new_ids[old_id]
             for old_id in self._native_expanded
-            if int(old_to_new[old_id]) >= 0
+            if old_to_new_ids[old_id] >= 0
         }
         self._active_roots = {
-            tree_key: (root, int(old_to_new[old_node_id]))
+            tree_key: (root, old_to_new_ids[old_node_id])
             for tree_key, (root, old_node_id) in active_items
-            if int(old_to_new[old_node_id]) >= 0
+            if old_to_new_ids[old_node_id] >= 0
         }
         self.root_ids = [
-            int(old_to_new[root_id])
+            old_to_new_ids[root_id]
             for root_id in self.root_ids
-            if int(old_to_new[root_id]) >= 0
+            if old_to_new_ids[root_id] >= 0
         ]
         self._released_since_compact = 0
+        self._roots_changed_since_compact = False
 
     def configure_root_states(self, states) -> None:
         for root_id, state in zip(self.root_ids, states):

@@ -1657,7 +1657,7 @@ MCTS_API std::int32_t mcts_forest_compact(
                 new_node.parent = -1;
                 new_node.parent_edge = -1;
             }
-            compact_nodes[static_cast<std::size_t>(new_id)] = new_node;
+            compact_nodes[static_cast<std::size_t>(new_id)] = std::move(new_node);
 
             for (std::int32_t edge_index = 0; edge_index < old_node.edge_count; ++edge_index) {
                 NativeEdge edge = forest->edges[

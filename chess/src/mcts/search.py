@@ -19,6 +19,8 @@ import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from functools import lru_cache
+from itertools import chain
+from operator import itemgetter
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +62,74 @@ _INPUT_PIECE_SPECS = tuple(
         chess.KING,
     )
 )
+# bulletchess accepts a Piece object directly in Board.__getitem__. Reuse
+# these objects in hot board-plane packing instead of constructing a
+# ``(color, piece_type)`` key tuple for each piece of every board.
+_INPUT_PIECES = tuple(
+    chess.Piece(color, piece_type)
+    for color, piece_type in _INPUT_PIECE_SPECS
+)
+_INPUT_PIECE_GETTERS = tuple(itemgetter(piece) for piece in _INPUT_PIECES)
+_VECTOR_CURRENT_MASK_MIN_BOARDS = 32
+_VECTOR_HISTORY_MASK_MIN_BOARDS = 16
+
+
+def _fill_native_piece_masks(boards, piece_masks, *, paired_rows=False):
+    """Fill one uint64 piece-mask row per board using C-level map iteration."""
+    board_count = len(boards)
+    if not board_count:
+        return
+    expected_rows = board_count * (2 if paired_rows else 1)
+    if piece_masks.shape != (expected_rows, len(_INPUT_PIECES)):
+        raise ValueError(
+            f"piece-mask buffer shape {piece_masks.shape} does not match "
+            f"{expected_rows} rows and {len(_INPUT_PIECES)} piece planes"
+        )
+    min_vector_boards = (
+        _VECTOR_HISTORY_MASK_MIN_BOARDS
+        if paired_rows
+        else _VECTOR_CURRENT_MASK_MIN_BOARDS
+    )
+    if board_count < min_vector_boards:
+        for board_idx, board in enumerate(boards):
+            for plane_idx, piece in enumerate(_INPUT_PIECES):
+                mask = int(board[piece]) if paired_rows else board[piece]
+                if paired_rows:
+                    piece_masks[board_idx * 2, plane_idx] = mask
+                    piece_masks[board_idx * 2 + 1, plane_idx] = mask
+                else:
+                    piece_masks[board_idx, plane_idx] = mask
+        return
+    for plane_idx, getter in enumerate(_INPUT_PIECE_GETTERS):
+        masks = np.fromiter(
+            map(getter, boards),
+            dtype=np.uint64,
+            count=board_count,
+        )
+        if paired_rows:
+            paired_column = piece_masks[:, plane_idx].reshape(board_count, 2)
+            paired_column[:] = masks[:, None]
+        else:
+            piece_masks[:, plane_idx] = masks
+
+
+# Empty edge vectors carry no per-node state. Sharing the zero-length
+# allocations avoids creating a dozen tiny NumPy objects for every new leaf;
+# reset and root setup replace them with node-owned arrays before any writes.
+_EMPTY_FLOAT32 = np.empty(0, dtype=np.float32)
+_EMPTY_FLOAT64 = np.empty(0, dtype=np.float64)
+_EMPTY_INT16 = np.empty(0, dtype=np.int16)
+_EMPTY_INT32 = np.empty(0, dtype=np.int32)
+_EMPTY_BOOL = np.empty(0, dtype=np.bool_)
+for _empty_array in (
+    _EMPTY_FLOAT32,
+    _EMPTY_FLOAT64,
+    _EMPTY_INT16,
+    _EMPTY_INT32,
+    _EMPTY_BOOL,
+):
+    _empty_array.setflags(write=False)
+del _empty_array
 _PIECE_VALUES = {
     chess.PAWN: 1.0,
     chess.KNIGHT: 3.0,
@@ -109,6 +179,16 @@ _TREE_REUSE_SCOUT_MIN_FRESH_FRACTION = 1.0 / 6.0
 # the configured action count as a cap and narrow only when the *fresh* action
 # budget cannot fund two complete first-round passes.
 _GUMBEL_MIN_INITIAL_VISITS_PER_ACTION = 2
+
+
+def _record_adaptive_leaf_id(state, key, edge_count, edge_index, leaf_id):
+    """Record a unique leaf under its root edge without rebuilding edge sets."""
+    edge_leaf_ids = state.get(key)
+    if edge_leaf_ids is None:
+        edge_leaf_ids = [set() for _ in range(edge_count)]
+        state[key] = edge_leaf_ids
+    edge_leaf_ids[edge_index].add(leaf_id)
+    return edge_leaf_ids
 
 
 _POLICY_TARGET_MODES = frozenset({'baseline', 'challenge_delta'})
@@ -2261,22 +2341,22 @@ class MCTSEdgeStats:
     def __init__(self):
         self.moves = ()
         self.nodes = []
-        self.base_priors = np.empty(0, dtype=np.float32)
-        self.log_base_priors = np.empty(0, dtype=np.float64)
-        self.visit_counts = np.empty(0, dtype=np.int32)
-        self.total_counts = np.empty(0, dtype=np.float32)
-        self.value_sums = np.empty(0, dtype=np.float32)
-        self.virtual_losses = np.empty(0, dtype=np.int16)
+        self.base_priors = _EMPTY_FLOAT32
+        self.log_base_priors = _EMPTY_FLOAT64
+        self.visit_counts = _EMPTY_INT32
+        self.total_counts = _EMPTY_FLOAT32
+        self.value_sums = _EMPTY_FLOAT32
+        self.virtual_losses = _EMPTY_INT16
         self.total_count_sum = 0.0
         self.stats_version = 0
         self.completed_q_cache_version = -1
-        self.completed_q_cache = np.empty(0, dtype=np.float64)
+        self.completed_q_cache = _EMPTY_FLOAT64
         self.improved_policy_cache_version = -1
-        self.improved_policy_cache = np.empty(0, dtype=np.float32)
-        self.selection_score_scratch = np.empty(0, dtype=np.float64)
-        self.q_score_scratch = np.empty(0, dtype=np.float32)
-        self.fresh_count_scratch = np.empty(0, dtype=np.float64)
-        self.eligibility_scratch = np.empty(0, dtype=np.bool_)
+        self.improved_policy_cache = _EMPTY_FLOAT32
+        self.selection_score_scratch = _EMPTY_FLOAT64
+        self.q_score_scratch = _EMPTY_FLOAT32
+        self.fresh_count_scratch = _EMPTY_FLOAT64
+        self.eligibility_scratch = _EMPTY_BOOL
         self._move_to_child = None
 
     def reset(self, legal_moves, legal_priors):
@@ -2291,7 +2371,7 @@ class MCTSEdgeStats:
         # Gumbel scratch/cache arrays are used by root bookkeeping and by the
         # Python correctness fallback, so allocating them eagerly for every
         # expanded interior node wastes memory without helping the native path.
-        self.log_base_priors = np.empty(0, dtype=np.float64)
+        self.log_base_priors = _EMPTY_FLOAT64
         self.visit_counts = np.zeros(child_count, dtype=np.int32)
         self.total_counts = np.zeros(child_count, dtype=np.float32)
         self.value_sums = np.zeros(child_count, dtype=np.float32)
@@ -2299,13 +2379,13 @@ class MCTSEdgeStats:
         self.total_count_sum = 0.0
         self.stats_version = 0
         self.completed_q_cache_version = -1
-        self.completed_q_cache = np.empty(0, dtype=np.float64)
+        self.completed_q_cache = _EMPTY_FLOAT64
         self.improved_policy_cache_version = -1
-        self.improved_policy_cache = np.empty(0, dtype=np.float32)
-        self.selection_score_scratch = np.empty(0, dtype=np.float64)
-        self.q_score_scratch = np.empty(0, dtype=np.float32)
-        self.fresh_count_scratch = np.empty(0, dtype=np.float64)
-        self.eligibility_scratch = np.empty(0, dtype=np.bool_)
+        self.improved_policy_cache = _EMPTY_FLOAT32
+        self.selection_score_scratch = _EMPTY_FLOAT64
+        self.q_score_scratch = _EMPTY_FLOAT32
+        self.fresh_count_scratch = _EMPTY_FLOAT64
+        self.eligibility_scratch = _EMPTY_BOOL
         self._move_to_child = None
 
     def ensure_gumbel_workspace(self):
@@ -2674,38 +2754,48 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
     if max_policy_targets is not None:
         max_len = min(max_len, max(1, int(max_policy_targets)))
 
-    policy_indices = torch.full((batch_size, max_len), -1, dtype=torch.int16)
-    policy_values = torch.zeros((batch_size, max_len), dtype=torch.float32)
-    policy_lengths = torch.zeros((batch_size,), dtype=torch.int16)
+    policy_indices = np.full((batch_size, max_len), -1, dtype=np.int16)
+    policy_values = np.zeros((batch_size, max_len), dtype=np.float32)
+    policy_lengths = np.zeros((batch_size,), dtype=np.int16)
     max_legal_len = min(
         MAX_LEGAL_MOVES,
         max(int((pos[9] if len(pos) > 9 and pos[9] is not None else pos[1]).numel()) for pos in positions),
     )
-    legal_indices = torch.full((batch_size, max_legal_len), -1, dtype=torch.int16)
-    legal_lengths = torch.zeros((batch_size,), dtype=torch.int16)
-    importance_scores = torch.zeros((batch_size,), dtype=torch.float32)
-    policy_weights = torch.ones((batch_size,), dtype=torch.float32)
-    value_weights = torch.ones((batch_size,), dtype=torch.float32)
-    moves_left = torch.zeros((batch_size, 1), dtype=torch.float32)
-    source_codes = torch.zeros((batch_size,), dtype=torch.int8)
-    root_q_targets = torch.full((batch_size, 1), float('nan'), dtype=torch.float32)
-    search_changed_top = torch.zeros((batch_size,), dtype=torch.bool)
-    search_q_deltas = torch.full((batch_size,), float('nan'), dtype=torch.float32)
-    best_q_targets = torch.full((batch_size, 1), float('nan'), dtype=torch.float32)
-    played_q_targets = torch.full((batch_size, 1), float('nan'), dtype=torch.float32)
-    orig_q_targets = torch.full((batch_size, 1), float('nan'), dtype=torch.float32)
-    policy_kld_targets = torch.full((batch_size,), float('nan'), dtype=torch.float32)
-    search_visits = torch.zeros((batch_size,), dtype=torch.int32)
-    game_ids = torch.full((batch_size,), -1, dtype=torch.int64)
-    game_ply_indices = torch.full((batch_size,), -1, dtype=torch.int16)
-    regret_targets = torch.full((batch_size,), float('nan'), dtype=torch.float32)
-    archive_ids = torch.full((batch_size,), -1, dtype=torch.int64)
-    search_budget_assigned = torch.full((batch_size,), -1, dtype=torch.int32)
-    search_simulations_effective = torch.full((batch_size,), -1, dtype=torch.int32)
-    search_simulations_fresh = torch.full((batch_size,), -1, dtype=torch.int32)
-    search_visits_inherited_credit = torch.full((batch_size,), -1, dtype=torch.int32)
+    legal_indices = np.full((batch_size, max_legal_len), -1, dtype=np.int16)
+    legal_lengths = np.zeros((batch_size,), dtype=np.int16)
+    importance_scores = np.zeros((batch_size,), dtype=np.float32)
+    policy_weights = np.ones((batch_size,), dtype=np.float32)
+    value_weights = np.ones((batch_size,), dtype=np.float32)
+    moves_left = np.zeros((batch_size, 1), dtype=np.float32)
+    source_codes = np.zeros((batch_size,), dtype=np.int8)
+    root_q_targets = np.full((batch_size, 1), np.nan, dtype=np.float32)
+    search_changed_top = np.zeros((batch_size,), dtype=np.bool_)
+    search_q_deltas = np.full((batch_size,), np.nan, dtype=np.float32)
+    best_q_targets = np.full((batch_size, 1), np.nan, dtype=np.float32)
+    played_q_targets = np.full((batch_size, 1), np.nan, dtype=np.float32)
+    orig_q_targets = np.full((batch_size, 1), np.nan, dtype=np.float32)
+    policy_kld_targets = np.full((batch_size,), np.nan, dtype=np.float32)
+    search_visits = np.zeros((batch_size,), dtype=np.int32)
+    game_ids = np.full((batch_size,), -1, dtype=np.int64)
+    game_ply_indices = np.full((batch_size,), -1, dtype=np.int16)
+    regret_targets = np.full((batch_size,), np.nan, dtype=np.float32)
+    archive_ids = np.full((batch_size,), -1, dtype=np.int64)
+    search_budget_assigned = np.full((batch_size,), -1, dtype=np.int32)
+    search_simulations_effective = np.full((batch_size,), -1, dtype=np.int32)
+    search_simulations_fresh = np.full((batch_size,), -1, dtype=np.int32)
+    search_visits_inherited_credit = np.full((batch_size,), -1, dtype=np.int32)
     fens = []
     history_fens = []
+
+    def _tensor_to_numpy(tensor, numpy_dtype, torch_dtype):
+        if tensor.device.type == 'cpu' and tensor.dtype == torch_dtype:
+            converted = tensor.detach().numpy()
+        else:
+            converted = tensor.detach().to(
+                device='cpu',
+                dtype=torch_dtype,
+            ).numpy()
+        return converted.astype(numpy_dtype, copy=False)
 
     for row_idx, pos in enumerate(positions):
         _, indices, probs, _ = pos[:4]
@@ -2720,7 +2810,11 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
         legal_payload = pos[9] if len(pos) > 9 and pos[9] is not None else indices
         legal_count = min(int(legal_payload.numel()), max_legal_len)
         if legal_count > 0:
-            legal_indices[row_idx, :legal_count] = legal_payload[:legal_count].to(dtype=torch.int16)
+            legal_indices[row_idx, :legal_count] = _tensor_to_numpy(
+                legal_payload[:legal_count],
+                np.int16,
+                torch.int16,
+            )
         legal_lengths[row_idx] = legal_count
         fens.append(str(pos[10]) if len(pos) > 10 and pos[10] else None)
         if len(pos) > 11 and pos[11] is not None:
@@ -2757,41 +2851,49 @@ def _pack_positions_for_transfer(positions, max_policy_targets=None):
             search_visits_inherited_credit[row_idx] = _optional_int32_search_count(pos[27])
         if count <= 0:
             continue
-        policy_indices[row_idx, :count] = indices.to(dtype=torch.int16)
-        policy_values[row_idx, :count] = probs.to(dtype=torch.float32)
+        policy_indices[row_idx, :count] = _tensor_to_numpy(
+            indices[:count],
+            np.int16,
+            torch.int16,
+        )
+        policy_values[row_idx, :count] = _tensor_to_numpy(
+            probs[:count],
+            np.float32,
+            torch.float32,
+        )
         policy_lengths[row_idx] = count
 
     return {
         'boards': boards,
-        'policy_indices': policy_indices,
-        'policy_values': policy_values,
-        'policy_lengths': policy_lengths,
-        'legal_indices': legal_indices,
-        'legal_lengths': legal_lengths,
+        'policy_indices': torch.from_numpy(policy_indices),
+        'policy_values': torch.from_numpy(policy_values),
+        'policy_lengths': torch.from_numpy(policy_lengths),
+        'legal_indices': torch.from_numpy(legal_indices),
+        'legal_lengths': torch.from_numpy(legal_lengths),
         'values': values,
-        'importance_scores': importance_scores,
-        'policy_weights': policy_weights,
-        'value_weights': value_weights,
-        'moves_left': moves_left,
-        'source_codes': source_codes,
+        'importance_scores': torch.from_numpy(importance_scores),
+        'policy_weights': torch.from_numpy(policy_weights),
+        'value_weights': torch.from_numpy(value_weights),
+        'moves_left': torch.from_numpy(moves_left),
+        'source_codes': torch.from_numpy(source_codes),
         'fens': fens,
-        'root_q_targets': root_q_targets,
+        'root_q_targets': torch.from_numpy(root_q_targets),
         'history_fens': history_fens,
-        'search_changed_top': search_changed_top,
-        'search_q_deltas': search_q_deltas,
-        'best_q_targets': best_q_targets,
-        'played_q_targets': played_q_targets,
-        'orig_q_targets': orig_q_targets,
-        'policy_kld_targets': policy_kld_targets,
-        'search_visits': search_visits,
-        'game_ids': game_ids,
-        'game_ply_indices': game_ply_indices,
-        'regret_targets': regret_targets,
-        'archive_ids': archive_ids,
-        'search_budget_assigned': search_budget_assigned,
-        'search_simulations_effective': search_simulations_effective,
-        'search_simulations_fresh': search_simulations_fresh,
-        'search_visits_inherited_credit': search_visits_inherited_credit,
+        'search_changed_top': torch.from_numpy(search_changed_top),
+        'search_q_deltas': torch.from_numpy(search_q_deltas),
+        'best_q_targets': torch.from_numpy(best_q_targets),
+        'played_q_targets': torch.from_numpy(played_q_targets),
+        'orig_q_targets': torch.from_numpy(orig_q_targets),
+        'policy_kld_targets': torch.from_numpy(policy_kld_targets),
+        'search_visits': torch.from_numpy(search_visits),
+        'game_ids': torch.from_numpy(game_ids),
+        'game_ply_indices': torch.from_numpy(game_ply_indices),
+        'regret_targets': torch.from_numpy(regret_targets),
+        'archive_ids': torch.from_numpy(archive_ids),
+        'search_budget_assigned': torch.from_numpy(search_budget_assigned),
+        'search_simulations_effective': torch.from_numpy(search_simulations_effective),
+        'search_simulations_fresh': torch.from_numpy(search_simulations_fresh),
+        'search_visits_inherited_credit': torch.from_numpy(search_visits_inherited_credit),
         'num_positions': batch_size,
     }
 
@@ -3967,15 +4069,11 @@ class MultiGameBatchMCTS:
             (row_count, 16, 8, 8),
             dtype=self.history_storage_dtype,
         )
-        for pair_idx, (_cache_key, node) in enumerate(pending_items):
-            board = node.board
+        boards = [node.board for _cache_key, node in pending_items]
+        _fill_native_piece_masks(boards, piece_masks, paired_rows=True)
+        for pair_idx, board in enumerate(boards):
             white_row = pair_idx * 2
             black_row = white_row + 1
-            for plane_idx, (color, piece_type) in enumerate(_INPUT_PIECE_SPECS):
-                mask = int(board[color, piece_type])
-                piece_masks[white_row, plane_idx] = mask
-                piece_masks[black_row, plane_idx] = mask
-
             castling_rights = board.castling_rights
             ep_square = board.en_passant_square
             ep_mask = 0 if ep_square is None else 1 << chess.square_index(ep_square)
@@ -4041,10 +4139,62 @@ class MultiGameBatchMCTS:
         root_position_counts,
         root_repetition_known,
         destinations,
+        *,
+        _allow_prefix_reuse=True,
     ):
         """Fill a leaf batch's histories while batching newly used MCTS ancestors."""
         if self.history_positions <= 0:
             return
+
+        # Siblings searched in the same game share the same prior-position
+        # history and side to move. Only build the grouping table when there
+        # are at least two rows per game in the batch; sparse batches otherwise
+        # spend more on grouping than they save. Fill one complete prefix per
+        # parent/game/POV, then copy it into siblings. Exact repetition
+        # encoders remain per-path and bypass this cache.
+        if (
+            _allow_prefix_reuse
+            and not self._encode_exact_repetition
+            and len(nodes) >= 2 * len(board_histories)
+            and len(nodes) >= 2 * len(set(game_indices))
+        ):
+            representatives = {}
+            unique_indices = []
+            row_to_representative = []
+            for row_idx, (node, game_idx) in enumerate(zip(nodes, game_indices)):
+                parent_or_node = node.parent if node.parent is not None else node
+                key = (
+                    parent_or_node,
+                    int(game_idx),
+                    node.board.turn == chess.BLACK,
+                )
+                representative = representatives.get(key)
+                if representative is None:
+                    representative = row_idx
+                    representatives[key] = representative
+                    unique_indices.append(row_idx)
+                row_to_representative.append(representative)
+            if len(unique_indices) < len(nodes):
+                representative_destinations = [
+                    destinations[idx]
+                    for idx in unique_indices
+                ]
+                self._fill_history_prefixes_for_nodes(
+                    [nodes[idx] for idx in unique_indices],
+                    [game_indices[idx] for idx in unique_indices],
+                    board_histories,
+                    root_position_counts,
+                    root_repetition_known,
+                    representative_destinations,
+                    _allow_prefix_reuse=False,
+                )
+                for row_idx, representative in enumerate(row_to_representative):
+                    if row_idx != representative:
+                        np.copyto(
+                            destinations[row_idx],
+                            destinations[representative],
+                        )
+                return
 
         profile_t0 = time.perf_counter() if self.profile_detail_enabled else None
         native_batch = (
@@ -4094,7 +4244,11 @@ class MultiGameBatchMCTS:
             resolved.update(self._encode_native_history_pairs(pending))
 
         for _node, entries, first_slot, use_black_pov, gi, destination in rows:
-            destination.fill(0.0)
+            # Every non-padding frame is overwritten below. Initialize only the
+            # prefix that remains empty instead of clearing the whole history
+            # tensor for every evaluated leaf (normally four complete frames).
+            if first_slot:
+                destination[:first_slot * self._board_planes].fill(0.0)
             if self._path_dependent_repetition:
                 destination.reshape(
                     history_positions,
@@ -4365,10 +4519,9 @@ class MultiGameBatchMCTS:
             halfmove_values,
             fullmove_values,
         ) = self._get_native_board_plane_scratch(len(nodes))
-        for row_idx, node in enumerate(nodes):
-            board = node.board
-            for plane_idx, (color, piece_type) in enumerate(_INPUT_PIECE_SPECS):
-                piece_masks[row_idx, plane_idx] = int(board[color, piece_type])
+        boards = [node.board for node in nodes]
+        _fill_native_piece_masks(boards, piece_masks)
+        for row_idx, board in enumerate(boards):
             is_black = board.turn == chess.BLACK
             black_to_move[row_idx] = int(is_black)
             pov_color = chess.BLACK if is_black else chess.WHITE
@@ -4427,12 +4580,12 @@ class MultiGameBatchMCTS:
             out=node_offsets[1:],
         )
         total_moves = int(node_offsets[-1])
+        flattened_moves = chain.from_iterable(
+            legal_moves_per_node[row_idx]
+            for row_idx in uncached_rows
+        )
         move_hashes = np.fromiter(
-            (
-                hash(move)
-                for row_idx in uncached_rows
-                for move in legal_moves_per_node[row_idx]
-            ),
+            map(hash, flattened_moves),
             dtype=np.int64,
             count=total_moves,
         )
@@ -6094,9 +6247,12 @@ class MultiGameBatchMCTS:
                         if root is None:
                             continue
                         state = root_selection_states[gs_idx]
-                        edge_cache = state.setdefault(
-                            '_adaptive_root_edge_index_cache', {}
-                        ) if state is not None else None
+                        edge_cache = None
+                        if state is not None:
+                            edge_cache = state.get('_adaptive_root_edge_index_cache')
+                            if edge_cache is None:
+                                edge_cache = {}
+                                state['_adaptive_root_edge_index_cache'] = edge_cache
                         edge_index = None
                         if edge_cache is not None:
                             path_ids = []
@@ -6125,10 +6281,13 @@ class MultiGameBatchMCTS:
                             edge_index = int(root_edge.parent_edge_index)
                         if state is not None and 0 <= edge_index < len(root.edges.moves):
                             if source in {'fresh_nn', 'cache_hit'}:
-                                state.setdefault(
+                                _record_adaptive_leaf_id(
+                                    state,
                                     '_adaptive_fresh_leaf_ids_by_edge',
-                                    [set() for _ in root.edges.moves],
-                                )[edge_index].add(id(node))
+                                    len(root.edges.moves),
+                                    edge_index,
+                                    id(node),
+                                )
                                 if search_efficiency_feedback_active:
                                     source_sets = state.get(
                                         '_adaptive_leaf_ids_by_source_and_edge'
@@ -6136,10 +6295,13 @@ class MultiGameBatchMCTS:
                                     if source_sets is not None:
                                         source_sets[edge_index][source].add(id(node))
                             else:
-                                state.setdefault(
+                                _record_adaptive_leaf_id(
+                                    state,
                                     '_adaptive_exact_leaf_ids_by_edge',
-                                    [set() for _ in root.edges.moves],
-                                )[edge_index].add(id(node))
+                                    len(root.edges.moves),
+                                    edge_index,
+                                    id(node),
+                                )
 
                 backprop_t0 = perf_counter() if profile_timing else None
                 if native_forest is not None:
