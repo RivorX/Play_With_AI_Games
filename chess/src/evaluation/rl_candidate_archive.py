@@ -132,6 +132,100 @@ def restore_candidate_archive_identity(
     return prior
 
 
+def fork_candidate_archive_identity(
+    manifest_path: str | os.PathLike,
+    *,
+    parent_identity: Mapping,
+    reason: str,
+    completed_iteration: int,
+) -> tuple[dict, dict]:
+    """Start a new archive identity at a documented resume-experiment boundary.
+
+    The previous archive identity is retained in a new sidecar beside the
+    current run manifest. The previous manifest and archive are read-only.
+    """
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("A non-empty reason is required to fork an RL resume experiment.")
+    if not isinstance(parent_identity, Mapping):
+        raise ValueError("The parent candidate archive identity must be a mapping.")
+    parent = dict(parent_identity)
+    required_identity_fields = {
+        "run_manifest_path",
+        "run_manifest_sha256_at_start",
+        "initial_checkpoint_path",
+        "initial_checkpoint_sha256",
+        "seed",
+        "git_commit",
+        "source_tree_sha256",
+        "effective_config_sha256",
+    }
+    missing_identity_fields = sorted(required_identity_fields.difference(parent))
+    if missing_identity_fields:
+        raise ValueError(
+            "The parent candidate archive identity is incomplete: "
+            + ", ".join(missing_identity_fields)
+        )
+    try:
+        completed_iteration = int(completed_iteration)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("completed_iteration must be a non-negative integer.") from exc
+    if completed_iteration < 0:
+        raise ValueError("completed_iteration must be a non-negative integer.")
+
+    manifest_path = Path(manifest_path).resolve()
+    current = immutable_run_identity(manifest_path)
+    checkpoint_path = current.get("initial_checkpoint_path")
+    checkpoint_sha256 = current.get("initial_checkpoint_sha256")
+    if not checkpoint_path or not checkpoint_sha256:
+        raise ValueError(
+            "The fork manifest must identify and hash its continuation checkpoint."
+        )
+
+    lineage_path = manifest_path.with_name(
+        f"{manifest_path.stem}_resume_experiment_fork.json"
+    )
+    if lineage_path.exists():
+        raise FileExistsError(
+            f"Resume experiment lineage already exists: {lineage_path}"
+        )
+    lineage = {
+        "schema_version": 1,
+        "kind": "resume_experiment_fork",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "reason": reason,
+        "completed_iteration": completed_iteration,
+        "first_iteration": completed_iteration + 1,
+        "continuation_checkpoint_path": checkpoint_path,
+        "continuation_checkpoint_sha256": checkpoint_sha256,
+        "parent_identity": parent,
+        "parent_identity_sha256": json_sha256(parent),
+        "forked_identity": current,
+        "forked_identity_sha256": json_sha256(current),
+    }
+    serialized = json.dumps(
+        lineage, indent=2, sort_keys=True, ensure_ascii=False, default=str
+    )
+    with lineage_path.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(serialized)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    lineage_reference = {
+        "path": str(lineage_path),
+        "sha256": sha256_file(lineage_path),
+        "reason": reason,
+        "completed_iteration": completed_iteration,
+        "first_iteration": completed_iteration + 1,
+        "continuation_checkpoint_path": checkpoint_path,
+        "continuation_checkpoint_sha256": checkpoint_sha256,
+        "parent_identity_sha256": lineage["parent_identity_sha256"],
+        "forked_identity_sha256": lineage["forked_identity_sha256"],
+    }
+    return current, lineage_reference
+
+
 def model_state_sha256(model) -> str:
     """Hash a model state dict independently of device and checkpoint metadata."""
     digest = hashlib.sha256()

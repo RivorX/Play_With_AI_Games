@@ -84,6 +84,20 @@ def architecture_scoped_directory(path, architecture_id):
     return path / sanitize_filename_tag(architecture_id)
 
 
+def versioned_checkpoint_paths(directory, version_tag, family=None):
+    """Return the version-specific checkpoint folder, best, and latest paths."""
+    directory = Path(directory)
+    tag = sanitize_filename_tag(version_tag, default="model")
+    if family:
+        family_tag = sanitize_filename_tag(family, default="model").upper()
+        if not tag.upper().startswith(family_tag):
+            tag = f"{family_tag}{tag.upper()}"
+        else:
+            tag = tag.upper()
+    checkpoint_dir = directory / tag
+    return checkpoint_dir, checkpoint_dir / "best.pt", checkpoint_dir / "latest.pt"
+
+
 def build_rl_experiment_name(config):
     """Build the compact user-facing RL run name."""
     model_version = sanitize_filename_tag(

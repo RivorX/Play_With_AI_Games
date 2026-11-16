@@ -24,6 +24,7 @@ from src.common.logger_helpers import (
     _upsert_mcts_elo_by_simulations,
     _apply_sorted_legend,
 )
+from src.common.dashboard_layout import create_dashboard, finish_dashboard
 
 
 IL_GRADIENT_METRIC_KEYS = (
@@ -752,12 +753,160 @@ class ILLoggerMixin:
         except Exception:
             pass
 
+    def _il_elo_visual_data(self):
+        """Return Elo data with SWA-only records removed from the dashboard."""
+        swa_epoch = None
+        swa_elo = None
+        if self.swa_elo_info:
+            try:
+                swa_epoch, swa_elo = int(self.swa_elo_info[0]), float(self.swa_elo_info[1])
+            except (TypeError, ValueError):
+                swa_epoch = swa_elo = None
+
+        def is_swa_point(epoch, elo):
+            if swa_epoch is None or swa_elo is None:
+                return False
+            try:
+                return int(epoch) == swa_epoch and abs(float(elo) - swa_elo) <= 0.5
+            except (TypeError, ValueError):
+                return False
+
+        elo_points = [
+            (epoch, value) for epoch, value in self.estimated_elos
+            if not is_swa_point(epoch, value)
+        ]
+        epoch_markers = []
+        for epoch, label in self.elo_epoch_markers:
+            label_text = str(label or "")
+            try:
+                marker_epoch = int(epoch)
+            except (TypeError, ValueError):
+                continue
+            if "swa" in label_text.lower() or (swa_epoch is not None and marker_epoch == swa_epoch):
+                continue
+            epoch_markers.append((marker_epoch, label_text))
+
+        mode_markers = []
+        for marker in self.il_mode_elo_markers:
+            if "swa" in str(marker.get("label", "")).lower():
+                continue
+            if is_swa_point(marker.get("epoch"), marker.get("elo")):
+                continue
+            mode_markers.append(marker)
+        return elo_points, epoch_markers, mode_markers
+
+    def _plot_il_summary_panel(self, ax):
+        """Compare the best-loss and latest validation checkpoints."""
+        ax.axis('off')
+        valid_indices = range(min(len(self.val_losses), len(self.val_iterations)))
+        if not valid_indices:
+            ax.set_title('Best vs Latest Validation', fontsize=14, fontweight='bold', pad=8)
+            return
+
+        best_idx = min(valid_indices, key=lambda index: self.val_losses[index])
+        best_epoch = self.val_iterations[best_idx]
+        latest_idx = max(
+            valid_indices,
+            key=lambda index: (int(self.val_iterations[index]), index),
+        )
+        latest_epoch = self.val_iterations[latest_idx]
+
+        def at(series, index):
+            return series[index] if len(series) > index else None
+
+        def number(value, digits=4):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return "—"
+            return f"{value:.{digits}f}" if value == value else "—"
+
+        def percent(value):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return "—"
+            return f"{value:.2%}" if value == value else "—"
+
+        elo_points, _, mode_markers = self._il_elo_visual_data()
+        def elo_at(epoch, mode):
+            if mode == 'nn' and self.best_final_elo_info:
+                try:
+                    final_epoch, final_elo = self.best_final_elo_info
+                    if int(final_epoch) == int(epoch):
+                        return final_elo
+                except (TypeError, ValueError):
+                    pass
+            candidates = []
+            for marker in mode_markers:
+                if marker.get('mode') != mode:
+                    continue
+                try:
+                    if int(marker.get('epoch')) != int(epoch):
+                        continue
+                    candidates.append((int(marker.get('simulations', 0) or 0), marker.get('elo')))
+                except (TypeError, ValueError):
+                    continue
+            if candidates:
+                return max(candidates, key=lambda candidate: candidate[0])[1]
+            if mode == 'nn':
+                for point_epoch, value in reversed(elo_points):
+                    try:
+                        if int(point_epoch) == int(epoch):
+                            return value
+                    except (TypeError, ValueError):
+                        continue
+            return None
+
+        best_nn_elo = elo_at(best_epoch, 'nn')
+        latest_nn_elo = elo_at(latest_epoch, 'nn')
+        best_mcts_elo = elo_at(best_epoch, 'mcts')
+        latest_mcts_elo = elo_at(latest_epoch, 'mcts')
+        elo_text = lambda value: number(value, digits=0) if value is not None else ''
+
+        rows = [
+            ('Validation loss', number(at(self.val_losses, best_idx)), number(at(self.val_losses, latest_idx))),
+            ('Policy top-1', percent(at(self.val_policy_top1, best_idx)), percent(at(self.val_policy_top1, latest_idx))),
+            ('Policy top-3', percent(at(self.val_policy_top3, best_idx)), percent(at(self.val_policy_top3, latest_idx))),
+            ('Value MAE', number(at(self.val_value_mae, best_idx)), number(at(self.val_value_mae, latest_idx))),
+            ('WDL accuracy', percent(at(self.val_value_wdl_acc, best_idx)), percent(at(self.val_value_wdl_acc, latest_idx))),
+            ('WDL cross-entropy', number(at(self.val_value_wdl_ce, best_idx)), number(at(self.val_value_wdl_ce, latest_idx))),
+            ('Estimated Elo NN', elo_text(best_nn_elo), elo_text(latest_nn_elo)),
+            ('Estimated Elo MCTS', elo_text(best_mcts_elo), elo_text(latest_mcts_elo)),
+        ]
+
+        ax.set_title(
+            f'Validation · Best ep {best_epoch} vs Latest ep {latest_epoch}',
+            fontsize=12,
+            fontweight='bold',
+            pad=8,
+        )
+        table = ax.table(
+            cellText=rows,
+            colLabels=['Metric', f'Best · ep {best_epoch}', f'Latest · ep {latest_epoch}'],
+            cellLoc='center',
+            loc='center',
+            bbox=[0.02, 0.04, 0.96, 0.92],
+            colWidths=[0.46, 0.27, 0.27],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(9.5)
+        for column, color in enumerate(('#424242', '#2E7D32', '#1565C0')):
+            cell = table[0, column]
+            cell.set_facecolor(color)
+            cell.set_text_props(fontweight='bold', color='white')
+            cell.set_height(cell.get_height() * 1.4)
+        for row_index, (label, _, _) in enumerate(rows, start=1):
+            background = '#F5F5F5' if row_index % 2 else '#FFFFFF'
+            for column in range(3):
+                table[row_index, column].set_facecolor(background)
+            table[row_index, 0].set_text_props(fontweight='bold', ha='left')
+
     def _plot_il_elo_panel(self, ax):
-        """Render IL Elo panel, including optional epoch markers (e.g. SWA final)."""
-        has_elos = bool(self.estimated_elos)
-        has_markers = bool(self.elo_epoch_markers)
-        has_mode_markers = bool(self.il_mode_elo_markers)
-        if not has_elos and not has_markers and not has_mode_markers:
+        """Render non-SWA Elo estimates and checkpoints."""
+        elo_points, epoch_markers, mode_markers = self._il_elo_visual_data()
+        has_best_final = bool(self.best_final_elo_info)
+        if not elo_points and not epoch_markers and not mode_markers and not has_best_final:
             ax.axis('off')
             return
 
@@ -766,531 +915,94 @@ class ILLoggerMixin:
         ax.set_title('Estimated Elo (vs Stockfish)')
         ax.grid(True, alpha=0.3)
 
-        # Visible training window for the current plot.  This avoids drawing
-        # transfer/resume seed Elo points that belong to epochs far outside the
-        # currently plotted run, which otherwise creates a misleading clipped
-        # horizontal line to the right edge of the panel.
         if self.iterations:
-            x_min = min(self.iterations)
-            x_max = max(self.iterations)
+            x_min, x_max = min(self.iterations), max(self.iterations)
             if x_min == x_max:
                 x_min -= 1
                 x_max += 1
         else:
-            x_min = None
-            x_max = None
+            x_min = x_max = None
 
-        # Determine SWA epoch to exclude from the regular line
-        swa_epoch = int(self.swa_elo_info[0]) if self.swa_elo_info else None
-        swa_elo_value = float(self.swa_elo_info[1]) if self.swa_elo_info else None
-
-        if has_elos:
-            visible_elos = self.estimated_elos
-            if x_min is not None and x_max is not None:
-                visible_elos = [
-                    (ep, val) for ep, val in self.estimated_elos
-                    if x_min <= int(ep) <= x_max
-                ]
-            if not visible_elos:
-                visible_elos = self.estimated_elos[-1:]
-
-            # Plot regular elo line (exclude SWA point so it gets its own marker)
-            regular_elos = [
-                (ep, val) for ep, val in visible_elos
-                if (
-                    swa_epoch is None
-                    or int(ep) != swa_epoch
-                    or swa_elo_value is None
-                    or abs(float(val) - swa_elo_value) > 0.5
-                )
-            ]
-            if regular_elos:
-                elo_epochs, elo_vals = zip(*regular_elos)
-                if len(regular_elos) == 1:
-                    ax.plot(
-                        elo_epochs,
-                        elo_vals,
-                        color='green',
-                        marker='o',
-                        linestyle='None',
-                        label='Estimated Elo',
-                        markersize=8,
-                    )
-                else:
-                    ax.plot(elo_epochs, elo_vals, 'go-', label='Estimated Elo', linewidth=2, markersize=8)
-                elo_errs = [
-                    (self.estimated_elo_errors.get(int(ep), {}) or {}).get('se')
-                    for ep, _ in regular_elos
-                ]
-                self._plot_elo_errorbars(
-                    ax,
-                    elo_epochs,
-                    elo_vals,
-                    elo_errs,
-                    'green',
-                    label='Estimated Elo ±SE',
-                )
-                all_elo_vals = elo_vals
-            else:
-                all_elo_vals = [v for _, v in visible_elos]
-
-            for ref_elo, ref_label in [(1200, 'Beginner'), (1500, 'Club'), (1800, 'Expert'), (2000, 'Candidate Master')]:
-                all_vals = [v for _, v in visible_elos]
-                if min(all_vals) - 200 <= ref_elo <= max(all_vals) + 200:
-                    x0 = visible_elos[0][0]
-                    ax.axhline(y=ref_elo, color='gray', linestyle=':', alpha=0.4)
-                    ax.text(x0, ref_elo + 15, ref_label, fontsize=8, color='gray', alpha=0.6)
-
-        # Plot SWA elo as a distinct gold star with annotation
-        if self.swa_elo_info:
-            sw_ep, sw_elo = self.swa_elo_info
-            swa_is_mcts_only = bool(
-                self.swa_metrics
-                and self.swa_metrics.get('elo') is None
-                and self.swa_metrics.get('elo_mcts') is not None
-            )
-            swa_star_title = "SWA final MCTS" if swa_is_mcts_only else "SWA final"
-            swa_annotation = "SWA MCTS" if swa_is_mcts_only else "SWA"
-            ax.plot(
-                sw_ep, sw_elo,
-                marker='*', markersize=18,
-                color='gold', markeredgecolor='darkorange', markeredgewidth=1.5,
-                linestyle='None',
-                label=f'{swa_star_title} ({int(round(sw_elo))})',
-                zorder=5,
-            )
-            ax.annotate(
-                f'{swa_annotation}\n{int(round(sw_elo))}',
-                xy=(sw_ep, sw_elo),
-                xytext=(-38, 6),
-                textcoords='offset points',
-                fontsize=8,
-                color='darkorange',
-                fontweight='bold',
-                arrowprops=dict(arrowstyle='->', color='darkorange', lw=1.2,
-                                shrinkB=12),
-            )
-
-        if self.best_final_elo_info and not has_mode_markers:
-            best_ep, best_elo = self.best_final_elo_info
-            ax.plot(
-                best_ep, best_elo,
-                marker='D', markersize=9,
-                color='#2563EB', markeredgecolor='#1E3A8A', markeredgewidth=1.2,
-                linestyle='None',
-                label=f'Best final ({int(round(best_elo))})',
-                zorder=6,
-            )
-            ax.annotate(
-                f'Best\n{int(round(best_elo))}',
-                xy=(best_ep, best_elo),
-                xytext=(8, -22),
-                textcoords='offset points',
-                fontsize=8,
-                color='#1E3A8A',
-                fontweight='bold',
-                arrowprops=dict(arrowstyle='->', color='#1E3A8A', lw=1.1,
-                                 shrinkB=6),
-            )
-
-        if has_mode_markers:
-            mcts_palette = (
-                ("#F59E0B", "#92400E"),
-                ("#7C3AED", "#4C1D95"),
-                ("#EF4444", "#991B1B"),
-                ("#10B981", "#065F46"),
-                ("#EC4899", "#9D174D"),
-            )
-            mcts_simulations = sorted({
-                int(marker.get("simulations", 0) or 0)
-                for marker in self.il_mode_elo_markers
-                if marker.get("mode") == "mcts"
-                and int(marker.get("simulations", 0) or 0) > 0
-            })
-            mcts_colors = {
-                simulations: mcts_palette[index % len(mcts_palette)]
-                for index, simulations in enumerate(mcts_simulations)
-            }
-            mode_styles = {
-                "nn": {
-                    "title": "NN",
-                    "marker": "D",
-                    "color": "#0EA5E9",
-                    "edge": "#075985",
-                    "offset": (8, 12),
-                },
-                "mcts": {
-                    "title": "MCTS",
-                    "marker": "P",
-                    "color": "#7C3AED",
-                    "edge": "#4C1D95",
-                    "offset": (8, -28),
-                },
-            }
-            markers_to_plot = []
-            for marker_info in self.il_mode_elo_markers:
-                marker_mode = marker_info.get("mode", "nn")
-                marker_label = str(marker_info.get("label", "")).lower()
-                if "swa" in marker_label:
-                    marker_kind = "swa"
-                elif "best" in marker_label:
-                    marker_kind = "best"
-                elif "current" in marker_label:
-                    marker_kind = "current"
-                elif "resume" in marker_label:
-                    marker_kind = "resume"
-                elif "final" in marker_label or "ctrl+c" in marker_label:
-                    marker_kind = "final"
-                else:
-                    marker_kind = "checkpoint"
-                try:
-                    marker_epoch = int(marker_info.get("epoch"))
-                except (TypeError, ValueError):
-                    continue
-                if marker_kind == "checkpoint":
-                    continue
-                if (
-                    marker_kind == "swa"
-                    and marker_mode == "nn"
-                    and self.swa_elo_info
-                    and int(self.swa_elo_info[0]) == marker_epoch
-                ):
-                    try:
-                        if abs(float(self.swa_elo_info[1]) - float(marker_info.get("elo"))) <= 0.5:
-                            continue
-                    except (TypeError, ValueError):
-                        pass
-                markers_to_plot.append(marker_info)
-
-            for marker_info in sorted(markers_to_plot, key=lambda item: (int(item.get("epoch", 0)), str(item.get("mode", "")), str(item.get("label", "")))):
-                try:
-                    marker_epoch = int(marker_info.get("epoch"))
-                    marker_elo = float(marker_info.get("elo"))
-                except (TypeError, ValueError):
-                    continue
-                marker_mode = marker_info.get("mode", "nn")
-                style = dict(mode_styles.get(marker_mode, mode_styles["nn"]))
-                sims = marker_info.get("simulations", 0) or 0
-                try:
-                    sims = int(sims)
-                except (TypeError, ValueError):
-                    sims = 0
-                if marker_mode == "mcts" and sims in mcts_colors:
-                    style["color"], style["edge"] = mcts_colors[sims]
-                sims_text = f" @{sims}" if marker_mode == "mcts" and sims > 0 else ""
-                raw_label = str(marker_info.get("label", "")).strip()
-                raw_label_lower = raw_label.lower()
-                if "swa" in raw_label_lower:
-                    legend_prefix = f'SWA {style["title"]}'
-                elif "best" in raw_label_lower:
-                    legend_prefix = f'Best {style["title"]}'
-                elif "current" in raw_label_lower:
-                    legend_prefix = f'Current {style["title"]}'
-                elif "resume" in raw_label_lower:
-                    legend_prefix = f'Resume {style["title"]}'
-                else:
-                    legend_prefix = f'Final {style["title"]}'
-                legend_label = f'{legend_prefix}{sims_text} ({int(round(marker_elo))})'
-                ax.plot(
-                    marker_epoch,
-                    marker_elo,
-                    marker=style["marker"],
-                    markersize=10,
-                    color=style["color"],
-                    markeredgecolor=style["edge"],
-                    markeredgewidth=1.2,
-                    linestyle='None',
-                    label=legend_label,
-                    zorder=7,
-                )
-                self._plot_elo_errorbars(
-                    ax,
-                    [marker_epoch],
-                    [marker_elo],
-                    [marker_info.get("std_error")],
-                    style["color"],
-                    label=f'Final {style["title"]} ±SE',
-                    x_offset=0.0,
-                    alpha=0.45,
-                )
-
-        if has_markers:
-            for marker_epoch, marker_label in self.elo_epoch_markers:
-                # Skip SWA marker vertical line - the gold star already marks it
-                if self.swa_elo_info and int(marker_epoch) == swa_epoch:
-                    continue
-                if has_mode_markers and "final elo" in str(marker_label).lower():
-                    continue
-                ax.axvline(
-                    x=marker_epoch,
-                    color='black',
-                    linestyle='--',
-                    alpha=0.55,
-                    linewidth=1.4,
-                    label=marker_label,
-                )
-                if has_elos:
-                    _, nearest_elo = min(
-                        self.estimated_elos,
-                        key=lambda pair: abs(int(pair[0]) - int(marker_epoch)),
-                    )
-                    ax.annotate(
-                        marker_label,
-                        xy=(marker_epoch, nearest_elo),
-                        xytext=(4, 8),
-                        textcoords='offset points',
-                        fontsize=8,
-                        color='black',
-                    )
-                else:
-                    ax.text(
-                        marker_epoch,
-                        0.95,
-                        marker_label,
-                        transform=ax.get_xaxis_transform(),
-                        rotation=90,
-                        va='top',
-                        ha='left',
-                        fontsize=8,
-                        color='black',
-                    )
-
-        # Compute x-axis range, padding right side to show SWA star fully
+        visible_elos = elo_points
         if x_min is not None and x_max is not None:
-            if self.swa_elo_info:
-                sw_ep = int(self.swa_elo_info[0])
-                if x_min <= sw_ep and sw_ep >= x_max - 1:
-                    x_max = sw_ep + max(2, int((x_max - x_min) * 0.08) + 1)
-            if self.best_final_elo_info:
-                best_ep = int(self.best_final_elo_info[0])
-                if x_min <= best_ep and best_ep >= x_max - 1:
-                    x_max = best_ep + max(2, int((x_max - x_min) * 0.08) + 1)
-            for marker_info in self.il_mode_elo_markers:
-                try:
-                    marker_ep = int(marker_info.get("epoch"))
-                except (TypeError, ValueError):
-                    continue
-                if x_min <= marker_ep and marker_ep >= x_max - 1:
-                    x_max = marker_ep + max(2, int((x_max - x_min) * 0.08) + 1)
-                if marker_ep <= x_min and marker_ep >= x_min - 1:
-                    x_min = marker_ep - max(1, int((x_max - x_min) * 0.04) + 1)
-            ax.set_xlim(x_min, x_max)
+            visible_elos = [(epoch, value) for epoch, value in elo_points if x_min <= int(epoch) <= x_max]
+            if not visible_elos and elo_points:
+                visible_elos = elo_points[-1:]
+        if visible_elos:
+            epochs, values = zip(*visible_elos)
+            ax.plot(epochs, values, 'go-', label='Estimated Elo', linewidth=2, markersize=7)
+            errors = [(self.estimated_elo_errors.get(int(epoch), {}) or {}).get('se') for epoch, _ in visible_elos]
+            self._plot_elo_errorbars(ax, epochs, values, errors, 'green', label='Estimated Elo ±SE')
+            for reference, label in [(1200, 'Beginner'), (1500, 'Club'), (1800, 'Expert'), (2000, 'Candidate Master')]:
+                if min(values) - 200 <= reference <= max(values) + 200:
+                    ax.axhline(reference, color='gray', linestyle=':', alpha=0.4)
+                    ax.text(epochs[0], reference + 15, label, fontsize=8, color='gray', alpha=0.6)
 
-        _apply_sorted_legend(ax, fontsize=8, loc='lower right')
+        for marker in mode_markers:
+            try:
+                epoch = int(marker.get('epoch'))
+                elo = float(marker.get('elo'))
+            except (TypeError, ValueError):
+                continue
+            mode = marker.get('mode', 'nn')
+            label_text = str(marker.get('label', '')).strip()
+            marker_kind = next((kind for kind in ('Best', 'Current', 'Resume', 'Final') if kind.lower() in label_text.lower()), 'Checkpoint')
+            sims = int(marker.get('simulations', 0) or 0)
+            suffix = f' @{sims}' if mode == 'mcts' and sims > 0 else ''
+            display = f'{marker_kind} {mode.upper()}{suffix} ({int(round(elo))})'
+            color = '#2563EB' if mode == 'nn' else '#7C3AED'
+            ax.plot(epoch, elo, marker='D' if mode == 'nn' else 'P', markersize=9,
+                    color=color, linestyle='None', label=display, zorder=6)
+            self._plot_elo_errorbars(
+                ax, [epoch], [elo], [marker.get('std_error')], color,
+                label=f'{marker_kind} {mode.upper()}{suffix} ±SE', x_offset=0.0, alpha=0.45,
+            )
 
-    def _plot_il_summary_panel(self, ax):
-        """Render styled two-column summary table: Best Model vs SWA Model."""
-        ax.axis('off')
-        ax.set_title('Training Summary', fontsize=14, fontweight='bold', pad=8)
-
-        if not self.val_losses or not self.iterations:
-            return
-
-        # Find best model (min val_loss)
-        best_idx = min(range(len(self.val_losses)), key=lambda i: self.val_losses[i])
-        best_epoch = self.val_iterations[best_idx] if best_idx < len(self.val_iterations) else self.iterations[best_idx]
-
-        def _at(lst, idx):
-            return lst[idx] if lst and idx < len(lst) else None
-
-        best = {
-            'epoch':    best_epoch,
-            'val_loss': self.val_losses[best_idx],
-            'top1':     _at(self.val_policy_top1, best_idx),
-            'top3':     _at(self.val_policy_top3, best_idx),
-            'mae':      _at(self.val_value_mae, best_idx),
-            'wdl_acc':  _at(self.val_value_wdl_acc, best_idx),
-            'wdl_ce':   _at(self.val_value_wdl_ce, best_idx),
-        }
-        # Elo closest to best_epoch (excluding SWA entry)
-        swa_ep = int(self.swa_elo_info[0]) if self.swa_elo_info else None
-        swa_elo_value = float(self.swa_elo_info[1]) if self.swa_elo_info else None
-        regular_elos = [(ep, v) for ep, v in self.estimated_elos
-                        if (
-                            swa_ep is None
-                            or int(ep) != swa_ep
-                            or swa_elo_value is None
-                            or abs(float(v) - swa_elo_value) > 0.5
-                        )]
         if self.best_final_elo_info:
-            best['elo'] = float(self.best_final_elo_info[1])
-        elif regular_elos:
-            _, best['elo'] = min(regular_elos, key=lambda p: abs(int(p[0]) - best_epoch))
-        else:
-            best['elo'] = None
+            best_epoch, best_elo = self.best_final_elo_info
+            ax.plot(best_epoch, best_elo, marker='D', markersize=9, color='#2563EB',
+                    markeredgecolor='#1E3A8A', markeredgewidth=1.2, linestyle='None',
+                    label=f'Best final ({int(round(best_elo))})', zorder=7)
 
-        swa = self.swa_metrics  # dict or None
+        for marker_epoch, marker_label in epoch_markers:
+            ax.axvline(marker_epoch, color='black', linestyle='--', alpha=0.55,
+                       linewidth=1.4, label=marker_label)
+            if visible_elos:
+                _, nearest_elo = min(visible_elos, key=lambda pair: abs(int(pair[0]) - marker_epoch))
+                ax.annotate(marker_label, xy=(marker_epoch, nearest_elo), xytext=(4, 8),
+                            textcoords='offset points', fontsize=8, color='black')
 
-        def _latest_il_mode_elo(mode, text=None, exclude_text=None):
-            candidates = []
-            text = str(text).lower() if text else None
-            exclude_text = str(exclude_text).lower() if exclude_text else None
-            for marker in self.il_mode_elo_markers:
-                if marker.get('mode') != mode:
-                    continue
-                label = str(marker.get('label', '')).lower()
-                if text and text not in label:
-                    continue
-                if exclude_text and exclude_text in label:
-                    continue
+        if x_min is not None and x_max is not None:
+            for marker in mode_markers:
                 try:
-                    candidates.append((int(marker.get('epoch')), float(marker.get('elo'))))
+                    marker_epoch = int(marker.get('epoch'))
                 except (TypeError, ValueError):
                     continue
-            if not candidates:
-                return None
-            candidates.sort(key=lambda item: item[0])
-            return candidates[-1][1]
-
-        best_mcts_elo = _latest_il_mode_elo('mcts', 'best')
-        if best_mcts_elo is None:
-            best_mcts_elo = _latest_il_mode_elo('mcts', exclude_text='swa')
-        swa_mcts_elo = _latest_il_mode_elo('mcts', 'swa')
-        if swa_mcts_elo is None and self.swa_metrics:
-            swa_mcts_elo = self.swa_metrics.get('elo_mcts')
-
-        # Formatters
-        def _fl(v):  return f"{v:.4f}" if v is not None else "-"
-        def _fp(v):  return f"{v:.2%}"  if v is not None else "-"
-        def _fe(v):  return f"{int(round(v))}" if v is not None else "-"
-        def _sv(d, k): return d.get(k) if d else None
-
-        def _delta(bv, sv, mode='less', pct=False):
-            if bv is None or sv is None:
-                return ""
-            d = sv - bv
-            s = f"{d:+.2%}" if pct else f"{d:+.4f}"
-            good = (d < -1e-6) if mode == 'less' else (d > 1e-6)
-            bad  = (d >  1e-6) if mode == 'less' else (d < -1e-6)
-            arrow = "+" if good else ("-" if bad else "")
-            return f"{arrow} {s}".strip() if arrow else s
-
-        # Elo delta is special (integer, 'more' is better)
-        def _delta_elo(bv, sv):
-            if bv is None or sv is None or not sv or not bv:
-                return ""
-            d = int(round(sv - bv))
-            arrow = "+" if d > 0 else ("-" if d < 0 else "")
-            return f"{arrow} {d:+d}".strip() if arrow else f"{d:+d}"
-
-        swa_ep_label = swa.get('epoch', '?') if swa else "-"
-        ax.set_title(
-            f"Training Summary - Best ep {best_epoch}, SWA ep {swa_ep_label}",
-            fontsize=12,
-            fontweight='bold',
-            pad=8,
-        )
-        col_labels = ["Metric", "Best", "SWA", "Delta"]
-
-        rows_raw = [
-            ("Val Loss",
-             _fl(best['val_loss']),
-             _fl(_sv(swa,'val_loss')),
-             _delta(best['val_loss'], _sv(swa,'val_loss'), 'less')),
-            ("Policy Top-1",
-             _fp(best['top1']),
-             _fp(_sv(swa,'top1')),
-             _delta(best['top1'], _sv(swa,'top1'), 'more', pct=True)),
-            ("Policy Top-3",
-             _fp(best['top3']),
-             _fp(_sv(swa,'top3')),
-             _delta(best['top3'], _sv(swa,'top3'), 'more', pct=True)),
-            ("Value MAE",
-             _fl(best['mae']),
-             _fl(_sv(swa,'mae')),
-             _delta(best['mae'], _sv(swa,'mae'), 'less')),
-            ("WDL Acc",
-             _fp(best['wdl_acc']),
-             _fp(_sv(swa,'wdl_acc')),
-             _delta(best['wdl_acc'], _sv(swa,'wdl_acc'), 'more', pct=True)),
-            ("WDL CE",
-             _fl(best['wdl_ce']),
-             _fl(_sv(swa,'wdl_ce')),
-             _delta(best['wdl_ce'], _sv(swa,'wdl_ce'), 'less')),
-            ("Est. Elo NN",
-             _fe(best['elo']),
-             _fe(_sv(swa,'elo')),
-             _delta_elo(best['elo'], _sv(swa,'elo'))),
-        ]
-        if best_mcts_elo is not None or swa_mcts_elo is not None:
-            rows_raw.append((
-                "Est. Elo MCTS",
-                _fe(best_mcts_elo),
-                _fe(swa_mcts_elo),
-                _delta_elo(best_mcts_elo, swa_mcts_elo),
-            ))
-
-        cell_text = [list(r) for r in rows_raw]
-
-        # Colour palette
-        C_BEST   = '#2E7D32'   # dark green header
-        C_SWA    = '#E65100'   # deep orange header
-        C_DELTA  = '#1565C0'   # dark blue header
-        C_METRIC = '#424242'   # dark grey header
-        BG_EVEN  = '#F5F5F5'
-        BG_ODD   = '#FFFFFF'
-        BG_SWA   = '#FFF8E1'   # warm yellow tint for SWA values
-        BG_UP    = '#C8E6C9'   # light green - improvement
-        BG_DOWN  = '#FFCDD2'   # light red - regression
-        BG_NEUT  = '#E3F2FD'   # light blue - neutral delta
-
-        def _delta_bg(d_str):
-            if '+' in d_str: return BG_UP
-            if '-' in d_str: return BG_DOWN
-            if d_str and d_str != "-": return BG_NEUT
-            return BG_ODD
-
-        col_colors = [C_METRIC, C_BEST, C_SWA, C_DELTA]
-        row_colors = []
-        for i, row in enumerate(rows_raw):
-            bg = BG_EVEN if i % 2 == 0 else BG_ODD
-            row_colors.append([bg, bg, BG_SWA, _delta_bg(row[3])])
-
-        tbl = ax.table(
-            cellText=cell_text,
-            colLabels=col_labels,
-            cellColours=row_colors,
-            colColours=col_colors,
-            cellLoc='center',
-            loc='center',
-            bbox=[0.0, 0.05, 1.0, 0.95],
-            colWidths=[0.28, 0.22, 0.22, 0.28],
-        )
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(12)
-
-        # Header row styling
-        for col_i, hdr_c in enumerate([C_METRIC, C_BEST, C_SWA, C_DELTA]):
-            cell = tbl[0, col_i]
-            cell.set_facecolor(hdr_c)
-            cell.set_text_props(fontweight='bold', color='white')
-            cell.set_height(cell.get_height() * 1.6)
-
-        # Metric column: bold
-        for row_i in range(1, len(rows_raw) + 1):
-            tbl[row_i, 0].set_text_props(fontweight='bold', ha='left')
-            tbl[row_i, 0].PAD = 0.05
-            for col_i in range(4):
-                tbl[row_i, col_i].set_height(tbl[row_i, col_i].get_height() * 1.3)
+                if x_min <= marker_epoch and marker_epoch >= x_max - 1:
+                    x_max = marker_epoch + max(2, int((x_max - x_min) * 0.08) + 1)
+            ax.set_xlim(x_min, x_max)
+        _apply_sorted_legend(ax, fontsize=8, loc='lower right')
 
     def _plot_il(self):
         """Plot IL training progress"""
-        fig, axes = plt.subplots(6, 3, figsize=(19, 23.2))
-        fig.patch.set_facecolor('#F7F8FA')
-
-        fig.suptitle('IL Training Progress', fontsize=21, fontweight='bold', y=0.992)
         context_lines = self._build_plot_context_lines(wrap_width=150)
-        for line_idx, line in enumerate(context_lines[:4]):
-            fig.text(
-                0.5,
-                0.970 - line_idx * 0.012,
-                line,
-                ha='center',
-                va='top',
-                fontsize=9.2 if line_idx == 0 else 8.6,
-                fontweight='semibold' if line_idx == 0 else 'normal',
-                color='#334155' if line_idx == 0 else '#64748B',
-            )
+        elo_points, elo_epoch_markers, elo_mode_markers = self._il_elo_visual_data()
+        has_elo_data = bool(
+            elo_points or elo_epoch_markers or elo_mode_markers or self.best_final_elo_info
+        )
+        outcome_panels = [(5, 0)]
+        if has_elo_data:
+            outcome_panels.append((5, 1))
+        outcome_panels.append((5, 2))
+        sections = [
+            ('Learning and Losses', [(0, 0), (0, 1), (0, 2), (0, 3)], 2),
+            ('Policy Quality', [(1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5)], 3),
+            ('Value and WDL', [(2, 0), (2, 1), (2, 2), (2, 3), (3, 0), (3, 1)], 3),
+            ('Moves-Left Auxiliary Task', [(3, 2)], 1),
+            ('Optimizer Diagnostics', [(4, 0), (4, 1), (4, 2)], 3),
+            ('Data Diagnostics and Outcomes', outcome_panels, 3 if has_elo_data else 2),
+        ]
+        fig, axes = create_dashboard(sections, width=19.0, panel_height=3.5)
 
         val_epochs = self.val_iterations if self.val_iterations else []
 
@@ -1377,6 +1089,21 @@ class ILLoggerMixin:
                     train_val = train_by_epoch[ep_i]
                     xs.append(ep)
                     ys.append(float(val) - float(train_val))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return xs, ys
+
+        def _relative_val_gap(train_series, val_series):
+            train_by_epoch = _epoch_map(train_series)
+            xs, ys = [], []
+            for ep, val in zip(val_epochs, val_series):
+                try:
+                    train_val = float(train_by_epoch[int(ep)])
+                    val_value = float(val)
+                    if abs(train_val) <= 1e-12:
+                        continue
+                    xs.append(ep)
+                    ys.append((val_value - train_val) / abs(train_val))
                 except (KeyError, TypeError, ValueError):
                     continue
             return xs, ys
@@ -1482,9 +1209,8 @@ class ILLoggerMixin:
                     frameon=False,
                 )
 
-        # IL plot layout is grouped by topic for scanning: losses, policy,
-        # value, moves-left, data diagnostics, and final run summary. Keep
-        # Training Summary as the last panel so it is always the closing read.
+        # The dashboard helper groups these panels by their learning topic;
+        # the training summary stays last as the closing read.
         # Row 1: losses
         ax = axes[0, 0]
         _plot_line(ax, self.iterations, self.train_losses, 'Train', colors['train'])
@@ -1528,24 +1254,40 @@ class ILLoggerMixin:
         _style_axis(ax, 'Value Loss', 'Loss')
         _apply_sorted_legend(ax, fontsize=8)
 
+        ax = axes[0, 3]
+        _style_axis(ax, 'Relative Loss Generalization Gap', 'Val − train / |train|', percent=True)
+        loss_gap_series = [
+            ('Total', self.train_losses, self.val_losses, '#111827'),
+            ('Policy', self.train_policy_losses, self.val_policy_losses, colors['policy']),
+            ('Value', self.train_value_losses, self.val_value_losses, colors['value']),
+            ('Moves-left', self.train_moves_left_losses, self.val_moves_left_losses, colors['gap']),
+        ]
+        has_loss_gap = False
+        for label, train_series, val_series, color in loss_gap_series:
+            gap_x, gap_y = _relative_val_gap(train_series, val_series)
+            if gap_x:
+                has_loss_gap = True
+                _plot_line(ax, gap_x, gap_y, label, color, marker='o', smooth=False)
+        if has_loss_gap:
+            ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.2)
+            _apply_sorted_legend(ax, fontsize=8)
+        else:
+            _show_no_data(ax, 'Requires matching train and validation epochs')
+
         # Row 2: policy quality
         ax = axes[1, 0]
         _plot_line(ax, self.iterations, self.train_policy_top1, 'Train Top-1', colors['train'])
         _plot_line(ax, self.iterations, self.train_policy_top3, 'Train Top-3', colors['train'], style='--', alpha=0.65)
-        _plot_line(ax, self.iterations, self.train_policy_target_mass_top3, 'Train target mass@3', '#0891B2', style=':', alpha=0.85)
         _plot_line(ax, val_epochs, self.val_policy_top1, 'Val Top-1', colors['val'], marker='o')
         _plot_line(ax, val_epochs, self.val_policy_top3, 'Val Top-3', colors['val'], style='--', marker='o', alpha=0.75)
-        _plot_line(ax, val_epochs, self.val_policy_target_mass_top3, 'Val target mass@3', '#F59E0B', style=':', marker='o', alpha=0.85)
         _mark_best(ax, val_epochs, self.val_policy_top1, mode='max', label='best top1')
-        _style_axis(ax, 'Policy Accuracy + Soft Mass', 'Accuracy / mass', percent=True)
+        _style_axis(ax, 'Policy Top-k Accuracy', 'Accuracy', percent=True)
         _set_percent_ylim(
             ax,
             list(self.train_policy_top1)
             + list(self.train_policy_top3)
             + list(self.val_policy_top1)
-            + list(self.val_policy_top3)
-            + list(self.train_policy_target_mass_top3)
-            + list(self.val_policy_target_mass_top3),
+            + list(self.val_policy_top3),
             min_pad=0.03,
         )
         _apply_sorted_legend(ax, fontsize=8)
@@ -1617,6 +1359,55 @@ class ILLoggerMixin:
         else:
             _show_no_data(ax, 'Needs new CSV columns')
 
+        ax = axes[1, 3]
+        _style_axis(ax, 'Policy Top-k Generalization Gap', 'Val − train (percentage points)')
+        top1_gap_x, top1_gap = _val_gap(self.train_policy_top1, self.val_policy_top1)
+        top3_gap_x, top3_gap = _val_gap(self.train_policy_top3, self.val_policy_top3)
+        if top1_gap or top3_gap:
+            _plot_line(ax, top1_gap_x, top1_gap, 'Top-1', colors['policy'], marker='o', smooth=False)
+            _plot_line(ax, top3_gap_x, top3_gap, 'Top-3', colors['elo'], marker='o', smooth=False)
+            ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.2)
+            ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+            _apply_sorted_legend(ax, fontsize=8)
+        else:
+            _show_no_data(ax, 'Requires matching train and validation epochs')
+
+        ax = axes[1, 4]
+        _style_axis(ax, 'Top-3 Accuracy Headroom', 'Top-3 − top-1 (percentage points)', percent=True)
+        train_headroom = [
+            float(top3) - float(top1)
+            for top1, top3 in zip(self.train_policy_top1, self.train_policy_top3)
+        ]
+        val_headroom = [
+            float(top3) - float(top1)
+            for top1, top3 in zip(self.val_policy_top1, self.val_policy_top3)
+        ]
+        if train_headroom or val_headroom:
+            _plot_line(ax, self.iterations[:len(train_headroom)], train_headroom, 'Train', colors['train'], smooth=False)
+            _plot_line(ax, val_epochs[:len(val_headroom)], val_headroom, 'Val', colors['val'], marker='o', smooth=False)
+            ax.axhline(0.0, color=colors['muted'], linestyle=':', linewidth=1.2)
+            _apply_sorted_legend(ax, fontsize=8)
+        else:
+            _show_no_data(ax, 'Requires top-1 and top-3 policy accuracy')
+
+        ax = axes[1, 5]
+        _style_axis(ax, 'Legal Policy Confidence and Margin', 'Probability gap', percent=True)
+        confidence_values = (
+            list(self.train_policy_legal_top1_prob)
+            + list(self.val_policy_legal_top1_prob)
+            + list(self.train_policy_legal_top1_margin)
+            + list(self.val_policy_legal_top1_margin)
+        )
+        if any(value is not None and float(value or 0.0) > 0.0 for value in confidence_values):
+            _plot_line(ax, self.iterations, self.train_policy_legal_top1_prob, 'Train top-1 prob', colors['train'])
+            _plot_line(ax, val_epochs, self.val_policy_legal_top1_prob, 'Val top-1 prob', colors['val'], marker='o')
+            _plot_line(ax, self.iterations, self.train_policy_legal_top1_margin, 'Train top-1 margin', colors['policy'], style='--')
+            _plot_line(ax, val_epochs, self.val_policy_legal_top1_margin, 'Val top-1 margin', colors['elo'], style='--', marker='o')
+            ax.set_ylim(bottom=0.0, top=1.0)
+            _apply_sorted_legend(ax, fontsize=8)
+        else:
+            _show_no_data(ax, 'Legal confidence telemetry unavailable')
+
         # Row 3: value
         ax = axes[2, 0]
         _plot_line(ax, self.iterations, self.train_value_mae, 'Train MAE', colors['train'])
@@ -1649,6 +1440,17 @@ class ILLoggerMixin:
         _style_axis(ax, 'Value WDL Cross-Entropy', 'CE')
         if self.train_value_wdl_ce or self.val_value_wdl_ce:
             _apply_sorted_legend(ax, fontsize=8)
+
+        ax = axes[2, 3]
+        _plot_line(ax, self.iterations, self.train_value_wdl_acc, 'Train WDL accuracy', colors['train'])
+        _plot_line(ax, val_epochs, self.val_value_wdl_acc, 'Val WDL accuracy', colors['val'], marker='o')
+        _style_axis(ax, 'Value WDL Accuracy', 'Accuracy', percent=True)
+        if any(float(value or 0.0) > 0.0 for value in self.train_value_wdl_acc + self.val_value_wdl_acc):
+            ax.set_ylim(0.0, 1.0)
+            _mark_best(ax, val_epochs, self.val_value_wdl_acc, mode='max', label='best')
+            _apply_sorted_legend(ax, fontsize=8)
+        else:
+            _show_no_data(ax, 'WDL accuracy telemetry unavailable')
 
         # Row 4: value diagnostics and moves-left
         ax = axes[3, 0]
@@ -1899,20 +1701,26 @@ class ILLoggerMixin:
                 bbox=dict(boxstyle='round,pad=0.35', fc='white', ec='#CBD5E1', alpha=0.92),
             )
 
-        ax = axes[5, 1]
-        self._plot_il_elo_panel(ax)
-        ax.set_facecolor('#FFFFFF')
+        if has_elo_data:
+            ax = axes[5, 1]
+            self._plot_il_elo_panel(ax)
+            ax.set_facecolor('#FFFFFF')
 
         ax = axes[5, 2]
         self._plot_il_summary_panel(ax)
 
-        for marker_ax in axes.flat[:-1]:
-            _draw_resume_markers(marker_ax, annotate=(marker_ax is axes[0, 0]))
+        for panel_key, marker_ax in axes.items():
+            if panel_key == (5, 2):
+                continue
+            _draw_resume_markers(marker_ax, annotate=(panel_key == (0, 0)))
 
-        fig.subplots_adjust(left=0.055, right=0.985, bottom=0.035, top=0.910, hspace=0.50, wspace=0.28)
-        fig.savefig(self.plot_path, dpi=150)
-        plt.close(fig)
-        
+        finish_dashboard(
+            fig,
+            self.plot_path,
+            'IL Training Progress',
+            context_lines[:4],
+        )
+
         print(f"Plot saved to: {self.plot_path}")
 
     def _log_il(self, iteration, train_losses=None, val_losses=None,

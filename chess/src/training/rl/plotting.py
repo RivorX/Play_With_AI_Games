@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import MaxNLocator, PercentFormatter
 
+from src.common.dashboard_layout import create_dashboard, finish_dashboard
 from src.common.logger_helpers import (
     _CSV_RESUME_METADATA_KEY,
     _metadata_json_payload,
@@ -114,7 +115,11 @@ def _mark_resume_boundaries(axes, markers):
     """Draw the same red continuation boundary on every time-series panel."""
     if not markers:
         return
-    flattened = np.asarray(axes, dtype=object).reshape(-1)
+    flattened = (
+        list(axes.values())
+        if isinstance(axes, dict)
+        else np.asarray(axes, dtype=object).reshape(-1)
+    )
     for axis_index, ax in enumerate(flattened):
         if ax is None:
             continue
@@ -159,6 +164,250 @@ def _series(rows, column):
             xs.append(int(x))
             ys.append(y)
     return xs, ys
+
+
+def _rl_reanalysis_plot_rows(rows):
+    """Add plotted ratios only where their logged denominators are observed."""
+    plotted = []
+    for source in rows:
+        row = dict(source)
+        updated = _number(row.get("reanalyse_updated"))
+        correction_fraction = _number(row.get("reanalyse_correction_fraction"))
+        row["_reanalyse_correction_fraction_observed"] = (
+            correction_fraction if updated is not None and updated > 0.0 else None
+        )
+
+        selected = _number(row.get("reanalyse_selected"))
+        eligible = _number(row.get("reanalyse_eligible_rows"))
+        row["_reanalyse_selected_eligible_fraction"] = (
+            selected / eligible
+            if selected is not None and eligible is not None and eligible > 0.0
+            else None
+        )
+        plotted.append(row)
+    return plotted
+
+
+def _rl_reanalysis_summary(rows):
+    """Summarize per-iteration reanalysis records without pooling repeated rows."""
+    ordered = sorted(
+        (row for row in rows if _number(row.get("iteration")) is not None),
+        key=lambda row: _number(row.get("iteration")),
+    )
+    if not ordered:
+        return {}
+
+    def value(row, key):
+        return _number(row.get(key))
+
+    active_rows = [
+        row for row in ordered
+        if (value(row, "reanalyse_selected") or 0.0) > 0.0
+        or (value(row, "reanalyse_updated") or 0.0) > 0.0
+    ]
+    selected_iterations = [
+        int(value(row, "iteration"))
+        for row in ordered
+        if value(row, "reanalyse_selected") is not None
+        and value(row, "reanalyse_selected") > 0.0
+    ]
+    intervals = [right - left for left, right in zip(selected_iterations, selected_iterations[1:])]
+    cadence = intervals[0] if intervals and all(step == intervals[0] for step in intervals) else None
+    latest = ordered[-1]
+    last_active = active_rows[-1] if active_rows else None
+    return {
+        "latest_iteration": int(value(latest, "iteration")),
+        "latest_selected": value(latest, "reanalyse_selected"),
+        "latest_updated": value(latest, "reanalyse_updated"),
+        "last_active_iteration": int(value(last_active, "iteration")) if last_active else None,
+        "last_active_selected": value(last_active, "reanalyse_selected") if last_active else None,
+        "last_active_updated": value(last_active, "reanalyse_updated") if last_active else None,
+        "selected_cadence": cadence,
+        "last_active_skipped": value(last_active, "reanalyse_skipped") if last_active else None,
+        "last_active_eligible": value(last_active, "reanalyse_eligible_rows") if last_active else None,
+        "last_active_age": value(last_active, "reanalyse_selected_target_age_mean") if last_active else None,
+        "last_active_actor_kl": value(last_active, "reanalyse_selected_actor_kl_mean") if last_active else None,
+        "last_active_actor_kl_coverage": value(last_active, "reanalyse_selected_actor_kl_coverage") if last_active else None,
+        "last_active_sims_mean": value(last_active, "reanalyse_simulations_mean") if last_active else None,
+        "last_active_sims_min": value(last_active, "reanalyse_simulations_min") if last_active else None,
+        "last_active_sims_max": value(last_active, "reanalyse_simulations_max") if last_active else None,
+    }
+
+
+def _rl_reanalysis_count_text(value):
+    return "n/a" if value is None else f"{value:,.0f}"
+
+
+def _rl_reanalysis_activity_note(summary, historical_note=None):
+    if not summary:
+        lines = ["No reanalysis iteration records."]
+    else:
+        latest = (
+            f"Latest i{summary['latest_iteration']}: "
+            f"{_rl_reanalysis_count_text(summary['latest_selected'])} selected, "
+            f"{_rl_reanalysis_count_text(summary['latest_updated'])} updated."
+        )
+        if summary["last_active_iteration"] is None:
+            activity = "No active reanalysis iteration recorded."
+        else:
+            activity = (
+                f"Last active i{summary['last_active_iteration']}: "
+                f"{_rl_reanalysis_count_text(summary['last_active_selected'])}/"
+                f"{_rl_reanalysis_count_text(summary['last_active_updated'])} selected/updated."
+            )
+        cadence = (
+            f"Selected every {summary['selected_cadence']} iterations (observed)."
+            if summary["selected_cadence"] is not None
+            else "Selection cadence unavailable or irregular."
+        )
+        age = (
+            "n/a" if summary["last_active_age"] is None
+            else f"{summary['last_active_age']:.2f}"
+        )
+        actor_kl = (
+            "n/a" if summary["last_active_actor_kl"] is None
+            else f"{summary['last_active_actor_kl']:.4f}"
+        )
+        actor_kl_coverage = (
+            "n/a" if summary["last_active_actor_kl_coverage"] is None
+            else f"{summary['last_active_actor_kl_coverage']:.0%}"
+        )
+        detail = (
+            "Last active: skipped "
+            f"{_rl_reanalysis_count_text(summary['last_active_skipped'])}, eligible "
+            f"{_rl_reanalysis_count_text(summary['last_active_eligible'])}, age {age}, "
+            f"actor KL {actor_kl} ({actor_kl_coverage} coverage)."
+        )
+        budget_values = (
+            summary["last_active_sims_mean"],
+            summary["last_active_sims_min"],
+            summary["last_active_sims_max"],
+        )
+        if all(value is None for value in budget_values):
+            budget = "Effective reanalysis simulations per updated target: not logged."
+        else:
+            mean = "n/a" if budget_values[0] is None else f"{budget_values[0]:.1f}"
+            low = "n/a" if budget_values[1] is None else f"{budget_values[1]:.0f}"
+            high = "n/a" if budget_values[2] is None else f"{budget_values[2]:.0f}"
+            budget = f"Effective sims per updated target: mean {mean}, range {low}–{high}."
+        lines = [latest, f"{activity} {cadence}", detail, budget]
+    if historical_note:
+        lines.append(str(historical_note))
+    return "\n".join(lines)
+
+
+def _draw_rl_reanalysis_activity(ax, rows, *, historical_note=None):
+    """Draw replay target refreshes and denominator-explicit rates."""
+    plotted = _rl_reanalysis_plot_rows(rows)
+    _style(ax, "Replay reanalysis activity (replay positions; not fresh self-play)")
+    shown = False
+    count_values = []
+    for column, label, color, linestyle in (
+        ("reanalyse_updated", "updated replay targets", _COLORS[2], "-"),
+        ("reanalyse_selected", "selected replay positions", _COLORS[0], "--"),
+        ("reanalyse_skipped", "skipped selected positions", _COLORS[1], ":"),
+    ):
+        shown |= _line(ax, plotted, column, label, color, ls=linestyle)
+        _, values = _series(plotted, column)
+        count_values.extend(values)
+    ax.set_ylabel("replay positions / iteration", fontsize=7.5)
+    ax.set_xlabel("training iteration")
+    ax.set_ylim(bottom=0.0)
+    if count_values:
+        ax.set_ylim(top=max(1.0, max(count_values) * 1.65))
+
+    ax2 = ax.twinx()
+    ax2.tick_params(labelsize=8)
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+    correction = _line(
+        ax2,
+        plotted,
+        "_reanalyse_correction_fraction_observed",
+        "search corrections vs current NN / updated",
+        _COLORS[4],
+        ls="--",
+    )
+    selected_share = _line(
+        ax2,
+        plotted,
+        "_reanalyse_selected_eligible_fraction",
+        "selected / eligible rows",
+        _COLORS[5],
+        ls=":",
+    )
+    ax2.set_ylabel("fraction (each line uses its labeled denominator)", fontsize=7.0)
+    ax2.set_ylim(0.0, 1.0)
+    _legend_below(ax, ax2, ncol=2)
+
+    summary = _rl_reanalysis_summary(plotted)
+    note = _rl_reanalysis_activity_note(summary, historical_note)
+    ax.text(
+        0.015,
+        0.985,
+        note,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=6.1,
+        color="#4b5563",
+        linespacing=1.25,
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.88, "pad": 2.0},
+    )
+    if not (shown or correction or selected_share):
+        _no_data(ax, "Replay reanalysis telemetry unavailable")
+    return shown or correction or selected_share
+
+
+def _draw_rl_reanalysis_budget(ax, rows):
+    """Draw actual simulations consumed per successfully updated replay target."""
+    _style(ax, "Effective simulations per successfully updated target")
+    shown = False
+    for column, label, color, linestyle in (
+        ("reanalyse_simulations_mean", "mean", _COLORS[0], "-"),
+        ("reanalyse_simulations_min", "min", _COLORS[2], "--"),
+        ("reanalyse_simulations_max", "max", _COLORS[4], "--"),
+    ):
+        shown |= _line(ax, rows, column, label, color, ls=linestyle)
+    ax.set_ylabel("effective simulations / updated position", fontsize=7.5)
+    ax.set_xlabel("training iteration")
+    ax.set_ylim(bottom=0.0)
+    _legend_below(ax, ncol=3)
+    if not shown:
+        _no_data(ax, "Actual reanalysis simulations per update were not logged")
+    return shown
+
+
+def _count_rate_data(rows, count_column, duration_column):
+    """Return measured counts per positive wall-second plus pooled totals."""
+    xs, rates = [], []
+    total_count = total_duration = 0.0
+    for row in rows:
+        iteration = _number(row.get("iteration"))
+        count = _number(row.get(count_column))
+        duration = _number(row.get(duration_column))
+        if (
+            iteration is None or count is None or count < 0.0
+            or duration is None or duration <= 0.0
+        ):
+            continue
+        xs.append(int(iteration))
+        rates.append(count / duration)
+        total_count += count
+        total_duration += duration
+    return xs, rates, total_count, total_duration
+
+
+def _weighted_rate_summary(rows, rate_column, duration_column):
+    """Pool an already measured rate using its observed wall-time denominator."""
+    weighted_count = total_duration = 0.0
+    for row in rows:
+        rate = _number(row.get(rate_column))
+        duration = _number(row.get(duration_column))
+        if rate is None or rate < 0.0 or duration is None or duration <= 0.0:
+            continue
+        weighted_count += rate * duration
+        total_duration += duration
+    return weighted_count / total_duration if total_duration > 0.0 else None
 
 
 def _regime_change_iterations(rows):
@@ -269,6 +518,313 @@ def _last(rows, column, default=None):
         if value is not None:
             return value
     return default
+
+
+def _relative_holdout_gain_pct(row, before_column, reduction_column):
+    """Express a held-out error reduction as a percent of its before value."""
+    before = _number(row.get(before_column))
+    reduction = _number(row.get(reduction_column))
+    if before is None or reduction is None or before <= 0.0:
+        return None
+    return 100.0 * reduction / before
+
+
+def _ratio_if_positive(row, numerator_column, denominator_column):
+    numerator = _number(row.get(numerator_column))
+    denominator = _number(row.get(denominator_column))
+    if numerator is None or denominator is None or denominator <= 0.0:
+        return None
+    return numerator / denominator
+
+
+def _rl_reuse_accounting_summary(rows):
+    """Pool reuse and simulation accounting using each metric's real sample count."""
+    provenance_rows = 0.0
+    effective_sum = 0.0
+    fresh_sum = 0.0
+    credited_sum = 0.0
+    provenance_coverage_available = True
+    candidate_rows = 0.0
+    provenance_mismatches = 0.0
+    provenance_partial = 0.0
+    provenance_metrics_seen = False
+    provenance_incomplete_rows = 0
+
+    hit_count = 0.0
+    attempt_count = 0.0
+    unknown_attempt_rows = 0
+    hit_metrics_seen = False
+    hit_rates = []
+    inherited_visits_sum = 0.0
+    inherited_visits_hits = 0.0
+    hit_metrics_incomplete = False
+    raw_visits_incomplete = False
+
+    for row in rows:
+        row_count = _number(row.get("replay_search_budget_provenance_rows"))
+        row_effective = _number(row.get("replay_search_simulations_effective_sum"))
+        row_fresh = _number(row.get("replay_search_simulations_fresh_sum"))
+        row_credited = _number(row.get("replay_search_visits_inherited_credit_sum"))
+        if "replay_search_budget_provenance_rows" in row:
+            provenance_metrics_seen = True
+        if row_count is not None and row_count > 0.0:
+            provenance_metrics_seen = True
+            if all(
+                value is not None and value >= 0.0
+                for value in (row_effective, row_fresh, row_credited)
+            ):
+                provenance_rows += row_count
+                effective_sum += row_effective
+                fresh_sum += row_fresh
+                credited_sum += row_credited
+                coverage = _number(row.get("replay_search_budget_provenance_coverage"))
+                if coverage is not None and 0.0 < coverage <= 1.0:
+                    candidate_rows += row_count / coverage
+                else:
+                    provenance_coverage_available = False
+            else:
+                provenance_coverage_available = False
+                provenance_incomplete_rows += 1
+        elif "replay_search_budget_provenance_rows" in row and row_count is None:
+            provenance_coverage_available = False
+            provenance_incomplete_rows += 1
+
+        partial = _number(row.get("replay_search_budget_provenance_partial_rows"))
+        mismatch = _number(row.get("replay_search_budget_accounting_mismatch_rows"))
+        if partial is not None:
+            provenance_metrics_seen = True
+            provenance_partial += max(0.0, partial)
+        if mismatch is not None:
+            provenance_metrics_seen = True
+            provenance_mismatches += max(0.0, mismatch)
+
+        telemetry_complete = _number(row.get("selfplay_telemetry_complete"))
+        if telemetry_complete is not None and telemetry_complete < 1.0:
+            hit_metrics_incomplete = True
+            raw_visits_incomplete = True
+            continue
+        hit_rate = _number(row.get("mcts_tree_reuse_hit_rate"))
+        reused_roots = _number(row.get("mcts_tree_reuse_credit_samples"))
+        raw_visits = _number(row.get("mcts_tree_inherited_visits_avg"))
+        if (
+            "mcts_tree_reuse_hit_rate" in row
+            or "mcts_tree_reuse_credit_samples" in row
+        ) and (hit_rate is None or reused_roots is None):
+            hit_metrics_incomplete = True
+        if reused_roots is not None and reused_roots > 0.0 and raw_visits is None:
+            raw_visits_incomplete = True
+        if hit_rate is not None and reused_roots is not None and 0.0 <= hit_rate <= 1.0 and reused_roots >= 0.0:
+            hit_metrics_seen = True
+            hit_rates.append(hit_rate)
+            hit_count += reused_roots
+            if hit_rate > 0.0 and reused_roots > 0.0:
+                attempts = reused_roots / hit_rate
+                rounded_attempts = round(attempts)
+                if math.isclose(attempts, rounded_attempts, rel_tol=1e-7, abs_tol=1e-5):
+                    attempt_count += float(rounded_attempts)
+                else:
+                    unknown_attempt_rows += 1
+            elif hit_rate == 0.0 and reused_roots == 0.0:
+                # The log stores hits and the ratio, but not attempts. With zero
+                # hits the denominator cannot be recovered for a mixed-rate pool.
+                unknown_attempt_rows += 1
+            else:
+                unknown_attempt_rows += 1
+            if reused_roots > 0.0 and raw_visits is not None and raw_visits >= 0.0:
+                inherited_visits_sum += raw_visits * reused_roots
+                inherited_visits_hits += reused_roots
+
+    if provenance_rows > 0.0:
+        effective_per_row = effective_sum / provenance_rows
+        fresh_per_row = fresh_sum / provenance_rows
+        credited_per_row = credited_sum / provenance_rows
+        composition_matches = math.isclose(
+            effective_sum, fresh_sum + credited_sum, rel_tol=1e-7, abs_tol=1e-5
+        ) and provenance_mismatches == 0.0
+        extra_pct = (
+            100.0 * credited_sum / fresh_sum
+            if composition_matches and fresh_sum > 0.0 else None
+        )
+        coverage = (
+            min(1.0, provenance_rows / candidate_rows)
+            if provenance_coverage_available and candidate_rows > 0.0 else None
+        )
+    else:
+        effective_per_row = fresh_per_row = credited_per_row = extra_pct = None
+        composition_matches = None
+        coverage = None
+
+    if hit_metrics_seen and unknown_attempt_rows == 0 and attempt_count > 0.0:
+        reuse_hit_rate = hit_count / attempt_count
+        reuse_attempts = attempt_count
+    elif hit_metrics_seen and hit_rates and all(rate == hit_rates[0] for rate in hit_rates):
+        # A constant recorded rate has the same weighted mean for any positive
+        # denominator; its count still cannot be reported when hits are zero.
+        reuse_hit_rate = hit_rates[0]
+        reuse_attempts = attempt_count if attempt_count > 0.0 else None
+    else:
+        reuse_hit_rate = None
+        reuse_attempts = None
+
+    return {
+        "provenance_rows": int(provenance_rows),
+        "provenance_available": provenance_metrics_seen,
+        "provenance_coverage": coverage,
+        "provenance_partial_rows": int(provenance_partial),
+        "provenance_mismatch_rows": int(provenance_mismatches),
+        "provenance_incomplete_rows": provenance_incomplete_rows,
+        "effective_per_row": effective_per_row,
+        "fresh_per_row": fresh_per_row,
+        "credited_per_row": credited_per_row,
+        "extra_credit_pct_of_fresh": extra_pct,
+        "composition_matches": composition_matches,
+        "reuse_hit_rate": reuse_hit_rate if not hit_metrics_incomplete else None,
+        "reuse_hits": int(hit_count) if hit_metrics_seen else None,
+        "reuse_attempts": int(reuse_attempts) if reuse_attempts is not None else None,
+        "reuse_unknown_attempt_rows": unknown_attempt_rows,
+        "raw_inherited_visits_per_hit": (
+            inherited_visits_sum / inherited_visits_hits
+            if inherited_visits_hits > 0.0 and not raw_visits_incomplete else None
+        ),
+        "raw_inherited_visit_hits": int(inherited_visits_hits),
+    }
+
+
+def _selfplay_search_simulation_parts(row):
+    """Return per-root fresh simulations and reuse credit when accounting agrees."""
+    telemetry_complete = _number(row.get("selfplay_telemetry_complete"))
+    if telemetry_complete is not None and telemetry_complete < 1.0:
+        return None
+    fresh = _number(row.get("mcts_fresh_sims"))
+    credited = _number(row.get("mcts_inherited_visit_credit"))
+    if fresh is None or credited is None or fresh < 0.0 or credited < 0.0:
+        return None
+    effective = _number(row.get("mcts_avg_sims"))
+    if effective is not None and not math.isclose(
+        effective, fresh + credited, rel_tol=1e-6, abs_tol=1e-4
+    ):
+        return None
+    return fresh, credited
+
+
+def _selfplay_inherited_visit_parts(row):
+    """Return fresh and raw inherited visits per all search roots when denominators are known.
+
+    The raw inherited-visit average is conditional on a reused root. Convert it
+    to an all-search-root average with the reuse hit count and search-sample
+    count; hit rate is conditional on reuse attempts and is not that fraction.
+    """
+    telemetry_complete = _number(row.get("selfplay_telemetry_complete"))
+    if telemetry_complete is not None and telemetry_complete < 1.0:
+        return None
+
+    fresh = _number(row.get("mcts_fresh_sims"))
+    search_samples = _number(row.get("mcts_search_samples"))
+    if search_samples is None:
+        # Older rows did not persist search_samples. Their generated-position
+        # count is equivalent only when every search is a current self-play
+        # move that produces a history position, with no post-search exits.
+        legacy_fields = (
+            "played_positions",
+            "opponent_current_actual_share",
+            "opponent_best_actual_share",
+            "selfplay_resigned_games",
+            "selfplay_adjudicated_games",
+        )
+        values = {key: _number(row.get(key)) for key in legacy_fields}
+        if (
+            telemetry_complete is None
+            or telemetry_complete < 1.0
+            or any(value is None for value in values.values())
+            or not math.isclose(values["opponent_current_actual_share"], 1.0)
+            or not math.isclose(values["opponent_best_actual_share"], 0.0)
+            or values["selfplay_resigned_games"] != 0.0
+            or values["selfplay_adjudicated_games"] != 0.0
+        ):
+            return None
+        search_samples = values["played_positions"]
+
+    hits = _number(row.get("mcts_tree_reuse_credit_samples"))
+    raw_per_hit = _number(row.get("mcts_tree_inherited_visits_avg"))
+    if (
+        fresh is None
+        or fresh < 0.0
+        or search_samples is None
+        or search_samples <= 0.0
+        or hits is None
+        or hits < 0.0
+        or hits > search_samples
+    ):
+        return None
+    if hits == 0.0:
+        inherited_per_root = 0.0
+    elif raw_per_hit is None or raw_per_hit < 0.0:
+        return None
+    else:
+        inherited_per_root = raw_per_hit * hits / search_samples
+    return fresh, inherited_per_root
+
+
+def _rl_reuse_summary_subtitle(summary, *, reuse_q_scale=None):
+    """Format a compact, denominator-explicit reuse summary for the dashboard."""
+    provenance_rows = summary["provenance_rows"]
+    if provenance_rows > 0 and summary["composition_matches"]:
+        coverage = summary["provenance_coverage"]
+        coverage_text = (
+            f" ({coverage:.0%} coverage)" if coverage is not None else " (coverage unknown)"
+        )
+        provenance_line = (
+            f"Replay provenance weighted over {provenance_rows:,} target rows{coverage_text}: "
+            f"{summary['effective_per_row']:.2f} effective sims/root = "
+            f"{summary['fresh_per_row']:.2f} fresh + {summary['credited_per_row']:.2f} credited "
+            f"({summary['extra_credit_pct_of_fresh']:.2f}% over fresh)."
+        )
+        if summary["provenance_incomplete_rows"]:
+            provenance_line += (
+                f" {summary['provenance_incomplete_rows']:,} iteration row(s) had missing provenance."
+            )
+    elif provenance_rows > 0:
+        provenance_line = (
+            f"Replay search provenance covers {provenance_rows:,} rows, but effective/fresh/credited "
+            "totals do not reconcile; pooled additional-budget percentage is unavailable."
+        )
+    else:
+        provenance_line = (
+            "Replay effective/fresh/credited averages are n/a because complete search provenance is unavailable."
+        )
+    if summary["provenance_partial_rows"] or summary["provenance_mismatch_rows"]:
+        provenance_line += (
+            f" Logged partial={summary['provenance_partial_rows']:,}, "
+            f"accounting mismatch={summary['provenance_mismatch_rows']:,}."
+        )
+
+    hit_rate = summary["reuse_hit_rate"]
+    raw_visits = summary["raw_inherited_visits_per_hit"]
+    if hit_rate is None:
+        reuse_line = (
+            "Self-play reuse hit-rate average is n/a because the logged hit/attempt counters cannot be pooled completely."
+        )
+    elif summary["reuse_attempts"] is not None:
+        reuse_line = (
+            f"Self-play reuse hit rate among attempted roots: {hit_rate:.1%} "
+            f"({summary['reuse_hits']:,}/{summary['reuse_attempts']:,}; not all search roots);"
+        )
+    else:
+        reuse_line = (
+            f"Self-play reuse hit rate: {hit_rate:.1%} (attempt-weighting unavailable);"
+        )
+    if raw_visits is None:
+        reuse_line += " raw visits per successful reuse: n/a."
+    else:
+        reuse_line += (
+            f" {raw_visits:.2f} raw prior visits per hit, weighted over "
+            f"{summary['raw_inherited_visit_hits']:,} hits;"
+        )
+        if reuse_q_scale == "total":
+            reuse_line += " they inform total-visit Q scaling, not fresh compute or credited sims."
+        else:
+            reuse_line += " they are not fresh compute or credited sims."
+    return [provenance_line, reuse_line]
 
 
 def _mean(rows, column, window=5):
@@ -586,7 +1142,10 @@ def _stacked_iteration_bars(
         iteration = _number(row.get("iteration"))
         if iteration is None:
             continue
-        resolved = dict(value_resolver(row) or {})
+        resolved_values = value_resolver(row)
+        if resolved_values is None:
+            continue
+        resolved = dict(resolved_values)
         values = {
             key: max(0.0, _number(resolved.get(key)) or 0.0)
             for key, _, _ in specs
@@ -653,35 +1212,6 @@ def _stacked_iteration_bars(
         bbox_to_anchor=(0.5, -0.08),
     )
     return True
-
-
-def _whole_run_composition(rows, specs, value_resolver, weight_column=None):
-    """Aggregate every logged iteration using the same resolver as the bars.
-
-    Runtime/CPU costs are summed. Per-request latency components use request-
-    weighted means so a short iteration has no more influence than a long one.
-    """
-    selected_rows = list(rows)
-    if not selected_rows:
-        return [], 0
-    sums = {key: 0.0 for key, _, _ in specs}
-    total_weight = 0.0
-    for row in selected_rows:
-        weight = 1.0
-        if weight_column is not None:
-            weight = max(0.0, _number(row.get(weight_column)) or 0.0)
-            if weight <= 0.0:
-                continue
-        resolved = dict(value_resolver(row) or {})
-        for key in sums:
-            sums[key] += weight * max(0.0, _number(resolved.get(key)) or 0.0)
-        total_weight += weight
-    divisor = total_weight if weight_column is not None else 1.0
-    aggregated = [
-        (key, label, sums[key] / max(1e-12, divisor), color)
-        for key, label, color in specs
-    ]
-    return aggregated, len(selected_rows)
 
 
 def _composition_donut(
@@ -760,11 +1290,12 @@ def _composition_donut(
 
 _RUNTIME_STAGE_SPECS = (
     ("selfplay", "self-play", "#2563eb"),
-    ("replay_setup", "replay/setup", "#0891b2"),
+    ("replay_setup", "setup/replay", "#0891b2"),
     ("train", "training", "#16a34a"),
     ("evaluation", "evaluation", "#f59e0b"),
-    ("maintenance", "checkpoint/log/cleanup", "#7c3aed"),
-    ("additional", "additional stages", "#64748b"),
+    ("elo_eval", "Elo eval", "#ea580c"),
+    ("maintenance", "maintenance", "#7c3aed"),
+    ("additional", "other phases", "#64748b"),
     ("other", "unaccounted", "#cbd5e1"),
 )
 
@@ -802,9 +1333,9 @@ def _runtime_composition_data(rows):
             "train": group(("stage_train_time_s",)),
             "evaluation": group((
                 "stage_regular_eval_time_s", "stage_promotion_eval_time_s",
-                "stage_promotion_confirmation_time_s", "stage_elo_eval_time_s",
-                "stage_eval_log_time_s",
+                "stage_promotion_confirmation_time_s", "stage_eval_log_time_s",
             )),
+            "elo_eval": group(("stage_elo_eval_time_s",)),
             "maintenance": group((
                 "stage_log_time_s", "stage_checkpoint_time_s", "stage_gc_time_s",
             )),
@@ -841,29 +1372,226 @@ def _runtime_composition_data(rows):
     return iterations, totals, stage_values, other_values
 
 
-def _average_runtime_composition_panel(ax, rows):
-    """Draw the identical average-runtime donut on both RL PNGs."""
-    iterations, _, stage_values, other_values = _runtime_composition_data(rows)
-    sample_count = len(iterations)
-    # Average each known stage over rows where its timing was actually logged.
+def _donut_note(ax, message):
+    ax.text(
+        0.5, -0.20, message,
+        transform=ax.transAxes, ha="center", va="top",
+        fontsize=6.2, color="#536273", wrap=True,
+    )
+
+
+def _overall_runtime_donut(ax, rows):
+    """Show summed, complete iteration wall-time from exclusive stage timers."""
+    _, totals, stage_values, other_values = _runtime_composition_data(rows)
+    complete_indices = [
+        index for index, total in enumerate(totals)
+        if total is not None and other_values[index] is not None
+    ]
+    if not complete_indices:
+        ax.set_title("Overall iteration time by phase", fontsize=10, fontweight="bold", loc="left")
+        _no_data(ax, "Complete total and stage timers unavailable")
+        return False
+
     averaged = []
+    measured_zero = []
     for column, label, color in _RUNTIME_STAGE_SPECS:
-        values = [value for value in stage_values[column] if value is not None]
-        if not values:
-            continue
-        if column == "other" and len(values) != sample_count:
-            continue
-        averaged.append((column, label, sum(values) / max(1, len(values)), color))
-    return _composition_donut(
+        values = [stage_values[column][index] for index in complete_indices]
+        if values and all(value is not None for value in values):
+            total = sum(values)
+            if total > 0.0:
+                averaged.append((column, label, total, color))
+            else:
+                measured_zero.append(label)
+    _composition_donut(
         ax,
         averaged,
-        title="Average runtime composition",
-        center_label="avg / iteration",
+        title="Overall iteration time by phase",
+        center_label="complete logged\niterations",
         unit="s",
         decimals=1,
-        min_share=0.01,
-        min_value=1.0,
+        min_share=0.005,
+        min_value=0.5,
     )
+    note = "Stage wall timers are exclusive; unaccounted is only the measured residual."
+    if measured_zero:
+        note += " Logged at 0s: " + ", ".join(measured_zero) + "."
+    _donut_note(ax, note)
+    return True
+
+
+def _selfplay_worker_search_donut(ax, rows):
+    """Partition worker search time into batch expansion and the search remainder."""
+    search = expansion = 0.0
+    samples = 0
+    for row in rows:
+        total = _number(row.get("mcts_search_many_time_s"))
+        expanded = _number(row.get("mcts_batch_expand_eval_time_s"))
+        if total is None or expanded is None or total < 0.0 or expanded < 0.0:
+            continue
+        if expanded > total:
+            continue
+        search += total
+        expansion += min(total, expanded)
+        samples += 1
+    averaged = []
+    if samples and search > 0.0:
+        averaged = [
+            ("expansion", "batch expand/eval", expansion, "#db2777"),
+            ("other_search", "other search", max(0.0, search - expansion), "#2563eb"),
+        ]
+    _composition_donut(
+        ax,
+        averaged,
+        title="Self-play search breakdown",
+        center_label="summed worker\nsearch seconds",
+        unit="s",
+        decimals=0,
+        min_share=0.0,
+        min_value=0.0,
+    )
+    if averaged:
+        _donut_note(ax, f"{samples} iterations. Worker-seconds sum across workers and can exceed wall time.")
+    return bool(averaged)
+
+
+def _cpu_worker_search_partition(rows):
+    """Return a non-overlapping worker-search partition outside measured NN wait."""
+    totals = {"selection": 0.0, "backprop": 0.0, "remainder": 0.0}
+    samples = 0
+    for row in rows:
+        wait = _number(row.get("mcts_nn_inference_time_s"))
+        search = _number(row.get("mcts_search_many_time_s"))
+        selection = _number(row.get("mcts_search_selection_time_s"))
+        backprop = _number(row.get("mcts_search_backprop_time_s"))
+        values = (search, wait, selection, backprop)
+        if any(value is None or value < 0.0 for value in values):
+            continue
+        known = wait + selection + backprop
+        if known > search:
+            continue
+        totals["selection"] += selection
+        totals["backprop"] += backprop
+        totals["remainder"] += max(0.0, search - known)
+        samples += 1
+    return totals, samples
+
+
+def _complete_exclusive_stage_rows(rows):
+    """Return rows with a complete stage-timer vector and its exact costs.
+
+    Stage counters are exclusive iteration wall timers.  A blank cell is
+    unknown, so rows with any missing stage timer are excluded from additive
+    stacks and ranked totals rather than silently treating it as zero.
+    """
+    stage_columns = sorted({
+        str(column)
+        for row in rows
+        for column in row
+        if str(column).startswith("stage_") and str(column).endswith("_time_s")
+    })
+    complete = []
+    if not stage_columns:
+        return stage_columns, complete
+    for row in rows:
+        iteration = _number(row.get("iteration"))
+        total = _number(row.get("iteration_total_time_s"))
+        values = {column: _number(row.get(column)) for column in stage_columns}
+        if iteration is None or total is None or any(value is None or value < 0 for value in values.values()):
+            continue
+        stage_sum = sum(values.values())
+        residual = total - stage_sum
+        if residual < -0.01:
+            continue
+        values["unaccounted"] = max(0.0, residual)
+        complete.append((int(iteration), total, values))
+    return stage_columns, complete
+
+
+def _exclusive_stage_labels(column):
+    return column.removeprefix("stage_").removesuffix("_time_s").replace("_", " ")
+
+
+_OVERLAPPING_WORKER_TIMERS = (
+    ("mcts_search_many_time_s", "search worker", "#2563eb"),
+    ("mcts_nn_inference_time_s", "NN wait", "#db2777"),
+    ("mcts_search_root_setup_time_s", "root setup", "#0891b2"),
+    ("mcts_search_selection_time_s", "tree selection", "#16a34a"),
+    ("mcts_search_backprop_time_s", "backpropagation", "#7c3aed"),
+    ("mcts_board_to_tensor_time_s", "board encoding", "#ea580c"),
+    ("mcts_batch_expand_tensor_pack_time_s", "input tensor packing", "#06b6d4"),
+    ("mcts_batch_expand_cpu_policy_time_s", "CPU policy", "#dc2626"),
+    ("mcts_batch_expand_move_index_time_s", "move indexing", "#a16207"),
+    ("mcts_policy_target_build_time_s", "policy target build", "#64748b"),
+)
+
+
+def _cpu_path_timer_donut(ax, rows):
+    """Show exclusive worker search timers without claiming process CPU time."""
+    totals, samples = _cpu_worker_search_partition(rows)
+    cpu_seconds = sum(totals.values())
+    counters = [
+        (key, label, value, color)
+        for key, label, color, value in (
+            ("selection", "tree selection", "#2563eb", totals["selection"]),
+            ("backprop", "backpropagation", "#16a34a", totals["backprop"]),
+            ("remainder", "other outside NN wait", "#64748b", totals["remainder"]),
+        )
+        if value > 0.0
+    ] if samples and cpu_seconds > 0.0 else []
+    _composition_donut(
+        ax,
+        counters,
+        title="CPU-side search worker time",
+        center_label="search outside\nNN wait",
+        unit="s",
+        decimals=0,
+        min_share=0.005,
+        min_value=0.5,
+        autopct_min=0.0,
+    )
+    if counters:
+        _donut_note(
+            ax,
+        f"{samples} iterations: search − NN wait = selection + backprop + remainder. Worker wall-time, not process CPU time/utilization.",
+        )
+    return bool(counters)
+
+
+def _gpu_path_timer_donut(ax, rows):
+    """Show latest host-timed central inference phases; no device utilization is inferred."""
+    columns = (
+        ("central_server_h2d_ms_per_request", "H2D", "#0891b2"),
+        ("central_server_forward_ms_per_request", "forward", "#7c3aed"),
+        ("central_server_d2h_ms_per_request", "D2H", "#f59e0b"),
+    )
+    latest = None
+    latest_iteration = None
+    for row in reversed(rows):
+        values = [_number(row.get(column)) for column, _, _ in columns]
+        if all(value is not None and value >= 0.0 for value in values):
+            latest = values
+            latest_iteration = _number(row.get("iteration"))
+            break
+    averaged = []
+    if latest:
+        averaged = [
+            (column, label, value, color)
+            for (column, label, color), value in zip(columns, latest)
+        ]
+    _composition_donut(
+        ax,
+        averaged,
+        title="GPU inference path",
+        center_label="latest\nms / request",
+        unit="ms",
+        decimals=2,
+        min_share=0.0,
+        min_value=0.0,
+    )
+    if averaged:
+        iteration_label = "n/a" if latest_iteration is None else f"{latest_iteration:g}"
+        _donut_note(ax, f"Iteration {iteration_label}: host-timed phases; no device-utilization counter.")
+    return bool(averaged)
 
 
 def _legend_below(ax, *extra_axes, ncol=2, y=-0.17):
@@ -900,6 +1628,8 @@ def _no_data(ax, message="Brak danych w CSV"):
 
 
 def _finish(fig, output_path, title, subtitle=None, *, hspace=0.48, wspace=0.30):
+    if getattr(fig, "_training_dashboard_layout", False):
+        return finish_dashboard(fig, output_path, title, subtitle)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.suptitle(title, fontsize=16, fontweight="bold", x=0.04, ha="left", y=0.988)
@@ -1265,7 +1995,27 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     if not main:
         return False
 
-    fig, axes = plt.subplots(3, 3, figsize=(18, 13.2))
+    holdout_gain_metrics = (
+        ("holdout_policy_kl", "holdout_policy_kl_before", "holdout_policy_kl_reduction"),
+        ("holdout_wdl_ce", "holdout_value_wdl_ce_before", "holdout_value_wdl_ce_reduction"),
+        ("holdout_brier", "holdout_value_brier_before", "holdout_value_brier_reduction"),
+        ("holdout_value_mae", "holdout_value_mae_before", "holdout_value_mae_reduction"),
+    )
+    for row in main:
+        for target, before, reduction in holdout_gain_metrics:
+            row[f"_{target}_relative_gain_pct"] = _relative_holdout_gain_pct(
+                row, before, reduction
+            )
+
+    sections = [
+        ("Strength and evaluation", [(0, 0), (0, 1), (0, 2)], 3),
+        ("Learning signals", [(1, 2), (2, 0), (2, 1)], 3),
+        ("Search and calibration", [(1, 1), (2, 2)], 2),
+        ("Measured timing and hardware path", [(3, column) for column in range(4)], 4),
+        ("Holdout learning audit", [(4, 0), (4, 1)], 2),
+        ("Gradient health", [(5, 0), (5, 1)], 2),
+    ]
+    fig, axes = create_dashboard(sections)
     promotion_iterations, recovery_iterations = _regime_change_iterations(main)
     selfplay_best_intervals = _selfplay_best_intervals(detail)
     matchup_breaks = tuple(promotion_iterations) + tuple(recovery_iterations)
@@ -1355,7 +2105,10 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     if not shown:
         _no_data(ax)
 
-    _average_runtime_composition_panel(axes[1, 0], performance)
+    _overall_runtime_donut(axes[3, 0], performance)
+    _selfplay_worker_search_donut(axes[3, 1], performance)
+    _cpu_path_timer_donut(axes[3, 2], performance)
+    _gpu_path_timer_donut(axes[3, 3], performance)
 
     ax = axes[1, 1]
     _search_correction_rate_panel(
@@ -1449,6 +2202,87 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     if not (shown or draw_shown):
         _no_data(ax)
 
+    ax = axes[4, 0]
+    _style(ax, "Holdout policy and value error reduction")
+    shown = False
+    for column, label, color in (
+        ("_holdout_policy_kl_relative_gain_pct", "policy KL", _COLORS[0]),
+        ("_holdout_wdl_ce_relative_gain_pct", "WDL cross-entropy", _COLORS[3]),
+        ("_holdout_brier_relative_gain_pct", "WDL Brier", _COLORS[2]),
+        ("_holdout_value_mae_relative_gain_pct", "value MAE", _COLORS[4]),
+    ):
+        shown |= _line(ax, main, column, label, color, break_after=recovery_iterations)
+    ax.axhline(0.0, color="#374151", lw=1.0, ls=":", label="no change")
+    ax.set_ylabel("reduction vs before (%)", fontsize=7.5)
+    _legend_below(ax, ncol=2)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not shown:
+        _no_data(ax, "Held-out before/after policy and value metrics unavailable")
+    else:
+        holdout_rows = _last(main, "holdout_rows")
+        if holdout_rows is not None:
+            ax.text(
+                0.98, 0.96, f"latest holdout n={holdout_rows:,.0f}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=7,
+                color="#4b5563",
+            )
+
+    ax = axes[4, 1]
+    _style(ax, "Holdout root-Q MAE reduction by phase")
+    shown = False
+    for column, label, color in (
+        ("holdout_root_q_mae_reduction", "overall", _COLORS[0]),
+        ("holdout_root_q_mae_opening_reduction", "opening", _COLORS[2]),
+        ("holdout_root_q_mae_middlegame_reduction", "middlegame", _COLORS[3]),
+        ("holdout_root_q_mae_endgame_reduction", "endgame", _COLORS[4]),
+    ):
+        shown |= _line(ax, main, column, label, color, break_after=recovery_iterations)
+    ax.axhline(0.0, color="#374151", lw=1.0, ls=":", label="no change")
+    ax.set_ylabel("MAE reduction (value units)", fontsize=7.5)
+    _legend_below(ax, ncol=2)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not shown:
+        _no_data(ax, "Held-out root-Q phase errors unavailable")
+
+    ax = axes[5, 0]
+    _style(ax, "Gradient norms and clipping")
+    shown = False
+    for column, label, color in (
+        ("grad_total_norm", "total norm", _COLORS[0]),
+        ("grad_backbone_norm", "backbone", _COLORS[1]),
+        ("grad_policy_head_norm", "policy head", _COLORS[2]),
+        ("grad_value_head_norm", "value head", _COLORS[3]),
+    ):
+        shown |= _line(ax, main, column, label, color, break_after=recovery_iterations)
+    ax.set_ylabel("gradient L2 norm", fontsize=7.5)
+    ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+    clipped = _line(
+        ax2, main, "grad_clip_fraction", "steps clipped", "#f59e0b",
+        ls="--", break_after=recovery_iterations,
+    )
+    ax2.set_ylabel("clipped optimizer steps", fontsize=7.2, color="#b45309")
+    ax2.tick_params(axis="y", labelcolor="#b45309")
+    ax2.set_ylim(0.0, 1.0)
+    _legend_below(ax, ax2, ncol=3)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not (shown or clipped):
+        _no_data(ax, "Gradient norm and clipping telemetry unavailable")
+
+    ax = axes[5, 1]
+    _style(ax, "Policy/value gradient alignment")
+    shown = _line(
+        ax, main, "grad_policy_value_cosine", "policy/value cosine", _COLORS[5],
+        lw=2.0, break_after=recovery_iterations,
+    )
+    ax.axhline(0.0, color="#374151", lw=1.0, ls="--", label="orthogonal")
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_ylabel("cosine similarity (−1 to +1)", fontsize=7.5)
+    _legend_below(ax, ncol=2)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not shown:
+        _no_data(ax, "Policy/value gradient cosine unavailable")
+
     for plot_index, plot_ax in enumerate((
         axes[0, 0], axes[0, 1], axes[0, 2],
         axes[1, 2],
@@ -1463,35 +2297,63 @@ def render_rl_main(main_csv_path, data_quality_csv_path, performance_csv_path, o
     # Best-actor intervals describe self-play provenance, not sparse external
     # Elo evaluations. They do belong on value/objective/search timelines
     # because actor changes can affect both targets and optimization difficulty.
-    timeline_axes = [axes[0, 0], axes[0, 1], axes[1, 1], axes[1, 2], *axes[2, :]]
+    timeline_axes = [
+        axes[0, 0], axes[0, 1], axes[1, 1], axes[1, 2],
+        axes[2, 0], axes[2, 1], axes[2, 2],
+        axes[4, 0], axes[4, 1], axes[5, 0], axes[5, 1],
+    ]
     for plot_index, plot_ax in enumerate(timeline_axes):
         _mark_selfplay_best_intervals(
             plot_ax,
             selfplay_best_intervals,
             label=(plot_index == 0),
         )
-    _mark_resume_boundaries(axes, _resume_markers(main_csv_path))
+    _mark_resume_boundaries(
+        {key: ax for key, ax in axes.items() if key[0] != 3},
+        _resume_markers(main_csv_path),
+    )
 
-    context = " | ".join(str(line) for line in (run_context_lines or []) if line)
+    context = [str(line) for line in (run_context_lines or []) if line]
     _finish(
         fig,
         output_path,
         "RL training - strength and learning dashboard",
         context or None,
-        hspace=0.72,
-        wspace=0.38,
     )
     return True
 
 
-def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
+def render_rl_data_quality(
+    main_csv_path,
+    data_quality_csv_path,
+    output_path,
+    *,
+    reanalysis_context=None,
+):
     """Render the compact dashboard used to diagnose RL data and search quality."""
     main = _rows(main_csv_path)
     rows = _rows(data_quality_csv_path)
     rl_cfg = _rl_config(main_csv_path)
     if not rows:
         return False
-    fig, axes = plt.subplots(4, 3, figsize=(18, 17.8))
+    reuse_summary = _rl_reuse_accounting_summary(rows)
+    for row in rows:
+        for target, numerator, denominator in (
+            ("_syzygy_ended_rate", "selfplay_syzygy_ended_games", "selfplay_completed_games"),
+            ("_resigned_rate", "selfplay_resigned_games", "selfplay_completed_games"),
+            ("_adjudicated_rate", "selfplay_adjudicated_games", "selfplay_completed_games"),
+        ):
+            row[target] = _ratio_if_positive(row, numerator, denominator)
+    sections = [
+        ("Replay feed and retention", [(0, 0), (0, 1), (1, 0), (3, 0)], 3),
+        ("Targets and correction learning", [(0, 2), (1, 1), (1, 2)], 3),
+        ("Search and self-play quality", [(2, 0), (2, 2), (3, 1), (3, 2)], 3),
+        ("Replay freshness and training coverage", [(4, 0), (4, 1), (4, 2)], 3),
+        ("Adaptive search budget and reuse", [(5, 0), (5, 1), (5, 2)], 3),
+        ("Game termination and opening breadth", [(6, 0), (6, 1)], 2),
+        ("MCTS reuse accounting", [(7, 0), (7, 1)], 2),
+    ]
+    fig, axes = create_dashboard(sections)
     promotion_iterations, recovery_iterations = _regime_change_iterations(main)
     selfplay_best_intervals = _selfplay_best_intervals(rows)
     selfplay_breaks = tuple(promotion_iterations) + tuple(recovery_iterations)
@@ -1726,27 +2588,14 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
     ax = axes[2, 0]
     budgets = (64, 128, 192, 256, 320)
     root_counts = [_last(rows, f"mcts_budget_{budget}_root_count") for budget in budgets]
-    _style(ax, "MCTS simulation allocation")
+    _style(ax, "MCTS simulation budget by iteration")
     shown = _line(
-        ax, rows, "mcts_avg_budget", "average budget", _COLORS[0], lw=2.2,
+        ax, rows, "mcts_avg_budget", "average allocated budget", _COLORS[0], lw=2.2,
         break_after=selfplay_breaks,
     )
-    shown |= _line(
-        ax, rows, "mcts_fresh_sims", "fresh after reuse", "#0891b2", ls=":", lw=1.8,
-        break_after=selfplay_breaks,
-    )
-    ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
-    _line(
-        ax2, rows, "mcts_tree_reuse_visit_credit_share", "inherited visit share",
-        "#db2777", ls="-.", lw=1.6, break_after=selfplay_breaks,
-    ) or _line(
-        ax2, rows, "mcts_tree_reuse_credit_fraction", "reuse-root rate (legacy)",
-        "#db2777", ls="-.", lw=1.6, break_after=selfplay_breaks,
-    )
-    ax2.set_ylim(-0.05, 1.05)
     _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
-    _legend_below(ax, ax2, ncol=2)
-    ax.set_ylabel("simulations / position", fontsize=8)
+    _legend_below(ax, ncol=2)
+    ax.set_ylabel("allocated simulations / root", fontsize=7.5)
     latest_budget_json = _last(rows, "mcts_budget_quality_levels_json")
     all_level_summary = []
     if latest_budget_json:
@@ -1800,15 +2649,6 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
         )
     if not shown:
         _no_data(ax)
-
-    ax = axes[2, 1]
-    _search_correction_rate_panel(
-        ax,
-        rows,
-        break_after=selfplay_breaks,
-        promotion_iterations=promotion_iterations,
-        recovery_iterations=recovery_iterations,
-    )
 
     ax = axes[2, 2]
     _style(ax, "Q gain when search changes move")
@@ -1901,8 +2741,255 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
 
     _latest_search_decision_donut(axes[3, 2], rows)
 
+    ax = axes[4, 0]
+    _style(ax, "Replay sample age")
+    shown = False
+    for column, label, color in (
+        ("sample_age_avg", "mean", _COLORS[0]),
+        ("sample_age_p50", "p50", _COLORS[2]),
+        ("sample_age_p90", "p90", _COLORS[3]),
+    ):
+        shown |= _line(ax, rows, column, label, color, break_after=selfplay_breaks)
+    ax.set_ylabel("iterations old at sample time", fontsize=7.5)
+    _legend_below(ax, ncol=3)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not shown:
+        _no_data(ax, "Replay sample-age telemetry unavailable")
+
+    ax = axes[4, 1]
+    _style(ax, "Training sample coverage and replay fill", percent=True)
+    shown = False
+    for column, label, color in (
+        ("train_replay_coverage", "sample coverage", _COLORS[0]),
+        ("train_game_coverage", "game coverage", _COLORS[2]),
+        ("replay_fill_rate", "buffer fill", _COLORS[3]),
+    ):
+        shown |= _line(ax, rows, column, label, color, break_after=selfplay_breaks)
+    ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
+    passes = _line(
+        ax2, rows, "train_replay_passes", "replay passes", _COLORS[4],
+        ls="--", break_after=selfplay_breaks,
+    )
+    ax2.set_ylabel("train-selected positions / replay size", fontsize=7.2, color="#b45309")
+    ax2.tick_params(axis="y", labelcolor="#b45309")
+    _legend_below(ax, ax2, ncol=2)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not (shown or passes):
+        _no_data(ax, "Training coverage and replay-fill telemetry unavailable")
+
+    ax = axes[4, 2]
+    _draw_rl_reanalysis_activity(
+        ax,
+        rows,
+        historical_note=reanalysis_context,
+    )
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+
+    ax = axes[5, 0]
+    _style(ax, "Adaptive simulation budget spread")
+    shown = False
+    for column, label, color, style in (
+        ("mcts_budget_p10", "p10", _COLORS[0], "--"),
+        ("mcts_budget_p50", "p50", _COLORS[2], "-"),
+        ("mcts_budget_p90", "p90", _COLORS[3], "--"),
+        ("mcts_budget_target", "configured target", "#111827", ":"),
+    ):
+        shown |= _line(
+            ax, rows, column, label, color, ls=style, break_after=selfplay_breaks,
+        )
+    p10_x, p10_y = _series(rows, "mcts_budget_p10")
+    p90_x, p90_y = _series(rows, "mcts_budget_p90")
+    if p10_x and p10_x == p90_x:
+        _fill_between_with_breaks(
+            ax, p10_x, p10_y, p90_y, break_after=selfplay_breaks,
+            color=_COLORS[0], alpha=0.08, linewidth=0,
+        )
+    ax.set_ylabel("simulations per position", fontsize=7.5)
+    ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+    utilization = _line(
+        ax2, rows, "mcts_budget_utilization", "mean budget utilization", _COLORS[4],
+        ls="-.", break_after=selfplay_breaks,
+    )
+    ax2.set_ylabel("budget used / allocated", fontsize=7.2, color="#b45309")
+    ax2.tick_params(axis="y", labelcolor="#b45309")
+    _legend_below(ax, ax2, ncol=3)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not (shown or utilization):
+        _no_data(ax, "Adaptive simulation-budget distribution unavailable")
+
+    ax = axes[5, 1]
+    _style(ax, "Budget assignment vs search difficulty")
+    shown = _line(
+        ax, rows, "mcts_difficulty_budget_correlation", "difficulty/budget correlation",
+        _COLORS[0], lw=2.0, break_after=selfplay_breaks,
+    )
+    ax.axhline(0.0, color="#374151", lw=1.0, ls=":", label="no association")
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_ylabel("per-position correlation (−1 to +1)", fontsize=7.2)
+    ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+    coverage = _line(
+        ax2, rows, "mcts_budget_quality_coverage", "budget-quality sample coverage",
+        _COLORS[4], ls="--", break_after=selfplay_breaks,
+    )
+    ax2.set_ylabel("positions with quality labels", fontsize=7.0, color="#b45309")
+    ax2.tick_params(axis="y", labelcolor="#b45309")
+    ax2.set_ylim(0.0, 1.0)
+    _legend_below(ax, ax2, ncol=2)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not (shown or coverage):
+        _no_data(ax, "Difficulty-to-budget correlation unavailable")
+    else:
+        ax.text(
+            0.02, 0.97, "Positive correlation means harder roots receive more simulations.",
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.5, color="#4b5563",
+        )
+
+    ax = axes[5, 2]
+    _style(ax, "Tree reuse quality and coverage", percent=True)
+    shown = False
+    for column, label, color in (
+        ("mcts_tree_reuse_hit_rate", "reuse hit rate", _COLORS[0]),
+        ("mcts_tree_reuse_quality_avg", "reuse quality", _COLORS[2]),
+        ("mcts_tree_reuse_candidate_coverage_avg", "candidate coverage", _COLORS[3]),
+        ("mcts_tree_reuse_visited_prior_mass_avg", "visited prior mass", _COLORS[4]),
+        ("mcts_tree_reuse_visit_credit_share", "inherited visit share", _COLORS[5]),
+    ):
+        shown |= _line(ax, rows, column, label, color, break_after=selfplay_breaks)
+    _legend_below(ax, ncol=2)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not shown:
+        _no_data(ax, "Tree-reuse quality counters unavailable")
+
+    ax = axes[6, 0]
+    _style(ax, "Self-play termination rates", percent=True)
+    shown = False
+    for column, label, color in (
+        ("selfplay_auto_draw_rate", "automatic draw", _COLORS[0]),
+        ("selfplay_truncated_rate", "move-limit truncated", _COLORS[1]),
+        ("_syzygy_ended_rate", "Syzygy-ended / completed", _COLORS[2]),
+        ("_resigned_rate", "resigned / completed", _COLORS[3]),
+        ("_adjudicated_rate", "adjudicated / completed", _COLORS[4]),
+    ):
+        shown |= _line(ax, rows, column, label, color, break_after=selfplay_breaks)
+    _legend_below(ax, ncol=2)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if shown:
+        ax.text(
+            0.02, 0.97, "Each rate uses its logged or completed-game denominator; rates are not stacked.",
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.2, color="#4b5563",
+        )
+    else:
+        _no_data(ax, "Self-play termination telemetry unavailable")
+
+    ax = axes[6, 1]
+    _style(ax, "Self-play opening breadth")
+    shown = _line(
+        ax, rows, "selfplay_opening_unique_8ply", "unique 8-ply prefixes", _COLORS[0],
+        break_after=selfplay_breaks,
+    )
+    shown |= _line(
+        ax, rows, "selfplay_opening_effective_8ply", "effective prefixes", _COLORS[2],
+        break_after=selfplay_breaks,
+    )
+    ax.set_ylabel("prefix count (unique / effective)", fontsize=7.3)
+    ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+    concentration = _line(
+        ax2, rows, "selfplay_opening_top1_8ply_rate", "most common prefix share",
+        _COLORS[4], ls="--", break_after=selfplay_breaks,
+    )
+    concentration |= _line(
+        ax2, rows, "selfplay_opening_prefix_coverage_completed", "prefix coverage",
+        _COLORS[5], ls=":", break_after=selfplay_breaks,
+    )
+    ax2.set_ylabel("share of completed games", fontsize=7.0, color="#b45309")
+    ax2.tick_params(axis="y", labelcolor="#b45309")
+    _legend_below(ax, ax2, ncol=2)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not (shown or concentration):
+        _no_data(ax, "Opening-prefix diversity telemetry unavailable")
+
+    ax = axes[7, 0]
+    _style(ax, "Fresh + inherited visits per search root")
+    search_iterations = []
+    fresh_per_root = []
+    inherited_per_root = []
+    for row in rows:
+        iteration = _number(row.get("iteration"))
+        parts = _selfplay_inherited_visit_parts(row)
+        if iteration is None or parts is None:
+            continue
+        search_iterations.append(int(iteration))
+        fresh_per_root.append(parts[0])
+        inherited_per_root.append(parts[1])
+    if search_iterations:
+        ax.bar(
+            search_iterations, fresh_per_root, width=0.68, color=_COLORS[0],
+            label="fresh simulations / root", edgecolor="white", linewidth=0.35,
+        )
+        ax.bar(
+            search_iterations, inherited_per_root, bottom=fresh_per_root,
+            width=0.68, color="#db2777", label="raw inherited visits / root",
+            edgecolor="white", linewidth=0.35,
+        )
+        for iteration, fresh, inherited in zip(
+            search_iterations, fresh_per_root, inherited_per_root
+        ):
+            ax.annotate(
+                f"{fresh + inherited:.0f}",
+                (iteration, fresh + inherited),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=6.2,
+                color="#9d174d",
+            )
+    effective_shown = _line(
+        ax, rows, "mcts_avg_sims", "effective simulations used", "#111827",
+        lw=1.8, break_after=selfplay_breaks,
+    )
+    budget_shown = _line(
+        ax, rows, "mcts_avg_budget", "allocated budget", "#64748b",
+        ls="--", break_after=selfplay_breaks,
+    )
+    ax.set_ylabel("visits or simulations / search root", fontsize=7.5)
+    _legend_below(ax, ncol=2)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not (search_iterations or effective_shown or budget_shown):
+        _no_data(ax, "Per-search-root inherited-visit accounting unavailable")
+
+    ax = axes[7, 1]
+    _style(ax, "Reuse hit rate and raw inherited visits", percent=True)
+    hit_rate_shown = _line(
+        ax, rows, "mcts_tree_reuse_hit_rate", "reuse hits / attempts", _COLORS[0],
+        break_after=selfplay_breaks,
+    )
+    ax.set_ylim(0.0, 1.05)
+    ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
+    raw_visits_shown = _line(
+        ax2, rows, "mcts_tree_inherited_visits_avg", "raw inherited visits / reused root",
+        _COLORS[4], ls="--", break_after=selfplay_breaks,
+    )
+    q_scale_note = (
+        " (Q scale: total)"
+        if rl_cfg.get("mcts_gumbel_reuse_q_scale") == "total" else ""
+    )
+    ax2.set_ylabel(
+        f"prior-root visits / reuse{q_scale_note}",
+        fontsize=7.0,
+        color="#b45309",
+    )
+    ax2.tick_params(axis="y", labelcolor="#b45309")
+    _legend_below(ax, ax2, ncol=2)
+    _mark_regime_changes(ax, promotion_iterations, recovery_iterations)
+    if not (hit_rate_shown or raw_visits_shown):
+        _no_data(ax, "Tree reuse hit and inherited-visit telemetry unavailable")
+
     for plot_index, plot_ax in enumerate(
-        ax for row_axes in axes for ax in row_axes if ax is not axes[3, 2]
+        ax for key, ax in axes.items() if key != (3, 2)
     ):
         _mark_selfplay_best_intervals(
             plot_ax,
@@ -1911,13 +2998,56 @@ def render_rl_data_quality(main_csv_path, data_quality_csv_path, output_path):
         )
     _legend_below(axes[0, 0], ncol=3)
 
-    _mark_resume_boundaries(axes, _resume_markers(main_csv_path))
+    _mark_resume_boundaries(
+        {key: ax for key, ax in axes.items() if key != (3, 2)},
+        _resume_markers(main_csv_path),
+    )
     _finish(
         fig,
         output_path,
         "RL details - data and search quality",
-        "Replay stability, supervision health and whether MCTS produces useful corrections for the learner.",
+        _rl_reuse_summary_subtitle(
+            reuse_summary,
+            reuse_q_scale=rl_cfg.get("mcts_gumbel_reuse_q_scale"),
+        ),
         hspace=0.78,
+    )
+    return True
+
+
+def render_rl_reanalysis_activity(
+    data_quality_csv_path,
+    output_path,
+    *,
+    historical_note=None,
+):
+    """Render a focused replay-reanalysis view from an existing data-quality CSV."""
+    rows = _rows(data_quality_csv_path)
+    if not rows:
+        return False
+    fig, (activity_ax, budget_ax) = plt.subplots(
+        2,
+        1,
+        figsize=(11.0, 7.2),
+        sharex=True,
+        facecolor="#f3f5f8",
+        gridspec_kw={"height_ratios": (1.5, 0.8)},
+    )
+    activity_ax.set_facecolor("white")
+    budget_ax.set_facecolor("white")
+    _draw_rl_reanalysis_activity(
+        activity_ax,
+        rows,
+        historical_note=historical_note,
+    )
+    _draw_rl_reanalysis_budget(budget_ax, rows)
+    _finish(
+        fig,
+        output_path,
+        "RL replay reanalysis diagnostics",
+        "Position counts are per iteration and refer to replay targets, not fresh self-play positions. "
+        "Correction rate is search target correction versus the current NN, not learner uptake.",
+        hspace=0.85,
     )
     return True
 
@@ -1941,6 +3071,13 @@ def render_rl_performance(
     for row in rows:
         iteration = _number(row.get("iteration"))
         quality = quality_by_iteration.get(int(iteration)) if iteration is not None else None
+        # Keep source counters distinct from compatibility estimates below.
+        # The dedicated fresh-NPS panel must never relabel effective/fallback
+        # simulations as fresh completed search work.
+        row["logged_fresh_mcts_nps"] = _number(row.get("mcts_simulations_per_sec"))
+        row["logged_effective_mcts_nps"] = _number(
+            row.get("mcts_effective_simulations_per_sec")
+        )
         replay_rate = _number(row.get("replay_positions_per_sec"))
         if replay_rate is None:
             replay_rate = _number(row.get("positions_per_sec"))  # schema <= 6
@@ -1989,32 +3126,326 @@ def render_rl_performance(
                 native_tree_leaves / tree_leaves if tree_leaves > 0.0 else 0.0
             )
 
-    fig = plt.figure(figsize=(18, 13.2))
-    grid = fig.add_gridspec(3, 3)
-    axes = np.empty((3, 3), dtype=object)
-    for row_idx in range(3):
-        for column_idx in range(3):
-            axes[row_idx, column_idx] = fig.add_subplot(grid[row_idx, column_idx])
+    sections = [
+        ("Time cost summaries", [(6, index) for index in range(4)], 4),
+        ("Exclusive iteration wall time", [(7, index) for index in range(4)], 2),
+        ("MCTS worker time costs", [(8, index) for index in range(4)], 2),
+        ("Search and neural throughput", [(9, index) for index in range(3)], 3),
+        ("Self-play throughput and iteration cost", [(0, 0), (0, 1)], 2),
+        ("Inference latency and server phases", [(1, 1), (1, 2)], 2),
+        ("Batching and cache efficiency", [(2, 2), (3, 0)], 2),
+        ("MCTS worker cost and native tree", [(0, 2), (2, 1), (3, 1)], 3),
+        ("Self-play worker balance", [(4, 0), (4, 1)], 2),
+        ("Per-request latency trends", [(5, 0), (5, 1)], 2),
+    ]
+    fig, axes = create_dashboard(sections)
+
+    _overall_runtime_donut(axes[6, 0], rows)
+    _selfplay_worker_search_donut(axes[6, 1], rows)
+    _cpu_path_timer_donut(axes[6, 2], rows)
+    _gpu_path_timer_donut(axes[6, 3], rows)
+
+    exact_stage_columns, exact_stage_rows = _complete_exclusive_stage_rows(rows)
+    stage_specs = [
+        (column, _exclusive_stage_labels(column), _COLORS[index % len(_COLORS)])
+        for index, column in enumerate(exact_stage_columns)
+    ] + [("unaccounted", "unaccounted", "#cbd5e1")]
+
+    def _exact_stage_values(row):
+        iteration = _number(row.get("iteration"))
+        total = _number(row.get("iteration_total_time_s"))
+        values = {column: _number(row.get(column)) for column in exact_stage_columns}
+        if iteration is None or total is None or not exact_stage_columns:
+            return None
+        if any(value is None or value < 0.0 for value in values.values()):
+            return None
+        residual = total - sum(values.values())
+        if residual < -0.01:
+            return None
+        values["unaccounted"] = max(0.0, residual)
+        return values
+
+    _stacked_iteration_bars(
+        axes[7, 0], rows, stage_specs, _exact_stage_values,
+        title="Exact stage wall time per iteration",
+        ylabel="exclusive seconds / iteration", legend_columns=4,
+    )
+    axes[7, 0].text(
+        0.02, 0.97,
+        f"Complete timer rows only ({len(exact_stage_rows)}/{len(rows)}); exclusive stage counters plus measured residual.",
+        transform=axes[7, 0].transAxes, ha="left", va="top", fontsize=6.2, color="#6b7280",
+    )
+
+    def _stage_share_values(row):
+        values = _exact_stage_values(row)
+        total = _number(row.get("iteration_total_time_s"))
+        if values is None or total is None or total <= 0.0:
+            return None
+        return {key: 100.0 * value / total for key, value in values.items()}
+
+    _stacked_iteration_bars(
+        axes[7, 1], rows, stage_specs, _stage_share_values,
+        title="Iteration wall-time composition",
+        ylabel="share of logged iteration total", legend_columns=4,
+    )
+    axes[7, 1].set_ylim(0.0, 100.0)
+    axes[7, 1].text(
+        0.02, 0.97, "100% bars use the same complete rows as the seconds stack.",
+        transform=axes[7, 1].transAxes, ha="left", va="top", fontsize=6.2, color="#6b7280",
+    )
+
+    eval_specs = [
+        (column, _exclusive_stage_labels(column), _COLORS[index % len(_COLORS)])
+        for index, column in enumerate(exact_stage_columns)
+        if column in {
+            "stage_regular_eval_time_s", "stage_promotion_eval_time_s",
+            "stage_promotion_confirmation_time_s", "stage_elo_eval_time_s",
+            "stage_eval_log_time_s",
+        }
+    ]
+    def _eval_stage_values(row):
+        values = _exact_stage_values(row)
+        if values is None or not eval_specs:
+            return None
+        return values if any(values[column] > 0.0 for column, _, _ in eval_specs) else None
+    _stacked_iteration_bars(
+        axes[7, 2], rows, eval_specs, _eval_stage_values,
+        title="Evaluation time per iteration",
+        ylabel="exclusive seconds / iteration", legend_columns=3,
+    )
+    axes[7, 2].set_xticks([
+        int(_number(row.get("iteration")))
+        for row in rows
+        if _eval_stage_values(row) is not None
+    ])
+    axes[7, 2].text(
+        0.02, 0.97, "Iterations with recorded evaluation time only; complete rows only.",
+        transform=axes[7, 2].transAxes, ha="left", va="top", fontsize=6.1, color="#6b7280",
+    )
+
+    ax = axes[7, 3]
+    _style(ax, "Accumulated exclusive stage cost")
+    if exact_stage_rows:
+        totals = {column: 0.0 for column in exact_stage_columns}
+        totals["unaccounted"] = 0.0
+        for _, _, values in exact_stage_rows:
+            for column, value in values.items():
+                totals[column] += value
+        ranked = sorted(totals.items(), key=lambda item: item[1], reverse=True)
+        visible = [(key, value) for key, value in ranked if value > 0.0]
+        if visible:
+            labels = [_exclusive_stage_labels(key) for key, _ in visible]
+            costs = [value for _, value in visible]
+            ax.barh(labels, costs, color=[_COLORS[i % len(_COLORS)] for i in range(len(labels))])
+            ax.invert_yaxis()
+            ax.set_xlabel("summed seconds", fontsize=7.5)
+            ax.set_xlim(0.0, max(costs) * 1.42)
+            ax.tick_params(axis="y", labelsize=6.8)
+            for y, (_, value) in enumerate(visible):
+                ax.text(value, y, f"  {value:.1f}s  |  {value / len(exact_stage_rows):.1f}s/iter", va="center", fontsize=6.2)
+            ax.text(0.02, 0.97, f"{len(exact_stage_rows)} complete iterations; ranked by accumulated wall time.",
+                    transform=ax.transAxes, ha="left", va="top", fontsize=6.1, color="#6b7280")
+        else:
+            _no_data(ax, "No positive stage costs")
+    else:
+        _no_data(ax, "Complete exclusive stage telemetry unavailable")
+
+    ax = axes[8, 0]
+    _style(ax, "Iteration cost by phase over time")
+    phase_specs = (
+        ("selfplay", "self-play", "#2563eb"),
+        ("replay_setup", "setup / replay / reanalysis", "#0891b2"),
+        ("train", "training", "#16a34a"),
+        ("evaluation", "evaluation", "#f59e0b"),
+        ("elo_eval", "Elo evaluation", "#ea580c"),
+        ("maintenance", "logging / checkpoint / GC", "#7c3aed"),
+    )
+    iterations, _, stage_values, _ = _runtime_composition_data(rows)
+    shown = False
+    for key, label, color in phase_specs:
+        ys = stage_values[key]
+        if any(y is not None for y in ys):
+            ax.plot(iterations, [np.nan if y is None else y for y in ys],
+                    marker="o", ms=2.5, lw=1.3, color=color, label=label)
+            shown = True
+    ax.set_ylabel("seconds / iteration", fontsize=7.5)
+    _legend_below(ax, ncol=3)
+    if shown:
+        ax.text(0.02, 0.97, "Measured exclusive phase wall timers; gaps mean the timer was unavailable.",
+                transform=ax.transAxes, ha="left", va="top", fontsize=6.1, color="#6b7280")
+    else:
+        _no_data(ax, "Exclusive phase timers unavailable")
+
+    ax = axes[8, 1]
+    search_specs = [
+        ("nn_wait", "NN inference wait", "#db2777"),
+        ("selection", "tree selection", "#2563eb"),
+        ("backprop", "backpropagation", "#16a34a"),
+        ("remainder", "other search outside NN wait", "#64748b"),
+    ]
+    def _search_worker_parts(row):
+        search = _number(row.get("mcts_search_many_time_s"))
+        wait = _number(row.get("mcts_nn_inference_time_s"))
+        selection = _number(row.get("mcts_search_selection_time_s"))
+        backprop = _number(row.get("mcts_search_backprop_time_s"))
+        values = (search, wait, selection, backprop)
+        if any(value is None or value < 0.0 for value in values) or wait + selection + backprop > search + 1e-6:
+            return None
+        return {
+            "nn_wait": wait, "selection": selection, "backprop": backprop,
+            "remainder": max(0.0, search - wait - selection - backprop),
+        }
+    _stacked_iteration_bars(
+        ax, rows, search_specs, _search_worker_parts,
+        title="Self-play search cost per iteration",
+        ylabel="summed worker-seconds", legend_columns=2,
+    )
+    ax.text(0.02, 0.97, "Valid complete search partitions only; worker-seconds sum across workers, not elapsed time.",
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.1, color="#6b7280")
+
+    ax = axes[8, 2]
+    _style(ax, "Ranked MCTS worker timer cost")
+    timer_totals = []
+    for column, label, color in _OVERLAPPING_WORKER_TIMERS:
+        values = [_number(row.get(column)) for row in rows]
+        values = [value for value in values if value is not None and value >= 0.0]
+        if values and sum(values) > 0.0:
+            timer_totals.append((label, sum(values), len(values), color))
+    timer_totals.sort(key=lambda item: item[1], reverse=True)
+    if timer_totals:
+        labels = [item[0] for item in timer_totals]
+        totals = [item[1] for item in timer_totals]
+        ax.barh(labels, totals, color=[item[3] for item in timer_totals])
+        ax.invert_yaxis()
+        ax.set_xlabel("summed worker-seconds", fontsize=7.5)
+        ax.set_xlim(0.0, max(totals) * 1.42)
+        ax.tick_params(axis="y", labelsize=6.8)
+        for y, (_, total, count, _) in enumerate(timer_totals):
+            ax.text(total, y, f"  {total:.0f}s | {total / count:.1f}s/observed iter", va="center", fontsize=6.2)
+        ax.text(0.02, 0.97, "Overlapping counters—not a partition. Each row is an independently measured timer sum.",
+                transform=ax.transAxes, ha="left", va="top", fontsize=6.1, color="#9a3412")
+    else:
+        _no_data(ax, "MCTS worker timers unavailable")
+
+    ax = axes[8, 3]
+    _style(ax, "Absolute worker hot-path timers")
+    shown = False
+    for index, (column, label, color) in enumerate(_OVERLAPPING_WORKER_TIMERS[2:]):
+        xs, ys = _series(rows, column)
+        if xs:
+            ax.plot(xs, ys, marker="o", ms=2.5, lw=1.2, label=label, color=color)
+            shown = True
+    ax.set_ylabel("summed worker-seconds / iteration", fontsize=7.1)
+    _legend_below(ax, ncol=2)
+    if shown:
+        ax.text(0.02, 0.97, "Overlapping counters—not a partition; compare absolute cost across iterations.",
+                transform=ax.transAxes, ha="left", va="top", fontsize=6.1, color="#9a3412")
+    else:
+        _no_data(ax, "Detailed worker hot-path timers unavailable")
+
+    ax = axes[9, 0]
+    _style(ax, "MCTS NPS: fresh and effective search visits")
+    fresh_shown = _line(
+        ax, rows, "logged_fresh_mcts_nps", "fresh completed simulations/s", "#2563eb"
+    )
+    effective_shown = _line(
+        ax, rows, "logged_effective_mcts_nps", "effective visits/s (incl. inherited credit)", "#9333ea"
+    )
+    ax.set_ylabel("MCTS simulations / visits per second", fontsize=7.2)
+    _legend_below(ax, ncol=2)
+    if fresh_shown or effective_shown:
+        fresh_mean = _weighted_rate_summary(
+            rows, "logged_fresh_mcts_nps", "stage_selfplay_time_s"
+        )
+        effective_mean = _weighted_rate_summary(
+            rows, "logged_effective_mcts_nps", "stage_selfplay_time_s"
+        )
+        note = "Fresh NPS counts newly completed simulations; effective visits include inherited credit."
+        if fresh_mean is not None:
+            note += f" Wall-time weighted fresh mean: {fresh_mean:,.0f}/s."
+        if effective_mean is not None and effective_shown:
+            note += f" Effective mean: {effective_mean:,.0f}/s."
+        ax.text(0.02, 0.97, textwrap.fill(note, width=64), transform=ax.transAxes,
+                ha="left", va="top", fontsize=6.1, color="#536273")
+    else:
+        _no_data(ax, "Logged fresh/effective MCTS throughput unavailable")
+
+    ax = axes[9, 1]
+    _style(ax, "Neural inference throughput")
+    req_x, req_rates, req_count, req_seconds = _count_rate_data(
+        rows, "mcts_nn_inference_batch_items", "stage_selfplay_time_s"
+    )
+    central_x, central_rates, central_count, central_seconds = _count_rate_data(
+        rows, "central_nn_evaluated_positions", "stage_selfplay_time_s"
+    )
+    if req_x:
+        ax.plot(req_x, req_rates, marker="o", ms=3, lw=1.5, color="#0891b2",
+                label="MCTS NN positions requested/s")
+    if central_x:
+        ax.plot(central_x, central_rates, marker="o", ms=3, lw=1.5, color="#16a34a",
+                label="central fresh NN evaluations/s")
+    ax.set_ylabel("positions / self-play wall-second", fontsize=7.2)
+    _legend_below(ax, ncol=2)
+    if req_x or central_x:
+        cfg = _rl_config(main_csv_path)
+        configured_central = cfg.get("self_play_central_inference_enabled") is True
+        device = str(cfg.get("self_play_device") or "").strip().lower()
+        gpu_confirmed = configured_central and device.startswith(("cuda", "gpu"))
+        note = "MCTS counts include requested leaf items; central count is fresh server work after cache/dedup."
+        if gpu_confirmed:
+            note += " Run metadata confirms a CUDA central backend; throughput is not GPU utilization."
+        elif central_x:
+            note += " Central device is not confirmed as GPU in run metadata."
+        if req_seconds > 0.0:
+            note += f" Pooled requested rate: {req_count / req_seconds:,.0f}/s."
+        if central_seconds > 0.0:
+            note += f" Pooled central fresh rate: {central_count / central_seconds:,.0f}/s."
+        ax.text(0.02, 0.97, textwrap.fill(note, width=64), transform=ax.transAxes,
+                ha="left", va="top", fontsize=6.1, color="#536273")
+    else:
+        _no_data(ax, "Measured NN position counts and self-play wall time unavailable")
+
+    ax = axes[9, 2]
+    _style(ax, "MCTS selection throughput and path length")
+    traversals_shown = _line(
+        ax, rows, "mcts_selection_node_traversals_per_sec",
+        "selection-node traversals/s", "#ea580c"
+    )
+    path_x, path_y = [], []
+    for row in rows:
+        iteration = _number(row.get("iteration"))
+        traversals = _number(row.get("mcts_selection_node_traversals_per_sec"))
+        fresh_rate = _number(row.get("logged_fresh_mcts_nps"))
+        if iteration is None or traversals is None or traversals < 0.0 or fresh_rate is None or fresh_rate <= 0.0:
+            continue
+        path_x.append(int(iteration))
+        path_y.append(traversals / fresh_rate)
+    if path_x:
+        ax2 = ax.twinx()
+        ax2.tick_params(labelsize=8)
+        ax2.plot(path_x, path_y, marker="s", ms=2.8, lw=1.2, color="#7c3aed",
+                 label="traversals per fresh simulation")
+        ax2.set_ylabel("traversals / fresh simulation", fontsize=7.0, color="#7c3aed")
+        _legend_below(ax, ax2, ncol=2)
+    else:
+        ax.set_ylabel("selection-node traversals / second", fontsize=7.2)
+        _legend_below(ax, ncol=2)
+    if traversals_shown or path_x:
+        ax.text(0.02, 0.97, textwrap.fill(
+                    "Path length uses directly logged fresh MCTS NPS; gaps mean missing telemetry.",
+                    width=64,
+                ),
+                transform=ax.transAxes, ha="left", va="top", fontsize=6.1, color="#536273")
+    else:
+        _no_data(ax, "Selection traversal throughput unavailable")
 
     ax = axes[0, 0]
     _style(ax, "Self-play throughput")
     shown = _line(ax, rows, "replay_positions_per_sec", "replay positions/s", _COLORS[0])
     shown |= _line(ax, rows, "played_positions_per_sec", "played positions/s", _COLORS[2])
-    ax2 = ax.twinx(); ax2.tick_params(labelsize=8)
-    visits = _line(
-        ax2,
-        rows,
-        "mcts_simulations_per_sec",
-        "completed MCTS visits/s",
-        _COLORS[3],
-    )
     ax.set_ylabel("positions/s", fontsize=8)
-    if visits:
-        ax2.set_ylabel("completed simulations/s", fontsize=8)
-    else:
-        ax2.set_visible(False)
-    _legend_below(ax, ax2, ncol=3)
-    if not (shown or visits): _no_data(ax)
+    _legend_below(ax, ncol=2)
+    if not shown: _no_data(ax)
     latest_path = _last(rows, "mcts_selection_path_length")
     if latest_path is not None:
         ax.text(
@@ -2134,34 +3565,28 @@ def render_rl_performance(
     else:
         _no_data(ax, "Search and NN wait timers unavailable")
 
-    ax = axes[1, 0]
-    _average_runtime_composition_panel(ax, rows)
-
-    central_specs = (
-        ("request_submit", "request submit", "#eab308"),
-        ("descriptor_queue", "waiting for server (backlog)", "#f59e0b"),
-        ("batch_coalesce", "batch coalesce", "#f97316"),
-        ("pipeline_wait", "prepared batch waiting", "#c2410c"),
-        ("concat", "concat", "#0891b2"),
-        ("cache", "cache/dedupe", "#84cc16"),
-        ("staging", "pinned staging", "#06b6d4"),
-        ("h2d", "H2D", "#2563eb"),
-        ("forward", "GPU submit", "#16a34a"),
-        ("d2h", "GPU completion + output", "#7c3aed"),
-        ("server_other", "server other", "#64748b"),
-        ("ipc_other", "IPC/worker", "#db2777"),
-    )
-
     def _central_latency_parts(row):
-        remote = max(0.0, _number(row.get("central_remote_wait_ms_per_request")) or 0.0)
-        queue = max(0.0, _number(row.get("central_server_queue_wait_ms_per_request")) or 0.0)
-        server_total = max(0.0, _number(row.get("central_server_total_ms_per_request")) or 0.0)
+        required = (
+            "central_remote_wait_ms_per_request",
+            "central_request_submit_ms_per_request",
+            "central_server_queue_wait_ms_per_request",
+            "central_server_pipeline_wait_ms_per_request",
+            "central_server_concat_ms_per_request",
+            "central_server_cache_lookup_ms_per_request",
+            "central_server_staging_copy_ms_per_request",
+            "central_server_h2d_ms_per_request",
+            "central_server_forward_ms_per_request",
+            "central_server_d2h_ms_per_request",
+            "central_server_total_ms_per_request",
+        )
+        if any(_number(row.get(column)) is None for column in required):
+            return None
+        remote = max(0.0, _number(row.get("central_remote_wait_ms_per_request")))
+        queue = max(0.0, _number(row.get("central_server_queue_wait_ms_per_request")))
+        server_total = max(0.0, _number(row.get("central_server_total_ms_per_request")))
         descriptor_raw = _number(row.get("central_descriptor_queue_wait_ms_per_request"))
         coalesce_raw = _number(row.get("central_batch_coalesce_wait_ms_per_request"))
-        request_submit = max(
-            0.0,
-            _number(row.get("central_request_submit_ms_per_request")) or 0.0,
-        )
+        request_submit = max(0.0, _number(row.get("central_request_submit_ms_per_request")))
         if descriptor_raw is None and coalesce_raw is None:
             descriptor_queue = queue
             batch_coalesce = 0.0
@@ -2216,11 +3641,13 @@ def render_rl_performance(
     )
 
     def _position_latency_parts(row):
-        worker_batch = max(0.0, _number(row.get("mcts_avg_batch_size")) or 0.0)
-        worker_wait = max(0.0, _number(row.get("mcts_worker_nn_wait_ms_per_position")) or 0.0)
-        if worker_batch <= 0.0:
-            return {"remainder": worker_wait}
+        worker_batch = _number(row.get("mcts_avg_batch_size"))
+        worker_wait = _number(row.get("mcts_worker_nn_wait_ms_per_position"))
+        if worker_batch is None or worker_batch <= 0.0 or worker_wait is None:
+            return None
         central = _central_latency_parts(row)
+        if central is None:
+            return None
         waiting = sum(central[key] for key in (
             "request_submit", "descriptor_queue", "batch_coalesce", "pipeline_wait",
         ))
@@ -2245,63 +3672,75 @@ def render_rl_performance(
         legend_columns=4,
     )
 
-    ax = axes[1, 2]
-    central_average, _ = _whole_run_composition(
-        rows,
-        central_specs,
-        _central_latency_parts,
-        weight_column="mcts_nn_inference_calls",
-    )
-    _composition_donut(
-        ax,
-        central_average,
-        title="Average central request composition",
-        center_label="avg / request",
-        unit="ms",
-        decimals=1,
-        min_share=0.01,
-        min_value=0.1,
-    )
-
-    ax = axes[2, 0]
-    _style(ax, "MCTS hotspots per 1k NN evaluations")
-    hotspot_specs = (
-        ("mcts_search_selection_time_s", "tree selection", "#2563eb"),
-        ("mcts_board_to_tensor_time_s", "board encoding", "#0891b2"),
-        ("mcts_batch_expand_cpu_policy_time_s", "CPU policy", "#16a34a"),
-        ("mcts_native_tree_import_time_s", "native import", "#9333ea"),
-        ("mcts_native_tree_sync_time_s", "native sync", "#f59e0b"),
-    )
-    hotspot_shown = False
-    for column, label, color in hotspot_specs:
-        xs, ys = [], []
-        for row in rows:
-            iteration = _number(row.get("iteration"))
-            positions = _number(row.get("mcts_nn_inference_batch_items"))
-            seconds = _number(row.get(column))
-            if iteration is None or positions is None or positions <= 0 or seconds is None:
+    def _latest_central_server_donut(ax, source_rows):
+        component_columns = (
+            ("central_server_pipeline_wait_ms_per_request", "pipeline wait", "#c2410c"),
+            ("central_server_concat_ms_per_request", "concat", "#0891b2"),
+            ("central_server_cache_lookup_ms_per_request", "cache lookup", "#84cc16"),
+            ("central_server_staging_copy_ms_per_request", "staging copy", "#06b6d4"),
+            ("central_server_h2d_ms_per_request", "H2D", "#2563eb"),
+            ("central_server_forward_ms_per_request", "forward", "#16a34a"),
+            ("central_server_d2h_ms_per_request", "D2H", "#7c3aed"),
+        )
+        required = tuple(column for column, _, _ in component_columns) + (
+            "central_server_total_ms_per_request",
+        )
+        averaged = []
+        latest_iteration = None
+        for row in reversed(source_rows):
+            values = [_number(row.get(column)) for column in required]
+            if any(value is None or value < 0.0 for value in values):
                 continue
-            xs.append(int(iteration)); ys.append(1e6 * max(0.0, seconds) / positions)
-        if xs:
-            ax.plot(xs, ys, marker="o", ms=2.7, lw=1.3, label=label, color=color)
-            hotspot_shown = True
-    ax.set_ylabel("worker ms / 1k NN evaluations", fontsize=8)
-    ax.text(0.02, 0.97, "Counters overlap; compare trends, do not add these lines.",
-            transform=ax.transAxes, ha="left", va="top", fontsize=6.4,
-            color="#6b7280")
-    _legend_below(ax, ncol=3)
-    if not hotspot_shown:
-        _no_data(ax, "MCTS hotspot timers unavailable")
+            total = values[-1]
+            components = values[:-1]
+            residual = total - sum(components)
+            if residual < -0.01:
+                continue
+            averaged = [
+                (column, label, value, color)
+                for (column, label, color), value in zip(component_columns, components)
+            ]
+            averaged.append(("other", "other server work", max(0.0, residual), "#64748b"))
+            latest_iteration = _number(row.get("iteration"))
+            break
+        _composition_donut(
+            ax,
+            averaged,
+            title="Central server phases per request",
+            center_label=(
+                "latest\nms / request"
+                if latest_iteration is None
+                else f"iteration {latest_iteration:g}\nms / request"
+            ),
+            unit="ms",
+            decimals=2,
+            min_share=0.005,
+            min_value=0.05,
+        )
+        if averaged:
+            _donut_note(ax, "Host-observed server phases only; excludes client and queue wait.")
+        return bool(averaged)
+
+    _latest_central_server_donut(axes[1, 2], rows)
 
     for row in rows:
-        item_count = max(1.0, _number(row.get("mcts_nn_inference_batch_items")) or 0.0)
-        row["hot_selection_ms_per_1k"] = 1e6 * max(0.0, _number(row.get("mcts_search_selection_time_s")) or 0.0) / item_count
-        row["hot_encoding_ms_per_1k"] = 1e6 * max(0.0, _number(row.get("mcts_board_to_tensor_time_s")) or 0.0) / item_count
-        row["hot_pack_ms_per_1k"] = 1e6 * max(0.0, _number(row.get("mcts_batch_expand_tensor_pack_time_s")) or 0.0) / item_count
-        row["hot_policy_ms_per_1k"] = 1e6 * max(0.0, _number(row.get("mcts_batch_expand_cpu_policy_time_s")) or 0.0) / item_count
-        row["hot_move_ms_per_1k"] = 1e6 * max(0.0, _number(row.get("mcts_batch_expand_move_index_time_s")) or 0.0) / item_count
+        item_count = _number(row.get("mcts_nn_inference_batch_items"))
+        if item_count is None or item_count <= 0.0:
+            continue
+        for source, target in (
+            ("mcts_search_selection_time_s", "hot_selection_ms_per_1k"),
+            ("mcts_board_to_tensor_time_s", "hot_encoding_ms_per_1k"),
+            ("mcts_batch_expand_tensor_pack_time_s", "hot_pack_ms_per_1k"),
+            ("mcts_batch_expand_cpu_policy_time_s", "hot_policy_ms_per_1k"),
+            ("mcts_batch_expand_move_index_time_s", "hot_move_ms_per_1k"),
+            ("mcts_native_tree_import_time_s", "hot_native_import_ms_per_1k"),
+            ("mcts_native_tree_sync_time_s", "hot_native_sync_ms_per_1k"),
+        ):
+            seconds = _number(row.get(source))
+            if seconds is not None and seconds >= 0.0:
+                row[target] = 1e6 * seconds / item_count
     ax = axes[2, 1]
-    _style(ax, "CPU hot paths normalized by NN work")
+    _style(ax, "MCTS CPU hot paths and native tree")
     hot = False
     for column, label, color in (
         ("hot_selection_ms_per_1k", "tree selection", _COLORS[0]),
@@ -2309,9 +3748,17 @@ def render_rl_performance(
         ("hot_pack_ms_per_1k", "input packing", "#06b6d4"),
         ("hot_policy_ms_per_1k", "CPU policy", _COLORS[1]),
         ("hot_move_ms_per_1k", "move encoding", _COLORS[4]),
+        ("hot_native_import_ms_per_1k", "native import", "#9333ea"),
+        ("hot_native_sync_ms_per_1k", "native sync", "#f59e0b"),
     ):
         hot |= _line(ax, rows, column, label, color)
     ax.set_ylabel("worker ms / 1k NN positions", fontsize=8)
+    ax.text(
+        0.02, 0.97,
+        "Timer counters may overlap; compare trends, not totals.",
+        transform=ax.transAxes, ha="left", va="top", fontsize=6.4,
+        color="#6b7280",
+    )
     _legend_below(ax, ncol=3)
     if not hot:
         _no_data(ax)
@@ -2334,30 +3781,136 @@ def render_rl_performance(
         "#0f766e",
     )
     ax2 = ax.twinx(); ax2.tick_params(labelsize=8); ax2.yaxis.set_major_formatter(PercentFormatter(100.0))
-    wait_share = _line(ax2, rows, "mcts_worker_nn_wait_share_pct", "worker NN wait share", _COLORS[3])
-    if not wait_share:
-        wait_share = _line(ax2, rows, "mcts_gpu_busy_proxy_pct", "worker NN wait share", _COLORS[3])
-    if not wait_share:
-        wait_share = _line(ax2, rows, "mcts_gpu_utilization_pct", "worker NN wait share", _COLORS[3])
+    wait_share = _line(
+        ax2, rows, "mcts_worker_nn_wait_share_pct", "worker NN wait share", _COLORS[3]
+    )
+    _legend_below(ax, ax2, ncol=4)
+    if not (shown or wait_share):
+        _no_data(ax)
+
+    ax = axes[3, 0]
+    _style(ax, "Inference cache and GPU output efficiency", percent=True)
+    efficiency_shown = False
     for column, label, color in (
         ("central_nn_saved_overall_rate", "NN evals saved overall", "#16a34a"),
         ("central_cache_active_fraction", "cache active coverage", "#0891b2"),
         ("central_gpu_batch_fill", "GPU batch fill", "#7c3aed"),
         ("central_compact_policy_rate", "legal-only GPU output", "#2563eb"),
         ("central_output_pipeline_rate", "overlapped GPU output", "#db2777"),
+    ):
+        efficiency_shown |= _line(ax, rows, column, label, color)
+    _legend_below(ax, ncol=3)
+    if not efficiency_shown:
+        _no_data(ax, "Central inference efficiency telemetry unavailable")
+
+    ax = axes[3, 1]
+    _style(ax, "Native tree execution", percent=True)
+    native_shown = False
+    for column, label, color in (
         ("mcts_native_root_selection_rate", "native root selection", "#ea580c"),
         ("mcts_native_completed_q_rate", "native completed-Q", "#dc2626"),
         ("mcts_native_tree_selection_rate", "native full-tree traversal", "#9333ea"),
     ):
-        xs, ys = _series(rows, column)
-        if xs:
-            ax2.plot(xs, [100.0 * value for value in ys], marker="o", ms=3, lw=1.5, label=label, color=color)
-            wait_share = True
-    _legend_below(ax, ax2, ncol=3)
-    if not (shown or wait_share): _no_data(ax)
+        native_shown |= _line(ax, rows, column, label, color)
+    _legend_below(ax, ncol=3)
+    if not native_shown:
+        _no_data(ax, "Native tree counters unavailable")
+
+    ax = axes[4, 0]
+    _style(ax, "Self-play games completed per worker")
+    shown = False
+    for column, label, color in (
+        ("selfplay_games_per_worker_min", "minimum", _COLORS[1]),
+        ("selfplay_games_per_worker_mean", "mean", _COLORS[0]),
+        ("selfplay_games_per_worker_max", "maximum", _COLORS[2]),
+    ):
+        shown |= _line(ax, rows, column, label, color)
+    ax.set_ylabel("completed games / worker", fontsize=7.5)
+    _legend_below(ax, ncol=3)
+    if shown:
+        latest_workers = _last(rows, "selfplay_worker_count")
+        if latest_workers is not None:
+            ax.text(
+                0.98, 0.96, f"latest workers={latest_workers:.0f}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=7,
+                color="#4b5563",
+            )
+    else:
+        _no_data(ax, "Per-worker completed-game distribution unavailable")
+
+    ax = axes[4, 1]
+    _style(ax, "Worker completion spread and final 10% tail")
+    shown = _line(
+        ax, rows, "selfplay_worker_finish_spread_s", "worker finish-time spread", _COLORS[0],
+    )
+    shown |= _line(
+        ax, rows, "selfplay_tail_10pct_time_s", "time after 90% games complete", _COLORS[4],
+        ls="--",
+    )
+    ax.set_ylabel("seconds", fontsize=7.5)
+    _legend_below(ax, ncol=2)
+    if shown:
+        ax.text(
+            0.02, 0.97,
+            "Separate worker scheduling measures; neither is an iteration-time component.",
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.4, color="#4b5563",
+        )
+    else:
+        _no_data(ax, "Worker completion timing unavailable")
+
+    ax = axes[5, 0]
+    _style(ax, "Request queue, wait and IPC latency")
+    shown = False
+    for column, label, color, style in (
+        ("central_remote_wait_ms_per_request", "worker remote wait", _COLORS[0], "-"),
+        ("central_server_queue_wait_ms_per_request", "server queue wait", _COLORS[1], "-"),
+        ("central_descriptor_queue_wait_ms_per_request", "descriptor queue", _COLORS[2], "--"),
+        ("central_batch_coalesce_wait_ms_per_request", "batch coalescing", _COLORS[3], "--"),
+        ("central_worker_ipc_ms_per_request", "worker IPC", _COLORS[4], ":"),
+    ):
+        shown |= _line(ax, rows, column, label, color, ls=style)
+    ax.set_ylabel("ms / request", fontsize=7.5)
+    _legend_below(ax, ncol=2)
+    if shown:
+        ax.text(
+            0.02, 0.97, "Independent path timers; do not add these lines.",
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.5, color="#4b5563",
+        )
+    else:
+        _no_data(ax, "Request queue and IPC timing unavailable")
+
+    ax = axes[5, 1]
+    _style(ax, "Central inference phase latency over time")
+    shown = False
+    for column, label, color, style in (
+        ("central_server_total_ms_per_request", "server total", "#111827", "-"),
+        ("central_server_forward_ms_per_request", "forward", _COLORS[2], "-"),
+        ("central_server_h2d_ms_per_request", "H2D", _COLORS[0], "--"),
+        ("central_server_d2h_ms_per_request", "D2H", _COLORS[3], "--"),
+        ("central_server_cache_lookup_ms_per_request", "cache lookup", _COLORS[4], ":"),
+        ("central_server_staging_copy_ms_per_request", "staging copy", _COLORS[5], ":"),
+    ):
+        shown |= _line(ax, rows, column, label, color, ls=style)
+    ax.set_ylabel("host-timed ms / request", fontsize=7.2)
+    _legend_below(ax, ncol=3)
+    if shown:
+        ax.text(
+            0.02, 0.97,
+            "Trends only, not a stack; GPU forward is host-observed timing.",
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.4, color="#4b5563",
+        )
+    else:
+        _no_data(ax, "Central inference phase timing unavailable")
 
     _mark_resume_boundaries(
-        axes,
+        {
+            key: ax for key, ax in axes.items()
+            if key not in {
+                (1, 2),  # central server donut
+                (6, 0), (6, 1), (6, 2), (6, 3),  # timing donuts
+                (7, 3), (8, 2),  # ranked cost summaries
+            }
+        },
         _resume_markers(main_csv_path or performance_csv_path),
     )
     _finish(

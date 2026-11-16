@@ -68,6 +68,7 @@ _POLICY_CORRECTION_RANK_MARGIN = 0.10
 # margin term bounded without restoring the stacked row multipliers removed in RL57.
 _POLICY_CORRECTION_RANK_WEIGHT = 0.75
 _POLICY_CORRECTION_Q_DELTA_FULL_STRENGTH = 0.20
+_POLICY_SURPRISE_DEFAULT_WEIGHT = 0.0
 
 
 _TRANSIENT_CUDA_ERROR_MARKERS = (
@@ -2897,6 +2898,85 @@ def _weighted_mean(losses, weights):
     return (losses * weights).sum() / denominator
 
 
+def _policy_surprise_weighted_sample_weights(
+    policy_effective_weights,
+    policy_kld_targets,
+    surprise_weight,
+):
+    """Mix uniform policy-row mass with KL-surprise-proportional row mass.
+
+    The replay KL is KL(MCTS target || network prior). It is normalized within
+    each minibatch, so the configured coefficient is a bounded share of total
+    policy-row mass. Missing/invalid KL values receive the batch's base-weighted
+    mean surprise (neutral imputation); finite zero KL remains zero surprise.
+    If no positive surprise mass is available, use the baseline row weights.
+    """
+    alpha = float(surprise_weight)
+    if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+        raise ValueError("policy_surprise_weight must be finite and in [0, 1]")
+
+    if alpha == 0.0:
+        return policy_effective_weights, 0.0, 0, 0, 0.0, 1.0
+
+    base = torch.where(
+        torch.isfinite(policy_effective_weights.reshape(-1).float()),
+        torch.clamp(policy_effective_weights.reshape(-1).float(), min=0.0),
+        torch.zeros_like(policy_effective_weights.reshape(-1), dtype=torch.float32),
+    )
+    base_total = base.sum()
+    eligible = base > 0.0
+    eligible_rows = int(eligible.sum().item())
+    if eligible_rows == 0 or float(base_total.detach().item()) <= 0.0:
+        return policy_effective_weights, 0.0, 0, eligible_rows, 0.0, 1.0
+
+    if policy_kld_targets is None:
+        return policy_effective_weights, 0.0, 0, eligible_rows, 0.0, 1.0
+    surprise = policy_kld_targets.reshape(-1).to(device=base.device, dtype=torch.float32)
+    if surprise.numel() != base.numel():
+        return policy_effective_weights, 0.0, 0, eligible_rows, 0.0, 1.0
+
+    valid_surprise = eligible & torch.isfinite(surprise) & (surprise >= 0.0)
+    valid_rows = int(valid_surprise.sum().item())
+    valid_base_total = base[valid_surprise].sum()
+    if valid_rows == 0 or float(valid_base_total.detach().item()) <= 0.0:
+        return policy_effective_weights, 0.0, valid_rows, eligible_rows, 0.0, 1.0
+
+    mean_surprise = (
+        base[valid_surprise] * surprise[valid_surprise]
+    ).sum() / valid_base_total
+    mean_surprise_value = float(mean_surprise.detach().item())
+    surprise_values = torch.where(
+        valid_surprise,
+        surprise,
+        mean_surprise.expand_as(surprise),
+    )
+    surprise_mass = base * surprise_values
+    surprise_total = surprise_mass.sum()
+    if (
+        not math.isfinite(float(surprise_total.detach().item()))
+        or float(surprise_total.detach().item()) <= 0.0
+    ):
+        return policy_effective_weights, 0.0, valid_rows, eligible_rows, mean_surprise_value, 1.0
+
+    base_distribution = base / base_total
+    surprise_distribution = surprise_mass / surprise_total
+    mixed_distribution = (
+        (1.0 - alpha) * base_distribution
+        + alpha * surprise_distribution
+    )
+    max_multiplier = float(
+        (mixed_distribution[eligible] / base_distribution[eligible]).max().detach().item()
+    )
+    return (
+        (mixed_distribution * base_total).to(dtype=policy_effective_weights.dtype),
+        alpha,
+        valid_rows,
+        eligible_rows,
+        mean_surprise_value,
+        max_multiplier,
+    )
+
+
 def _useful_policy_correction_rank_loss(
     legal_log_probs,
     valid_legal_mask,
@@ -2947,6 +3027,66 @@ def _useful_policy_correction_rank_loss(
     # by zero: that poisons both the objective and rank-loss gradients.
     loss = (per_row[valid_rows] * effective_weights).sum() / denominator + zero
     return loss, per_row, valid_rows
+
+
+def _policy_correction_row_counts(
+    policy_rows_mask,
+    policy_budget_weights,
+    correction_policy_mask,
+):
+    """Return mergeable counts for all rows, budget-eligible rows and corrections.
+
+    These unweighted integer counts are intended to be summed across batches
+    before computing fractions. The positive-weight cohort uses the budget
+    weights before optional KL reweighting, so its value isolates rows retained
+    by the search-budget confidence filter.
+    """
+    policy_rows = policy_rows_mask.reshape(-1).bool()
+    budget_weights = policy_budget_weights.reshape(-1).float()
+    corrections = correction_policy_mask.reshape(-1).bool()
+    if not (policy_rows.numel() == budget_weights.numel() == corrections.numel()):
+        raise ValueError("Policy correction diagnostic masks must have matching rows.")
+    positive_weight_rows = (
+        policy_rows
+        & torch.isfinite(budget_weights)
+        & (budget_weights > 0.0)
+    )
+    positive_weight_correction_rows = corrections & positive_weight_rows
+    return {
+        "policy_rows": int(policy_rows.sum().item()),
+        "positive_weight_policy_rows": int(positive_weight_rows.sum().item()),
+        "correction_rows": int(positive_weight_correction_rows.sum().item()),
+    }
+
+
+def _policy_correction_fraction_metrics(
+    *,
+    policy_rows,
+    positive_weight_policy_rows,
+    correction_rows,
+):
+    """Convert globally summed counts to finite, zero-guarded fractions."""
+    try:
+        policy_rows = max(0, int(policy_rows))
+        positive_weight_policy_rows = max(0, int(positive_weight_policy_rows))
+        correction_rows = max(0, int(correction_rows))
+    except (TypeError, ValueError, OverflowError):
+        policy_rows = positive_weight_policy_rows = correction_rows = 0
+
+    def _ratio(numerator, denominator):
+        if denominator <= 0:
+            return 0.0
+        result = float(numerator) / float(denominator)
+        return result if math.isfinite(result) else 0.0
+
+    return {
+        "policy_positive_weight_fraction": _ratio(
+            positive_weight_policy_rows, policy_rows
+        ),
+        "policy_correction_positive_weight_fraction": _ratio(
+            correction_rows, positive_weight_policy_rows
+        ),
+    }
 
 
 def _reliable_sparse_policy_target_mask(policy_values, policy_mask):
@@ -3230,6 +3370,17 @@ def train_on_batch_rl(
     amp_dtype = torch.bfloat16 if config["hardware"].get("use_bfloat16", False) else torch.float16
 
     moves_left_loss_weight = max(0.0, float(rl_cfg.get("moves_left_loss_weight", 0.05)))
+    policy_surprise_weight = float(
+        rl_cfg.get("policy_surprise_weight", _POLICY_SURPRISE_DEFAULT_WEIGHT)
+    )
+    cap_kl_weighted_fraction = float(
+        rl_cfg.get("self_play_cap_kl_weighted_fraction", 0.0)
+    )
+    if policy_surprise_weight > 0.0 and cap_kl_weighted_fraction > 0.0:
+        raise ValueError(
+            "policy_surprise_weight and self_play_cap_kl_weighted_fraction are "
+            "alternative KL-attention modes; set one of them to 0.0"
+        )
     search_q_loss_weight = max(0.0, float(rl_cfg.get("search_q_loss_weight", 0.0)))
     value_scalar_aux_loss_weight = max(
         0.0,
@@ -3327,6 +3478,18 @@ def train_on_batch_rl(
         ).to(dtype=policy_pred.dtype)
         policy_effective_weights = (
             policy_rows_mask.to(dtype=policy_pred.dtype) * finite_policy_weights
+        )
+        (
+            policy_effective_weights,
+            policy_surprise_effective_weight,
+            policy_surprise_valid_rows,
+            policy_surprise_eligible_rows,
+            policy_surprise_mean_kl,
+            policy_surprise_max_weight_multiplier,
+        ) = _policy_surprise_weighted_sample_weights(
+            policy_effective_weights,
+            policy_kld_targets,
+            policy_surprise_weight,
         )
         if policy_indices.numel() == 0:
             policy_loss_per_row = torch.zeros(
@@ -3701,8 +3864,13 @@ def train_on_batch_rl(
             1,
             legal_top_slots,
         ).squeeze(1)
-        correction_count = int(correction_policy_mask.sum().item())
-        policy_row_count = int(policy_rows_mask.sum().item())
+        policy_correction_counts = _policy_correction_row_counts(
+            policy_rows_mask,
+            finite_policy_weights,
+            correction_policy_mask,
+        )
+        correction_count = policy_correction_counts["correction_rows"]
+        policy_row_count = policy_correction_counts["policy_rows"]
         correction_loss_sum = float(
             policy_loss_per_row[correction_policy_mask].sum().detach().item()
         ) if correction_count > 0 else 0.0
@@ -3832,11 +4000,20 @@ def train_on_batch_rl(
     policy_diagnostics = {
         "correction_rows": correction_count,
         "policy_rows": policy_row_count,
+        "positive_weight_policy_rows": policy_correction_counts[
+            "positive_weight_policy_rows"
+        ],
         "correction_loss_sum": correction_loss_sum,
         "correction_rank_rows": correction_rank_count,
         "correction_rank_loss_sum": correction_rank_loss_sum,
         "correction_rank_objective": float(policy_correction_rank_loss.detach().item()),
         "correction_rank_weight": float(_POLICY_CORRECTION_RANK_WEIGHT),
+        "policy_surprise_weight": policy_surprise_weight,
+        "policy_surprise_effective_weight": policy_surprise_effective_weight,
+        "policy_surprise_valid_rows": policy_surprise_valid_rows,
+        "policy_surprise_eligible_rows": policy_surprise_eligible_rows,
+        "policy_surprise_mean_kl": policy_surprise_mean_kl,
+        "policy_surprise_max_weight_multiplier": policy_surprise_max_weight_multiplier,
         "bn_head_loss_weight": bn_head_loss_weight if v10_training_aux else 0.0,
         "bn_policy_loss": float(bn_policy_loss.detach().item()),
         "bn_policy_correction_rank_loss": float(

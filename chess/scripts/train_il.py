@@ -76,6 +76,7 @@ from src.common.runtime import (
     legacy_architecture_scoped_file,
     model_alias_file,
     cleanup_interrupted_log_csv,
+    versioned_checkpoint_paths,
 )
 from src.evaluation.elo_runner import (
     apply_checkpoint_elo_seed,
@@ -868,8 +869,10 @@ def main(argv=None):
     legacy_best_model_path = legacy_architecture_scoped_file(
         configured_best_model_path, architecture_id
     )
-    version_best_model_path = il_dir / f"{model_file_tag}_best.pt"
-    latest_checkpoint_path = il_dir / f"{model_file_tag}_latest.pt"
+    versioned_il_dir, version_best_model_path, latest_checkpoint_path = (
+        versioned_checkpoint_paths(il_dir, model_file_tag)
+    )
+    versioned_il_dir.mkdir(parents=True, exist_ok=True)
     
     # Get configuration
     history_positions = config['model'].get('history_positions', 0)
@@ -947,8 +950,10 @@ def main(argv=None):
             if hasattr(model, 'model_version'):
                 model.model_version = resume_tag
             model_architecture = build_model_architecture_metadata(config)
-            version_best_model_path = il_dir / f"{model_file_tag}_best.pt"
-            latest_checkpoint_path = il_dir / f"{model_file_tag}_latest.pt"
+            versioned_il_dir, version_best_model_path, latest_checkpoint_path = (
+                versioned_checkpoint_paths(il_dir, model_file_tag)
+            )
+            versioned_il_dir.mkdir(parents=True, exist_ok=True)
             print(
                 "Resume naming: using checkpoint tag "
                 f"{model_file_tag} for logs/checkpoints (was {previous_tag} from config)."

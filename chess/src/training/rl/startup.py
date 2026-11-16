@@ -231,6 +231,7 @@ def _collect_rl_checkpoints(
             path
             for path in Path(rl_dir).rglob("*.pt")
             if path.is_file()
+            and ".replay." not in path.name
             and not path.name.endswith(".replay.pt")
             and not _is_diagnostic_candidate_checkpoint(path)
         ),
@@ -258,6 +259,7 @@ def _collect_transfer_checkpoints(
             path
             for path in Path(models_dir).rglob("*.pt")
             if path.is_file()
+            and ".replay." not in path.name
             and not path.name.endswith(".replay.pt")
             and not _is_diagnostic_candidate_checkpoint(path)
         ),
@@ -269,32 +271,108 @@ def _collect_transfer_checkpoints(
     return candidates
 
 
-def _suggest_start_mode_default(best_model_rl_path, rl_dir, fallback_best_paths=()):
-    """Prefer a fresh RL run when the latest RL checkpoint is clearly underperforming."""
+def _normalize_rl_run_version(value):
+    value = str(value or "").strip().casefold()
+    return value if value.startswith("rl") else f"rl{value}"
+
+
+_RESUME_ARCHIVE_IDENTITY_REQUIRED_FIELDS = (
+    "run_manifest_path",
+    "run_manifest_sha256_at_start",
+    "initial_checkpoint_path",
+    "initial_checkpoint_sha256",
+    "seed",
+    "git_commit",
+    "source_tree_sha256",
+    "effective_config_sha256",
+)
+
+
+def _resume_archive_forkable_changes(saved_identity, current_identity):
+    """List code/config identity changes safe for a lineage-recorded archive fork.
+
+    Seed, Git commit, and required origin identities stay strict. Any other
+    identity mismatch is left to the canonical restore validator to reject.
+    """
+    saved_identity = dict(saved_identity or {})
+    current_identity = dict(current_identity or {})
+    missing_saved = [
+        key
+        for key in _RESUME_ARCHIVE_IDENTITY_REQUIRED_FIELDS
+        if saved_identity.get(key) is None
+        or (isinstance(saved_identity.get(key), str) and not saved_identity.get(key))
+    ]
+    missing_current = [
+        key
+        for key in _RESUME_ARCHIVE_IDENTITY_REQUIRED_FIELDS
+        if current_identity.get(key) is None
+        or (isinstance(current_identity.get(key), str) and not current_identity.get(key))
+    ]
+    if missing_saved or missing_current:
+        missing = sorted(set(missing_saved + missing_current))
+        raise ValueError(
+            "Incomplete RL candidate archive identity; missing "
+            + ", ".join(missing)
+        )
+    checked_fields = (
+        "seed",
+        "git_commit",
+        "source_tree_sha256",
+        "effective_config_sha256",
+    )
+    mismatches = {
+        key
+        for key in checked_fields
+        if saved_identity.get(key) != current_identity.get(key)
+    }
+    forkable = {"source_tree_sha256", "effective_config_sha256"}
+    if mismatches and mismatches <= forkable:
+        return tuple(sorted(mismatches))
+    return ()
+
+
+def _suggest_start_mode_default(
+    best_model_rl_path,
+    rl_dir,
+    fallback_best_paths=(),
+    *,
+    preferred_rl_version=None,
+    preferred_architecture_id=None,
+):
+    """Prefer the current run's newest RL checkpoint with an optimizer."""
     rl_candidates = _collect_rl_checkpoints(
         Path(best_model_rl_path).parent,
         best_model_rl_path,
         rl_dir,
         fallback_best_paths,
     )
+    expected_version = (
+        _normalize_rl_run_version(preferred_rl_version)
+        if preferred_rl_version else None
+    )
     for checkpoint_path in rl_candidates:
         entry = load_checkpoint_metadata(checkpoint_path)
         if entry.get("error"):
             continue
 
-        score_rate = _safe_float(entry.get("score_rate"))
-        true_win_rate = _safe_float(entry.get("eval_true_win_rate"))
+        if (
+            expected_version is not None
+            and _normalize_rl_run_version(entry.get("rl_run_version")) != expected_version
+        ):
+            continue
+        checkpoint_architecture = entry.get("architecture_id") or "se_cnn_v9"
+        if (
+            preferred_architecture_id
+            and str(checkpoint_architecture) != str(preferred_architecture_id)
+        ):
+            continue
         optimizer_present = bool(entry.get("optimizer", False))
 
         if not optimizer_present:
-            return "1", f"defaulting to new: {checkpoint_path.name} has no optimizer state for a true resume"
-        if score_rate is not None and score_rate < 0.50:
-            return "1", f"defaulting to new: latest RL score_rate is only {score_rate:.2%}"
-        if true_win_rate is not None and true_win_rate <= 0.0:
-            return "1", f"defaulting to new: latest RL true win rate is {true_win_rate:.2%}"
-        return "2", f"defaulting to resume: latest RL checkpoint looks healthy enough ({checkpoint_path.name})"
+            continue
+        return "2", f"defaulting to resume: current RL run checkpoint has optimizer state ({checkpoint_path.name})"
 
-    return "1", "defaulting to new: no healthy RL resume candidate found"
+    return "1", "defaulting to new: no compatible checkpoint for this RL run has optimizer state"
 
 
 def _choose_start_mode(has_checkpoints, default_choice="2", default_hint=None):
@@ -306,7 +384,7 @@ def _choose_start_mode(has_checkpoints, default_choice="2", default_hint=None):
     _print_block_title("RL STARTUP | choose how to initialize the learner")
     print(" [1] NEW       fresh RL run; initialize from the best IL checkpoint")
     print(" [2] RESUME    continue model, optimizer, scaler and iteration counter")
-    print("               replay/champion buffers rebuild from newly generated games")
+    print("               restore replay/champion state from checkpoint sidecar when available")
     print(" [3] TRANSFER  copy compatible weights; reset optimizer and schedule")
 
     if default_hint:
@@ -502,6 +580,8 @@ def plan_rl_startup(
     initial_plan=None,
     prefer_fresh_il=False,
     fallback_best_paths=(),
+    preferred_rl_version=None,
+    preferred_architecture_id=None,
 ):
     """Choose the startup mode first, then finalize it once the model exists."""
     initial_plan = dict(initial_plan or {})
@@ -522,7 +602,11 @@ def plan_rl_startup(
             default_hint = "RL quality experiment: NEW from canonical IL with empty replay"
         else:
             default_choice, default_hint = _suggest_start_mode_default(
-                best_model_rl_path, rl_dir, fallback_best_paths
+                best_model_rl_path,
+                rl_dir,
+                fallback_best_paths,
+                preferred_rl_version=preferred_rl_version,
+                preferred_architecture_id=preferred_architecture_id,
             )
         start_mode = _choose_start_mode(
             has_checkpoints=(len(available_checkpoints) > 0),
@@ -576,6 +660,32 @@ def plan_rl_startup(
                 if bool(entry.get("optimizer"))
                 and bool(entry.get("strict_resume_ok"))
             ]
+            preferred_resume_entries = [
+                entry
+                for entry in checkpoint_catalog
+                if (
+                    not preferred_rl_version
+                    or _normalize_rl_run_version(entry.get("rl_run_version"))
+                    == _normalize_rl_run_version(preferred_rl_version)
+                )
+                and (
+                    not preferred_architecture_id
+                    or str(entry.get("architecture_id") or "se_cnn_v9")
+                    == str(preferred_architecture_id)
+                )
+            ]
+            if preferred_resume_entries:
+                # Put the configured run first; other compatible runs remain
+                # visible for a deliberate interactive selection.
+                preferred_paths = {
+                    str(Path(entry["path"]).resolve())
+                    for entry in preferred_resume_entries
+                }
+                checkpoint_catalog = preferred_resume_entries + [
+                    entry
+                    for entry in checkpoint_catalog
+                    if str(Path(entry["path"]).resolve()) not in preferred_paths
+                ]
         _print_checkpoint_catalog(checkpoint_catalog, start_mode)
         if forced_checkpoint is not None:
             forced_path = Path(forced_checkpoint).resolve()

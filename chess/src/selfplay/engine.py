@@ -3,6 +3,7 @@
 import math
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ from src.mcts.q_delta import (
     q_delta_histogram as _q_delta_histogram,
     q_delta_percentile_from_histogram as _q_delta_percentile_from_histogram,
 )
+from src.mcts.policy_budget import teacher_policy_weight_from_effective_simulations
 from src.mcts.search import (
     MultiGameBatchMCTS,
     _EMPTY_HISTORY_TENSOR,
@@ -200,9 +202,10 @@ class _CompactSelfPlayHistoryEntry:
     """Compact internal candidate storage with the legacy indexed view.
 
     Games retain every candidate until the final trajectory length is known,
-    then select evenly spaced replay rows. Keep the sequence indices consumed
-    by suffix_regret_targets and the postgame selector, while storing sparse
-    tensors as exact bytes and scalar search metadata as float64 bytes.
+    then select coverage and optional KL weighted replay rows. Keep the
+    sequence indices consumed by suffix_regret_targets and the postgame
+    selector, while storing sparse tensors as exact bytes and scalar metadata
+    as float64 bytes.
     """
 
     __slots__ = (
@@ -234,6 +237,7 @@ class _CompactSelfPlayHistoryEntry:
         14: 3,
         15: 4,
         16: 5,
+        5: 6,
     }
 
     def __init__(
@@ -255,6 +259,7 @@ class _CompactSelfPlayHistoryEntry:
         played_q,
         orig_q,
         policy_kld,
+        policy_weight=1.0,
         search_visits,
         search_budget_assigned=None,
         search_simulations_effective=None,
@@ -272,13 +277,14 @@ class _CompactSelfPlayHistoryEntry:
         self.legal_indices = legal_indices.numpy().tobytes()
         self.fen = fen
         self.packed_metrics = struct.pack(
-            '<6d',
+            '<7d',
             float(root_q),
             float(search_q_delta),
             float(best_q),
             float(played_q),
             float(orig_q),
             float(policy_kld),
+            float(policy_weight),
         )
         self.history_fens = history_fens
         self.search_changed_top = bool(search_changed_top)
@@ -315,7 +321,7 @@ class _CompactSelfPlayHistoryEntry:
             return self.policy_values
         if index == 3:
             return self.turn
-        if index in (4, 5):
+        if index == 4:
             return 1.0
         if index == 6:
             return self.source_code
@@ -337,6 +343,36 @@ class _CompactSelfPlayHistoryEntry:
         if metric_index is not None:
             return struct.unpack_from('<d', self.packed_metrics, metric_index * 8)[0]
         raise IndexError(index)
+
+
+def _merge_finalized_game_stats(target, source):
+    """Merge completed game counters while preserving fractional KL sums."""
+    if target is None:
+        target = {
+            key: ({} if isinstance(value, dict) else 0)
+            for key, value in source.items()
+        }
+    for key, value in source.items():
+        if key in {'opponent_source_counts', 'opening_sequence_counts'}:
+            destination = target.setdefault(key, {})
+            for label, count in value.items():
+                destination[label] = int(destination.get(label, 0)) + int(count)
+        elif key == 'opponent_source_results':
+            destination = target.setdefault(key, {})
+            for label, row in value.items():
+                dst = destination.setdefault(
+                    label, {'wins': 0, 'draws': 0, 'losses': 0, 'games': 0}
+                )
+                for field in ('wins', 'draws', 'losses', 'games'):
+                    dst[field] += int(row.get(field, 0) or 0)
+        elif key in {
+            'teacher_cap_kld_selected_sum',
+            'teacher_cap_kld_dropped_sum',
+        }:
+            target[key] = float(target.get(key, 0.0) or 0.0) + float(value or 0.0)
+        else:
+            target[key] = int(target.get(key, 0) or 0) + int(value or 0)
+    return target
 
 
 def _restore_compact_history_tensor(payload, dtype):
@@ -371,8 +407,57 @@ class SelfPlayEngine:
         opponent_source_label="current",
         opponent_models_by_label=None,
         opponent_plan_labels=None,
+        cohort_models=None,
+        cohort_opponent_models_by_label=None,
+        worker_rank=0,
     ):
         rl_cfg = config.get('reinforcement_learning', {})
+        self.search_cohort_count = max(
+            1, int(rl_cfg.get('self_play_search_cohort_count', 1) or 1)
+        )
+        self.search_cohort_mode = str(
+            rl_cfg.get('self_play_search_cohort_mode', 'serialized') or 'serialized'
+        ).strip().lower()
+        if self.search_cohort_mode not in {'serialized', 'concurrent'}:
+            raise ValueError(
+                "reinforcement_learning.self_play_search_cohort_mode must be "
+                "'serialized' or 'concurrent'"
+            )
+        self.per_game_rng_enabled = bool(
+            rl_cfg.get(
+                'self_play_per_game_rng_enabled',
+                self.search_cohort_count > 1,
+            )
+        )
+        if self.search_cohort_count > 1 and not self.per_game_rng_enabled:
+            raise ValueError(
+                "Grouped self-play search requires per-game RNG streams."
+            )
+        self.worker_rank = int(worker_rank)
+        self.teacher_policy_budget_weighting_enabled = bool(
+            rl_cfg.get('self_play_teacher_policy_budget_weighting_enabled', False)
+        )
+        self.teacher_policy_min_budget_ratio = min(
+            1.0,
+            max(0.0, float(rl_cfg.get('self_play_teacher_policy_min_budget_ratio', 0.60))),
+        )
+        self.cap_kl_weighted_fraction = min(
+            1.0,
+            max(0.0, float(rl_cfg.get('self_play_cap_kl_weighted_fraction', 0.0))),
+        )
+        self._root_rng_counter = 0
+        self._search_cohort_pending = 0
+        self._search_cohort_peak_pending = 0
+        self._search_cohort_concurrent_rounds = 0
+        self._search_executor = (
+            ThreadPoolExecutor(
+                max_workers=self.search_cohort_count,
+                thread_name_prefix=f'selfplay-search-{self.worker_rank}',
+            )
+            if self.search_cohort_count > 1
+            and self.search_cohort_mode == 'concurrent'
+            else None
+        )
         self.opening_pool_path = rl_cfg.get('self_play_opening_pool_path')
         if self.opening_pool_path:
             self.opening_lines = load_opening_pool(
@@ -398,30 +483,86 @@ class SelfPlayEngine:
             int(rl_cfg.get('value_phase_endgame_min_fullmove', 40)),
         )
 
-        self.mcts = MultiGameBatchMCTS(
-            model, config, device, search_context='self_play'
-        )
-        self.opponent_models_by_label = {}
-        if isinstance(opponent_models_by_label, dict):
-            for label, opp_model in opponent_models_by_label.items():
-                if opp_model is not None:
-                    self.opponent_models_by_label[str(label)] = opp_model
-        elif opponent_model is not None:
-            self.opponent_models_by_label[self.opponent_source_label] = opponent_model
-        self.opponent_mcts_by_label = {
-            str(label): MultiGameBatchMCTS(
-                opp_model, config, device, search_context='self_play'
+        if self.search_cohort_count > 1:
+            if not isinstance(cohort_models, (list, tuple)) or len(cohort_models) != self.search_cohort_count:
+                raise ValueError(
+                    "Grouped self-play requires one isolated inference model per cohort."
+                )
+            learner_models = list(cohort_models)
+            if any(candidate is None for candidate in learner_models):
+                raise ValueError("Every grouped self-play cohort needs an inference model.")
+            if len({id(candidate) for candidate in learner_models}) != len(learner_models):
+                raise ValueError("Each grouped self-play cohort needs an isolated inference model.")
+        else:
+            learner_models = [model]
+        self._learner_models_by_cohort = learner_models
+        self._learner_mcts_by_cohort = [
+            MultiGameBatchMCTS(
+                cohort_model, config, device, search_context='self_play'
             )
-            for label, opp_model in self.opponent_models_by_label.items()
-            if opp_model is not None
-        }
+            for cohort_model in learner_models
+        ]
+        self.mcts = self._learner_mcts_by_cohort[0]
+
+        if self.search_cohort_count > 1 and cohort_opponent_models_by_label is not None:
+            if (
+                not isinstance(cohort_opponent_models_by_label, (list, tuple))
+                or len(cohort_opponent_models_by_label) != self.search_cohort_count
+            ):
+                raise ValueError(
+                    "Grouped self-play requires one opponent model map per cohort."
+                )
+            opponent_model_maps = [
+                {
+                    str(label): candidate
+                    for label, candidate in dict(model_map or {}).items()
+                    if candidate is not None
+                }
+                for model_map in cohort_opponent_models_by_label
+            ]
+            for label in set().union(*(set(row) for row in opponent_model_maps)):
+                candidates = [row.get(label) for row in opponent_model_maps]
+                present = [candidate for candidate in candidates if candidate is not None]
+                if len({id(candidate) for candidate in present}) != len(present):
+                    raise ValueError(
+                        f"Opponent model {label!r} is shared across grouped search cohorts."
+                    )
+        else:
+            first_map = {}
+            if isinstance(opponent_models_by_label, dict):
+                for label, opp_model in opponent_models_by_label.items():
+                    if opp_model is not None:
+                        first_map[str(label)] = opp_model
+            elif opponent_model is not None:
+                first_map[self.opponent_source_label] = opponent_model
+            opponent_model_maps = [first_map]
+            if self.search_cohort_count > 1:
+                raise ValueError(
+                    "Grouped self-play requires isolated opponent model maps per cohort."
+                )
+
+        self._opponent_mcts_by_cohort = [
+            {
+                str(label): MultiGameBatchMCTS(
+                    opp_model, config, device, search_context='self_play'
+                )
+                for label, opp_model in model_map.items()
+            }
+            for model_map in opponent_model_maps
+        ]
+        self.opponent_models_by_label = opponent_model_maps[0]
+        self.opponent_mcts_by_label = self._opponent_mcts_by_cohort[0]
         self.opponent_mcts = next(iter(self.opponent_mcts_by_label.values()), None)
         self.opponent_plan_labels = list(opponent_plan_labels or [])
         self.history_positions = int(self.mcts.history_positions)
         self.share_trees = bool(rl_cfg.get('self_play_share_trees', True))
 
         if device.type == 'cuda':
-            self.model = self.model.to(memory_format=torch.channels_last)
+            self._learner_models_by_cohort = [
+                candidate.to(memory_format=torch.channels_last)
+                for candidate in self._learner_models_by_cohort
+            ]
+            self.model = self._learner_models_by_cohort[0]
 
         self.num_simulations = int(config['reinforcement_learning']['mcts_simulations'])
         self.temp_threshold = config['reinforcement_learning']['mcts_temperature_threshold']
@@ -719,47 +860,17 @@ class SelfPlayEngine:
                 total += float(aggregated.get(f'opponent_mcts_{label}_{metric}', 0.0) or 0.0)
             aggregated[f'mcts_{metric}'] = float(total)
         for metric in (
-            'native_root_selection_calls',
-            'python_root_selection_calls',
             'native_completed_q_calls',
-            'python_completed_q_calls',
             'native_tree_selection_batches',
             'native_tree_backup_batches',
             'native_tree_selected_leaves',
-            'python_tree_selected_leaves',
             'native_tree_import_nodes',
             'native_tree_import_edges',
-            'native_tree_fallbacks',
         ):
             total = int(aggregated.get(f'learner_mcts_{metric}', 0) or 0)
             for label in self.opponent_mcts_by_label.keys():
                 total += int(aggregated.get(f'opponent_mcts_{label}_{metric}', 0) or 0)
             aggregated[f'mcts_{metric}'] = int(total)
-        root_selection_calls = int(aggregated.get('mcts_native_root_selection_calls', 0) or 0)
-        root_selection_calls += int(aggregated.get('mcts_python_root_selection_calls', 0) or 0)
-        aggregated['mcts_native_root_selection_rate'] = (
-            float(aggregated.get('mcts_native_root_selection_calls', 0) or 0)
-            / float(root_selection_calls)
-            if root_selection_calls > 0 else 0.0
-        )
-        completed_q_calls = int(aggregated.get('mcts_native_completed_q_calls', 0) or 0)
-        completed_q_calls += int(aggregated.get('mcts_python_completed_q_calls', 0) or 0)
-        aggregated['mcts_native_completed_q_rate'] = (
-            float(aggregated.get('mcts_native_completed_q_calls', 0) or 0)
-            / float(completed_q_calls)
-            if completed_q_calls > 0 else 0.0
-        )
-        tree_selected_leaves = int(
-            aggregated.get('mcts_native_tree_selected_leaves', 0) or 0
-        )
-        tree_selected_leaves += int(
-            aggregated.get('mcts_python_tree_selected_leaves', 0) or 0
-        )
-        aggregated['mcts_native_tree_selection_rate'] = (
-            float(aggregated.get('mcts_native_tree_selected_leaves', 0) or 0)
-            / float(tree_selected_leaves)
-            if tree_selected_leaves > 0 else 0.0
-        )
         aggregated['average_batch_size'] = float(nn_batch_items / nn_calls) if nn_calls > 0 else 0.0
         aggregated['central_average_batch_size'] = (
             float(central_batch_items / central_requests) if central_requests > 0 else 0.0
@@ -860,7 +971,7 @@ class SelfPlayEngine:
 
     @staticmethod
     def _select_evenly_spaced_candidates(candidates, effective_cap):
-        if effective_cap <= 0 or len(candidates) <= effective_cap:
+        if effective_cap <= 0:
             return list(candidates)
         ordered = sorted(candidates, key=lambda item: int(item['history_idx']))
         positions = np.linspace(0, len(ordered) - 1, num=effective_cap)
@@ -886,6 +997,105 @@ class SelfPlayEngine:
         selected_lookup = set(selected_history[:effective_cap])
         return [item for item in ordered if int(item['history_idx']) in selected_lookup]
 
+    @staticmethod
+    def _select_quality_aware_candidates(
+        candidates,
+        effective_cap,
+        kl_weighted_fraction,
+        *,
+        rng=None,
+    ):
+        """Retain phase coverage, then spend the configured share on high-KL rows.
+
+        Rows without finite KL, or with a zero policy weight, are not eligible
+        for the weighted share. Any unfilled slots fall back to even coverage
+        over the remaining trajectory. Sampling is without replacement.
+        """
+        if effective_cap <= 0 or len(candidates) <= effective_cap:
+            return list(candidates)
+
+        ordered = sorted(candidates, key=lambda item: int(item['history_idx']))
+        unique = []
+        seen = set()
+        for item in ordered:
+            history_idx = int(item['history_idx'])
+            if history_idx in seen:
+                continue
+            seen.add(history_idx)
+            unique.append(item)
+        if len(unique) <= effective_cap:
+            return unique
+
+        weighted_fraction = min(1.0, max(0.0, float(kl_weighted_fraction)))
+        weighted_slots = int(math.floor(effective_cap * weighted_fraction))
+        coverage_slots = effective_cap - weighted_slots
+        selected = SelfPlayEngine._select_evenly_spaced_candidates(
+            unique,
+            coverage_slots,
+        )
+        selected_ids = {int(item['history_idx']) for item in selected}
+        remaining = [
+            item for item in unique
+            if int(item['history_idx']) not in selected_ids
+        ]
+        weighted_slots = min(weighted_slots, effective_cap - len(selected))
+
+        if weighted_slots > 0:
+            eligible = []
+            for item in remaining:
+                try:
+                    policy_weight = float(item.get('policy_weight', 1.0))
+                    policy_kld = float(item.get('policy_kld', float('nan')))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if (
+                    math.isfinite(policy_weight)
+                    and policy_weight > 0.0
+                    and math.isfinite(policy_kld)
+                    and policy_kld > 0.0
+                ):
+                    eligible.append((item, policy_kld))
+
+            if eligible:
+                raw_weights = np.asarray([value for _, value in eligible], dtype=np.float64)
+                # A small number of extreme rows should not consume the full
+                # quality quota; preserve rank while bounding their leverage.
+                clip = float(np.percentile(raw_weights, 95.0))
+                if math.isfinite(clip) and clip > 0.0:
+                    weights = np.minimum(raw_weights, clip)
+                    total_weight = float(weights.sum())
+                    if math.isfinite(total_weight) and total_weight > 0.0:
+                        weighted_rng = np.random if rng is None else rng
+                        take = min(weighted_slots, len(eligible))
+                        try:
+                            indices = weighted_rng.choice(
+                                len(eligible),
+                                size=take,
+                                replace=False,
+                                p=weights / total_weight,
+                            )
+                            selected.extend(eligible[int(index)][0] for index in np.atleast_1d(indices))
+                        except (ValueError, FloatingPointError):
+                            # A malformed probability vector must not shrink
+                            # replay coverage; the deterministic fallback below
+                            # fills every remaining slot.
+                            pass
+
+        selected_ids = {int(item['history_idx']) for item in selected}
+        remaining = [
+            item for item in unique
+            if int(item['history_idx']) not in selected_ids
+        ]
+        if len(selected) < effective_cap:
+            selected.extend(
+                SelfPlayEngine._select_evenly_spaced_candidates(
+                    remaining,
+                    effective_cap - len(selected),
+                )
+            )
+        selected = sorted(selected, key=lambda item: int(item['history_idx']))
+        return selected[:effective_cap]
+
     def _select_history_indices_to_keep(self, candidates, history_len, is_decisive=False):
         if not candidates:
             return [], 0, 0
@@ -906,10 +1116,16 @@ class SelfPlayEngine:
             selected = filtered
             cap_dropped = 0
         else:
-            # Keep the stored trajectory representative. Search confidence and
-            # tactical salience belong in the target distribution, not in a
-            # second hidden sampling policy layered on top of it.
-            selected = self._select_evenly_spaced_candidates(filtered, effective_cap)
+            if self.cap_kl_weighted_fraction > 0.0:
+                selected = self._select_quality_aware_candidates(
+                    filtered,
+                    effective_cap,
+                    self.cap_kl_weighted_fraction,
+                )
+            else:
+                # Preserve the legacy even-coverage policy when KL selection is
+                # explicitly disabled.
+                selected = self._select_evenly_spaced_candidates(filtered, effective_cap)
             cap_dropped = len(filtered) - len(selected)
 
         selected.sort(key=lambda item: int(item['history_idx']))
@@ -919,9 +1135,19 @@ class SelfPlayEngine:
         candidates = []
         for history_idx, history_entry in enumerate(gs['game_history']):
             importance_score = float(history_entry[4]) if len(history_entry) > 4 else 0.0
+            try:
+                policy_weight = float(history_entry[5]) if len(history_entry) > 5 else 1.0
+            except (TypeError, ValueError, OverflowError):
+                policy_weight = 1.0
+            try:
+                policy_kld = float(history_entry[16]) if len(history_entry) > 16 else float('nan')
+            except (TypeError, ValueError, OverflowError):
+                policy_kld = float('nan')
             candidates.append({
                 'history_idx': history_idx,
                 'importance_score': importance_score,
+                'policy_weight': policy_weight,
+                'policy_kld': policy_kld,
                 'source_code': int(history_entry[6]) if len(history_entry) > 6 else _REPLAY_SOURCE_UNKNOWN,
             })
         return candidates
@@ -1113,6 +1339,28 @@ class SelfPlayEngine:
             history_len,
             is_decisive=(outcome != 0.0),
         )
+        selected_history_ids = {
+            int(candidate['history_idx']) for candidate in selected_candidates
+        }
+        selected_kld_sum = 0.0
+        selected_kld_count = 0
+        dropped_kld_sum = 0.0
+        dropped_kld_count = 0
+        if self.cap_kl_weighted_fraction > 0.0:
+            for candidate in selection_candidates:
+                kld = float(candidate.get('policy_kld', float('nan')))
+                if not math.isfinite(kld):
+                    continue
+                if int(candidate['history_idx']) in selected_history_ids:
+                    selected_kld_sum += kld
+                    selected_kld_count += 1
+                else:
+                    dropped_kld_sum += kld
+                    dropped_kld_count += 1
+        gs['_teacher_cap_kld_selected_sum'] = selected_kld_sum
+        gs['_teacher_cap_kld_selected_count'] = selected_kld_count
+        gs['_teacher_cap_kld_dropped_sum'] = dropped_kld_sum
+        gs['_teacher_cap_kld_dropped_count'] = dropped_kld_count
         encoded_fen_cache = {}
 
         for candidate in selected_candidates:
@@ -1415,6 +1663,10 @@ class SelfPlayEngine:
         total_decisive_length_sum = 0
         total_curriculum_dropped_positions = 0
         total_cap_dropped_positions = 0
+        total_teacher_cap_kld_selected_sum = 0.0
+        total_teacher_cap_kld_selected_count = 0
+        total_teacher_cap_kld_dropped_sum = 0.0
+        total_teacher_cap_kld_dropped_count = 0
         total_resigned_games = 0
         total_syzygy_ended_games = 0
         total_syzygy_probe_positions = 0
@@ -1525,6 +1777,18 @@ class SelfPlayEngine:
         total_decisive_length_sum += int(batch_stats.get('decisive_length_sum', 0))
         total_curriculum_dropped_positions += int(batch_stats.get('curriculum_dropped_positions', 0))
         total_cap_dropped_positions += int(batch_stats.get('cap_dropped_positions', 0))
+        total_teacher_cap_kld_selected_sum += float(
+            batch_stats.get('teacher_cap_kld_selected_sum', 0.0) or 0.0
+        )
+        total_teacher_cap_kld_selected_count += int(
+            batch_stats.get('teacher_cap_kld_selected_count', 0) or 0
+        )
+        total_teacher_cap_kld_dropped_sum += float(
+            batch_stats.get('teacher_cap_kld_dropped_sum', 0.0) or 0.0
+        )
+        total_teacher_cap_kld_dropped_count += int(
+            batch_stats.get('teacher_cap_kld_dropped_count', 0) or 0
+        )
         total_resigned_games += int(batch_stats.get('resigned_games', 0))
         total_syzygy_ended_games += int(batch_stats.get('syzygy_ended_games', 0))
         total_syzygy_probe_positions += int(batch_stats.get('syzygy_probe_positions', 0))
@@ -1691,6 +1955,20 @@ class SelfPlayEngine:
             'decisive_length_sum': int(total_decisive_length_sum),
             'curriculum_dropped_positions': int(total_curriculum_dropped_positions),
             'cap_dropped_positions': int(total_cap_dropped_positions),
+            'teacher_cap_selected_policy_kld_mean': (
+                total_teacher_cap_kld_selected_sum / total_teacher_cap_kld_selected_count
+                if total_teacher_cap_kld_selected_count > 0 else None
+            ),
+            'teacher_cap_dropped_policy_kld_mean': (
+                total_teacher_cap_kld_dropped_sum / total_teacher_cap_kld_dropped_count
+                if total_teacher_cap_kld_dropped_count > 0 else None
+            ),
+            'teacher_cap_selected_policy_kld_count': int(
+                total_teacher_cap_kld_selected_count
+            ),
+            'teacher_cap_dropped_policy_kld_count': int(
+                total_teacher_cap_kld_dropped_count
+            ),
             'resigned_games': int(total_resigned_games),
             'syzygy_ended_games': int(total_syzygy_ended_games),
             'syzygy_probe_positions': int(total_syzygy_probe_positions),
@@ -1968,6 +2246,10 @@ class SelfPlayEngine:
             'decisive_length_sum': 0,
             'curriculum_dropped_positions': 0,
             'cap_dropped_positions': 0,
+            'teacher_cap_kld_selected_sum': 0.0,
+            'teacher_cap_kld_selected_count': 0,
+            'teacher_cap_kld_dropped_sum': 0.0,
+            'teacher_cap_kld_dropped_count': 0,
             'hard_start_games': 0,
             'opening_prefix_sampled_games': 0,
             'opening_prefix_games': 0,
@@ -2071,6 +2353,13 @@ class SelfPlayEngine:
             )
             stats['curriculum_dropped_positions'] += curriculum_dropped
             stats['cap_dropped_positions'] += cap_dropped
+            for key in (
+                'teacher_cap_kld_selected_sum',
+                'teacher_cap_kld_selected_count',
+                'teacher_cap_kld_dropped_sum',
+                'teacher_cap_kld_dropped_count',
+            ):
+                stats[key] += gs.get(f'_{key}', 0)
 
         return positions, game_lengths, stats
 
@@ -2104,25 +2393,7 @@ class SelfPlayEngine:
         finalized_game_stats = None
 
         def _merge_finalized_stats(target, source):
-            if target is None:
-                target = {
-                    key: ({} if isinstance(value, dict) else 0)
-                    for key, value in source.items()
-                }
-            for key, value in source.items():
-                if key in {'opponent_source_counts', 'opening_sequence_counts'}:
-                    for label, count in value.items():
-                        target[key][label] = int(target[key].get(label, 0)) + int(count)
-                elif key == 'opponent_source_results':
-                    for label, row in value.items():
-                        dst = target[key].setdefault(
-                            label, {'wins': 0, 'draws': 0, 'losses': 0, 'games': 0}
-                        )
-                        for field in ('wins', 'draws', 'losses', 'games'):
-                            dst[field] += int(row.get(field, 0) or 0)
-                else:
-                    target[key] += int(value or 0)
-            return target
+            return _merge_finalized_game_stats(target, source)
 
         def _flush_completed_games(force=False):
             nonlocal finalized_game_stats
@@ -2796,12 +3067,27 @@ class SelfPlayEngine:
                     # training is game-balanced, so importance ranking is not a
                     # sampling input. The compact history sequence exposes the
                     # legacy constant slot to postgame replay construction.
-                    # Every completed Gumbel root is one policy example. Its
-                    # uncertainty is already encoded by the soft improved-policy
-                    # target, so confidence must not scale CE a second time.
+                    # Policy weight comes from completed effective visits when
+                    # budget-based teacher weighting is active. The assigned
+                    # budget alone is not evidence that the search completed.
                     search_changed_top, search_q_delta = (
                         _search_correction_metadata(search_metadata)
                     )
+                    policy_weight = 1.0
+                    if self.teacher_policy_budget_weighting_enabled:
+                        effective_simulations = (
+                            search_metadata.get('simulations_used')
+                            if isinstance(search_metadata, dict)
+                            else None
+                        )
+                        budget_weight = teacher_policy_weight_from_effective_simulations(
+                            effective_simulations,
+                            nominal_simulations=self.num_simulations,
+                            min_budget_ratio=self.teacher_policy_min_budget_ratio,
+                        )
+                        if budget_weight is not None:
+                            policy_weight = float(budget_weight)
+                    weak_teacher_target = policy_weight <= 0.0
                     replay_source_code = _replay_source_code(
                         learner_turn,
                         game_opponent_mcts,
@@ -2820,12 +3106,16 @@ class SelfPlayEngine:
                         policy_indices=policy_indices,
                         policy_values=policy_values,
                         turn=board.turn,
+                        policy_weight=policy_weight,
                         source_code=replay_source_code,
                         legal_indices=legal_indices_full,
                         fen=chess.board_fen(board),
                         root_q=(
                             float(replay_search_metadata.get('root_value'))
-                            if replay_search_metadata.get('root_value') is not None
+                            if (
+                                not weak_teacher_target
+                                and replay_search_metadata.get('root_value') is not None
+                            )
                             else float('nan')
                         ),
                         history_fens=tuple(
@@ -2839,17 +3129,26 @@ class SelfPlayEngine:
                         search_q_delta=search_q_delta,
                         best_q=(
                             float(replay_search_metadata.get('best_q'))
-                            if replay_search_metadata.get('best_q') is not None
+                            if (
+                                not weak_teacher_target
+                                and replay_search_metadata.get('best_q') is not None
+                            )
                             else float('nan')
                         ),
                         played_q=(
                             float(replay_search_metadata.get('played_q'))
-                            if replay_search_metadata.get('played_q') is not None
+                            if (
+                                not weak_teacher_target
+                                and replay_search_metadata.get('played_q') is not None
+                            )
                             else float('nan')
                         ),
                         orig_q=(
                             float(replay_search_metadata.get('orig_q'))
-                            if replay_search_metadata.get('orig_q') is not None
+                            if (
+                                not weak_teacher_target
+                                and replay_search_metadata.get('orig_q') is not None
+                            )
                             else float('nan')
                         ),
                         policy_kld=(
@@ -3235,6 +3534,18 @@ class SelfPlayEngine:
             'decisive_length_sum': int(decisive_length_sum),
             'curriculum_dropped_positions': int(curriculum_dropped_positions),
             'cap_dropped_positions': int(cap_dropped_positions),
+            'teacher_cap_kld_selected_sum': float(
+                finalized_game_stats.get('teacher_cap_kld_selected_sum', 0.0) or 0.0
+            ),
+            'teacher_cap_kld_selected_count': int(
+                finalized_game_stats.get('teacher_cap_kld_selected_count', 0) or 0
+            ),
+            'teacher_cap_kld_dropped_sum': float(
+                finalized_game_stats.get('teacher_cap_kld_dropped_sum', 0.0) or 0.0
+            ),
+            'teacher_cap_kld_dropped_count': int(
+                finalized_game_stats.get('teacher_cap_kld_dropped_count', 0) or 0
+            ),
             'opponent_source': source_label,
             'opponent_source_counts': opponent_source_counts,
             'opponent_source_results': opponent_source_results,

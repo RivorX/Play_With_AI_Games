@@ -595,22 +595,10 @@ class RLLoggerMixin:
             'mcts_native_tree_selected_leaves': _value(
                 'mcts_native_tree_selected_leaves'
             ),
-            'mcts_python_tree_selected_leaves': _value(
-                'mcts_python_tree_selected_leaves'
-            ),
-            'mcts_native_tree_selection_rate': _value(
-                'mcts_native_tree_selection_rate'
-            ),
             'mcts_native_tree_import_nodes': _value('mcts_native_tree_import_nodes'),
             'mcts_native_tree_import_edges': _value('mcts_native_tree_import_edges'),
-            'mcts_native_tree_fallbacks': _value('mcts_native_tree_fallbacks'),
             'mcts_search_metadata_time_s': _value('mcts_search_metadata_time'),
-            'mcts_native_root_selection_calls': _value('mcts_native_root_selection_calls'),
-            'mcts_python_root_selection_calls': _value('mcts_python_root_selection_calls'),
-            'mcts_native_root_selection_rate': _value('mcts_native_root_selection_rate'),
             'mcts_native_completed_q_calls': _value('mcts_native_completed_q_calls'),
-            'mcts_python_completed_q_calls': _value('mcts_python_completed_q_calls'),
-            'mcts_native_completed_q_rate': _value('mcts_native_completed_q_rate'),
             'mcts_batch_expand_dedup_time_s': _value('mcts_batch_expand_dedup_terminal_time'),
             'mcts_batch_expand_eval_time_s': _value('mcts_batch_expand_eval_time'),
             'mcts_batch_expand_eval_calls': _value('mcts_batch_expand_eval_calls'),
@@ -1123,6 +1111,18 @@ class RLLoggerMixin:
                 _float(selfplay_stats, 'syzygy_probe_positions'),
             ),
             'selfplay_replay_storage_keep_rate': replay_storage_keep_rate,
+            'selfplay_teacher_cap_selected_policy_kld_mean': _value(
+                selfplay_stats, 'teacher_cap_selected_policy_kld_mean'
+            ),
+            'selfplay_teacher_cap_dropped_policy_kld_mean': _value(
+                selfplay_stats, 'teacher_cap_dropped_policy_kld_mean'
+            ),
+            'selfplay_teacher_cap_selected_policy_kld_count': _value(
+                selfplay_stats, 'teacher_cap_selected_policy_kld_count'
+            ),
+            'selfplay_teacher_cap_dropped_policy_kld_count': _value(
+                selfplay_stats, 'teacher_cap_dropped_policy_kld_count'
+            ),
             'selfplay_hard_start_games': hard_start_games if hard_start_games is not None else '',
             'selfplay_hard_start_fraction': _ratio(
                 hard_start_games,
@@ -1207,8 +1207,28 @@ class RLLoggerMixin:
             ),
             'reanalyse_selected': _value(replay_stats, 'reanalyse_selected'),
             'reanalyse_updated': _value(replay_stats, 'reanalyse_updated'),
+            'reanalyse_skipped': _value(replay_stats, 'reanalyse_skipped'),
             'reanalyse_correction_fraction': _value(
                 replay_stats, 'reanalyse_correction_fraction'
+            ),
+            'reanalyse_eligible_rows': _value(replay_stats, 'reanalyse_eligible_rows'),
+            'reanalyse_selected_target_age_mean': _value(
+                replay_stats, 'reanalyse_selected_target_age_mean'
+            ),
+            'reanalyse_selected_actor_kl_mean': _value(
+                replay_stats, 'reanalyse_selected_actor_kl_mean'
+            ),
+            'reanalyse_selected_actor_kl_coverage': _value(
+                replay_stats, 'reanalyse_selected_actor_kl_coverage'
+            ),
+            'reanalyse_simulations_mean': _value(
+                replay_stats, 'reanalyse_simulations_mean'
+            ),
+            'reanalyse_simulations_min': _value(
+                replay_stats, 'reanalyse_simulations_min'
+            ),
+            'reanalyse_simulations_max': _value(
+                replay_stats, 'reanalyse_simulations_max'
             ),
             'opponent_mix_error': opponent_mix_error,
             'opponent_count_error': opponent_count_error,
@@ -1221,6 +1241,11 @@ class RLLoggerMixin:
             ),
             'mcts_inherited_visit_credit': _value(
                 selfplay_stats, 'search_inherited_visit_credit_avg'
+            ),
+            'mcts_search_samples': (
+                int(mcts_search_samples)
+                if mcts_search_samples is not None and mcts_search_samples >= 0.0
+                else ''
             ),
             'mcts_avg_budget': mcts_avg_budget,
             'mcts_budget_quality_samples': _value(
@@ -1595,9 +1620,31 @@ class RLLoggerMixin:
             'policy_correction_rank_to_ce_ratio': train_metrics.get(
                 'policy_correction_rank_to_ce_ratio', ''
             ) if train_metrics else '',
+            'policy_surprise_weight': train_metrics.get(
+                'policy_surprise_weight', ''
+            ) if train_metrics else '',
+            'policy_surprise_effective_weight': train_metrics.get(
+                'policy_surprise_effective_weight', ''
+            ) if train_metrics else '',
+            'policy_surprise_active_step_fraction': train_metrics.get(
+                'policy_surprise_active_step_fraction', ''
+            ) if train_metrics else '',
+            'policy_surprise_coverage': train_metrics.get(
+                'policy_surprise_coverage', ''
+            ) if train_metrics else '',
+            'policy_surprise_mean_kl': train_metrics.get(
+                'policy_surprise_mean_kl', ''
+            ) if train_metrics else '',
+            'policy_surprise_max_weight_multiplier': train_metrics.get(
+                'policy_surprise_max_weight_multiplier', ''
+            ) if train_metrics else '',
             'policy_correction_top1_acc': train_metrics.get('policy_correction_top1_acc', '') if train_metrics else '',
             'policy_correction_fraction': train_metrics.get('policy_correction_fraction', '') if train_metrics else '',
             'policy_correction_weight_share': train_metrics.get('policy_correction_weight_share', '') if train_metrics else '',
+            'policy_positive_weight_fraction': train_metrics.get('policy_positive_weight_fraction', '') if train_metrics else '',
+            'policy_correction_positive_weight_fraction': train_metrics.get(
+                'policy_correction_positive_weight_fraction', ''
+            ) if train_metrics else '',
             'correction_audit_rows': train_metrics.get('correction_audit_rows', '') if train_metrics else '',
             'correction_audit_candidate_rows': train_metrics.get('correction_audit_candidate_rows', '') if train_metrics else '',
             'correction_audit_eligible_rows': train_metrics.get('correction_audit_eligible_rows', '') if train_metrics else '',

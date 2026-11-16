@@ -8,7 +8,12 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -32,6 +37,12 @@ from src.mcts.search import (
     _debug_nested,
     _maybe_compile_selfplay_model,
 )
+
+_SHARED_INPUT_LOCK_STATE = threading.local()
+
+
+def _thread_holds_shared_input_lock(lock):
+    return id(lock) in getattr(_SHARED_INPUT_LOCK_STATE, "held_locks", set())
 
 
 def _configure_selfplay_worker_runtime(config, device_id):
@@ -219,6 +230,179 @@ def _central_eval_cache_key(
     return primary, verifier
 
 
+class _SharedInputReservation:
+    """One locked input slot reserved by a remote MCTS worker."""
+
+    __slots__ = (
+        "client",
+        "slot",
+        "batch_size",
+        "input_planes",
+        "legal_cols",
+        "boards",
+        "legal_indices",
+        "legal_counts",
+        "thread_id",
+        "active",
+    )
+
+    def __init__(self, client, slot, batch_size, input_planes, legal_cols):
+        self.client = client
+        self.slot = int(slot)
+        self.batch_size = int(batch_size)
+        self.input_planes = int(input_planes)
+        self.legal_cols = int(legal_cols)
+        self.boards = client._shared_arrays["boards"][
+            self.slot, :self.batch_size, :self.input_planes
+        ]
+        self.legal_indices = client._shared_arrays["legal_indices"][
+            self.slot, :self.batch_size, :self.legal_cols
+        ]
+        self.legal_counts = client._shared_arrays["legal_counts"][
+            self.slot, :self.batch_size
+        ]
+        self.thread_id = threading.get_ident()
+        self.active = True
+
+
+class RemoteInferenceResponseBroker:
+    """Route one worker's response channel to concurrent inference callers.
+
+    A broker owns only its reader thread; the Pipe or queue remains owned by
+    its caller. Requests must register their response mailbox before they are
+    submitted so a fast server reply cannot race registration.
+    """
+
+    def __init__(self, response_queue):
+        self.response_queue = response_queue
+        self._lock = threading.Lock()
+        self._pending = {}
+        self._peak_pending_count = 0
+        self._failure = None
+        self._closed = False
+        self._stop_event = threading.Event()
+        self._reader = threading.Thread(
+            target=self._read_responses,
+            name="central-inference-response-broker",
+            daemon=True,
+        )
+        self._reader.start()
+
+    @property
+    def pending_count(self):
+        """Number of requests still waiting for a response."""
+        with self._lock:
+            return len(self._pending)
+
+    @property
+    def peak_pending_count(self):
+        """Highest number of simultaneously registered outstanding requests."""
+        with self._lock:
+            return self._peak_pending_count
+
+    def register(self, request_id):
+        """Create the response mailbox before putting the request on its queue."""
+        request_id = str(request_id)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Central inference response broker is unavailable.") from self._failure
+            if request_id in self._pending:
+                raise ValueError(f"Duplicate central inference request ID: {request_id}")
+            mailbox = Future()
+            self._pending[request_id] = mailbox
+            self._peak_pending_count = max(
+                self._peak_pending_count, len(self._pending)
+            )
+            return mailbox
+
+    def poison(self, error):
+        """Fail closed after an ambiguous request or response-channel failure."""
+        if not isinstance(error, BaseException):
+            error = RuntimeError(str(error))
+        self._fail(error)
+
+    def _fail(self, error):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._failure = error
+            pending = list(self._pending.values())
+            self._pending.clear()
+            self._stop_event.set()
+        for mailbox in pending:
+            if not mailbox.done():
+                try:
+                    mailbox.set_exception(error)
+                except Exception:
+                    # A caller may have cancelled its mailbox concurrently.
+                    pass
+
+    def close(self):
+        """Stop the reader and fail outstanding callers without closing its channel."""
+        self._fail(RuntimeError("Central inference response broker was closed."))
+        if self._reader is not threading.current_thread():
+            self._reader.join(timeout=1.0)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+    def _route_response(self, response):
+        if not isinstance(response, dict):
+            self._fail(
+                RuntimeError(
+                    "Central inference response channel returned a malformed response."
+                )
+            )
+            return
+        request_id = response.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            self._fail(
+                RuntimeError(
+                    "Central inference response channel returned a response without "
+                    "a valid request ID."
+                )
+            )
+            return
+        with self._lock:
+            mailbox = self._pending.pop(request_id, None)
+        # Unknown and late IDs can arrive after a timeout or on a reused channel;
+        # they are intentionally ignored instead of being delivered to another
+        # caller.
+        if mailbox is not None and not mailbox.done():
+            try:
+                mailbox.set_result(response)
+            except Exception:
+                pass
+
+    def _read_one(self):
+        channel = self.response_queue
+        if hasattr(channel, "poll") and hasattr(channel, "recv"):
+            if not channel.poll(0.1):
+                raise queue.Empty()
+            return channel.recv()
+        return channel.get(timeout=0.1)
+
+    def _read_responses(self):
+        while not self._stop_event.is_set():
+            try:
+                response = self._read_one()
+            except queue.Empty:
+                continue
+            except Exception as exc:
+                self._fail(
+                    RuntimeError(
+                        f"Central inference response channel failed: {exc}"
+                    )
+                )
+                return
+            self._route_response(response)
+
+
 class RemoteInferenceClient:
     """Small model-like proxy used by MCTS workers with central GPU inference."""
 
@@ -235,6 +419,8 @@ class RemoteInferenceClient:
         shared_buffer=None,
         shared_call_lock=None,
         model_spec=None,
+        response_broker=None,
+        shared_slot_index=None,
     ):
         self.model_label = str(model_label or "learner")
         self.model_spec = dict(model_spec) if isinstance(model_spec, dict) else None
@@ -303,9 +489,24 @@ class RemoteInferenceClient:
         self.transport_dtype = "float32" if transport_dtype in {"float32", "fp32"} else "float16"
         self._transport_np_dtype = np.float32 if self.transport_dtype == "float32" else np.float16
         self.shared_buffer = shared_buffer
+        self.response_broker = response_broker
+        if shared_slot_index is None:
+            self.shared_slot_index = None
+        else:
+            if shared_buffer is None:
+                raise ValueError("A fixed shared slot requires a shared inference buffer.")
+            slots = max(1, int(shared_buffer.get("slots", 1) or 1))
+            shared_slot_index = int(shared_slot_index)
+            if shared_slot_index < 0 or shared_slot_index >= slots:
+                raise ValueError(
+                    f"Shared slot index {shared_slot_index} is outside the buffer's "
+                    f"{slots} slots."
+                )
+            self.shared_slot_index = shared_slot_index
         self._shared_arrays = None
         self._evaluation_generation_views = shared_inference_generation_arrays(shared_buffer)
         self._shared_call_lock = shared_call_lock or threading.Lock()
+        self._shared_input_state = threading.local()
         # A CentralInferenceSession may expose several label-specific proxies
         # over the same response queue. Serialize those proxies even when the
         # transport uses ordinary queues (without a shared-memory slot), so a
@@ -370,10 +571,118 @@ class RemoteInferenceClient:
             return self.response_queue.recv()
         return self.response_queue.get(timeout=wait_s)
 
+    def can_reserve_shared_inputs(
+        self, batch_size, legal_cols, *, input_dtype=None, input_planes=None
+    ):
+        """Whether this request fits the worker's FP16 shared input slots."""
+        if self._shared_arrays is None or self.transport_dtype != "float16":
+            return False
+        if (
+            input_dtype is not None
+            and np.dtype(input_dtype) != self._shared_arrays["boards"].dtype
+        ):
+            return False
+        buffer = self.shared_buffer
+        buffer_input_planes = int(buffer.get("input_planes", 0) or 0)
+        requested_input_planes = (
+            self.input_planes if input_planes is None else int(input_planes)
+        )
+        if requested_input_planes is None:
+            requested_input_planes = buffer_input_planes
+        return bool(
+            int(batch_size) > 0
+            and int(legal_cols) > 0
+            and int(batch_size) <= int(buffer.get("capacity", 0) or 0)
+            and int(legal_cols) <= int(buffer.get("max_legal_moves", 0) or 0)
+            and int(requested_input_planes) > 0
+            and int(requested_input_planes) <= buffer_input_planes
+            and (
+                self.input_planes is None
+                or int(requested_input_planes) == int(self.input_planes)
+            )
+        )
+
+    @contextmanager
+    def shared_input_buffers(
+        self, batch_size, legal_cols, *, input_dtype=None, input_planes=None
+    ):
+        """Reserve a shared slot while MCTS fills it and submits that request.
+
+        The reservation serializes model-label proxies that share the worker's
+        response channel and slot arena. It is intentionally explicit: ordinary
+        calls retain their existing copy-in behavior and output ownership.
+        """
+        batch_size = int(batch_size)
+        legal_cols = int(legal_cols)
+        if not self.can_reserve_shared_inputs(
+            batch_size,
+            legal_cols,
+            input_dtype=input_dtype,
+            input_planes=input_planes,
+        ):
+            yield None
+            return
+
+        wait_t0 = time.perf_counter()
+        lock_key = id(self._shared_call_lock)
+        if _thread_holds_shared_input_lock(self._shared_call_lock):
+            raise RuntimeError(
+                "Nested central shared-input reservations on one worker are unsupported."
+            )
+        self._shared_call_lock.acquire()
+        held_locks = getattr(_SHARED_INPUT_LOCK_STATE, "held_locks", None)
+        if held_locks is None:
+            held_locks = set()
+            _SHARED_INPUT_LOCK_STATE.held_locks = held_locks
+        held_locks.add(lock_key)
+        reservation = None
+        try:
+            self.last_shared_slot_wait_s = time.perf_counter() - wait_t0
+            if getattr(self._shared_input_state, "reservation", None) is not None:
+                raise RuntimeError("Nested central shared-input reservations are unsupported.")
+            slots = max(1, int(self.shared_buffer.get("slots", 1) or 1))
+            slot = (
+                self.shared_slot_index
+                if self.shared_slot_index is not None
+                else self._request_counter % slots
+            )
+            reservation_input_planes = (
+                self.input_planes if input_planes is None else int(input_planes)
+            )
+            if reservation_input_planes is None:
+                reservation_input_planes = int(
+                    self.shared_buffer.get("input_planes", 0) or 0
+                )
+            reservation = _SharedInputReservation(
+                self, slot, batch_size, reservation_input_planes, legal_cols
+            )
+            self._shared_input_state.reservation = reservation
+            yield reservation
+        finally:
+            if reservation is not None:
+                reservation.active = False
+                if getattr(self._shared_input_state, "reservation", None) is reservation:
+                    self._shared_input_state.reservation = None
+            held_locks.discard(lock_key)
+            self._shared_call_lock.release()
+
     def _ts(self):
         return time.strftime("%H:%M:%S")
 
     def __call__(self, board_tensors, apply_log_softmax=False, legal_index_matrix=None, **kwargs):
+        reservation = getattr(self._shared_input_state, "reservation", None)
+        if reservation is not None and reservation.active and reservation.client is self:
+            return self._call_impl(
+                board_tensors,
+                apply_log_softmax=apply_log_softmax,
+                legal_index_matrix=legal_index_matrix,
+                _shared_input_reservation=reservation,
+                **kwargs,
+            )
+        if self._serialize_calls and _thread_holds_shared_input_lock(self._shared_call_lock):
+            raise RuntimeError(
+                "A different central model proxy cannot be called inside a shared-input reservation."
+            )
         if not self._serialize_calls:
             return self._call_impl(
                 board_tensors,
@@ -391,7 +700,14 @@ class RemoteInferenceClient:
                 **kwargs,
             )
 
-    def _call_impl(self, board_tensors, apply_log_softmax=False, legal_index_matrix=None, **kwargs):
+    def _call_impl(
+        self,
+        board_tensors,
+        apply_log_softmax=False,
+        legal_index_matrix=None,
+        _shared_input_reservation=None,
+        **kwargs,
+    ):
         if apply_log_softmax:
             raise ValueError("Remote inference proxy only supports raw policy logits.")
         self._request_counter += 1
@@ -431,6 +747,8 @@ class RemoteInferenceClient:
             and legal_cols <= int(self.shared_buffer.get("max_legal_moves", 0))
             and int(boards_source.shape[1]) <= int(self.shared_buffer.get("input_planes", -1))
         )
+        if _shared_input_reservation is not None and not shared_eligible:
+            raise RuntimeError("Reserved central inputs no longer match shared transport limits.")
         request = {
             "cmd": "infer",
             "rank": self.worker_rank,
@@ -442,16 +760,38 @@ class RemoteInferenceClient:
         }
         shared_slot = None
         if shared_eligible:
-            shared_slot = int((self._request_counter - 1) % int(self.shared_buffer.get("slots", 1)))
-            np.copyto(
-                self._shared_arrays["boards"][
-                    shared_slot, :batch_size, :int(boards_source.shape[1])
-                ],
-                boards_source,
-                casting="unsafe",
+            slots = max(1, int(self.shared_buffer.get("slots", 1) or 1))
+            shared_slot = int(
+                self.shared_slot_index
+                if self.shared_slot_index is not None
+                else (self._request_counter - 1) % slots
             )
-            self._shared_arrays["legal_indices"][shared_slot, :batch_size, :legal_cols] = legal_source
-            self._shared_arrays["legal_counts"][shared_slot, :batch_size] = legal_counts_source
+            if _shared_input_reservation is not None:
+                reservation = _shared_input_reservation
+                if (
+                    not isinstance(reservation, _SharedInputReservation)
+                    or reservation.client is not self
+                    or not reservation.active
+                    or reservation.thread_id != threading.get_ident()
+                    or reservation.slot != shared_slot
+                    or reservation.batch_size != batch_size
+                    or reservation.input_planes != int(boards_source.shape[1])
+                    or reservation.legal_cols != legal_cols
+                    or board_tensors is not reservation.boards
+                    or legal_index_matrix is not reservation.legal_indices
+                    or legal_counts is not reservation.legal_counts
+                ):
+                    raise RuntimeError("Invalid central shared-input reservation.")
+            else:
+                np.copyto(
+                    self._shared_arrays["boards"][
+                        shared_slot, :batch_size, :int(boards_source.shape[1])
+                    ],
+                    boards_source,
+                    casting="unsafe",
+                )
+                self._shared_arrays["legal_indices"][shared_slot, :batch_size, :legal_cols] = legal_source
+                self._shared_arrays["legal_counts"][shared_slot, :batch_size] = legal_counts_source
             shared_token = (
                 ((int(os.getpid()) & 0x7FFFFFFF) << 32)
                 | (int(self._request_counter) & 0xFFFFFFFF)
@@ -480,7 +820,19 @@ class RemoteInferenceClient:
         request_started_perf = time.perf_counter()
         request["queued_at_perf"] = request_started_perf
         put_t0 = request_started_perf
-        self.request_queue.put(request)
+        response_mailbox = None
+        if self.response_broker is not None:
+            # Register before queue.put so an immediate server response cannot
+            # be consumed before its destination exists.
+            response_mailbox = self.response_broker.register(request_id)
+        try:
+            self.request_queue.put(request)
+        except Exception as exc:
+            if self.response_broker is not None:
+                self.response_broker.poison(
+                    RuntimeError(f"Central inference request submission failed: {exc}")
+                )
+            raise
         self.last_request_put_s = time.perf_counter() - put_t0
         if self.debug_enabled and not self._printed_first_request:
             self._printed_first_request = True
@@ -490,136 +842,186 @@ class RemoteInferenceClient:
                 f"transport={'shared' if shared_eligible else 'queue'}).",
                 flush=True,
             )
-        started_at = time.time()
-        deadline = None if self.timeout_s is None else started_at + self.timeout_s
-        next_warning_at = (
-            started_at + self.stall_warning_s
-            if self.stall_warning_s > 0.0
-            else None
-        )
-        while True:
-            now = time.time()
-            if deadline is not None:
-                remaining = deadline - now
-                if remaining <= 0:
-                    raise TimeoutError(f"Central inference timed out for model '{self.model_label}'.")
-                wait_s = min(max(remaining, 0.01), 1.0)
-            else:
-                wait_s = 1.0
-            if self.debug_enabled and next_warning_at is not None and now >= next_warning_at:
-                waited_s = now - started_at
-                print(
-                    f"[{self._ts()}] Central inference: worker {self.worker_rank} still waiting "
-                    f"{waited_s:.0f}s for model '{self.model_label}'.",
-                    flush=True,
-                )
-                next_warning_at = now + self.stall_warning_s
-            try:
-                response = self._receive_response(wait_s)
-            except queue.Empty:
-                continue
-            if response.get("request_id") != request_id:
-                response_request_id = str(response.get("request_id") or "")
-                if not response_request_id.startswith(f"{os.getpid()}_"):
-                    continue
-                raise RuntimeError(
-                    "Central inference response routing failed: "
-                    f"worker {self.worker_rank} received response for another request."
-                )
-            if not response.get("ok", False):
-                raise RuntimeError(response.get("error", "central inference failed"))
-            response_provenance = response.get("prediction_provenance")
-            if (
-                isinstance(response_provenance, dict)
-                and type(response_provenance.get("schema_version")) is int
-                and response_provenance.get("schema_version")
-                == _PREDICTION_PROVENANCE_SCHEMA_VERSION
-            ):
-                row_sources = response_provenance.get("row_sources")
-            else:
-                row_sources = None
-            self.last_prediction_provenance = _prediction_provenance_for_sources(
-                row_sources, batch_size
+        if response_mailbox is not None:
+            started_at = time.time()
+            deadline = None if self.timeout_s is None else started_at + self.timeout_s
+            next_warning_at = (
+                started_at + self.stall_warning_s
+                if self.stall_warning_s > 0.0
+                else None
             )
-            self.last_remote_wait_s = time.perf_counter() - request_started_perf
-            self.last_server_batch_size = int(response.get("server_batch_size", 0) or 0)
-            self.last_server_batch_target = int(response.get("server_batch_target", 0) or 0)
-            self.last_server_batch_auto = bool(response.get("server_batch_auto", False))
-            self.last_server_batch_auto_calibrated = bool(
-                response.get("server_batch_auto_calibrated", False)
+            while True:
+                now = time.time()
+                if deadline is not None:
+                    remaining = deadline - now
+                    if remaining <= 0:
+                        timeout_error = TimeoutError(
+                            f"Central inference timed out for model '{self.model_label}'."
+                        )
+                        # The GPU may still write a shared slot after this caller
+                        # has stopped waiting, so no later request may reuse it.
+                        self.response_broker.poison(timeout_error)
+                        raise timeout_error
+                    wait_s = min(max(remaining, 0.01), 1.0)
+                else:
+                    wait_s = 1.0
+                try:
+                    response = response_mailbox.result(timeout=wait_s)
+                    break
+                except FutureTimeoutError as exc:
+                    now = time.time()
+                    if deadline is not None and now >= deadline:
+                        timeout_error = TimeoutError(
+                            f"Central inference timed out for model '{self.model_label}'."
+                        )
+                        # The GPU may still write a shared slot after this caller
+                        # has stopped waiting, so no later request may reuse it.
+                        self.response_broker.poison(timeout_error)
+                        raise timeout_error from exc
+                    if (
+                        self.debug_enabled
+                        and next_warning_at is not None
+                        and now >= next_warning_at
+                    ):
+                        waited_s = now - started_at
+                        print(
+                            f"[{self._ts()}] Central inference: worker {self.worker_rank} still waiting "
+                            f"{waited_s:.0f}s for model '{self.model_label}'.",
+                            flush=True,
+                        )
+                        next_warning_at = now + self.stall_warning_s
+        else:
+            started_at = time.time()
+            deadline = None if self.timeout_s is None else started_at + self.timeout_s
+            next_warning_at = (
+                started_at + self.stall_warning_s
+                if self.stall_warning_s > 0.0
+                else None
             )
-            self.last_response_compact_policy = bool(response.get("compact_policy", False))
-            self.last_server_queue_wait_s = float(response.get("server_queue_wait_s", 0.0) or 0.0)
-            self.last_server_descriptor_queue_wait_s = float(
-                response.get("server_descriptor_queue_wait_s", 0.0) or 0.0
-            )
-            self.last_server_batch_coalesce_wait_s = float(
-                response.get("server_batch_coalesce_wait_s", 0.0) or 0.0
-            )
-            self.last_server_pipeline_wait_s = float(
-                response.get("server_pipeline_wait_s", 0.0) or 0.0
-            )
-            self.last_server_output_finalize_wait_s = float(
-                response.get("server_output_finalize_wait_s", 0.0) or 0.0
-            )
-            self.last_server_output_pipeline_used = bool(
-                response.get("server_output_pipeline_used", False)
-            )
-            self.last_server_output_ready_checked = bool(
-                response.get("server_output_ready_checked", False)
-            )
-            self.last_server_output_early_published = bool(
-                response.get("server_output_early_published", False)
-            )
-            self.last_server_total_s = float(response.get("server_total_time_s", 0.0) or 0.0)
-            self.last_server_concat_s = float(response.get("server_concat_time_s", 0.0) or 0.0)
-            self.last_server_h2d_s = float(response.get("server_h2d_time_s", 0.0) or 0.0)
-            self.last_server_forward_s = float(response.get("server_forward_time_s", 0.0) or 0.0)
-            self.last_server_d2h_s = float(response.get("server_d2h_time_s", 0.0) or 0.0)
-            self.last_server_send_s = float(response.get("server_send_time_s", 0.0) or 0.0)
-            self.last_shared_bytes_avoided = int(response.get("shared_bytes_avoided", 0) or 0)
-            self.last_cache_queries = int(response.get("cache_queries", 0) or 0)
-            self.last_cache_bypassed_positions = int(
-                response.get("cache_bypassed_positions", 0) or 0
-            )
-            self.last_cache_hits = int(response.get("cache_hits", 0) or 0)
-            self.last_dedup_hits = int(response.get("dedup_hits", 0) or 0)
-            self.last_cache_suspensions = int(response.get("cache_suspensions", 0) or 0)
-            self.last_cache_reactivations = int(response.get("cache_reactivations", 0) or 0)
-            self.last_nn_evaluated_positions = int(response.get("nn_evaluated_positions", 0) or 0)
-            self.last_server_cache_lookup_s = float(response.get("server_cache_lookup_s", 0.0) or 0.0)
-            self.last_server_staging_copy_s = float(response.get("server_staging_copy_s", 0.0) or 0.0)
-            self.last_gpu_batch_fill = float(response.get("gpu_batch_fill", 0.0) or 0.0)
-            if self.debug_enabled and not self._printed_first_response:
-                self._printed_first_response = True
-                print(
-                    f"[{self._ts()}] Central inference: worker {self.worker_rank} received first "
-                    f"{self.model_label} response (server_batch={self.last_server_batch_size}).",
-                    flush=True,
-                )
-            if bool(response.get("shared_memory", False)):
-                response_slot = int(response.get("shared_slot", shared_slot if shared_slot is not None else 0))
-                expected_token = int(response.get("shared_token", 0) or 0)
-                actual_token = int(self._shared_arrays["response_tokens"][response_slot])
-                if expected_token <= 0 or actual_token != expected_token:
-                    raise RuntimeError(
-                        "Central inference shared-memory response token mismatch."
+            while True:
+                now = time.time()
+                if deadline is not None:
+                    remaining = deadline - now
+                    if remaining <= 0:
+                        raise TimeoutError(f"Central inference timed out for model '{self.model_label}'.")
+                    wait_s = min(max(remaining, 0.01), 1.0)
+                else:
+                    wait_s = 1.0
+                if self.debug_enabled and next_warning_at is not None and now >= next_warning_at:
+                    waited_s = now - started_at
+                    print(
+                        f"[{self._ts()}] Central inference: worker {self.worker_rank} still waiting "
+                        f"{waited_s:.0f}s for model '{self.model_label}'.",
+                        flush=True,
                     )
-                response_batch = int(response.get("batch_size", batch_size))
-                policy_cols = int(response.get("policy_cols", legal_cols))
-                policy_np = self._shared_arrays[
-                    "policy_logits"
-                ][response_slot, :response_batch, :policy_cols].copy()
-                value_np = self._shared_arrays[
-                    "value_logits"
-                ][response_slot, :response_batch, :3].copy()
-                policy = torch.from_numpy(policy_np)
-                value = torch.from_numpy(value_np)
-            else:
-                policy_dtype = np.float16 if self.last_response_compact_policy else np.float32
-                policy = torch.from_numpy(np.asarray(response["policy_logits"], dtype=policy_dtype))
-                value = torch.from_numpy(np.asarray(response["value_logits"], dtype=np.float32))
-            return policy, value
+                    next_warning_at = now + self.stall_warning_s
+                try:
+                    response = self._receive_response(wait_s)
+                except queue.Empty:
+                    continue
+                if response.get("request_id") != request_id:
+                    response_request_id = str(response.get("request_id") or "")
+                    if not response_request_id.startswith(f"{os.getpid()}_"):
+                        continue
+                    raise RuntimeError(
+                        "Central inference response routing failed: "
+                        f"worker {self.worker_rank} received response for another request."
+                    )
+                break
+        if not response.get("ok", False):
+            raise RuntimeError(response.get("error", "central inference failed"))
+        response_provenance = response.get("prediction_provenance")
+        if (
+            isinstance(response_provenance, dict)
+            and type(response_provenance.get("schema_version")) is int
+            and response_provenance.get("schema_version")
+            == _PREDICTION_PROVENANCE_SCHEMA_VERSION
+        ):
+            row_sources = response_provenance.get("row_sources")
+        else:
+            row_sources = None
+        self.last_prediction_provenance = _prediction_provenance_for_sources(
+            row_sources, batch_size
+        )
+        self.last_remote_wait_s = time.perf_counter() - request_started_perf
+        self.last_server_batch_size = int(response.get("server_batch_size", 0) or 0)
+        self.last_server_batch_target = int(response.get("server_batch_target", 0) or 0)
+        self.last_server_batch_auto = bool(response.get("server_batch_auto", False))
+        self.last_server_batch_auto_calibrated = bool(
+            response.get("server_batch_auto_calibrated", False)
+        )
+        self.last_response_compact_policy = bool(response.get("compact_policy", False))
+        self.last_server_queue_wait_s = float(response.get("server_queue_wait_s", 0.0) or 0.0)
+        self.last_server_descriptor_queue_wait_s = float(
+            response.get("server_descriptor_queue_wait_s", 0.0) or 0.0
+        )
+        self.last_server_batch_coalesce_wait_s = float(
+            response.get("server_batch_coalesce_wait_s", 0.0) or 0.0
+        )
+        self.last_server_pipeline_wait_s = float(
+            response.get("server_pipeline_wait_s", 0.0) or 0.0
+        )
+        self.last_server_output_finalize_wait_s = float(
+            response.get("server_output_finalize_wait_s", 0.0) or 0.0
+        )
+        self.last_server_output_pipeline_used = bool(
+            response.get("server_output_pipeline_used", False)
+        )
+        self.last_server_output_ready_checked = bool(
+            response.get("server_output_ready_checked", False)
+        )
+        self.last_server_output_early_published = bool(
+            response.get("server_output_early_published", False)
+        )
+        self.last_server_total_s = float(response.get("server_total_time_s", 0.0) or 0.0)
+        self.last_server_concat_s = float(response.get("server_concat_time_s", 0.0) or 0.0)
+        self.last_server_h2d_s = float(response.get("server_h2d_time_s", 0.0) or 0.0)
+        self.last_server_forward_s = float(response.get("server_forward_time_s", 0.0) or 0.0)
+        self.last_server_d2h_s = float(response.get("server_d2h_time_s", 0.0) or 0.0)
+        self.last_server_send_s = float(response.get("server_send_time_s", 0.0) or 0.0)
+        self.last_shared_bytes_avoided = int(response.get("shared_bytes_avoided", 0) or 0)
+        self.last_cache_queries = int(response.get("cache_queries", 0) or 0)
+        self.last_cache_bypassed_positions = int(
+            response.get("cache_bypassed_positions", 0) or 0
+        )
+        self.last_cache_hits = int(response.get("cache_hits", 0) or 0)
+        self.last_dedup_hits = int(response.get("dedup_hits", 0) or 0)
+        self.last_cache_suspensions = int(response.get("cache_suspensions", 0) or 0)
+        self.last_cache_reactivations = int(response.get("cache_reactivations", 0) or 0)
+        self.last_nn_evaluated_positions = int(response.get("nn_evaluated_positions", 0) or 0)
+        self.last_server_cache_lookup_s = float(response.get("server_cache_lookup_s", 0.0) or 0.0)
+        self.last_server_staging_copy_s = float(response.get("server_staging_copy_s", 0.0) or 0.0)
+        self.last_gpu_batch_fill = float(response.get("gpu_batch_fill", 0.0) or 0.0)
+        if self.debug_enabled and not self._printed_first_response:
+            self._printed_first_response = True
+            print(
+                f"[{self._ts()}] Central inference: worker {self.worker_rank} received first "
+                f"{self.model_label} response (server_batch={self.last_server_batch_size}).",
+                flush=True,
+            )
+        if bool(response.get("shared_memory", False)):
+            response_slot = int(response.get("shared_slot", shared_slot if shared_slot is not None else 0))
+            expected_token = int(response.get("shared_token", 0) or 0)
+            actual_token = int(self._shared_arrays["response_tokens"][response_slot])
+            if expected_token <= 0 or actual_token != expected_token:
+                raise RuntimeError(
+                    "Central inference shared-memory response token mismatch."
+                )
+            response_batch = int(response.get("batch_size", batch_size))
+            policy_cols = int(response.get("policy_cols", legal_cols))
+            policy_np = self._shared_arrays[
+                "policy_logits"
+            ][response_slot, :response_batch, :policy_cols].copy()
+            value_np = self._shared_arrays[
+                "value_logits"
+            ][response_slot, :response_batch, :3].copy()
+            policy = torch.from_numpy(policy_np)
+            value = torch.from_numpy(value_np)
+        else:
+            policy_dtype = np.float16 if self.last_response_compact_policy else np.float32
+            policy = torch.from_numpy(np.asarray(response["policy_logits"], dtype=policy_dtype))
+            value = torch.from_numpy(np.asarray(response["value_logits"], dtype=np.float32))
+        return policy, value
 
 
 def _central_inference_option(config, key, default=None):
@@ -1790,7 +2192,6 @@ def central_inference_server(
             if (
                 compute_hashes
                 and compact_policy
-                and native_server_kernels is not None
                 and not path_dependent_input
             ):
                 native_hashes = np.empty((total_n, 2), dtype=np.uint64)
@@ -2112,7 +2513,6 @@ def central_inference_server(
                 ) == 'planes_history_v2'
                 if (
                     native_hashes is None
-                    and native_server_kernels is not None
                     and not path_dependent_input
                 ):
                     native_hashes = native_hash_scratch[:total_n]

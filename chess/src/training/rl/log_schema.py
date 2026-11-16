@@ -8,9 +8,11 @@ import csv
 # Version 63 is already present in historical dirty RL81 CSVs with a
 # different column layout. Version 64 added independent promotion confirmation.
 # Version 69 records V10's deployment/BN head losses and soft-policy signal.
-# History import maps rows by column name; these new fields stay blank for old
-# rows, while V9 batches emit zero-valued branch metrics.
-RL_LOG_SCHEMA_VERSION = 69
+# Version 72 reports reanalysis selection age/surprise and removes the retired
+# correction-mixture fields. History import maps rows by column name.
+# Version 73 records actual effective reanalysis simulations per updated row.
+# Version 74 distinguishes budget-filtered policy rows from all legal targets.
+RL_LOG_SCHEMA_VERSION = 74
 
 
 # One row per training iteration. This is the promotion/strength dashboard source,
@@ -29,8 +31,13 @@ RL_MAIN_COLUMNS = (
     "policy_correction_loss", "policy_correction_rank_loss",
     "policy_correction_rank_weight", "policy_correction_rank_objective",
     "policy_correction_rank_contribution", "policy_correction_rank_to_ce_ratio",
+    "policy_surprise_weight", "policy_surprise_effective_weight",
+    "policy_surprise_active_step_fraction", "policy_surprise_coverage",
+    "policy_surprise_mean_kl", "policy_surprise_max_weight_multiplier",
     "policy_correction_top1_acc",
     "policy_correction_fraction", "policy_correction_weight_share",
+    "policy_positive_weight_fraction",
+    "policy_correction_positive_weight_fraction",
     "correction_audit_rows", "correction_audit_candidate_rows",
     "correction_audit_eligible_rows", "correction_audit_correction_fraction",
     "correction_audit_coverage", "correction_audit_q_delta_mean",
@@ -185,6 +192,10 @@ RL_DATA_QUALITY_COLUMNS = (
     "selfplay_value_std", "selfplay_adjudicated_games", "selfplay_syzygy_ended_games",
     "selfplay_resigned_games", "selfplay_syzygy_probe_hits",
     "selfplay_syzygy_probe_hit_rate", "selfplay_replay_storage_keep_rate",
+    "selfplay_teacher_cap_selected_policy_kld_mean",
+    "selfplay_teacher_cap_dropped_policy_kld_mean",
+    "selfplay_teacher_cap_selected_policy_kld_count",
+    "selfplay_teacher_cap_dropped_policy_kld_count",
     "selfplay_hard_start_games", "selfplay_hard_start_fraction",
     "selfplay_normal_start_games", "selfplay_normal_start_no_prefix_games",
     "selfplay_opening_prefix_sampled_games", "selfplay_opening_prefix_applied_games",
@@ -203,7 +214,12 @@ RL_DATA_QUALITY_COLUMNS = (
     "search_control_start_fraction", "search_control_regret_mean",
     "search_control_regret_p10", "search_control_regret_p50", "search_control_regret_p90",
     "search_control_sampled_regret_mean", "search_control_sampled_regret_p90",
-    "reanalyse_selected", "reanalyse_updated", "reanalyse_correction_fraction",
+    "reanalyse_selected", "reanalyse_updated", "reanalyse_skipped",
+    "reanalyse_correction_fraction",
+    "reanalyse_eligible_rows", "reanalyse_selected_target_age_mean",
+    "reanalyse_selected_actor_kl_mean", "reanalyse_selected_actor_kl_coverage",
+    "reanalyse_simulations_mean", "reanalyse_simulations_min",
+    "reanalyse_simulations_max",
     "opponent_current_planned_share", "opponent_current_actual_share",
     "opponent_current_games", "opponent_current_score_rate",
     "opponent_best_planned_share", "opponent_best_actual_share",
@@ -211,6 +227,7 @@ RL_DATA_QUALITY_COLUMNS = (
     "opponent_count_error",
     "opponent_promotion_transition_progress",
     "mcts_avg_sims", "mcts_fresh_sims", "mcts_inherited_visit_credit",
+    "mcts_search_samples",
     "mcts_avg_budget",
     "mcts_budget_quality_samples", "mcts_budget_quality_coverage",
     "mcts_budget_quality_levels_json",
@@ -296,12 +313,9 @@ RL_PERFORMANCE_COLUMNS = (
     "mcts_native_tree_expand_sync_time_s", "mcts_native_tree_backup_time_s",
     "mcts_native_tree_import_time_s", "mcts_native_tree_sync_time_s",
     "mcts_native_tree_selection_batches", "mcts_native_tree_backup_batches",
-    "mcts_native_tree_selected_leaves", "mcts_python_tree_selected_leaves",
-    "mcts_native_tree_selection_rate", "mcts_native_tree_import_nodes",
-    "mcts_native_tree_import_edges", "mcts_native_tree_fallbacks",
-    "mcts_search_metadata_time_s", "mcts_native_root_selection_calls", "mcts_python_root_selection_calls",
-    "mcts_native_root_selection_rate", "mcts_native_completed_q_calls",
-    "mcts_python_completed_q_calls", "mcts_native_completed_q_rate",
+    "mcts_native_tree_selected_leaves", "mcts_native_tree_import_nodes",
+    "mcts_native_tree_import_edges", "mcts_search_metadata_time_s",
+    "mcts_native_completed_q_calls",
     "mcts_batch_expand_dedup_time_s", "mcts_batch_expand_eval_time_s",
     "mcts_batch_expand_eval_calls", "mcts_board_materialize_time_s", "mcts_terminal_checks_time_s",
     "mcts_board_to_tensor_time_s",

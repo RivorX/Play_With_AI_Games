@@ -1,4 +1,4 @@
-"""Optional native CPU kernels for the Python MCTS tree.
+"""Required native CPU kernels for MCTS and inference hashing.
 
 The extension deliberately uses a small C ABI instead of the PyTorch C++ ABI:
 the hot data already lives in NumPy arrays, and a standalone DLL avoids a
@@ -23,13 +23,7 @@ from filelock import FileLock
 
 _API_VERSION = 17
 _INSTANCE = None
-_LOAD_ATTEMPTED = False
 _INSTANCE_LOCK = threading.Lock()
-
-
-def _enabled_by_environment() -> bool:
-    value = str(os.environ.get("CHESS_NATIVE_MCTS", "1")).strip().lower()
-    return value not in {"0", "false", "no", "off"}
 
 
 def _source_path() -> Path:
@@ -42,6 +36,7 @@ def _find_compiler() -> str | None:
         resolved = shutil.which(override)
         if resolved:
             return resolved
+        raise RuntimeError(f"CHESS_CXX compiler was not found: {override}")
     for candidate in ("g++", "clang++"):
         resolved = shutil.which(candidate)
         if resolved:
@@ -1055,16 +1050,20 @@ class NativeMCTSForest:
             if int(offsets[-1]) > 0
             else np.empty(0, dtype=np.float32)
         )
-        status = self._lib.mcts_forest_expand_batch(
-            self._context,
-            _pointer(node_ids_array),
-            _pointer(offsets),
-            _pointer(flat_priors),
-            _pointer(raw_values),
-            int(node_ids_array.size),
-        )
+        try:
+            status = self._lib.mcts_forest_expand_batch(
+                self._context,
+                _pointer(node_ids_array),
+                _pointer(offsets),
+                _pointer(flat_priors),
+                _pointer(raw_values),
+                int(node_ids_array.size),
+            )
+        except OSError as error:
+            self._poison_and_discard(error)
+            raise
         if status < 0:
-            raise RuntimeError(f"mcts_forest_expand_batch failed with status {status}")
+            self._raise_native_failure("mcts_forest_expand_batch", status)
         self._native_expanded.update(node_ids)
 
     def backup_batch(self, selection_ids, values) -> None:
@@ -1072,14 +1071,18 @@ class NativeMCTSForest:
         values = np.ascontiguousarray(values, dtype=np.float64)
         if selection_ids.size != values.size:
             raise ValueError("native backup batch size mismatch")
-        status = self._lib.mcts_forest_backup_batch(
-            self._context,
-            _pointer(selection_ids),
-            _pointer(values),
-            int(values.size),
-        )
+        try:
+            status = self._lib.mcts_forest_backup_batch(
+                self._context,
+                _pointer(selection_ids),
+                _pointer(values),
+                int(values.size),
+            )
+        except OSError as error:
+            self._poison_and_discard(error)
+            raise
         if status != 0:
-            raise RuntimeError(f"mcts_forest_backup_batch failed with status {status}")
+            self._raise_native_failure("mcts_forest_backup_batch", status)
 
     def sync_node(self, node, sync_root_stats=True) -> None:
         node_id = self._node_ids[id(node)]
@@ -1087,20 +1090,24 @@ class NativeMCTSForest:
         root_visits = ctypes.c_int32()
         root_value_sum = ctypes.c_double()
         root_virtual_loss = ctypes.c_int32()
-        count = int(self._lib.mcts_forest_export_node(
-            self._context,
-            int(node_id),
-            ctypes.byref(root_visits),
-            ctypes.byref(root_value_sum),
-            ctypes.byref(root_virtual_loss),
-            _pointer(edges.visit_counts),
-            _pointer(edges.value_sums),
-            _pointer(edges.virtual_losses),
-            _pointer(edges.total_counts),
-            int(len(edges.moves)),
-        ))
+        try:
+            count = int(self._lib.mcts_forest_export_node(
+                self._context,
+                int(node_id),
+                ctypes.byref(root_visits),
+                ctypes.byref(root_value_sum),
+                ctypes.byref(root_virtual_loss),
+                _pointer(edges.visit_counts),
+                _pointer(edges.value_sums),
+                _pointer(edges.virtual_losses),
+                _pointer(edges.total_counts),
+                int(len(edges.moves)),
+            ))
+        except OSError as error:
+            self._poison_and_discard(error)
+            raise
         if count < 0:
-            raise RuntimeError(f"mcts_forest_export_node failed with status {count}")
+            self._raise_native_failure("mcts_forest_export_node", count)
         if sync_root_stats:
             node._root_visit_count = int(root_visits.value)
             node._root_value_sum = float(root_value_sum.value)
@@ -1168,29 +1175,29 @@ class NativeMCTSForest:
             edges.mark_search_stats_changed()
 
 
-def get_native_mcts() -> NativeMCTSKernels | None:
-    """Return the process-local native backend, or ``None`` on safe fallback."""
-    global _INSTANCE, _LOAD_ATTEMPTED
-    if _LOAD_ATTEMPTED:
+def get_native_mcts() -> NativeMCTSKernels:
+    """Return the process-local C++ backend or raise a clear setup error."""
+    global _INSTANCE
+    disabled = str(os.environ.get("CHESS_NATIVE_MCTS", "1")).strip().lower()
+    if disabled in {"0", "false", "no", "off"}:
+        raise RuntimeError(
+            "Native MCTS C++ is required but CHESS_NATIVE_MCTS disables it; "
+            "remove that setting to use the required backend."
+        )
+    if _INSTANCE is not None:
         return _INSTANCE
-    if not _enabled_by_environment():
-        _LOAD_ATTEMPTED = True
-        return None
     with _INSTANCE_LOCK:
-        if _LOAD_ATTEMPTED:
+        if _INSTANCE is not None:
             return _INSTANCE
         source = _source_path()
         if not source.is_file():
-            _LOAD_ATTEMPTED = True
-            return None
+            raise RuntimeError(f"native MCTS C++ source is missing: {source}")
         try:
             _INSTANCE = NativeMCTSKernels(_build_library(source, _find_compiler()))
-        except Exception:
-            # Native acceleration must never make an RL run unavailable. Tests
-            # can request a hard failure through CHESS_NATIVE_MCTS_REQUIRED=1.
-            required = str(os.environ.get("CHESS_NATIVE_MCTS_REQUIRED", "0")).lower()
-            if required in {"1", "true", "yes", "on"}:
-                raise
-            _INSTANCE = None
-        _LOAD_ATTEMPTED = True
+        except Exception as exc:
+            raise RuntimeError(
+                "Required native MCTS C++ backend could not be built or loaded. "
+                "Check that g++ or clang++ is installed and CHESS_CXX points to "
+                "a working compiler, then inspect the build error below."
+            ) from exc
         return _INSTANCE

@@ -5,6 +5,7 @@ Replay buffer for RL training.
 import numpy as np
 import torch
 
+from src.mcts.policy_budget import teacher_policy_weight_from_effective_simulations
 from src.models.data.se_cnn_v9.helpers import MAX_LEGAL_MOVES
 from src.mcts.q_delta import (
     RELIABLE_POLICY_TARGET_GAP_MIN,
@@ -17,6 +18,8 @@ _DEFAULT_MAX_POLICY_TARGETS = 256
 _REPLAY_STATE_VERSION = 3
 _UNKNOWN_SEARCH_COUNT = -1
 _MAX_SEARCH_COUNT = (1 << 31) - 1
+_COMPACT_BOARD_CODEC_V1 = "planes_history_v1"
+_COMPACT_BOARD_CODEC_V2 = "planes_history_v2"
 _REPLAY_TENSOR_FIELDS = (
     "_boards",
     "_values",
@@ -90,6 +93,54 @@ def _fen_resets_repetition_history(fen):
         return False
 
 
+def _reanalysis_priority_weights(
+    regret,
+    q_delta,
+    changed_top,
+    target_age,
+    policy_kld,
+    *,
+    min_staleness,
+):
+    """Bound replay refresh priority by regret, target age, and actor surprise.
+
+    ``policy_kld`` is stored KL(MCTS target || self-play actor prior), not a
+    current-learner difficulty estimate. Missing KL receives a neutral factor.
+    """
+    regret = np.asarray(regret, dtype=np.float64).reshape(-1)
+    q_delta = np.asarray(q_delta, dtype=np.float64).reshape(-1)
+    changed_top = np.asarray(changed_top, dtype=bool).reshape(-1)
+    target_age = np.asarray(target_age, dtype=np.float64).reshape(-1)
+    policy_kld = np.asarray(policy_kld, dtype=np.float64).reshape(-1)
+    if not (
+        regret.shape == q_delta.shape == changed_top.shape
+        == target_age.shape == policy_kld.shape
+    ):
+        raise ValueError("Reanalysis priority inputs must have matching row counts")
+
+    safe_regret = np.nan_to_num(regret, nan=0.0, posinf=0.0, neginf=0.0)
+    priority = 0.25 + np.sqrt(np.maximum(0.0, safe_regret))
+    priority *= 1.0 + np.where(
+        changed_top & np.isfinite(q_delta) & (q_delta > USEFUL_SEARCH_Q_DELTA_MIN),
+        np.clip(q_delta, 0.0, 0.50) / 0.20,
+        0.0,
+    )
+
+    safe_age = np.nan_to_num(target_age, nan=float(min_staleness))
+    age_excess = np.maximum(0.0, safe_age - float(min_staleness))
+    age_factor = 1.0 + 0.5 * np.clip(age_excess / 4.0, 0.0, 1.0)
+
+    valid_kl = np.isfinite(policy_kld) & (policy_kld >= 0.0)
+    surprise_factor = np.ones_like(priority)
+    log_surprise = np.log1p(np.maximum(policy_kld[valid_kl], 0.0))
+    reference_surprise = float(np.median(log_surprise)) if log_surprise.size else 0.0
+    if reference_surprise > 1e-8:
+        ratio = np.log1p(np.maximum(policy_kld[valid_kl], 0.0)) / reference_surprise
+        surprise_factor[valid_kl] = 0.5 + 0.5 * np.clip(ratio, 0.0, 2.0)
+
+    return priority * age_factor * surprise_factor
+
+
 class ReplayBuffer:
     """
     Replay buffer backed by preallocated tensors.
@@ -101,12 +152,14 @@ class ReplayBuffer:
         max_policy_targets=_DEFAULT_MAX_POLICY_TARGETS,
         use_fp16=False,
         compact_boards=False,
+        compact_board_codec=_COMPACT_BOARD_CODEC_V1,
         store_hard_positions=True,
     ):
         self.max_size = int(max_size)
         self.max_policy_targets = max(1, int(max_policy_targets))
         self.use_fp16 = bool(use_fp16)
         self.compact_boards = bool(compact_boards)
+        self.compact_board_codec = str(compact_board_codec or _COMPACT_BOARD_CODEC_V1)
         self.store_hard_positions = bool(store_hard_positions)
         self.decisive_value_epsilon = 0.05
         self.value_balance_epsilon = 0.05
@@ -152,6 +205,13 @@ class ReplayBuffer:
         self.current_iteration = 0
         self.last_sample_age_stats = {}
         self.last_sample_ages = np.empty(0, dtype=np.float32)
+        self.last_reanalysis_selection_stats = {
+            "eligible_rows": 0,
+            "selected_rows": 0,
+            "selected_target_age_mean": 0.0,
+            "selected_actor_kl_mean": 0.0,
+            "selected_actor_kl_coverage": 0.0,
+        }
         self.total_overwritten_positions = 0
         self.total_resize_dropped_positions = 0
 
@@ -175,13 +235,24 @@ class ReplayBuffer:
             board = torch.as_tensor(board)
 
         board_shape = tuple(board.shape)
-        if self.compact_boards and (
-            len(board_shape) != 3 or int(board_shape[0]) % 16 != 0
-        ):
-            raise ValueError(
-                "Compact replay boards require [16*k, 8, 8] encoder planes, "
-                f"got {board_shape}."
-            )
+        if self.compact_boards:
+            if len(board_shape) != 3:
+                raise ValueError(
+                    "Compact replay boards require [planes, 8, 8] tensors, "
+                    f"got {board_shape}."
+                )
+            channels = int(board_shape[0])
+            if self.compact_board_codec == _COMPACT_BOARD_CODEC_V1:
+                supported = channels >= 16 and channels % 16 == 0
+            elif self.compact_board_codec == _COMPACT_BOARD_CODEC_V2:
+                supported = channels >= 20 and (channels - 7) % 13 == 0
+            else:
+                supported = False
+            if not supported:
+                raise ValueError(
+                    f"Compact replay codec {self.compact_board_codec!r} does not "
+                    f"support board shape {board_shape}."
+                )
         board_dtype = torch.uint8 if self.compact_boards else (
             torch.float16 if self.use_fp16 else torch.float32
         )
@@ -259,6 +330,51 @@ class ReplayBuffer:
             return
         destination.copy_(source)
         channels = int(destination.shape[-3])
+        if self.compact_board_codec == _COMPACT_BOARD_CODEC_V2:
+            history_positions = (channels - 7) // 13 - 1
+            for frame in range(history_positions + 1):
+                repetition_channel = frame * 13 + 12
+                repetitions = source[..., repetition_channel, :, :].float()
+                valid_repetitions = (
+                    (repetitions == -1.0)
+                    | (repetitions == 0.0)
+                    | (repetitions == 0.5)
+                    | (repetitions == 1.0)
+                )
+                if not bool(valid_repetitions.all().item()):
+                    raise ValueError(
+                        "Compact planes_history_v2 replay requires repetition "
+                        "planes encoded as -1, 0, 0.5, or 1."
+                    )
+                codes = torch.where(
+                    repetitions < 0.0,
+                    torch.zeros_like(repetitions),
+                    torch.round(repetitions * 2.0) + 2.0,
+                )
+                destination[..., repetition_channel, :, :].copy_(
+                    codes.to(dtype=torch.uint8)
+                )
+
+            halfmove_channel = 13 * (history_positions + 1) + 5
+            halfmove = source[..., halfmove_channel, :, :].float()
+            scaled_halfmove = halfmove * 150.0
+            rounded_halfmove = torch.round(scaled_halfmove)
+            valid_halfmove = (
+                torch.isfinite(scaled_halfmove)
+                & (scaled_halfmove >= 0.0)
+                & (scaled_halfmove <= 150.0)
+                & ((scaled_halfmove - rounded_halfmove).abs() <= 0.05)
+            )
+            if not bool(valid_halfmove.all().item()):
+                raise ValueError(
+                    "Compact planes_history_v2 replay requires halfmove-clock "
+                    "metadata normalized from integer clocks in [0, 150]."
+                )
+            destination[..., halfmove_channel, :, :].copy_(
+                rounded_halfmove.clamp_(0.0, 150.0).to(dtype=torch.uint8)
+            )
+            return
+
         for offset in range(0, channels, 16):
             destination[..., offset + 14, :, :].copy_(
                 torch.round(source[..., offset + 14, :, :].float() * 50.0)
@@ -282,6 +398,14 @@ class ReplayBuffer:
         if not self.compact_boards:
             return
         channels = int(destination.shape[-3])
+        if self.compact_board_codec == _COMPACT_BOARD_CODEC_V2:
+            history_positions = (channels - 7) // 13 - 1
+            for frame in range(history_positions + 1):
+                repetition_channel = frame * 13 + 12
+                destination[..., repetition_channel, :, :].mul_(0.5).sub_(1.0)
+            halfmove_channel = 13 * (history_positions + 1) + 5
+            destination[..., halfmove_channel, :, :].div_(150.0)
+            return
         for offset in range(0, channels, 16):
             destination[..., offset + 14, :, :].div_(50.0)
             destination[..., offset + 15, :, :].div_(100.0)
@@ -305,6 +429,7 @@ class ReplayBuffer:
             "max_policy_targets": int(self.max_policy_targets),
             "use_fp16": bool(self.use_fp16),
             "compact_boards": bool(self.compact_boards),
+            "compact_board_codec": self.compact_board_codec,
             "store_hard_positions": bool(self.store_hard_positions),
             "size": int(self.size),
             "position": int(self.position),
@@ -400,6 +525,10 @@ class ReplayBuffer:
         )
         self.use_fp16 = bool(state.get("use_fp16", self.use_fp16))
         self.compact_boards = bool(state.get("compact_boards", self.compact_boards))
+        self.compact_board_codec = str(
+            state.get("compact_board_codec", self.compact_board_codec)
+            or _COMPACT_BOARD_CODEC_V1
+        )
         self.size = size
         self.position = int(state.get("position", 0) or 0) % self.max_size
         self.current_iteration = max(0, int(state.get("current_iteration", 0) or 0))
@@ -1182,7 +1311,10 @@ class ReplayBuffer:
             chunk = indices[start:start + chunk_size]
             idx = torch.as_tensor(chunk, dtype=torch.long)
             copied_boards = self._boards[idx]
-            if self.compact_boards and not target.compact_boards:
+            if self.compact_boards and (
+                not target.compact_boards
+                or self.compact_board_codec != target.compact_board_codec
+            ):
                 copied_boards = torch.empty(
                     copied_boards.shape,
                     dtype=torch.float16 if self.use_fp16 else torch.float32,
@@ -1340,11 +1472,66 @@ class ReplayBuffer:
             return []
         result = []
         for idx in np.asarray(indices, dtype=np.int64).tolist():
-            result.append({
+            item = {
                 "fen": self._fens[int(idx)],
                 "history_fens": list(self._history_fens[int(idx)] or ()),
                 "importance": float(self._importance[int(idx)].item()),
-            })
+                "search_visits": int(self._search_visits[int(idx)].item()),
+                "search_budget_assigned": int(
+                    self._search_budget_assigned[int(idx)].item()
+                ),
+                "search_simulations_effective": int(
+                    self._search_simulations_effective[int(idx)].item()
+                ),
+                "search_simulations_fresh": int(
+                    self._search_simulations_fresh[int(idx)].item()
+                ),
+            }
+            if (
+                self.compact_board_codec == _COMPACT_BOARD_CODEC_V2
+                and self._boards is not None
+            ):
+                channels = int(self._boards.shape[-3])
+                history_positions = (channels - 7) // 13 - 1
+                history_count = min(
+                    history_positions,
+                    len(item["history_fens"]),
+                )
+                first_frame = history_positions - history_count
+
+                def repetition_count_for_frame(frame):
+                    channel = frame * 13 + 12
+                    value = self._boards[int(idx), channel, 0, 0]
+                    if self.compact_boards:
+                        code = int(value.item())
+                        if code == 0:
+                            return None
+                        if code in (2, 3, 4):
+                            return code - 2
+                        raise ValueError(
+                            f"Invalid compact v2 repetition code {code} in replay row {idx}."
+                        )
+                    normalized = float(value.item())
+                    if normalized < 0.0:
+                        return None
+                    repetitions = int(round(normalized * 2.0))
+                    if (
+                        repetitions not in (0, 1, 2)
+                        or abs(normalized * 2.0 - repetitions) > 1e-3
+                    ):
+                        raise ValueError(
+                            f"Invalid v2 repetition plane value {normalized} in replay row {idx}."
+                        )
+                    return repetitions
+
+                item["history_repetition_counts"] = [
+                    repetition_count_for_frame(frame)
+                    for frame in range(first_frame, history_positions)
+                ]
+                item["repetition_count"] = repetition_count_for_frame(
+                    history_positions
+                )
+            result.append(item)
         return result
 
     def search_control_candidates(self, iteration):
@@ -1411,6 +1598,13 @@ class ReplayBuffer:
     ):
         """Select old, reconstructable targets once per generation."""
         if self.size <= 0 or not self.store_hard_positions or not self._fens:
+            self.last_reanalysis_selection_stats = {
+                "eligible_rows": 0,
+                "selected_rows": 0,
+                "selected_target_age_mean": 0.0,
+                "selected_actor_kl_mean": 0.0,
+                "selected_actor_kl_coverage": 0.0,
+            }
             return np.empty(0, dtype=np.int64)
         current = int(self.current_iteration)
         eligible = []
@@ -1428,25 +1622,162 @@ class ReplayBuffer:
             eligible.append(idx)
         eligible = np.asarray(eligible, dtype=np.int64)
         if eligible.size <= 0:
+            self.last_reanalysis_selection_stats = {
+                "eligible_rows": 0,
+                "selected_rows": 0,
+                "selected_target_age_mean": 0.0,
+                "selected_actor_kl_mean": 0.0,
+                "selected_actor_kl_coverage": 0.0,
+            }
             return eligible
         count = min(max(0, int(sample_size)), int(eligible.size))
         if count <= 0:
+            self.last_reanalysis_selection_stats = {
+                "eligible_rows": int(eligible.size),
+                "selected_rows": 0,
+                "selected_target_age_mean": 0.0,
+                "selected_actor_kl_mean": 0.0,
+                "selected_actor_kl_coverage": 0.0,
+            }
             return np.empty(0, dtype=np.int64)
         idx = torch.as_tensor(eligible, dtype=torch.long)
         regret = self._regret_targets[idx].float().cpu().numpy()
         q_delta = self._search_q_deltas[idx].float().cpu().numpy()
         changed = self._search_changed_top[idx].cpu().numpy()
-        priority = 0.25 + np.sqrt(np.maximum(0.0, np.nan_to_num(regret, nan=0.0)))
-        priority *= 1.0 + np.where(
-            changed & np.isfinite(q_delta) & (q_delta > USEFUL_SEARCH_Q_DELTA_MIN),
-            np.clip(q_delta, 0.0, 0.50) / 0.20,
-            0.0,
+        target_age = current - self._policy_target_iterations[idx].cpu().numpy()
+        policy_kld = self._policy_kld_targets[idx].float().cpu().numpy()
+        priority = _reanalysis_priority_weights(
+            regret,
+            q_delta,
+            changed,
+            target_age,
+            policy_kld,
+            min_staleness=min_staleness,
         )
         priority /= max(1e-12, float(priority.sum()))
         rng = np.random.default_rng(int(seed))
-        return np.sort(rng.choice(eligible, count, replace=False, p=priority)).astype(np.int64)
+        selected = np.sort(
+            rng.choice(eligible, count, replace=False, p=priority)
+        ).astype(np.int64)
+        selected_age = current - self._policy_target_iterations[
+            torch.as_tensor(selected, dtype=torch.long)
+        ].cpu().numpy()
+        selected_kl = self._policy_kld_targets[
+            torch.as_tensor(selected, dtype=torch.long)
+        ].float().cpu().numpy()
+        finite_kl = np.isfinite(selected_kl) & (selected_kl >= 0.0)
+        self.last_reanalysis_selection_stats = {
+            "eligible_rows": int(eligible.size),
+            "selected_rows": int(selected.size),
+            "selected_target_age_mean": float(np.mean(selected_age)) if selected_age.size else 0.0,
+            "selected_actor_kl_mean": (
+                float(np.mean(selected_kl[finite_kl])) if finite_kl.any() else 0.0
+            ),
+            "selected_actor_kl_coverage": (
+                float(np.count_nonzero(finite_kl)) / float(selected.size)
+                if selected.size else 0.0
+            ),
+        }
+        return selected
 
-    def apply_reanalysis(self, indices, policy_targets, metadata_rows, *, target_iteration):
+    def reweight_policy_targets_from_budget(
+        self,
+        *,
+        nominal_simulations,
+        min_budget_ratio,
+    ):
+        """Idempotently apply completed-search policy weights to replay rows.
+
+        Rows already ineligible for policy learning stay at zero until a valid
+        reanalysis replaces their target. Unknown budget provenance preserves
+        the current weight. Value/outcome weights are never changed here.
+        """
+        size = int(self.size)
+        if size <= 0 or self._policy_sample_weights is None:
+            return {
+                'reweighted': 0,
+                'masked': 0,
+                'q_masked': 0,
+                'unknown': 0,
+            }
+
+        policy_weights = self._policy_sample_weights[:size]
+        current_weights = policy_weights.tolist()
+        effective = self._search_simulations_effective[:size].tolist()
+        fresh = self._search_simulations_fresh[:size].tolist()
+        visits = self._search_visits[:size].tolist()
+        reweighted = masked = q_masked = unknown = 0
+        for idx, current_weight in enumerate(current_weights):
+            if not np.isfinite(float(current_weight)):
+                continue
+            actual = None
+            for candidate in (effective[idx], fresh[idx]):
+                try:
+                    candidate = int(candidate)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if candidate >= 0:
+                    actual = candidate
+                    break
+            if actual is None:
+                try:
+                    legacy_visits = int(visits[idx])
+                except (TypeError, ValueError, OverflowError):
+                    legacy_visits = 0
+                if legacy_visits > 0:
+                    actual = legacy_visits
+            new_weight = teacher_policy_weight_from_effective_simulations(
+                actual,
+                nominal_simulations=nominal_simulations,
+                min_budget_ratio=min_budget_ratio,
+            )
+            if new_weight is None:
+                unknown += 1
+                continue
+            if new_weight <= 0.0:
+                if current_weight > 0.0:
+                    policy_weights[idx] = 0.0
+                    masked += 1
+                has_searched_q = any(
+                    bool(torch.isfinite(values[idx]).any())
+                    for values in (
+                        self._root_q_targets,
+                        self._best_q_targets,
+                        self._played_q_targets,
+                        self._orig_q_targets,
+                        self._search_q_deltas,
+                    )
+                ) or bool(self._search_changed_top[idx])
+                if has_searched_q:
+                    self._root_q_targets[idx].fill_(float('nan'))
+                    self._best_q_targets[idx].fill_(float('nan'))
+                    self._played_q_targets[idx].fill_(float('nan'))
+                    self._orig_q_targets[idx].fill_(float('nan'))
+                    self._search_q_deltas[idx] = float('nan')
+                    self._search_changed_top[idx] = False
+                    q_masked += 1
+            elif current_weight > 0.0:
+                policy_weights[idx] = float(new_weight)
+                reweighted += 1
+
+        return {
+            'reweighted': int(reweighted),
+            'masked': int(masked),
+            'q_masked': int(q_masked),
+            'unknown': int(unknown),
+        }
+
+    def apply_reanalysis(
+        self,
+        indices,
+        policy_targets,
+        metadata_rows,
+        *,
+        target_iteration,
+        policy_budget_weighting_enabled=False,
+        nominal_simulations=192,
+        min_budget_ratio=0.60,
+    ):
         """Atomically replace search-derived fields while preserving game outcomes."""
         indices = np.asarray(indices, dtype=np.int64).reshape(-1)
         if len(set(indices.tolist())) != int(indices.size):
@@ -1474,23 +1805,62 @@ class ReplayBuffer:
             legal = set(int(value) for value in self._legal_indices[idx, :legal_count].tolist())
             if any(int(value) not in legal for value in policy_indices.tolist()):
                 raise ValueError("Reanalysis policy contains an illegal action index.")
-            prepared.append((idx, policy_indices, policy_values / mass, dict(metadata or {})))
+            metadata = dict(metadata or {})
+            prior_policy_weight = float(self._policy_sample_weights[idx].item())
+            if policy_budget_weighting_enabled:
+                actual_simulations = metadata.get('simulations_used')
+                if actual_simulations is None:
+                    actual_simulations = metadata.get('fresh_simulations_used')
+                if actual_simulations is None:
+                    actual_simulations = metadata.get('search_visits')
+                policy_weight = teacher_policy_weight_from_effective_simulations(
+                    actual_simulations,
+                    nominal_simulations=nominal_simulations,
+                    min_budget_ratio=min_budget_ratio,
+                )
+                if policy_weight is None:
+                    policy_weight = prior_policy_weight
+            else:
+                policy_weight = 1.0
+            prepared.append((
+                idx,
+                policy_indices,
+                policy_values / mass,
+                metadata,
+                float(policy_weight),
+            ))
 
-        for idx, policy_indices, policy_values, metadata in prepared:
+        for idx, policy_indices, policy_values, metadata, policy_weight in prepared:
             count = int(policy_indices.numel())
             self._policy_indices[idx].fill_(-1)
             self._policy_values[idx].zero_()
             self._policy_indices[idx, :count].copy_(policy_indices)
             self._policy_values[idx, :count].copy_(policy_values.to(self._policy_values.dtype))
             self._policy_lengths[idx] = count
-            self._policy_sample_weights[idx] = 1.0
-            self._root_q_targets[idx] = float(metadata.get("root_q", float("nan")))
-            self._best_q_targets[idx] = float(metadata.get("best_q", float("nan")))
+            self._policy_sample_weights[idx] = float(policy_weight)
+            weak_teacher_target = float(policy_weight) <= 0.0
+            self._root_q_targets[idx] = (
+                float("nan") if weak_teacher_target
+                else float(metadata.get("root_q", float("nan")))
+            )
+            self._best_q_targets[idx] = (
+                float("nan") if weak_teacher_target
+                else float(metadata.get("best_q", float("nan")))
+            )
             self._played_q_targets[idx] = float("nan")
-            self._orig_q_targets[idx] = float(metadata.get("orig_q", float("nan")))
+            self._orig_q_targets[idx] = (
+                float("nan") if weak_teacher_target
+                else float(metadata.get("orig_q", float("nan")))
+            )
             self._policy_kld_targets[idx] = float(metadata.get("policy_kld", float("nan")))
-            self._search_changed_top[idx] = bool(metadata.get("search_changed_top", False))
-            self._search_q_deltas[idx] = float(metadata.get("search_q_delta", float("nan")))
+            self._search_changed_top[idx] = (
+                False if weak_teacher_target
+                else bool(metadata.get("search_changed_top", False))
+            )
+            self._search_q_deltas[idx] = (
+                float("nan") if weak_teacher_target
+                else float(metadata.get("search_q_delta", float("nan")))
+            )
             self._search_visits[idx] = max(0, int(metadata.get("search_visits", 0)))
             # A reanalyzed policy supersedes the old search target. When the
             # producer lacks explicit accounting, clear provenance to unknown

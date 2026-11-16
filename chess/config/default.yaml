@@ -54,9 +54,8 @@ reinforcement_learning:
     version: "rl83"
     iterations: 100
     games_per_iteration: 1000
-    # New quality experiments start from the canonical IL best with
-    # empty replay. The normal startup menu remains available so resume/transfer
-    # can be selected explicitly when this is not the controlled comparison.
+    # Start each RL comparison from the canonical IL best with empty replay.
+    # Select RESUME explicitly in the startup menu to continue an existing run.
     fresh_il_start: true
 
   # Game generation. Runtime mechanics use tested internal defaults.
@@ -85,6 +84,13 @@ reinforcement_learning:
     # Startup and training must use existing local tables only. Downloads are
     # available through the explicit Syzygy download tool.
     syzygy_auto_download_enabled: false
+    # Policy confidence uses completed effective simulations against the
+    # nominal 192-simulation teacher budget.
+    teacher_policy_budget_weighting_enabled: true
+    teacher_policy_min_budget_ratio: 0.60
+    # Keep one half of each game's replay cap for rows with high teacher KL.
+    # Policy loss remains uniform so the same KL signal is not weighted twice.
+    cap_kl_weighted_fraction: 0.50
 
   # Optimizer and the few regularizers worth tuning between runs.
   training:
@@ -120,9 +126,21 @@ reinforcement_learning:
     augment_prob: 0.50            # Applied only where horizontal symmetry is exact
 
   # Uniform FIFO training replay. A bounded regret archive controls 20% of game
-  # starts, while a small periodic current-model search refreshes stale targets.
+  # starts, while a bounded current-model search refreshes stale targets with
+  # at least their recorded prior search effort.
   replay:
     buffer_multiplier: 3.2
+    reanalyse_enabled: true
+    reanalyse_interval: 1
+    reanalyse_fraction: 0.005
+    reanalyse_max_positions: 512
+    reanalyse_min_age: 2
+    reanalyse_min_staleness: 2
+    reanalyse_max_refreshes: 2
+    # Minimum refresh budget; each row is raised to at least its recorded prior
+    # assigned/effective/fresh search effort when that metadata is available.
+    reanalyse_simulations: 192
+    reanalyse_batch_positions: 16
 
   # Model comparison and promotion. Technical worker/opening settings are fixed.
   evaluation:
@@ -130,18 +148,18 @@ reinforcement_learning:
     # Promotion evaluation is exact: both models receive 192 fresh root
     # simulations on 96 unique colour-paired opening positions, without
     # self-play redistribution or easy-root cuts.
-    # Raw-policy matches are periodic diagnostics; every MCTS promotion
-    # candidate still gets a fresh same-iteration raw match on demand.
+    # Raw-policy matches are periodic diagnostics and never gate promotion.
     # This gate does not choose the self-play actor: a safe learner-MCTS actor
     # may still generate data.
     eval_no_mcts_every: 4
     eval_no_mcts_games: 96
-    promotion_no_mcts_gate_enabled: true
-    # The one-sided raw-NN lower bound must reach 48% against best.
-    # Uncertain candidates may use the existing single 96->192 game retest.
+    # Deprecated compatibility flag. Raw NN is diagnostic and cannot gate promotion.
+    promotion_no_mcts_gate_enabled: false
     promotion_no_mcts_score_rate_min: 0.48
 
-    # Early rejection uses the paired-score upper bound (z=1.28), not point score.
+    # Early rejection uses paired-score upper bounds with the nominal one-sided
+    # z=1.28 error budget divided across the rejecting looks actually planned.
+    # A two-look funnel uses z≈1.64 at each look; one look keeps z=1.28.
     # A plausible selector candidate reaches 192 games on 96 unique opening pairs.
     # It must then pass a second, independent 96-opening confirmation arena.
     eval_funnel_preliminary_games: 48
@@ -152,11 +170,11 @@ reinforcement_learning:
 
     # MCTS-first promotion: the candidate must score at least 53%, and the
     # one-sided 95% paired-opening confidence bound must remain above parity.
-    # NN-only safety also gates promotion; the legacy IL-anchor path is disabled.
+    # Candidate promotion is based on MCTS and independent MCTS confirmation.
     score_rate_threshold: 0.53
     promotion_stat_gate_z: 1.645
     promotion_score_lower_bound_min: 0.50
-    # After the selector and raw-NN gates pass, promotion requires an
+    # After the MCTS selector passes, promotion requires an
     # independent 96-opening confirmation arena at the same MCTS budget.
     promotion_confirmation_games: 192
     promotion_confirmation_openings: 96
@@ -185,6 +203,9 @@ reinforcement_learning:
   # the paired benchmark showed that pure Q and WDL/Q blending weakened play.
   losses:
     policy: 1.0
+    # Optional loss-side KL attention. Default zero because cap retention uses
+    # the same teacher KL for replay selection; enable only as an alternative.
+    policy_surprise_weight: 0.0
     value: 1.00
     # Match the canonical IL value contract: WDL CE preserves draw calibration,
     # while a small robust loss directly trains the W-L scalar used by MCTS.

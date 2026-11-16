@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import math
-from numbers import Real
+from numbers import Integral, Real
 
 
 def _with_defaults(defaults, values):
@@ -276,6 +276,9 @@ _RL_SECTION_PREFIXES = {
 _RL_KEY_ALIASES = {
     'self_play.max_batch_games_per_worker': 'max_batch_games_per_worker',
     'search.search_efficiency_feedback_enabled': 'mcts_search_efficiency_feedback_enabled',
+    'self_play.teacher_policy_budget_weighting_enabled': 'self_play_teacher_policy_budget_weighting_enabled',
+    'self_play.teacher_policy_min_budget_ratio': 'self_play_teacher_policy_min_budget_ratio',
+    'self_play.cap_kl_weighted_fraction': 'self_play_cap_kl_weighted_fraction',
     'self_play.syzygy_paths': 'syzygy_paths',
     'self_play.syzygy_auto_download_enabled': 'syzygy_auto_download_enabled',
     'losses.policy': 'policy_loss_weight',
@@ -284,12 +287,15 @@ _RL_KEY_ALIASES = {
     'losses.value_search_consistency': 'value_search_consistency_loss_weight',
     'losses.moves_left': 'moves_left_loss_weight',
     'losses.search_q': 'search_q_loss_weight',
+    'losses.policy_surprise_weight': 'policy_surprise_weight',
 }
 
 
-# Stable implementation choices intentionally hidden from YAML. They keep the
-# staged presentation small while preserving the exact current RL behavior.
+# Stable implementation defaults. Public loss settings are also declared in
+# the grouped YAML and normalized here for flat/legacy configs.
 _RL_DEFAULTS = {
+    # Optional loss-side KL attention is disabled when cap retention already uses KL.
+    'policy_surprise_weight': 0.0,
     # Self-play/search runtime.
     'self_play_worker_cap_multiplier': 1.7, 'self_play_torch_threads': 1,
     'self_play_history_fp16': True, 'self_play_central_inference_enabled': True,
@@ -300,6 +306,9 @@ _RL_DEFAULTS = {
     'syzygy_auto_download_enabled': False, 'self_play_progress_interval_games': 5,
     'self_play_opening_diversity_enabled': True,
     'self_play_opening_pool_path': None, 'self_play_opening_pool_sha256': None,
+    'self_play_teacher_policy_budget_weighting_enabled': False,
+    'self_play_teacher_policy_min_budget_ratio': 0.60,
+    'self_play_cap_kl_weighted_fraction': 0.0,
     # A bounded archive-start share improves value-target independence without
     # replacing the normal initial-position distribution.
     'self_play_hard_start_fraction': 0.20, 'self_play_hard_start_min_age': 1,
@@ -309,10 +318,9 @@ _RL_DEFAULTS = {
     'search_control_enabled': True, 'search_control_archive_capacity': 800,
     'search_control_min_archive_size': 16, 'search_control_rank_alpha': 0.50,
     'search_control_ema_alpha': 0.50,
-    # Reanalyse is a small freshness budget, not a second self-play phase. It
-    # must not replace normal 192-sim targets with a cheaper search target.
-    'replay_reanalyse_enabled': True, 'replay_reanalyse_interval': 4,
-    'replay_reanalyse_fraction': 0.02, 'replay_reanalyse_max_positions': 64,
+    # Refresh a bounded cohort of stale replay targets using standard search.
+    'replay_reanalyse_enabled': True, 'replay_reanalyse_interval': 1,
+    'replay_reanalyse_fraction': 0.005, 'replay_reanalyse_max_positions': 512,
     'replay_reanalyse_min_age': 2, 'replay_reanalyse_min_staleness': 2,
     'replay_reanalyse_max_refreshes': 2, 'replay_reanalyse_simulations': 192,
     'replay_reanalyse_batch_positions': 16,
@@ -378,7 +386,8 @@ _RL_DEFAULTS = {
     'promotion_stat_gate_enabled': True, 'promotion_stat_gate_z': 1.645,
     'actor_guard_confidence_z': 1.28,
     'promotion_score_lower_bound_min': 0.50, 'promotion_require_anchor_non_regression': False,
-    'promotion_no_mcts_gate_enabled': True, 'promotion_no_mcts_score_rate_min': 0.48,
+    # Kept only when reading legacy configs; raw NN can never gate promotion.
+    'promotion_no_mcts_gate_enabled': False, 'promotion_no_mcts_score_rate_min': 0.48,
     'promotion_anchor_min_score_rate': 0.50, 'promotion_anchor_min_true_win_rate': 0.0,
     'promotion_anchor_no_mcts_gate_enabled': False,
     'promotion_anchor_no_mcts_score_rate_min': 0.50,
@@ -459,6 +468,7 @@ def normalize_rl_config(config):
 
     has_grouped_rl = any(section in rl_cfg for section in _RL_SECTION_PREFIXES)
     if not has_grouped_rl:
+        _reject_removed_policy_correction_mixture(rl_cfg)
         rl_cfg.setdefault('mcts_algorithm', 'gumbel')
         _validate_mcts_algorithm(rl_cfg['mcts_algorithm'])
         rl_cfg.setdefault('mcts_dynamic_budget_strategy', 'feedback')
@@ -483,6 +493,12 @@ def normalize_rl_config(config):
             rl_cfg['mcts_gumbel_q_scale_visit_knee'],
             rl_cfg['mcts_gumbel_q_scale_visit_exponent'],
         )
+        rl_cfg['policy_surprise_weight'] = _validate_policy_surprise_weight(
+            rl_cfg.get('policy_surprise_weight', 0.0)
+        )
+        _reject_removed_fixed_teacher_budget_keys(rl_cfg)
+        _validate_teacher_policy_budget_config(rl_cfg)
+        _validate_policy_weighting_mode(rl_cfg)
         rl_cfg['search_control_effective_archive_capacity'] = (
             _effective_search_control_archive_capacity(rl_cfg)
         )
@@ -508,7 +524,14 @@ def normalize_rl_config(config):
     if isinstance(stockfish_cfg, dict):
         normalized['stockfish_elo'] = stockfish_cfg
 
+    _reject_removed_fixed_teacher_budget_keys(normalized)
+    _reject_removed_policy_correction_mixture(normalized)
     normalized['mcts_batch_size'] = int(normalized.get('mcts_simulations', 192))
+    normalized['policy_surprise_weight'] = _validate_policy_surprise_weight(
+        normalized.get('policy_surprise_weight', 0.0)
+    )
+    _validate_teacher_policy_budget_config(normalized)
+    _validate_policy_weighting_mode(normalized)
     _validate_mcts_algorithm(normalized['mcts_algorithm'])
     _validate_dynamic_budget_strategy(normalized['mcts_dynamic_budget_strategy'])
     _validate_search_efficiency_feedback_enabled(
@@ -530,6 +553,110 @@ def normalize_rl_config(config):
     config['reinforcement_learning'] = normalized
     _preflight_configured_opening_pool(config, normalized)
     return config
+
+
+def _reject_removed_policy_correction_mixture(rl_cfg):
+    """Reject the retired duplicate correction-CE objective explicitly."""
+    legacy_key = 'policy_correction_mixture_weight'
+    if legacy_key not in rl_cfg:
+        return
+    value = rl_cfg.pop(legacy_key)
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(
+            'reinforcement_learning.losses.policy_correction_mixture_weight was '
+            'removed; delete this setting (it is not an alias for policy_surprise_weight)'
+        )
+    if not math.isfinite(float(value)) or float(value) != 0.0:
+        raise ValueError(
+            'reinforcement_learning.losses.policy_correction_mixture_weight was '
+            'removed; delete this setting and use the supported policy weighting mode'
+        )
+
+
+def _validate_policy_surprise_weight(value):
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(
+            'reinforcement_learning.losses.policy_surprise_weight '
+            'must be a finite number in [0.0, 1.0]'
+        )
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(
+            'reinforcement_learning.losses.policy_surprise_weight '
+            'must be a finite number in [0.0, 1.0]'
+        )
+    return value
+
+
+def _validate_policy_weighting_mode(rl_cfg):
+    if (
+        float(rl_cfg.get('policy_surprise_weight', 0.0)) > 0.0
+        and float(rl_cfg.get('self_play_cap_kl_weighted_fraction', 0.0)) > 0.0
+    ):
+        raise ValueError(
+            'policy_surprise_weight and self_play.cap_kl_weighted_fraction are '
+            'alternative KL-attention modes; set one of them to 0.0'
+        )
+
+
+def _validate_unit_interval(value, key):
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f'{key} must be a finite number in [0.0, 1.0]')
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f'{key} must be a finite number in [0.0, 1.0]')
+    return value
+
+
+def _validate_positive_int32(value, key):
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f'{key} must be an integer in [1, 2147483647]')
+    value = int(value)
+    if not 1 <= value <= 2_147_483_647:
+        raise ValueError(f'{key} must be an integer in [1, 2147483647]')
+    return value
+
+
+def _reject_removed_fixed_teacher_budget_keys(rl_cfg):
+    """Fail clearly when a config still requests the retired fixed split."""
+    removed_keys = (
+        'self_play_teacher_budget_split_enabled',
+        'self_play_teacher_full_budget_fraction',
+        'self_play_teacher_full_simulations',
+        'self_play_teacher_fast_simulations',
+    )
+    present = [key for key in removed_keys if key in rl_cfg]
+    if present:
+        raise ValueError(
+            'fixed teacher full/fast budget settings were removed; delete '
+            + ', '.join(present)
+            + ' and use the dynamic feedback budget with '
+            'self_play.teacher_policy_budget_weighting_enabled'
+        )
+
+
+def _validate_teacher_policy_budget_config(rl_cfg):
+    policy_weighting_enabled = rl_cfg.get(
+        'self_play_teacher_policy_budget_weighting_enabled', False
+    )
+    if type(policy_weighting_enabled) is not bool:
+        raise ValueError(
+            'reinforcement_learning.self_play.teacher_policy_budget_weighting_enabled '
+            'must be true or false'
+        )
+    min_policy_budget_ratio = _validate_unit_interval(
+        rl_cfg.get('self_play_teacher_policy_min_budget_ratio', 0.60),
+        'reinforcement_learning.self_play.teacher_policy_min_budget_ratio',
+    )
+    cap_fraction = _validate_unit_interval(
+        rl_cfg.get('self_play_cap_kl_weighted_fraction', 0.0),
+        'reinforcement_learning.self_play.cap_kl_weighted_fraction',
+    )
+    rl_cfg['self_play_teacher_policy_budget_weighting_enabled'] = (
+        policy_weighting_enabled
+    )
+    rl_cfg['self_play_teacher_policy_min_budget_ratio'] = min_policy_budget_ratio
+    rl_cfg['self_play_cap_kl_weighted_fraction'] = cap_fraction
 
 
 def _validate_local_cuda_graph_forward(value):

@@ -270,11 +270,13 @@ def _path_relative_to_base(path, base_dir):
 def _collect_il_checkpoints(best_model_path, il_dir, fallback_best_paths=()):
     candidates = []
     il_checkpoints = sorted(
-        il_dir.glob("*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+        (path for path in il_dir.rglob("*.pt") if path.is_file()),
+        key=lambda p: (-p.stat().st_mtime, str(p).lower()),
     )
-    has_version_best = any(checkpoint.name.endswith("_best.pt") for checkpoint in il_checkpoints)
+    has_version_best = any(
+        checkpoint.name == "best.pt" or checkpoint.name.endswith("_best.pt")
+        for checkpoint in il_checkpoints
+    )
     if not has_version_best:
         for path in (best_model_path, *tuple(fallback_best_paths or ())):
             path = Path(path)
